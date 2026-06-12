@@ -1,0 +1,15 @@
+# End-to-end test gateway config. The gateway autodiscovers the served models from these worker
+# endpoints (compose service names + base_port + worker index). Consumed only by
+# test/e2e/docker-compose.yml and `make e2e`.
+listen:
+  grpc: "0.0.0.0:8001"
+  metrics: "0.0.0.0:8002"
+grpc:
+  max_recv_msg_bytes: 268435456   # 256 MiB
+  max_send_msg_bytes: 268435456
+logging:
+  level: "info"
+  format: "json"
+endpoints:
+  - "worker0:8080"
+  - "worker1:8081"

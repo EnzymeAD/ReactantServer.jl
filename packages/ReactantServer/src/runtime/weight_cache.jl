@@ -1,0 +1,257 @@
+# On-demand residency for unpinned model weights.
+#
+# Pinned models load their weights at startup and keep them on the device for the server's
+# lifetime; they are exempt from the budget here. Every other model starts evicted and has
+# its weights transferred to the device on first dispatch. Weights are kept resident after a
+# dispatch (so back-to-back requests to the same model still coalesce) and evicted LRU only
+# when a different model needs room and `max_bytes` would be exceeded.
+#
+# `max_bytes` budgets only the on-demand pool, i.e. the GPU memory left after the pinned
+# models. It is sized by the operator with that in mind.
+#
+# Only the single dispatch-loop thread mutates the cache (plus startup, before that loop is
+# spawned), so the read-decide-write of victim selection is internally consistent without a
+# lock. The lock guards the brief bookkeeping commits against the read-only metrics snapshot;
+# the slow device transfers run outside it.
+
+mutable struct WeightCache
+    backend::AbstractBackend
+    pool::MemoryPool
+    registry::ModelRegistry
+    mode::ResidencyMode            # who owns device residency on this worker
+    store::WeightStore             # host-weight residency (private, or node-shared)
+    max_bytes::Int                 # byte budget for non-device-pinned resident weights (> 0)
+    resident_bytes::Int            # current non-device-pinned resident total
+    lru::Vector{String}            # non-device-pinned resident model names, LRU at front, MRU at back
+    loads::Int                     # observability: on-demand loads performed
+    evicts::Int                    # observability: evictions performed
+    load_seconds::Float64          # observability: cumulative time spent loading weights
+    lock::ReentrantLock
+end
+
+WeightCache(backend::AbstractBackend, pool::MemoryPool, registry::ModelRegistry, max_bytes::Integer;
+            mode::ResidencyMode=SELF_MANAGED, store::WeightStore=PrivateWeightStore()) =
+    WeightCache(backend, pool, registry, mode, store, Int(max_bytes), 0, String[], 0, 0, 0.0, ReentrantLock())
+
+_touch_mru!(cache::WeightCache, name::AbstractString) = begin
+    i = findfirst(==(name), cache.lru)
+    i !== nothing && (deleteat!(cache.lru, i); push!(cache.lru, name))
+    nothing
+end
+
+_remove_lru!(cache::WeightCache, name::AbstractString) = begin
+    i = findfirst(==(name), cache.lru)
+    i !== nothing && deleteat!(cache.lru, i)
+    nothing
+end
+
+# Transfer a model's weights to GPU buffers. When the weights are pinned in host RAM
+# (host_weights set, the normal on-demand case) this is a pure host->device transfer; otherwise
+# it falls back to materializing from the mmap (used by tests that do not pin in RAM).
+function _device_buffers(cache::WeightCache, entry::ModelEntry, model::LoadedModel)
+    if model.host_weights !== nothing
+        return transfer_to_device(cache.backend, cache.pool, model.host_weights)
+    end
+    return load_pinned_weights(cache.backend, cache.pool, entry.weights, model.sig.weight_names)
+end
+
+"""
+    preload_pinned!(cache, registry) -> nothing
+
+Ensure every pinned model's weights are resident. `build_loaded_model` already loads them
+when on-demand mode is on, so this is normally a no-op; it loads defensively otherwise.
+"""
+function preload_pinned!(cache::WeightCache, registry::ModelRegistry)
+    for entry in values(registry.by_name)
+        model = entry.executable
+        if is_device_pinned(model) && model.weights === nothing
+            model.weights = _device_buffers(cache, entry, model)
+        end
+    end
+    return nothing
+end
+
+"""
+    NotResidentError
+
+Raised by [`acquire!`](@ref) in externally-managed mode when a request targets a model whose
+weights are not currently resident. A control plane is authoritative for residency in that mode,
+so the worker does not autonomously load; the model must be pinned first.
+"""
+struct NotResidentError <: Exception
+    model::String
+end
+Base.showerror(io::IO, e::NotResidentError) =
+    print(io, "model '", e.model, "' is not resident on the device; the control plane must pin it before inference")
+
+"""
+    acquire!(cache, entry) -> nothing
+
+Guarantee `entry.executable.weights` is resident before the model runs. Device-pinned and
+already-resident models return immediately (the latter is bumped to most-recently-used). In
+self-managed mode an evicted model is loaded autonomously, evicting LRU victims until it fits
+the budget (a model larger than the whole budget is loaded anyway after evicting everything,
+with a warning, since it cannot run otherwise). In externally-managed mode the worker does not
+autonomously load: an evicted model raises [`NotResidentError`](@ref).
+"""
+function acquire!(cache::WeightCache, entry::ModelEntry)
+    model = entry.executable
+    is_device_pinned(model) && return nothing
+    if model.weights !== nothing
+        lock(cache.lock) do
+            _touch_mru!(cache, entry.name)
+        end
+        return nothing
+    end
+
+    cache.mode == EXTERNALLY_MANAGED && throw(NotResidentError(entry.name))
+
+    need = model.nbytes
+    # Select LRU victims (front first) until the target would fit.
+    victims = String[]
+    projected = cache.resident_bytes
+    for name in cache.lru
+        projected + need <= cache.max_bytes && break
+        push!(victims, name)
+        projected -= cache.registry.by_name[name].executable.nbytes
+    end
+    if projected + need > cache.max_bytes
+        @warn "weight cache: model exceeds budget even after evicting all unpinned models; loading anyway" model = entry.name nbytes = need budget = cache.max_bytes
+    end
+
+    # Evict victims first so loading the target does not transiently exceed the budget. Commit
+    # the residency bookkeeping under the lock, then release the device buffers outside it.
+    if !isempty(victims)
+        to_free = Any[]
+        lock(cache.lock) do
+            for name in victims
+                vm = cache.registry.by_name[name].executable
+                push!(to_free, vm.weights)
+                vm.weights = nothing
+                _remove_lru!(cache, name)
+                cache.resident_bytes -= vm.nbytes
+                cache.evicts += 1
+            end
+        end
+        for fb in to_free
+            free_weights!(cache.backend, fb)
+        end
+        @info "residency: evicted for headroom" loading = entry.name evicted = victims
+    end
+
+    # Transfer the target's weights to the GPU (outside the lock), then commit residency. With
+    # weights pinned in host RAM this is a pure host->device copy, not a re-materialization.
+    t0 = time()
+    bufs = _device_buffers(cache, entry, model)
+    dt = time() - t0
+    lock(cache.lock) do
+        model.weights = bufs
+        push!(cache.lru, entry.name)
+        cache.resident_bytes += model.nbytes
+        cache.loads += 1
+        cache.load_seconds += dt
+    end
+    log_residency_change(entry.name, :system, :device, model.nbytes;
+        memory=memory_report(cache.backend, cache.pool; registry=cache.registry, weight_cache=cache))
+    return nothing
+end
+
+"""
+    set_residency_state!(cache, entry, target) -> ResidencyState
+
+Move a model to the `target` residency floor (see `ResidencyState`). Like [`acquire!`](@ref)
+this runs on the dispatch-loop thread, the sole mutator of residency. It materializes or drops
+the host floor and, for `PINNED_DEVICE`, ensures the weights are resident on the device (exempt
+from the budget). In externally-managed mode, leaving the device floor releases the device
+buffers (there is no autonomous evictor to reclaim them); in self-managed mode they stay
+resident but become evictable. The slow host/device work runs outside the lock; only the
+bookkeeping commit is locked.
+"""
+function set_residency_state!(cache::WeightCache, entry::ModelEntry, target::ResidencyState)
+    model = entry.executable
+    cur = model.state
+    cur == target && return target
+
+    # Slow work outside the lock: materialize the host floor and/or transfer to the device.
+    new_host = model.host_weights
+    drop_host = false
+    if target == PINNED_SYSTEM && model.host_weights === nothing
+        new_host = host_materialize(cache.store, entry.name, entry.weights, model.sig.weight_names)
+    elseif target == UNPINNED && model.host_weights !== nothing
+        new_host = nothing        # drop the host floor
+        drop_host = true
+    end
+
+    new_dev = model.weights
+    free_dev = nothing
+    if target == PINNED_DEVICE && model.weights === nothing
+        new_dev = _device_buffers(cache, entry, model)
+    elseif target != PINNED_DEVICE && cache.mode == EXTERNALLY_MANAGED && model.weights !== nothing
+        # Externally-managed has no evictor, so unpinning from the device must free it here.
+        free_dev = model.weights
+        new_dev = nothing
+    end
+
+    lock(cache.lock) do
+        # Uncount if presently counted (non-device-pinned and device-resident).
+        if entry.name in cache.lru
+            _remove_lru!(cache, entry.name)
+            cache.resident_bytes -= model.nbytes
+        end
+        model.host_weights = new_host
+        model.weights = new_dev
+        model.state = target
+        # Recount if it is now device-resident but not device-pinned (evictable in self-managed).
+        if target != PINNED_DEVICE && model.weights !== nothing
+            push!(cache.lru, entry.name)
+            cache.resident_bytes += model.nbytes
+        end
+    end
+    free_dev === nothing || free_weights!(cache.backend, free_dev)
+    # The host arrays are no longer referenced (model.host_weights was set to nothing); release the
+    # store entry (detach + last-one-out unlink for the shared store).
+    drop_host && host_release!(cache.store, entry.name)
+    log_residency_change(entry.name, cur, target, model.nbytes;
+        memory=memory_report(cache.backend, cache.pool; registry=cache.registry, weight_cache=cache))
+    return target
+end
+
+"""
+    release_all!(cache, entry) -> nothing
+
+Release every residency a model holds: free its device buffers, drop it from the LRU budget, and
+release any shared host floor. Used by `evict!` when a model is removed from the worker. Runs on
+the dispatch thread (sole residency mutator); the device free runs outside the lock.
+"""
+function release_all!(cache::WeightCache, entry::ModelEntry)
+    model = entry.executable
+    model === nothing && return nothing
+    to_free = nothing
+    lock(cache.lock) do
+        if entry.name in cache.lru
+            _remove_lru!(cache, entry.name)
+            cache.resident_bytes -= model.nbytes
+        end
+        to_free = model.weights
+        model.weights = nothing
+    end
+    to_free === nothing || free_weights!(cache.backend, to_free)
+    if model.host_weights !== nothing
+        model.host_weights = nothing
+        host_release!(cache.store, entry.name)
+    end
+    return nothing
+end
+
+"""
+    weight_cache_stats(cache) -> NamedTuple
+
+Snapshot the cache counters under its lock for observability.
+"""
+function weight_cache_stats(cache::WeightCache)
+    lock(cache.lock) do
+        return (resident_bytes = cache.resident_bytes, max_bytes = cache.max_bytes,
+                resident_models = copy(cache.lru), loads = cache.loads, evicts = cache.evicts,
+                load_seconds = cache.load_seconds)
+    end
+end

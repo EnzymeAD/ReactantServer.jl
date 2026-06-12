@@ -1,0 +1,10 @@
+[deps]
+InterProcessCommunication = "a7427343-1d15-5490-a218-bfcb7db836a2"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+ReactantServer = "faa8a0e4-1926-4c6b-a0e2-e70699715ecf"
+gRPCClient = "aaca4a50-36af-4a1d-b878-4c443f2061ad"
+
+[sources]
+# Resolve the package from the repository root; its [sources] pull in the vendored lib/
+# submodules (Reactant, gRPCServer, HTTP) transitively.
+ReactantServer = {path = "../.."}

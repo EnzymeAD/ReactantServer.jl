@@ -1,0 +1,83 @@
+# Per-model value types, defined before `registry.jl` so `ModelEntry` can hold them with precise
+# `Union{T,Nothing}` fields rather than `Any`. The behavior lives elsewhere: `build_loaded_model`
+# in `runtime/model.jl`, and the `ModelSchedState` scheduling methods in `scheduler.jl`.
+
+# A compiled model's signature: its executable input/output names and element types, the weight
+# argument order, and the network batch axis.
+struct ModelSignature
+    input_names::Vector{String}
+    input_eltypes::Vector{DataType}
+    weight_names::Vector{String}        # StableHLO argument order, following the inputs
+    num_outputs::Int
+    output_names::Vector{String}
+    output_eltypes::Vector{DataType}
+    batch_dim::Int                      # 0-based network batch axis (derived from input shape letters)
+end
+
+num_parameters(s::ModelSignature) = length(s.input_names) + length(s.weight_names)
+
+# A compiled, ready-to-serve model: its signature, its compiled executables (one per batch size),
+# and its resident weight buffers.
+#
+# weights is the resident device (GPU) buffers (shared across sizes, in weight_names order), or
+# `nothing` when the model's weights are currently evicted from the GPU. `state` is the residency
+# floor an operator or control plane has set (see `ResidencyState`): `PINNED_DEVICE` models are
+# kept resident and never evicted; `PINNED_SYSTEM` keeps host_weights resident and loads to the
+# device on demand; `UNPINNED` keeps no floor. `nbytes` is the device footprint used for the
+# cache budget. host_weights holds the materialized weight Arrays resident in host RAM; when
+# present, an on-demand GPU load is a pure host->device transfer rather than a re-materialization
+# from the mmap. It is `nothing` when no host floor is held (unpinned, the non-on-demand path,
+# and the hand-built models used in tests). `execs` and the buffer vectors stay `Any`-typed
+# because their elements are backend-opaque (mock vs Reactant executables and device buffers).
+mutable struct LoadedModel
+    sig::ModelSignature
+    execs::Dict{Int,Any}                # batch size -> backend executable; key 0 = single unbatched
+    weights::Union{Vector{Any},Nothing}
+    state::ResidencyState
+    nbytes::Int
+    host_weights::Union{Vector{Any},Nothing}
+end
+
+# True when the model's weights are guaranteed resident on the device for the server's lifetime
+# (exempt from eviction).
+is_device_pinned(m::LoadedModel) = m.state == PINNED_DEVICE
+
+# Preserve the original three-argument form: resident, unpinned, footprint unknown (0), no host
+# pinning. Used by tests that hand-build a model with weights already in place.
+LoadedModel(sig::ModelSignature, execs::Dict{Int,Any}, weights::Vector{Any}) =
+    LoadedModel(sig, execs, weights, UNPINNED, 0, nothing)
+
+# Bool shims map the old `pinned` flag onto the residency state (true => PINNED_DEVICE,
+# false => UNPINNED), preserving the five- and six-argument forms used by tests.
+LoadedModel(sig::ModelSignature, execs::Dict{Int,Any}, weights::Union{Vector{Any},Nothing},
+            pinned::Bool, nbytes::Integer) =
+    LoadedModel(sig, execs, weights, pinned ? PINNED_DEVICE : UNPINNED, Int(nbytes), nothing)
+
+LoadedModel(sig::ModelSignature, execs::Dict{Int,Any}, weights::Union{Vector{Any},Nothing},
+            pinned::Bool, nbytes::Integer, host_weights::Union{Vector{Any},Nothing}) =
+    LoadedModel(sig, execs, weights, pinned ? PINNED_DEVICE : UNPINNED, Int(nbytes), host_weights)
+
+# Per-model scheduler state. The EMA and cost fields drive the fair discipline only; under FIFO
+# they are left untouched. The EMA fields are always decayed to "now" before being read or
+# written so the value is current as of the read time. The scheduling methods live in
+# `scheduler.jl`.
+mutable struct ModelSchedState
+    name::String
+    weight::Float64                       # relative compute share (fair discipline); share = weight / Σ weights
+    max_batch_size::Union{Int,Nothing}    # coalescing cap (rows per dispatch); nothing = uncapped
+    queue::Vector{QueuedRequest}          # FIFO: front is oldest
+    recent_compute_ema::Float64
+    ema_last_update::Float64
+    cost_estimate::Dict{Int,Float64}      # batch size -> estimated GPU time (seconds)
+    # observability
+    dispatch_count::Int                   # coalesced batch executions
+    requests_served::Int                  # individual requests served (>= dispatch_count under coalescing)
+    total_compute::Float64
+    wait_samples::Vector{Float64}
+    batch_size_hist::Dict{Int,Int}
+end
+
+function ModelSchedState(name::AbstractString, mc::ModelSchedConfig, now::Float64)
+    return ModelSchedState(String(name), mc.weight, mc.max_batch_size, QueuedRequest[],
+        0.0, now, Dict{Int,Float64}(), 0, 0, 0.0, Float64[], Dict{Int,Int}())
+end

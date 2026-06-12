@@ -1,0 +1,24 @@
+# Reactant persistent compilation cache for the worker. Read at runtime by
+# Reactant.PersistentCompileCache.__init__ (lib/Reactant.jl/src/PersistentCompileCache.jl),
+# whose settings make_compile_options wires into XLA's debug options for every compile.
+# The worker entrypoint serves under --project=.../packages/ReactantServer, so this is the
+# active project whose LocalPreferences.toml is consulted.
+#
+# persistent_cache_directory is pinned to a fixed path so a persistent Docker volume can be
+# mounted there (docker-compose.gpu2.yml); the default would land in an ephemeral depot
+# scratchspace that is lost on container recreation. Only the autotune cache is persisted,
+# which is the larger GPU-compile cost (gemm/conv algorithm selection, ~5-10s/model).
+#
+# The kernel cache is OFF. Enabling it on this Reactant_jll/XLA build produced incorrect
+# executables at runtime: CUDA_ERROR_NOT_FOUND "named symbol not found" for fusion kernels
+# (e.g. triton_softmax, input_reduce_fusion) in the jit_reordered executable, followed by GPU
+# OOM. It also required a matching nvlink (not bundled by Reactant; see NVLINK.md) and capping
+# compilation parallelism to avoid OOM. Net: not viable here. Revisit if a future Reactant fixes it.
+#
+# Note: pinning an explicit directory bypasses Reactant_jll version-keying. After a
+# Reactant/CUDA bump, wipe the volume or call Reactant.clear_compilation_cache!().
+[Reactant]
+persistent_cache_enabled = true
+persistent_cache_directory = "/var/cache/reactant-compile"
+persistent_kernel_cache_enabled = false
+persistent_autotune_cache_enabled = true

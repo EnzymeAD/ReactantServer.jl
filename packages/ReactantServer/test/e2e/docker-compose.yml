@@ -1,0 +1,66 @@
+# Podman-tailored end-to-end stack: two GPU workers (GPUs attached via CDI) plus the gateway,
+# sharing the host IPC namespace so a host-side client can drive the POSIX shared-memory path.
+# Brought up by test/e2e/run_e2e.sh (`make e2e`) with podman-compose, which forwards CDI
+# `devices:` to `podman run --device` (the docker-compose provider mangles them).
+#
+# Volume sources are absolute via ${REACTANT_REPO} (the repo root, exported by run_e2e.sh) so path
+# resolution does not depend on the compose tool's working directory. This file is separate from
+# the production docker-compose.yml (which targets Docker and the nvidia `deploy` stanza).
+
+x-worker: &worker
+  image: reactantserver-worker:latest
+  volumes:
+    - ${REACTANT_REPO:?set REACTANT_REPO to the repo root (run via make e2e / run_e2e.sh)}/packages/ReactantServer/test/e2e/node.yaml:/etc/reactantserver/node.yaml:ro
+    - ${REACTANT_REPO}/packages/ReactantServer/test/e2e/models/scale4:/var/lib/reactantserver/models/scale4:ro
+    - ${REACTANT_REPO}/bundles/bit_resnet50:/var/lib/reactantserver/models/bit_resnet50:ro
+    # Share the host's POSIX shared memory so the host-side client and the worker see the same
+    # /dev/shm regions (the KServe system-shared-memory data plane). `ipc: host` below is the
+    # intent and works under Docker, but podman-compose silently ignores it, so bind-mount
+    # /dev/shm explicitly, which podman-compose honors and which fully shares POSIX shm.
+    - /dev/shm:/dev/shm
+  ipc: host
+  healthcheck:
+    test: ["CMD", "julia", "--project=/opt/reactantserver", "/usr/local/bin/healthcheck.worker.jl"]
+    interval: 15s
+    timeout: 20s
+    retries: 40
+    start_period: 600s   # covers Reactant CUDA compilation of bit_resnet50 at startup
+
+services:
+  worker0:
+    <<: *worker
+    environment:
+      REACTANT_WORKER_NAME: worker0
+    devices:
+      - "nvidia.com/gpu=${E2E_GPU0:-2}"
+    ports:
+      - "18080:8080"   # host:container; published for client ModelMetadata introspection only
+
+  worker1:
+    <<: *worker
+    environment:
+      REACTANT_WORKER_NAME: worker1
+    devices:
+      - "nvidia.com/gpu=${E2E_GPU1:-1}"
+
+  gateway:
+    image: reactantserver-gateway:latest
+    user: "0"   # read the host-owned mounted gateway file under rootless podman
+    # Start ordering only; readiness is gated by the /readyz poll in run_e2e.sh. The gateway
+    # tolerates not-yet-ready workers (it keeps probing/rediscovering), so it need not wait here.
+    depends_on:
+      - worker0
+      - worker1
+    volumes:
+      - ${REACTANT_REPO}/packages/ReactantServer/test/e2e/gateway.yml:/etc/reactantserver/gateway.yml:ro
+    # Host ports are remapped off 8001/8002 to avoid colliding with a co-resident Triton
+    # (whose gRPC default is 8001 and metrics 8002). Container-internal ports stay 8001/8002 per gateway.yml.
+    ports:
+      - "18501:8001"   # host:container; KServe V2 gRPC for the client
+      - "19501:8002"   # host:container; metrics / health (used by the readiness poll)
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8002/readyz"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s

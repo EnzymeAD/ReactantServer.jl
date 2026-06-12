@@ -1,0 +1,104 @@
+# Single-GPU end-to-end soak stack: one worker on GPU 2, the gateway, and a dummy-data load
+# generator, all under `docker compose`. Use this to exercise the full serving path on one GPU and
+# watch for memory leaks, races, and instability.
+#
+# Prerequisites:
+#   - docker/node.gpu2.yaml exists (run docker/gen_node_gpu2.sh first; `make gpu2-up` does this)
+#   - images built: `make worker gateway loadgen`
+#   - the NVIDIA container runtime is available to Docker (sudo nvidia-ctk runtime configure
+#     --runtime=docker && sudo systemctl restart docker)
+#   - git submodules checked out (lib/Reactant.jl, gRPC*, HTTP, Prometheus)
+#
+# Usage:
+#   make gpu2-up                 # generate node file + docker compose up
+#   docker compose -f docker-compose.gpu2.yml up
+#
+# The worker compiles and warms up every model's executables before it serves, so first startup is
+# slow (potentially hours for all 85 bundles). The worker healthcheck start_period is set high to
+# cover this; for a quick check, restrict the set with LOADGEN_MODELS and trim the bundle mount.
+
+services:
+  worker0:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    image: reactantserver-worker:latest
+    volumes:
+      - ./docker/node.gpu2.yaml:/etc/reactantserver/node.yaml:ro
+      - ${REACTANTSERVER_MODELS:-/docker/xlaserver/models}:/var/lib/reactantserver/models:ro
+      # Persistent XLA compile cache (autotune results + GPU kernel binaries). Pinned here by
+      # packages/ReactantServer/LocalPreferences.toml so warm restarts skip recompilation work.
+      - reactant-compile-cache:/var/cache/reactant-compile
+    # Share the host IPC namespace and its /dev/shm so the load generator's POSIX shared-memory
+    # regions are visible to the worker. Under Docker, ipc: host also mounts the host /dev/shm
+    # (replacing the small default), so no explicit /dev/shm bind is needed.
+    ipc: host
+    ports:
+      - "9100:9100"   # Prometheus worker metrics / health (metrics_base_port in node.gpu2.yaml)
+    environment:
+      REACTANT_WORKER_NAME: worker0
+      # Physical GPU 2; CUDA renumbers it to ordinal 0 inside the container (the worker default).
+      CUDA_VISIBLE_DEVICES: "2"
+    healthcheck:
+      test: ["CMD", "julia", "--project=/opt/reactantserver", "/usr/local/bin/healthcheck.worker.jl"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      # Generous: all compiled executables compile and warm up before the gRPC plane accepts traffic.
+      start_period: 14400s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+              count: all
+
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.gateway
+    image: reactantserver-gateway:latest
+    depends_on:
+      worker0:
+        condition: service_healthy
+    volumes:
+      - ./docker/gateway.gpu2.yml:/etc/reactantserver/gateway.yml:ro
+    ports:
+      - "8001:8001"   # KServe V2 gRPC endpoint (Triton-compatible)
+      - "8002:8002"   # Prometheus metrics / health / admin HTTP (Triton-compatible)
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8002/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  loadgen:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.loadgen
+    image: reactantserver-loadgen:latest
+    depends_on:
+      gateway:
+        condition: service_healthy
+    volumes:
+      # Read the manifests to synthesize correctly shaped dummy inputs (manifest_io_spec).
+      - ${REACTANTSERVER_MODELS:-/docker/xlaserver/models}:/var/lib/reactantserver/models:ro
+    # ipc: host shares the host IPC namespace and /dev/shm, so the shm transport's regions reach
+    # the worker without an explicit /dev/shm bind.
+    ipc: host
+    environment:
+      LOADGEN_GATEWAY: "grpc://gateway:8001"
+      LOADGEN_METRICS: "http://gateway:8002/metrics"
+      LOADGEN_MODEL_REPO: "/var/lib/reactantserver/models"
+      LOADGEN_CONCURRENCY: "32"
+      LOADGEN_DURATION_SECONDS: "3600"
+      LOADGEN_TRANSPORT: "tcp"        # tcp | shm | mixed
+      LOADGEN_SHM_OUTPUTS: "true"     # shm path also reads outputs back through shared memory
+      LOADGEN_REPORT_SECONDS: "30"
+      JULIA_NUM_THREADS: "8"
+
+volumes:
+  # Survives `docker compose down/up` so the worker's first-run compilation work is reused.
+  reactant-compile-cache:

@@ -1,0 +1,35 @@
+# Workspace root for the ReactantServer monorepo. This environment is not itself a package;
+# it lists the member packages under [workspace] (they share the single root Manifest) and
+# declares the path [sources] for the vendored lib/* submodules and the inter-package
+# ReactantServerCore dependency, so every member resolves them consistently.
+
+# packages/ReactantServerExport is intentionally NOT listed here: it is the offline export
+# tooling, kept out of the shared workspace manifest so its Lux/PythonCall weakdeps never get
+# pulled into the worker image. Examples/tests/validation path-source it directly.
+[workspace]
+projects = [
+    "packages/ReactantServerCore",
+    "packages/ReactantServer",
+    "packages/ReactantServerGateway",
+    "packages/ReactantServerClient",
+]
+
+[deps]
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+Prometheus = "f25c1797-fe98-4e0c-b252-1b4fe3b6bde6"
+Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+ReactantServerCore = "387a5f05-f7b4-4d57-bca9-cd3358e52bdc"
+YAML = "ddb6d928-2868-570f-bddf-ab3f9cf99eb6"
+gRPCClient = "aaca4a50-36af-4a1d-b878-4c443f2061ad"
+gRPCServer = "b7f0dee4-5e6a-42e7-93b0-9c098bad2317"
+
+[sources]
+ReactantServerCore = {path = "packages/ReactantServerCore"}
+HTTP = {path = "lib/HTTP.jl"}
+Prometheus = {path = "lib/Prometheus.jl"}
+Reactant = {path = "lib/Reactant.jl"}
+gRPCClient = {path = "lib/gRPCClient.jl"}
+gRPCServer = {path = "lib/gRPCServer.jl"}
+
+[compat]
+julia = "1.11"

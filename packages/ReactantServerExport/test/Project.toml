@@ -1,0 +1,21 @@
+[deps]
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
+PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+ReactantServer = "faa8a0e4-1926-4c6b-a0e2-e70699715ecf"
+ReactantServerCore = "387a5f05-f7b4-4d57-bca9-cd3358e52bdc"
+ReactantServerExport = "90fa0446-f028-4638-8833-e223884d9b4d"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+gRPCServer = "b7f0dee4-5e6a-42e7-93b0-9c098bad2317"
+
+# Standalone env: declare the full vendored path-source closure (the round-trip loads the
+# ReactantServer worker, which pulls the Reactant/gRPCServer/HTTP forks + ReactantServerCore).
+[sources]
+HTTP = {path = "../../../lib/HTTP.jl"}
+Reactant = {path = "../../../lib/Reactant.jl"}
+ReactantServer = {path = "../../ReactantServer"}
+ReactantServerCore = {path = "../../ReactantServerCore"}
+ReactantServerExport = {path = ".."}
+gRPCServer = {path = "../../../lib/gRPCServer.jl"}

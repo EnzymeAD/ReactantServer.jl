@@ -1,0 +1,48 @@
+# reactant-gateway image: the pure-Julia KServe V2 gRPC reverse proxy
+# (ReactantServerGateway.serve_gateway).
+#
+# Build context is the repository root:
+#   docker build -f docker/Dockerfile.gateway -t reactantserver-gateway .
+#
+# The gateway depends only on ReactantServerCore + the gRPC/HTTP forks, never on Reactant, so the
+# image is built from the ReactantServerGateway workspace member alone: no Reactant/Enzyme/XLA
+# stack and no CUDA artifacts are pulled. The vendored dependencies are git submodules under
+# lib/; run
+#   git submodule update --init --recursive
+# before building.
+FROM docker.io/library/julia:1.12.5-trixie
+
+ENV JULIA_DEPOT_PATH=/opt/julia-depot \
+    JULIA_PROJECT=/opt/reactantserver/packages/ReactantServerGateway
+
+# git/CA certs for the General registry and artifact downloads during instantiate; curl backs the
+# container healthcheck; build-essential so packages with a native build step (e.g.
+# InterProcessCommunication.jl) can compile their helpers.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates build-essential curl \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/reactantserver
+
+# Only the gateway member and its dependencies: ReactantServerCore, the gateway package, and the
+# vendored gRPC/HTTP submodules. Reactant is deliberately NOT copied. The layout is preserved
+# under WORKDIR so the gateway member's relative [sources] (../ReactantServerCore, ../../lib/*)
+# resolve. gRPCClient.jl is a runtime dependency (the gateway forwards to workers as a client).
+COPY packages/ReactantServerCore/    ./packages/ReactantServerCore/
+COPY packages/ReactantServerGateway/ ./packages/ReactantServerGateway/
+COPY lib/gRPCServer.jl/  ./lib/gRPCServer.jl/
+COPY lib/gRPCClient.jl/  ./lib/gRPCClient.jl/
+COPY lib/HTTP.jl/        ./lib/HTTP.jl/
+COPY lib/Prometheus.jl/  ./lib/Prometheus.jl/
+
+# Install the General registry (the custom JULIA_DEPOT_PATH starts empty), then resolve,
+# instantiate, and precompile the gateway member so the gateway starts fast (no first-request
+# precompile). This resolves only the gateway's closure, so no Reactant is pulled.
+RUN julia --project=/opt/reactantserver/packages/ReactantServerGateway -e 'using Pkg; Pkg.Registry.add("General"); Pkg.resolve(); Pkg.instantiate(); Pkg.precompile()'
+
+COPY docker/entrypoint.gateway.sh /usr/local/bin/entrypoint.gateway.sh
+RUN chmod +x /usr/local/bin/entrypoint.gateway.sh
+
+# KServe V2 gRPC endpoint for clients, and the metrics / health admin HTTP port.
+EXPOSE 8001 8002
+ENTRYPOINT ["/usr/local/bin/entrypoint.gateway.sh"]

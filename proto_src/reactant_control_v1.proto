@@ -1,0 +1,85 @@
+// ReactantServer control plane (v1). A worker-side service, distinct from the KServe V2
+// GRPCInferenceService data plane, that lets a gateway/control plane drive model residency and
+// live scheduler policy. Modeled on NVIDIA Triton's model-control extension with our pinning
+// semantics. Residency RPCs are authoritative only on an externally-managed worker; a
+// self-managed worker rejects them. SetModelPolicy works in both modes.
+
+syntax = "proto3";
+package reactant_control;
+
+service ControlService
+{
+  // List every model with its residency state, host/device residency, footprint, scheduler
+  // weight, and queue depth, plus the worker's residency mode and scheduling discipline.
+  rpc ModelControlStatus(ModelControlStatusRequest) returns (ModelControlStatusResponse) {}
+
+  // Move a model to a target residency floor (externally-managed workers only).
+  rpc SetModelResidency(SetModelResidencyRequest) returns (SetModelResidencyResponse) {}
+
+  // Update a model's live scheduler policy (currently its fair-discipline weight).
+  rpc SetModelPolicy(SetModelPolicyRequest) returns (SetModelPolicyResponse) {}
+}
+
+// Residency floor for a model's weights. UNSPECIFIED is never returned; it is the proto3 zero
+// value and is rejected as a SetModelResidency target.
+enum Residency
+{
+  RESIDENCY_UNSPECIFIED = 0;
+  UNPINNED = 1;
+  PINNED_SYSTEM = 2;
+  PINNED_DEVICE = 3;
+}
+
+message ModelControlStatusRequest {}
+
+message ModelStatus
+{
+  string name = 1;
+  Residency residency = 2;
+  bool device_resident = 3;
+  bool host_resident = 4;
+  int64 weight_nbytes = 5;
+  double weight = 6;
+  int64 queue_depth = 7;
+  // Cumulative serving counters, for a gateway/control plane to derive true per-request compute
+  // cost (delta total_compute_seconds / delta requests_served between polls) and dispatch rates.
+  // requests_served counts individual requests; dispatch_count counts coalesced batch executions.
+  double total_compute_seconds = 8;
+  uint64 requests_served = 9;
+  uint64 dispatch_count = 10;
+}
+
+message ModelControlStatusResponse
+{
+  // "self_managed" or "externally_managed".
+  string residency_mode = 1;
+  // "fair" or "fifo".
+  string discipline = 2;
+  repeated ModelStatus models = 3;
+  // Byte budget for on-demand (unpinned) weights on this worker, the memory capacity a
+  // gateway packs model weight footprints against. 0 when the on-demand cache is disabled
+  // (every model stays device-resident), meaning memory is not a packing constraint.
+  uint64 weight_cache_max_bytes = 4;
+}
+
+message SetModelResidencyRequest
+{
+  string name = 1;
+  Residency target = 2;
+}
+
+message SetModelResidencyResponse
+{
+  // The resulting residency state.
+  Residency residency = 1;
+}
+
+message SetModelPolicyRequest
+{
+  string name = 1;
+  // proto3 has no scalar presence; set has_weight to apply `weight`.
+  bool has_weight = 2;
+  double weight = 3;
+}
+
+message SetModelPolicyResponse {}

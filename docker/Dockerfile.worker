@@ -1,0 +1,81 @@
+# ReactantServer.jl single-GPU worker image.
+#
+# Build context is the repository root. The vendored dependencies are git submodules under
+# lib/ (Reactant.jl, gRPCServer.jl, gRPCClient.jl, HTTP.jl); run
+# `git submodule update --init --recursive` before building.
+#
+# Build (from the repo root):
+#   docker build -f docker/Dockerfile.worker -t reactantserver-worker .
+
+FROM docker.io/library/julia:1.12.5-trixie
+
+ENV JULIA_DEPOT_PATH=/opt/julia-depot \
+    JULIA_PROJECT=/opt/reactantserver
+
+# git/CA certs for the General registry and artifact downloads during instantiate;
+# build-essential (make + C toolchain) so packages with a native build step, e.g.
+# InterProcessCommunication.jl, can compile their helpers.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates build-essential \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/reactantserver
+
+# Workspace root environment, the member packages, and the vendored submodules. The worker is
+# built on the workspace root so the shared Manifest.toml keeps the HTTP/Reactant forks pinned;
+# the entrypoint then runs on the ReactantServer member project. .dockerignore drops the package
+# test trees (e.g. the large e2e weights) from the packages/ copy.
+COPY Project.toml Manifest.toml ./
+COPY packages/ ./packages/
+COPY lib/Reactant.jl/   ./lib/Reactant.jl/
+COPY lib/gRPCServer.jl/ ./lib/gRPCServer.jl/
+COPY lib/gRPCClient.jl/ ./lib/gRPCClient.jl/
+COPY lib/HTTP.jl/       ./lib/HTTP.jl/
+# Resolved transitively via the gateway workspace member (which depends on Prometheus); the
+# worker never loads it, but the workspace-root instantiate needs the source present.
+COPY lib/Prometheus.jl/ ./lib/Prometheus.jl/
+
+# CUDA artifact selection for Reactant_jll. Its platform augmentation honors the REACTANT_GPU
+# and REACTANT_GPU_VERSION environment variables to choose the prebuilt artifact. Without them a
+# GPU-less build selects the CPU (gpu=none) artifact and `client("cuda")` then fails at runtime
+# with "No functional client was found". These are set as ENV (not ARG) so the same selection
+# applies at build time (artifact download + precompile of the CUDA libReactantExtra) and at
+# runtime (load-time wrapper selection in the worker). The value must match the host CUDA major
+# version: Reactant ships 12.9 and 13.1 builds, and the bundled cuBLASLt/cuDNN must match the
+# host driver's CUDA runtime or symbol loading (e.g. cublasLtCreate) aborts during GPU compile.
+# This box has the CUDA 13.1 toolkit (driver 580 reports max CUDA 13.0), so 13.1 is the correct
+# choice; use 12.9 on CUDA 12 hosts.
+ARG XLA_CUDA_GPU_VERSION=13.1
+ENV REACTANT_GPU=cuda \
+    REACTANT_GPU_VERSION=${XLA_CUDA_GPU_VERSION}
+
+# Install the General registry (the custom JULIA_DEPOT_PATH starts empty, and resolve does not
+# auto-install it), then resolve, instantiate, and precompile the whole workspace so the worker
+# starts fast (no first-request precompile). The workspace [sources] (in the copied root
+# Project.toml) already point the vendored deps at lib/ and ReactantServerCore at packages/.
+#
+# Precompiling the CUDA build loads libReactantExtra, whose DT_NEEDED list includes
+# libcuda.so.1 (the NVIDIA *driver*, injected by the container runtime at run time and absent in
+# `podman build`, since --device does not accept CDI names). The bundled cuBLAS/cuDNN/cudart come
+# from the artifact; only libcuda is missing. Precompilation never calls into the driver (the GPU
+# client is created lazily at serve time), so a do-nothing stub libcuda.so.1 satisfies the
+# loader's NEEDED dependency and lets precompilation complete. The stub is exposed only via
+# LD_LIBRARY_PATH for the precompile command and removed afterwards, so at run time the real
+# CDI-injected libcuda.so.1 is used, not the stub.
+RUN mkdir -p /tmp/cudastub && : > /tmp/empty.c \
+ && gcc -shared -fPIC -Wl,-soname,libcuda.so.1 -o /tmp/cudastub/libcuda.so.1 /tmp/empty.c \
+ && LD_LIBRARY_PATH=/tmp/cudastub julia --project=/opt/reactantserver -e 'using Pkg; Pkg.Registry.add("General"); Pkg.resolve(); Pkg.instantiate(); Pkg.precompile()' \
+ && rm -rf /tmp/cudastub /tmp/empty.c
+
+COPY docker/entrypoint.worker.sh /usr/local/bin/entrypoint.worker.sh
+RUN chmod +x /usr/local/bin/entrypoint.worker.sh
+
+# Pure-Julia readiness probe invoked by the container healthcheck. It imports only gRPCClient and
+# YAML (never ReactantServer), so it does not pay the Reactant load on every probe.
+COPY docker/healthcheck.worker.jl /usr/local/bin/healthcheck.worker.jl
+
+# The gRPC listen port is derived from the cluster file (base_port + worker index); this is
+# informational. No system CUDA toolkit is installed: Reactant supplies the PJRT plugin via
+# JLLs and only needs the host driver, exposed by the NVIDIA container runtime.
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/entrypoint.worker.sh"]

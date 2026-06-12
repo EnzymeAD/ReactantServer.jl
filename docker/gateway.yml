@@ -1,0 +1,22 @@
+# Gateway config for the docker compose deployment. The gateway is decoupled from the node file:
+# it is given a flat list of worker `endpoints` (host:port) and autodiscovers which models each
+# serves via RepositoryIndex, refreshing its routing table periodically. Endpoints use the compose
+# service names as hostnames; ports follow the node's base_port (8080) plus the worker index, so
+# worker0 listens on 8080 and worker1 on 8081. To front multiple nodes, list every node's worker
+# endpoints here (e.g. node1-worker0:8080, node2-worker0:8080, ...).
+
+listen:
+  grpc: "0.0.0.0:8001"
+  metrics: "0.0.0.0:8002"
+
+grpc:
+  max_recv_msg_bytes: 268435456
+  max_send_msg_bytes: 268435456
+
+logging:
+  level: "info"
+  format: "json"
+
+endpoints:
+  - "worker0:8080"
+  - "worker1:8081"

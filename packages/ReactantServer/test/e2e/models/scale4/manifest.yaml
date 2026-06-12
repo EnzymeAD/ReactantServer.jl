@@ -1,0 +1,7 @@
+format_version: "2.0"
+name: scale4
+executable_inputs:
+  - {name: x, dtype: f32, shape: c, dims: {c: 4}}
+executable_outputs:
+  - {name: y, dtype: f32, shape: c, dims: {c: 4}}
+batching: {compiled_batch_sizes: [1]}

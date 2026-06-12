@@ -1,0 +1,10 @@
+# Python dependencies for the ReactantServerExport PyTorch extension. CPU wheels by default; downstream
+# consumers can override these pins in their own CondaPkg.toml if they need a
+# GPU build or a specific torch version.
+
+[pip.deps]
+torch = ">=2.4"
+torchax = ""
+jax = ""
+jaxlib = ""
+numpy = ""

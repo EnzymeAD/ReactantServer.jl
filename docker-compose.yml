@@ -1,0 +1,93 @@
+# Single-node multi-GPU ReactantServer deployment: two single-GPU workers behind one gateway.
+#
+# The workers read docker/node.yaml (the node's source of truth); each is told its identity via
+# REACTANT_WORKER_NAME and serves only its assigned models. The gateway reads its own
+# docker/gateway.yml (a list of worker endpoints) and autodiscovers which models each serves.
+#
+# Prerequisites:
+#   - git submodule update --init --recursive   (populates lib/Reactant.jl, gRPCServer.jl, HTTP.jl)
+#   - NVIDIA Container Toolkit on the host for GPU access
+#   - a model bundle repository on the host; point REACTANTSERVER_MODELS at it (defaults to ./bundles)
+#
+# Usage:
+#   docker compose build
+#   REACTANTSERVER_MODELS=/path/to/bundles docker compose up
+
+# Shared worker configuration, including the standard GPU deploy template (identical for every
+# worker). Each worker service below merges this with `<<: *worker` and overrides only its
+# identity (REACTANT_WORKER_NAME) and the physical GPU it uses (CUDA_VISIBLE_DEVICES). `x-`-prefixed
+# top-level keys are ignored by Compose, so this is config, not a service.
+#
+# GPU model: every container reserves all GPUs, then CUDA_VISIBLE_DEVICES restricts each worker
+# to a single physical GPU, which CUDA renumbers to index 0. Workers therefore always use
+# device ordinal 0 (the default), so no per-worker device_ordinal is needed.
+x-worker: &worker
+  build:
+    context: .
+    dockerfile: docker/Dockerfile.worker
+  image: reactantserver-worker:latest
+  volumes:
+    - ./docker/node.yaml:/etc/reactantserver/node.yaml:ro
+    - ${REACTANTSERVER_MODELS:-./bundles}:/var/lib/reactantserver/models:ro
+  # Share the host IPC namespace so POSIX shared-memory regions (KServe system shared memory)
+  # created by a client are visible to the worker via shm_open. This replaces a private
+  # /dev/shm (shm_size), which would isolate the worker from the host's SHM.
+  ipc: host
+  # Health = the worker's KServe ServerReady: the gRPC plane is up and every assigned model is
+  # compiled and resident on the GPU. healthcheck.worker.jl resolves this worker's own port from
+  # the mounted node file plus REACTANT_WORKER_NAME and probes it over loopback (importing only
+  # gRPCClient and YAML, not ReactantServer, so the probe is light). start_period is generous
+  # because model compilation (Reactant -> device executable) runs before the gRPC plane accepts
+  # traffic; raise it for large model sets.
+  healthcheck:
+    test: ["CMD", "julia", "--project=/opt/reactantserver", "/usr/local/bin/healthcheck.worker.jl"]
+    interval: 30s
+    timeout: 20s
+    retries: 3
+    start_period: 300s
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            capabilities: [gpu]
+            count: all
+
+services:
+  worker0:
+    <<: *worker
+    environment:
+      REACTANT_WORKER_NAME: worker0
+      CUDA_VISIBLE_DEVICES: "0"   # host GPU 0; appears as device 0 inside the worker
+
+  worker1:
+    <<: *worker
+    environment:
+      REACTANT_WORKER_NAME: worker1
+      CUDA_VISIBLE_DEVICES: "1"   # host GPU 1; appears as device 0 inside the worker
+
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.gateway
+    image: reactantserver-gateway:latest
+    # Wait for both workers to pass their healthchecks before starting, so the gateway's own
+    # readiness (which requires at least one ready worker) goes green promptly.
+    depends_on:
+      worker0:
+        condition: service_healthy
+      worker1:
+        condition: service_healthy
+    volumes:
+      - ./docker/gateway.yml:/etc/reactantserver/gateway.yml:ro
+    ports:
+      - "8001:8001"   # KServe V2 gRPC endpoint for clients (Triton-compatible)
+      - "8002:8002"   # Prometheus metrics / health / admin HTTP (Triton-compatible)
+    # Health = the gateway's /readyz: the process is up and at least one worker reports ready.
+    # curl is installed in the gateway image and probes the admin HTTP port over loopback.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8002/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

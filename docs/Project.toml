@@ -1,0 +1,27 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+ReactantServer = "faa8a0e4-1926-4c6b-a0e2-e70699715ecf"
+ReactantServerClient = "df172679-9d9b-4a02-a92c-27cb5f9e1c5c"
+ReactantServerCore = "387a5f05-f7b4-4d57-bca9-cd3358e52bdc"
+ReactantServerGateway = "b92f1031-7cb7-4fde-89de-b6dd50303018"
+gRPCClient = "aaca4a50-36af-4a1d-b878-4c443f2061ad"
+gRPCServer = "b7f0dee4-5e6a-42e7-93b0-9c098bad2317"
+
+# A standalone environment does not inherit a path-dependency's own [sources], so the docs env
+# must declare the full vendored path-source closure itself: the four member packages plus the
+# unregistered/forked deps under lib/ (gRPCServer/gRPCClient are unregistered; Reactant/HTTP are
+# forks that share the registered UUID).
+[sources]
+HTTP = {path = "../lib/HTTP.jl"}
+Reactant = {path = "../lib/Reactant.jl"}
+ReactantServer = {path = "../packages/ReactantServer"}
+ReactantServerClient = {path = "../packages/ReactantServerClient"}
+ReactantServerCore = {path = "../packages/ReactantServerCore"}
+ReactantServerGateway = {path = "../packages/ReactantServerGateway"}
+gRPCClient = {path = "../lib/gRPCClient.jl"}
+gRPCServer = {path = "../lib/gRPCServer.jl"}
+
+[compat]
+Documenter = "1"

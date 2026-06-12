@@ -1,0 +1,11 @@
+.idea
+*.pyc
+__pycache__
+bundles/
+.CondaPkg
+.venv
+*.mlir
+*.safetensors
+build
+validation/gpu_memory_sharing/results/
+private/

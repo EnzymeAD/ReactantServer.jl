@@ -1,0 +1,48 @@
+# Node config for the docker compose deployment: one machine, one shared IPC space, mounted
+# read-only into every worker on this node. Each worker is told its identity via
+# REACTANT_WORKER_NAME and loads (and can serve) every bundle in the mounted model repository.
+# The gateway is configured separately (docker/gateway.yml) and discovers what each worker
+# serves, so it does not read this file.
+#
+# To add a GPU: add a worker entry here and a matching service in docker-compose.yml. The
+# optional `models:` map (below) is only for pinning specific models to device memory.
+
+model_repo: /var/lib/reactantserver/models
+base_port: 8080
+# Per-worker Prometheus metrics port (metrics_base_port + worker index): worker0 -> 9100,
+# worker1 -> 9101, ... Each worker serves /metrics, /healthz, /readyz. Scrape them as separate
+# Prometheus targets, one per GPU (see docker/README.md).
+metrics_base_port: 9100
+
+global:
+  cache_dir: /var/cache/reactantserver
+  # Model lifecycle control mode: dynamic (default) watches the repo and hot-swaps bundles as they
+  # are added/changed/removed; static keeps the startup set fixed; explicit cedes authority to the
+  # control plane. In dynamic mode model_poll_seconds sets the poll interval (default 15s).
+  # model_control_mode: dynamic
+  runtime:
+    backend: cuda
+    mem_fraction: 0.9
+    preallocate: true
+    allow_cpu_fallback: false
+  scheduler:
+    ema_halflife_seconds: 30.0
+    max_queue_depth: 1024
+  endpoints:
+    host: 0.0.0.0
+
+# One worker per GPU. Each worker uses device ordinal 0; the physical GPU is selected in
+# docker-compose.yml via CUDA_VISIBLE_DEVICES, so no `gpu:` field is needed here.
+workers:
+  - { name: worker0 }
+  - { name: worker1 }
+
+# Optional per-model override. Every worker already loads and can serve every bundle in the repo
+# (the gateway replicates and load-balances across all workers that report a model ready). List a
+# model here only to pin it permanently to device memory on the named worker(s) for the lowest
+# latency; unlisted models stay system-pinned and load to the device on demand. Use the bundle
+# directory names. Omit this block entirely to keep every model on-demand.
+#
+# models:
+#   resnet50: [worker0, worker1]      # hot on both GPUs
+#   vsq_coral: [worker0]              # hot on worker0 only
