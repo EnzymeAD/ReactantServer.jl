@@ -12,7 +12,8 @@ x-worker: &worker
   volumes:
     - ${REACTANT_REPO:?set REACTANT_REPO to the repo root (run via make e2e / run_e2e.sh)}/packages/ReactantServer/test/e2e/node.yaml:/etc/reactantserver/node.yaml:ro
     - ${REACTANT_REPO}/packages/ReactantServer/test/e2e/models/scale4:/var/lib/reactantserver/models/scale4:ro
-    - ${REACTANT_REPO}/bundles/bit_resnet50:/var/lib/reactantserver/models/bit_resnet50:ro
+    # Generated at e2e time by gen_bit_resnet50.jl (random-init Luximm model; not checked in).
+    - ${REACTANT_REPO}/packages/ReactantServer/test/e2e/models/bit_resnet50:/var/lib/reactantserver/models/bit_resnet50:ro
     # Share the host's POSIX shared memory so the host-side client and the worker see the same
     # /dev/shm regions (the KServe system-shared-memory data plane). `ipc: host` below is the
     # intent and works under Docker, but podman-compose silently ignores it, so bind-mount

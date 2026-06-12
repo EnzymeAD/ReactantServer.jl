@@ -32,17 +32,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "== [1/5] generating scale4 bundle =="
+echo "== [1/6] instantiating e2e env =="
+julia --project="$E2E_DIR" -e 'using Pkg; Pkg.instantiate()'
+
+echo "== [2/6] generating scale4 bundle =="
 julia --project=packages/ReactantServer "$E2E_DIR/gen_scale4.jl"
 
-echo "== [2/5] ensuring images (build if missing) =="
+echo "== [3/6] generating bit_resnet50 bundle (Luximm, random init) =="
+julia --project="$E2E_DIR" "$E2E_DIR/gen_bit_resnet50.jl"
+
+echo "== [4/6] ensuring images (build if missing) =="
 "$ENGINE" image exists reactantserver-worker:latest  || make worker
 "$ENGINE" image exists reactantserver-gateway:latest || make gateway
 
-echo "== [3/5] instantiating client env =="
-julia --project="$E2E_DIR" -e 'using Pkg; Pkg.instantiate()'
-
-echo "== [4/5] bringing up stack =="
+echo "== [5/6] bringing up stack =="
 "${COMPOSE[@]}" up -d
 
 echo "   waiting for gateway /readyz (timeout ${READY_TIMEOUT}s)..."
@@ -57,7 +60,7 @@ until python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.
 done
 echo "   gateway ready."
 
-echo "== [5/5] running e2e client =="
+echo "== [6/6] running e2e client =="
 set +e
 julia --project="$E2E_DIR" "$E2E_DIR/client.jl"
 client_rc=$?
