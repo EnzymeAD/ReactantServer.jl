@@ -1,8 +1,8 @@
 # Single-GPU end-to-end soak stack: the supervised node on one GPU plus a dummy-data load
 # generator, under `docker compose`. Use this to exercise the full serving path on one GPU and
-# watch for memory leaks, races, and instability. It runs the same all-in-one container as a
-# production single-node deployment (the supervisor with one worker and the embedded gateway),
-# so the soak mirrors what users actually run.
+# watch for memory leaks, races, and instability. It runs the same container as a production
+# single-GPU deployment (the supervisor with one worker and no gateway, the worker serving
+# 8001/8002 directly), so the soak mirrors what users actually run.
 #
 # Prerequisites:
 #   - images built: `make image loadgen`
@@ -23,8 +23,9 @@ services:
       context: .
       dockerfile: docker/Dockerfile.worker
     image: reactantserver:latest
-    # Default entrypoint: the node supervisor (all-in-one role) runs the single worker plus the
-    # embedded gateway, exactly as a production single-GPU deployment does.
+    # Default entrypoint: the node supervisor. With a single GPU it runs one worker and no
+    # gateway (a lone worker serves the full KServe V2 API itself), binding the public ports
+    # 8001/8002 directly, exactly as a production single-GPU deployment does.
     volumes:
       - ./docker/node.gpu2.yaml:/etc/reactantserver/node.yaml:ro
       - ${REACTANTSERVER_MODELS:-/docker/xlaserver/models}:/var/lib/reactantserver/models:ro
@@ -36,9 +37,8 @@ services:
     # (replacing the small default), so no explicit /dev/shm bind is needed.
     ipc: host
     ports:
-      - "8001:8001"   # KServe V2 gRPC endpoint (Triton-compatible)
-      - "8002:8002"   # gateway metrics / health / admin HTTP; /metrics aggregates the worker's
-                      # own series (tagged worker/gpu), so the worker's 9100 needs no mapping
+      - "8001:8001"   # KServe V2 gRPC endpoint, served by the worker directly (Triton-compatible)
+      - "8002:8002"   # the worker's /metrics, /healthz, /readyz (series already tagged worker/gpu)
     environment:
       # Physical GPU 2; the supervisor passes it to the worker child, which CUDA renumbers to
       # ordinal 0 inside the container.
@@ -46,8 +46,8 @@ services:
     # The supervisor forwards SIGTERM to its children and waits for them before exiting.
     stop_grace_period: 30s
     healthcheck:
-      # Role-aware probe; for the all-in-one role it curls the gateway's /readyz (ready once the
-      # worker reports ServerReady).
+      # Role-aware probe; for the all-in-one role it curls /readyz on 8002 (here the worker's own,
+      # ready once every model is compiled and the gRPC plane is up).
       test: ["CMD", "/usr/local/bin/healthcheck.node.sh"]
       interval: 30s
       timeout: 20s

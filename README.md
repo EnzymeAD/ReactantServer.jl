@@ -28,8 +28,9 @@ A Julia 1.11 workspace of five packages under `packages/`, plus the non-member
 - **`ReactantServerClient`** — a Reactant-free inference client (`KServeModel`,
   `infer_sync`, `infer_async`, `InferInput`, `InferOutput`).
 - **`ReactantServerNode`** — the single-container node supervisor (`supervise`): detects the
-  visible GPUs, runs one worker subprocess per device plus the embedded gateway, multiplexes
-  their logs with `[name]` line prefixes, and restarts children that die. No Reactant.
+  visible GPUs, runs one worker subprocess per device (plus an embedded gateway when there is
+  more than one worker; a single worker serves the public ports directly), multiplexes their
+  logs with `[name]` line prefixes, and restarts children that die. No Reactant.
 
 Offline model-export tooling is `packages/ReactantServerExport` (the bundle writer plus the
 Reactant tracing frontend; PyTorch support is a package extension that loads when `PythonCall`
@@ -114,9 +115,11 @@ orchestrators; and full StableHLO-signature validation of manifests.
 
 The recommended deployment is the unified `reactantserver` image, whose entrypoint is the node
 supervisor (`ReactantServerNode`). It detects every GPU granted to the container, spawns one
-single-GPU worker subprocess per device, runs the embedded gateway, multiplexes all logs onto
-the container's stdout with `[worker0]` / `[gateway]` line prefixes, and restarts children that
-die. A multi-GPU deployment is therefore a single container with no per-GPU configuration:
+single-GPU worker subprocess per device, multiplexes all logs onto the container's stdout with
+`[worker0]` / `[gateway]` line prefixes, and restarts children that die. With two or more
+workers it also runs an embedded gateway on the public ports; with a single worker it skips the
+gateway and binds that worker to the public ports directly. A multi-GPU deployment is therefore
+a single container with no per-GPU configuration:
 
 ```
 docker run --gpus all --ipc=host -p 8001:8001 -p 8002:8002 \
@@ -226,12 +229,13 @@ For a multi-GPU deployment, the supervisor does the fan-out for you:
 
 ```julia
 using ReactantServerNode
-ReactantServerNode.supervise("docker/node.yaml")   # one worker per visible GPU + gateway
+ReactantServerNode.supervise("docker/node.yaml")   # one worker per visible GPU (+ gateway if >1)
 ```
 
-It synthesizes the worker list when the node file has none (`gpus: auto`), spawns each worker as
-a subprocess pinned to its device via `CUDA_VISIBLE_DEVICES`, and runs the embedded gateway,
-which routes by model name and load-balances replicated models. Equivalently, run one worker per
+It synthesizes the worker list when the node file has none (`gpus: auto`) and spawns each worker
+as a subprocess pinned to its device via `CUDA_VISIBLE_DEVICES`. With more than one worker it
+also runs the embedded gateway, which routes by model name and load-balances replicated models;
+a single worker serves clients directly. Equivalently, run one worker per
 GPU yourself (each pointed at the same node file with a distinct `worker`) behind a standalone
 gateway: `using ReactantServerGateway; ReactantServerGateway.serve_gateway(gateway_path)` reads
 its own `gateway.yml` and serves the KServe V2 gRPC proxy. To call a server from Julia, use the

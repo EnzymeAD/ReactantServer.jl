@@ -15,11 +15,14 @@ const HEALTH_INTERVAL_SECONDS = 10.0
 # bounded to worker-churn windows).
 const PROBE_TIMEOUT_SECONDS = 8.0
 
-# A watchdog timeout is also the wedge signature: the client's own 5s deadline can only be
-# missed when the multi is no longer being driven at all. A fresh process always recovers, so
-# after this many consecutive all-timeout probe rounds the gateway exits and its supervisor
-# (the node supervisor, or the container restart policy) restarts it. Override with
-# REACTANT_GATEWAY_WEDGE_EXIT_ROUNDS; 0 disables.
+# A watchdog timeout is the wedge signature only as a *regression*: the client's own 5s deadline
+# can be missed when the multi handle stops being driven, which a fresh process recovers. But an
+# all-timeout round is NOT a wedge during warmup, when workers are simply slow or busy (e.g.
+# compiling a large model set) and have never answered yet, nor when a heavily loaded host
+# starves the prober's tasks. Restarting then is useless churn. So the gateway exits to be
+# restarted only after it has talked to a worker at least once (a true regression) and then sees
+# this many consecutive all-timeout rounds. Override with REACTANT_GATEWAY_WEDGE_EXIT_ROUNDS;
+# 0 disables.
 const WEDGE_EXIT_ROUNDS = 3
 
 # Returns (value, timed_out). On timeout the abandoned task keeps running detached; `default`
@@ -47,8 +50,9 @@ mutable struct HealthProber
     interval::Float64
     running::Threads.Atomic{Bool}
     task::Union{Task,Nothing}
-    wedged_rounds::Int                        # consecutive rounds where every probe hit the watchdog
+    wedged_rounds::Int                        # consecutive all-timeout rounds since last response
     wedge_exit_rounds::Int                    # exit(1) after this many; 0 disables
+    ever_responsive::Bool                     # a worker has answered (non-timeout) at least once
 end
 
 function HealthProber(pool::ClientPool, metrics::GatewayMetrics, admin::AdminServer,
@@ -59,7 +63,7 @@ function HealthProber(pool::ClientPool, metrics::GatewayMetrics, admin::AdminSer
                           parse(Int, get(ENV, "REACTANT_GATEWAY_WEDGE_EXIT_ROUNDS",
                                          string(WEDGE_EXIT_ROUNDS))))
     return HealthProber(pool, metrics, admin, routes, packing, Float64(interval),
-                        Threads.Atomic{Bool}(true), nothing, 0, Int(wedge_exit_rounds))
+                        Threads.Atomic{Bool}(true), nothing, 0, Int(wedge_exit_rounds), false)
 end
 
 # Query every endpoint's ready models concurrently and build the model -> endpoints routing table.
@@ -93,11 +97,14 @@ function _check_once(p::HealthProber)
                      "ServerReady probe", wc.url)
     end
     any_ready = false
+    any_responsive = false
     for (i, wc) in enumerate(workers)
         set_worker_ready!(p.metrics, wc.url, results[i])
         any_ready |= results[i]
+        any_responsive |= !timeouts[i]   # answered within the watchdog (ready or not)
     end
     set_ready!(p.admin, any_ready)
+    p.ever_responsive |= any_responsive
     _track_wedge!(p, !isempty(workers) && all(timeouts))
     if p.routes !== nothing
         table = discover_routes(p.pool)
@@ -122,15 +129,16 @@ function _check_once(p::HealthProber)
     return any_ready
 end
 
-# Wedge accounting: a round where EVERY probe missed even the watchdog (the clients' own 5s
-# deadlines can only be missed when the libcurl multi has stopped being driven) means the
-# client stack is dead and will not heal in-process. Exit so the supervisor / container restart
-# policy brings up a fresh gateway, which reconnects immediately. Distinct from dead workers:
-# those produce fast connection errors, not watchdog timeouts.
+# Wedge accounting: a round where EVERY probe missed even the watchdog. This is treated as a
+# wedged client stack (and the gateway exits for a fresh restart) ONLY after a worker has
+# answered at least once (`ever_responsive`) — i.e. a genuine regression from working to wedged.
+# Before that, an all-timeout round is just warmup (workers slow/busy/compiling) or a loaded
+# host starving the prober; restarting then is useless churn, so it is ignored.
 function _track_wedge!(p::HealthProber, all_timed_out::Bool)
     p.wedged_rounds = all_timed_out ? p.wedged_rounds + 1 : 0
+    p.ever_responsive || return nothing
     if p.wedge_exit_rounds > 0 && p.wedged_rounds >= p.wedge_exit_rounds
-        @error "health: every ServerReady probe timed out for $(p.wedged_rounds) consecutive rounds; the gRPC client stack is wedged. Exiting so the supervisor restarts the gateway." rounds = p.wedged_rounds
+        @error "health: every ServerReady probe timed out for $(p.wedged_rounds) consecutive rounds after previously reaching a worker; the gRPC client stack is wedged. Exiting so the supervisor restarts the gateway." rounds = p.wedged_rounds
         exit(1)
     end
     return nothing

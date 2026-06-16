@@ -2,8 +2,11 @@
 
 One container runs the whole node. The image's default entrypoint is the supervisor
 (`ReactantServerNode`): it detects every GPU granted to the container, spawns one single-GPU
-worker subprocess per device, runs the embedded gateway, multiplexes all logs onto the
-container's stdout with `[worker0]` / `[gateway]` line prefixes, and restarts children that die.
+worker subprocess per device, multiplexes all logs onto the container's stdout with `[worker0]` /
+`[gateway]` line prefixes, and restarts children that die. With two or more workers it also runs
+an embedded gateway on the public ports; with a single worker it skips the gateway and binds that
+worker to the public ports directly (a lone worker serves the full KServe V2 API itself). The
+external interface (8001/8002) is the same either way.
 
 ```
 docker run --gpus all --ipc=host -p 8001:8001 -p 8002:8002 \
@@ -108,12 +111,13 @@ inline tensor path.
 
 ## Metrics
 
-One scrape covers everything: the gateway's `/metrics` on the admin port (`8002`) serves its own
-`gateway_*` series and, in the supervised all-in-one container, also fans out to every worker's
-metrics endpoint and merges the results into a single exposition. Each worker tags all of its
-series (`worker_*` plus `process_*`/`julia_gc_*`) with `worker` and `gpu` labels itself, where
-`gpu` is the physical device behind the worker's `CUDA_VISIBLE_DEVICES`, so nothing needs to be
-configured in Prometheus:
+One scrape on `8002` covers everything. With multiple workers, the embedded gateway's `/metrics`
+serves its own `gateway_*` series and fans out to every worker's metrics endpoint, merging the
+results into a single exposition; with a single worker (no gateway), `8002` is that worker's own
+`/metrics` directly. Either way, each worker tags all of its series (`worker_*` plus
+`process_*`/`julia_gc_*`) with `worker` and `gpu` labels itself, where `gpu` is the physical
+device behind the worker's `CUDA_VISIBLE_DEVICES`, so nothing needs to be configured in
+Prometheus:
 
 ```yaml
 scrape_configs:
@@ -156,12 +160,12 @@ authority: a single-GPU worker, or a multi-GPU fleet served round-robin.
 
 ## Single-GPU soak test
 
-`docker-compose.gpu2.yml` brings up the supervised all-in-one container on one GPU to exercise
-inference with dummy data and watch for memory leaks, races, and instability: the supervisor
-runs one worker on GPU 2 (`CUDA_VISIBLE_DEVICES=2`) plus the embedded gateway, exactly as a
-production single-GPU deployment does, alongside a `loadgen` service that drives sustained
-concurrent requests. It uses on-demand weight caching so every bundle need not be GPU-resident
-at once.
+`docker-compose.gpu2.yml` brings up the supervised container on one GPU to exercise inference
+with dummy data and watch for memory leaks, races, and instability: the supervisor runs one
+worker on GPU 2 (`CUDA_VISIBLE_DEVICES=2`) and no gateway, the worker serving 8001/8002 directly,
+exactly as a production single-GPU deployment does, alongside a `loadgen` service that drives
+sustained concurrent requests. It uses on-demand weight caching so every bundle need not be
+GPU-resident at once.
 
 Files:
 

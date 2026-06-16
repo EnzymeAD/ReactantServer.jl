@@ -84,12 +84,39 @@ end
         end
         @test _envval(sup.children[1].spec.cmd, "CUDA_VISIBLE_DEVICES") == "0"
         @test _envval(sup.children[2].spec.cmd, "CUDA_VISIBLE_DEVICES") == "1"
+        # Multi-worker: the gateway owns the public ports, so workers keep their node-file ports
+        # (no public-port override) and the gateway fronts them.
+        @test _envval(sup.children[1].spec.cmd, "INFERENCE_SERVER_ENDPOINTS_PORT") === nothing
         @test _envval(sup.children[3].spec.cmd, "REACTANT_GATEWAY_WORKERS") ==
               "127.0.0.1:8080,127.0.0.1:8081"
         # Worker metrics endpoints feed the gateway's aggregated /metrics.
         @test _envval(sup.children[3].spec.cmd, "REACTANT_GATEWAY_WORKER_METRICS") ==
               "127.0.0.1:9100,127.0.0.1:9101"
         @test occursin("role=all", String(take!(sink)))
+    end
+end
+
+@testset "build_supervisor: single worker has no gateway" begin
+    mktempdir() do dir
+        path = _node_yaml(dir)
+        sink = IOBuffer()
+        sup = RSN.build_supervisor(path; env=Dict("REACTANT_GPUS" => "1"), sink=sink,
+                                   workspace_root="/opt/rs", runtime_dir=joinpath(dir, "run"))
+        # No gateway child: the sole worker is the node's public endpoint.
+        @test [c.spec.name for c in sup.children] == ["worker0"]
+        w = sup.children[1].spec.cmd
+        @test _envval(w, "INFERENCE_SERVER_ENDPOINTS_PORT") == "8001"
+        @test _envval(w, "INFERENCE_SERVER_ENDPOINTS_METRICS_PORT") == "8002"
+        @test _envval(w, "CUDA_VISIBLE_DEVICES") == "0"
+        @test occursin("no gateway", String(take!(sink)))
+
+        # The public ports honor the gateway listen overrides.
+        sup = RSN.build_supervisor(path;
+            env=Dict("REACTANT_GPUS" => "1", "REACTANT_GATEWAY_LISTEN_GRPC" => "0.0.0.0:7001",
+                     "REACTANT_GATEWAY_LISTEN_METRICS" => "0.0.0.0:7002"),
+            sink=IOBuffer(), workspace_root="/opt/rs", runtime_dir=joinpath(dir, "run2"))
+        @test _envval(sup.children[1].spec.cmd, "INFERENCE_SERVER_ENDPOINTS_PORT") == "7001"
+        @test _envval(sup.children[1].spec.cmd, "INFERENCE_SERVER_ENDPOINTS_METRICS_PORT") == "7002"
     end
 end
 

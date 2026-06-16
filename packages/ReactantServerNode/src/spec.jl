@@ -40,6 +40,8 @@ ReactantServer.serve(ARGS[1]; worker = isempty(w) ? nothing : w)
 
 function worker_spec(name::AbstractString, node_file::AbstractString,
                      device::Union{AbstractString,Nothing}, workspace_root::AbstractString;
+                     grpc_port::Union{Integer,Nothing}=nothing,
+                     metrics_port::Union{Integer,Nothing}=nothing,
                      grace_seconds::Real=15.0)
     proj = joinpath(workspace_root, "packages", "ReactantServer")
     cmd = `$(Base.julia_cmd()) --project=$proj -e $_WORKER_BOOT $node_file`
@@ -47,7 +49,23 @@ function worker_spec(name::AbstractString, node_file::AbstractString,
     # Always set device visibility explicitly: the assigned selector, or empty for a CPU worker,
     # so a container-level CUDA_VISIBLE_DEVICES is never inherited by accident.
     push!(pairs, "CUDA_VISIBLE_DEVICES" => (device === nothing ? "" : String(device)))
+    # A sole worker that is the node's public endpoint (no gateway) overrides its node-file ports
+    # to the public ones, so the external interface matches the multi-worker gateway's.
+    grpc_port === nothing || push!(pairs, "INFERENCE_SERVER_ENDPOINTS_PORT" => string(Int(grpc_port)))
+    metrics_port === nothing || push!(pairs, "INFERENCE_SERVER_ENDPOINTS_METRICS_PORT" => string(Int(metrics_port)))
     return ChildSpec(String(name), addenv(cmd, pairs...), Float64(grace_seconds))
+end
+
+# The node's public gRPC and metrics ports (where clients and Prometheus connect): the gateway's
+# listen ports, default 8001/8002, overridable via REACTANT_GATEWAY_LISTEN_* so a single worker
+# bound directly to them stays consistent with the gateway it replaces.
+function public_ports(env::AbstractDict=ENV)
+    _port(addr, default) = begin
+        i = findlast(==(':'), String(addr))
+        i === nothing ? default : something(tryparse(Int, String(addr)[(i + 1):end]), default)
+    end
+    return (_port(get(env, "REACTANT_GATEWAY_LISTEN_GRPC", "0.0.0.0:8001"), 8001),
+            _port(get(env, "REACTANT_GATEWAY_LISTEN_METRICS", "0.0.0.0:8002"), 8002))
 end
 
 const _GATEWAY_BOOT = _PDEATHSIG_BOOT * """

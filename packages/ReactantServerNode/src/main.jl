@@ -116,10 +116,22 @@ function build_supervisor(node_path::AbstractString;
         node_file = _write_materialized(node, runtime_dir)
         push!(notes, "materialized node file: $node_file")
         ws = _node_workers(node)
+
+        # A single worker needs no gateway: it serves the full KServe V2 API on its own. In the
+        # all-in-one role it becomes the node's public endpoint directly, binding the gateway's
+        # ports (8001/8002) so the external interface is identical to the multi-worker case but
+        # without the extra process or hop. The gateway is spawned only for two or more workers.
+        gpub, mpub = public_ports(env)
+        sole_public = r === :all && length(ws) == 1
         for (i, w) in enumerate(ws)
-            push!(specs, worker_spec(_worker_name(w), node_file, selectors[i], root))
+            push!(specs, sole_public ?
+                worker_spec(_worker_name(w), node_file, selectors[i], root;
+                            grpc_port=gpub, metrics_port=mpub) :
+                worker_spec(_worker_name(w), node_file, selectors[i], root))
         end
-        if r === :all
+        if sole_public
+            push!(notes, "single worker: serving directly on $gpub (gRPC) / $mpub (metrics); no gateway")
+        elseif r === :all
             overlap = intersect(Set(_worker_ports(node)), _gateway_listen_ports(gw_path, env))
             isempty(overlap) ||
                 push!(notes, "WARNING: worker port(s) $(sort!(collect(overlap))) collide with the gateway listen ports; adjust base_port / metrics_base_port")

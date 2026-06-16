@@ -12,6 +12,12 @@ bundle in the shared model repository.
 A single GPU is just a one-worker cluster: keep one entry under `workers:` and omit the
 `gateway:` block. Growing to more GPUs means adding workers, not changing the config format.
 
+Under the node supervisor (the container default, see [Docker Deployment](@ref)) the `workers:`
+list is optional: omit it and add `gpus: auto` (or an integer count, or an explicit device
+list) and the supervisor synthesizes one worker per detected GPU, assigning each its device.
+An explicit `workers:` list still wins when present. The keys below describe that explicit form,
+which the supervisor also honors.
+
 ## Top-level keys
 
 ```yaml

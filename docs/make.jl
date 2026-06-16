@@ -15,13 +15,14 @@ using ReactantServerCore
 using ReactantServer
 using ReactantServerGateway
 using ReactantServerClient
+using ReactantServerNode
 
-for m in (ReactantServerCore, ReactantServer, ReactantServerGateway, ReactantServerClient)
+for m in (ReactantServerCore, ReactantServer, ReactantServerGateway, ReactantServerClient, ReactantServerNode)
     DocMeta.setdocmeta!(m, :DocTestSetup, :(using $(Symbol(m))); recursive=true)
 end
 
 makedocs(;
-    modules  = [ReactantServerCore, ReactantServer, ReactantServerGateway, ReactantServerClient],
+    modules  = [ReactantServerCore, ReactantServer, ReactantServerGateway, ReactantServerClient, ReactantServerNode],
     authors  = "Carroll Vance <cvance@medicalmetrics.com>",
     sitename = "ReactantServer.jl",
     # The repository is hosted on Azure DevOps, which Documenter's automatic remote

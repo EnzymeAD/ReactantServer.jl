@@ -6,11 +6,13 @@ KServe V2 gRPC endpoint. It is pure Julia, lives in its own package `ReactantSer
 parsing and the generated KServe protobuf. Because it builds only on `ReactantServerCore` and
 the gRPC layer, the gateway carries no Reactant dependency.
 
-**The gateway is only needed in multi-GPU configurations.** A single worker already serves the
-full KServe V2 gRPC API for its GPU, so single-GPU clients should connect to the worker
-directly. Run the gateway when you have one worker per GPU and want clients to reach all of them
-through a single endpoint, with each `ModelInferRequest` routed to the worker that hosts the
-requested model.
+In the standard single-node deployment you do not start the gateway yourself: the node
+supervisor ([`ReactantServerNode.supervise`](@ref ReactantServerNode.supervise), the container's
+default entry point) runs it as an embedded child and synthesizes its worker endpoint list from
+the node file. This page describes what that gateway does and how to run it standalone, which is
+needed only when workers and the gateway live on different hosts (see the `gateway` role in
+[Docker Deployment](@ref)). A single worker already serves the full KServe V2 gRPC API for its
+GPU, so a bare single-GPU deployment without the supervisor can also be addressed directly.
 
 Clients connect to a single gRPC endpoint. The gateway extracts the model name from each
 `ModelInferRequest` and forwards the raw protobuf bytes over gRPC to the worker that hosts that
@@ -103,19 +105,23 @@ per second.
 
 ## Build
 
-The container image is built from the repository root (podman by default; Docker works too):
+The standalone gateway image is built from the repository root (podman by default; Docker works
+too):
 
 ```
-make            # build the reactant-gateway image
+make gateway    # build the slim reactant-gateway image
 ```
 
 The image is produced by `docker/Dockerfile.gateway` (see [Docker Deployment](docker.md)). It is
-built from the `ReactantServerGateway` member alone, so it pulls no Reactant/XLA stack.
+built from the `ReactantServerGateway` member alone, so it pulls no Reactant/XLA stack. The
+unified node image (`make image`) also contains the gateway and runs it in the `gateway` role.
 
 ## Run
 
-Start the Julia workers first (one per GPU, each pointed at the same node file with a
-distinct `worker`). Then run the gateway against its own `gateway.yml`:
+The supervisor starts the embedded gateway for you. To run a gateway standalone (the multi-node
+case), start the Julia workers first (one per GPU, each pointed at the same node file with a
+distinct `worker`, or a worker-role node container per host). Then run the gateway against its
+own `gateway.yml`:
 
 ```julia
 using ReactantServerGateway
