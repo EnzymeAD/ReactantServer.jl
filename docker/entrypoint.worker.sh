@@ -6,7 +6,11 @@ set -euo pipefail
 
 NODE_FILE="${REACTANT_NODE_FILE:-/etc/reactantserver/node.yaml}"
 
-exec julia --project=/opt/reactantserver/packages/ReactantServer -e '
+# --threads=auto,1: a host-sized default pool runs per-request preprocess/postprocess in parallel
+# while one interactive thread runs the GPU dispatch loop, so CPU hook work overlaps the
+# serialized GPU execution. The supervisor (entrypoint.node.sh) sets the same on its worker
+# children; this covers the direct single-worker escape hatch.
+exec julia --threads=auto,1 --project=/opt/reactantserver/packages/ReactantServer -e '
     using ReactantServer
     worker = get(ENV, "REACTANT_WORKER_NAME", "")
     ReactantServer.serve(ARGS[1]; worker = isempty(worker) ? nothing : worker)

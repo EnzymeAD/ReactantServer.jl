@@ -337,9 +337,10 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
     entry, B, taken = d.entry, d.size, d.taken
     st = entry.sched
     try
-        # preprocess/postprocess come from a bundle's model.jl, defined in a newer world age
-        # than this loop; invokelatest crosses that boundary (harmless for identity).
-        pres = Vector{NamedTensor}[Base.invokelatest(entry.preprocess, qr.req.inputs) for qr in taken]
+        # Inputs were already run through the model's preprocess hook on each caller's task before
+        # the request was queued (see `infer`); the loop runs no model.jl code, only coalesce +
+        # execute + slice, so user hooks never serialize against the GPU.
+        pres = Vector{NamedTensor}[qr.prepared for qr in taken]
         rows = Int[_executable_rows(entry, p) for p in pres]
         total = sum(rows)
         # A lone request that already fills the dispatch needs neither concatenation nor
@@ -356,15 +357,16 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
         out = run_model(s.backend, s.pool, entry.executable, merged)
         compute_time = time() - t0
 
-        # Compute every per-request result before delivering any. Splitting or postprocess can
-        # throw; doing it up front means the catch below has not yet filled any reply channel,
-        # so it can deliver the error exactly once per request without blocking on a full slot.
+        # Slice every per-request result before delivering any. Slicing can throw; doing it up
+        # front means the catch below has not yet filled any reply channel, so it can deliver the
+        # error exactly once per request without blocking on a full slot. Each result is the raw
+        # device output for that request; the caller's task runs the postprocess hook on it (see
+        # `infer`), off this loop.
         results = Vector{Any}(undef, length(taken))
         offset = 0
         for i in eachindex(taken)
-            slice = _slice_outputs(entry, out, offset, rows[i])
+            results[i] = _slice_outputs(entry, out, offset, rows[i])
             offset += rows[i]
-            results[i] = Base.invokelatest(entry.postprocess, slice)
         end
 
         lock(s.cond) do
@@ -418,7 +420,15 @@ function start!(s::Scheduler)
         end
     end
     s.running = true
-    s.task = Threads.@spawn dispatch_loop(s)
+    # Run the dispatch loop on the interactive threadpool when one exists (the worker is started
+    # with `--threads=auto,1`), so the GPU dispatch is scheduled promptly and is never starved by
+    # the per-request preprocess/postprocess tasks that saturate the default pool. With no
+    # interactive thread the default pool is used; correctness is unaffected, only the overlap.
+    if Threads.nthreads(:interactive) > 0
+        s.task = Threads.@spawn :interactive dispatch_loop(s)
+    else
+        s.task = Threads.@spawn dispatch_loop(s)
+    end
     return s
 end
 
@@ -713,13 +723,26 @@ unload_model!(s::Scheduler, name::AbstractString) = evict!(s, name)
 
 Submit a request and block until the scheduler returns the result. Re-raises any error
 captured during dispatch.
+
+Runs the model's `preprocess`/`postprocess` hooks here, on the caller's task, rather than on the
+dispatch loop: preprocess before the request is queued, postprocess on the raw device outputs the
+loop hands back. Because each gRPC request runs on its own task, many requests' hook work
+proceeds in parallel and overlaps the single, serialized GPU execution. The dispatch loop coalesces
+and runs `qr.prepared` and never executes a request whose preprocess has not finished, since a
+request is only enqueued (made visible to the loop) after preprocess returns.
 """
 function infer(s::Scheduler, req::InferRequest)
-    qr = QueuedRequest(req)
+    entry = get(s.registry.by_name, req.model_name, nothing)
+    (entry === nothing || entry.sched === nothing) &&
+        throw(ErrorException("unknown model: $(req.model_name)"))
+    # preprocess/postprocess come from a bundle's model.jl, defined in a newer world age;
+    # invokelatest crosses that boundary (harmless for identity).
+    prepared = Base.invokelatest(entry.preprocess, req.inputs)
+    qr = QueuedRequest(req, prepared)
     submit!(s, qr)
-    result = take!(qr.reply)
-    result isa Exception && throw(result)
-    return result
+    raw = take!(qr.reply)
+    raw isa Exception && throw(raw)
+    return Base.invokelatest(entry.postprocess, raw)
 end
 
 # ---------------------------------------------------------------------------------------------

@@ -131,12 +131,22 @@ fight). Coalescing applies under both.
 
 ### Structure
 
-Requests arrive concurrently over gRPC and are placed on per-model FIFO queues. A single
-dispatch loop selects the next model, coalesces that model's queued requests into one execution
-at a compiled batch size, runs it, and splits the results back to each caller. One lock guards
-the queues and the per-model statistics and wakes the loop when work arrives. The loop holds the
-lock only to select and dequeue; the GPU execution runs outside the lock, so new requests keep
-arriving during a running inference.
+Requests arrive concurrently over gRPC, each on its own task. A request's `preprocess` hook runs
+on that task before the request is queued, so it is queued already executable-ready; the request
+becomes visible to the dispatch loop only after preprocess has returned. A single dispatch loop
+then selects the next model, coalesces that model's queued requests into one execution at a
+compiled batch size, runs it, and hands each caller back its raw output slice; the caller's task
+runs the `postprocess` hook on that slice. One lock guards the queues and the per-model statistics
+and wakes the loop when work arrives. The loop holds the lock only to select and dequeue; the GPU
+execution runs outside the lock, so new requests keep arriving during a running inference.
+
+Because the hooks run on the per-request tasks rather than on the dispatch loop, the CPU-side
+pre/post work of many requests proceeds in parallel and overlaps the single, serialized GPU
+execution: while the loop runs one model on the GPU, other requests are being pre/post-processed
+on other threads, and the loop runs no `model.jl` code itself. The GPU still executes exactly one
+model at a time (that is solely a property of the single loop). Realizing the overlap needs more
+than one OS thread; the worker is started with `--threads=auto,1` and the loop runs on the lone
+interactive thread so a blocking GPU call never starves it of CPU.
 
 ### Decision order
 

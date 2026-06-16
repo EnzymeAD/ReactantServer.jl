@@ -47,9 +47,10 @@ function _empty_sched(; discipline=ReactantServer.FAIR)
         SchedulerConfig(30.0, 1024, 30.0; discipline=discipline))
 end
 
-_qr(model; rows=1, arrival=0.0) =
-    QueuedRequest(InferRequest(model, ["y"], [NamedTensor("x", zeros(Float32, 2, rows))]),
-                  arrival, Channel{Any}(1))
+function _qr(model; rows=1, arrival=0.0)
+    req = InferRequest(model, ["y"], [NamedTensor("x", zeros(Float32, 2, rows))])
+    return QueuedRequest(req, req.inputs, arrival, Channel{Any}(1))
+end
 
 @testset "priority: spec worked example" begin
     # Three equal-weight models, EMAs 0.7/0.2/0.1, cap 0.25, discount 0.10, batch-1 costs in ms.

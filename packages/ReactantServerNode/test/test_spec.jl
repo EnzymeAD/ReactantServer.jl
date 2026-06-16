@@ -31,6 +31,8 @@ end
     @test _envval(spec.cmd, "REACTANT_WORKER_NAME") == "worker1"
     @test _envval(spec.cmd, "CUDA_VISIBLE_DEVICES") == "1"
     @test any(a -> a == "/run/node.yaml", spec.cmd.exec)
+    # Multithreaded so per-request pre/post overlap the GPU dispatch loop (interactive thread).
+    @test any(a -> a == "--threads=auto,1", spec.cmd.exec)
     @test any(a -> occursin("packages/ReactantServer", a), spec.cmd.exec)
 
     # A CPU worker gets explicit empty GPU visibility (never the container's

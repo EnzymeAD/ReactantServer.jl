@@ -136,6 +136,12 @@ ReactantServer.stop!(server)
 `supervise` is the right choice for deployment (it is what the container runs and it scales to
 many GPUs unchanged); a bare `serve` is convenient for a quick single-worker REPL session.
 
+Start Julia multithreaded so per-request `preprocess`/`postprocess` overlap the GPU execution
+(`julia --threads=auto,1`: a default pool for the hooks plus one interactive thread for the GPU
+dispatch loop). The container image and the supervisor's worker processes already do this; set it
+yourself only for a bare `serve`. With a single thread the server still works, just without the
+overlap.
+
 ## Step 5: Query it
 
 The server speaks KServe V2 over gRPC, so any Triton/KServe client works; this repository ships

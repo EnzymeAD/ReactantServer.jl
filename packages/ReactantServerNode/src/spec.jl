@@ -44,7 +44,11 @@ function worker_spec(name::AbstractString, node_file::AbstractString,
                      metrics_port::Union{Integer,Nothing}=nothing,
                      grace_seconds::Real=15.0)
     proj = joinpath(workspace_root, "packages", "ReactantServer")
-    cmd = `$(Base.julia_cmd()) --project=$proj -e $_WORKER_BOOT $node_file`
+    # `--threads=auto,1`: a default pool sized to the host for the per-request preprocess/
+    # postprocess tasks, plus one interactive thread the scheduler pins its GPU dispatch loop to,
+    # so CPU hook work overlaps the serialized GPU execution. (Base.julia_cmd() carries no
+    # thread setting, so this is the sole source.)
+    cmd = `$(Base.julia_cmd()) --threads=auto,1 --project=$proj -e $_WORKER_BOOT $node_file`
     pairs = Pair{String,String}["REACTANT_WORKER_NAME" => String(name)]
     # Always set device visibility explicitly: the assigned selector, or empty for a CPU worker,
     # so a container-level CUDA_VISIBLE_DEVICES is never inherited by accident.

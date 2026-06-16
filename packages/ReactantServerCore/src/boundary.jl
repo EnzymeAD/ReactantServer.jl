@@ -40,7 +40,14 @@ end
 
 struct QueuedRequest
     req::InferRequest
+    prepared::Vector{NamedTensor}   # preprocess(req.inputs), the executable-ready inputs;
+                                    # computed on the caller's task before the request is queued
     enqueued_at::Float64
-    reply::Channel{Any}      # buffered size 1; holds the result or a captured exception
+    reply::Channel{Any}      # buffered size 1; holds the raw sliced outputs or a captured exception
 end
-QueuedRequest(req::InferRequest) = QueuedRequest(req, time(), Channel{Any}(1))
+# `prepared` defaults to the request's own inputs (the identity-preprocess case, and the form the
+# scheduler unit tests build). The caller passes the preprocessed inputs explicitly when a
+# bundle's `preprocess` hook is non-trivial; the dispatch loop coalesces and executes `prepared`,
+# never re-running the hook.
+QueuedRequest(req::InferRequest, prepared::Vector{NamedTensor}=req.inputs) =
+    QueuedRequest(req, prepared, time(), Channel{Any}(1))

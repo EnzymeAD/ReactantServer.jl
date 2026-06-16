@@ -27,6 +27,68 @@ end
         [ReactantServer.NamedTensor("wrong", Float32[1, 2, 3, 4])])
 end
 
+@testset "scheduler: pre/post hooks compose, and preprocess gates device execution" begin
+    backend = ReactantServer.MockBackend()
+    pool = ReactantServer.MemoryPool(backend, ReactantServer.MockClient(), ReactantServer.MockDevice(0), "mock", nothing)
+    reg = ReactantServer.ModelRegistry()
+
+    # The device executable bumps a counter so we can see exactly when it runs (y = x .* w, w=2).
+    ran = Threads.Atomic{Int}(0)
+    sig = ReactantServer.ModelSignature(["x"], DataType[Float32], ["w"], 1, ["y"], DataType[Float32], 0)
+    weights = Any[ReactantServer.MockBuffer(Float32[2, 2, 2, 2])]
+    exec = ReactantServer.MockExecutable(args -> (Threads.atomic_add!(ran, 1); [args[1] .* args[2]]), 1)
+    model = ReactantServer.LoadedModel(sig, Dict{Int,Any}(0 => exec), weights)
+
+    # preprocess waits on a gate so the test can prove the request is not executed until preprocess
+    # returns; it adds 1 to each input. postprocess scales the output by 10.
+    gate = Base.Event()
+    pre(inputs) = (wait(gate); [ReactantServer.NamedTensor("x", inputs[1].data .+ 1)])
+    post(outputs) = [ReactantServer.NamedTensor("y", outputs[1].data .* 10)]
+    reg.by_name["h"] = ReactantServer.ModelEntry("h", _trivial_manifest("h"), Dict{Int,Vector{UInt8}}(),
+        "", nothing, model, nothing, pre, post)
+
+    sched = ReactantServer.Scheduler(reg, backend, pool, ReactantServer.SchedulerConfig(30.0, 64, 30.0))
+    ReactantServer.start!(sched)
+
+    req = ReactantServer.InferRequest("h", ["y"], [ReactantServer.NamedTensor("x", Float32[1, 2, 3, 4])])
+    t = Threads.@spawn ReactantServer.infer(sched, req)
+    # preprocess is blocked on the gate, so the request has not been queued and the device has not
+    # run: preprocess provably completes before device execution.
+    sleep(0.2)
+    @test ran[] == 0
+    notify(gate)
+    out = fetch(t)
+    @test ran[] == 1
+    # 10 * (2 * (x + 1)): preprocess (+1), device (*2), postprocess (*10).
+    @test out[1].data == Float32[40, 60, 80, 100]
+
+    ReactantServer.shutdown!(sched)
+end
+
+@testset "scheduler: preprocess of many requests overlaps (not serialized on the loop)" begin
+    backend = ReactantServer.MockBackend()
+    pool = ReactantServer.MemoryPool(backend, ReactantServer.MockClient(), ReactantServer.MockDevice(0), "mock", nothing)
+    reg = ReactantServer.ModelRegistry()
+    S = 0.1
+    slow_pre(inputs) = (sleep(S); inputs)   # stands in for real per-request CPU work
+    reg.by_name["scale"] = ReactantServer.ModelEntry("scale", _trivial_manifest("scale"),
+        Dict{Int,Vector{UInt8}}(), "", nothing, _scale_model(), nothing, slow_pre, identity)
+    sched = ReactantServer.Scheduler(reg, backend, pool, ReactantServer.SchedulerConfig(30.0, 64, 30.0))
+    ReactantServer.start!(sched)
+
+    N = 8
+    reqs = [ReactantServer.InferRequest("scale", ["y"], [ReactantServer.NamedTensor("x", Float32[1, 2, 3, 4])]) for _ in 1:N]
+    t0 = time()
+    tasks = [Threads.@spawn ReactantServer.infer(sched, r) for r in reqs]
+    foreach(fetch, tasks)
+    elapsed = time() - t0
+    # If preprocess ran on the single dispatch loop it would serialize to ~N*S; running it on the
+    # per-request tasks overlaps the sleeps, finishing in ~S. Generous threshold for CI jitter.
+    @test elapsed < N * S * 0.6
+
+    ReactantServer.shutdown!(sched)
+end
+
 @testset "mock scheduler" begin
     backend = ReactantServer.MockBackend()
     pool = ReactantServer.MemoryPool(backend, ReactantServer.MockClient(), ReactantServer.MockDevice(0), "mock", nothing)
@@ -92,9 +154,9 @@ end
 # deterministic rather than dependent on arrival timing.
 @testset "mock scheduler coalesces queued requests into one dispatch" begin
     sched = _batched_scheduler("bscale", [1, 4])
-    qrs = [ReactantServer.QueuedRequest(
-               ReactantServer.InferRequest("bscale", ["y"], [ReactantServer.NamedTensor("x", reshape(Float32[k, k], 2, 1))]),
-               0.0, Channel{Any}(1)) for k in 1:4]
+    qrs = [let req = ReactantServer.InferRequest("bscale", ["y"], [ReactantServer.NamedTensor("x", reshape(Float32[k, k], 2, 1))])
+               ReactantServer.QueuedRequest(req, req.inputs, 0.0, Channel{Any}(1))
+           end for k in 1:4]
     for qr in qrs
         push!(sched.registry.by_name["bscale"].sched.queue, qr)
     end
@@ -115,9 +177,8 @@ end
 
 @testset "mock scheduler pads a partial-fill coalesced dispatch" begin
     sched = _batched_scheduler("pad", [4])                       # only a batch-4 executable
-    qr = ReactantServer.QueuedRequest(
-        ReactantServer.InferRequest("pad", ["y"], [ReactantServer.NamedTensor("x", reshape(Float32[3, 5], 2, 1))]),
-        0.0, Channel{Any}(1))
+    padreq = ReactantServer.InferRequest("pad", ["y"], [ReactantServer.NamedTensor("x", reshape(Float32[3, 5], 2, 1))])
+    qr = ReactantServer.QueuedRequest(padreq, padreq.inputs, 0.0, Channel{Any}(1))
     push!(sched.registry.by_name["pad"].sched.queue, qr)
 
     d = ReactantServer.select_dispatch!(sched, 0.0)

@@ -140,8 +140,8 @@ ReactantServerClient.output_specs(io::DummyIO) = io.spec.out_specs
 
 const N_OK   = Atomic{Int}(0)
 const N_ERR  = Atomic{Int}(0)
-const LAT_NS = Atomic{Int}(0)        # summed successful-request latency, nanoseconds
-const LAT_MX = Atomic{Int}(0)        # max single-request latency, nanoseconds
+const LAT_NS = Atomic{Int}(0)        # cumulative successful-request latency, nanoseconds
+const LAT_MX = Atomic{Int}(0)        # max single-request latency this window, ns (reset each report)
 const ERR_SAMPLES = String[]
 const ERR_LOCK = ReentrantLock()
 
@@ -213,16 +213,21 @@ function main()
 
     reporter = Threads.@spawn begin
         last_ok = 0
+        last_lat = 0
         last_t = time()
         err_shown = false
         while time() < deadline
             sleep(REPORT_SEC)
             now = time()
-            ok = N_OK[]; err = N_ERR[]
+            ok = N_OK[]; err = N_ERR[]; lat = LAT_NS[]
             d_ok = ok - last_ok
+            d_lat = lat - last_lat
             rps = d_ok / max(now - last_t, 1e-6)
-            mean_ms = ok > 0 ? (LAT_NS[] / ok) / 1e6 : 0.0
-            max_ms = LAT_MX[] / 1e6
+            # Per-window mean and max so the distribution reflects this window, not the whole run.
+            # In particular the one-time startup-compile spike no longer pins the max forever:
+            # read-and-reset the window max with atomic_xchg!. `ok`/`err` stay cumulative totals.
+            mean_ms = d_ok > 0 ? (d_lat / d_ok) / 1e6 : 0.0
+            max_ms = atomic_xchg!(LAT_MX, 0) / 1e6
             println("[t+$(round(Int, now - (deadline - DURATION)))s] ok=$ok err=$err rps=$(round(rps, digits=1)) ",
                     "mean=$(round(mean_ms, digits=1))ms max=$(round(max_ms, digits=1))ms")
             # Surface the failure cause as soon as errors appear instead of only at soak end.
@@ -232,7 +237,7 @@ function main()
                 err_shown = true
             end
             scrape_metrics()
-            last_ok = ok; last_t = now
+            last_ok = ok; last_lat = lat; last_t = now
         end
     end
 

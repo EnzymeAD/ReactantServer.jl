@@ -56,9 +56,8 @@ end
 
 # Dispatch a single one-row request to `name` and return the per-caller result.
 function _dispatch1!(sched, name; val::Float32=1.0f0)
-    qr = ReactantServer.QueuedRequest(
-        ReactantServer.InferRequest(name, ["y"], [ReactantServer.NamedTensor("x", reshape(Float32[val, val], 2, 1))]),
-        0.0, Channel{Any}(1))
+    wreq = ReactantServer.InferRequest(name, ["y"], [ReactantServer.NamedTensor("x", reshape(Float32[val, val], 2, 1))])
+    qr = ReactantServer.QueuedRequest(wreq, wreq.inputs, 0.0, Channel{Any}(1))
     push!(sched.registry.by_name[name].sched.queue, qr)
     d = ReactantServer.select_dispatch!(sched, 0.0)
     ReactantServer.execute_and_record!(sched, d)

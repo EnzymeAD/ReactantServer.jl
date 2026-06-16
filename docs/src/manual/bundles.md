@@ -77,11 +77,14 @@ end
 register_model("resnet50"; preprocess=normalize, postprocess=to_classes)
 ```
 
-The scheduler runs the hooks around each dispatch, crossing the world-age boundary with
-`invokelatest`. When `model.jl` transforms the I/O, declare the client-facing tensors via
-`client_inputs` / `client_outputs` in the manifest; without a `model.jl` those keys are not
-permitted and the executable specs are the client-facing specs. See [`register_model`](@ref)
-in the API reference for the exact hook signatures.
+The worker runs the hooks on each request's own task (preprocess before the request is queued,
+postprocess on the result), crossing the world-age boundary with `invokelatest`. This means the
+hooks for different requests run **concurrently, on multiple threads**, overlapping the GPU
+execution: keep them free of shared mutable state (or guard it yourself). When `model.jl`
+transforms the I/O, declare the client-facing tensors via `client_inputs` / `client_outputs` in
+the manifest; without a `model.jl` those keys are not permitted and the executable specs are the
+client-facing specs. See [`register_model`](@ref) in the API reference for the exact hook
+signatures.
 
 ## Producing bundles
 
