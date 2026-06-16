@@ -46,6 +46,13 @@ control plane, and return a result. The cost-aware coalescing scheduler and the 
 weight cache are both implemented (see below). The runtime is device agnostic; it defaults to
 CPU PJRT and selects CUDA through configuration, with CPU fallback.
 
+Beyond GPU is a goal, not a limitation of the design. Because the runtime sits on Reactant's PJRT
+bindings, any accelerator Reactant can target (other PJRT plugins, e.g. TPU, and additional
+backends as they mature) is reachable through the same device-agnostic path; the on-demand
+host-to-device weight tiering and the single-executes-at-a-time scheduler are not GPU-specific.
+GPU is simply the most common deployment, so this initial release focuses on it (CUDA, with CPU
+for development and fallback). Support for more accelerators is intended to follow.
+
 What works today:
 
 - StableHLO bundle loading, manifest parsing and validation, and a typed YAML configuration
