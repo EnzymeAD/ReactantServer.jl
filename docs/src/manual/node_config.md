@@ -82,12 +82,16 @@ workers:
 ```
 
 `name` is the routing identity (and, under Docker, the compose service name). The listen port
-is `base_port + index` unless the worker sets an explicit `port:`. Each worker uses device
-ordinal `0` by default (one visible GPU at index 0). Pick the physical GPU per deployment:
+is `base_port + index` unless the worker sets an explicit `port:`.
 
-- Containers reserve all GPUs and set `CUDA_VISIBLE_DEVICES` per worker (see
-  [Docker Deployment](docker.md)). CUDA then renumbers the chosen GPU to index 0.
-- Bare metal with several visible GPUs sets `gpu: N` on a worker to use device ordinal `N`.
+Under the supervisor (the container default) you do not assign GPUs yourself: it detects the
+visible devices, gives each worker one of them, and sets that worker's own
+`CUDA_VISIBLE_DEVICES`, so every worker sees a single GPU at ordinal `0`. Influence the assignment
+with `gpus:` above (`auto`, a count, or an explicit device list), the `REACTANT_GPUS` environment
+variable, or by adding `gpu: N` to a worker entry to pin it to a specific visible device. A
+container-level `CUDA_VISIBLE_DEVICES` acts as a coarse filter on which physical GPUs the
+supervisor sees (see [Docker Deployment](docker.md)). Running a single worker by hand without the
+supervisor (a bare `serve`), the worker uses device ordinal `0`, or `gpu: N` to pick another.
 
 A worker entry may also carry override blocks (for example a `runtime:` block) that merge over
 `global`.

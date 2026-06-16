@@ -69,8 +69,8 @@ schedule and coalesce requests, and serve over the KServe V2 gRPC control plane.
 scheduler, the on-demand GPU weight cache, dynamic model lifecycle, and the single- and multi-GPU
 deployment paths all work today on CUDA (with CPU for development and fallback); broader accelerator
 support is intended to follow. Deferred to later milestones: dynamic-batch export with server-side
-`stablehlo-refine` specialization, the compiled-executable disk cache, CUDA (device) shared memory,
-multi-model orchestrators, and full StableHLO-signature validation of manifests. See
+`stablehlo-refine` specialization, the compiled-executable disk cache, multi-model orchestrators,
+and full StableHLO-signature validation of manifests. See
 [Architecture](docs/src/design/architecture.md) for the full picture.
 
 ## Repository layout

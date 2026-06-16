@@ -37,8 +37,12 @@ global:
   endpoints:
     host: 0.0.0.0
 
-# One worker per GPU. Each worker uses device ordinal 0; the physical GPU is selected in
-# docker-compose.yml via CUDA_VISIBLE_DEVICES, so no `gpu:` field is needed here.
+# Workers are optional under the supervisor: omit this list and the supervisor synthesizes one
+# worker per detected GPU (set `gpus: auto`, a count, or a device list above; the `REACTANT_GPUS`
+# env overrides it). When you do list workers, the supervisor assigns each one a detected device
+# and sets that worker's own CUDA_VISIBLE_DEVICES, so each worker sees a single GPU at ordinal 0 —
+# you do not set CUDA_VISIBLE_DEVICES per worker yourself. Add `gpu: N` to an entry only to pin it
+# to a specific device among those visible.
 workers:
   - { name: worker0 }
   - { name: worker1 }
