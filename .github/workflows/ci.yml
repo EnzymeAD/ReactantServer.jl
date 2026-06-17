@@ -160,9 +160,11 @@ jobs:
       cache-name: export-lux
       command: "julia --color=yes --project=packages/ReactantServerExport/test -e 'using Pkg; Pkg.instantiate()' && REACTANTSERVER_SKIP_PYTORCH=true julia --color=yes --project=packages/ReactantServerExport/test packages/ReactantServerExport/test/runtests.jl"
 
-  # Full round-trip including the PyTorch export path. This is a standalone job (not the reusable
-  # workflow) because it needs an extra cache step for the CondaPkg-provisioned Python environment,
-  # which julia-actions/cache does not cover. Gated on the narrow export_pytorch filter.
+  # Full round-trip including the PyTorch export path. Standalone (not the reusable workflow) so it
+  # can run the torch path with the full conda provisioning. The CondaPkg Python environment
+  # (torch/jax/tensorflow) is deliberately NOT cached: it is multi-GB and would crowd out the Julia
+  # depot caches under the repo's 10 GB cache budget, and this job runs only on the narrow
+  # export_pytorch filter, so re-provisioning it occasionally is the cheaper trade.
   export-pytorch:
     needs: changes
     if: ${{ needs.changes.outputs.export_pytorch == 'true' }}
@@ -179,29 +181,10 @@ jobs:
         with:
           version: '1.12'
       - uses: julia-actions/cache@a45e8fa8be21c18a06b7177052533149e61e9b38 # v3.1.0
-      # Cache the CondaPkg-provisioned Python env (torch/jax/tensorflow), keyed on the conda pins and
-      # the test Project.toml so a torch bump or dep change invalidates it. Use the split
-      # restore/save sub-actions with an `if: always()` save so the slow, multi-GB env is cached
-      # even when the test step fails. The combined actions/cache skips its post-step save on job
-      # failure, which is why this env was being re-provisioned from scratch every run.
-      - uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        id: condapkg-cache
-        with:
-          path: packages/ReactantServerExport/test/.CondaPkg
-          key: condapkg-${{ runner.os }}-${{ hashFiles('packages/ReactantServerExport/CondaPkg.toml', 'packages/ReactantServerExport/test/Project.toml') }}
-          restore-keys: |
-            condapkg-${{ runner.os }}-
       - name: Run PyTorch export round-trip
         run: |
           julia --color=yes --project=packages/ReactantServerExport/test -e 'using Pkg; Pkg.instantiate()'
           julia --color=yes --project=packages/ReactantServerExport/test packages/ReactantServerExport/test/runtests.jl
-      # Save even on failure (the env is valid once provisioned), but skip when the restore was an
-      # exact-key hit, since the env is already cached under this key.
-      - uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        if: always() && steps.condapkg-cache.outputs.cache-hit != 'true'
-        with:
-          path: packages/ReactantServerExport/test/.CondaPkg
-          key: condapkg-${{ runner.os }}-${{ hashFiles('packages/ReactantServerExport/CondaPkg.toml', 'packages/ReactantServerExport/test/Project.toml') }}
 
   ci-ok:
     needs: [core, client, gateway, server, node, export-lux, export-pytorch]
