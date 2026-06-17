@@ -1,5 +1,9 @@
 # ReactantServer.jl
 
+[![Documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://enzymead.github.io/ReactantServer.jl/dev/)
+[![Documentation](https://img.shields.io/badge/docs-stable-blue.svg)](https://enzymead.github.io/ReactantServer.jl/stable/)
+[![CI](https://img.shields.io/github/checks-status/enzymead/ReactantServer.jl/main?label=CI)](https://github.com/enzymead/ReactantServer.jl/commits/main)
+
 A production inference server for XLA-accelerated models, compiled through Reactant.jl
 (StableHLO via XLA today). It speaks the KServe V2 inference API natively over gRPC, so standard
 Triton and KServe clients connect unchanged; it scales from a single GPU to many from one

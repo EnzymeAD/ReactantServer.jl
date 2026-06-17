@@ -23,7 +23,7 @@ end
 
 makedocs(;
     modules  = [ReactantServerCore, ReactantServer, ReactantServerGateway, ReactantServerClient, ReactantServerNode],
-    authors  = "Carroll Vance <cvance@medicalmetrics.com>",
+    authors  = "Carroll Vance <cs.vance@icloud.com>",
     sitename = "ReactantServer.jl",
     # The repository is hosted on Azure DevOps, which Documenter's automatic remote
     # detection does not recognize. Disable remote "source"/"edit" links for the local
@@ -35,8 +35,8 @@ makedocs(;
         # search inventory; set it explicitly to match the member packages.
         inventory_version = "0.1.0",
         # Navbar link to the repository; set explicitly because remote detection is off.
-        repolink  = "https://devops.medicalmetrics.com/MMI/AI/_git/ReactantServer.jl",
-        edit_link = "master",
+        repolink  = "https://github.com/EnzymeAD/ReactantServer.jl",
+        edit_link = "main",
         # Pretty (directory) URLs only in CI; plain .html files build locally so the
         # site is browseable straight from docs/build/ over file://.
         prettyurls = get(ENV, "CI", "false") == "true",
@@ -75,5 +75,4 @@ makedocs(;
     warnonly = [:missing_docs],
 )
 
-# No deploydocs: this repository is hosted on Azure DevOps and docs are built locally.
-# An Azure DevOps pipeline can publish docs/build/ as an artifact when desired.
+deploydocs(; repo = "github.com/EnzymeAD/ReactantServer.jl")
