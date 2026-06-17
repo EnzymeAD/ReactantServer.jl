@@ -2,9 +2,13 @@
 # consumers can override these pins in their own CondaPkg.toml if they need a
 # GPU build or a specific torch version.
 
+# torchax is capped because PyTorchExportExt depends on its internal API layout (its func closure,
+# decomposition order, and the jaten/ops_registry internals). torchax >=0.0.10 also requires
+# jax >=0.6.2, which the unpinned jax/jaxlib resolve to. torch is reinstalled as the CPU build at
+# test time (see test/runtests.jl); the CUDA wheel segfaults against Reactant/XLA on a CPU host.
 [pip.deps]
 torch = ">=2.4"
-torchax = ""
+torchax = ">=0.0.10,<0.0.13"
 jax = ""
 jaxlib = ""
 numpy = ""

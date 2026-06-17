@@ -24,17 +24,24 @@ const SKIP_PYTORCH = get(ENV, "REACTANTSERVER_SKIP_PYTORCH", "false") == "true"
 # PythonCall here also provisions the CondaPkg environment declared in CondaPkg.toml.
 SKIP_PYTORCH || @eval using PythonCall, CondaPkg
 
-# Force the CPU build of PyTorch. PyPI's default Linux torch wheel bundles CUDA libraries that
-# segfault when they collide with JAX/XLA on a CPU-only host, and conda cannot select the `+cpu`
-# wheel, so install it into the CondaPkg environment after it is provisioned (this mirrors the
-# workaround used in Reactant.jl). The round-trip runs entirely on CPU, so the CPU build is the
-# correct one regardless of the host. The pixi/uv-based CondaPkg env has no `pip` module, but it
-# does ship `uv` (CondaPkg's pip backend), so install through `uv pip` targeting the env interpreter.
+# Force the CPU build of PyTorch. The default PyPI torch wheel on Linux is a CUDA build whose
+# libtorch_cuda.so clashes with Reactant/XLA and segfaults on a CPU-only host. CondaPkg cannot pin
+# a per-package index, so we let it resolve torch (and torchax) normally from CondaPkg.toml, then
+# reinstall the resolved torch as its CPU variant from the PyTorch CPU index (this mirrors the
+# workaround used in Reactant.jl). The round-trip runs entirely on CPU, so the CPU build is correct
+# regardless of host. The resolved version is read from package metadata, not by importing torch,
+# because the CUDA build may fail to import; the matching CPU wheel is then force-reinstalled with
+# --no-deps since torch's dependencies are already present. The pixi/CondaPkg env ships no pip, so
+# ensurepip provisions it first.
 if !SKIP_PYTORCH
     CondaPkg.withenv() do
-        uv = CondaPkg.which("uv")
-        python = CondaPkg.which("python")
-        run(`$uv pip install --python $python --reinstall --no-deps --index-url https://download.pytorch.org/whl/cpu torch`)
+        run(`python -m ensurepip --upgrade`)
+        torch_version = readchomp(
+            `python -c "import importlib.metadata as m; print(m.version('torch').split('+')[0])"`,
+        )
+        run(
+            `python -m pip install --index-url https://download.pytorch.org/whl/cpu --no-deps --force-reinstall "torch==$(torch_version)"`,
+        )
     end
 end
 
