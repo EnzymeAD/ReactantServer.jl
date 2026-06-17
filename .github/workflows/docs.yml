@@ -20,6 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # docs/Project.toml path-sources the member packages and the vendored lib/* forks,
+          # so the submodules must be present before instantiate.
+          submodules: recursive
       - uses: julia-actions/setup-julia@v2
         with:
           version: '1'
@@ -27,8 +31,10 @@ jobs:
       - name: Install dependencies
         shell: julia --color=yes --project=docs {0}
         run: |
+          # docs/Project.toml already declares the full path-source closure (the five member
+          # packages + lib/* forks); just instantiate it. Do not Pkg.develop the repo root: it
+          # is a [workspace] file with no `name`, which Pkg.develop rejects.
           using Pkg
-          Pkg.develop(PackageSpec(path=pwd()))
           Pkg.instantiate()
       - name: Build and deploy
         run: julia --color=yes --project=docs docs/make.jl
