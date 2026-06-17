@@ -349,13 +349,18 @@ and to `output_0`, `output_1`, ... otherwise.
 The precision in effect, and the JAX backend platform, are reported once per
 session. See the module docstring for why the export host's platform, not the
 deployment GPU, determines whether reduced (TF32-style) precision is baked in.
+
+`strict` selects `torch.export`'s tracing mode. It defaults to `false` (non-strict):
+strict mode drives TorchDynamo, which on recent torch queries the current
+accelerator's stream and raises against torchax's registered "jax" device. Non-strict
+tracing avoids that path and is the recommended default for `torch.export`.
 """
 function export_bundle(::Val{:pytorch}, model, example_inputs::Tuple;
                        dir::AbstractString, name::AbstractString,
                        input_names=nothing, output_name::AbstractString="output",
                        output_names=nothing,
                        batch_sizes::AbstractVector{<:Integer}=[1],
-                       strict::Bool=true,
+                       strict::Bool=false,
                        matmul_precision::Union{Nothing,AbstractString}=nothing,
                        provenance=Dict{String,Any}())
     isempty(example_inputs) && error("PyTorchExport: at least one example input is required")

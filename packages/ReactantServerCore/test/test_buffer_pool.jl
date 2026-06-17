@@ -92,8 +92,14 @@
         singles = [ReactantServerCore.acquire_slot!(p) for _ in 1:4]
 
         order = Channel{Symbol}(8)
+        # The big waiter takes the whole pool. This is deliberate: with any smaller span the
+        # final release would satisfy big and leave a slot over that immediately satisfies the
+        # next (small) waiter, so big and that small become runnable together and their `put!`s
+        # race. With span == n_slots no slot is free while big holds the pool, so a small cannot
+        # be served until big releases (strictly after big's `put!(:big)`), making the completion
+        # order deterministic and not dependent on scheduler timing on a loaded CI runner.
         big = Threads.@spawn begin
-            s = ReactantServerCore.acquire_slot!(p, 3)
+            s = ReactantServerCore.acquire_slot!(p, 4)
             put!(order, :big)
             ReactantServerCore.release_slot!(s)
         end
@@ -106,7 +112,9 @@
                 ReactantServerCore.release_slot!(s)
             end
         end
-        sleep(0.1)   # let the small waiters park behind the big one
+        # Wait until both small waiters have parked behind the big one, so the FIFO ordering is
+        # actually under test. Polling the queue length is robust where a fixed sleep is not.
+        @test timedwait(() -> (@lock p.alloc_lock length(p.waitq) == 3), 5.0) == :ok
 
         # Release singles one at a time; freed slots must not be handed past the big waiter.
         for s in singles

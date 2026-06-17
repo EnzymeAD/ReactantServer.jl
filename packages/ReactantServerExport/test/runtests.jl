@@ -12,16 +12,57 @@ using Random
 # ahead of Reactant's MLIR/LLVM to avoid a static-initialization SIGSEGV. The PyTorch export
 # methods live in the PythonCall-triggered extension, so loading PythonCall here also enables
 # them once ReactantServerExport is loaded below.
-using PythonCall
-const HAS_TORCH = try
-    pyimport("torch")
-    pyimport("torch.export")
-    pyimport("torchax.export")
-    pyimport("numpy")
-    true
-catch err
-    @info "Skipping PyTorch export tests: required Python module not importable" error = err
+#
+# Set REACTANTSERVER_SKIP_PYTORCH=true to skip the PyTorch path without loading PythonCall at all,
+# so no conda environment is provisioned. The `export-lux` CI job sets this for a fast Lux-only
+# run; `export-pytorch` leaves it unset to exercise the full round-trip. Default (unset) keeps the
+# original behavior: load PythonCall and run the torch tests when torch is importable.
+const SKIP_PYTORCH = get(ENV, "REACTANTSERVER_SKIP_PYTORCH", "false") == "true"
+
+# Keep the load in its own top-level statement (via @eval, since `using` cannot be nested inside an
+# expression) so the methods are visible in the next world age when we probe below. Loading
+# PythonCall here also provisions the CondaPkg environment declared in CondaPkg.toml.
+SKIP_PYTORCH || @eval using PythonCall, CondaPkg
+
+# Force the CPU build of PyTorch. The default PyPI torch wheel on Linux is a CUDA build whose
+# libtorch_cuda.so clashes with Reactant/XLA and segfaults on a CPU-only host. CondaPkg cannot pin
+# a per-package index, so we let it resolve torch (and torchax) normally from CondaPkg.toml, then
+# reinstall the resolved torch as its CPU variant from the PyTorch CPU index (this mirrors the
+# workaround used in Reactant.jl). The round-trip runs entirely on CPU, so the CPU build is correct
+# regardless of host. The resolved version is read from package metadata, not by importing torch,
+# because the CUDA build may fail to import; the matching CPU wheel is then force-reinstalled with
+# --no-deps since torch's dependencies are already present. The pixi/CondaPkg env ships no pip, so
+# ensurepip provisions it first.
+if !SKIP_PYTORCH
+    CondaPkg.withenv() do
+        run(`python -m ensurepip --upgrade`)
+        torch_version = readchomp(
+            `python -c "import importlib.metadata as m; print(m.version('torch').split('+')[0])"`,
+        )
+        run(
+            `python -m pip install --index-url https://download.pytorch.org/whl/cpu --no-deps --force-reinstall "torch==$(torch_version)"`,
+        )
+        # The CUDA torch resolve also pulled in triton, whose bundled libtriton.so statically links
+        # an LLVM that collides with Reactant/XLA and segfaults when torch's export path imports it.
+        # The CPU build does not need triton, so remove it (pip exits 0 if it is already absent).
+        run(`python -m pip uninstall -y triton pytorch-triton`)
+    end
+end
+
+const HAS_TORCH = if SKIP_PYTORCH
+    @info "Skipping PyTorch export tests: REACTANTSERVER_SKIP_PYTORCH is set"
     false
+else
+    try
+        pyimport("torch")
+        pyimport("torch.export")
+        pyimport("torchax.export")
+        pyimport("numpy")
+        true
+    catch err
+        @info "Skipping PyTorch export tests: required Python module not importable" error = err
+        false
+    end
 end
 
 using ReactantServerExport
@@ -92,8 +133,8 @@ _load_manifest(dir) = ReactantServer.parse_manifest(
     end
 
     if HAS_TORCH
-        const np = pyimport("numpy")
-        const torch = pyimport("torch")
+        np = pyimport("numpy")
+        torch = pyimport("torch")
 
         # PyTorch (row-major) tensor -> Julia col-major Array with reversed shape (same bytes).
         function torch_to_julia(py_tensor)

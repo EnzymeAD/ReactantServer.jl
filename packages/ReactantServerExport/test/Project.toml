@@ -1,4 +1,5 @@
 [deps]
+CondaPkg = "992eb4ea-22a4-4c89-a5bb-47a3300528ab"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
 PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"

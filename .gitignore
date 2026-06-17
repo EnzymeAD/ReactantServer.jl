@@ -11,3 +11,7 @@ validation/gpu_memory_sharing/results/
 private/
 # Generated at e2e time by gen_bit_resnet50.jl (random-init Luximm model)
 packages/ReactantServer/test/e2e/models/bit_resnet50/
+# Julia resolved-dependency lockfiles: not checked in, resolved fresh per environment (incl. CI)
+# so a vendored-fork compat bump (e.g. HTTP requiring a newer Reseau) is picked up automatically.
+Manifest.toml
+Manifest-v*.toml

@@ -352,3 +352,5 @@ function node_server_config(node::AbstractDict, worker::Union{AbstractString,Not
     applied = apply_env_overrides!(raw)
     return build_config(raw), applied, wname
 end
+
+_trigger_ci = true
