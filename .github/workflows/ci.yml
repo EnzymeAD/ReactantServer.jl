@@ -114,6 +114,7 @@ jobs:
     if: ${{ needs.changes.outputs.core == 'true' }}
     uses: ./.github/workflows/_test.yml
     with:
+      cache-name: core
       command: "julia --color=yes --project=packages/ReactantServerCore -e 'using Pkg; Pkg.test(; julia_args=[\"--threads=auto,1\"])'"
 
   client:
@@ -121,6 +122,7 @@ jobs:
     if: ${{ needs.changes.outputs.client == 'true' }}
     uses: ./.github/workflows/_test.yml
     with:
+      cache-name: client
       command: "julia --color=yes --project=packages/ReactantServerClient -e 'using Pkg; Pkg.test(; julia_args=[\"--threads=auto,1\"])'"
 
   gateway:
@@ -128,6 +130,7 @@ jobs:
     if: ${{ needs.changes.outputs.gateway == 'true' }}
     uses: ./.github/workflows/_test.yml
     with:
+      cache-name: gateway
       command: "julia --color=yes --project=packages/ReactantServerGateway -e 'using Pkg; Pkg.test(; julia_args=[\"--threads=auto,1\"])'"
 
   server:
@@ -135,6 +138,7 @@ jobs:
     if: ${{ needs.changes.outputs.server == 'true' }}
     uses: ./.github/workflows/_test.yml
     with:
+      cache-name: server
       command: "julia --color=yes --project=packages/ReactantServer -e 'using Pkg; Pkg.test(; julia_args=[\"--threads=auto,1\"])'"
 
   node:
@@ -142,6 +146,7 @@ jobs:
     if: ${{ needs.changes.outputs.node == 'true' }}
     uses: ./.github/workflows/_test.yml
     with:
+      cache-name: node
       command: "julia --color=yes --project=packages/ReactantServerNode -e 'using Pkg; Pkg.test(; julia_args=[\"--threads=auto,1\"])'"
 
   # Lux-only round-trip: REACTANTSERVER_SKIP_PYTORCH=true keeps runtests.jl from loading PythonCall,
@@ -152,6 +157,7 @@ jobs:
     if: ${{ needs.changes.outputs.export_lux == 'true' }}
     uses: ./.github/workflows/_test.yml
     with:
+      cache-name: export-lux
       command: "julia --color=yes --project=packages/ReactantServerExport/test -e 'using Pkg; Pkg.instantiate()' && REACTANTSERVER_SKIP_PYTORCH=true julia --color=yes --project=packages/ReactantServerExport/test packages/ReactantServerExport/test/runtests.jl"
 
   # Full round-trip including the PyTorch export path. This is a standalone job (not the reusable
