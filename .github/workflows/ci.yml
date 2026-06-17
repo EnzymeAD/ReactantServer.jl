@@ -1,0 +1,154 @@
+# Non-GPU test CI. A `changes` job computes, per suite, whether anything that suite depends on
+# changed; each suite job runs only when its filter is true, so untouched packages don't burn
+# runner time. `ci-ok` aggregates them into one status (mark it the required check in branch
+# protection — a skipped suite counts as success, so required-check gating is not broken).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read   # dorny/paths-filter reads changed files from the PR
+    outputs:
+      core: ${{ steps.filter.outputs.core }}
+      client: ${{ steps.filter.outputs.client }}
+      gateway: ${{ steps.filter.outputs.gateway }}
+      server: ${{ steps.filter.outputs.server }}
+      node: ${{ steps.filter.outputs.node }}
+      export: ${{ steps.filter.outputs.export }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        id: filter
+        with:
+          # `common` (global files + Core) is folded into every suite, since Core is a dependency
+          # of all of them and the global files affect everything. Each suite then adds its own
+          # package dir and the vendored lib/* it depends on (submodule bumps show as a change to
+          # the gitlink path `lib/X.jl`). Filters err toward over-inclusion so a real dependency
+          # change can never produce a false green.
+          filters: |
+            common: &common
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/_test.yml'
+              - 'Project.toml'
+              - 'Manifest.toml'
+              - '.gitmodules'
+              - 'packages/ReactantServerCore/**'
+            core:
+              - *common
+            client:
+              - *common
+              - 'packages/ReactantServerClient/**'
+              - 'lib/gRPCClient.jl'
+              - 'lib/gRPCClient.jl/**'
+            gateway:
+              - *common
+              - 'packages/ReactantServerGateway/**'
+              - 'lib/gRPCServer.jl'
+              - 'lib/gRPCServer.jl/**'
+              - 'lib/gRPCClient.jl'
+              - 'lib/gRPCClient.jl/**'
+              - 'lib/HTTP.jl'
+              - 'lib/HTTP.jl/**'
+              - 'lib/Prometheus.jl'
+              - 'lib/Prometheus.jl/**'
+            server:
+              - *common
+              - 'packages/ReactantServer/**'
+              - 'lib/Reactant.jl'
+              - 'lib/Reactant.jl/**'
+              - 'lib/gRPCServer.jl'
+              - 'lib/gRPCServer.jl/**'
+              - 'lib/gRPCClient.jl'        # test target only, but the server suite uses it
+              - 'lib/gRPCClient.jl/**'
+              - 'lib/HTTP.jl'
+              - 'lib/HTTP.jl/**'
+              - 'lib/Prometheus.jl'
+              - 'lib/Prometheus.jl/**'
+            node:
+              - *common
+              - 'packages/ReactantServerNode/**'
+            export:
+              - *common
+              - 'packages/ReactantServerExport/**'
+              - 'packages/ReactantServer/**'
+              - 'lib/Reactant.jl'
+              - 'lib/Reactant.jl/**'
+              - 'lib/gRPCServer.jl'
+              - 'lib/gRPCServer.jl/**'
+              - 'lib/HTTP.jl'
+              - 'lib/HTTP.jl/**'
+              - 'lib/Prometheus.jl'
+              - 'lib/Prometheus.jl/**'
+
+  core:
+    needs: changes
+    if: ${{ needs.changes.outputs.core == 'true' }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      command: "julia --color=yes --project=packages/ReactantServerCore -e 'using Pkg; Pkg.test(; julia_args=[\"--threads=auto,1\"])'"
+
+  client:
+    needs: changes
+    if: ${{ needs.changes.outputs.client == 'true' }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      command: "julia --color=yes --project=packages/ReactantServerClient -e 'using Pkg; Pkg.test(; julia_args=[\"--threads=auto,1\"])'"
+
+  gateway:
+    needs: changes
+    if: ${{ needs.changes.outputs.gateway == 'true' }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      command: "julia --color=yes --project=packages/ReactantServerGateway -e 'using Pkg; Pkg.test(; julia_args=[\"--threads=auto,1\"])'"
+
+  server:
+    needs: changes
+    if: ${{ needs.changes.outputs.server == 'true' }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      command: "julia --color=yes --project=packages/ReactantServer -e 'using Pkg; Pkg.test(; julia_args=[\"--threads=auto,1\"])'"
+
+  node:
+    needs: changes
+    if: ${{ needs.changes.outputs.node == 'true' }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      command: "julia --color=yes --project=packages/ReactantServerNode -e 'using Pkg; Pkg.test(; julia_args=[\"--threads=auto,1\"])'"
+
+  export:
+    needs: changes
+    if: ${{ needs.changes.outputs.export == 'true' }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      command: "julia --color=yes --project=packages/ReactantServerExport/test packages/ReactantServerExport/test/runtests.jl"
+
+  ci-ok:
+    needs: [core, client, gateway, server, node, export]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify no suite failed
+        run: |
+          results="${{ join(needs.*.result, ' ') }}"
+          echo "suite results: $results"
+          for r in $results; do
+            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
+              echo "A test suite failed or was cancelled."
+              exit 1
+            fi
+          done
+          echo "All required suites passed or were skipped."
