@@ -9,6 +9,13 @@ on:
         description: The full julia test command to run.
         required: true
         type: string
+      cache-name:
+        description: >-
+          Unique name for this suite's Julia depot cache. Required because inside a reusable
+          workflow github.job is always 'run', so without an explicit name every suite would
+          share one cache and clobber each other's precompiled Reactant/Lux depot every run.
+        required: true
+        type: string
       julia-version:
         description: Julia version to test on.
         required: false
@@ -32,6 +39,8 @@ jobs:
         with:
           version: ${{ inputs.julia-version }}
       - uses: julia-actions/cache@a45e8fa8be21c18a06b7177052533149e61e9b38 # v3.1.0
+        with:
+          cache-name: julia-${{ inputs.cache-name }}
       # No REACTANT_GPU env => Reactant selects the CPU artifact; threads come from the command.
       - name: Run tests
         run: ${{ inputs.command }}
