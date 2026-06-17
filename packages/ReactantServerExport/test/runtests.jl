@@ -26,12 +26,15 @@ SKIP_PYTORCH || @eval using PythonCall, CondaPkg
 
 # Force the CPU build of PyTorch. PyPI's default Linux torch wheel bundles CUDA libraries that
 # segfault when they collide with JAX/XLA on a CPU-only host, and conda cannot select the `+cpu`
-# wheel, so install it with pip into the CondaPkg environment after it is provisioned (this mirrors
-# the workaround used in Reactant.jl). The round-trip runs entirely on CPU, so the CPU build is the
-# correct one regardless of the host.
+# wheel, so install it into the CondaPkg environment after it is provisioned (this mirrors the
+# workaround used in Reactant.jl). The round-trip runs entirely on CPU, so the CPU build is the
+# correct one regardless of the host. The pixi/uv-based CondaPkg env has no `pip` module, but it
+# does ship `uv` (CondaPkg's pip backend), so install through `uv pip` targeting the env interpreter.
 if !SKIP_PYTORCH
     CondaPkg.withenv() do
-        run(`python -m pip install --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cpu torch`)
+        uv = CondaPkg.which("uv")
+        python = CondaPkg.which("python")
+        run(`$uv pip install --python $python --reinstall --no-deps --index-url https://download.pytorch.org/whl/cpu torch`)
     end
 end
 
