@@ -15,7 +15,7 @@ concurrency:
 
 # actions: write is needed because the suite jobs call _test.yml, which runs julia-actions/cache
 # (it prunes its own old caches). A called workflow cannot request more than the caller holds, so
-# it is granted here at the top level; the `changes` job overrides with a narrower set below.
+# it is granted here at the top level; the `changes` job overrides with a narrower set below
 permissions:
   contents: read
   actions: write
