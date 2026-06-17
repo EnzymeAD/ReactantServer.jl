@@ -49,7 +49,6 @@ jobs:
               - '.github/workflows/ci.yml'
               - '.github/workflows/_test.yml'
               - 'Project.toml'
-              - 'Manifest.toml'
               - '.gitmodules'
               - 'packages/ReactantServerCore/**'
             core:
@@ -179,7 +178,7 @@ jobs:
       - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: packages/ReactantServerExport/test/.CondaPkg
-          key: condapkg-${{ runner.os }}-${{ hashFiles('packages/ReactantServerExport/CondaPkg.toml', 'packages/ReactantServerExport/test/Manifest.toml') }}
+          key: condapkg-${{ runner.os }}-${{ hashFiles('packages/ReactantServerExport/CondaPkg.toml', 'packages/ReactantServerExport/test/Project.toml') }}
           restore-keys: |
             condapkg-${{ runner.os }}-
       - name: Run PyTorch export round-trip
