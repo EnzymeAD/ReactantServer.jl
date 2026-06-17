@@ -179,9 +179,13 @@ jobs:
         with:
           version: '1.12'
       - uses: julia-actions/cache@a45e8fa8be21c18a06b7177052533149e61e9b38 # v3.1.0
-      # Cache the CondaPkg-provisioned Python env (torch/jax/tensorflow); keyed on the conda pins and
-      # the test Manifest so a torch bump or dep change invalidates it.
-      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      # Cache the CondaPkg-provisioned Python env (torch/jax/tensorflow), keyed on the conda pins and
+      # the test Project.toml so a torch bump or dep change invalidates it. Use the split
+      # restore/save sub-actions with an `if: always()` save so the slow, multi-GB env is cached
+      # even when the test step fails. The combined actions/cache skips its post-step save on job
+      # failure, which is why this env was being re-provisioned from scratch every run.
+      - uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        id: condapkg-cache
         with:
           path: packages/ReactantServerExport/test/.CondaPkg
           key: condapkg-${{ runner.os }}-${{ hashFiles('packages/ReactantServerExport/CondaPkg.toml', 'packages/ReactantServerExport/test/Project.toml') }}
@@ -191,6 +195,13 @@ jobs:
         run: |
           julia --color=yes --project=packages/ReactantServerExport/test -e 'using Pkg; Pkg.instantiate()'
           julia --color=yes --project=packages/ReactantServerExport/test packages/ReactantServerExport/test/runtests.jl
+      # Save even on failure (the env is valid once provisioned), but skip when the restore was an
+      # exact-key hit, since the env is already cached under this key.
+      - uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        if: always() && steps.condapkg-cache.outputs.cache-hit != 'true'
+        with:
+          path: packages/ReactantServerExport/test/.CondaPkg
+          key: condapkg-${{ runner.os }}-${{ hashFiles('packages/ReactantServerExport/CondaPkg.toml', 'packages/ReactantServerExport/test/Project.toml') }}
 
   ci-ok:
     needs: [core, client, gateway, server, node, export-lux, export-pytorch]
