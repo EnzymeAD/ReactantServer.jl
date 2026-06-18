@@ -46,7 +46,7 @@ mutable struct HealthProber
     metrics::GatewayMetrics
     admin::AdminServer
     routes::Union{DiscoveredRoutes,Nothing}
-    packing::Union{LptPackingState,Nothing}   # packing-mode rebalancer, ticked on its own interval
+    scheduler::GatewayScheduler               # ticked each round via scheduler_tick! (no-op unless lpt_packing)
     interval::Float64
     running::Threads.Atomic{Bool}
     task::Union{Task,Nothing}
@@ -57,12 +57,12 @@ end
 
 function HealthProber(pool::ClientPool, metrics::GatewayMetrics, admin::AdminServer,
                       routes::Union{DiscoveredRoutes,Nothing} = nothing;
-                      packing::Union{LptPackingState,Nothing} = nothing,
+                      scheduler::GatewayScheduler = RoundRobinScheduler(),
                       interval::Real = HEALTH_INTERVAL_SECONDS,
                       wedge_exit_rounds::Integer =
                           parse(Int, get(ENV, "REACTANT_GATEWAY_WEDGE_EXIT_ROUNDS",
                                          string(WEDGE_EXIT_ROUNDS))))
-    return HealthProber(pool, metrics, admin, routes, packing, Float64(interval),
+    return HealthProber(pool, metrics, admin, routes, scheduler, Float64(interval),
                         Threads.Atomic{Bool}(true), nothing, 0, Int(wedge_exit_rounds), false)
 end
 
@@ -115,20 +115,16 @@ function _check_once(p::HealthProber)
         swap_table!(p.routes, table)
         set_routing_size!(p.metrics, nmodels(table))
     end
-    # LPT-packing: poll the ready workers every probe round to refresh routing metadata and
-    # accumulate consumed compute; tick_packing! repacks only once the fleet has consumed the
-    # configured compute budget. Placement is computed over the workers that reported ready this
-    # round; a dead worker drops out until it recovers.
-    if p.packing !== nothing
-        ready_urls = String[wc.url for (i, wc) in enumerate(workers) if results[i]]
-        if isempty(ready_urls)
-            @warn "lpt_packing: no ready workers this round; keeping the previous assignment"
-        else
-            try
-                tick_packing!(p.packing, p.pool, ready_urls, p.metrics)
-            catch e
-                @warn "lpt_packing: rebalance failed; keeping the previous assignment" exception = e
-            end
+    # Scheduler tick: lpt_packing polls the ready workers every probe round to refresh routing
+    # metadata and accumulate consumed compute, repacking only once the fleet has consumed the
+    # configured compute budget (other schedulers are no-ops). Placement is computed over the workers
+    # that reported ready this round; a dead worker drops out until it recovers.
+    ready_urls = String[wc.url for (i, wc) in enumerate(workers) if results[i]]
+    if !isempty(ready_urls)
+        try
+            scheduler_tick!(p.scheduler, p.pool, ready_urls, p.metrics)
+        catch e
+            @warn "scheduler tick failed; keeping the previous state" exception = e
         end
     end
     return any_ready

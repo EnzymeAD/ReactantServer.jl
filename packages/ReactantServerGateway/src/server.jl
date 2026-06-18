@@ -4,15 +4,16 @@
 # independently. All three are raw Vector{UInt8} in and out; only the small routing headers are
 # decoded (see headers.jl). Mirrors the Go gateway's internal/grpcserver.
 
-# Per-request state threaded through gRPCServer's context payload. Parametric on the pool type so
-# the request hot path (`st.pool` -> `get_clients` -> `wc.infer`) stays type-stable.
-struct GatewayState{P<:ClientPool}
+# Per-request state threaded through gRPCServer's context payload. Parametric on the pool and
+# scheduler types so the request hot path (`st.pool` -> `get_clients` -> `wc.infer`, and the
+# `select_replicas` dispatch) stays type-stable.
+struct GatewayState{P<:ClientPool,S<:GatewayScheduler}
     pool::P
     routes::DiscoveredRoutes
     gate::RegisterGate
     metrics::GatewayMetrics
     refresher::RouteRefresher
-    packing::Union{LptPackingState,Nothing}   # nothing in round_robin mode
+    scheduler::S
 end
 
 # Map a gateway status string to a server-side gRPC exception with the matching code.
@@ -65,58 +66,30 @@ function _try_replicas(st::GatewayState, urls, model, id, body)
     return nothing, last_status, last_exc
 end
 
-# Try a model's placement replicas in order (urls[1] is the routing choice; the rest are failover),
-# then, if every placement replica returns a retryable error, the remaining discovered replicas as a
-# last resort so a concentrated model survives its worker dying between repacks. The reservation made
-# by route_replica is released exactly once here, on every path (success, retryable error, hard
-# error, or timeout), so the outstanding counter never leaks.
-function _try_packing(st::GatewayState, urls, counters, model, id, body)
-    try
-        last_status = STATUS_UNAVAILABLE
-        last_exc = gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_UNAVAILABLE, "no replica available")
-        for url in urls
-            resp, status, exc = _post_infer(st, url, model, id, body)
-            exc === nothing && return resp, status, nothing
-            status == STATUS_NOT_FOUND && request_refresh!(st.refresher)
-            last_status, last_exc = status, exc
-            (status == STATUS_NOT_FOUND || status == STATUS_UNAVAILABLE) || return nothing, status, exc
-        end
-        # Last-resort failover to replicas outside the placement (untracked by the fill counters).
-        rr = pick(st.routes, model)
-        if rr !== nothing
-            extra = String[u for u in rr if !(u in urls)]
-            isempty(extra) || return _try_replicas(st, extra, model, id, body)
-        end
-        return nothing, last_status, last_exc
-    finally
-        _release_route!(counters)
-    end
-end
-
 function _dispatch_infer(st::GatewayState, model, id, body)
-    # LPT-packing mode: route to the replica that fills its batch first (route_replica reserves it),
-    # the remaining placement replicas following as failover. A model without a placement yet (cold,
-    # or new since the last repack) falls through to the round-robin path below.
-    if st.packing !== nothing
-        routed = route_replica(st.packing, model)
-        if routed !== nothing
-            urls, counters = routed
-            return _try_packing(st, urls, counters, model, id, body)
-        end
-    end
-    urls = pick(st.routes, model)
-    if urls === nothing
-        # The model is unknown to the routing table. It may have just been loaded on a worker, so
-        # refresh on demand (single-flight, rate-limited) and re-pick before giving up.
+    # Ask the scheduler which replicas to try (urls[1] is its choice; the rest are failover order)
+    # and for an opaque reservation to release once the request completes. `nothing` means the
+    # scheduler has no route for the model: it may have just been loaded on a worker, so refresh the
+    # routing table on demand (single-flight, rate-limited) and re-select before giving up.
+    ctx = ScheduleContext(model, id, st.pool, st.routes, st.metrics, st.refresher)
+    sel = select_replicas(st.scheduler, ctx)
+    if sel === nothing
         refresh_now!(st.refresher)
-        urls = pick(st.routes, model)
+        sel = select_replicas(st.scheduler, ctx)
     end
-    if urls === nothing
+    if sel === nothing
         @info "infer: model not found" model request_id = id
         return nothing, STATUS_NOT_FOUND,
             gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_NOT_FOUND, "model \"$model\" not found on any worker")
     end
-    return _try_replicas(st, urls, model, id, body)
+    urls, reservation = sel
+    # Release the reservation exactly once, on every path (success, retryable error, hard error, or
+    # timeout), so a scheduler's outstanding counters never leak.
+    try
+        return _try_replicas(st, urls, model, id, body)
+    finally
+        release!(st.scheduler, reservation)
+    end
 end
 
 function _gw_infer(body::Vector{UInt8}, st::GatewayState)
@@ -134,7 +107,7 @@ function _gw_infer(body::Vector{UInt8}, st::GatewayState)
         throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_INVALID_ARGUMENT,
             "ModelInferRequest.model_name is empty"))
     end
-    st.packing === nothing || record_arrival!(st.packing, model)
+    record_arrival!(st.scheduler, model)
     resp, status, exc = _dispatch_infer(st, model, id, body)
     observe_request!(st.metrics, "ModelInfer", model, time() - t0)
     inc_requests!(st.metrics, "ModelInfer", model, status)

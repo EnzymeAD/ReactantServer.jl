@@ -149,8 +149,11 @@ See [Multi-GPU Gateway](multi_gpu_gateway.md) and [Scaling to Multiple GPUs](sca
 **What it provides today.**
 
 - ReactantServerGateway `lpt_packing` with a configurable replica count per model and coalescing-aware routing across those replicas
+- The simpler `round_robin` and `least_outstanding` modes, which also distribute a model's requests across its replicas when you do not need batch coalescing or reactive placement
 
-**How to configure it.** Set `scheduling.mode: lpt_packing` in `gateway.yml` and give the replicated model a replica count, either with `scheduling.default_replicas` or per model under `scheduling.models.<name>.replicas`. The gateway places each model on that many distinct GPUs and routes its requests to fill one replica's batch before moving to the next, so coalescing is preserved across replicas rather than diluted. Tune `routing_fill_factor` (raise it above 1.0 to keep the next batch queued under fast arrival) and choose a `routing_policy`: `fill_rr` (default) round-robins which replica opens each batch, `fill_least` opens it on the least compute-loaded GPU (best when replicas share GPUs with other models), and `least_outstanding` spreads every request without concentrating. See [Multi-GPU Gateway](multi_gpu_gateway.md) for the full set of knobs.
+**Which scheduling mode.** All three modes work with replicas, so the choice is about what you optimize. Use `lpt_packing` when you want to maximize batch coalescing even with replicas: it concentrates a model's requests to fill one replica's batch before spilling to the next, and it places models on GPUs reactively by measured compute and memory load, including which GPUs host a replicated model. If you do not care about batch coalescing or reactive placement, `round_robin` and `least_outstanding` are both significantly less complicated and need no measurements, no `fifo` discipline, and no startup preconditions. Both route across the replicas the workers already serve, so you replicate a model by loading it on more than one worker rather than by setting a gateway replica count: `round_robin` spreads requests blindly across those replicas, and `least_outstanding` spreads them by live occupancy, sending each request to the replica with the fewest in flight.
+
+**How to configure it.** For the batching-first path, set `scheduling.mode: lpt_packing` in `gateway.yml` and give the replicated model a replica count, either with `scheduling.default_replicas` or per model under `scheduling.models.<name>.replicas`. The gateway places each model on that many distinct GPUs and routes its requests to fill one replica's batch before moving to the next, so coalescing is preserved across replicas rather than diluted. Tune `routing_fill_factor` (raise it above 1.0 to keep the next batch queued under fast arrival) and choose a `routing_policy`: `fill_rr` (default) round-robins which replica opens each batch, and `fill_least` opens it on the least compute-loaded GPU (best when replicas share GPUs with other models). For the simpler path, set `scheduling.mode: round_robin` or `least_outstanding` and load the model on each worker that should serve it; neither mode takes a replica count or any of the `lpt_packing` knobs. See [Multi-GPU Gateway](multi_gpu_gateway.md) for the full set of knobs.
 
 Replica counts are fixed at startup; a model does not fan out automatically under load. Size the replica count for the model's expected concurrency, and rely on the per-GPU queue and batch coalescing to absorb bursts on each replica.
 
@@ -166,7 +169,7 @@ scheduling:
   default_replicas: 1               # most models on one GPU
   rebalance_compute_seconds: 30
   routing_fill_factor: 1.0          # raise above 1 to keep the next batch queued under bursty load
-  routing_policy: fill_rr           # fill_least when replicas share GPUs with other models; least_outstanding to spread
+  routing_policy: fill_rr           # fill_least when replicas share GPUs with other models
   models:
     resnet50:
       replicas: 2                   # served on 2 distinct GPUs; requests routed to fill batches

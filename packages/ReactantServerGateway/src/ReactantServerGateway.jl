@@ -48,6 +48,7 @@ include("routing.jl")
 include("metrics.jl")
 include("client.jl")
 include("refresh.jl")
+include("scheduler.jl")
 include("lpt_packing.jl")
 include("server.jl")
 include("health.jl")
@@ -109,16 +110,15 @@ function serve_gateway(gateway_path::Union{AbstractString,Nothing} = nothing; bl
     gate = RegisterGate()
     metrics = GatewayMetrics()
     refresher = RouteRefresher(pool, routes, metrics)
-    # LPT-packing scheduling: hard startup preconditions (all workers reachable, FIFO discipline,
-    # identical model sets), then an initial rebalance so the first requests already route by
-    # packing rather than waiting a prober tick.
-    packing = nothing
-    if cfg.scheduling_mode == "lpt_packing"
-        verify_lpt_packing_preconditions!(pool; wait_seconds = _startup_wait_seconds())
-        packing = LptPackingState(cfg)
-        @info "gateway scheduling: lpt_packing" rebalance_compute_seconds = cfg.rebalance_compute_seconds min_rebalance_seconds = cfg.min_rebalance_seconds default_replicas = (cfg.default_replicas == REPLICAS_ALL ? "all" : cfg.default_replicas) routing_policy = cfg.routing_policy
-    end
-    state = GatewayState(pool, routes, gate, metrics, refresher, packing)
+    # Build the gateway scheduler for the configured mode and run its startup hook before anything
+    # else starts: lpt_packing verifies hard preconditions (all workers reachable, FIFO discipline,
+    # identical model sets, raising on violation) and does an initial rebalance so the first requests
+    # already route by packing; round_robin / least_outstanding are no-ops here. Run before the admin
+    # server starts so a precondition failure leaves nothing running.
+    scheduler = make_scheduler(cfg)
+    scheduler_start!(scheduler, pool, metrics)
+    @info "gateway scheduling" mode = cfg.scheduling_mode
+    state = GatewayState(pool, routes, gate, metrics, refresher, scheduler)
 
     admin = start_admin(metrics, cfg.listen_metrics; worker_metrics = cfg.worker_metrics)
     # Discover routes once synchronously so the table is populated before we accept traffic;
@@ -130,8 +130,7 @@ function serve_gateway(gateway_path::Union{AbstractString,Nothing} = nothing; bl
     catch e
         @warn "initial route discovery failed; the health prober will retry" exception = e
     end
-    packing === nothing || rebalance!(packing, pool, copy(pool.order), metrics)
-    prober = start_prober!(HealthProber(pool, metrics, admin, routes; packing = packing))
+    prober = start_prober!(HealthProber(pool, metrics, admin, routes; scheduler = scheduler))
     router = build_gateway_router(state, cfg)
 
     host, port = _split_hostport(cfg.listen_grpc)

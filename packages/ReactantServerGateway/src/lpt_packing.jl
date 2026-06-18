@@ -15,10 +15,11 @@
 # Within a model's replica set the gateway routes each request to fill one replica's batch before
 # moving to the next (see route_replica), using the worker-reported effective max batch size as the
 # fill target, so the workers receive favorable groupings to coalesce. The routing_policy decides
-# only which replica a fresh batch opens on: `fill_rr` round-robins it across the set, `fill_least`
-# opens on the least compute-loaded GPU (so a model's batches avoid GPUs busy with other models),
-# and `least_outstanding` skips concentration entirely. Coalescing itself stays at the worker; the
-# gateway only routes and tracks small per-replica and per-worker outstanding/load counters.
+# only which replica a fresh batch opens on: `fill_rr` round-robins it across the set and
+# `fill_least` opens on the least compute-loaded GPU (so a model's batches avoid GPUs busy with
+# other models). Coalescing itself stays at the worker; the gateway only routes and tracks small
+# per-replica and per-worker outstanding/load counters. (Spreading without concentration is the
+# separate `least_outstanding` scheduling mode, not an lpt_packing policy; see scheduler.jl.)
 #
 # Repacks are driven by accumulated fleet compute, not wall-clock: the prober polls the workers
 # every tick and a repack fires once the fleet has consumed `rebalance_compute_seconds`
@@ -139,7 +140,7 @@ end
 
 # ---------------------------------------------------------------------------------------------
 
-mutable struct LptPackingState
+mutable struct LptPackingState <: GatewayScheduler
     # knobs (from GatewayConfig)
     hysteresis::Float64
     rate_halflife::Float64
@@ -148,7 +149,7 @@ mutable struct LptPackingState
     default_replicas::Int
     model_replicas::Dict{String,Int}         # per-model replica overrides (immutable after build)
     routing_fill_factor::Float64
-    routing_policy::String                    # "fill_rr" | "fill_least" | "least_outstanding"
+    routing_policy::String                    # "fill_rr" | "fill_least"
     # arrival counting: a copy-on-write snapshot dict of per-model atomic counters. Reads (the
     # request hot path) touch only the immutable snapshot; insertion of a new model swaps in a
     # copy under the lock.
@@ -174,9 +175,8 @@ mutable struct LptPackingState
     @atomic assignment::Dict{String,Placement}
     # outstanding (in-flight) request counters, swapped atomically at repack so the hot path reads a
     # stable snapshot and increments the shared atomics inside. Per (model, worker) drives the fill
-    # quantum; per worker drives least_outstanding (request count) and fill_least (compute-weighted).
+    # quantum.
     @atomic outstanding::Dict{Tuple{String,String},Threads.Atomic{Int}}
-    @atomic worker_outstanding::Dict{String,Threads.Atomic{Int}}
     # Per-worker in-flight compute load: the sum over a worker's in-flight requests of each routed
     # model's cost weight (GPU-seconds). Drives fill_least's least-loaded batch-start choice. Every
     # routed request, single- or multi-replica, contributes, so the load reflects all models.
@@ -201,7 +201,7 @@ LptPackingState(cfg::GatewayConfig) = LptPackingState(
     Dict{String,Float64}(), Dict{String,Float64}(), Dict{String,Tuple{Float64,UInt64}}(),
     0.0, 0.0, 0.0,
     Dict{String,Int}(), Dict{String,Float64}(), Dict{String,Placement}(),
-    Dict{Tuple{String,String},Threads.Atomic{Int}}(), Dict{String,Threads.Atomic{Int}}(),
+    Dict{Tuple{String,String},Threads.Atomic{Int}}(),
     Dict{String,Threads.Atomic{Float64}}(),
     Dict{String,ReentrantLock}(), Dict{String,Threads.Atomic{Int}}(),
     Set{Tuple{String,String}}(), Set{String}())
@@ -283,12 +283,10 @@ end
 # reused per model so the same object guards a model regardless of which snapshot a request read.
 function _swap_outstanding!(s::LptPackingState, next::Dict{String,Placement})
     prev_out = @atomic s.outstanding
-    prev_wout = @atomic s.worker_outstanding
     prev_wload = @atomic s.worker_load
     prev_locks = @atomic s.sel_locks
     prev_cursors = @atomic s.rr_cursor
     out = Dict{Tuple{String,String},Threads.Atomic{Int}}()
-    wout = Dict{String,Threads.Atomic{Int}}()
     wload = Dict{String,Threads.Atomic{Float64}}()
     locks = Dict{String,ReentrantLock}()
     cursors = Dict{String,Threads.Atomic{Int}}()
@@ -299,14 +297,10 @@ function _swap_outstanding!(s::LptPackingState, next::Dict{String,Placement})
         end
         for (w, _) in placement
             out[(m, w)] = get(prev_out, (m, w), Threads.Atomic{Int}(0))
-            if !haskey(wout, w)
-                wout[w] = get(prev_wout, w, Threads.Atomic{Int}(0))
-                wload[w] = get(prev_wload, w, Threads.Atomic{Float64}(0.0))
-            end
+            haskey(wload, w) || (wload[w] = get(prev_wload, w, Threads.Atomic{Float64}(0.0)))
         end
     end
     @atomic s.outstanding = out
-    @atomic s.worker_outstanding = wout
     @atomic s.worker_load = wload
     @atomic s.sel_locks = locks
     @atomic s.rr_cursor = cursors
@@ -500,17 +494,15 @@ function _route_weight(s::LptPackingState, model::AbstractString)
 end
 
 # Reserve `model` on a single worker `w` (the n==1 fast path and the shared per-worker bookkeeping):
-# bump the per-(model,worker), per-worker request, and per-worker compute-load counters, returning
-# the reservation tuple to release later. Any counter missing from the live snapshot (mid-repack
-# drift) is skipped and released as a no-op.
-function _reserve_on!(out_snap, wout_snap, wload_snap, model, w, weight)
+# bump the per-(model,worker) and per-worker compute-load counters, returning the reservation tuple
+# to release later. Any counter missing from the live snapshot (mid-repack drift) is skipped and
+# released as a no-op.
+function _reserve_on!(out_snap, wload_snap, model, w, weight)
     mwc = get(out_snap, (model, w), nothing)
-    wreq = get(wout_snap, w, nothing)
     wload = get(wload_snap, w, nothing)
     mwc === nothing || Threads.atomic_add!(mwc, 1)
-    wreq === nothing || Threads.atomic_add!(wreq, 1)
     wload === nothing || Threads.atomic_add!(wload, weight)
-    return (mwc, wreq, wload, weight)
+    return (mwc, wload, weight)
 end
 
 """
@@ -531,13 +523,11 @@ model's requests (the `-outs` term wins), so batches coalesce. They differ only 
   - `fill_least`: opens on the replica whose worker has the least in-flight compute load (in-flight
     requests weighted by measured per-request cost), so a model's batches land on whichever GPU is
     least busy across all models; URL breaks exact ties.
-  - `least_outstanding`: non-concentrating; every request goes to the worker with the least total
-    in-flight work.
 
-Every routed request, single- or multi-replica, bumps the per-worker request and compute-load
-counters, so `fill_least`/`least_outstanding` see load from all models. The reservation (atomic
-increments under the per-model selection lock for multi-replica models) makes concurrent selections
-see the choice, so requests do not stampede onto the same replica.
+Every routed request, single- or multi-replica, bumps the per-worker compute-load counter, so
+`fill_least` sees load from all models. The reservation (atomic increments under the per-model
+selection lock for multi-replica models) makes concurrent selections see the choice, so requests do
+not stampede onto the same replica.
 """
 function route_replica(s::LptPackingState, model::AbstractString)
     placement = get(@atomic(s.assignment), model, nothing)
@@ -546,13 +536,12 @@ function route_replica(s::LptPackingState, model::AbstractString)
     n == 0 && return nothing
 
     out_snap = @atomic s.outstanding
-    wout_snap = @atomic s.worker_outstanding
     wload_snap = @atomic s.worker_load
     weight = _route_weight(s, model)
 
     if n == 1
         w = placement[1][1]
-        return (String[w], _reserve_on!(out_snap, wout_snap, wload_snap, model, w, weight))
+        return (String[w], _reserve_on!(out_snap, wload_snap, model, w, weight))
     end
 
     workers = String[p[1] for p in placement]
@@ -571,15 +560,7 @@ function route_replica(s::LptPackingState, model::AbstractString)
             outs[i] = a[]
         end
         order = collect(1:n)
-        if s.routing_policy == "least_outstanding"
-            wouts = Vector{Int}(undef, n)
-            for i in 1:n
-                wa = get(wout_snap, workers[i], nothing)
-                wouts[i] = wa === nothing ? 0 : wa[]
-            end
-            sort!(order; by = i -> (wouts[i], outs[i], workers[i]))
-            chosen = order[1]
-        elseif s.routing_policy == "fill_least"
+        if s.routing_policy == "fill_least"
             wloads = Vector{Float64}(undef, n)
             for i in 1:n
                 wa = get(wload_snap, workers[i], nothing)
@@ -601,29 +582,64 @@ function route_replica(s::LptPackingState, model::AbstractString)
             tied > 1 && cur !== nothing && (cur[] = mod(chosen, n))
         end
         Threads.atomic_add!(cobjs[chosen], 1)
-        wobj = get(wout_snap, workers[chosen], nothing)
-        wobj === nothing || Threads.atomic_add!(wobj, 1)
         wload = get(wload_snap, workers[chosen], nothing)
         wload === nothing || Threads.atomic_add!(wload, weight)
         ordered = String[workers[i] for i in order]
-        return (ordered, cobjs[chosen], wobj, wload)
+        return (ordered, cobjs[chosen], wload)
     end
     res === nothing && return (workers, nothing)
-    ordered, mwc, wobj, wload = res
-    return (ordered, (mwc, wobj, wload, weight))
+    ordered, mwc, wload = res
+    return (ordered, (mwc, wload, weight))
 end
 
-# Release a reservation made by route_replica: decrement the per-(model,worker) and per-worker
-# request counters and subtract the captured compute weight from the per-worker load. Robust to the
-# failure path: called once in a finally regardless of how the dispatch ended, and to any counter
-# that was absent at reservation time (drift), which is stored as `nothing`.
+# Release a reservation made by route_replica: decrement the per-(model,worker) request counter and
+# subtract the captured compute weight from the per-worker load. Robust to the failure path: called
+# once in a finally regardless of how the dispatch ended, and to any counter that was absent at
+# reservation time (drift), which is stored as `nothing`.
 function _release_route!(counters)
     counters === nothing && return nothing
-    mwc, wreq, wload, weight = counters
+    mwc, wload, weight = counters
     mwc === nothing || Threads.atomic_sub!(mwc, 1)
-    wreq === nothing || Threads.atomic_sub!(wreq, 1)
     wload === nothing || Threads.atomic_sub!(wload, weight)
     return nothing
+end
+
+# --- GatewayScheduler interface (see scheduler.jl) --------------------------------------------
+# `record_arrival!(s::LptPackingState, model)` is defined above and is the specialization of the
+# generic for this scheduler; the rest of the interface is adapted here.
+
+release!(::LptPackingState, reservation) = _release_route!(reservation)
+
+scheduler_tick!(s::LptPackingState, pool::ClientPool, ready_urls, metrics) =
+    tick_packing!(s, pool, ready_urls, metrics)
+
+# Hard startup preconditions (all workers reachable, FIFO discipline, identical model sets), then an
+# initial rebalance so the first requests already route by packing rather than waiting a prober tick.
+function scheduler_start!(s::LptPackingState, pool::ClientPool, metrics)
+    verify_lpt_packing_preconditions!(pool; wait_seconds = _startup_wait_seconds())
+    @info "gateway scheduling: lpt_packing" rebalance_compute_seconds = s.rebalance_compute_seconds min_rebalance_seconds = s.min_rebalance_seconds default_replicas = (s.default_replicas == REPLICAS_ALL ? "all" : s.default_replicas) routing_policy = s.routing_policy
+    rebalance!(s, pool, copy(pool.order), metrics)
+    return nothing
+end
+
+# Route to the placement replica that fills its batch first (route_replica reserves it), the rest of
+# the placement following as failover, then any discovered replicas outside the placement as a
+# last resort so a concentrated model survives its worker dying between repacks. A model without a
+# placement yet (cold, or new since the last repack) falls back to round robin over discovered routes.
+function select_replicas(s::LptPackingState, ctx::ScheduleContext)
+    routed = route_replica(s, ctx.model)
+    if routed === nothing
+        urls = pick(ctx.routes, ctx.model)
+        urls === nothing && return nothing
+        return (urls, nothing)
+    end
+    urls, counters = routed
+    rr = pick(ctx.routes, ctx.model)
+    if rr !== nothing
+        extra = String[u for u in rr if !(u in urls)]
+        isempty(extra) || (urls = vcat(urls, extra))
+    end
+    return (urls, counters)
 end
 
 """

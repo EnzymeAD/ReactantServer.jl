@@ -56,14 +56,14 @@ The gateway routes each model's requests across its replicas according to `sched
 
 ```yaml
 scheduling:
-  mode: lpt_packing             # round_robin (default) | lpt_packing
+  mode: lpt_packing             # round_robin (default) | least_outstanding | lpt_packing
   rebalance_compute_seconds: 30 # fleet GPU-seconds consumed that triggers a repack
   min_rebalance_seconds: 0      # wall-clock floor between repacks (0 = none)
   rate_halflife_seconds: 30
   hysteresis: 0.1               # minimum improvement before a model moves workers
   default_replicas: 1           # GPUs per model unless overridden below (a number, or "all")
-  routing_fill_factor: 1.0      # per-replica fill target as a multiple of max batch size
-  routing_policy: fill_rr       # fill_rr (default) | fill_least | least_outstanding
+  routing_fill_factor: 1.0      # per-replica fill target as a multiple of max batch size (lpt_packing only)
+  routing_policy: fill_rr       # fill_rr (default) | fill_least  (lpt_packing only)
   models:
     big-model:
       replicas: 2               # this model is placed on 2 distinct GPUs (a number, or "all")
@@ -73,6 +73,12 @@ scheduling:
 It is fully predictable from the config file and needs no measurements, at the cost of thin
 per-worker queues: when every model is on every worker, each worker sees a slice of every
 model's traffic, so coalesced batches rarely fill.
+
+**`least_outstanding`** sends each request to the replica with the fewest in-flight requests,
+spreading by live occupancy rather than blindly. Like `round_robin` it needs no measurements and no
+preconditions and does not concentrate traffic, so it favors even spreading over batch coalescing;
+prefer it over `round_robin` when a model's replicas have uneven or unpredictable per-request
+latency, so a slow replica stops attracting new work instead of accumulating a backlog.
 
 **`lpt_packing`** places each model on a fixed number of distinct GPUs and routes its requests
 to preserve batch fill. A model's replica count is operator-controlled: `default_replicas`
@@ -115,8 +121,9 @@ times the model's max batch size, then opens a fresh batch on another replica. S
 `routing_fill_factor` above 1.0 to keep the next batch queued so a worker does not go idle between
 dispatches.
 
-`routing_policy` decides only *which* replica a fresh batch opens on (all the `fill_*` variants
-preserve the fill-one-replica-first behavior above; they differ only at the batch boundary):
+`routing_policy` (lpt_packing only) decides only *which* replica a fresh batch opens on (both
+variants preserve the fill-one-replica-first behavior above; they differ only at the batch
+boundary):
 
 - **`fill_rr`** (default) round-robins the opening replica across the model's set, so successive
   batches of the same model spread evenly over its GPUs.
@@ -124,16 +131,12 @@ preserve the fill-one-replica-first behavior above; they differ only at the batc
   compute load, measured across *all* models as in-flight requests weighted by each model's
   measured per-request compute cost. Prefer this when replicas share GPUs with other models, so a
   model's batches open on whichever of its GPUs is least busy rather than always the same one.
-- **`least_outstanding`** drops concentration entirely and sends every request to the GPU with the
-  least total in-flight work. Use it only when you want even spreading over batching.
+
+Spreading every request without concentrating it is the separate `least_outstanding` scheduling
+mode above, not a routing policy.
 
 A single-replica model is the degenerate case: all its requests go to its one GPU (and still count
 toward that GPU's load for the `fill_least` decisions of models that share it).
-
-!!! note "`fill` is deprecated"
-    The earlier `routing_policy: fill` is still accepted as an alias of `fill_rr` and logs a
-    deprecation warning at startup. Its old behavior opened every model's first batch on the same
-    lowest-address GPU, which concentrated cold traffic onto one card; `fill_rr` replaces it.
 
 `lpt_packing` has two preconditions, verified at gateway startup: every worker must run the `fifo`
 scheduler discipline (placement decisions move to the gateway, so workers should not re-order

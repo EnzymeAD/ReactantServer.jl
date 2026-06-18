@@ -85,7 +85,7 @@ end
     @test_throws ReactantServerCore.ConfigError _load("scheduling:\n  default_replicas: huge\n" * eps)
 end
 
-@testset "config: routing_policy accepts the fill variants and deprecates 'fill'" begin
+@testset "config: routing_policy accepts only the fill variants" begin
     function _load(yaml)
         path = tempname() * ".yaml"
         write(path, yaml)
@@ -97,13 +97,17 @@ end
     end
     eps = "endpoints:\n  - \"127.0.0.1:7001\"\n"
     _pol(p) = _load("scheduling:\n  routing_policy: $p\n" * eps).routing_policy
+    _mode(m) = _load("scheduling:\n  mode: $m\n" * eps).scheduling_mode
     @test _pol("fill_rr") == "fill_rr"
     @test _pol("fill_least") == "fill_least"
-    @test _pol("least_outstanding") == "least_outstanding"
     @test _load(eps).routing_policy == "fill_rr"                      # default
-    # 'fill' is a deprecated alias of 'fill_rr': warns, but resolves rather than failing.
-    @test (@test_logs (:warn,) _pol("fill")) == "fill_rr"
+    # least_outstanding is now a top-level scheduling mode, not a routing policy.
+    @test _mode("least_outstanding") == "least_outstanding"
+    @test_throws ReactantServerCore.ConfigError _pol("least_outstanding")
+    # The old 'fill' alias is removed; it is now just an invalid value.
+    @test_throws ReactantServerCore.ConfigError _pol("fill")
     @test_throws ReactantServerCore.ConfigError _pol("bogus")
+    @test_throws ReactantServerCore.ConfigError _mode("bogus")
 end
 
 @testset "verify_lpt_packing_preconditions!: gates on worker reachability" begin
@@ -256,15 +260,6 @@ end
     @test out[("m", "w0")][] == 0 && out[("m", "w1")][] == 0
 end
 
-@testset "route_replica: least_outstanding spreads by total in-flight" begin
-    s = _pk_state(; routing_policy = "least_outstanding", max_batch = 8)
-    # With equal totals, the first pick is deterministic; the second goes to the other replica
-    # because the first reservation raised that worker's total.
-    a, _ = GW.route_replica(s, "m")
-    b, _ = GW.route_replica(s, "m")
-    @test a[1] != b[1]
-end
-
 @testset "reset_clients! recovers a poisoned (stalled) worker connection" begin
     # A server that accepts TCP but never speaks gRPC/HTTP-2: the connection establishes then stalls
     # on the HTTP/2 handshake, exactly like a worker caught in its brief silent-accept window at
@@ -400,8 +395,8 @@ end
             _aff_infer(gw_port, "beta")
         end
         sleep(1.1)   # ensure dt since the startup baseline rebalance is meaningful
-        aff = gw.prober.packing
-        @test aff !== nothing
+        aff = gw.prober.scheduler
+        @test aff isa GW.LptPackingState
         GW.rebalance!(aff, gw.pool, copy(gw.pool.order), gw.metrics)
 
         # Both models now have a single-worker placement (default replicas = 1): every route for a

@@ -26,13 +26,15 @@ struct GatewayConfig
     max_send_msg_bytes::Int
     log_level::String
     log_format::String
-    # Scheduling (the `scheduling:` block). `round_robin` spreads each model's requests uniformly
-    # across its replicas (the original behavior); `lpt_packing` concentrates each model's traffic on
-    # few workers, placing each model on a fixed, operator-configured number of distinct GPUs and
-    # routing a model's requests to fill one replica's batch before the next, to maximize the
-    # workers' batch coalescing. LPT packing requires worker FIFO discipline and all models on all
-    # workers (checked at startup). The remaining knobs apply to lpt_packing only.
-    scheduling_mode::String                 # "round_robin" | "lpt_packing"
+    # Scheduling (the `scheduling:` block); the mode selects the gateway scheduler (see scheduler.jl).
+    # `round_robin` spreads each model's requests uniformly across its replicas (the original
+    # behavior); `least_outstanding` sends each request to the replica with the least in-flight work
+    # (spreads without concentrating); `lpt_packing` concentrates each model's traffic on few workers,
+    # placing each model on a fixed, operator-configured number of distinct GPUs and routing a model's
+    # requests to fill one replica's batch before the next, to maximize the workers' batch coalescing.
+    # LPT packing requires worker FIFO discipline and all models on all workers (checked at startup).
+    # The remaining knobs apply to lpt_packing only.
+    scheduling_mode::String                 # "round_robin" | "least_outstanding" | "lpt_packing"
     # Repack cadence is driven by accumulated fleet compute, not wall-clock: a repack fires once the
     # fleet has consumed `rebalance_compute_seconds` GPU-seconds since the last one, subject to a
     # `min_rebalance_seconds` wall-clock floor (0 = none).
@@ -45,19 +47,17 @@ struct GatewayConfig
     # `scheduling.models`, else `default_replicas`). Set at startup; never grows automatically.
     # `default_replicas: all` (stored as REPLICAS_ALL) places every model on every ready worker.
     default_replicas::Int
-    # Request routing within a model's replica set. `routing_fill_factor` is the per-replica fill
-    # target as a multiple of the model's max batch size (1.0 fills exactly one batch before moving
-    # on; >1 over-provisions to keep the next batch queued). `routing_policy` selects where a new
-    # batch starts (all `fill_*` variants still concentrate to fill one replica's batch before the
+    # Request routing within a model's replica set (lpt_packing only). `routing_fill_factor` is the
+    # per-replica fill target as a multiple of the model's max batch size (1.0 fills exactly one batch
+    # before moving on; >1 over-provisions to keep the next batch queued). `routing_policy` selects
+    # where a new batch starts (both variants still concentrate to fill one replica's batch before the
     # next; they differ only in which replica a fresh batch opens on):
     #   "fill_rr"     round-robins the starting replica across the model's set (default).
     #   "fill_least"  starts on the replica with the least in-flight compute load (in-flight
     #                 requests weighted by the model's measured per-request cost), so a model's
     #                 batches open on whichever GPU is least busy across all models.
-    #   "least_outstanding"  the non-concentrating option: every request goes to the GPU with the
-    #                 least total in-flight work (no batch concentration).
-    # "fill" is a deprecated alias of "fill_rr" (warned at load); the old URL-first behavior, which
-    # opened every model's first batch on the same lowest-URL GPU, is gone.
+    # Spreading every request without concentration is the separate `least_outstanding` scheduling
+    # mode (see scheduling_mode above), not a routing policy.
     routing_fill_factor::Float64
     routing_policy::String
     models::Dict{String,GatewayModelConfig}
@@ -176,15 +176,13 @@ function _build_gateway_config(raw::Dict{String,Any})
     end
 
     scheduling_mode = lowercase(strip(_opt(sched, "mode", String, "round_robin")))
-    scheduling_mode in ("round_robin", "lpt_packing") ||
-        throw(ConfigError("scheduling.mode must be 'round_robin' or 'lpt_packing', got '$scheduling_mode'"))
+    scheduling_mode in ("round_robin", "least_outstanding", "lpt_packing") ||
+        throw(ConfigError("scheduling.mode must be 'round_robin', 'least_outstanding', or 'lpt_packing', got '$scheduling_mode'"))
     routing_policy = lowercase(strip(_opt(sched, "routing_policy", String, "fill_rr")))
-    if routing_policy == "fill"
-        @warn "scheduling.routing_policy 'fill' is deprecated; use 'fill_rr' (its replacement) or 'fill_least'. Treating as 'fill_rr'."
-        routing_policy = "fill_rr"
-    end
-    routing_policy in ("fill_rr", "fill_least", "least_outstanding") ||
-        throw(ConfigError("scheduling.routing_policy must be 'fill_rr', 'fill_least', or 'least_outstanding', got '$routing_policy'"))
+    routing_policy == "least_outstanding" &&
+        throw(ConfigError("scheduling.routing_policy no longer accepts 'least_outstanding'; it is now a top-level scheduling mode. Set scheduling.mode: least_outstanding instead."))
+    routing_policy in ("fill_rr", "fill_least") ||
+        throw(ConfigError("scheduling.routing_policy must be 'fill_rr' or 'fill_least', got '$routing_policy'"))
 
     cfg = GatewayConfig(
         _opt(listen, "grpc", String, "0.0.0.0:8001"),
