@@ -58,7 +58,7 @@ include("health.jl")
 Handle to a gateway started with `serve_gateway(...; blocking=false)`. Pass it to [`stop!`](@ref)
 to shut the gRPC server, the readiness prober, and the admin HTTP server down.
 """
-struct RunningGateway
+struct RunningGateway{S}
     cfg::GatewayConfig
     pool::ClientPool
     routes::DiscoveredRoutes
@@ -66,7 +66,7 @@ struct RunningGateway
     metrics::GatewayMetrics
     admin::AdminServer
     prober::HealthProber
-    server::Any
+    server::S          # the gRPC server handle; type inferred from gRPCServer.serve!
 end
 
 # HTTP/2 receive flow-control windows the gateway advertises to its clients. The protocol default
@@ -159,6 +159,7 @@ function stop!(g::RunningGateway)
     close(g.server)
     stop_prober!(g.prober)
     close(g.admin.server)
+    close_pool!(g.pool)
     return nothing
 end
 

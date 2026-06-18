@@ -125,8 +125,10 @@ control plane answers, the workers are usually not up when the gateway starts, s
 for all of them before serving rather than failing, logging which workers are still pending. Under
 the node supervisor (the embedded gateway) this wait is enabled automatically; for a standalone
 gateway set `REACTANT_GATEWAY_STARTUP_WAIT_SECONDS` (a number of seconds, or `inf` to wait
-indefinitely; the default `0` fails fast). Once all workers are up, a wrong discipline or differing
-model set is a hard error. Runtime drift after startup degrades gracefully: a model temporarily
+indefinitely; the default `0` fails fast). Each poll is watchdog-bounded, and if the gRPC client
+stack wedges during the long warmup (a known libcurl failure mode) the gateway exits so the
+supervisor restarts it with a fresh stack; this self-heals and you may see one such restart before
+it serves. Once all workers are up, a wrong discipline or differing model set is a hard error. Runtime drift after startup degrades gracefully: a model temporarily
 missing from some workers is routed uniformly over its actual replicas with a warning until the
 fleet converges, and a worker that drops out is excluded from placement, its traffic failing over
 to the remaining replicas.

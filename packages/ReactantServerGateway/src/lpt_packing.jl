@@ -30,6 +30,12 @@
 # The weights are exported as metrics; request routing uses outstanding-batch counts, not weights.
 const Placement = Vector{Tuple{String,Float64}}
 
+# Watchdog ceiling for one control-status poll. The gateway's clients share one libcurl multi
+# handle with a 16-slot request semaphore (GRPC_MAX_STREAMS); if its driving stalls, in-flight
+# calls never release their slot and new calls block forever, so every poll is bounded and a worker
+# that exceeds this is treated as not-polled.
+const POLL_TIMEOUT_SECONDS = 8.0
+
 """
     compute_assignment(u, workers, prev; mem=Dict(), mem_cap=Dict(),
                        replicas=Dict(), default_replicas=1, hysteresis=0.1)
@@ -205,7 +211,11 @@ function _poll_workers(pool::ClientPool, ready_urls::Vector{String})
         wc = get_clients(pool, url)
         wc === nothing && continue
         @async begin
-            resp = fetch_control_status(wc)
+            # Watchdog-bounded: a wedged client stack would otherwise hang the prober tick (and with
+            # it route discovery and /readyz). A worker that does not answer is simply skipped this
+            # round, as if not ready.
+            resp, _ = _bounded(() -> fetch_control_status(wc), POLL_TIMEOUT_SECONDS, nothing,
+                               "ModelControlStatus poll", url)
             resp === nothing && return
             lock(lk) do
                 push!(polled, url)
@@ -471,7 +481,8 @@ function _release_route!(counters)
 end
 
 """
-    verify_lpt_packing_preconditions!(pool; wait_seconds=0, poll_interval=5.0) -> nothing
+    verify_lpt_packing_preconditions!(pool; wait_seconds=0, poll_interval=10.0,
+                                      call_timeout=8.0, wedge_rounds=3) -> nothing
 
 LPT-packing mode's startup checks: every configured worker must be reachable over the control
 plane, report FIFO scheduling discipline, and serve an identical model set (load-all).
@@ -483,21 +494,46 @@ answer, logging which are still pending; with `wait_seconds <= 0` (the default) 
 fails fast. The supervisor sets this to wait for the workers it co-launches (see `gateway_spec`).
 Once all workers are reachable, FIFO discipline and identical model sets are hard requirements and
 a violation raises with the offending worker named.
+
+Every poll is watchdog-bounded (`call_timeout`): the gateway's clients share one libcurl multi
+handle whose request semaphore caps in-flight requests at GRPC_MAX_STREAMS (16). After the burst of
+failed connects during warmup the handle's socket/timer driving can stall, so in-flight requests
+never complete, never return their semaphore slot, and every new call blocks at acquire forever (the
+"wedge"). A worker that is merely down refuses fast and releases its slot; but if every worker's
+call exceeds the watchdog for `wedge_rounds` consecutive rounds (the wedge signature), the process
+exits so the supervisor restarts the gateway with a fresh handle (16 free slots), which recovers.
 """
 function verify_lpt_packing_preconditions!(pool::ClientPool; wait_seconds::Real=0,
-                                           poll_interval::Real=5.0)
+                                           poll_interval::Real=10.0, call_timeout::Real=8.0,
+                                           wedge_rounds::Integer=3)
     clients = all_clients(pool)
     forever = isinf(wait_seconds)
     deadline = (forever || wait_seconds <= 0) ? nothing : time() + Float64(wait_seconds)
     statuses = Dict{String,Any}()
+    wedged_streak = 0
     while true
         statuses = Dict{String,Any}()
         pending = String[]
+        timed_out = 0
         for wc in clients
-            resp = fetch_control_status(wc)
-            resp === nothing ? push!(pending, wc.url) : (statuses[wc.url] = resp)
+            resp, to = _bounded(() -> fetch_control_status(wc), call_timeout, nothing,
+                                "ModelControlStatus poll", wc.url)
+            if resp === nothing
+                push!(pending, wc.url)
+                to && (timed_out += 1)
+            else
+                statuses[wc.url] = resp
+            end
         end
         isempty(pending) && break
+        # Wedge signature: every worker's call exceeded the watchdog (the client stack stopped being
+        # driven, not just refused). A fresh process recovers, so exit for a supervisor restart
+        # rather than spin forever on a dead handle.
+        wedged_streak = timed_out == length(clients) ? wedged_streak + 1 : 0
+        if wedge_rounds > 0 && wedged_streak >= wedge_rounds
+            @error "lpt_packing: control-plane calls timed out for $(wedged_streak) consecutive rounds; the gRPC client stack is wedged. Exiting so the supervisor restarts the gateway with a fresh stack." rounds = wedged_streak
+            exit(1)
+        end
         if !forever && (wait_seconds <= 0 || time() >= deadline)
             suffix = wait_seconds <= 0 ? "" : " after $(round(Int, wait_seconds))s"
             error("lpt_packing scheduling: worker(s) $(sort(pending)) unreachable over the control plane$(suffix); all workers must be up (set REACTANT_GATEWAY_STARTUP_WAIT_SECONDS to wait for slow-starting workers, or 'inf' to wait indefinitely)")

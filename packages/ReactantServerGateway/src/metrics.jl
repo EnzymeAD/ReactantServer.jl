@@ -182,10 +182,10 @@ end
 # once at least one worker has reported ServerReady. With `worker_metrics` endpoints configured,
 # /metrics aggregates every worker's export behind the gateway's own, so one scrape covers the
 # whole node (workers self-tag their series with worker/gpu labels).
-mutable struct AdminServer
+mutable struct AdminServer{S}
     ready::Threads.Atomic{Bool}
     metrics::GatewayMetrics
-    server::Any
+    server::S          # the HTTP listener handle; type inferred from HTTP.serve!
 end
 
 set_ready!(a::AdminServer, v::Bool) = (a.ready[] = v; nothing)

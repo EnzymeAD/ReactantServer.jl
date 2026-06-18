@@ -4,9 +4,10 @@
 # independently. All three are raw Vector{UInt8} in and out; only the small routing headers are
 # decoded (see headers.jl). Mirrors the Go gateway's internal/grpcserver.
 
-# Per-request state threaded through gRPCServer's context payload.
-struct GatewayState
-    pool::ClientPool
+# Per-request state threaded through gRPCServer's context payload. Parametric on the pool type so
+# the request hot path (`st.pool` -> `get_clients` -> `wc.infer`) stays type-stable.
+struct GatewayState{P<:ClientPool}
+    pool::P
     routes::DiscoveredRoutes
     gate::RegisterGate
     metrics::GatewayMetrics
