@@ -78,7 +78,9 @@ synthesizes `worker0..workerN-1`, one per detected device. To customize, mount a
 - `global:` — defaults merged into every worker (runtime, scheduler, cache_dir, endpoints).
 
 Supervisor environment variables: `REACTANT_GPUS` (count or device list; `0` for a CPU node),
-`REACTANT_CPU_WORKERS` (workers on a CPU node, default 1), `REACTANT_ROLE` (below),
+`REACTANT_CPU_WORKERS` (workers on a CPU node, default 1), `REACTANT_WORKER_THREADS` (compute
+threads per worker; default is the host's share, `min(CPU_THREADS ÷ workers, 16)`, so co-located
+workers do not oversubscribe the CPU), `REACTANT_ROLE` (below),
 `REACTANT_SUPERVISOR_MAX_RESTARTS` (consecutive crash budget per child before the node exits 1;
 default unlimited, with the healthcheck reporting unready instead), `REACTANT_NODE_FILE`, and
 `REACTANT_GATEWAY_FILE`.
@@ -178,5 +180,25 @@ Load parameters are the `loadgen` service's `LOADGEN_*` environment variables:
 `LOADGEN_TRANSPORT` (`tcp`, `shm`, or `mixed`; `shm` exercises shared-memory
 register/unregister), `LOADGEN_CONCURRENCY`, `LOADGEN_DURATION_SECONDS`,
 `LOADGEN_REPORT_SECONDS`, and `LOADGEN_MODELS`. The generator's weight cache budget is
-`WEIGHT_CACHE_BYTES` (default 24 GiB). The loadgen prints rolling throughput, latency, error
-counts, and scraped gateway metrics, and exits nonzero if any request errored.
+`WEIGHT_CACHE_BYTES` (default 24 GiB). The loadgen prints rolling throughput, latency, and error
+counts, plus the fleet weight-cache `loads=`/`evicts=` totals (with per-window deltas, scraped
+from the aggregated `/metrics`), and exits nonzero if any request errored. A steadily rising
+`evicts` means the model set does not fit resident and the workers are reloading weights from host
+to device — weight thrash, distinct from CPU oversubscription.
+
+## Two-GPU lpt_packing soak test
+
+`docker-compose.gpu23.yml` is the multi-GPU counterpart, exercising the gateway's placement and
+coalescing-aware routing rather than a lone worker: the supervisor runs two workers (GPUs 2 and 3,
+`CUDA_VISIBLE_DEVICES=2,3`) behind the embedded gateway, with the gateway put in `lpt_packing`
+mode via `REACTANT_GATEWAY_SCHEDULING_*` environment. It mounts `docker/node.gpu23.yaml`, which
+sets `scheduler.discipline: fifo` (required by `lpt_packing`); every worker loads every bundle, so
+the gateway places each model on one of the two GPUs and routes its requests to fill batches. Same
+prerequisites and `LOADGEN_*` knobs as the single-GPU stack:
+
+```
+REACTANTSERVER_MODELS=/path/to/bundles docker compose -f docker-compose.gpu23.yml up
+```
+
+During warmup the embedded gateway waits for both workers to come up (it logs which are pending)
+before serving; that is expected.

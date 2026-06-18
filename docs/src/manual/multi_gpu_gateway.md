@@ -178,7 +178,15 @@ e.g. `REACTANT_GATEWAY_LOGGING_LEVEL=debug` or `REACTANT_GATEWAY_SCHEDULING_MODE
 - Under `lpt_packing`, the gateway polls the workers on every 10s probe round to refresh routing
   metadata and accumulate consumed compute, but recomputes the placement only once the fleet has
   consumed `scheduling.rebalance_compute_seconds` GPU-seconds (subject to the
-  `scheduling.min_rebalance_seconds` floor).
-- Every `ModelInfer` is logged with the model name, the client-supplied request id (KServe `id`
-  field), worker URL, request and response byte counts, worker latency, and gRPC status. Logs
-  contain no tensor data.
+  `scheduling.min_rebalance_seconds` floor). Each repack logs a `lpt_packing: repack` line with the
+  number of models placed, how many `moved` workers, how many were `held_by_hysteresis`, the largest
+  available `max_improvement` against the `hysteresis` threshold, and the `compute_seconds`/
+  `wall_seconds` since the last repack — useful for watching placement churn and the trigger cadence.
+- If a probe to a worker hangs (times out, rather than failing fast), the gateway drops and
+  recreates that worker's gRPC connection before the next attempt. This recovers from a half-open
+  connection (e.g. caught during a worker's brief silent-accept window at startup) that would
+  otherwise be reused and stall every later request to that worker — the per-worker equivalent of a
+  restart, without dropping HTTP/2 multiplexing for healthy workers.
+- Successful `ModelInfer` requests are not logged (to keep the hot path quiet); worker errors and a
+  model with no live replica are logged, and per-request latency and gRPC status are exported as
+  Prometheus metrics. Logs contain no tensor data.

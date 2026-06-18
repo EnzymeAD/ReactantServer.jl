@@ -84,7 +84,9 @@ surface):
 - `global:` — defaults merged into every worker (runtime, scheduler, cache_dir, endpoints).
 
 Supervisor environment variables: `REACTANT_GPUS` (count or device list; `0` for a CPU node),
-`REACTANT_CPU_WORKERS` (workers on a CPU node, default 1), `REACTANT_ROLE` (below),
+`REACTANT_CPU_WORKERS` (workers on a CPU node, default 1), `REACTANT_WORKER_THREADS` (compute
+threads per worker; default is the host's share, `min(CPU_THREADS ÷ workers, 16)`, see
+[Scaling to Multiple GPUs](scaling.md)), `REACTANT_ROLE` (below),
 `REACTANT_SUPERVISOR_MAX_RESTARTS` (consecutive crash budget per child before the node exits 1;
 default unlimited, with the healthcheck reporting unready instead), `REACTANT_NODE_FILE`, and
 `REACTANT_GATEWAY_FILE`. The supervisor writes the materialized node file (with the synthesized
@@ -143,6 +145,21 @@ and watch for memory leaks. It pins a persistent XLA compile-cache volume so war
 recompilation, and `docker/monitor_gpu2.sh` logs GPU memory and container RSS to a CSV for leak
 detection. Because it runs the production single-GPU container, the soak tests exactly what users
 deploy.
+
+## Two-GPU lpt_packing soak test
+
+`docker-compose.gpu23.yml` is the multi-GPU counterpart: the same supervised container across two
+GPUs (`CUDA_VISIBLE_DEVICES=2,3`, so two workers behind the embedded gateway) with the gateway in
+`lpt_packing` mode. It mounts `docker/node.gpu23.yaml`, which sets `scheduler.discipline: fifo`
+(required by `lpt_packing`), and enables packing via `REACTANT_GATEWAY_SCHEDULING_*` environment.
+Use it to exercise the gateway's placement and coalescing-aware routing on the full serving path,
+not just a lone worker.
+
+The `loadgen` report line includes the fleet weight-cache `loads=`/`evicts=` totals with
+per-window deltas (scraped from the aggregated `/metrics`). A steadily rising `evicts` means the
+model set does not fit resident and the workers are thrashing weights (host-to-device reloads,
+which cost CPU) — a different problem from CPU oversubscription, addressed by more
+`weight_cache_bytes`, pinning hot models, or more GPUs.
 
 ## Security
 

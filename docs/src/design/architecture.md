@@ -151,8 +151,11 @@ pre/post work of many requests proceeds in parallel and overlaps the single, ser
 execution: while the loop runs one model on the GPU, other requests are being pre/post-processed
 on other threads, and the loop runs no `model.jl` code itself. The GPU still executes exactly one
 model at a time (that is solely a property of the single loop). Realizing the overlap needs more
-than one OS thread; the worker is started with `--threads=auto,1` and the loop runs on the lone
-interactive thread so a blocking GPU call never starves it of CPU.
+than one OS thread; the supervisor starts each worker with a bounded share of the host
+(`min(cores ÷ workers, 16)` compute threads plus one interactive thread, overridable via
+`REACTANT_WORKER_THREADS`, so co-located workers do not oversubscribe the CPU) and the loop runs
+on the lone interactive thread so a blocking GPU call never starves it of CPU. (A bare
+`ReactantServer.serve` uses whatever `--threads` you pass.)
 
 ### Decision order
 

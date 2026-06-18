@@ -91,6 +91,15 @@ to exactly one device through its own `CUDA_VISIBLE_DEVICES`, so inside the work
 always ordinal 0 and the single-GPU worker code runs unchanged. The materialized node file is
 written to `/run/reactantserver/node.yaml` for inspection.
 
+Each worker's compute-thread pool is sized to its share of the host: `min(CPU_THREADS ÷ workers, 16)`
+threads, plus one interactive thread for the GPU dispatch loop. This avoids the oversubscription
+that `--threads=auto` would cause — with several workers on one node, each `auto` worker (and its
+GC and host library pools) would otherwise size itself to the whole machine and the workers would
+fight for every core under load. The cap keeps a very large box from handing any one worker an
+unhelpfully huge pool. Set `REACTANT_WORKER_THREADS` to override the computed value (it is used
+verbatim, bypassing the split and the cap). Sized this way, each worker's steady-state CPU should
+sit near its actual working set (dispatch, GPU sync, and the data plane), not all cores.
+
 **3. Decide on the gateway** by worker count, in the default `all` role:
 
 - **One worker → no gateway.** A lone worker already serves the full KServe V2 API, so the

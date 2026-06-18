@@ -138,9 +138,11 @@ many GPUs unchanged); a bare `serve` is convenient for a quick single-worker REP
 
 Start Julia multithreaded so per-request `preprocess`/`postprocess` overlap the GPU execution
 (`julia --threads=auto,1`: a default pool for the hooks plus one interactive thread for the GPU
-dispatch loop). The container image and the supervisor's worker processes already do this; set it
-yourself only for a bare `serve`. With a single thread the server still works, just without the
-overlap.
+dispatch loop). Set this yourself only for a bare `serve`; under the supervisor (the container
+image) each worker is instead sized to its share of the host, `min(cores ÷ workers, 16)` threads
+plus the interactive one, so co-located workers do not oversubscribe the CPU (see
+[Scaling to Multiple GPUs](scaling.md)). With a single thread the server still works, just without
+the overlap.
 
 ## Step 5: Query it
 
