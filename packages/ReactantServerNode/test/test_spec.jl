@@ -26,14 +26,22 @@ end
 @testset "workspace root and child specs" begin
     @test RSN.default_workspace_root(Dict("REACTANT_WORKSPACE_ROOT" => "/opt/rs")) == "/opt/rs"
 
-    spec = RSN.worker_spec("worker1", "/run/node.yaml", "1", "/opt/rs")
+    spec = RSN.worker_spec("worker1", "/run/node.yaml", "1", "/opt/rs"; compute_threads=8)
     @test spec.name == "worker1"
     @test _envval(spec.cmd, "REACTANT_WORKER_NAME") == "worker1"
     @test _envval(spec.cmd, "CUDA_VISIBLE_DEVICES") == "1"
     @test any(a -> a == "/run/node.yaml", spec.cmd.exec)
-    # Multithreaded so per-request pre/post overlap the GPU dispatch loop (interactive thread).
-    @test any(a -> a == "--threads=auto,1", spec.cmd.exec)
+    # Sized to the worker's share of the host, plus one interactive thread for the GPU dispatch loop.
+    @test any(a -> a == "--threads=8,1", spec.cmd.exec)
     @test any(a -> occursin("packages/ReactantServer", a), spec.cmd.exec)
+
+    # Per-worker thread share: cores ÷ workers, floored at 1 and capped (default 16).
+    @test RSN._worker_thread_count(32, 2) == 16
+    @test RSN._worker_thread_count(64, 2) == 16    # capped
+    @test RSN._worker_thread_count(16, 2) == 8
+    @test RSN._worker_thread_count(8, 1) == 8
+    @test RSN._worker_thread_count(100, 1) == 16   # capped
+    @test RSN._worker_thread_count(1, 4) == 1      # floored
 
     # A CPU worker gets explicit empty GPU visibility (never the container's
     # CUDA_VISIBLE_DEVICES). Bind hosts stay the node file's concern.

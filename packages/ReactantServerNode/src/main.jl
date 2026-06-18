@@ -123,11 +123,20 @@ function build_supervisor(node_path::AbstractString;
         # without the extra process or hop. The gateway is spawned only for two or more workers.
         gpub, mpub = public_ports(env)
         sole_public = r === :all && length(ws) == 1
+        # Size each worker's compute-thread pool to its share of the host (cores ÷ workers, capped),
+        # not `auto`, so N workers on one node do not each grab every core. REACTANT_WORKER_THREADS
+        # overrides the computed value verbatim (bypassing the share split and the cap).
+        worker_threads = let v = strip(get(env, "REACTANT_WORKER_THREADS", ""))
+            isempty(v) ? _worker_thread_count(Sys.CPU_THREADS, length(ws)) :
+                         max(1, parse(Int, v))
+        end
+        push!(notes, "worker compute threads: $worker_threads (host $(Sys.CPU_THREADS) / $(length(ws)) worker(s))")
         for (i, w) in enumerate(ws)
             push!(specs, sole_public ?
                 worker_spec(_worker_name(w), node_file, selectors[i], root;
-                            grpc_port=gpub, metrics_port=mpub) :
-                worker_spec(_worker_name(w), node_file, selectors[i], root))
+                            compute_threads=worker_threads, grpc_port=gpub, metrics_port=mpub) :
+                worker_spec(_worker_name(w), node_file, selectors[i], root;
+                            compute_threads=worker_threads))
         end
         if sole_public
             push!(notes, "single worker: serving directly on $gpub (gRPC) / $mpub (metrics); no gateway")

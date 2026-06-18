@@ -38,17 +38,31 @@ w = get(ENV, "REACTANT_WORKER_NAME", "")
 ReactantServer.serve(ARGS[1]; worker = isempty(w) ? nothing : w)
 """
 
+# The default per-worker compute-thread cap. `--threads=auto` would size each worker's pool to the
+# whole host; with N workers per node that is an N-way oversubscription (each worker, plus its GC
+# and host library pools, grabbing every core), which pegs the CPU under load. The supervisor sizes
+# each worker to its share of the host (cores ÷ workers), capped here so a very large box does not
+# hand any one worker an unhelpfully huge pool.
+const _MAX_WORKER_THREADS = 16
+
+# Per-worker compute-thread count: the host's share among the workers, at least 1, capped.
+_worker_thread_count(cpu_threads::Integer, nworkers::Integer; cap::Integer=_MAX_WORKER_THREADS) =
+    clamp(cpu_threads ÷ max(1, nworkers), 1, cap)
+
 function worker_spec(name::AbstractString, node_file::AbstractString,
                      device::Union{AbstractString,Nothing}, workspace_root::AbstractString;
+                     compute_threads::Integer=_worker_thread_count(Sys.CPU_THREADS, 1),
                      grpc_port::Union{Integer,Nothing}=nothing,
                      metrics_port::Union{Integer,Nothing}=nothing,
                      grace_seconds::Real=15.0)
     proj = joinpath(workspace_root, "packages", "ReactantServer")
-    # `--threads=auto,1`: a default pool sized to the host for the per-request preprocess/
-    # postprocess tasks, plus one interactive thread the scheduler pins its GPU dispatch loop to,
-    # so CPU hook work overlaps the serialized GPU execution. (Base.julia_cmd() carries no
-    # thread setting, so this is the sole source.)
-    cmd = `$(Base.julia_cmd()) --threads=auto,1 --project=$proj -e $_WORKER_BOOT $node_file`
+    # `--threads=<compute_threads>,1`: a default pool sized to this worker's share of the host for
+    # the per-request preprocess/postprocess tasks, plus one interactive thread the scheduler pins
+    # its GPU dispatch loop to, so CPU hook work overlaps the serialized GPU execution. The share
+    # (cores ÷ workers, capped) avoids the N-way oversubscription that `auto` causes when several
+    # workers run on one node. (Base.julia_cmd() carries no thread setting, so this is the sole
+    # source.)
+    cmd = `$(Base.julia_cmd()) --threads=$(compute_threads),1 --project=$proj -e $_WORKER_BOOT $node_file`
     pairs = Pair{String,String}["REACTANT_WORKER_NAME" => String(name)]
     # Always set device visibility explicitly: the assigned selector, or empty for a CPU worker,
     # so a container-level CUDA_VISIBLE_DEVICES is never inherited by accident.
