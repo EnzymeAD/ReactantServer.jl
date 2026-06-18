@@ -37,7 +37,6 @@ function _post_infer(st::GatewayState, url, model, id, body)
     try
         resp = invoke_infer(wc, body)
         observe_worker!(st.metrics, "ModelInfer", url, time() - t0)
-        @info "infer: ok" model worker = url request_id = id req_bytes = length(body) resp_bytes = length(resp)
         return resp, STATUS_OK, nothing
     catch e
         observe_worker!(st.metrics, "ModelInfer", url, time() - t0)
