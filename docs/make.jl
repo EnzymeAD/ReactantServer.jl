@@ -45,6 +45,7 @@ makedocs(;
         "Home" => "index.md",
         "Manual" => [
             "Getting Started"          => "manual/getting_started.md",
+            "Common Use Cases"         => "manual/common_use_cases.md",
             "Scaling to Multiple GPUs" => "manual/scaling.md",
             "Client Usage"             => "manual/client_usage.md",
             "Node Configuration"       => "manual/node_config.md",
