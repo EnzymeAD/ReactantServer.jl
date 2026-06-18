@@ -59,6 +59,29 @@ end
     # replicas clamps to the worker count; default_replicas applies to unlisted models.
     @test length(GW.compute_assignment(Dict("m" => 0.9), W, NOPREV; replicas = Dict("m" => 9))["m"]) == 3
     @test length(GW.compute_assignment(Dict("m" => 0.9), W, NOPREV; default_replicas = 2)["m"]) == 2
+
+    # default_replicas = all places every model on every worker (clamped to the worker count).
+    everywhere = GW.compute_assignment(Dict("a" => 0.5, "b" => 0.1, "c" => 0.0), W, NOPREV;
+                                       default_replicas = GW.REPLICAS_ALL)
+    @test all(m -> length(everywhere[m]) == 3, keys(everywhere))
+end
+
+@testset "config: replica counts accept a positive integer or 'all'" begin
+    function _load(yaml)
+        path = tempname() * ".yaml"
+        write(path, yaml)
+        try
+            return GW.load_gateway(path)
+        finally
+            rm(path; force = true)
+        end
+    end
+    eps = "endpoints:\n  - \"127.0.0.1:7001\"\n"
+    @test _load("scheduling:\n  default_replicas: all\n" * eps).default_replicas == GW.REPLICAS_ALL
+    @test _load("scheduling:\n  default_replicas: 3\n" * eps).default_replicas == 3
+    @test _load("scheduling:\n  models:\n    big:\n      replicas: all\n" * eps).models["big"].replicas == GW.REPLICAS_ALL
+    @test_throws ReactantServerCore.ConfigError _load("scheduling:\n  default_replicas: 0\n" * eps)
+    @test_throws ReactantServerCore.ConfigError _load("scheduling:\n  default_replicas: huge\n" * eps)
 end
 
 @testset "compute_assignment: memory dimension steers placement" begin

@@ -5,6 +5,11 @@
 # Environment overrides use the `REACTANT_GATEWAY_*` prefix; `REACTANT_GATEWAY_WORKERS` (comma
 # separated) overrides the endpoint list.
 
+# Replica count sentinel: "all" in the config means "place on every ready worker". It is stored as
+# typemax(Int) so the placement clamp (clamp(replicas, 1, nworkers)) resolves it to the current
+# worker count, which tracks the fleet as workers come and go.
+const REPLICAS_ALL = typemax(Int)
+
 # Per-model scheduling override (an entry under `scheduling.models`). Currently only the replica
 # count: how many distinct GPUs host the model under lpt_packing (default `default_replicas`).
 struct GatewayModelConfig
@@ -38,6 +43,7 @@ struct GatewayConfig
     rate_halflife_seconds::Float64          # EWMA halflife for per-model arrival-rate and cost smoothing
     # Replica placement: a model lives on exactly `replicas` distinct GPUs (per-model override under
     # `scheduling.models`, else `default_replicas`). Set at startup; never grows automatically.
+    # `default_replicas: all` (stored as REPLICAS_ALL) places every model on every ready worker.
     default_replicas::Int
     # Request routing within a model's replica set. `routing_fill_factor` is the per-replica fill
     # target as a multiple of the model's max batch size (1.0 fills exactly one batch before moving
@@ -59,7 +65,7 @@ const GW_ENV_PATHS = Tuple{String,Vector{String},DataType}[
     ("SCHEDULING_MAX_WORKER_SHARE", ["scheduling", "max_worker_share"], Float64),
     ("SCHEDULING_HYSTERESIS", ["scheduling", "hysteresis"], Float64),
     ("SCHEDULING_RATE_HALFLIFE_SECONDS", ["scheduling", "rate_halflife_seconds"], Float64),
-    ("SCHEDULING_DEFAULT_REPLICAS", ["scheduling", "default_replicas"], Int),
+    ("SCHEDULING_DEFAULT_REPLICAS", ["scheduling", "default_replicas"], String),
     ("SCHEDULING_ROUTING_FILL_FACTOR", ["scheduling", "routing_fill_factor"], Float64),
     ("SCHEDULING_ROUTING_POLICY", ["scheduling", "routing_policy"], String),
     ("WORKER_CLIENT_REQUEST_TIMEOUT_SECONDS", ["worker_client", "request_timeout_seconds"], Int),
@@ -184,7 +190,7 @@ function _build_gateway_config(raw::Dict{String,Any})
         _opt(sched, "max_worker_share", Float64, 0.8),
         _opt(sched, "hysteresis", Float64, 0.1),
         _opt(sched, "rate_halflife_seconds", Float64, 30.0),
-        _opt(sched, "default_replicas", Int, 1),
+        _parse_replicas(get(sched, "default_replicas", 1), "scheduling.default_replicas"),
         _opt(sched, "routing_fill_factor", Float64, 1.0),
         routing_policy,
         _parse_gateway_sched_models(sched),
@@ -194,7 +200,6 @@ function _build_gateway_config(raw::Dict{String,Any})
     0 < cfg.max_worker_share <= 1 || throw(ConfigError("scheduling.max_worker_share must be in (0, 1]"))
     0 <= cfg.hysteresis < 1 || throw(ConfigError("scheduling.hysteresis must be in [0, 1)"))
     cfg.rate_halflife_seconds > 0 || throw(ConfigError("scheduling.rate_halflife_seconds must be positive"))
-    cfg.default_replicas >= 1 || throw(ConfigError("scheduling.default_replicas must be >= 1"))
     cfg.routing_fill_factor > 0 || throw(ConfigError("scheduling.routing_fill_factor must be positive"))
 
     if !isempty(_opt(tls, "cert_file", String, "")) || !isempty(_opt(tls, "key_file", String, ""))
@@ -206,9 +211,27 @@ function _build_gateway_config(raw::Dict{String,Any})
     return cfg
 end
 
+# Parse a replica count: a positive integer, or the string "all" (every ready worker, stored as
+# REPLICAS_ALL). Accepts an Int (from YAML) or a String (from YAML or a `REACTANT_GATEWAY_*` env).
+function _parse_replicas(v, key::AbstractString)
+    if v isa AbstractString
+        s = lowercase(strip(v))
+        s == "all" && return REPLICAS_ALL
+        n = tryparse(Int, s)
+        (n === nothing || n < 1) &&
+            throw(ConfigError("$key must be a positive integer or 'all', got '$v'"))
+        return n
+    elseif v isa Integer
+        Int(v) >= 1 || throw(ConfigError("$key must be a positive integer or 'all', got $v"))
+        return Int(v)
+    else
+        throw(ConfigError("$key must be a positive integer or 'all'"))
+    end
+end
+
 # Per-model scheduling overrides under `scheduling.models`. Each entry may set `replicas` (the
-# number of distinct GPUs that host the model under lpt_packing). Unlisted models use
-# `default_replicas`.
+# number of distinct GPUs that host the model under lpt_packing; a positive integer or "all").
+# Unlisted models use `default_replicas`.
 function _parse_gateway_sched_models(sched::AbstractDict)
     raw = get(sched, "models", nothing)
     raw === nothing && return Dict{String,GatewayModelConfig}()
@@ -217,9 +240,7 @@ function _parse_gateway_sched_models(sched::AbstractDict)
     for (name, v) in raw
         key = "scheduling.models.$name"
         v isa AbstractDict || throw(ConfigError("$key must be a mapping"))
-        replicas = _opt(v, "replicas", Int, 1)
-        replicas >= 1 || throw(ConfigError("$key.replicas must be >= 1"))
-        out[String(name)] = GatewayModelConfig(replicas)
+        out[String(name)] = GatewayModelConfig(_parse_replicas(get(v, "replicas", 1), "$key.replicas"))
     end
     return out
 end

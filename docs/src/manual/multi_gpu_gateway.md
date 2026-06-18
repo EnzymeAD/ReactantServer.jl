@@ -61,12 +61,12 @@ scheduling:
   min_rebalance_seconds: 0      # wall-clock floor between repacks (0 = none)
   rate_halflife_seconds: 30
   hysteresis: 0.1               # minimum improvement before a model moves workers
-  default_replicas: 1           # GPUs per model unless overridden below
+  default_replicas: 1           # GPUs per model unless overridden below (a number, or "all")
   routing_fill_factor: 1.0      # per-replica fill target as a multiple of max batch size
   routing_policy: fill          # fill (default) | least_outstanding
   models:
     big-model:
-      replicas: 2               # this model is placed on 2 distinct GPUs
+      replicas: 2               # this model is placed on 2 distinct GPUs (a number, or "all")
 ```
 
 **`round_robin`** (the default) spreads each model's requests uniformly across its replicas.
@@ -77,8 +77,21 @@ model's traffic, so coalesced batches rarely fill.
 **`lpt_packing`** places each model on a fixed number of distinct GPUs and routes its requests
 to preserve batch fill. A model's replica count is operator-controlled: `default_replicas`
 (default 1, the single-GPU case that coalesces best), overridable per model under
-`scheduling.models.<name>.replicas`. The count is set at startup and never grows automatically
-under load; a hot model relies on its worker's queue and coalescing rather than fanning out. The
+`scheduling.models.<name>.replicas`. Both accept a positive integer or `all`, which places the
+model on every ready worker (so `default_replicas: all` replicates the whole model set across all
+GPUs without listing each model, and tracks the fleet as workers come and go). The count is set at
+startup and never grows automatically under load; a hot model relies on its worker's queue and
+coalescing rather than fanning out.
+
+!!! warning "Replication is the operator's responsibility"
+    The gateway does not check that a replica count is feasible for your hardware. Replicating a
+    model charges its full weight footprint to every GPU it lands on, so `replicas: 2` (or
+    `default_replicas: all`) only makes sense when those weights actually fit on each card
+    alongside everything else placed there. If the assigned footprint exceeds a worker's
+    on-demand weight budget, the weights cannot all stay resident and the worker thrashes,
+    loading and evicting weights on nearly every request, which destroys throughput. Size replica
+    counts against your GPU memory. The gateway logs a `weight footprint exceeds the worker's
+    on-demand budget` warning at each repack when a placement is oversubscribed, so watch for it. The
 packer chooses which GPUs host each model's replicas by balancing two live measurements: compute
 demand (the gateway-measured arrival rate times the true per-request compute cost the workers
 report over the control plane) and resident weight footprint against each worker's weight-memory

@@ -22,16 +22,19 @@ logging:
 # fill one replica's batch before the next, maximizing batch coalescing. lpt_packing requires
 # worker scheduler.discipline: fifo (node file) and all models loaded on all workers. The
 # embedded gateway reads the same knobs from REACTANT_GATEWAY_SCHEDULING_* environment variables.
+# NOTE: replicas are the operator's responsibility. A replica charges the model's full weight
+# footprint to every GPU it lands on; if that does not fit a GPU's weight budget the worker
+# thrashes (loads/evicts weights on nearly every request). Size replica counts to your GPU memory.
 # scheduling:
 #   mode: lpt_packing               # round_robin | lpt_packing
 #   rebalance_compute_seconds: 30.0 # fleet GPU-seconds consumed that triggers a repack
 #   min_rebalance_seconds: 0.0      # wall-clock floor between repacks (0 = none)
-#   default_replicas: 1             # GPUs per model unless overridden under models below
+#   default_replicas: 1             # GPUs per model unless overridden below (a number, or "all")
 #   routing_fill_factor: 1.0        # per-replica fill target as a multiple of max batch size
 #   routing_policy: fill            # fill | least_outstanding
 #   models:
 #     resnet50:
-#       replicas: 2                 # this model is served on 2 distinct GPUs
+#       replicas: 2                 # this model on 2 distinct GPUs (a number, or "all")
 
 endpoints:
   - "worker0:8080"

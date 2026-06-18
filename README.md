@@ -14,6 +14,10 @@ convention follows Julia's (column-major, batch-last axes).
 It targets static-graph workloads — computer vision, scientific computing — where many models
 share a GPU and one model executes at a time.
 
+Not sure which setup fits you? [Common Use Cases](docs/src/manual/common_use_cases.md) walks
+through the deployment shapes (single GPU, multi-GPU distributed or replicated, multi-node) with
+an example configuration for each.
+
 ## Highlights
 
 - **XLA-accelerated, Reactant-compiled.** Models are compiled ahead of time into device
@@ -109,6 +113,7 @@ Lux/PythonCall weakdeps stay out of the server images. The vendored forks/unregi
 ## Documentation
 
 - [Getting Started](docs/src/manual/getting_started.md) — export a model, configure a node, serve and query it.
+- [Common Use Cases](docs/src/manual/common_use_cases.md) — choosing a deployment shape, with an example configuration for each.
 - [Scaling to Multiple GPUs](docs/src/manual/scaling.md) — add GPUs and how the supervisor decides what to run.
 - [Client Usage](docs/src/manual/client_usage.md) — the Julia client, batched inference, and IO validation.
 - [Node Configuration](docs/src/manual/node_config.md) — the full node-file surface and environment overrides.

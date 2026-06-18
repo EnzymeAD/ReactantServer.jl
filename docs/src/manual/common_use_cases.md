@@ -172,7 +172,24 @@ scheduling:
       replicas: 2                   # served on 2 distinct GPUs; requests routed to fill batches
 ```
 
+To replicate every model across all GPUs without listing each one, set `default_replicas: all`
+(it resolves to the current ready-worker count and tracks the fleet as workers come and go):
+
+```yaml
+scheduling:
+  mode: lpt_packing
+  default_replicas: all             # every model on every GPU
+```
+
 Replica counts are fixed at startup; size them for the model's expected concurrency.
+
+!!! warning "Make sure you have the memory to replicate"
+    Replicating a model puts its full weight footprint on every GPU it lands on. It is your
+    responsibility to keep the result feasible: if the models placed on a GPU do not fit in its
+    weight budget, that worker thrashes, loading and evicting weights on nearly every request and
+    collapsing throughput. This is the failure mode to watch for with `default_replicas: all` on a
+    memory-constrained fleet. Size replica counts against your GPU memory, and watch the gateway's
+    oversubscription warning (see [Multi-GPU Gateway](multi_gpu_gateway.md)).
 
 See [Multi-GPU Gateway](multi_gpu_gateway.md).
 
