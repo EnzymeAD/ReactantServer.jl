@@ -39,7 +39,11 @@ end
 # Build one worker's clients over a freshly-created multi handle.
 function _worker_clients(cfg::GatewayConfig, url::AbstractString)
     host, port = _split_hostport(url)
-    grpc = gRPCClient.gRPCCURL()   # one running multi handle per worker
+    # sticky=true pins each handle's libcurl driving tasks (socket watchers + timer) to the thread
+    # that owns them via @async rather than Threads.@spawn. The gateway terminates and forwards on
+    # one event-loop thread, so sticky scheduling keeps the per-request driving on that thread and
+    # avoids cross-thread handoff overhead on the hot path.
+    grpc = gRPCClient.gRPCCURL(; sticky = true)   # one running multi handle per worker
     infer = GRPCInferenceService_ModelInfer_Client(host, port; grpc = grpc,
         TRequest = Vector{UInt8}, TResponse = Vector{UInt8},
         deadline = cfg.request_timeout_seconds,
