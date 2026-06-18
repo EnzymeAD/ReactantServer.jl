@@ -1,0 +1,41 @@
+# Two-GPU lpt_packing soak node config, mounted into the supervised all-in-one container
+# (docker-compose.gpu23.yml). The supervisor runs two workers (one per visible GPU, selected by
+# CUDA_VISIBLE_DEVICES=2,3) plus the embedded gateway on 8001/8002. The gateway is put in
+# lpt_packing mode via the REACTANT_GATEWAY_SCHEDULING_* environment in the compose file. That mode
+# requires every worker to run the fifo discipline (set below, so placement decisions move to the
+# gateway and the workers do not re-order against it) and to serve the identical model set (every
+# worker loads every bundle in the repository, which is the default).
+#
+# This is the no-replication setup: with the gateway's default_replicas: 1, lpt_packing places each
+# model on ONE of the two GPUs (chosen by balancing memory and compute), so a model's weights live
+# on a single card and its traffic concentrates there for batch coalescing. As in the single-GPU
+# soak (node.gpu2.yaml), no `models:` map is needed; the on-demand weight cache (weight_cache_bytes)
+# keeps each GPU memory-safe by loading weights lazily and evicting LRU within the byte budget.
+model_repo: /var/lib/reactantserver/models
+base_port: 8080
+# Per-worker Prometheus metrics port (metrics_base_port + worker index): worker0 -> 9100,
+# worker1 -> 9101. The embedded gateway aggregates both behind its own /metrics on 8002.
+metrics_base_port: 9100
+
+global:
+  cache_dir: /var/cache/reactantserver
+  runtime:
+    backend: cuda
+    mem_fraction: 0.9
+    preallocate: true
+    allow_cpu_fallback: false
+    # On-demand weight cache per GPU: weights load lazily and evict LRU within this byte budget
+    # (24 GiB), so all models need not be resident at once. 0 would keep every weight resident.
+    weight_cache_bytes: 25769803776
+  scheduler:
+    discipline: fifo            # required by lpt_packing (placement decisions move to the gateway)
+    ema_halflife_seconds: 30.0
+    max_queue_depth: 1024
+  endpoints:
+    host: 0.0.0.0
+
+# Two workers, one per visible GPU. The supervisor assigns device i to worker i and sets that
+# worker's own CUDA_VISIBLE_DEVICES, so each worker sees a single GPU at ordinal 0.
+workers:
+  - { name: worker0 }
+  - { name: worker1 }
