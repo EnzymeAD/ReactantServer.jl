@@ -18,15 +18,20 @@ logging:
   format: "json"
 
 # Request scheduling across workers. round_robin (default) spreads each model uniformly;
-# lpt_packing concentrates each model's traffic on few workers from measured load and
-# worker-reported compute cost, maximizing batch coalescing. lpt_packing requires worker
-# scheduler.discipline: fifo (node file) and all models loaded on all workers. The embedded
-# gateway reads the same knobs from REACTANT_GATEWAY_SCHEDULING_* environment variables.
+# lpt_packing places each model on a fixed number of distinct GPUs and routes its requests to
+# fill one replica's batch before the next, maximizing batch coalescing. lpt_packing requires
+# worker scheduler.discipline: fifo (node file) and all models loaded on all workers. The
+# embedded gateway reads the same knobs from REACTANT_GATEWAY_SCHEDULING_* environment variables.
 # scheduling:
-#   mode: lpt_packing         # round_robin | lpt_packing
-#   rebalance_seconds: 15.0   # placement recompute interval
-#   max_worker_share: 0.8     # max share of one worker a single model may claim
-#   hysteresis: 0.1           # min improvement required to move a placement
+#   mode: lpt_packing               # round_robin | lpt_packing
+#   rebalance_compute_seconds: 30.0 # fleet GPU-seconds consumed that triggers a repack
+#   min_rebalance_seconds: 0.0      # wall-clock floor between repacks (0 = none)
+#   default_replicas: 1             # GPUs per model unless overridden under models below
+#   routing_fill_factor: 1.0        # per-replica fill target as a multiple of max batch size
+#   routing_policy: fill            # fill | least_outstanding
+#   models:
+#     resnet50:
+#       replicas: 2                 # this model is served on 2 distinct GPUs
 
 endpoints:
   - "worker0:8080"

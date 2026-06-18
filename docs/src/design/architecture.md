@@ -73,7 +73,8 @@ The broader mission, the target audience, and the explicit non-goals are on the
   visible GPUs and starts one worker process per device. With a single worker it binds that
   worker to the public ports directly (no gateway); with two or more it also starts a thin
   embedded gateway that gives clients one endpoint and routes each model's traffic across
-  workers, either uniformly (round robin) or by adaptive memory-aware placement (`lpt_packing`).
+  workers, either uniformly (round robin) or by packing each model onto a fixed,
+  operator-configured number of GPUs with coalescing-aware routing (`lpt_packing`).
   See the [Scaling to Multiple GPUs](../manual/scaling.md) and
   [Multi-GPU Gateway](../manual/multi_gpu_gateway.md) guides.
 - **Weights as explicit arguments.** Weights are passed to the compiled executable as arguments
@@ -131,7 +132,7 @@ single-resident-model strategy above safe.
 Two disciplines are supported. `fair` (the default) is a deficit-weighted, cost-aware share that
 balances GPU time across models on the worker. `fifo` ignores per-model weights and serves in
 global arrival order; it is the right choice when the worker sits behind a gateway running
-`lpt_packing`, which moves the placement and fairness decisions upstream (the two would otherwise
+`lpt_packing`, which moves the placement decisions upstream (the two would otherwise
 fight). Coalescing applies under both.
 
 ### Structure

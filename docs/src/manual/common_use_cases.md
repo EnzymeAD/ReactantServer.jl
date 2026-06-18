@@ -1,6 +1,6 @@
 # Common Use Cases
 
-This page describes the most common ways people deploy ReactantServer, organized by the situation you are in rather than by feature. Each section describes who the configuration is for, what it provides today, and leaves room for an example configuration.
+This page describes the most common ways people deploy ReactantServer, organized by the situation you are in rather than by feature. Each section describes who the configuration is for, what it provides today, and gives an example configuration to start from.
 
 Support for more accelerators is planned. CUDA is supported today, with CPU for development and fallback. For the authoritative and current feature details, see the [Architecture](../design/architecture.md) and the manual pages linked throughout; this page is a guide to choosing a configuration, not a substitute for the reference documentation.
 
@@ -45,11 +45,32 @@ On-demand loading is what makes this work for "a ton of models": a card serves f
 
 This is the recommended starting point for small labs. It is also the conceptual foundation for the multi-GPU distributed case, which scales this same idea across cards.
 
-**Example configuration.**
+**Example configuration.** A node file with a single worker on the visible GPU. The on-demand
+weight cache (`weight_cache_bytes`) lets the model library exceed VRAM: weights load lazily and
+evict LRU within the budget. The `fair` discipline shares GPU time across models so a busy model
+does not starve the rest. Mount it over `/etc/reactantserver/node.yaml`.
 
 ```yaml
-# Example single-GPU node configuration.
-# (configuration to be filled in)
+# node.yaml — one GPU, many models served on demand.
+model_repo: /var/lib/reactantserver/models
+base_port: 8080
+metrics_base_port: 9100
+gpus: auto                          # one worker on the visible GPU
+
+global:
+  cache_dir: /var/cache/reactantserver
+  runtime:
+    backend: cuda
+    mem_fraction: 0.9
+    # Weights load lazily and evict LRU within this GPU byte budget (here 24 GiB), so the model
+    # library need not fit in VRAM at once. 0 keeps every weight resident.
+    weight_cache_bytes: 25769803776
+  scheduler:
+    discipline: fair                # cost-aware share of GPU time across models (the default)
+    ema_halflife_seconds: 30.0
+    max_queue_depth: 1024
+  endpoints:
+    host: 0.0.0.0
 ```
 
 See [Node Configuration](node_config.md) and [On-demand Weights](on_demand_weights.md) for the full surface.
@@ -81,11 +102,42 @@ flowchart LR
     class Client client
 ```
 
-**Example configuration.**
+**Example configuration.** A node file with one worker per GPU, and the embedded gateway in
+`lpt_packing` mode with `default_replicas: 1` so each model lives on a single GPU that the packer
+chooses by balancing memory and compute. `lpt_packing` requires the workers to run the `fifo`
+discipline (placement moves to the gateway).
 
 ```yaml
-# Example multi-GPU distributed node configuration.
-# (configuration to be filled in)
+# node.yaml — several GPUs on one machine; each model placed on one GPU by the gateway.
+model_repo: /var/lib/reactantserver/models
+base_port: 8080
+metrics_base_port: 9100
+gpus: auto                          # one worker per visible GPU
+
+global:
+  cache_dir: /var/cache/reactantserver
+  runtime:
+    backend: cuda
+    mem_fraction: 0.9
+    weight_cache_bytes: 25769803776 # on-demand cache per GPU, as in the single-GPU case
+  scheduler:
+    discipline: fifo                # required by lpt_packing (placement moves to the gateway)
+    ema_halflife_seconds: 30.0
+    max_queue_depth: 1024
+  endpoints:
+    host: 0.0.0.0
+```
+
+The supervisor runs the embedded gateway for you; enable `lpt_packing` on it either with
+`REACTANT_GATEWAY_SCHEDULING_MODE=lpt_packing` (plus matching `REACTANT_GATEWAY_SCHEDULING_*`
+variables) or by mounting a `gateway.yml` with:
+
+```yaml
+# gateway.yml — embedded gateway scheduling block.
+scheduling:
+  mode: lpt_packing
+  default_replicas: 1               # each model on a single GPU; the packer balances which one
+  rebalance_compute_seconds: 30     # repack after the fleet consumes this many GPU-seconds
 ```
 
 See [Multi-GPU Gateway](multi_gpu_gateway.md) and [Scaling to Multiple GPUs](scaling.md).
@@ -96,18 +148,31 @@ See [Multi-GPU Gateway](multi_gpu_gateway.md) and [Scaling to Multiple GPUs](sca
 
 **What it provides today.**
 
-- ReactantServerGateway round-robin routing across replicas
+- ReactantServerGateway `lpt_packing` with a configurable replica count per model and coalescing-aware routing across those replicas
 
-**Current status and known limitation.** This is the configuration that needs the most work. It functions, but round-robin routing does not maximize batch coalescing: distributing a model's concurrent requests evenly across replicas means each replica assembles smaller batches than it could. Work is underway on a smart routing strategy that concentrates a model's concurrent requests onto one replica until it has a full batch worth in flight before moving to the next replica, which preserves coalescing across replicas. Until that lands, expect round-robin's batch-fill behavior under bursty load to be suboptimal.
+**How to configure it.** Set `scheduling.mode: lpt_packing` in `gateway.yml` and give the replicated model a replica count, either with `scheduling.default_replicas` or per model under `scheduling.models.<name>.replicas`. The gateway places each model on that many distinct GPUs and routes its requests to fill one replica's batch before moving to the next, so coalescing is preserved across replicas rather than diluted. Tune `routing_fill_factor` (raise it above 1.0 to keep the next batch queued under fast arrival) and choose `routing_policy: least_outstanding` when replicas share GPUs with other models. See [Multi-GPU Gateway](multi_gpu_gateway.md) for the full set of knobs.
 
-If your workload is not especially bursty, or if per-request latency matters more than batch throughput, round-robin may be perfectly adequate today. If you depend on batch coalescing for throughput on a replicated model, watch for the smart routing work before relying on this configuration.
+Replica counts are fixed at startup; a model does not fan out automatically under load. Size the replica count for the model's expected concurrency, and rely on the per-GPU queue and batch coalescing to absorb bursts on each replica.
 
-**Example configuration.**
+**Example configuration.** The node file is the same as the distributed case (one worker per GPU,
+`discipline: fifo`). The difference is in the gateway: give the hot model a replica count so it is
+placed on more than one GPU, and the gateway routes its requests to fill one replica's batch before
+the next.
 
 ```yaml
-# Example multi-GPU replicated node configuration.
-# (configuration to be filled in)
+# gateway.yml — front the node's workers and replicate hot models for throughput.
+scheduling:
+  mode: lpt_packing
+  default_replicas: 1               # most models on one GPU
+  rebalance_compute_seconds: 30
+  routing_fill_factor: 1.0          # raise above 1 to keep the next batch queued under bursty load
+  routing_policy: fill              # or least_outstanding when replicas share GPUs with other models
+  models:
+    resnet50:
+      replicas: 2                   # served on 2 distinct GPUs; requests routed to fill batches
 ```
+
+Replica counts are fixed at startup; size them for the model's expected concurrency.
 
 See [Multi-GPU Gateway](multi_gpu_gateway.md).
 
@@ -134,17 +199,42 @@ flowchart TD
     class G0,G1,G2 gpu
 ```
 
-**Example integration.**
+**The endpoint contract.** Each node exposes the same interface a control plane integrates
+against: the KServe V2 gRPC data plane (`ModelInfer`, `RepositoryIndex`, `ServerReady`) plus the
+worker control RPCs (`ModelControlStatus`, `SetModelResidency`, `SetModelPolicy`) for residency and
+policy, and an admin HTTP port serving `/healthz`, `/readyz`, and Prometheus `/metrics`. Your
+control plane discovers which models each node serves via `RepositoryIndex` and routes `ModelInfer`
+to a node that reports the model ready.
+
+**Example integration.** The simplest multi-node setup reuses the standalone gateway, pointed at
+every node's worker endpoints; a larger deployment replaces it with your own control plane speaking
+the same gRPC interface.
 
 ```yaml
-# Example showing the control plane interface / endpoint contract.
-# (to be filled in)
+# gateway.yml — a standalone gateway fronting the workers of several nodes.
+listen:
+  grpc: "0.0.0.0:8001"
+  metrics: "0.0.0.0:8002"
+scheduling:
+  mode: lpt_packing
+  default_replicas: 1
+endpoints:
+  - "node1-worker0:8080"
+  - "node1-worker1:8081"
+  - "node2-worker0:8080"
+  - "node2-worker1:8081"
+# Optional: aggregate every worker's /metrics behind the gateway's own.
+# metrics_endpoints:
+#   - "node1-worker0:9100"
+#   - "node1-worker1:9101"
+#   - "node2-worker0:9100"
+#   - "node2-worker1:9101"
 ```
 
 See [Multi-GPU Gateway](multi_gpu_gateway.md) and [Docker Deployment](docker.md) for the node interface, ports, and health/metrics endpoints a control plane would use.
 
 ## Summary
 
-The common path is to start on a single GPU with on-demand loading and fair scheduling, then scale to multi-GPU distributed (LPT packing) as the model library outgrows one card. Replicated multi-GPU is for compute-bound workloads and currently uses round-robin routing, with smarter coalescing-aware routing in progress. Multi-node is for users who bring their own control plane and integrate against the provided gRPC interface.
+The common path is to start on a single GPU with on-demand loading and fair scheduling, then scale to multi-GPU distributed (LPT packing) as the model library outgrows one card. Replicated multi-GPU is for compute-bound workloads: set a per-model replica count under `lpt_packing` and the gateway routes across replicas to preserve batch coalescing. Multi-node is for users who bring their own control plane and integrate against the provided gRPC interface.
 
 Feature support evolves; check the linked manual and design pages for the current state rather than relying on this overview alone.

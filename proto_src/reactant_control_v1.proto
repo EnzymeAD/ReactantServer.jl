@@ -47,6 +47,10 @@ message ModelStatus
   double total_compute_seconds = 8;
   uint64 requests_served = 9;
   uint64 dispatch_count = 10;
+  // The effective maximum batch size the worker coalesces this model to: the largest compiled
+  // batch shape, further limited by the configured scheduler.models.<name>.max_batch_size cap.
+  // 0 when unknown. Routing metadata a gateway uses to fill one replica's batch before the next.
+  int64 max_batch_size = 11;
 }
 
 message ModelControlStatusResponse

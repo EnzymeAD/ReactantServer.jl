@@ -106,7 +106,7 @@ function serve_gateway(gateway_path::Union{AbstractString,Nothing} = nothing; bl
     if cfg.scheduling_mode == "lpt_packing"
         verify_lpt_packing_preconditions!(pool)
         packing = LptPackingState(cfg)
-        @info "gateway scheduling: lpt_packing" rebalance_seconds = cfg.rebalance_seconds max_worker_share = cfg.max_worker_share hysteresis = cfg.hysteresis
+        @info "gateway scheduling: lpt_packing" rebalance_compute_seconds = cfg.rebalance_compute_seconds min_rebalance_seconds = cfg.min_rebalance_seconds default_replicas = cfg.default_replicas routing_policy = cfg.routing_policy
     end
     state = GatewayState(pool, routes, gate, metrics, refresher, packing)
 

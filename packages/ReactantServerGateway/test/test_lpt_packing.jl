@@ -16,6 +16,16 @@ include(ReactantServerCore.control_server_stubs_path())
 const GW = ReactantServerGateway
 const NOPREV = Dict{String,GW.Placement}()
 
+@testset "control proto: max_batch_size round-trips" begin
+    ms = ACtl.ModelStatus(; name = "m", max_batch_size = Int64(32))
+    io = IOBuffer()
+    GW.PB.encode(GW.PB.ProtoEncoder(io), ms)
+    seekstart(io)
+    got = GW.PB.decode(GW.PB.ProtoDecoder(io), ACtl.ModelStatus)
+    @test got.name == "m"
+    @test got.max_batch_size == 32
+end
+
 @testset "compute_assignment: concentration and LPT balance" begin
     W = ["w0", "w1"]
     asn = GW.compute_assignment(Dict("a" => 0.5, "b" => 0.4, "c" => 0.1), W, NOPREV)
@@ -32,17 +42,23 @@ const NOPREV = Dict{String,GW.Placement}()
     @test !haskey(asn, "ghost")
 end
 
-@testset "compute_assignment: split over the share cap" begin
+@testset "compute_assignment: configured replicas on distinct GPUs" begin
     W = ["w0", "w1", "w2"]
-    asn = GW.compute_assignment(Dict("big" => 1.5), W, NOPREV; max_share = 0.8)
-    pl = asn["big"]
-    @test length(pl) == 2                            # ceil(1.5 / 0.8) = 2 workers
-    @test sum(last.(pl)) ≈ 1.0                       # distribution sums to 1
-    @test all(w -> w == 0.5, last.(pl))              # even shares
-    # too big for the fleet: clamps to all workers
-    asn2 = GW.compute_assignment(Dict("huge" => 9.0), W, NOPREV; max_share = 0.8)
-    @test length(asn2["huge"]) == 3
-    @test sum(last.(asn2["huge"])) ≈ 1.0
+    # Default is one GPU regardless of load: a hot model does not fan out on its own.
+    one = GW.compute_assignment(Dict("hot" => 1.5), W, NOPREV)
+    @test length(one["hot"]) == 1
+    @test one["hot"][1][2] == 1.0
+
+    # replicas = 2 places the model on two distinct workers with even weights summing to 1.
+    two = GW.compute_assignment(Dict("m" => 0.9), W, NOPREV; replicas = Dict("m" => 2))
+    @test length(two["m"]) == 2
+    @test allunique(first.(two["m"]))                # no worker hosts the model twice
+    @test sum(last.(two["m"])) ≈ 1.0
+    @test all(==(0.5), last.(two["m"]))
+
+    # replicas clamps to the worker count; default_replicas applies to unlisted models.
+    @test length(GW.compute_assignment(Dict("m" => 0.9), W, NOPREV; replicas = Dict("m" => 9))["m"]) == 3
+    @test length(GW.compute_assignment(Dict("m" => 0.9), W, NOPREV; default_replicas = 2)["m"]) == 2
 end
 
 @testset "compute_assignment: memory dimension steers placement" begin
@@ -98,20 +114,55 @@ end
     @test asn3["a"][1][1] in W
 end
 
-@testset "pick_placement: weighted sampling and failover order" begin
+# Build a packing state directly for routing unit tests, with a two-replica placement installed.
+function _pk_state(; routing_policy = "fill", fill_factor = 1.0, max_batch = 8)
     cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], 60, 1, 1, "info", "json",
-                           "lpt_packing", 15.0, 0.8, 0.1, 30.0)
+                           "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, fill_factor, routing_policy,
+                           Dict{String,GW.GatewayModelConfig}())
     s = GW.LptPackingState(cfg)
-    @atomic s.assignment = Dict{String,GW.Placement}("m" => [("w0", 0.9), ("w1", 0.1)])
-    n0 = 0
-    for _ in 1:2000
-        urls = GW.pick_placement(s, "m")
-        @test length(urls) == 2
-        @test Set(urls) == Set(["w0", "w1"])         # all replicas present as failover
-        urls[1] == "w0" && (n0 += 1)
-    end
-    @test 1650 <= n0 <= 1950                          # ~90% to the heavy worker
-    @test GW.pick_placement(s, "unknown") === nothing  # cold -> caller falls back to RR
+    @atomic s.assignment = Dict{String,GW.Placement}("m" => [("w0", 0.5), ("w1", 0.5)])
+    @atomic s.max_batch = Dict("m" => max_batch)
+    GW._swap_outstanding!(s, (@atomic s.assignment))
+    return s
+end
+
+@testset "route_replica: fill one replica before the next" begin
+    s = _pk_state(; max_batch = 8)
+    firsts = [GW.route_replica(s, "m")[1][1] for _ in 1:8]   # hold all 8 in flight
+    @test all(==(firsts[1]), firsts)                          # first batch fills one replica
+    ninth, _ = GW.route_replica(s, "m")
+    @test ninth[1] != firsts[1]                               # then spill to the other
+    @test Set(ninth) == Set(["w0", "w1"])                     # both present as failover
+
+    # fill_factor over-provisions the per-replica target (1.5 * 8 = 12).
+    s2 = _pk_state(; fill_factor = 1.5, max_batch = 8)
+    f2 = [GW.route_replica(s2, "m")[1][1] for _ in 1:12]
+    @test all(==(f2[1]), f2)
+    @test GW.route_replica(s2, "m")[1][1] != f2[1]
+
+    # single-replica fast path: no counters; cold model falls back to round robin.
+    @atomic s.assignment = Dict{String,GW.Placement}("solo" => [("w0", 1.0)])
+    GW._swap_outstanding!(s, (@atomic s.assignment))
+    urls, counters = GW.route_replica(s, "solo")
+    @test urls == ["w0"] && counters === nothing
+    @test GW.route_replica(s, "unknown") === nothing
+end
+
+@testset "route_replica: release frees the counter on every path" begin
+    s = _pk_state(; max_batch = 4)
+    held = [GW.route_replica(s, "m")[2] for _ in 1:6]
+    foreach(GW._release_route!, held)
+    out = @atomic s.outstanding
+    @test out[("m", "w0")][] == 0 && out[("m", "w1")][] == 0
+end
+
+@testset "route_replica: least_outstanding spreads by total in-flight" begin
+    s = _pk_state(; routing_policy = "least_outstanding", max_batch = 8)
+    # With equal totals, the first pick is deterministic; the second goes to the other replica
+    # because the first reservation raised that worker's total.
+    a, _ = GW.route_replica(s, "m")
+    b, _ = GW.route_replica(s, "m")
+    @test a[1] != b[1]
 end
 
 # --- Integration: mock workers serving inference + control ------------------------------------
@@ -149,7 +200,8 @@ function _aff_router()
                               weight_nbytes = Int64(256 * 1024 * 1024),
                               total_compute_seconds = get(w.compute, m, 0.0),
                               requests_served = UInt64(get(w.served, m, 0)),
-                              dispatch_count = UInt64(get(w.served, m, 0)))
+                              dispatch_count = UInt64(get(w.served, m, 0)),
+                              max_batch_size = Int64(8))
                           for m in w.models],
                 weight_cache_max_bytes = UInt64(8) * 1024^3)
         end,
@@ -169,7 +221,7 @@ function _aff_gatewayfile(gw_port, admin_port, worker_ports)
       metrics: "127.0.0.1:$admin_port"
     scheduling:
       mode: lpt_packing
-      rebalance_seconds: 1.0
+      rebalance_compute_seconds: 0.001
     endpoints:
     $eps
     """)
@@ -212,11 +264,13 @@ end
         @test aff !== nothing
         GW.rebalance!(aff, gw.pool, copy(gw.pool.order), gw.metrics)
 
-        # Both models now have a single-worker placement (weight 1.0).
+        # Both models now have a single-worker placement (default replicas = 1): every route for a
+        # model returns the same worker.
         for m in models
-            urls = GW.pick_placement(aff, m)
-            @test urls !== nothing
-            @test count(u -> u == urls[1], [GW.pick_placement(aff, m)[1] for _ in 1:10]) == 10
+            routed = GW.route_replica(aff, m)
+            @test routed !== nothing
+            urls = routed[1]
+            @test count(u -> u == urls[1], [GW.route_replica(aff, m)[1][1] for _ in 1:10]) == 10
         end
 
         # Concentration end to end: further traffic for alpha lands on one worker only.
@@ -230,10 +284,30 @@ end
         @test d0 + d1 == 20
         @test max(d0, d1) == 20                       # all on the placed worker
 
+        # Compute-driven trigger: tick_packing! accumulates fleet compute and repacks only once the
+        # budget is crossed.
+        aff.rebalance_compute_seconds = 1.0e9      # effectively never
+        before = aff.last_rebalance
+        for _ in 1:10
+            _aff_infer(gw_port, "alpha")
+        end
+        GW.tick_packing!(aff, gw.pool, copy(gw.pool.order), gw.metrics)
+        @test aff.last_rebalance == before          # not enough compute -> no repack
+        @test aff.compute_accum > 0                 # but the compute was accounted
+
+        aff.rebalance_compute_seconds = 1.0e-9      # any compute triggers
+        for _ in 1:10
+            _aff_infer(gw_port, "alpha")
+        end
+        GW.tick_packing!(aff, gw.pool, copy(gw.pool.order), gw.metrics)
+        @test aff.last_rebalance > before           # repacked
+        @test aff.compute_accum == 0.0              # accumulator reset on repack
+
         # Placement is observable in the metrics.
         body = String(HTTP.get("http://127.0.0.1:$admin_port/metrics"; retry = false).body)
         @test occursin("gateway_placement_weight", body)
         @test occursin("gateway_model_utilization", body)
+        @test occursin("gateway_model_replicas", body)
     finally
         GW.stop!(gw)
         close(s0)

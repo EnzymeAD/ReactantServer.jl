@@ -141,10 +141,11 @@ struct ModelStatus
     total_compute_seconds::Float64
     requests_served::UInt64
     dispatch_count::UInt64
+    max_batch_size::Int64
 end
-ModelStatus(;name = "", residency = Residency.RESIDENCY_UNSPECIFIED, device_resident = false, host_resident = false, weight_nbytes = zero(Int64), weight = zero(Float64), queue_depth = zero(Int64), total_compute_seconds = zero(Float64), requests_served = zero(UInt64), dispatch_count = zero(UInt64)) = ModelStatus(name, residency, device_resident, host_resident, weight_nbytes, weight, queue_depth, total_compute_seconds, requests_served, dispatch_count)
-PB.default_values(::Type{ModelStatus}) = (;name = "", residency = Residency.RESIDENCY_UNSPECIFIED, device_resident = false, host_resident = false, weight_nbytes = zero(Int64), weight = zero(Float64), queue_depth = zero(Int64), total_compute_seconds = zero(Float64), requests_served = zero(UInt64), dispatch_count = zero(UInt64))
-PB.field_numbers(::Type{ModelStatus}) = (;name = 1, residency = 2, device_resident = 3, host_resident = 4, weight_nbytes = 5, weight = 6, queue_depth = 7, total_compute_seconds = 8, requests_served = 9, dispatch_count = 10)
+ModelStatus(;name = "", residency = Residency.RESIDENCY_UNSPECIFIED, device_resident = false, host_resident = false, weight_nbytes = zero(Int64), weight = zero(Float64), queue_depth = zero(Int64), total_compute_seconds = zero(Float64), requests_served = zero(UInt64), dispatch_count = zero(UInt64), max_batch_size = zero(Int64)) = ModelStatus(name, residency, device_resident, host_resident, weight_nbytes, weight, queue_depth, total_compute_seconds, requests_served, dispatch_count, max_batch_size)
+PB.default_values(::Type{ModelStatus}) = (;name = "", residency = Residency.RESIDENCY_UNSPECIFIED, device_resident = false, host_resident = false, weight_nbytes = zero(Int64), weight = zero(Float64), queue_depth = zero(Int64), total_compute_seconds = zero(Float64), requests_served = zero(UInt64), dispatch_count = zero(UInt64), max_batch_size = zero(Int64))
+PB.field_numbers(::Type{ModelStatus}) = (;name = 1, residency = 2, device_resident = 3, host_resident = 4, weight_nbytes = 5, weight = 6, queue_depth = 7, total_compute_seconds = 8, requests_served = 9, dispatch_count = 10, max_batch_size = 11)
 
 function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelStatus}, _endpos::Int=0, _group::Bool=false)
     name = ""
@@ -157,6 +158,7 @@ function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelStatus}, _endpos::I
     total_compute_seconds = zero(Float64)
     requests_served = zero(UInt64)
     dispatch_count = zero(UInt64)
+    max_batch_size = zero(Int64)
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         if field_number == 1
@@ -179,11 +181,13 @@ function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelStatus}, _endpos::I
             requests_served = PB.decode(d, UInt64)
         elseif field_number == 10
             dispatch_count = PB.decode(d, UInt64)
+        elseif field_number == 11
+            max_batch_size = PB.decode(d, Int64)
         else
             Base.skip(d, wire_type)
         end
     end
-    return ModelStatus(name, residency, device_resident, host_resident, weight_nbytes, weight, queue_depth, total_compute_seconds, requests_served, dispatch_count)
+    return ModelStatus(name, residency, device_resident, host_resident, weight_nbytes, weight, queue_depth, total_compute_seconds, requests_served, dispatch_count, max_batch_size)
 end
 
 function PB.encode(e::PB.AbstractProtoEncoder, x::ModelStatus)
@@ -198,6 +202,7 @@ function PB.encode(e::PB.AbstractProtoEncoder, x::ModelStatus)
     x.total_compute_seconds !== zero(Float64) && PB.encode(e, 8, x.total_compute_seconds)
     x.requests_served != zero(UInt64) && PB.encode(e, 9, x.requests_served)
     x.dispatch_count != zero(UInt64) && PB.encode(e, 10, x.dispatch_count)
+    x.max_batch_size != zero(Int64) && PB.encode(e, 11, x.max_batch_size)
     return position(e.io) - initpos
 end
 function PB._encoded_size(x::ModelStatus)
@@ -212,6 +217,7 @@ function PB._encoded_size(x::ModelStatus)
     x.total_compute_seconds !== zero(Float64) && (encoded_size += PB._encoded_size(x.total_compute_seconds, 8))
     x.requests_served != zero(UInt64) && (encoded_size += PB._encoded_size(x.requests_served, 9))
     x.dispatch_count != zero(UInt64) && (encoded_size += PB._encoded_size(x.dispatch_count, 10))
+    x.max_batch_size != zero(Int64) && (encoded_size += PB._encoded_size(x.max_batch_size, 11))
     return encoded_size
 end
 

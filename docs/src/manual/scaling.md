@@ -6,6 +6,10 @@ container (or the same `supervise` call), the supervisor puts one worker on each
 fronts them with an embedded gateway so clients still send one request to one endpoint and it is
 routed to a worker that serves the model.
 
+For help deciding between the distributed (memory-constrained) and replicated (compute-constrained)
+multi-GPU shapes, with an example configuration for each, see
+[Common Use Cases](common_use_cases.md).
+
 ## The node file is unchanged
 
 `gpus: auto` already means "one worker per visible GPU", so the single-GPU node file from

@@ -1,5 +1,6 @@
 [deps]
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+DocumenterMermaid = "a078cd44-4d9c-4618-b545-3ab9d77f9177"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 ReactantServer = "faa8a0e4-1926-4c6b-a0e2-e70699715ecf"
@@ -10,10 +11,6 @@ ReactantServerNode = "49f09047-4fb9-4260-828b-8494ed8e9881"
 gRPCClient = "aaca4a50-36af-4a1d-b878-4c443f2061ad"
 gRPCServer = "b7f0dee4-5e6a-42e7-93b0-9c098bad2317"
 
-# A standalone environment does not inherit a path-dependency's own [sources], so the docs env
-# must declare the full vendored path-source closure itself: the five member packages plus the
-# unregistered/forked deps under lib/ (gRPCServer/gRPCClient are unregistered; Reactant/HTTP are
-# forks that share the registered UUID).
 [sources]
 HTTP = {path = "../lib/HTTP.jl"}
 Reactant = {path = "../lib/Reactant.jl"}

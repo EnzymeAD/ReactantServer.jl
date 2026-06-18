@@ -119,6 +119,8 @@ end
     @test snap.models["scale"].requests_served == 6
     @test snap.models["scale"].dispatch_count == 6
     @test snap.models["scale"].total_compute > 0
+    # Unbatched model (only the key-0 exec): no compiled batch shape, so the effective max batch is 0.
+    @test snap.models["scale"].max_batch_size == 0
 end
 
 # A batched mock model: x and y are (features=2, n) with the batch axis last; y = x .* w. The
@@ -148,6 +150,18 @@ function _batched_scheduler(name, sizes)
     sched = ReactantServer.Scheduler(reg, backend, pool, ReactantServer.SchedulerConfig(30.0, 1024, 30.0))
     reg.by_name[name].sched = ReactantServer.ModelSchedState(name, ReactantServer.ModelSchedConfig(1.0), 0.0)
     return sched
+end
+
+@testset "control_status reports the effective max batch" begin
+    # Largest compiled batch shape when uncapped.
+    sched = _batched_scheduler("bscale", [1, 4, 8])
+    @test ReactantServer.control_status(sched).models["bscale"].max_batch_size == 8
+
+    # The configured cap further limits the reported max batch.
+    capped = _batched_scheduler("capped", [1, 4, 8])
+    capped.registry.by_name["capped"].sched =
+        ReactantServer.ModelSchedState("capped", ReactantServer.ModelSchedConfig(1.0; max_batch_size = 2), 0.0)
+    @test ReactantServer.control_status(capped).models["capped"].max_batch_size == 2
 end
 
 # Drive select_dispatch! + execute_and_record! directly (no spawned loop) so coalescing is

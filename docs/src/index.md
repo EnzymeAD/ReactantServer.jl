@@ -30,8 +30,9 @@ clients connect to it directly.
   loads/unloads/reloads bundles online (weights, MLIR, and `model.jl` changes alike); `static`
   fixes the startup set; `explicit` cedes lifecycle and residency to an external control plane
   over the worker control RPCs.
-- Multi-GPU scheduling in the gateway: `round_robin` or adaptive memory-aware `lpt_packing`
-  placement that concentrates each model's traffic for batch coalescing (see
+- Multi-GPU scheduling in the gateway: `round_robin` or `lpt_packing`, which places each model on a
+  fixed, operator-configured number of GPUs and routes its requests to fill one replica's batch
+  before the next, preserving batch coalescing (see
   [Multi-GPU Gateway](manual/multi_gpu_gateway.md)).
 - Multiple compiled batch sizes per model and custom per-model pre/post-processing via a
   bundle's `model.jl` (see [Bundles & model.jl](manual/bundles.md)).
@@ -45,6 +46,8 @@ export). See [Architecture](design/architecture.md) for the split.
 ## Where to go next
 
 - New here? Start with [Getting Started](manual/getting_started.md).
+- Choosing a deployment shape (single GPU, multi-GPU, multi-node) with example configs:
+  [Common Use Cases](manual/common_use_cases.md).
 - Calling a server from your code: [Client Usage](manual/client_usage.md).
 - Configuring a deployment: [Node Configuration](manual/node_config.md).
 - Scaling to multiple GPUs: [Scaling to Multiple GPUs](manual/scaling.md).

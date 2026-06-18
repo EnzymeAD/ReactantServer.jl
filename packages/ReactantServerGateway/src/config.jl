@@ -5,6 +5,12 @@
 # Environment overrides use the `REACTANT_GATEWAY_*` prefix; `REACTANT_GATEWAY_WORKERS` (comma
 # separated) overrides the endpoint list.
 
+# Per-model scheduling override (an entry under `scheduling.models`). Currently only the replica
+# count: how many distinct GPUs host the model under lpt_packing (default `default_replicas`).
+struct GatewayModelConfig
+    replicas::Int
+end
+
 struct GatewayConfig
     listen_grpc::String
     listen_metrics::String
@@ -17,14 +23,30 @@ struct GatewayConfig
     log_format::String
     # Scheduling (the `scheduling:` block). `round_robin` spreads each model's requests uniformly
     # across its replicas (the original behavior); `lpt_packing` concentrates each model's traffic on
-    # few workers from measured load and worker-reported compute cost, to maximize the workers'
-    # batch coalescing. LPT packing requires worker FIFO discipline and all models on all workers
-    # (checked at startup). The remaining knobs apply to lpt_packing only.
+    # few workers, placing each model on a fixed, operator-configured number of distinct GPUs and
+    # routing a model's requests to fill one replica's batch before the next, to maximize the
+    # workers' batch coalescing. LPT packing requires worker FIFO discipline and all models on all
+    # workers (checked at startup). The remaining knobs apply to lpt_packing only.
     scheduling_mode::String                 # "round_robin" | "lpt_packing"
-    rebalance_seconds::Float64              # lpt_packing assignment recompute interval
-    max_worker_share::Float64               # cap of one worker's expected capacity a single model may claim
+    # Repack cadence is driven by accumulated fleet compute, not wall-clock: a repack fires once the
+    # fleet has consumed `rebalance_compute_seconds` GPU-seconds since the last one, subject to a
+    # `min_rebalance_seconds` wall-clock floor (0 = none).
+    rebalance_compute_seconds::Float64
+    min_rebalance_seconds::Float64
+    max_worker_share::Float64               # advisory only: load no longer drives a model's GPU count
     hysteresis::Float64                     # min relative max-load improvement required to move a placement
     rate_halflife_seconds::Float64          # EWMA halflife for per-model arrival-rate and cost smoothing
+    # Replica placement: a model lives on exactly `replicas` distinct GPUs (per-model override under
+    # `scheduling.models`, else `default_replicas`). Set at startup; never grows automatically.
+    default_replicas::Int
+    # Request routing within a model's replica set. `routing_fill_factor` is the per-replica fill
+    # target as a multiple of the model's max batch size (1.0 fills exactly one batch before moving
+    # on; >1 over-provisions to keep the next batch queued). `routing_policy` is "fill" (concentrate
+    # to fill a batch, then the least-filled replica) or "least_outstanding" (the GPU with the least
+    # total in-flight work).
+    routing_fill_factor::Float64
+    routing_policy::String
+    models::Dict{String,GatewayModelConfig}
 end
 
 const GW_ENV_PREFIX = "REACTANT_GATEWAY_"
@@ -32,10 +54,14 @@ const GW_ENV_PATHS = Tuple{String,Vector{String},DataType}[
     ("LISTEN_GRPC", ["listen", "grpc"], String),
     ("LISTEN_METRICS", ["listen", "metrics"], String),
     ("SCHEDULING_MODE", ["scheduling", "mode"], String),
-    ("SCHEDULING_REBALANCE_SECONDS", ["scheduling", "rebalance_seconds"], Float64),
+    ("SCHEDULING_REBALANCE_COMPUTE_SECONDS", ["scheduling", "rebalance_compute_seconds"], Float64),
+    ("SCHEDULING_MIN_REBALANCE_SECONDS", ["scheduling", "min_rebalance_seconds"], Float64),
     ("SCHEDULING_MAX_WORKER_SHARE", ["scheduling", "max_worker_share"], Float64),
     ("SCHEDULING_HYSTERESIS", ["scheduling", "hysteresis"], Float64),
     ("SCHEDULING_RATE_HALFLIFE_SECONDS", ["scheduling", "rate_halflife_seconds"], Float64),
+    ("SCHEDULING_DEFAULT_REPLICAS", ["scheduling", "default_replicas"], Int),
+    ("SCHEDULING_ROUTING_FILL_FACTOR", ["scheduling", "routing_fill_factor"], Float64),
+    ("SCHEDULING_ROUTING_POLICY", ["scheduling", "routing_policy"], String),
     ("WORKER_CLIENT_REQUEST_TIMEOUT_SECONDS", ["worker_client", "request_timeout_seconds"], Int),
     ("GRPC_MAX_RECV_MSG_BYTES", ["grpc", "max_recv_msg_bytes"], Int),
     ("GRPC_MAX_SEND_MSG_BYTES", ["grpc", "max_send_msg_bytes"], Int),
@@ -138,6 +164,9 @@ function _build_gateway_config(raw::Dict{String,Any})
     scheduling_mode = lowercase(strip(_opt(sched, "mode", String, "round_robin")))
     scheduling_mode in ("round_robin", "lpt_packing") ||
         throw(ConfigError("scheduling.mode must be 'round_robin' or 'lpt_packing', got '$scheduling_mode'"))
+    routing_policy = lowercase(strip(_opt(sched, "routing_policy", String, "fill")))
+    routing_policy in ("fill", "least_outstanding") ||
+        throw(ConfigError("scheduling.routing_policy must be 'fill' or 'least_outstanding', got '$routing_policy'"))
 
     cfg = GatewayConfig(
         _opt(listen, "grpc", String, "0.0.0.0:8001"),
@@ -150,15 +179,23 @@ function _build_gateway_config(raw::Dict{String,Any})
         _opt(logging, "level", String, "info"),
         _opt(logging, "format", String, "json"),
         scheduling_mode,
-        _opt(sched, "rebalance_seconds", Float64, 15.0),
+        _opt(sched, "rebalance_compute_seconds", Float64, 30.0),
+        _opt(sched, "min_rebalance_seconds", Float64, 0.0),
         _opt(sched, "max_worker_share", Float64, 0.8),
         _opt(sched, "hysteresis", Float64, 0.1),
         _opt(sched, "rate_halflife_seconds", Float64, 30.0),
+        _opt(sched, "default_replicas", Int, 1),
+        _opt(sched, "routing_fill_factor", Float64, 1.0),
+        routing_policy,
+        _parse_gateway_sched_models(sched),
     )
-    cfg.rebalance_seconds > 0 || throw(ConfigError("scheduling.rebalance_seconds must be positive"))
+    cfg.rebalance_compute_seconds > 0 || throw(ConfigError("scheduling.rebalance_compute_seconds must be positive"))
+    cfg.min_rebalance_seconds >= 0 || throw(ConfigError("scheduling.min_rebalance_seconds must be non-negative"))
     0 < cfg.max_worker_share <= 1 || throw(ConfigError("scheduling.max_worker_share must be in (0, 1]"))
     0 <= cfg.hysteresis < 1 || throw(ConfigError("scheduling.hysteresis must be in [0, 1)"))
     cfg.rate_halflife_seconds > 0 || throw(ConfigError("scheduling.rate_halflife_seconds must be positive"))
+    cfg.default_replicas >= 1 || throw(ConfigError("scheduling.default_replicas must be >= 1"))
+    cfg.routing_fill_factor > 0 || throw(ConfigError("scheduling.routing_fill_factor must be positive"))
 
     if !isempty(_opt(tls, "cert_file", String, "")) || !isempty(_opt(tls, "key_file", String, ""))
         @warn "gateway TLS is configured but not yet enforced; serving cleartext h2c"
@@ -167,6 +204,24 @@ function _build_gateway_config(raw::Dict{String,Any})
     isempty(cfg.workers) && throw(ConfigError("gateway has no endpoints; set 'endpoints:' in gateway.yml or REACTANT_GATEWAY_WORKERS"))
     isempty(applied) || @info "gateway configuration overridden by environment" overrides = applied
     return cfg
+end
+
+# Per-model scheduling overrides under `scheduling.models`. Each entry may set `replicas` (the
+# number of distinct GPUs that host the model under lpt_packing). Unlisted models use
+# `default_replicas`.
+function _parse_gateway_sched_models(sched::AbstractDict)
+    raw = get(sched, "models", nothing)
+    raw === nothing && return Dict{String,GatewayModelConfig}()
+    raw isa AbstractDict || throw(ConfigError("scheduling.models must be a mapping"))
+    out = Dict{String,GatewayModelConfig}()
+    for (name, v) in raw
+        key = "scheduling.models.$name"
+        v isa AbstractDict || throw(ConfigError("$key must be a mapping"))
+        replicas = _opt(v, "replicas", Int, 1)
+        replicas >= 1 || throw(ConfigError("$key.replicas must be >= 1"))
+        out[String(name)] = GatewayModelConfig(replicas)
+    end
+    return out
 end
 
 # Split a worker URL "host:port" into (host::String, port::Int).

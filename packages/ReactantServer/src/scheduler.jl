@@ -781,6 +781,17 @@ function scheduler_metrics(s::Scheduler)
     end
 end
 
+# The largest compiled batch shape a model can serve, limited by its configured coalescing cap;
+# 0 when no batched shape is compiled. Reported over the control plane as routing metadata.
+function _effective_max_batch(entry::ModelEntry)
+    largest = 0
+    for k in keys(entry.executable.execs)
+        k > largest && (largest = k)
+    end
+    cap = entry.sched.max_batch_size
+    return cap === nothing ? largest : min(Int(cap), largest)
+end
+
 """
     control_status(scheduler) -> NamedTuple
 
@@ -802,6 +813,10 @@ function control_status(s::Scheduler)
             total_compute = entry.sched.total_compute,
             requests_served = entry.sched.requests_served,
             dispatch_count = entry.sched.dispatch_count,
+            # Effective max batch the worker coalesces to: the largest compiled batch shape
+            # (positive exec keys; key 0 is the unbatched module), capped by the configured
+            # max_batch_size. Routing metadata for the gateway's coalescing-aware placement.
+            max_batch_size = _effective_max_batch(entry),
         ) for entry in values(s.registry.by_name) if entry.sched !== nothing && entry.executable !== nothing)
         # The on-demand weight budget is the memory capacity a gateway packs weight footprints
         # against; 0 (cache disabled, all weights resident) means memory is not a constraint.

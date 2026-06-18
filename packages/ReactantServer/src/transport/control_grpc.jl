@@ -39,7 +39,8 @@ function _handle_model_control_status(ctx::InferContext)
                   weight_nbytes = m.weight_nbytes, weight = m.weight, queue_depth = m.queue_depth,
                   total_compute_seconds = m.total_compute,
                   requests_served = UInt64(m.requests_served),
-                  dispatch_count = UInt64(m.dispatch_count))
+                  dispatch_count = UInt64(m.dispatch_count),
+                  max_batch_size = Int64(m.max_batch_size))
               for (name, m) in snap.models]
     return _CTRL.ModelControlStatusResponse(;
         residency_mode = (snap.residency_mode == SELF_MANAGED ? "self_managed" : "externally_managed"),

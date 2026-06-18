@@ -11,6 +11,7 @@
 # on CPU is sufficient; nothing here starts a server or touches a GPU.
 
 using Documenter
+using DocumenterMermaid
 using ReactantServerCore
 using ReactantServer
 using ReactantServerGateway

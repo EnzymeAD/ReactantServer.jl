@@ -169,6 +169,8 @@ shared-memory data path.
 
 ## Next steps
 
+- [Common Use Cases](common_use_cases.md): choose a deployment shape (single GPU, multi-GPU
+  distributed or replicated, multi-node) with an example configuration for each.
 - [Scaling to Multiple GPUs](scaling.md): add GPUs and how the supervisor decides what to start.
 - [Node Configuration](node_config.md): the full config surface and environment overrides.
 - [Bundles & model.jl](bundles.md): the bundle format and custom pre/post-processing.

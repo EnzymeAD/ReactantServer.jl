@@ -28,9 +28,10 @@ gRPC-to-gRPC pass-through that never re-marshals the body.
   routing table is rebuilt and swapped in atomically on each probe, so a control-plane
   pin/unpin or a worker restart flips routing on the next probe.
 - **Replica scheduling:** a model served by more than one worker is load-balanced across those
-  workers, either uniformly (`round_robin`, the default) or by adaptive placement
-  (`lpt_packing`); see [Scheduling modes](#scheduling-modes) below. Either way, a request fails
-  over to the remaining replicas when a worker returns `NotFound` or `Unavailable`.
+  workers, either uniformly (`round_robin`, the default) or by packing each model onto a fixed,
+  operator-configured number of GPUs with coalescing-aware routing (`lpt_packing`); see
+  [Scheduling modes](#scheduling-modes) below. Either way, a request fails over to the remaining
+  replicas when a worker returns `NotFound` or `Unavailable`.
 - **Readiness probe:** a background loop calls each worker's KServe `ServerReady` RPC; `/readyz`
   is ready when at least one worker reports ready.
 - **Raw passthrough:** the `ModelInfer` hot path never decodes or re-marshals the protobuf body.
@@ -46,16 +47,26 @@ gRPC-to-gRPC pass-through that never re-marshals the body.
 
 ## Scheduling modes
 
+For guidance on choosing `round_robin` versus `lpt_packing` and setting replica counts for your
+situation, with an example configuration for each shape, see
+[Common Use Cases](common_use_cases.md).
+
 The gateway routes each model's requests across its replicas according to `scheduling.mode` in
 `gateway.yml`:
 
 ```yaml
 scheduling:
-  mode: lpt_packing        # round_robin (default) | lpt_packing
-  rebalance_seconds: 15    # placement recomputation cadence
+  mode: lpt_packing             # round_robin (default) | lpt_packing
+  rebalance_compute_seconds: 30 # fleet GPU-seconds consumed that triggers a repack
+  min_rebalance_seconds: 0      # wall-clock floor between repacks (0 = none)
   rate_halflife_seconds: 30
-  max_worker_share: 0.8    # cap on one worker's capacity a single model may claim
-  hysteresis: 0.1          # minimum improvement before a model moves workers
+  hysteresis: 0.1               # minimum improvement before a model moves workers
+  default_replicas: 1           # GPUs per model unless overridden below
+  routing_fill_factor: 1.0      # per-replica fill target as a multiple of max batch size
+  routing_policy: fill          # fill (default) | least_outstanding
+  models:
+    big-model:
+      replicas: 2               # this model is placed on 2 distinct GPUs
 ```
 
 **`round_robin`** (the default) spreads each model's requests uniformly across its replicas.
@@ -63,33 +74,48 @@ It is fully predictable from the config file and needs no measurements, at the c
 per-worker queues: when every model is on every worker, each worker sees a slice of every
 model's traffic, so coalesced batches rarely fill.
 
-**`lpt_packing`** places models on workers automatically and adaptively. Each model gets a
-sampling distribution over workers, recomputed every `rebalance_seconds` from two live
-measurements: its compute demand (the gateway-measured arrival rate times the true per-request
-compute cost the workers report over the control plane) and its resident weight footprint
-against each worker's weight-memory budget. The packer places models heaviest-first, each
-wholly on the least pressured worker, where pressure is whichever of compute or memory is
-closer to full. Concentrating a model's traffic on one worker is what lets the worker's batch
-coalescing fill compiled batch sizes, and packing by memory keeps each GPU's resident weight
-set bounded so evictions stay rare.
+**`lpt_packing`** places each model on a fixed number of distinct GPUs and routes its requests
+to preserve batch fill. A model's replica count is operator-controlled: `default_replicas`
+(default 1, the single-GPU case that coalesces best), overridable per model under
+`scheduling.models.<name>.replicas`. The count is set at startup and never grows automatically
+under load; a hot model relies on its worker's queue and coalescing rather than fanning out. The
+packer chooses which GPUs host each model's replicas by balancing two live measurements: compute
+demand (the gateway-measured arrival rate times the true per-request compute cost the workers
+report over the control plane) and resident weight footprint against each worker's weight-memory
+budget, placing models heaviest-first onto the least pressured workers, where pressure is
+whichever of compute or memory is closer to full. Packing by memory keeps each GPU's resident
+weight set bounded so evictions stay rare. Placements are sticky: a single-replica model moves
+only when the move improves its resulting pressure by more than `hysteresis`, because batching
+depends on traffic staying where the queues are. (`max_worker_share` is accepted but advisory
+only; load no longer determines a model's GPU count.)
 
-Three safeguards apply. A model whose demand exceeds `max_worker_share` of one GPU is split
-evenly across the minimum number of workers that brings each share under the cap, so a hot
-model cannot starve its neighbors. Placements are sticky: a model moves only when the move
-improves its resulting pressure by more than `hysteresis`, because batching depends on traffic
-staying where the queues are. And a worker that drops out is excluded from placement, its
-traffic failing over to the remaining replicas immediately.
+Repacks are driven by accumulated compute, not wall-clock: the gateway polls the workers every
+probe round and recomputes the placement once the fleet has consumed `rebalance_compute_seconds`
+GPU-seconds since the last repack, subject to the `min_rebalance_seconds` wall-clock floor. An
+idle fleet does not repack until traffic resumes.
+
+For a model with more than one replica, the gateway routes to fill one replica's batch before
+moving to the next, so the workers receive favorable groupings to coalesce (the coalescing itself
+stays at the worker). It tracks the in-flight request count per replica and, under the default
+`fill` policy, sends requests to the replica with the fewest full batches until it holds about
+`routing_fill_factor` times the model's max batch size, then moves to the next least-filled
+replica. Set `routing_fill_factor` above 1.0 to keep the next batch queued so a worker does not go
+idle between dispatches. The `least_outstanding` policy instead routes to the GPU with the least
+total in-flight work, which helps when replicas share GPUs with other models. A single-replica
+model is the degenerate case: all its requests go to its one GPU.
 
 `lpt_packing` has two preconditions, verified as a hard failure at gateway startup: every
-worker must run the `fifo` scheduler discipline (placement and fairness decisions move to the
-gateway, so workers should not re-order against it; see `scheduler.discipline` in
+worker must run the `fifo` scheduler discipline (placement decisions move to the gateway, so
+workers should not re-order against it; see `scheduler.discipline` in
 [Node Configuration](node_config.md)), and every worker must serve the identical model
 set. Runtime drift degrades gracefully: a model temporarily missing from some workers is
-routed uniformly over its actual replicas with a warning until the fleet converges.
+routed uniformly over its actual replicas with a warning until the fleet converges. A worker that
+drops out is excluded from placement, its traffic failing over to the remaining replicas.
 
-The placement is observable: `gateway_placement_weight` reports each model's current sampling
-weight per worker, and `gateway_model_utilization` reports its estimated demand in GPU-seconds
-per second.
+The placement is observable: `gateway_model_replicas` reports each model's replica count,
+`gateway_placement_weight` reports its per-worker weight, `gateway_replica_outstanding` reports
+the in-flight requests per replica sampled at the last repack, and `gateway_model_utilization`
+reports its estimated demand in GPU-seconds per second.
 
 ## What the gateway does not do
 
@@ -128,9 +154,10 @@ e.g. `REACTANT_GATEWAY_LOGGING_LEVEL=debug` or `REACTANT_GATEWAY_SCHEDULING_MODE
   or `Unavailable`), and a model with no live replica returns `NotFound`. The worker-side
   readiness probe (`ServerReady`, same 10s loop) drives `/readyz` and the
   `gateway_worker_ready` metric.
-- Under `lpt_packing`, placement rebalancing runs on its own cadence
-  (`scheduling.rebalance_seconds`, default 15s), separate from the 10s discovery and readiness
-  probes.
+- Under `lpt_packing`, the gateway polls the workers on every 10s probe round to refresh routing
+  metadata and accumulate consumed compute, but recomputes the placement only once the fleet has
+  consumed `scheduling.rebalance_compute_seconds` GPU-seconds (subject to the
+  `scheduling.min_rebalance_seconds` floor).
 - Every `ModelInfer` is logged with the model name, the client-supplied request id (KServe `id`
   field), worker URL, request and response byte counts, worker latency, and gRPC status. Logs
   contain no tensor data.

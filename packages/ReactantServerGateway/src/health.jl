@@ -111,16 +111,17 @@ function _check_once(p::HealthProber)
         swap_table!(p.routes, table)
         set_routing_size!(p.metrics, nmodels(table))
     end
-    # LPT-packing rebalance on its own cadence (>= the probe interval). Placement is computed over
-    # the workers that reported ready this round; a dead worker drops out until it recovers.
-    if p.packing !== nothing &&
-       time() - p.packing.last_rebalance >= p.packing.rebalance_seconds
+    # LPT-packing: poll the ready workers every probe round to refresh routing metadata and
+    # accumulate consumed compute; tick_packing! repacks only once the fleet has consumed the
+    # configured compute budget. Placement is computed over the workers that reported ready this
+    # round; a dead worker drops out until it recovers.
+    if p.packing !== nothing
         ready_urls = String[wc.url for (i, wc) in enumerate(workers) if results[i]]
         if isempty(ready_urls)
             @warn "lpt_packing: no ready workers this round; keeping the previous assignment"
         else
             try
-                rebalance!(p.packing, p.pool, ready_urls, p.metrics)
+                tick_packing!(p.packing, p.pool, ready_urls, p.metrics)
             catch e
                 @warn "lpt_packing: rebalance failed; keeping the previous assignment" exception = e
             end

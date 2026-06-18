@@ -65,18 +65,46 @@ function _try_replicas(st::GatewayState, urls, model, id, body)
     return nothing, last_status, last_exc
 end
 
-function _dispatch_infer(st::GatewayState, model, id, body)
-    # LPT-packing mode: route by the model's placement distribution (sampled worker first, remaining
-    # replicas by descending weight as failover). Replicas outside the placement are appended as
-    # last-resort failover so a concentrated model survives its worker dying between rebalances.
-    # A model without a placement yet (cold, or new since the last rebalance) falls through to the
-    # round-robin path below.
-    urls = st.packing === nothing ? nothing : pick_placement(st.packing, model)
-    if urls !== nothing
+# Try a model's placement replicas in order (urls[1] is the routing choice; the rest are failover),
+# then, if every placement replica returns a retryable error, the remaining discovered replicas as a
+# last resort so a concentrated model survives its worker dying between repacks. The reservation made
+# by route_replica is released exactly once here, on every path (success, retryable error, hard
+# error, or timeout), so the outstanding counter never leaks.
+function _try_packing(st::GatewayState, urls, counters, model, id, body)
+    try
+        last_status = STATUS_UNAVAILABLE
+        last_exc = gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_UNAVAILABLE, "no replica available")
+        for url in urls
+            resp, status, exc = _post_infer(st, url, model, id, body)
+            exc === nothing && return resp, status, nothing
+            status == STATUS_NOT_FOUND && request_refresh!(st.refresher)
+            last_status, last_exc = status, exc
+            (status == STATUS_NOT_FOUND || status == STATUS_UNAVAILABLE) || return nothing, status, exc
+        end
+        # Last-resort failover to replicas outside the placement (untracked by the fill counters).
         rr = pick(st.routes, model)
-        rr === nothing || append!(urls, [u for u in rr if !(u in urls)])
+        if rr !== nothing
+            extra = String[u for u in rr if !(u in urls)]
+            isempty(extra) || return _try_replicas(st, extra, model, id, body)
+        end
+        return nothing, last_status, last_exc
+    finally
+        _release_route!(counters)
     end
-    urls === nothing && (urls = pick(st.routes, model))
+end
+
+function _dispatch_infer(st::GatewayState, model, id, body)
+    # LPT-packing mode: route to the replica that fills its batch first (route_replica reserves it),
+    # the remaining placement replicas following as failover. A model without a placement yet (cold,
+    # or new since the last repack) falls through to the round-robin path below.
+    if st.packing !== nothing
+        routed = route_replica(st.packing, model)
+        if routed !== nothing
+            urls, counters = routed
+            return _try_packing(st, urls, counters, model, id, body)
+        end
+    end
+    urls = pick(st.routes, model)
     if urls === nothing
         # The model is unknown to the routing table. It may have just been loaded on a worker, so
         # refresh on demand (single-flight, rate-limited) and re-pick before giving up.

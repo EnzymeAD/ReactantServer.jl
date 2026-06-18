@@ -17,6 +17,8 @@ struct GatewayMetrics
     worker_ready::Prometheus.Family{Prometheus.Gauge}
     placement_weight::Prometheus.Family{Prometheus.Gauge}
     model_utilization::Prometheus.Family{Prometheus.Gauge}
+    model_replicas::Prometheus.Family{Prometheus.Gauge}
+    replica_outstanding::Prometheus.Family{Prometheus.Gauge}
     worker_metrics_up::Prometheus.Family{Prometheus.Gauge}
 end
 
@@ -47,13 +49,21 @@ function GatewayMetrics()
         "gateway_model_utilization",
         "Estimated per-model expected utilization (arrival rate x compute cost, GPU-seconds/second).",
         (:model,); registry = reg)
+    model_replicas = Prometheus.Family{Prometheus.Gauge}(
+        "gateway_model_replicas",
+        "LPT-packing replica count for a model (number of distinct GPUs hosting it; 0 when unplaced).",
+        (:model,); registry = reg)
+    replica_outstanding = Prometheus.Family{Prometheus.Gauge}(
+        "gateway_replica_outstanding",
+        "In-flight requests routed to a model's replica on a worker, sampled at the last repack.",
+        (:model, :worker); registry = reg)
     worker_metrics_up = Prometheus.Family{Prometheus.Gauge}(
         "gateway_worker_metrics_up",
         "1 if the worker's metrics endpoint answered the most recent aggregated scrape, else 0.",
         (:endpoint,); registry = reg)
     return GatewayMetrics(reg, requests_total, request_latency, worker_latency,
         routing_table_size, worker_ready, placement_weight, model_utilization,
-        worker_metrics_up)
+        model_replicas, replica_outstanding, worker_metrics_up)
 end
 
 inc_requests!(m::GatewayMetrics, rpc, model, status) =
@@ -75,6 +85,12 @@ set_placement_weight!(m::GatewayMetrics, model, worker, w) =
 
 set_model_utilization!(m::GatewayMetrics, model, u) =
     Prometheus.set(Prometheus.labels(m.model_utilization, (String(model),)), Float64(u))
+
+set_model_replicas!(m::GatewayMetrics, model, k) =
+    Prometheus.set(Prometheus.labels(m.model_replicas, (String(model),)), Float64(k))
+
+set_replica_outstanding!(m::GatewayMetrics, model, worker, n) =
+    Prometheus.set(Prometheus.labels(m.replica_outstanding, (String(model), String(worker))), Float64(n))
 
 """
     expose(io, metrics)
