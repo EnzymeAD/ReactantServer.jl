@@ -48,6 +48,8 @@ include("runtime/model.jl")
 include("runtime/weight_cache.jl")
 include("runtime/execution.jl")
 include("runtime/reactant_backend.jl")
+# Load-time TF32 stripping for portable artifacts; uses the backend's _RMLIR/_RXLA aliases.
+include("runtime/tf32.jl")
 
 # Lifecycle observability helpers (formatting + structured load/unload/residency logs). After the
 # backend (for device_memory_stats) and weight_cache (for weight_cache_stats); before scheduler.

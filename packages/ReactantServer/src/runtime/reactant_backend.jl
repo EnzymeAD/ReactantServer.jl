@@ -104,6 +104,10 @@ function compile_artifact(backend::ReactantBackend, pool::MemoryPool, mlir_bytes
         artifact = String(copy(Vector{UInt8}(mlir_bytes)))
         mlir_mod = _RMLIR.API.stablehloDeserializePortableArtifactNoError(artifact, ctx)
         mod = _RMLIR.IR.Module(mlir_mod)
+        # Portable artifacts may carry TF32 baked into dot_general as an explicit DotAlgorithm, which
+        # is a hard compile error on non-Ampere targets. Strip it when this device cannot run it,
+        # before XLA sees the module; on a TF32-capable GPU leave it intact.
+        tf32_supported(pool.client, pool.device) || maybe_strip_tf32!(mod)
         opts = _RXLA.make_compile_options(; device_id=Int64(device_ordinal(backend, pool.device)))
         return _RXLA.compile(pool.client, mod;
             compile_options=opts,
