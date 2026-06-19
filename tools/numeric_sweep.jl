@@ -30,6 +30,11 @@ const pygc = pyimport("gc")
 const MODELS_ROOT = "/docker/reactantserver/models"
 const SOURCES = ["/docker/triton/models", "/docker/triton/dynamic"]
 const REPORT = "/docker/reactantserver/numeric_sweep_report.md"
+# rtol/atol compare the server against a full-f32 reference on one device. Stripping a bundle's
+# baked TF32 (on a non-Ampere target) yields full f32, which matches the reference at least as well
+# as TF32 would, so these need no widening. If a TF32-capable device is ever compared against a
+# stripped/f32 result, widen rtol to about 2^-10 (~1e-3 already covers it), since TF32 keeps only
+# ~10 mantissa bits.
 const RTOL = 1.0f-3
 const ATOL = 1.0f-3
 
