@@ -244,6 +244,66 @@ end
 
 id_of(d::DecodedRequest) = d.id
 
+# --- Outbound request / inbound response -----------------------------------------------------
+#
+# The pair below is the mirror image of decode_infer_request / encode_infer_response: it lets a
+# process act as a *client* of a KServe V2 endpoint (used by the worker's meta-model GatewayCaller
+# to call back into the gateway). Data travels inline via raw_input_contents / raw_output_contents;
+# shared memory is deliberately not used on this path.
+
+function _input_tensor(t::NamedTensor)
+    # Wire shape is row-major: the reverse of the Julia col-major NamedTensor.shape.
+    wire_shape = Int64[Int64(s) for s in reverse(collect(t.shape))]
+    return _PB_INF.var"ModelInferRequest.InferInputTensor"(;
+        name=t.name, datatype=kserve_string(t.dtype), shape=wire_shape)
+end
+
+"""
+    encode_infer_request(model_name, inputs; requested_outputs=String[], id="") -> ModelInferRequest
+
+Build a ModelInferRequest from boundary [`NamedTensor`](@ref) inputs, with tensor data inline in
+raw_input_contents. `requested_outputs`, when non-empty, names the outputs to return.
+"""
+function encode_infer_request(model_name::AbstractString, inputs::Vector{NamedTensor};
+                              requested_outputs::Vector{String}=String[], id::AbstractString="")
+    in_tensors = [_input_tensor(t) for t in inputs]
+    raw = Vector{UInt8}[_raw_from_array(t.data) for t in inputs]
+    outs = _PB_INF.var"ModelInferRequest.InferRequestedOutputTensor"[
+        _PB_INF.var"ModelInferRequest.InferRequestedOutputTensor"(; name=String(n)) for n in requested_outputs]
+    return _PB_INF.ModelInferRequest(; model_name=String(model_name), id=String(id),
+        inputs=in_tensors, outputs=outs, raw_input_contents=raw)
+end
+
+"""
+    decode_infer_response(msg) -> Vector{NamedTensor}
+
+Translate a ModelInferResponse into boundary [`NamedTensor`](@ref) outputs. Data is read from
+raw_output_contents when present, otherwise from the typed contents field. Shared-memory-backed
+outputs are not supported on this path (the caller never requests them).
+"""
+function decode_infer_response(msg::_PB_INF.ModelInferResponse)
+    n = length(msg.outputs)
+    use_raw = !isempty(msg.raw_output_contents)
+    if use_raw && length(msg.raw_output_contents) != n
+        error("raw_output_contents has $(length(msg.raw_output_contents)) entries but response has $n outputs")
+    end
+    tensors = Vector{NamedTensor}(undef, n)
+    for i in 1:n
+        o = msg.outputs[i]
+        dt = dtype_from_kserve(o.datatype)
+        shape = Int[Int(s) for s in o.shape]
+        data = if use_raw
+            _array_from_raw(dt, shape, msg.raw_output_contents[i])
+        elseif o.contents !== nothing
+            _array_from_contents(dt, shape, o.contents)
+        else
+            error("output '$(o.name)' carries neither raw_output_contents nor contents")
+        end
+        tensors[i] = NamedTensor(o.name, dt, Tuple(size(data)), data)
+    end
+    return tensors
+end
+
 # The manifest's shape is Julia order (col-major); the wire metadata advertises the
 # reverse (row-major), so Triton/KServe-style clients see canonical network dims.
 _julia_shape_int64(s::TensorSpec) = Int64[d.kind == FIXED ? Int64(d.size) : Int64(-1) for d in s.shape]

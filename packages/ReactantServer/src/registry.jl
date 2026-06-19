@@ -28,6 +28,27 @@ function register_model(name::AbstractString; preprocess::Function=identity, pos
     return nothing
 end
 
+# Collected when a meta bundle's model.jl calls register_meta_model. Mirrors Registration but
+# carries the orchestration function instead of pre/post hooks.
+struct MetaRegistration
+    name::String
+    run::Function
+end
+
+const _CURRENT_META_REGISTRATION = Ref{Union{MetaRegistration,Nothing}}(nothing)
+
+"""
+    register_meta_model(name; run)
+
+Called from a meta bundle's model.jl to register the orchestration function. `run` has the form
+`run(inputs::Vector{NamedTensor}, call) -> Vector{NamedTensor}`, where `call(model_name, inputs)`
+invokes another model (routed to the gateway in multi-worker mode, or the local worker otherwise).
+"""
+function register_meta_model(name::AbstractString; run::Function)
+    _CURRENT_META_REGISTRATION[] = MetaRegistration(String(name), run)
+    return nothing
+end
+
 mutable struct ModelEntry
     name::String
     manifest::Manifest
@@ -40,10 +61,24 @@ mutable struct ModelEntry
     postprocess::Function
 end
 
+# A meta model: a Julia orchestration over other models. It has no executable, weights, or
+# scheduling state; the gRPC layer runs `run` directly on the request task (see meta.jl).
+mutable struct MetaEntry
+    name::String
+    manifest::Manifest
+    calls::Vector{String}   # declared sub-model names (manifest meta.calls)
+    run::Function
+end
+
 struct ModelRegistry
     by_name::Dict{String,ModelEntry}
+    meta::Dict{String,MetaEntry}   # meta models, kept separate so the compile/scheduler paths never see them
 end
-ModelRegistry() = ModelRegistry(Dict{String,ModelEntry}())
+ModelRegistry() = ModelRegistry(Dict{String,ModelEntry}(), Dict{String,MetaEntry}())
 
 get_model(reg::ModelRegistry, name::AbstractString) = get(reg.by_name, name, nothing)
-model_names(reg::ModelRegistry) = sort!(collect(keys(reg.by_name)))
+get_meta(reg::ModelRegistry, name::AbstractString) = get(reg.meta, name, nothing)
+is_meta_name(reg::ModelRegistry, name::AbstractString) = haskey(reg.meta, name)
+# Every servable name: regular models plus meta models. The two namespaces are disjoint
+# (enforced at load), so a simple union is sufficient.
+model_names(reg::ModelRegistry) = sort!(collect(union(keys(reg.by_name), keys(reg.meta))))

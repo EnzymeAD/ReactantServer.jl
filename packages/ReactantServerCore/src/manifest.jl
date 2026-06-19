@@ -21,6 +21,11 @@
 
 const SUPPORTED_FORMAT_VERSIONS = ("2.0", "2")
 
+# A bundle is either a regular "model" (a StableHLO executable + weights) or a "meta" model: a
+# user-authored Julia workflow (model.jl) that chains other models with data-dependent logic in
+# between. A meta bundle carries no executable/weights and declares the models it calls.
+const SUPPORTED_KINDS = ("model", "meta")
+
 const _RESERVED_BATCH_LETTERS = ('n', 'b')
 
 struct ManifestError <: Exception
@@ -95,7 +100,22 @@ struct Manifest
     batching::BatchingSpec
     provenance::Provenance
     input_batch_dim::Union{Int,Nothing}   # derived: 0-based batch axis of the inputs (or nothing)
+    kind::String                          # "model" (default) or "meta"
+    meta_calls::Vector{String}            # for kind=="meta": declared sub-model names; empty otherwise
 end
+
+# Backward-compatible 10-arg constructor: a regular model with no meta metadata. Keeps existing
+# positional callers (tests, fixtures) working after the kind/meta_calls fields were appended.
+Manifest(fv, name, desc, exin, exout, clin, clout, batching, prov, ibd) =
+    Manifest(fv, name, desc, exin, exout, clin, clout, batching, prov, ibd, "model", String[])
+
+"""
+    is_meta(m::Manifest) -> Bool
+
+True when the bundle is a meta model (a Julia orchestration over other models) rather than a
+regular StableHLO executable.
+"""
+is_meta(m::Manifest) = m.kind == "meta"
 
 _is_ascii_letter(c::Char) = ('a' <= c <= 'z') || ('A' <= c <= 'Z')
 _is_reserved_batch(c::Char) = c in _RESERVED_BATCH_LETTERS
@@ -203,6 +223,21 @@ function _derive_input_batch_dim(inputs::Vector{TensorSpec})
     return bd
 end
 
+# Parse the `meta` block of a meta manifest into the declared list of called sub-model names.
+function _parse_meta_calls(d::AbstractDict, name::AbstractString)
+    blk = get(d, "meta", nothing)
+    blk isa AbstractDict || throw(ManifestError("meta manifest '$name' missing 'meta' mapping"))
+    calls = get(blk, "calls", nothing)
+    calls isa AbstractVector || throw(ManifestError("meta manifest '$name' 'meta.calls' must be a list"))
+    out = String[]
+    for c in calls
+        c isa AbstractString ||
+            throw(ManifestError("meta manifest '$name' 'meta.calls' entries must be strings (got $(typeof(c)))"))
+        push!(out, String(c))
+    end
+    return out
+end
+
 function parse_manifest(d::AbstractDict)
     name = get(d, "name", nothing)
     name isa AbstractString || throw(ManifestError("manifest missing string 'name'"))
@@ -210,10 +245,24 @@ function parse_manifest(d::AbstractDict)
     fv === nothing && throw(ManifestError("manifest '$name' missing 'format_version'"))
     desc = get(d, "description", "")
 
-    haskey(d, "executable_inputs") || throw(ManifestError("manifest '$name' missing 'executable_inputs'"))
-    haskey(d, "executable_outputs") || throw(ManifestError("manifest '$name' missing 'executable_outputs'"))
-    exin = parse_tensor_list(d["executable_inputs"], "executable_inputs")
-    exout = parse_tensor_list(d["executable_outputs"], "executable_outputs")
+    kind = get(d, "kind", "model")
+    kind isa AbstractString || throw(ManifestError("manifest '$name' field 'kind' must be a string"))
+    kind = String(kind)
+    meta = kind == "meta"
+    meta_calls = meta ? _parse_meta_calls(d, String(name)) : String[]
+
+    # A meta bundle has no StableHLO executable, so its executable specs are optional (default
+    # empty); its external I/O is carried by client_inputs/client_outputs instead. A regular model
+    # must declare both executable sections.
+    if meta
+        exin = haskey(d, "executable_inputs") ? parse_tensor_list(d["executable_inputs"], "executable_inputs") : TensorSpec[]
+        exout = haskey(d, "executable_outputs") ? parse_tensor_list(d["executable_outputs"], "executable_outputs") : TensorSpec[]
+    else
+        haskey(d, "executable_inputs") || throw(ManifestError("manifest '$name' missing 'executable_inputs'"))
+        haskey(d, "executable_outputs") || throw(ManifestError("manifest '$name' missing 'executable_outputs'"))
+        exin = parse_tensor_list(d["executable_inputs"], "executable_inputs")
+        exout = parse_tensor_list(d["executable_outputs"], "executable_outputs")
+    end
 
     clin = haskey(d, "client_inputs") ? parse_tensor_list(d["client_inputs"], "client_inputs") : nothing
     clout = haskey(d, "client_outputs") ? parse_tensor_list(d["client_outputs"], "client_outputs") : nothing
@@ -225,7 +274,7 @@ function parse_manifest(d::AbstractDict)
     input_batch_dim = _derive_input_batch_dim(exin)
 
     return Manifest(string(fv), String(name), desc === nothing ? "" : string(desc),
-                    exin, exout, clin, clout, batching, prov, input_batch_dim)
+                    exin, exout, clin, clout, batching, prov, input_batch_dim, kind, meta_calls)
 end
 
 function _check_unique_names(tensors::Vector{TensorSpec}, section::AbstractString)
@@ -241,9 +290,27 @@ function validate_manifest(m::Manifest, dir::AbstractString, has_model_jl::Bool)
         throw(ManifestError("unsupported format_version '$(m.format_version)'; " *
                             "supported: $(join(SUPPORTED_FORMAT_VERSIONS, ", "))"))
 
+    m.kind in SUPPORTED_KINDS ||
+        throw(ManifestError("unsupported kind '$(m.kind)'; supported: $(join(SUPPORTED_KINDS, ", "))"))
+
     expected = basename(normpath(String(dir)))
     m.name == expected ||
         throw(ManifestError("manifest name '$(m.name)' does not match directory name '$expected'"))
+
+    if is_meta(m)
+        has_model_jl ||
+            throw(ManifestError("meta model '$(m.name)' requires a model.jl that calls register_meta_model"))
+        (m.client_inputs !== nothing && !isempty(m.client_inputs)) ||
+            throw(ManifestError("meta model '$(m.name)' must declare non-empty client_inputs"))
+        (m.client_outputs !== nothing && !isempty(m.client_outputs)) ||
+            throw(ManifestError("meta model '$(m.name)' must declare non-empty client_outputs"))
+        isempty(m.meta_calls) &&
+            throw(ManifestError("meta model '$(m.name)' declares no models in meta.calls"))
+        allunique(m.meta_calls) ||
+            throw(ManifestError("meta model '$(m.name)' has duplicate entries in meta.calls"))
+        m.name in m.meta_calls &&
+            throw(ManifestError("meta model '$(m.name)' lists itself in meta.calls"))
+    end
 
     _check_unique_names(m.executable_inputs, "executable_inputs")
     _check_unique_names(m.executable_outputs, "executable_outputs")

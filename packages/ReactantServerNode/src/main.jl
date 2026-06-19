@@ -160,12 +160,18 @@ function build_supervisor(node_path::AbstractString;
                          max(1, parse(Int, v))
         end
         push!(notes, "worker compute threads: $worker_threads (host $(Sys.CPU_THREADS) / $(length(ws)) worker(s))")
+        # Where a meta model's sub-calls route. A sole public worker has no gateway, so force the
+        # in-process path (empty string overrides any stale inherited value). A multi-worker all-in-
+        # one node routes them to its embedded gateway on the public gRPC port. The `workers` role
+        # has an external gateway, so leave REACTANT_LOOPBACK_GRPC to the inherited environment.
+        loopback = sole_public ? "" : (r === :all ? "127.0.0.1:$gpub" : nothing)
         for (i, w) in enumerate(ws)
             push!(specs, sole_public ?
                 worker_spec(_worker_name(w), node_file, selectors[i], root;
-                            compute_threads=worker_threads, grpc_port=gpub, metrics_port=mpub) :
+                            compute_threads=worker_threads, grpc_port=gpub, metrics_port=mpub,
+                            loopback=loopback) :
                 worker_spec(_worker_name(w), node_file, selectors[i], root;
-                            compute_threads=worker_threads))
+                            compute_threads=worker_threads, loopback=loopback))
         end
         if sole_public
             push!(notes, "single worker: serving directly on $gpub (gRPC) / $mpub (metrics); no gateway")

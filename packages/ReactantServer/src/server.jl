@@ -142,12 +142,16 @@ function serve(cfg::ServerConfig; backend::AbstractBackend=ReactantBackend(), bl
     shm = SharedMemoryRegistry()
     metrics = WorkerMetrics(sched, backend, pool, cfg; worker_name=worker_name)
     router = build_grpc_router(sched, registry, pool.platform, shm)
-    ctx = InferContext(sched, registry, shm, pool.platform, metrics)
+    # Meta-model sub-calls route through this caller: a loopback gateway when REACTANT_LOOPBACK_GRPC
+    # is set (multi-worker), otherwise the local scheduler in-process (single-worker).
+    caller = build_caller(sched)
+    ctx = InferContext(sched, registry, shm, pool.platform, metrics, caller)
     # Optional Prometheus metrics endpoint (opt-in via endpoints.metrics_port > 0). Request counting
     # is always on (the InferContext carries `metrics`); only the HTTP listener is gated.
     metrics_server = nothing
     if cfg.endpoints.metrics_port > 0
-        ready_fn = () -> (es = values(registry.by_name); !isempty(es) && all(e -> e.executable !== nothing, es))
+        ready_fn = () -> (es = values(registry.by_name);
+            (!isempty(es) || !isempty(registry.meta)) && all(e -> e.executable !== nothing, es))
         metrics_server = start_worker_metrics(metrics, cfg.endpoints.host, cfg.endpoints.metrics_port;
             ready_fn=ready_fn, worker_name=worker_name, gpu=_gpu_identity(cfg))
     end

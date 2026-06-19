@@ -32,6 +32,11 @@ import gRPCServer
 include(ReactantServerCore.inference_server_stubs_path())
 include(ReactantServerCore.control_server_stubs_path())
 
+# Client-side gRPC service stubs (define the per-RPC `_Client` constructors). The worker is a
+# client only for the meta-model loopback path (a GatewayCaller calling back into the gateway).
+import gRPCClient
+include(ReactantServerCore.inference_client_stubs_path())
+
 # Per-model value types (defined before the registry so ModelEntry can hold them precisely).
 include("runtime/model_types.jl")
 
@@ -61,6 +66,10 @@ include("scheduler.jl")
 # (it drives load_model!/evict!) and before server.jl (RunningServer holds a BundleWatcher).
 include("watcher.jl")
 
+# Meta-model execution (the ModelCaller abstraction + run_meta). After the scheduler (LocalCaller
+# wraps it) and before grpc.jl (InferContext holds a ModelCaller and _handle_infer dispatches meta).
+include("meta.jl")
+
 # Transport assembly: the gRPC control plane (the codec and shared-memory registry come from
 # ReactantServerCore) and top-level server. Worker Prometheus metrics are defined before grpc.jl
 # (InferContext holds a WorkerMetrics) and reuse the scheduler/observe snapshot functions above.
@@ -69,6 +78,6 @@ include("transport/grpc.jl")
 include("transport/control_grpc.jl")
 include("server.jl")
 
-export serve, serve_worker, stop!, register_model
+export serve, serve_worker, stop!, register_model, register_meta_model
 
 end # module ReactantServer

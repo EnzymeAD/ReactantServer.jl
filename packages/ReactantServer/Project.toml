@@ -15,6 +15,7 @@ Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 ReactantServerCore = "387a5f05-f7b4-4d57-bca9-cd3358e52bdc"
 SafeTensors = "eeda0dda-7046-4914-a807-2495fc7abb89"
 YAML = "ddb6d928-2868-570f-bddf-ab3f9cf99eb6"
+gRPCClient = "aaca4a50-36af-4a1d-b878-4c443f2061ad"
 gRPCServer = "b7f0dee4-5e6a-42e7-93b0-9c098bad2317"
 
 [compat]
@@ -29,6 +30,7 @@ Reactant = "0.2.262"
 ReactantServerCore = "0.1"
 SafeTensors = "1.2.1"
 YAML = "0.4.16"
+gRPCClient = "1.0.3"
 gRPCServer = "0.1"
 julia = "1.12"
 
@@ -36,10 +38,9 @@ julia = "1.12"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
-gRPCClient = "aaca4a50-36af-4a1d-b878-4c443f2061ad"
 
 [targets]
-test = ["Test", "Logging", "Sockets", "gRPCClient"]
+test = ["Test", "Logging", "Sockets"]
 
 [sources]
 ReactantServerCore = {path = "../ReactantServerCore"}

@@ -36,7 +36,13 @@ struct InferContext
     shm::SharedMemoryRegistry
     platform::String
     metrics::Union{WorkerMetrics,Nothing}
+    caller::ModelCaller        # routes meta-model sub-calls (local scheduler or loopback gateway)
 end
+# `caller` defaults to a LocalCaller over this worker's scheduler; `serve` overrides it with a
+# GatewayCaller when a loopback gateway is configured. The 4-arg form is used by control-plane-only
+# contexts (tests) that never serve inference.
+InferContext(sched, registry, shm, platform, metrics) =
+    InferContext(sched, registry, shm, platform, metrics, LocalCaller(sched))
 InferContext(sched, registry, shm, platform) = InferContext(sched, registry, shm, platform, nothing)
 
 # gRPC status code -> Prometheus label string, for worker_requests_total.
@@ -70,6 +76,8 @@ end
 # assigned model is always ready because the scheduler loads it on demand. The gateway discovers
 # routes from this readiness, so a control-plane pin/unpin flips routing on the next probe.
 function _model_ready(ctx::InferContext, name::AbstractString)
+    # A meta model has no executable or device residency; it is ready as soon as it is loaded.
+    is_meta_name(ctx.registry, name) && return true
     entry = get_model(ctx.registry, name)
     (entry === nothing || entry.executable === nothing) && return false
     sched = ctx.sched
@@ -87,7 +95,8 @@ _handle_model_ready(ctx::InferContext, req) =
 # guards mainly against a misconfigured model_dirs that left the registry empty.
 function _handle_server_ready(ctx::InferContext)
     entries = values(ctx.registry.by_name)
-    ready = !isempty(entries) && all(e -> e.executable !== nothing, entries)
+    has_any = !isempty(entries) || !isempty(ctx.registry.meta)
+    ready = has_any && all(e -> e.executable !== nothing, entries)
     return inference.ServerReadyResponse(; ready = ready)
 end
 
@@ -97,7 +106,11 @@ _handle_server_metadata(::InferContext) =
 
 function _handle_model_metadata(ctx::InferContext, req)
     entry = get_model(ctx.registry, req.name)
-    entry === nothing && _not_found("unknown model: $(req.name)")
+    if entry === nothing
+        meta = get_meta(ctx.registry, req.name)
+        meta === nothing && _not_found("unknown model: $(req.name)")
+        return encode_model_metadata(req.name, meta.manifest, ctx.platform)
+    end
     return encode_model_metadata(req.name, entry.manifest, ctx.platform)
 end
 
@@ -168,6 +181,8 @@ end
 function _handle_infer_impl(ctx::InferContext, req)
     name = req.model_name
     isempty(name) && _invalid("ModelInferRequest.model_name is empty")
+    meta = get_meta(ctx.registry, name)
+    meta === nothing || return _handle_meta_infer(ctx, meta, req)
     entry = get_model(ctx.registry, name)
     entry === nothing && _not_found("unknown model: $name")
     decoded = _as_invalid(() -> decode_infer_request(req, ctx.shm))
@@ -177,6 +192,32 @@ function _handle_infer_impl(ctx::InferContext, req)
     # Encoding rejects a requested output the model does not produce: a client mistake, so
     # surface it as INVALID_ARGUMENT (matching the codec's documented contract).
     return _as_invalid(() -> encode_infer_response(name, decoded, outputs, ctx.shm))
+end
+
+# Map a meta model's sub-call availability failures to NOT_FOUND so they are retryable upstream,
+# mirroring `_infer_or_not_found`. This covers the LocalCaller path ("unknown model"/"was
+# unloaded" thrown by the scheduler); the GatewayCaller path surfaces a gRPCClient exception that
+# the worker's gRPC server already renders with its own status.
+function _meta_or_not_found(ctx::InferContext, meta, inputs::Vector{NamedTensor})
+    try
+        return run_meta(meta, ctx.caller, inputs)
+    catch e
+        e isa _G.gRPCServiceCallException && rethrow()
+        msg = sprint(showerror, e)
+        (occursin("unknown model", msg) || occursin("was unloaded", msg)) && _not_found(msg)
+        rethrow()
+    end
+end
+
+# A meta model runs its Julia orchestration on this request task (off the GPU dispatch loop). Input
+# validation reuses the regular path (it reads only `manifest`, which MetaEntry also carries). The
+# orchestration's own sub-calls go through `ctx.caller`.
+function _handle_meta_infer(ctx::InferContext, meta, req)
+    decoded = _as_invalid(() -> decode_infer_request(req, ctx.shm))
+    request = InferRequest(meta.name, decoded.request.requested_outputs, decoded.request.inputs)
+    _validate_inputs(meta, request)
+    outputs = _meta_or_not_found(ctx, meta, request.inputs)
+    return _as_invalid(() -> encode_infer_response(meta.name, decoded, outputs, ctx.shm))
 end
 
 # List models with per-model readiness reflecting residency. `req.ready` filters to ready models

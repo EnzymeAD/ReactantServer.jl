@@ -86,7 +86,7 @@ export NamedTensor, InferRequest, QueuedRequest
 # ---- manifest ----
 export ManifestError, DimKind, FIXED, BATCH, VARIABLE, Dim, TensorSpec, BatchingSpec, Provenance, Manifest
 export parse_shape, parse_tensor_spec, parse_tensor_list, parse_batching, parse_manifest, validate_manifest
-export load_manifest
+export load_manifest, is_meta
 export client_input_spec, client_output_spec
 
 # ---- signature ----
@@ -112,5 +112,6 @@ export shm_regions, shm_teardown!
 # ---- codec ----
 export OutputTarget, DecodedRequest, decode_infer_request, encode_infer_response, encode_model_metadata
 export encode_repository_index, encode_shm_status, encode_shm_register_response, encode_shm_unregister_response, id_of
+export encode_infer_request, decode_infer_response
 
 end # module ReactantServerCore

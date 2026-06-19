@@ -719,6 +719,32 @@ Alias for [`evict!`](@ref): remove a model from the live system. Provided for sy
 unload_model!(s::Scheduler, name::AbstractString) = evict!(s, name)
 
 """
+    put_meta!(scheduler, entry::MetaEntry) -> String
+
+Register (or replace) a meta model. Meta models carry no executable or scheduling state and the
+dispatch loop never touches `registry.meta`, so this mutates the registry directly under the
+scheduler lock rather than through the control queue. Returns the model name.
+"""
+function put_meta!(s::Scheduler, entry::MetaEntry)
+    lock(s.cond) do
+        s.registry.meta[entry.name] = entry
+    end
+    return entry.name
+end
+
+"""
+    remove_meta!(scheduler, name) -> Nothing
+
+Remove a meta model from the registry (the dynamic watcher's unload path for meta bundles).
+"""
+function remove_meta!(s::Scheduler, name::AbstractString)
+    lock(s.cond) do
+        delete!(s.registry.meta, String(name))
+    end
+    return nothing
+end
+
+"""
     infer(scheduler, request) -> Vector{NamedTensor}
 
 Submit a request and block until the scheduler returns the result. Re-raises any error
