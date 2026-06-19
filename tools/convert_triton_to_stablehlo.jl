@@ -465,7 +465,9 @@ function run_handler(fn::Function, options::Dict{String,Any}, hname::AbstractStr
                          batch_ladder(parse_max_batch_size(text)), options,
                          (; batch_ladder, parse_max_batch_size, example_input, short_error))
     try
-        sizes = fn(ctx)
+        # invokelatest: the handler function was defined by `Base.include` in a newer world age
+        # than this call site; Julia 1.12's strict world-age semantics otherwise reject it.
+        sizes = Base.invokelatest(fn, ctx)
         return Record(source, model, bundle_name, :success, collect(Int, sizes), "handler $hname")
     catch e
         return Record(source, model, bundle_name, :failed, Int[], "handler $hname: " * short_error(e))
