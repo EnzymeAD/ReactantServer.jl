@@ -182,6 +182,50 @@ end
     end
 end
 
+@testset "build_supervisor: shared_host_weights warning" begin
+    # Multiple workers + on-demand cache + private host floor: warn about the Nx host-RAM copies.
+    ondemand_node(dir; shared) = begin
+        path = joinpath(dir, "node.yaml")
+        write(path, """
+        model_repo: /repo
+        base_port: 8080
+        metrics_base_port: 9100
+        global:
+          runtime:
+            backend: cuda
+            weight_cache_bytes: 10737418240
+            shared_host_weights: $shared
+        """)
+        path
+    end
+
+    # Two workers, on-demand cache, shared store off: the warning fires.
+    mktempdir() do dir
+        sink = IOBuffer()
+        RSN.build_supervisor(ondemand_node(dir; shared=false); env=Dict("REACTANT_GPUS" => "2"),
+                             sink=sink, workspace_root="/opt/rs", runtime_dir=joinpath(dir, "run"))
+        out = String(take!(sink))
+        @test occursin("shared_host_weights", out)
+        @test occursin("private host copy", out)
+    end
+
+    # Same, but the shared store is on: no warning.
+    mktempdir() do dir
+        sink = IOBuffer()
+        RSN.build_supervisor(ondemand_node(dir; shared=true); env=Dict("REACTANT_GPUS" => "2"),
+                             sink=sink, workspace_root="/opt/rs", runtime_dir=joinpath(dir, "run"))
+        @test !occursin("private host copy", String(take!(sink)))
+    end
+
+    # A single worker materializes one floor regardless, so the warning is gated on >1 worker.
+    mktempdir() do dir
+        sink = IOBuffer()
+        RSN.build_supervisor(ondemand_node(dir; shared=false); env=Dict("REACTANT_GPUS" => "1"),
+                             sink=sink, workspace_root="/opt/rs", runtime_dir=joinpath(dir, "run"))
+        @test !occursin("private host copy", String(take!(sink)))
+    end
+end
+
 @testset "build_supervisor: cpu node" begin
     mktempdir() do dir
         path = joinpath(dir, "node.yaml")

@@ -33,6 +33,13 @@ global:
     # (10 GiB, sized for the T4's 16 GiB), so all models need not be resident at once. 0 would keep
     # every weight resident.
     weight_cache_bytes: 10737418240
+    # Share the PINNED_SYSTEM host weight floor across all four worker subprocesses via POSIX shm
+    # regions (keyed by model name + content digest) instead of each worker holding its own private
+    # anonymous-RAM copy. Since every worker loads every bundle here, this collapses the host floor
+    # from 4x to 1x the total weight bytes. The container's shared /dev/shm (ipc: host in the compose
+    # file) carries the regions. Mode 660 rather than the default world-writable 666.
+    shared_host_weights: true
+    shared_host_weights_mode: "660"
   scheduler:
     discipline: fifo            # required by lpt_packing (placement decisions move to the gateway)
     ema_halflife_seconds: 30.0
