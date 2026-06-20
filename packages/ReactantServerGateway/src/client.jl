@@ -43,7 +43,9 @@ function _worker_clients(cfg::GatewayConfig, url::AbstractString)
     # that owns them via @async rather than Threads.@spawn. The gateway terminates and forwards on
     # one event-loop thread, so sticky scheduling keeps the per-request driving on that thread and
     # avoids cross-thread handoff overhead on the hot path.
-    grpc = gRPCClient.gRPCCURL(; sticky = true)   # one running multi handle per worker
+    # one running multi handle per worker; its stream semaphore caps outbound in-flight requests to
+    # this worker (the rest block until a slot frees).
+    grpc = gRPCClient.gRPCCURL(; sticky = true, max_streams = cfg.max_concurrent_streams_per_worker)
     infer = GRPCInferenceService_ModelInfer_Client(host, port; grpc = grpc,
         TRequest = Vector{UInt8}, TResponse = Vector{UInt8},
         deadline = cfg.request_timeout_seconds,

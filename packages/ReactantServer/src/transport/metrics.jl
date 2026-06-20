@@ -39,6 +39,29 @@ Prometheus.metric_names(::WorkerSnapshotCollector) = (
 _scalar(name, type, help, v) =
     Prometheus.Metric(type, name, help, Prometheus.Sample(nothing, nothing, nothing, Float64(v)))
 
+# Reads the gRPC server's live admission counters at scrape time: in-flight RPCs, the cumulative
+# count shed at the concurrency cap, and the configured cap (0 = uncapped). Holds only references.
+struct AdmissionCollector <: Prometheus.Collector
+    inflight::Threads.Atomic{Int}
+    shed::Threads.Atomic{Int}
+    max_concurrent::Int
+end
+
+Prometheus.metric_names(::AdmissionCollector) =
+    ("worker_inflight_requests", "worker_requests_shed_total", "worker_max_concurrent_requests")
+
+function Prometheus.collect!(metrics::Vector, c::AdmissionCollector)
+    push!(metrics,
+        _scalar("worker_inflight_requests", "gauge",
+            "RPCs currently being handled (counted only when the cap is enabled).", c.inflight[]),
+        _scalar("worker_requests_shed_total", "counter",
+            "RPCs rejected with RESOURCE_EXHAUSTED at the concurrency cap.", c.shed[]),
+        _scalar("worker_max_concurrent_requests", "gauge",
+            "Configured in-flight RPC cap (0 = uncapped).", c.max_concurrent),
+    )
+    return metrics
+end
+
 function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
     sm = scheduler_metrics(c.sched)   # Dict: model name => per-model NamedTuple
     model_ln = Prometheus.LabelNames(("model",))
@@ -134,7 +157,9 @@ struct WorkerMetrics
 end
 
 function WorkerMetrics(sched::Scheduler, backend::AbstractBackend, pool::MemoryPool,
-                       cfg::ServerConfig; worker_name::AbstractString="")
+                       cfg::ServerConfig; worker_name::AbstractString="",
+                       inflight::Threads.Atomic{Int}=Threads.Atomic{Int}(0),
+                       shed::Threads.Atomic{Int}=Threads.Atomic{Int}(0))
     reg = Prometheus.CollectorRegistry()
     requests_total = Prometheus.Family{Prometheus.Counter}(
         "worker_requests_total", "Worker ModelInfer requests by model and gRPC status.",
@@ -143,6 +168,7 @@ function WorkerMetrics(sched::Scheduler, backend::AbstractBackend, pool::MemoryP
         "worker_request_latency_seconds", "Worker ModelInfer handler latency (seconds).",
         (:model,); buckets = _WM_BUCKETS, registry = reg)
     Prometheus.register(reg, WorkerSnapshotCollector(sched, backend, pool, cfg, String(worker_name)))
+    Prometheus.register(reg, AdmissionCollector(inflight, shed, cfg.endpoints.max_concurrent_requests))
     # Free process/runtime metrics (julia_gc_*, process_resident_memory_bytes, etc.). Guarded so a
     # platform without /proc cannot break worker startup.
     try

@@ -59,6 +59,9 @@ global:
     models: {}             # per-model overrides -> ModelSchedConfig (see below)
   endpoints:               # -> EndpointsConfig
     host: 0.0.0.0          # bind all interfaces so the gateway/clients can reach the worker
+    max_concurrent_requests: 64  # in-flight RPC cap; 0 = uncapped. Past the cap the worker sheds
+                                 # with RESOURCE_EXHAUSTED. Keep it above the gateway's per-worker
+                                 # outbound stream limit (worker_client.max_concurrent_streams)
 ```
 
 `model_control_mode` sets how the loaded model set evolves: `dynamic` (the default) watches
@@ -155,6 +158,12 @@ listen:
 grpc:
   max_recv_msg_bytes: 268435456   # 256 MiB
   max_send_msg_bytes: 268435456
+  max_concurrent_requests_per_worker: 64   # inbound cap is this x worker count; 0 = uncapped.
+                                           # Sized above the outbound stream limit so a startup
+                                           # burst has headroom rather than being shed early
+worker_client:
+  request_timeout_seconds: 60
+  max_concurrent_streams: 32      # outbound in-flight RPCs the gateway multiplexes to one worker
 logging:
   level: "info"
   format: "json"

@@ -134,15 +134,24 @@ function serve_gateway(gateway_path::Union{AbstractString,Nothing} = nothing; bl
     router = build_gateway_router(state, cfg)
 
     host, port = _split_hostport(cfg.listen_grpc)
-    @info "Starting reactant-gateway" grpc = cfg.listen_grpc metrics = cfg.listen_metrics endpoints = cfg.workers
+    # Inbound admission cap: a per-worker multiple of the configured budget, scaled by the fleet
+    # size so the gateway sheds (RESOURCE_EXHAUSTED) only past what the workers can plausibly absorb.
+    # 0 (per-worker = 0) disables the cap. The atomics are read live by the admission metrics.
+    max_concurrent = cfg.max_concurrent_requests_per_worker * length(cfg.workers)
+    inflight = Threads.Atomic{Int}(0)
+    shed = Threads.Atomic{Int}(0)
+    register_admission!(metrics, inflight, shed, max_concurrent)
+    @info "Starting reactant-gateway" grpc = cfg.listen_grpc metrics = cfg.listen_metrics endpoints = cfg.workers max_concurrent_requests = max_concurrent outbound_streams_per_worker = cfg.max_concurrent_streams_per_worker
 
     if blocking
         gRPCServer.serve(router, host, port; context = state,
+            max_concurrent_requests = max_concurrent, inflight = inflight, shed_total = shed,
             h2_initial_window_size = _H2_INITIAL_WINDOW_BYTES,
             h2_connection_window_size = _H2_CONNECTION_WINDOW_BYTES)
         return nothing
     end
     server = gRPCServer.serve!(router, host, port; context = state,
+        max_concurrent_requests = max_concurrent, inflight = inflight, shed_total = shed,
         h2_initial_window_size = _H2_INITIAL_WINDOW_BYTES,
         h2_connection_window_size = _H2_CONNECTION_WINDOW_BYTES)
     return RunningGateway(cfg, pool, routes, gate, metrics, admin, prober, server)

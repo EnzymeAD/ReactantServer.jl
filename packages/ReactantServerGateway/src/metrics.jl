@@ -92,6 +92,39 @@ set_model_replicas!(m::GatewayMetrics, model, k) =
 set_replica_outstanding!(m::GatewayMetrics, model, worker, n) =
     Prometheus.set(Prometheus.labels(m.replica_outstanding, (String(model), String(worker))), Float64(n))
 
+# Reads the gRPC server's live admission counters at scrape time: in-flight RPCs, the cumulative
+# count shed at the inbound concurrency cap, and the configured cap (0 = uncapped). Holds only
+# references, so the values are always current.
+struct AdmissionCollector <: Prometheus.Collector
+    inflight::Threads.Atomic{Int}
+    shed::Threads.Atomic{Int}
+    max_concurrent::Int
+end
+
+Prometheus.metric_names(::AdmissionCollector) =
+    ("gateway_inflight_requests", "gateway_requests_shed_total", "gateway_max_concurrent_requests")
+
+_adm_scalar(name, type, help, v) =
+    Prometheus.Metric(type, name, help, Prometheus.Sample(nothing, nothing, nothing, Float64(v)))
+
+function Prometheus.collect!(metrics::Vector, c::AdmissionCollector)
+    push!(metrics,
+        _adm_scalar("gateway_inflight_requests", "gauge",
+            "RPCs currently being handled (counted only when the cap is enabled).", c.inflight[]),
+        _adm_scalar("gateway_requests_shed_total", "counter",
+            "RPCs rejected with RESOURCE_EXHAUSTED at the inbound concurrency cap.", c.shed[]),
+        _adm_scalar("gateway_max_concurrent_requests", "gauge",
+            "Configured inbound RPC cap across all workers (0 = uncapped).", c.max_concurrent),
+    )
+    return metrics
+end
+
+# Register the admission collector against the gateway's metrics registry, exposing the gRPC
+# server's live in-flight / shed counters on /metrics.
+register_admission!(m::GatewayMetrics, inflight::Threads.Atomic{Int}, shed::Threads.Atomic{Int},
+                    max_concurrent::Integer) =
+    Prometheus.register(m.registry, AdmissionCollector(inflight, shed, Int(max_concurrent)))
+
 """
     expose(io, metrics)
 

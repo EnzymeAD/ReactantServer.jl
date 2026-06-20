@@ -173,20 +173,31 @@ SchedulerConfig(ema_halflife_seconds::Real, max_queue_depth::Integer, dispatch_t
 """
     EndpointsConfig
 
-The listen addresses (the `endpoints:` config block): `host`, the gRPC `port`, and the optional
-`metrics_port` for the Prometheus exposition endpoint (`0` = disabled). For a worker fronted by the
-gateway, bind `host` to all interfaces (`0.0.0.0`) so the gateway and Prometheus can reach it; the
-gRPC port is usually derived from the node file's `base_port` and the metrics port from
-`metrics_base_port`.
+The listen addresses (the `endpoints:` config block): `host`, the gRPC `port`, the optional
+`metrics_port` for the Prometheus exposition endpoint (`0` = disabled), and
+`max_concurrent_requests`, the cap on simultaneously-handled RPCs (`0` = uncapped). For a worker
+fronted by the gateway, bind `host` to all interfaces (`0.0.0.0`) so the gateway and Prometheus can
+reach it; the gRPC port is usually derived from the node file's `base_port` and the metrics port
+from `metrics_base_port`.
+
+`max_concurrent_requests` is a worker-level overload backstop: past the cap, new requests are shed
+immediately with `RESOURCE_EXHAUSTED` rather than queued. Keep it strictly above the gateway's
+per-worker outbound stream limit so it never sheds traffic the gateway has already admitted (and so
+it never rejects a meta-model's loopback sub-call); in single-worker mode (no gateway, clients hit
+the worker directly) it is the only inbound admission control.
 """
 struct EndpointsConfig
     host::String
     port::Int
-    metrics_port::Int    # Prometheus metrics HTTP port; 0 = disabled
+    metrics_port::Int          # Prometheus metrics HTTP port; 0 = disabled
+    max_concurrent_requests::Int   # cap on in-flight RPCs; 0 = uncapped
 end
 
-# Back-compat: the gRPC-only form; metrics disabled.
-EndpointsConfig(host, port) = EndpointsConfig(host, port, 0)
+# Back-compat: the gRPC-only form (metrics disabled, uncapped) and the host/port/metrics form
+# (uncapped). The cap defaults to 0 for programmatic construction; the YAML path (`build_config`)
+# supplies its own default.
+EndpointsConfig(host, port) = EndpointsConfig(host, port, 0, 0)
+EndpointsConfig(host, port, metrics_port) = EndpointsConfig(host, port, metrics_port, 0)
 
 """
     ServerConfig
@@ -247,6 +258,7 @@ const ENV_PATHS = Tuple{String,Vector{String},DataType}[
     ("ENDPOINTS_HOST", ["endpoints", "host"], String),
     ("ENDPOINTS_PORT", ["endpoints", "port"], Int),
     ("ENDPOINTS_METRICS_PORT", ["endpoints", "metrics_port"], Int),
+    ("ENDPOINTS_MAX_CONCURRENT_REQUESTS", ["endpoints", "max_concurrent_requests"], Int),
 ]
 
 _parse_env(::Type{Int}, s) = parse(Int, s)
@@ -449,6 +461,7 @@ function build_config(raw::AbstractDict)
         _opt(ep, "host", String, "127.0.0.1"),
         _opt(ep, "port", Int, 8080),
         _opt(ep, "metrics_port", Int, 0),
+        _opt(ep, "max_concurrent_requests", Int, 64),
     )
 
     models_include = haskey(raw, "models_include") ?
@@ -471,6 +484,8 @@ function validate_config(cfg::ServerConfig)
         throw(ConfigError("endpoints.metrics_port out of range: $(cfg.endpoints.metrics_port)"))
     cfg.endpoints.metrics_port == 0 || cfg.endpoints.metrics_port != cfg.endpoints.port ||
         throw(ConfigError("endpoints.metrics_port must differ from endpoints.port ($(cfg.endpoints.port))"))
+    cfg.endpoints.max_concurrent_requests >= 0 ||
+        throw(ConfigError("endpoints.max_concurrent_requests must be non-negative (0 = uncapped)"))
     cfg.scheduler.ema_halflife_seconds > 0 || throw(ConfigError("scheduler.ema_halflife_seconds must be positive"))
     0 < cfg.scheduler.recency_penalty_cap <= 1 || throw(ConfigError("scheduler.recency_penalty_cap must be in (0, 1]"))
     0 <= cfg.scheduler.coalescing_discount < 1 || throw(ConfigError("scheduler.coalescing_discount must be in [0, 1)"))
@@ -494,7 +509,7 @@ end
 # `apply_env_overrides!` is applied on top by `node_server_config`.
 
 function log_effective_config(cfg::ServerConfig, applied)
-    @info "Effective configuration" model_dirs=cfg.model_dirs models_include=cfg.models_include model_control_mode=cfg.model_control_mode model_poll_seconds=cfg.model_poll_seconds cache_dir=cfg.cache_dir backend=cfg.runtime.backend device_ordinal=cfg.runtime.device_ordinal mem_fraction=cfg.runtime.mem_fraction preallocate=cfg.runtime.preallocate allow_cpu_fallback=cfg.runtime.allow_cpu_fallback weight_cache_bytes=cfg.runtime.weight_cache_bytes residency_mode=cfg.runtime.residency_mode shared_host_weights=cfg.runtime.shared_host_weights shared_host_weights_mode=string(cfg.runtime.shared_host_weights_mode; base=8) host=cfg.endpoints.host port=cfg.endpoints.port metrics_port=cfg.endpoints.metrics_port discipline=cfg.scheduler.discipline ema_halflife_seconds=cfg.scheduler.ema_halflife_seconds recency_penalty_cap=cfg.scheduler.recency_penalty_cap coalescing_discount=cfg.scheduler.coalescing_discount cost_ema_alpha=cfg.scheduler.cost_ema_alpha max_queue_depth=cfg.scheduler.max_queue_depth scheduler_models=collect(keys(cfg.scheduler.models))
+    @info "Effective configuration" model_dirs=cfg.model_dirs models_include=cfg.models_include model_control_mode=cfg.model_control_mode model_poll_seconds=cfg.model_poll_seconds cache_dir=cfg.cache_dir backend=cfg.runtime.backend device_ordinal=cfg.runtime.device_ordinal mem_fraction=cfg.runtime.mem_fraction preallocate=cfg.runtime.preallocate allow_cpu_fallback=cfg.runtime.allow_cpu_fallback weight_cache_bytes=cfg.runtime.weight_cache_bytes residency_mode=cfg.runtime.residency_mode shared_host_weights=cfg.runtime.shared_host_weights shared_host_weights_mode=string(cfg.runtime.shared_host_weights_mode; base=8) host=cfg.endpoints.host port=cfg.endpoints.port metrics_port=cfg.endpoints.metrics_port max_concurrent_requests=cfg.endpoints.max_concurrent_requests discipline=cfg.scheduler.discipline ema_halflife_seconds=cfg.scheduler.ema_halflife_seconds recency_penalty_cap=cfg.scheduler.recency_penalty_cap coalescing_discount=cfg.scheduler.coalescing_discount cost_ema_alpha=cfg.scheduler.cost_ema_alpha max_queue_depth=cfg.scheduler.max_queue_depth scheduler_models=collect(keys(cfg.scheduler.models))
     isempty(applied) || @info "Configuration overridden by environment" overrides=first.(applied)
     return nothing
 end

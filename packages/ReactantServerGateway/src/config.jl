@@ -61,6 +61,14 @@ struct GatewayConfig
     routing_fill_factor::Float64
     routing_policy::String
     models::Dict{String,GatewayModelConfig}
+    # Concurrency limits. `max_concurrent_streams_per_worker` is the outbound cap: the in-flight
+    # gRPC streams the gateway will multiplex over one worker's shared libcurl handle (the rest block
+    # until a slot frees). `max_concurrent_requests_per_worker` sizes the inbound cap: the gateway
+    # sheds inbound RPCs past `max_concurrent_requests_per_worker * n_workers` with RESOURCE_EXHAUSTED.
+    # The inbound multiple is set above the outbound limit so a startup burst has wiggle room rather
+    # than being rejected before the workers are even saturated.
+    max_concurrent_streams_per_worker::Int
+    max_concurrent_requests_per_worker::Int
 end
 
 const GW_ENV_PREFIX = "REACTANT_GATEWAY_"
@@ -77,8 +85,10 @@ const GW_ENV_PATHS = Tuple{String,Vector{String},DataType}[
     ("SCHEDULING_ROUTING_FILL_FACTOR", ["scheduling", "routing_fill_factor"], Float64),
     ("SCHEDULING_ROUTING_POLICY", ["scheduling", "routing_policy"], String),
     ("WORKER_CLIENT_REQUEST_TIMEOUT_SECONDS", ["worker_client", "request_timeout_seconds"], Int),
+    ("WORKER_CLIENT_MAX_CONCURRENT_STREAMS", ["worker_client", "max_concurrent_streams"], Int),
     ("GRPC_MAX_RECV_MSG_BYTES", ["grpc", "max_recv_msg_bytes"], Int),
     ("GRPC_MAX_SEND_MSG_BYTES", ["grpc", "max_send_msg_bytes"], Int),
+    ("GRPC_MAX_CONCURRENT_REQUESTS_PER_WORKER", ["grpc", "max_concurrent_requests_per_worker"], Int),
     ("LOGGING_LEVEL", ["logging", "level"], String),
     ("LOGGING_FORMAT", ["logging", "format"], String),
     ("TLS_CERT_FILE", ["tls", "cert_file"], String),
@@ -204,7 +214,16 @@ function _build_gateway_config(raw::Dict{String,Any})
         _opt(sched, "routing_fill_factor", Float64, 1.0),
         routing_policy,
         _parse_gateway_sched_models(sched),
+        _opt(wc, "max_concurrent_streams", Int, 32),
+        _opt(grpc, "max_concurrent_requests_per_worker", Int, 64),
     )
+    cfg.max_concurrent_streams_per_worker > 0 ||
+        throw(ConfigError("worker_client.max_concurrent_streams must be positive"))
+    cfg.max_concurrent_requests_per_worker >= 0 ||
+        throw(ConfigError("grpc.max_concurrent_requests_per_worker must be non-negative (0 = uncapped)"))
+    cfg.max_concurrent_requests_per_worker == 0 ||
+        cfg.max_concurrent_requests_per_worker > cfg.max_concurrent_streams_per_worker ||
+        @warn "gateway inbound cap per worker is not above the outbound stream limit; a burst may shed before workers saturate" inbound_per_worker = cfg.max_concurrent_requests_per_worker outbound_streams = cfg.max_concurrent_streams_per_worker
     cfg.rebalance_compute_seconds > 0 || throw(ConfigError("scheduling.rebalance_compute_seconds must be positive"))
     cfg.min_rebalance_seconds >= 0 || throw(ConfigError("scheduling.min_rebalance_seconds must be non-negative"))
     0 < cfg.max_worker_share <= 1 || throw(ConfigError("scheduling.max_worker_share must be in (0, 1]"))

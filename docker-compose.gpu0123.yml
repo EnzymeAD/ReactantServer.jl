@@ -52,7 +52,10 @@ services:
       # inherits these REACTANT_GATEWAY_SCHEDULING_* variables from this environment.
       REACTANT_GATEWAY_SCHEDULING_MODE: "lpt_packing"
       REACTANT_GATEWAY_SCHEDULING_DEFAULT_REPLICAS: "1"
-      REACTANT_GATEWAY_SCHEDULING_REBALANCE_COMPUTE_SECONDS: "30.0"
+      # Doubled from 30s: each repack relocates models (transient recompile/unavailability) and spiked
+      # the per-worker GPU dispatch queue, inflating meta sub-call wait tails (p99 4-7s). A slower
+      # rebalance lets steady-state settle; raise further (or bump hysteresis) if tails persist.
+      REACTANT_GATEWAY_SCHEDULING_REBALANCE_COMPUTE_SECONDS: "60.0"
     # The supervisor forwards SIGTERM to its children and waits for them before exiting.
     stop_grace_period: 30s
     healthcheck:

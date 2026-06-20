@@ -113,7 +113,7 @@ end
 @testset "verify_lpt_packing_preconditions!: gates on worker reachability" begin
     cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", ["127.0.0.1:1"], String[], 1, 1, 1, "info",
                            "json", "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr",
-                           Dict{String,GW.GatewayModelConfig}())
+                           Dict{String,GW.GatewayModelConfig}(), 32, 64)
     pool = GW.ClientPool(cfg)
     # Default (wait_seconds = 0) fails fast when a worker is unreachable.
     @test_throws ErrorException GW.verify_lpt_packing_preconditions!(pool; wait_seconds = 0)
@@ -184,7 +184,7 @@ function _pk_state(; routing_policy = "fill_rr", fill_factor = 1.0, max_batch = 
                    costs = nothing)
     cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], 60, 1, 1, "info", "json",
                            "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, fill_factor, routing_policy,
-                           Dict{String,GW.GatewayModelConfig}())
+                           Dict{String,GW.GatewayModelConfig}(), 32, 64)
     s = GW.LptPackingState(cfg)
     @atomic s.assignment = assignment
     @atomic s.max_batch = Dict(m => max_batch for m in keys(assignment))
