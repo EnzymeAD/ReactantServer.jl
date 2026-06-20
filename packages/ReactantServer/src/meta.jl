@@ -87,12 +87,13 @@ function _build_subcall_request(pool::Union{BufferPool,Nothing}, name::AbstractS
         end
         ok && return encode_infer_request_shm(name, inputs, pool_region_name(pool), offs;
                                               requested_outputs=requested_outputs)
-        # A pool exists but some input is not a contiguous pool buffer: inline, and surface a large
-        # accidental fallback (e.g. the author copied or strided a scratch buffer) rather than letting
-        # it silently regress.
+        # A pool exists but some input is not a contiguous pool buffer -> inline. Diagnostic only (at
+        # @debug): a meta legitimately passes large NON-scratch inputs through (e.g. the stage1 image),
+        # so this is normal, not a warning; it's useful only when chasing why a buffer that WAS meant
+        # to be scratch ended up inlined (a copy/strided view of a scratch buffer).
         for t in inputs
             sizeof(t.data) > 1_000_000 && _region_offset(t.data, base, nbytes) === nothing &&
-                @warn "meta sub-call input inlined instead of shared-memory (not a contiguous pool buffer)" model = name input = t.name bytes = sizeof(t.data) maxlog = 16
+                @debug "meta sub-call input inlined (not a contiguous pool buffer)" model = name input = t.name bytes = sizeof(t.data)
         end
     end
     return encode_infer_request(name, inputs; requested_outputs=requested_outputs)
@@ -146,13 +147,25 @@ end
 function setup_fanout(shm::SharedMemoryRegistry)
     self = strip(get(ENV, FANOUT_SELF_ENV, ""))
     isempty(self) && return nothing
+    parts = split(self, ":")
+    if length(parts) != 3
+        @warn "fan-out: REACTANT_FANOUT_SELF malformed; meta sub-calls will inline" value = self
+        return nothing
+    end
+    self_key = String(parts[1])
     own = try
-        parts = split(self, ":")
-        length(parts) == 3 || error("REACTANT_FANOUT_SELF must be '<key>:<bytes>:<n_slots>', got $self")
-        BufferPool(parse(Int, parts[2]); n_slots=parse(Int, parts[3]), use_shm=true, key=String(parts[1]))
+        BufferPool(parse(Int, parts[2]); n_slots=parse(Int, parts[3]), use_shm=true, key=self_key)
     catch err
         @warn "fan-out: could not create own region; meta sub-calls will inline" exception = err
         return nothing
+    end
+    # Register our OWN region for READING too. The gateway can route a meta's sub-call back to the
+    # SAME worker that produced it; there decode_infer_request -> shm_read must find this region. The
+    # BufferPool (write) and the registry (read) are separate mappings of the same physical region.
+    try
+        shm_register!(shm, own.name, self_key, 0, sizeof(own))
+    catch err
+        @warn "fan-out: could not register own region for read-back; same-worker sub-calls will error on SHM" exception = err
     end
     for ent in split(strip(get(ENV, FANOUT_PEERS_ENV, "")), ","; keepempty=false)
         kb = split(ent, ":")
