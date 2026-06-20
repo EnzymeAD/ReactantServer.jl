@@ -99,7 +99,10 @@ services:
       LOADGEN_TRANSPORT: "tcp"        # tcp | shm | mixed
       LOADGEN_SHM_OUTPUTS: "true"     # shm path also reads outputs back through shared memory
       LOADGEN_REPORT_SECONDS: "30"
-      JULIA_NUM_THREADS: "8"
+      # 8 compute + 1 interactive: the firing tasks saturate the compute pool at concurrency 32, so
+      # the stats reporter runs on the reserved interactive thread (Threads.@spawn :interactive) and
+      # keeps printing instead of starving once the soak is at full load.
+      JULIA_NUM_THREADS: "8,1"
 
 volumes:
   # Survives `docker compose down/up` so the workers' first-run compilation work is reused.

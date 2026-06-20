@@ -313,7 +313,11 @@ function main()
         end
     end
 
-    reporter = Threads.@spawn begin
+    # Reporter on the INTERACTIVE pool: at concurrency >> nthreads the firing tasks saturate the
+    # default (compute) pool, and a default-pool reporter wakes from sleep() with no free thread to
+    # run on — so it prints once during the ramp lull then goes silent while the soak keeps running.
+    # The interactive thread is reserved (run julia with --threads=N,1) so the reporter always fires.
+    reporter = Threads.@spawn :interactive begin
         last_ok = 0
         last_t = time()
         last_loads = 0; last_evicts = 0
@@ -359,6 +363,7 @@ function main()
                 println("    first error: ", sample)
                 err_shown = true
             end
+            flush(stdout)   # piped stdout (docker logs) is block-buffered; flush so reports appear live
             last_ok = ok; last_t = now
         end
     end
