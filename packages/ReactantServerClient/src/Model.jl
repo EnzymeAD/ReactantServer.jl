@@ -100,6 +100,11 @@ struct KServeModel <: AbstractInferenceModel
     deadline::Float64
     max_send_message_length::Int64
     max_receive_message_length::Int64
+    # The gRPCCURL handle (libcurl multi handle + connection pool + concurrent-stream semaphore) all
+    # of this model's client calls share. Defaults to the process-global handle (GRPC_MAX_STREAMS=16
+    # concurrent requests). Pass a dedicated handle with a larger `max_streams` to drive more
+    # concurrency than 16 (e.g. a load generator sizing it to its request concurrency).
+    grpc::gRPCClient.gRPCCURL
 
     function KServeModel(
         host,
@@ -110,6 +115,7 @@ struct KServeModel <: AbstractInferenceModel
         deadline = 10.0,
         max_send_message_length = DEFAULT_MAX_MESSAGE_BYTES,
         max_receive_message_length = DEFAULT_MAX_MESSAGE_BYTES,
+        grpc = gRPCClient.grpc_global_handle(),
     )
         new(
             host,
@@ -120,6 +126,7 @@ struct KServeModel <: AbstractInferenceModel
             deadline,
             max_send_message_length,
             max_receive_message_length,
+            grpc,
         )
     end
 
@@ -130,6 +137,7 @@ struct KServeModel <: AbstractInferenceModel
         deadline = 10.0,
         max_send_message_length = DEFAULT_MAX_MESSAGE_BYTES,
         max_receive_message_length = DEFAULT_MAX_MESSAGE_BYTES,
+        grpc = gRPCClient.grpc_global_handle(),
     )
         host, port, secure = parse_grpc_url(url)
 
@@ -142,6 +150,7 @@ struct KServeModel <: AbstractInferenceModel
             max_send_message_length = max_send_message_length,
             max_receive_message_length = max_receive_message_length,
             deadline = deadline,
+            grpc = grpc,
         )
     end
 end
@@ -160,6 +169,7 @@ function grpc_infer_client(x::KServeModel)
         max_send_message_length = x.max_send_message_length,
         # The generated client stub's keyword spells it 'recieve'; the public field does not.
         max_recieve_message_length = x.max_receive_message_length,
+        grpc = x.grpc,
     )
 end
 
@@ -168,6 +178,7 @@ function grpc_shm_unregister_client(x::KServeModel)
         x.host,
         x.port;
         secure = x.secure,
+        grpc = x.grpc,
     )
 end
 
@@ -176,6 +187,7 @@ function grpc_shm_register_client(x::KServeModel)
         x.host,
         x.port;
         secure = x.secure,
+        grpc = x.grpc,
     )
 end
 
@@ -185,5 +197,6 @@ function grpc_metadata_client(x::KServeModel)
         x.port;
         secure = x.secure,
         deadline = x.deadline,
+        grpc = x.grpc,
     )
 end

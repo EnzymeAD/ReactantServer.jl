@@ -19,6 +19,7 @@
 
 using ReactantServerClient
 using ReactantServerCore: load_manifest   # to read meta.calls and skip internal sub-bundles
+import gRPCClient                          # for a dedicated gRPCCURL sized to CONCURRENCY
 using Base.Threads
 
 # ---- config ----------------------------------------------------------------------------------
@@ -125,7 +126,7 @@ function _internal_submodels(names)
     return internal
 end
 
-function discover_models()
+function discover_models(grpc)
     names = readdir(MODEL_REPO)
     want = get(ENV, "LOADGEN_MODELS", "")
     if !isempty(want)
@@ -156,7 +157,7 @@ function discover_models()
             unmapped && (@warn "skip: unmapped dtype" model=name; continue)
             tcp_inputs = Any[InferInput(inp.name, zeros(inp.dtype, _wire_dims(inp, 1)...))
                              for inp in inputs]
-            spec = ModelSpec(name, KServeModel(GATEWAY, name; max_batch_size = 1),
+            spec = ModelSpec(name, KServeModel(GATEWAY, name; max_batch_size = 1, grpc = grpc),
                              inputs, tcp_inputs, output_shm_specs(io))
         catch err
             @warn "skip: manifest_io_spec failed" model=name exception=err
@@ -244,7 +245,7 @@ function warmup(specs::Vector{ModelSpec})
     println("warmup: priming $(length(specs)) models serially (deadline $(WARMUP_DEADLINE)s) ...")
     t0 = time(); ok = 0
     for spec in specs
-        m = KServeModel(GATEWAY, spec.name; max_batch_size = 1, deadline = WARMUP_DEADLINE)
+        m = KServeModel(GATEWAY, spec.name; max_batch_size = 1, deadline = WARMUP_DEADLINE, grpc = spec.model.grpc)
         try
             infer_sync(m, spec.tcp_inputs)
             ok += 1
@@ -289,7 +290,15 @@ end
 function main()
     println("== loadgen: gateway=$GATEWAY transport=$TRANSPORT concurrency=$CONCURRENCY duration=$(DURATION)s ==")
     kserve_init(; n_slots = max(CONCURRENCY, ReactantServerClient.DEFAULT_POOL_SLOTS))
-    specs = discover_models()
+    # One number (CONCURRENCY) controls everything: firing tasks, the SHM staging-pool slots above,
+    # and the gRPC concurrent-stream semaphore here. Without this the clients use the global handle
+    # (GRPC_MAX_STREAMS=16), which caps in-flight requests at 16 no matter how high CONCURRENCY is.
+    grpc = gRPCClient.gRPCCURL(; sticky = false, max_streams = CONCURRENCY)
+    # Echo the single knob and everything it derived, so a glance at the logs confirms it propagated.
+    println("== loadgen config: LOADGEN_CONCURRENCY=$CONCURRENCY -> firing_tasks=$CONCURRENCY, ",
+            "shm_pool_slots=$(max(CONCURRENCY, ReactantServerClient.DEFAULT_POOL_SLOTS)), ",
+            "grpc_max_streams=$CONCURRENCY, julia_threads=$(Threads.nthreads()) ==")
+    specs = discover_models(grpc)
     isempty(specs) && (println("ERROR: no usable models discovered under $MODEL_REPO"); exit(2))
     println("discovered $(length(specs)) models; starting soak with $(nthreads()) threads")
 
