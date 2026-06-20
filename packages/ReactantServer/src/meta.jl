@@ -179,9 +179,10 @@ mutable struct MetaCall{C<:ModelCaller}
     name::String
     declared::Set{String}
     slots::Vector{PoolSlot}
+    scratched::Bool          # call.scratch may be used at most once per request (see _scratch)
 end
 MetaCall(caller::ModelCaller, name::AbstractString, declared) =
-    MetaCall(caller, String(name), Set{String}(declared), PoolSlot[])
+    MetaCall(caller, String(name), Set{String}(declared), PoolSlot[], false)
 
 # `call(name, inputs)` — dispatch a sub-call, rejecting undeclared callees.
 function (mc::MetaCall)(name::AbstractString, inputs::Vector{NamedTensor};
@@ -205,11 +206,25 @@ Request fan-out scratch buffers for this request. With a pool (multi-worker), al
 are carved from ONE contiguous acquired block (released when the orchestration returns) and writing
 into them then passing them to `call(...)` sends them by shared-memory reference. Without a pool
 (single-worker, in-process), returns plain heap arrays — identical model.jl code either way.
+
+MUST be called at most once per request: ask for ALL buffers up front in a single call (pass a vector
+of `dims => T`). Two reasons, both enforced by rejecting a second call:
+  1. Deadlock-freedom: a request only ever holds one block, so it never waits on the pool while
+     holding a slot — there is no acquire-while-holding circular wait.
+  2. Allocation efficiency: one call carves N buffers from ONE block (waste = the unused tail of the
+     final slot, < slot_bytes, O(1) in N); N separate calls would grab N blocks (O(n) waste).
+A second call throws — enforced in both modes so the anti-pattern surfaces in single-worker testing,
+not just under multi-worker load.
 """
 _scratch(mc::MetaCall, dims, ::Type{T}) where {T} =
     first(_scratch(mc, Pair[(dims isa Tuple ? dims : (dims,)) => T]))
 
 function _scratch(mc::MetaCall, reqs::AbstractVector)
+    getfield(mc, :scratched) && error(
+        "meta model '$(getfield(mc, :name))': call.scratch may be called only once per request; " *
+        "request all buffers up front in a single call, e.g. call.scratch([dims1 => T1, dims2 => T2]). " *
+        "Repeated acquisition while holding a slot is rejected to keep the fan-out pool deadlock-free.")
+    setfield!(mc, :scratched, true)
     specs = [(Tuple(first(r)), last(r)) for r in reqs]   # dims => T pairs
     pool = caller_pool(getfield(mc, :caller))
     if pool === nothing
