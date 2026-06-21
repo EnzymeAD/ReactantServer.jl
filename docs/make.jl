@@ -51,6 +51,7 @@ makedocs(;
             "Client Usage"             => "manual/client_usage.md",
             "Node Configuration"       => "manual/node_config.md",
             "Bundles & model.jl"       => "manual/bundles.md",
+            "Meta Models"              => "manual/meta_models.md",
             "On-demand Weights"        => "manual/on_demand_weights.md",
             "Multi-GPU Gateway"        => "manual/multi_gpu_gateway.md",
             "Docker Deployment"        => "manual/docker.md",
