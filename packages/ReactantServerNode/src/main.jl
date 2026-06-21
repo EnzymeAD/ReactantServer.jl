@@ -168,8 +168,11 @@ function build_supervisor(node_path::AbstractString;
         # Shared-memory fan-out mesh: only meaningful with >1 worker on this host (a sole worker
         # routes meta sub-calls in-process). Mint one region key per worker (node-unique so a restart
         # never collides with a stale region), then give each worker its own key and all peers' keys.
-        fbytes = parse(Int, strip(get(env, "REACTANT_FANOUT_BYTES", string(1 << 30))))   # 1 GiB
-        fslots = parse(Int, strip(get(env, "REACTANT_FANOUT_SLOTS", "8")))               # 128 MiB each
+        fbytes = parse(Int, strip(get(env, "REACTANT_FANOUT_BYTES", string(1 << 30))))   # 1 GiB total
+        # 16 slots over the 1 GiB region = 64 MiB each. Doubled from 8 (same total memory): each slot
+        # is held for a meta's whole request, so more, smaller slots admit more concurrent fan-out
+        # metas before they queue on the pool. A scratch buffer larger than one slot spans several.
+        fslots = parse(Int, strip(get(env, "REACTANT_FANOUT_SLOTS", "16")))
         fanout = length(ws) > 1 && get(env, "REACTANT_FANOUT", "true") != "false"
         ftoken = string(rand(UInt32); base=16)
         fkeys = ["/reactant-fanout-$(_worker_name(w))-$(ftoken)" for w in ws]

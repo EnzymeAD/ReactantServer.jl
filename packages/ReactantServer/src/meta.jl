@@ -326,7 +326,15 @@ function _scratch(mc::MetaCall, reqs::AbstractVector)
     # One contiguous block fits everything (simple by design; revisit for fragmentation later).
     total = sum(sizeof(T) * prod(d) for (d, T) in specs)
     span = max(1, cld(total, pool_slot_bytes(pool)))
-    slot = acquire_slot!(pool, span)
+    # Bound the slot wait by the meta's deadline so a slot-starved meta fails fast instead of burning
+    # its whole budget parked in acquire_slot!. A pool timeout maps to the meta's DeadlineExceeded, so
+    # it sheds exactly like an expired sub-call.
+    slot = try
+        acquire_slot!(pool, span; deadline_ns = getfield(mc, :deadline_ns))
+    catch e
+        e isa PoolAcquireTimeout && throw(DeadlineExceeded(getfield(mc, :name)))
+        rethrow()
+    end
     push!(getfield(mc, :slots), slot)
     return Any[pool_view(subslot(slot, sizeof(T) * prod(d)), T, d...) for (d, T) in specs]
 end

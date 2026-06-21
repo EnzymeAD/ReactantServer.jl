@@ -151,6 +151,32 @@
         foreach(ReactantServerCore.release_slot!, singles[2:end])
     end
 
+    @testset "deadline-bounded acquire times out instead of parking forever" begin
+        p = ReactantServerCore.BufferPool(4096; n_slots = 4, use_shm = false)
+        singles = [ReactantServerCore.acquire_slot!(p) for _ in 1:4]   # pool fully held
+        # No slot will free; a short deadline must throw rather than block indefinitely. The timer
+        # has to wake the parked waiter on its own, since nothing is released here.
+        dl = Int64(time_ns()) + 200_000_000   # 200 ms
+        @test_throws ReactantServerCore.PoolAcquireTimeout ReactantServerCore.acquire_slot!(p; deadline_ns = dl)
+        # The timed-out waiter dequeued itself; the queue is clean and a later acquire still works.
+        @test timedwait(() -> (@lock p.alloc_lock isempty(p.waitq)), 5.0) == :ok
+
+        # A deadline a release beats is satisfied normally (no spurious timeout).
+        got = Channel{Any}(1)
+        t = Threads.@spawn put!(got,
+            ReactantServerCore.acquire_slot!(p; deadline_ns = Int64(time_ns()) + 5_000_000_000))
+        @test timedwait(() -> (@lock p.alloc_lock !isempty(p.waitq)), 5.0) == :ok
+        ReactantServerCore.release_slot!(singles[1])
+        @test timedwait(() -> isready(got), 5.0) == :ok
+        ReactantServerCore.release_slot!(take!(got))
+        wait(t)
+
+        # deadline_ns = 0 (the default) keeps the original unbounded behavior.
+        s = ReactantServerCore.acquire_slot!(p)   # slot 1 is free again
+        ReactantServerCore.release_slot!(s)
+        foreach(ReactantServerCore.release_slot!, singles[2:end])
+    end
+
     @testset "no overlap under contention" begin
         n_slots = 8
         p = ReactantServerCore.BufferPool(8 * 4096; n_slots = n_slots, use_shm = false)

@@ -116,15 +116,37 @@ function _find_free_run(free::BitVector, span::Int)
 end
 
 """
-    acquire_slot!(pool, span=1) -> PoolSlot
+    PoolAcquireTimeout(span, waited_ns)
+
+Raised by [`acquire_slot!`](@ref) when a `deadline_ns` was supplied and passed before `span`
+contiguous slots became free. The waiter is dequeued before this is thrown, so it never stalls the
+line. Callers that carry a request deadline (e.g. a meta model's fan-out) translate this into their
+own deadline-exceeded error.
+"""
+struct PoolAcquireTimeout <: Exception
+    span::Int
+    waited_ns::Int64
+end
+Base.showerror(io::IO, e::PoolAcquireTimeout) =
+    print(io, "acquire_slot!: timed out after ", round(e.waited_ns / 1e9, digits = 3),
+          "s waiting for ", e.span, " contiguous slot(s)")
+
+"""
+    acquire_slot!(pool, span=1; deadline_ns=0) -> PoolSlot
 
 Block until `span` physically contiguous slots are free, then return them as one slot whose
 `[offset, offset + span*slot_bytes)` range no other in-flight slot overlaps. Throws an
 `ArgumentError` immediately if `span` exceeds the pool's total slot count, since such a
 request could never be satisfied and would otherwise deadlock. Waiters are served in FIFO
 order. Pair with `release_slot!`, which frees the whole run.
+
+`deadline_ns` is an absolute `time_ns()` deadline (0 = wait indefinitely, the default and prior
+behavior). When set, a waiter that has not acquired by the deadline throws [`PoolAcquireTimeout`]
+instead of parking past it. A one-shot timer wakes the waiter at the deadline even if no slot is
+released in the meantime, so a starved waiter fails fast rather than burning a request's whole
+budget in the park.
 """
-function acquire_slot!(pool::BufferPool, span::Integer = 1)
+function acquire_slot!(pool::BufferPool, span::Integer = 1; deadline_ns::Integer = 0)
     s = Int(span)
     s >= 1 || throw(ArgumentError("acquire_slot!: span must be >= 1 (got $s)"))
     s <= pool.n_slots || throw(ArgumentError(
@@ -132,12 +154,18 @@ function acquire_slot!(pool::BufferPool, span::Integer = 1)
         "$(pool.slot_bytes) bytes each; this request can never be satisfied. " *
         "Increase the pool's total bytes or decrease n_slots so each slot is larger."))
 
+    dl = Int64(deadline_ns)
+    t0 = Int64(time_ns())
     lock(pool.alloc_lock)
     token = UInt64(0)   # sentinel keeps the finally safe if we are interrupted pre-enqueue
+    timer = nothing     # one-shot wake at the deadline; armed on first park, closed in finally
     try
         token = (pool.token_counter += 1)
         push!(pool.waitq, token)
         while true
+            if dl != 0 && Int64(time_ns()) >= dl
+                throw(PoolAcquireTimeout(s, Int64(time_ns()) - t0))
+            end
             if first(pool.waitq) == token
                 start = _find_free_run(pool.free, s)
                 if start != 0
@@ -148,9 +176,19 @@ function acquire_slot!(pool::BufferPool, span::Integer = 1)
                                     s * pool.slot_bytes, s)
                 end
             end
+            # Arm a single timer for the absolute deadline so the park is bounded even with no
+            # release. It notifies `freed` (under the lock it guards), waking every waiter to
+            # re-check; the expired one then throws on the next loop turn. notify wakes all, so one
+            # timer per waiter is enough for each to observe its own deadline.
+            if dl != 0 && timer === nothing
+                rem = (dl - Int64(time_ns())) / 1e9
+                rem <= 0 && throw(PoolAcquireTimeout(s, Int64(time_ns()) - t0))
+                timer = Timer(_ -> (try; @lock pool.alloc_lock notify(pool.freed); catch; end), rem)
+            end
             wait(pool.freed)   # releases alloc_lock while parked, reacquires on wake
         end
     finally
+        timer === nothing || close(timer)
         # Runs on success, on interruption while parked (wait reacquires the lock before
         # rethrowing), and on any other error: dequeue ourselves and wake the next head so an
         # abandoned waiter can never stall the line.
