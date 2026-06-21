@@ -2,9 +2,11 @@
 # (docker-compose.gpu0123.yml). The supervisor runs four workers (one per visible GPU, selected by
 # CUDA_VISIBLE_DEVICES=0,1,2,3) plus the embedded gateway on 8001/8002. The gateway is put in
 # lpt_packing mode via the REACTANT_GATEWAY_SCHEDULING_* environment in the compose file. That mode
-# requires every worker to run the fifo discipline (set below, so placement decisions move to the
-# gateway and the workers do not re-order against it) and to serve the identical model set (every
-# worker loads every bundle in the repository, which is the default).
+# requires every worker to run the fifo or edf discipline (set below, so placement decisions stay with
+# the gateway and the workers do not impose a competing per-model fairness policy) and to serve the
+# identical model set (every worker loads every bundle in the repository, which is the default). This
+# stack uses edf so in-flight meta sub-calls, which have already spent part of their deadline budget,
+# are served ahead of fresh full-budget requests instead of starving at the deadline line.
 #
 # This is the no-replication setup: with the gateway's default_replicas: 1, lpt_packing places each
 # model on ONE of the four GPUs (chosen by balancing memory and compute), so a model's weights live
@@ -41,7 +43,12 @@ global:
     shared_host_weights: true
     shared_host_weights_mode: "660"
   scheduler:
-    discipline: fifo            # required by lpt_packing (placement decisions move to the gateway)
+    # edf: earliest-deadline-first. lpt_packing accepts fifo or edf (neither imposes a competing
+    # per-model fairness policy). edf behaves exactly like fifo while clients share one deadline, and
+    # only diverges to promote requests with less budget left (the in-flight meta sub-calls), and to
+    # shed work that cannot finish in time. Using different per-client deadlines for a model would
+    # reorder its service and so affect cross-client fairness; uniform deadlines keep it fifo-like.
+    discipline: edf             # fifo | edf under lpt_packing (placement decisions stay with the gateway)
     ema_halflife_seconds: 30.0
     max_queue_depth: 1024
   endpoints:

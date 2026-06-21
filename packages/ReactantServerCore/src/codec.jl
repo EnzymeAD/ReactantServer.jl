@@ -13,6 +13,40 @@ const _SHM_REGION = "shared_memory_region"
 const _SHM_OFFSET = "shared_memory_offset"
 const _SHM_BYTE_SIZE = "shared_memory_byte_size"
 
+"""
+    TIMEOUT_NS_PARAM
+
+Key of the request-level KV parameter carrying the caller's REMAINING budget in nanoseconds
+(relative, not an absolute timestamp). Like the shared-memory region parameters, this is an
+extension to KServe V2 passed through `ModelInferRequest.parameters`. It is relative so each hop
+converts it to its own local absolute deadline (`time_ns() + budget`), which makes it robust to
+cross-process monotonic-clock differences and lets it ride unchanged through the gateway's raw-byte
+request forwarding. See [`deadline_params`](@ref).
+"""
+const TIMEOUT_NS_PARAM = "reactant_timeout_ns"
+
+"""
+    deadline_params(budget_ns) -> Dict{String,InferParameter}
+
+Build the request-level parameters map carrying a remaining-budget timeout of `budget_ns`
+nanoseconds (see [`TIMEOUT_NS_PARAM`](@ref)). A non-positive `budget_ns` yields an empty map (no
+deadline). Merge the result into a `ModelInferRequest`'s `parameters`.
+"""
+function deadline_params(budget_ns::Integer)
+    budget_ns > 0 || return Dict{String,_PB_INF.InferParameter}()
+    return Dict{String,_PB_INF.InferParameter}(TIMEOUT_NS_PARAM => _int_param(Int64(budget_ns)))
+end
+
+# Read the relative timeout budget (ns) from a request's parameters and convert it to an absolute
+# local deadline (`time_ns() + budget`), or 0 when absent/non-positive. Saturates instead of
+# overflowing on an absurd budget so a hostile value yields a far-future deadline, never a wrapped one.
+function _decode_deadline_ns(params)
+    budget = _param_int(params, TIMEOUT_NS_PARAM)
+    (budget === nothing || budget <= 0) && return Int64(0)
+    now = Int64(time_ns())
+    return budget > typemax(Int64) - now ? typemax(Int64) : now + Int64(budget)
+end
+
 # Element count and byte size of an untrusted wire shape, validated BEFORE any allocation:
 # every dim must be non-negative and the products must fit in Int. A hostile shape must be
 # rejected here, not by attempting the allocation it describes.
@@ -156,7 +190,8 @@ function decode_infer_request(msg::_PB_INF.ModelInferRequest,
         targets[o.name] = OutputTarget(region, offset, bsize)
     end
 
-    return DecodedRequest(InferRequest(msg.model_name, requested, tensors), msg.id, targets)
+    deadline_ns = _decode_deadline_ns(msg.parameters)
+    return DecodedRequest(InferRequest(msg.model_name, requested, tensors, deadline_ns), msg.id, targets)
 end
 
 # Copy a Julia col-major array's bytes into a fresh Vector{UInt8}. The bytes are already
@@ -243,6 +278,101 @@ function encode_infer_response(model_name::AbstractString, decoded::DecodedReque
 end
 
 id_of(d::DecodedRequest) = d.id
+
+# --- Outbound request / inbound response -----------------------------------------------------
+#
+# The pair below is the mirror image of decode_infer_request / encode_infer_response: it lets a
+# process act as a *client* of a KServe V2 endpoint (used by the worker's meta-model GatewayCaller
+# to call back into the gateway). Data travels inline via raw_input_contents / raw_output_contents;
+# shared memory is deliberately not used on this path.
+
+function _input_tensor(t::NamedTensor)
+    # Wire shape is row-major: the reverse of the Julia col-major NamedTensor.shape.
+    wire_shape = Int64[Int64(s) for s in reverse(collect(t.shape))]
+    return _PB_INF.var"ModelInferRequest.InferInputTensor"(;
+        name=t.name, datatype=kserve_string(t.dtype), shape=wire_shape)
+end
+
+"""
+    encode_infer_request(model_name, inputs; requested_outputs=String[], id="") -> ModelInferRequest
+
+Build a ModelInferRequest from boundary [`NamedTensor`](@ref) inputs, with tensor data inline in
+raw_input_contents. `requested_outputs`, when non-empty, names the outputs to return.
+"""
+function encode_infer_request(model_name::AbstractString, inputs::Vector{NamedTensor};
+                              requested_outputs::Vector{String}=String[], id::AbstractString="",
+                              parameters::Dict{String,_PB_INF.InferParameter}=Dict{String,_PB_INF.InferParameter}())
+    in_tensors = [_input_tensor(t) for t in inputs]
+    raw = Vector{UInt8}[_raw_from_array(t.data) for t in inputs]
+    outs = _PB_INF.var"ModelInferRequest.InferRequestedOutputTensor"[
+        _PB_INF.var"ModelInferRequest.InferRequestedOutputTensor"(; name=String(n)) for n in requested_outputs]
+    return _PB_INF.ModelInferRequest(; model_name=String(model_name), id=String(id),
+        inputs=in_tensors, outputs=outs, raw_input_contents=raw, parameters=parameters)
+end
+
+# Build an InferInputTensor that references bytes already staged in a shared-memory region rather
+# than inlining them (the meta fan-out's transport==scratch path; mirrors the client encoder).
+function _shm_input_tensor(t::NamedTensor, region::AbstractString, offset::Integer, byte_size::Integer)
+    wire_shape = Int64[Int64(s) for s in reverse(collect(t.shape))]
+    params = Dict{String,_PB_INF.InferParameter}(
+        _SHM_REGION => _string_param(region),
+        _SHM_OFFSET => _int_param(offset),
+        _SHM_BYTE_SIZE => _int_param(byte_size))
+    return _PB_INF.var"ModelInferRequest.InferInputTensor"(;
+        name=t.name, datatype=kserve_string(t.dtype), shape=wire_shape, parameters=params)
+end
+
+"""
+    encode_infer_request_shm(model_name, inputs, region, offsets; requested_outputs, id)
+
+Encode a request whose inputs are ALL staged in shared-memory `region` at the given byte `offsets`
+(parallel to `inputs`); no `raw_input_contents` — the receiver reads each tensor via `shm_read`. The
+receiver must have `region` registered. This is all-or-nothing per request: the decode path treats
+`raw_input_contents` as parallel-to-inputs, so a request never mixes raw and SHM inputs.
+"""
+function encode_infer_request_shm(model_name::AbstractString, inputs::Vector{NamedTensor},
+                                  region::AbstractString, offsets::Vector{<:Integer};
+                                  requested_outputs::Vector{String}=String[], id::AbstractString="",
+                                  parameters::Dict{String,_PB_INF.InferParameter}=Dict{String,_PB_INF.InferParameter}())
+    length(offsets) == length(inputs) ||
+        throw(ArgumentError("encode_infer_request_shm: offsets ($(length(offsets))) != inputs ($(length(inputs)))"))
+    in_tensors = [_shm_input_tensor(inputs[i], region, offsets[i], sizeof(inputs[i].data))
+                  for i in eachindex(inputs)]
+    outs = _PB_INF.var"ModelInferRequest.InferRequestedOutputTensor"[
+        _PB_INF.var"ModelInferRequest.InferRequestedOutputTensor"(; name=String(n)) for n in requested_outputs]
+    return _PB_INF.ModelInferRequest(; model_name=String(model_name), id=String(id),
+        inputs=in_tensors, outputs=outs, parameters=parameters)
+end
+
+"""
+    decode_infer_response(msg) -> Vector{NamedTensor}
+
+Translate a ModelInferResponse into boundary [`NamedTensor`](@ref) outputs. Data is read from
+raw_output_contents when present, otherwise from the typed contents field. Shared-memory-backed
+outputs are not supported on this path (the caller never requests them).
+"""
+function decode_infer_response(msg::_PB_INF.ModelInferResponse)
+    n = length(msg.outputs)
+    use_raw = !isempty(msg.raw_output_contents)
+    if use_raw && length(msg.raw_output_contents) != n
+        error("raw_output_contents has $(length(msg.raw_output_contents)) entries but response has $n outputs")
+    end
+    tensors = Vector{NamedTensor}(undef, n)
+    for i in 1:n
+        o = msg.outputs[i]
+        dt = dtype_from_kserve(o.datatype)
+        shape = Int[Int(s) for s in o.shape]
+        data = if use_raw
+            _array_from_raw(dt, shape, msg.raw_output_contents[i])
+        elseif o.contents !== nothing
+            _array_from_contents(dt, shape, o.contents)
+        else
+            error("output '$(o.name)' carries neither raw_output_contents nor contents")
+        end
+        tensors[i] = NamedTensor(o.name, dt, Tuple(size(data)), data)
+    end
+    return tensors
+end
 
 # The manifest's shape is Julia order (col-major); the wire metadata advertises the
 # reverse (row-major), so Triton/KServe-style clients see canonical network dims.

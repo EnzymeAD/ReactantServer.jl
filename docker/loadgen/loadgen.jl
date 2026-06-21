@@ -18,6 +18,8 @@
 #   LOADGEN_MODELS            comma list to restrict the set   (default: all bundles)
 
 using ReactantServerClient
+using ReactantServerCore: load_manifest   # to read meta.calls and skip internal sub-bundles
+import gRPCClient                          # for a dedicated gRPCCURL sized to CONCURRENCY
 using Base.Threads
 
 # ---- config ----------------------------------------------------------------------------------
@@ -31,6 +33,14 @@ const DURATION    = parse(Float64, env("LOADGEN_DURATION_SECONDS", "3600"))
 const TRANSPORT   = Symbol(env("LOADGEN_TRANSPORT", "tcp"))   # :tcp | :shm | :mixed
 const SHM_OUTPUTS = lowercase(env("LOADGEN_SHM_OUTPUTS", "true")) in ("1", "true", "yes", "on")
 const REPORT_SEC  = parse(Float64, env("LOADGEN_REPORT_SECONDS", "30"))
+# Serial warmup before the concurrent soak: one request per model with a long deadline. The first
+# request to a model triggers Reactant compilation (often >10s); firing 32 concurrent cold requests
+# instead stampedes the gRPCClient libcurl multi-handle into a wedge, so the soak never makes
+# progress until manually restarted against warm models. A serial pass (no stampede) + a long
+# deadline (tolerates compilation) compiles every model — and warming a meta fans out to compile its
+# sub-models — so the soak then hits only warm models. Set LOADGEN_WARMUP=false to skip.
+const WARMUP          = lowercase(env("LOADGEN_WARMUP", "true")) != "false"
+const WARMUP_DEADLINE = parse(Float64, env("LOADGEN_WARMUP_DEADLINE", "300"))
 
 # KServe wire dtype string -> Julia type. Covers the dtypes the bundles use; extend if needed.
 const DTYPE = Dict(
@@ -42,16 +52,29 @@ const DTYPE = Dict(
 
 # ---- model discovery + dummy-input synthesis --------------------------------------------------
 
-# One model's everything needed to fire a request: its gateway handle, the input tensor name and
-# Julia element type, the per-item Julia column-major dims (batch dropped), and a prebuilt inline
-# InferInput for the TCP path (immutable, so safe to reuse across requests).
+# One input tensor: its name, Julia element type, per-item Julia column-major dims (batch dropped),
+# and whether the manifest declares a batch axis for it. A model with `has_batch=false` is unbatched
+# (e.g. a meta core with mixed-rank inputs); we must NOT append a batch row to it, or it arrives one
+# rank too large.
+struct InputSpec
+    name::String
+    dtype::DataType
+    per_item_dims::Vector{Int}
+    has_batch::Bool
+end
+
+# Julia column-major wire dims for one input carrying `n` rows: batched inputs get the batch axis
+# appended (last, matching the manifest); unbatched inputs are sent at exactly their fixed dims.
+_wire_dims(inp::InputSpec, n::Int) = inp.has_batch ? Int[inp.per_item_dims..., n] : copy(inp.per_item_dims)
+
+# One model's everything needed to fire a request: its gateway handle, ALL of its input specs, the
+# prebuilt inline InferInputs for the TCP path (immutable, reused across requests), and shm output
+# read-back declarations.
 struct ModelSpec
     name::String
     model::KServeModel
-    input_name::String
-    dtype::DataType
-    per_item_dims::Vector{Int}
-    tcp_input::Any              # ModelInferRequest.InferInputTensor for the inline path
+    inputs::Vector{InputSpec}
+    tcp_inputs::Vector{Any}         # one ModelInferRequest.InferInputTensor per input (inline path)
     out_specs::Vector{OutputSpec}   # shm read-back declarations; empty = outputs stay inline
 end
 
@@ -83,29 +106,59 @@ function output_shm_specs(io)
     return specs
 end
 
-function discover_models()
+# Models that are internal sub-bundles of a meta model (declared in some meta's meta.calls, e.g.
+# <m>_stage1 / <m>_stage2 / <m>_core). Clients call the meta, which fans out to these; soaking them
+# directly doubles their queue load with zero/garbage inputs and congests the queues the metas wait
+# on. Skipped by default; set LOADGEN_SKIP_INTERNAL=false to soak them anyway.
+function _internal_submodels(names)
+    internal = Set{String}()
+    for name in names
+        mf = joinpath(MODEL_REPO, name, "manifest.yaml")
+        isfile(mf) || continue
+        try
+            for c in load_manifest(mf).meta_calls
+                push!(internal, String(c))
+            end
+        catch err
+            @warn "could not read meta.calls" model = name exception = err
+        end
+    end
+    return internal
+end
+
+function discover_models(grpc)
     names = readdir(MODEL_REPO)
     want = get(ENV, "LOADGEN_MODELS", "")
     if !isempty(want)
         sel = Set(strip.(split(want, ",")))
         names = filter(in(sel), names)
     end
+    skip_internal = lowercase(env("LOADGEN_SKIP_INTERNAL", "true")) != "false"
+    internal = skip_internal ? _internal_submodels(names) : Set{String}()
+    isempty(internal) || @info "skipping internal meta sub-bundles" count = length(internal) models = sort(collect(internal))
     specs = ModelSpec[]
     for name in sort(names)
+        name in internal && continue
         manifest = joinpath(MODEL_REPO, name, "manifest.yaml")
         isfile(manifest) || continue
         local spec
         try
             io = manifest_io_spec(manifest)
             isempty(io.input_order) && (@warn "skip: no inputs" model=name; continue)
-            tname = io.input_order[1]
-            tm = io.inputs[tname]
-            haskey(DTYPE, tm.datatype) || (@warn "skip: unmapped dtype" model=name dtype=tm.datatype; continue)
-            T = DTYPE[tm.datatype]
-            dims = per_item_dims(tm.shape)
-            arr = zeros(T, dims..., 1)                       # one item; Julia col-major, batch last
-            spec = ModelSpec(name, KServeModel(GATEWAY, name; max_batch_size = 1),
-                             tname, T, dims, InferInput(tname, arr), output_shm_specs(io))
+            inputs = InputSpec[]
+            unmapped = false
+            for tname in io.input_order                      # ALL inputs, not just the first
+                tm = io.inputs[tname]
+                haskey(DTYPE, tm.datatype) || (unmapped = true; break)
+                # batch axis shows up as -1 in the metadata shape; absent => unbatched input
+                push!(inputs, InputSpec(tname, DTYPE[tm.datatype],
+                                        per_item_dims(tm.shape), any(==(-1), tm.shape)))
+            end
+            unmapped && (@warn "skip: unmapped dtype" model=name; continue)
+            tcp_inputs = Any[InferInput(inp.name, zeros(inp.dtype, _wire_dims(inp, 1)...))
+                             for inp in inputs]
+            spec = ModelSpec(name, KServeModel(GATEWAY, name; max_batch_size = 1, grpc = grpc),
+                             inputs, tcp_inputs, output_shm_specs(io))
         catch err
             @warn "skip: manifest_io_spec failed" model=name exception=err
             continue
@@ -115,19 +168,25 @@ function discover_models()
     return specs
 end
 
-# Minimal IO for the shared-memory path: one zero-filled item of a single model's input.
+# Minimal IO for the shared-memory path: one zero-filled item of every one of a model's inputs.
 struct DummyIO <: AbstractInferenceIO
     spec::ModelSpec
 end
 Base.length(::DummyIO) = 1
-ReactantServerClient.item_input_bytes(io::DummyIO) = sizeof(io.spec.dtype) * prod(io.spec.per_item_dims)
+# Per-item bytes summed across all inputs (each input's per-item size; the batch row, if any, is 1).
+ReactantServerClient.item_input_bytes(io::DummyIO) =
+    sum(sizeof(inp.dtype) * prod(_wire_dims(inp, 1)) for inp in io.spec.inputs)
 function ReactantServerClient.infer_encode_chunk!(io::DummyIO, r, slot)
     n = length(r)
-    nbytes = n * item_input_bytes(io)
-    sub = subslot(slot, nbytes)
-    fill!(pool_view(sub, UInt8, nbytes), 0x00)
-    # PoolInferInput shape is Julia column-major (per-item dims then batch last).
-    return [InferInput(io.spec.input_name, sub, Int[io.spec.per_item_dims..., n], io.spec.dtype)]
+    ins = InferInput[]
+    for inp in io.spec.inputs
+        wire = _wire_dims(inp, n)                          # Julia col-major; batch (if any) last
+        nbytes = sizeof(inp.dtype) * prod(wire)
+        sub = subslot(slot, nbytes)
+        fill!(pool_view(sub, UInt8, nbytes), 0x00)
+        push!(ins, InferInput(inp.name, sub, wire, inp.dtype))
+    end
+    return ins
 end
 ReactantServerClient.infer_decode_chunk!(::DummyIO, r, response) = nothing
 # Declaring outputs opts the shm path into shared-memory read-back (explicit-output mode): the
@@ -170,13 +229,31 @@ function fire(spec::ModelSpec, use_shm::Bool)
     if use_shm
         infer_async(spec.model, DummyIO(spec))
     else
-        infer_sync(spec.model, [spec.tcp_input])
+        infer_sync(spec.model, spec.tcp_inputs)
     end
     dt = Int(time_ns() - t0)
     atomic_add!(N_OK, 1)
     atomic_add!(LAT_NS, dt)
     @lock LAT_LOCK push!(LAT_SAMPLES, dt)        # window sample for the distribution stats
     return nothing
+end
+
+# Serial warmup: fire one request per model with a long deadline so first-request compilation
+# completes before the concurrent soak begins (see WARMUP comment). Sequential by design — a
+# concurrent cold stampede wedges the gRPCClient multi-handle. Failures are logged, not fatal.
+function warmup(specs::Vector{ModelSpec})
+    println("warmup: priming $(length(specs)) models serially (deadline $(WARMUP_DEADLINE)s) ...")
+    t0 = time(); ok = 0
+    for spec in specs
+        m = KServeModel(GATEWAY, spec.name; max_batch_size = 1, deadline = WARMUP_DEADLINE, grpc = spec.model.grpc)
+        try
+            infer_sync(m, spec.tcp_inputs)
+            ok += 1
+        catch err
+            @warn "warmup failed (continuing)" model = spec.name exception = err
+        end
+    end
+    println("warmup: $ok/$(length(specs)) models primed in $(round(time() - t0, digits = 1))s")
 end
 
 # ---- metrics scrape (via curl; no extra Julia deps) -------------------------------------------
@@ -213,9 +290,21 @@ end
 function main()
     println("== loadgen: gateway=$GATEWAY transport=$TRANSPORT concurrency=$CONCURRENCY duration=$(DURATION)s ==")
     kserve_init(; n_slots = max(CONCURRENCY, ReactantServerClient.DEFAULT_POOL_SLOTS))
-    specs = discover_models()
+    # One number (CONCURRENCY) controls everything: firing tasks, the SHM staging-pool slots above,
+    # and the gRPC concurrent-stream semaphore here. Without this the clients use the global handle
+    # (GRPC_MAX_STREAMS=16), which caps in-flight requests at 16 no matter how high CONCURRENCY is.
+    grpc = gRPCClient.gRPCCURL(; sticky = false, max_streams = CONCURRENCY)
+    # Echo the single knob and everything it derived, so a glance at the logs confirms it propagated.
+    println("== loadgen config: LOADGEN_CONCURRENCY=$CONCURRENCY -> firing_tasks=$CONCURRENCY, ",
+            "shm_pool_slots=$(max(CONCURRENCY, ReactantServerClient.DEFAULT_POOL_SLOTS)), ",
+            "grpc_max_streams=$CONCURRENCY, julia_threads=$(Threads.nthreads()) ==")
+    specs = discover_models(grpc)
     isempty(specs) && (println("ERROR: no usable models discovered under $MODEL_REPO"); exit(2))
     println("discovered $(length(specs)) models; starting soak with $(nthreads()) threads")
+    flush(stdout)   # surface startup lines now; stdout to docker is block-buffered (see reporter)
+
+    WARMUP && warmup(specs)
+    flush(stdout)
 
     deadline = time() + DURATION
     pick_shm(i) = TRANSPORT === :shm ? true : TRANSPORT === :mixed ? isodd(i) : false
@@ -228,20 +317,30 @@ function main()
                 spec = specs[rand(1:length(specs))]
                 try
                     fire(spec, pick_shm(i))
-                catch err
-                    record_err(err)
+                catch ex
+                    # NOTE: must NOT be named `err` — `err` is a main()-scope local (the summary at
+                    # the end assigns it), so every closure here would capture and SHARE that one
+                    # variable. A firing task writing the caught exception into it races the reporter,
+                    # which reads `err` as the N_ERR[] count; the reporter would then print/compare an
+                    # exception (isless(::Int, ::Exception)) and die. A distinct name keeps it local.
+                    record_err(ex)
                 end
             end
         end
     end
 
-    reporter = Threads.@spawn begin
+    # Reporter on the INTERACTIVE pool: at concurrency >> nthreads the firing tasks saturate the
+    # default (compute) pool, and a default-pool reporter wakes from sleep() with no free thread to
+    # run on — so it prints once during the ramp lull then goes silent while the soak keeps running.
+    # The interactive thread is reserved (run julia with --threads=N,1) so the reporter always fires.
+    reporter = Threads.@spawn :interactive begin
         last_ok = 0
         last_t = time()
         last_loads = 0; last_evicts = 0
         err_shown = false
         while time() < deadline
             sleep(REPORT_SEC)
+            try
             now = time()
             ok = N_OK[]; err = N_ERR[]
             d_ok = ok - last_ok
@@ -281,7 +380,13 @@ function main()
                 println("    first error: ", sample)
                 err_shown = true
             end
+            flush(stdout)   # piped stdout (docker logs) is block-buffered; flush so reports appear live
             last_ok = ok; last_t = now
+            catch e
+                # A single bad iteration (e.g. a transient scrape/format error) must never kill the
+                # reporter and masquerade as a silent soak — log it and keep reporting.
+                println("[reporter] error this window (continuing): ", sprint(showerror, e)); flush(stdout)
+            end
         end
     end
 

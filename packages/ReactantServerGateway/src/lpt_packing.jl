@@ -706,8 +706,11 @@ function verify_lpt_packing_preconditions!(pool::ClientPool; wait_seconds::Real=
         sleep(poll_interval)
     end
     for (url, resp) in statuses
-        resp.discipline == "fifo" ||
-            error("lpt_packing scheduling requires worker FIFO discipline; worker $url reports '$(resp.discipline)' (set scheduler.discipline: fifo in the node file)")
+        # FIFO and EDF are both compatible with lpt_packing: neither imposes a competing per-model
+        # fairness policy (EDF only reorders by request deadline, degrading to FIFO for equal
+        # deadlines), so the gateway stays the placement/fairness authority. FAIR is rejected.
+        resp.discipline in ("fifo", "edf") ||
+            error("lpt_packing scheduling requires worker FIFO or EDF discipline; worker $url reports '$(resp.discipline)' (set scheduler.discipline: fifo or edf in the node file)")
     end
     sets = Dict(url => sort([ms.name for ms in resp.models]) for (url, resp) in statuses)
     ref_url = first(keys(sets))

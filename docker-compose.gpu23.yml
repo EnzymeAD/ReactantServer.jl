@@ -31,7 +31,7 @@ services:
     # embedded gateway, which binds the public ports 8001/8002 and routes to the workers.
     volumes:
       - ./docker/node.gpu23.yaml:/etc/reactantserver/node.yaml:ro
-      - ${REACTANTSERVER_MODELS:-/docker/xlaserver/models}:/var/lib/reactantserver/models:ro
+      - ${REACTANTSERVER_MODELS:-/docker/reactantserver/models}:/var/lib/reactantserver/models:ro
       # Persistent XLA compile cache (autotune results + GPU kernel binaries), shared by both
       # workers in this container. Pinned by packages/ReactantServer/LocalPreferences.toml so warm
       # restarts skip recompilation work.
@@ -52,7 +52,10 @@ services:
       # inherits these REACTANT_GATEWAY_SCHEDULING_* variables from this environment.
       REACTANT_GATEWAY_SCHEDULING_MODE: "lpt_packing"
       REACTANT_GATEWAY_SCHEDULING_DEFAULT_REPLICAS: "1"
-      REACTANT_GATEWAY_SCHEDULING_REBALANCE_COMPUTE_SECONDS: "30.0"
+      # Doubled from 30s: each repack relocates models (transient recompile/unavailability) and spiked
+      # the per-worker GPU dispatch queue, inflating meta sub-call wait tails (p99 4-7s). A slower
+      # rebalance lets steady-state settle; raise further (or bump hysteresis) if tails persist.
+      REACTANT_GATEWAY_SCHEDULING_REBALANCE_COMPUTE_SECONDS: "60.0"
     # The supervisor forwards SIGTERM to its children and waits for them before exiting.
     stop_grace_period: 30s
     healthcheck:
@@ -83,7 +86,7 @@ services:
         condition: service_healthy
     volumes:
       # Read the manifests to synthesize correctly shaped dummy inputs (manifest_io_spec).
-      - ${REACTANTSERVER_MODELS:-/docker/xlaserver/models}:/var/lib/reactantserver/models:ro
+      - ${REACTANTSERVER_MODELS:-/docker/reactantserver/models}:/var/lib/reactantserver/models:ro
     # ipc: host shares the host IPC namespace and /dev/shm, so the shm transport's regions reach
     # the workers without an explicit /dev/shm bind.
     ipc: host
@@ -96,7 +99,10 @@ services:
       LOADGEN_TRANSPORT: "tcp"        # tcp | shm | mixed
       LOADGEN_SHM_OUTPUTS: "true"     # shm path also reads outputs back through shared memory
       LOADGEN_REPORT_SECONDS: "30"
-      JULIA_NUM_THREADS: "8"
+      # 8 compute + 1 interactive: the firing tasks saturate the compute pool at concurrency 32, so
+      # the stats reporter runs on the reserved interactive thread (Threads.@spawn :interactive) and
+      # keeps printing instead of starving once the soak is at full load.
+      JULIA_NUM_THREADS: "8,1"
 
 volumes:
   # Survives `docker compose down/up` so the workers' first-run compilation work is reused.

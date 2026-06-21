@@ -218,6 +218,7 @@ end
 # if nothing is queued.
 function select_dispatch!(s::Scheduler, now::Float64)
     s.cfg.discipline == FIFO && return _select_fifo!(s)
+    s.cfg.discipline == EDF && return _select_edf!(s)
     return _select_fair!(s, now)
 end
 
@@ -231,6 +232,44 @@ function _select_fifo!(s::Scheduler)
         t = entry.sched.queue[1].enqueued_at
         if chosen === nothing || t < best_t || (t == best_t && entry.name < chosen.name)
             chosen, best_t = entry, t
+        end
+    end
+    chosen === nothing && return nothing
+    return _finalize(chosen, plan_batch(chosen, chosen.sched))
+end
+
+# The soonest deadline among a model's queued requests, or typemax (least urgent) when none carries
+# a deadline. Requests with deadline_ns == 0 (no deadline) are treated as least urgent.
+function _queue_min_deadline(st::ModelSchedState)
+    best = typemax(Int64)
+    for qr in st.queue
+        dl = qr.req.deadline_ns
+        dl != 0 && dl < best && (best = dl)
+    end
+    return best
+end
+
+# EDF: serve the model whose most-urgent queued request has the soonest deadline, then coalesce that
+# model's queue (unchanged). Ties break by the model's oldest queued request and then by name, so when
+# deadlines are equal (the common case: one deadline per client) this is exactly `_select_fifo!`. Its
+# only divergence from FIFO is to promote a model carrying a request with less budget left, i.e. an
+# in-flight meta sub-call. Queues stay arrival-ordered (never reordered), so `queue[1]` is always the
+# model's oldest request and the FIFO tiebreak is exact. Coalescing still draws FIFO from the front, so
+# a request deep behind the batch size advances over successive dispatches of its (preferentially
+# selected) model rather than jumping the batch; that keeps coalescing semantics intact.
+function _select_edf!(s::Scheduler)
+    chosen = nothing
+    best_dl = typemax(Int64)
+    best_oldest = Inf
+    for entry in values(s.registry.by_name)
+        _schedulable(entry) || continue
+        st = entry.sched
+        dl = _queue_min_deadline(st)
+        oldest = st.queue[1].enqueued_at
+        if chosen === nothing || dl < best_dl ||
+           (dl == best_dl && oldest < best_oldest) ||
+           (dl == best_dl && oldest == best_oldest && entry.name < chosen.name)
+            chosen, best_dl, best_oldest = entry, dl, oldest
         end
     end
     chosen === nothing && return nothing
@@ -336,6 +375,30 @@ end
 function execute_and_record!(s::Scheduler, d::Dispatch)
     entry, B, taken = d.entry, d.size, d.taken
     st = entry.sched
+    # Deadline admission: drop any request that cannot meet its deadline before we begin GPU work.
+    # This is the only place a request is cancelled, and it never interrupts a running PJRT/GPU call —
+    # it only refuses to START work that will not finish in time. The base check drops requests whose
+    # deadline has already passed (all disciplines). Under EDF we add a laxity margin: a request is also
+    # dropped if it cannot finish within this dispatch's learned compute cost, so the scheduler does not
+    # burn GPU on work that will miss anyway (the classic EDF overload failure mode). Dropped requests
+    # get a DeadlineExceeded reply (mapped to gRPC DEADLINE_EXCEEDED upstream); only feasible ones run,
+    # and when none are feasible we skip run_model entirely. The cost estimate is learned from prior
+    # dispatches; unseeded it defaults small, so the laxity drop is a no-op until the model has run once.
+    now_ns = Int64(time_ns())
+    margin_ns = s.cfg.discipline == EDF ?
+        round(Int64, get(st.cost_estimate, B, _DEFAULT_COST) * 1e9) : Int64(0)
+    live = QueuedRequest[]
+    for qr in taken
+        if qr.req.deadline_ns != 0 && now_ns + margin_ns >= qr.req.deadline_ns
+            put!(qr.reply, DeadlineExceeded(qr.req.model_name))
+        else
+            push!(live, qr)
+        end
+    end
+    if length(live) != length(taken)
+        taken = live          # the catch below and the slicing loop operate only on live requests
+        isempty(taken) && return nothing
+    end
     try
         # Inputs were already run through the model's preprocess hook on each caller's task before
         # the request was queued (see `infer`); the loop runs no model.jl code, only coalesce +
@@ -717,6 +780,32 @@ Alias for [`evict!`](@ref): remove a model from the live system. Provided for sy
 [`load_model!`](@ref) on the dynamic directory-watch path.
 """
 unload_model!(s::Scheduler, name::AbstractString) = evict!(s, name)
+
+"""
+    put_meta!(scheduler, entry::MetaEntry) -> String
+
+Register (or replace) a meta model. Meta models carry no executable or scheduling state and the
+dispatch loop never touches `registry.meta`, so this mutates the registry directly under the
+scheduler lock rather than through the control queue. Returns the model name.
+"""
+function put_meta!(s::Scheduler, entry::MetaEntry)
+    lock(s.cond) do
+        s.registry.meta[entry.name] = entry
+    end
+    return entry.name
+end
+
+"""
+    remove_meta!(scheduler, name) -> Nothing
+
+Remove a meta model from the registry (the dynamic watcher's unload path for meta bundles).
+"""
+function remove_meta!(s::Scheduler, name::AbstractString)
+    lock(s.cond) do
+        delete!(s.registry.meta, String(name))
+    end
+    return nothing
+end
 
 """
     infer(scheduler, request) -> Vector{NamedTensor}

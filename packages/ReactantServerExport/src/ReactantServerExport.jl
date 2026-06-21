@@ -109,18 +109,27 @@ end
 
 """
     write_bundle(dir; name, executable_inputs, executable_outputs, modules, weights,
-                 provenance=Dict()) -> dir
+                 client_inputs=nothing, client_outputs=nothing, provenance=Dict()) -> dir
 
 Write a bundle. `modules` is a `Dict` keyed by batch size of StableHLO modules (or text or
 bytes); a single entry under key `0` writes `model.mlir`, otherwise each writes
 `model.b{N}.mlir`. `weights` is an ordered collection of `name => array` pairs whose order
 becomes the safetensors `argument_order`. The per-input batch axis is recorded in each
 input's `IOSpec.batch_axis`; the manifest derives `batching.batch_dim` from there.
+
+`client_inputs`/`client_outputs` (each `nothing` or a `Vector{IOSpec}`) declare the wire-facing
+spec when it differs from the executable spec, for bundles that ship a `model.jl` whose
+preprocess/postprocess transform between the two. They are emitted only when given. A variable
+(non-batch) axis is encoded by passing `-1` for that axis size (e.g. the variable detection count
+of a postprocessed detector). The server requires these only when a `model.jl` is present, so the
+caller is responsible for also shipping `model.jl` into the bundle dir (see the converter handlers).
 """
 function write_bundle(dir::AbstractString; name::AbstractString,
                       executable_inputs::AbstractVector{IOSpec},
                       executable_outputs::AbstractVector{IOSpec},
                       modules::AbstractDict, weights,
+                      client_inputs::Union{Nothing,AbstractVector{IOSpec}}=nothing,
+                      client_outputs::Union{Nothing,AbstractVector{IOSpec}}=nothing,
                       provenance=Dict{String,Any}())
     basename(normpath(dir)) == String(name) ||
         error("ReactantServerExport: bundle dir basename must equal name '$name' (got '$(basename(normpath(dir)))')")
@@ -149,6 +158,8 @@ function write_bundle(dir::AbstractString; name::AbstractString,
         "batching" => Dict{String,Any}("compiled_batch_sizes" => sizes),
         "provenance" => Dict{String,Any}(string(k) => v for (k, v) in provenance),
     )
+    client_inputs === nothing || (manifest["client_inputs"] = [_spec_dict(s) for s in client_inputs])
+    client_outputs === nothing || (manifest["client_outputs"] = [_spec_dict(s) for s in client_outputs])
     YAML.write_file(joinpath(dir, "manifest.yaml"), manifest)
     return dir
 end

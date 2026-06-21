@@ -362,6 +362,7 @@ function export_bundle(::Val{:pytorch}, model, example_inputs::Tuple;
                        batch_sizes::AbstractVector{<:Integer}=[1],
                        strict::Bool=false,
                        matmul_precision::Union{Nothing,AbstractString}=nothing,
+                       client_inputs=nothing, client_outputs=nothing,
                        provenance=Dict{String,Any}())
     isempty(example_inputs) && error("PyTorchExport: at least one example input is required")
     isempty(batch_sizes) && error("PyTorchExport: batch_sizes cannot be empty")
@@ -477,6 +478,7 @@ function export_bundle(::Val{:pytorch}, model, example_inputs::Tuple;
         executable_outputs=outputs,
         modules=modules,
         weights=[kept_names[i] => kept_weights[i] for i in eachindex(kept_names)],
+        client_inputs=client_inputs, client_outputs=client_outputs,
         provenance=prov)
     return dir
 end
@@ -580,6 +582,11 @@ for in-memory scripts/traces or custom load options).
 forward, for example a wrapper that returns an intermediate activation and drops
 a trailing data-dependent op. The TorchScript patches (parameter re-wrap, conv
 handler) are applied to `jit_module` before `wrap` is called.
+
+`client_inputs`/`client_outputs` (each `nothing` or a `Vector{IOSpec}`) are forwarded to
+`write_bundle` to declare the wire-facing spec when a shipped `model.jl` postprocess turns the
+dense executable outputs into different client outputs (e.g. a variable detection count, encoded
+with `-1` for that axis). When you pass these you must also copy a `model.jl` into `dir`.
 """
 function export_torchscript_bundle(pt_path::AbstractString,
                                    example_inputs::Tuple;
@@ -590,6 +597,7 @@ function export_torchscript_bundle(pt_path::AbstractString,
                                    output_names=nothing,
                                    batch_sizes::AbstractVector{<:Integer}=[1],
                                    matmul_precision::Union{Nothing,AbstractString}=nothing,
+                                   client_inputs=nothing, client_outputs=nothing,
                                    provenance=Dict{String,Any}(),
                                    map_location="cpu",
                                    wrap=nothing)
@@ -601,6 +609,7 @@ function export_torchscript_bundle(pt_path::AbstractString,
         dir=dir, name=name, input_names=input_names,
         output_name=output_name, output_names=output_names,
         batch_sizes=batch_sizes, matmul_precision=matmul_precision,
+        client_inputs=client_inputs, client_outputs=client_outputs,
         provenance=prov, wrap=wrap)
 end
 
@@ -612,11 +621,19 @@ function export_torchscript_bundle(jit_module::Py, example_inputs::Tuple;
                                    output_names=nothing,
                                    batch_sizes::AbstractVector{<:Integer}=[1],
                                    matmul_precision::Union{Nothing,AbstractString}=nothing,
+                                   client_inputs=nothing, client_outputs=nothing,
                                    provenance=Dict{String,Any}(),
                                    wrap=nothing)
     _pyimports()
     _pyimports_torchscript()
-    jit_module.eval()
+    # Most scripted modules want eval mode, but some (e.g. detectron2 detectors) bake training=False
+    # as a constant and raise "Can't set constant training" on .eval(); they are already in eval, so
+    # ignore that specific failure.
+    try
+        jit_module.eval()
+    catch err
+        occursin("training", sprint(showerror, err)) || rethrow()
+    end
     pyeval("_fix_jit_parameters", @__MODULE__)(jit_module)
     wrapper = wrap === nothing ? pyeval("_JitWrapper", @__MODULE__)(jit_module) : wrap(jit_module)
     prov = merge(Dict{String,Any}("source_subframework" => "torchscript"),
@@ -627,6 +644,7 @@ function export_torchscript_bundle(jit_module::Py, example_inputs::Tuple;
         batch_sizes=batch_sizes,
         strict=false,
         matmul_precision=matmul_precision,
+        client_inputs=client_inputs, client_outputs=client_outputs,
         provenance=prov)
 end
 

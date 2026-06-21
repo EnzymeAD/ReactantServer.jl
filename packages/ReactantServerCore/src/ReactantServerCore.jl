@@ -75,18 +75,19 @@ export memory_from_shm, memory_from_bytes, fsa_from_memory
 # ---- buffer pool ----
 export BufferPool, PoolSlot, acquire_slot!, release_slot!, subslot, reset_slot!
 export pool_view, pool_memory, pool_fsa, is_shm_backed
+export pool_base_pointer, pool_region_name, pool_slot_bytes
 
 # ---- weight store ----
 export WeightStore, PrivateWeightStore, SharedWeightStore
 export materialize_host_weights!, release_host_weights!, weights_digest
 
 # ---- boundary ----
-export NamedTensor, InferRequest, QueuedRequest
+export NamedTensor, InferRequest, QueuedRequest, DeadlineExceeded
 
 # ---- manifest ----
 export ManifestError, DimKind, FIXED, BATCH, VARIABLE, Dim, TensorSpec, BatchingSpec, Provenance, Manifest
 export parse_shape, parse_tensor_spec, parse_tensor_list, parse_batching, parse_manifest, validate_manifest
-export load_manifest
+export load_manifest, is_meta
 export client_input_spec, client_output_spec
 
 # ---- signature ----
@@ -97,7 +98,7 @@ export ConfigError, BackendKind, CPU_BACKEND, CUDA_BACKEND
 export ResidencyState, UNPINNED, PINNED_SYSTEM, PINNED_DEVICE
 export ResidencyMode, SELF_MANAGED, EXTERNALLY_MANAGED
 export ModelControlMode, STATIC, DYNAMIC, EXPLICIT
-export SchedulingDiscipline, FAIR, FIFO
+export SchedulingDiscipline, FAIR, FIFO, EDF
 export RuntimeConfig, ModelSchedConfig, SchedulerConfig, EndpointsConfig, ServerConfig
 export build_config, validate_config, apply_env_overrides!, log_effective_config
 
@@ -112,5 +113,7 @@ export shm_regions, shm_teardown!
 # ---- codec ----
 export OutputTarget, DecodedRequest, decode_infer_request, encode_infer_response, encode_model_metadata
 export encode_repository_index, encode_shm_status, encode_shm_register_response, encode_shm_unregister_response, id_of
+export encode_infer_request, encode_infer_request_shm, decode_infer_response
+export deadline_params, TIMEOUT_NS_PARAM
 
 end # module ReactantServerCore

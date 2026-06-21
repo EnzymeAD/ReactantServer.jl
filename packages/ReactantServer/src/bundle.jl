@@ -9,17 +9,30 @@ struct BundleError <: Exception
 end
 Base.showerror(io::IO, e::BundleError) = print(io, "BundleError: ", e.msg)
 
-# Include a bundle's model.jl in an isolated module so it cannot clobber server globals.
-# Only register_model and the ReactantServer module are injected.
-function _include_model_jl(path::AbstractString, expected_name::AbstractString)
+# Include a bundle's model.jl in an isolated module so it cannot clobber server globals. Only
+# register_model, register_meta_model, and the ReactantServer module are injected. When `meta` is
+# true the bundle must call register_meta_model; otherwise it must call register_model.
+function _include_model_jl(path::AbstractString, expected_name::AbstractString; meta::Bool=false)
     _CURRENT_REGISTRATION[] = nothing
+    _CURRENT_META_REGISTRATION[] = nothing
     sandbox = Module(gensym(:bundle))
     Core.eval(sandbox, :(const register_model = $register_model))
+    Core.eval(sandbox, :(const register_meta_model = $register_meta_model))
     Core.eval(sandbox, :(const ReactantServer = $(@__MODULE__)))
     Base.include(sandbox, String(path))
     reg = _CURRENT_REGISTRATION[]
+    mreg = _CURRENT_META_REGISTRATION[]
     _CURRENT_REGISTRATION[] = nothing
+    _CURRENT_META_REGISTRATION[] = nothing
+    if meta
+        mreg === nothing && throw(BundleError("model.jl for meta model '$expected_name' did not call register_meta_model"))
+        reg === nothing || throw(BundleError("meta model '$expected_name' must call register_meta_model, not register_model"))
+        mreg.name == expected_name ||
+            throw(BundleError("model.jl registered meta model '$(mreg.name)' but bundle directory is '$expected_name'"))
+        return mreg
+    end
     reg === nothing && throw(BundleError("model.jl for '$expected_name' did not call register_model"))
+    mreg === nothing || throw(BundleError("model '$expected_name' must call register_model, not register_meta_model"))
     reg.name == expected_name ||
         throw(BundleError("model.jl registered '$(reg.name)' but bundle directory is '$expected_name'"))
     return reg
@@ -65,6 +78,13 @@ function load_bundle_entry(dir::AbstractString; validator::SignatureValidator=Nu
     has_jl = isfile(model_jl)
     validate_manifest(m, dir, has_jl)
 
+    # A meta bundle has no StableHLO module or weights: it is just a manifest + model.jl
+    # orchestration. validate_manifest already enforced model.jl presence and the meta block.
+    if is_meta(m)
+        mreg = _include_model_jl(model_jl, m.name; meta=true)
+        return MetaEntry(m.name, m, m.meta_calls, mreg.run)
+    end
+
     mlir_bytes = _discover_modules(dir, m)
 
     weights_path = joinpath(dir, "weights.safetensors")
@@ -84,8 +104,13 @@ end
 
 function _load_one_bundle!(reg::ModelRegistry, dir::AbstractString, validator::SignatureValidator)
     entry = load_bundle_entry(dir; validator=validator)
-    haskey(reg.by_name, entry.name) && throw(BundleError("duplicate model name '$(entry.name)'"))
-    reg.by_name[entry.name] = entry
+    (haskey(reg.by_name, entry.name) || haskey(reg.meta, entry.name)) &&
+        throw(BundleError("duplicate model name '$(entry.name)'"))
+    if entry isa MetaEntry
+        reg.meta[entry.name] = entry
+    else
+        reg.by_name[entry.name] = entry
+    end
     return nothing
 end
 
@@ -124,5 +149,23 @@ function load_bundles(model_dirs::AbstractVector{<:AbstractString};
         isempty(missing_names) ||
             @warn "requested models not found in any model dir" missing = sort!(collect(missing_names)) model_dirs = model_dirs
     end
+    _validate_meta_calls(reg)
     return reg
+end
+
+# Cross-bundle validation of every meta model's declared calls. A meta model may not call another
+# meta model (prevents server-side pipeline recursion); a backbone that is not loaded locally is
+# allowed (in a multi-worker deployment it lives on another worker, reached via the gateway), but
+# is logged so a typo is visible.
+function _validate_meta_calls(reg::ModelRegistry)
+    for entry in values(reg.meta)
+        for callee in entry.calls
+            haskey(reg.meta, callee) &&
+                throw(BundleError("meta model '$(entry.name)' calls '$callee', which is also a meta model; " *
+                                  "meta models may not call other meta models"))
+            haskey(reg.by_name, callee) ||
+                @info "meta model declares a call to a model not loaded on this worker (expected in multi-worker deployments)" meta = entry.name callee = callee
+        end
+    end
+    return nothing
 end

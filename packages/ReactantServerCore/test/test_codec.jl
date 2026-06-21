@@ -32,6 +32,31 @@ const _Inf = ReactantServer.inference
     @test collect(reinterpret(Float32, rmsg.raw_output_contents[1])) == Float32[2, 4, 6, 8]
 end
 
+@testset "codec deadline KV param round-trip" begin
+    x = Float32[1, 2, 3, 4]
+    inp = ReactantServer.NamedTensor("x", x)
+    # encode with a remaining-budget timeout -> decode converts it to an absolute local deadline.
+    budget = Int64(5_000_000_000)
+    msg = ReactantServer.encode_infer_request("m", [inp]; parameters=ReactantServer.deadline_params(budget))
+    @test haskey(msg.parameters, ReactantServer.TIMEOUT_NS_PARAM)
+    before = Int64(time_ns())
+    dec = ReactantServer.decode_infer_request(msg).request
+    after = Int64(time_ns())
+    # The absolute deadline lands within [now+budget] of the decode instant (relative->absolute).
+    @test before + budget <= dec.deadline_ns <= after + budget
+
+    # Absent param -> no deadline.
+    @test ReactantServer.decode_infer_request(ReactantServer.encode_infer_request("m", [inp])).request.deadline_ns == 0
+    # A non-positive budget produces an empty params map (no deadline carried).
+    @test isempty(ReactantServer.deadline_params(0))
+    @test isempty(ReactantServer.deadline_params(-5))
+
+    # The SHM encoder carries the param too (meta fan-out path).
+    shmmsg = ReactantServer.encode_infer_request_shm("m", [inp], "region", [0];
+                                                     parameters=ReactantServer.deadline_params(budget))
+    @test haskey(shmmsg.parameters, ReactantServer.TIMEOUT_NS_PARAM)
+end
+
 @testset "codec inline typed contents" begin
     contents = _Inf.InferTensorContents(; fp32_contents=Float32[5, 6, 7])
     inp = _Inf.var"ModelInferRequest.InferInputTensor"(; name="x", datatype="FP32", shape=Int64[3], contents=contents)

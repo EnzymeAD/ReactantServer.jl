@@ -28,7 +28,7 @@ services:
     # 8001/8002 directly, exactly as a production single-GPU deployment does.
     volumes:
       - ./docker/node.gpu2.yaml:/etc/reactantserver/node.yaml:ro
-      - ${REACTANTSERVER_MODELS:-/docker/xlaserver/models}:/var/lib/reactantserver/models:ro
+      - ${REACTANTSERVER_MODELS:-/docker/reactantserver/models}:/var/lib/reactantserver/models:ro
       # Persistent XLA compile cache (autotune results + GPU kernel binaries). Pinned here by
       # packages/ReactantServer/LocalPreferences.toml so warm restarts skip recompilation work.
       - reactant-compile-cache:/var/cache/reactant-compile
@@ -72,7 +72,7 @@ services:
         condition: service_healthy
     volumes:
       # Read the manifests to synthesize correctly shaped dummy inputs (manifest_io_spec).
-      - ${REACTANTSERVER_MODELS:-/docker/xlaserver/models}:/var/lib/reactantserver/models:ro
+      - ${REACTANTSERVER_MODELS:-/docker/reactantserver/models}:/var/lib/reactantserver/models:ro
     # ipc: host shares the host IPC namespace and /dev/shm, so the shm transport's regions reach
     # the worker without an explicit /dev/shm bind.
     ipc: host

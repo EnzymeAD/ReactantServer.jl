@@ -2,9 +2,11 @@
 # (docker-compose.gpu23.yml). The supervisor runs two workers (one per visible GPU, selected by
 # CUDA_VISIBLE_DEVICES=2,3) plus the embedded gateway on 8001/8002. The gateway is put in
 # lpt_packing mode via the REACTANT_GATEWAY_SCHEDULING_* environment in the compose file. That mode
-# requires every worker to run the fifo discipline (set below, so placement decisions move to the
-# gateway and the workers do not re-order against it) and to serve the identical model set (every
-# worker loads every bundle in the repository, which is the default).
+# requires every worker to run the fifo or edf discipline (set below, so placement decisions stay with
+# the gateway and the workers do not impose a competing per-model fairness policy) and to serve the
+# identical model set (every worker loads every bundle in the repository, which is the default). This
+# stack uses edf so in-flight meta sub-calls, which have already spent part of their deadline budget,
+# are served ahead of fresh full-budget requests instead of starving at the deadline line.
 #
 # This is the no-replication setup: with the gateway's default_replicas: 1, lpt_packing places each
 # model on ONE of the two GPUs (chosen by balancing memory and compute), so a model's weights live
@@ -25,10 +27,23 @@ global:
     preallocate: true
     allow_cpu_fallback: false
     # On-demand weight cache per GPU: weights load lazily and evict LRU within this byte budget
-    # (24 GiB), so all models need not be resident at once. 0 would keep every weight resident.
+    # (24 GiB, sized for this box's larger cards; the T4-based node.gpu0123.yaml uses 10 GiB), so all
+    # models need not be resident at once. 0 would keep every weight resident.
     weight_cache_bytes: 25769803776
+    # Share the PINNED_SYSTEM host weight floor across both worker subprocesses via POSIX shm regions
+    # (keyed by model name + content digest) instead of each worker holding its own private
+    # anonymous-RAM copy. Since every worker loads every bundle here, this collapses the host floor
+    # from 2x to 1x the total weight bytes. The container's shared /dev/shm (ipc: host in the compose
+    # file) carries the regions. Mode 660 rather than the default world-writable 666.
+    shared_host_weights: true
+    shared_host_weights_mode: "660"
   scheduler:
-    discipline: fifo            # required by lpt_packing (placement decisions move to the gateway)
+    # edf: earliest-deadline-first. lpt_packing accepts fifo or edf (neither imposes a competing
+    # per-model fairness policy). edf behaves exactly like fifo while clients share one deadline, and
+    # only diverges to promote requests with less budget left (the in-flight meta sub-calls), and to
+    # shed work that cannot finish in time. Using different per-client deadlines for a model would
+    # reorder its service and so affect cross-client fairness; uniform deadlines keep it fifo-like.
+    discipline: edf             # fifo | edf under lpt_packing (placement decisions stay with the gateway)
     ema_halflife_seconds: 30.0
     max_queue_depth: 1024
   endpoints:

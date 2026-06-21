@@ -138,27 +138,45 @@ serve_worker(node_path::AbstractString, worker::AbstractString; kwargs...) =
 
 function serve(cfg::ServerConfig; backend::AbstractBackend=ReactantBackend(), blocking::Bool=true,
                worker_name::AbstractString="")
-    pool, registry, sched, watcher = _bring_up(cfg, backend)
     shm = SharedMemoryRegistry()
-    metrics = WorkerMetrics(sched, backend, pool, cfg; worker_name=worker_name)
+    # Create this worker's fan-out shared-memory region and attach peers' regions BEFORE the slow
+    # model load/compile in `_bring_up`, so the region exists immediately for peers' startup attach.
+    fanout = setup_fanout(shm)
+    pool, registry, sched, watcher = _bring_up(cfg, backend)
+    # Admission counters shared with the gRPC server: the cap (endpoints.max_concurrent_requests,
+    # 0 = uncapped) sheds past `inflight`, counting each rejection in `shed`. The metrics collector
+    # reads both live, so they are exported even while `serve` blocks the calling task.
+    inflight = Threads.Atomic{Int}(0)
+    shed = Threads.Atomic{Int}(0)
+    metrics = WorkerMetrics(sched, backend, pool, cfg; worker_name=worker_name,
+        inflight=inflight, shed=shed)
     router = build_grpc_router(sched, registry, pool.platform, shm)
-    ctx = InferContext(sched, registry, shm, pool.platform, metrics)
+    # Meta-model sub-calls route through this caller: a loopback gateway when REACTANT_LOOPBACK_GRPC
+    # is set (multi-worker), otherwise the local scheduler in-process (single-worker). The fan-out
+    # pool (when present) lets a meta stage large sub-call inputs in shared memory via call.scratch.
+    caller = build_caller(sched; pool=fanout)
+    ctx = InferContext(sched, registry, shm, pool.platform, metrics, caller)
     # Optional Prometheus metrics endpoint (opt-in via endpoints.metrics_port > 0). Request counting
     # is always on (the InferContext carries `metrics`); only the HTTP listener is gated.
     metrics_server = nothing
     if cfg.endpoints.metrics_port > 0
-        ready_fn = () -> (es = values(registry.by_name); !isempty(es) && all(e -> e.executable !== nothing, es))
+        ready_fn = () -> (es = values(registry.by_name);
+            (!isempty(es) || !isempty(registry.meta)) && all(e -> e.executable !== nothing, es))
         metrics_server = start_worker_metrics(metrics, cfg.endpoints.host, cfg.endpoints.metrics_port;
             ready_fn=ready_fn, worker_name=worker_name, gpu=_gpu_identity(cfg))
     end
-    @info "Starting gRPC control plane" host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port models = model_names(registry)
+    @info "Starting gRPC control plane" host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests models = model_names(registry)
     if blocking
         _G.serve(router, cfg.endpoints.host, cfg.endpoints.port; context=ctx,
+            max_concurrent_requests=cfg.endpoints.max_concurrent_requests,
+            inflight=inflight, shed_total=shed,
             h2_initial_window_size=_H2_INITIAL_WINDOW_BYTES,
             h2_connection_window_size=_H2_CONNECTION_WINDOW_BYTES)
         return nothing
     end
     server = _G.serve!(router, cfg.endpoints.host, cfg.endpoints.port; context=ctx,
+        max_concurrent_requests=cfg.endpoints.max_concurrent_requests,
+        inflight=inflight, shed_total=shed,
         h2_initial_window_size=_H2_INITIAL_WINDOW_BYTES,
         h2_connection_window_size=_H2_CONNECTION_WINDOW_BYTES)
     return RunningServer(cfg, registry, sched, pool, shm, server, cfg.endpoints.port, watcher, metrics_server)

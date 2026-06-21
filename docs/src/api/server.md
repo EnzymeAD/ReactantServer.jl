@@ -12,6 +12,7 @@ serve
 serve_worker
 stop!
 register_model
+register_meta_model
 RunningServer
 ```
 

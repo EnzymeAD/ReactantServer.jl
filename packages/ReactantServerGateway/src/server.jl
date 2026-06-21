@@ -26,7 +26,12 @@ end
 
 # --- ModelInfer -------------------------------------------------------------------------------
 
-function _post_infer(st::GatewayState, url, model, id, body)
+# `deadline_ns` is the request's absolute deadline in the gateway's clock (0 = none). We recompute the
+# remaining budget HERE — the latest point before the worker call, after the register-gate wait and
+# any failover retries — and forward it as the worker's grpc-timeout, so the budget shrinks for time
+# burned at the gateway instead of resetting to a fresh full budget at the worker. If it is already
+# gone, shed here (DEADLINE_EXCEEDED) rather than forward doomed work into the worker's queue.
+function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64)
     wc = get_clients(st.pool, url)
     if wc === nothing
         @error "infer: routing table referenced unknown worker" worker = url model
@@ -34,9 +39,22 @@ function _post_infer(st::GatewayState, url, model, id, body)
             gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_INTERNAL, "routing table referenced unknown worker")
     end
     gate_wait(st.gate, url)
+    deadline_s = nothing
+    if deadline_ns != 0
+        rem = deadline_ns - Int64(time_ns())
+        if rem <= 0
+            return nothing, STATUS_DEADLINE,
+                gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_DEADLINE_EXCEEDED,
+                    "deadline exceeded at gateway for model \"$model\"")
+        end
+        # Forward as WHOLE SECONDS: grpc_timeout_header_val only encodes integer seconds without
+        # falling back to a >8-digit nanosecond value the worker rejects; ceil so a sub-second budget
+        # never becomes 0 (which would disable curl's timeout entirely).
+        deadline_s = max(1, cld(rem, 1_000_000_000))
+    end
     t0 = time()
     try
-        resp = invoke_infer(wc, body)
+        resp = invoke_infer(wc, body; deadline=deadline_s)
         observe_worker!(st.metrics, "ModelInfer", url, time() - t0)
         return resp, STATUS_OK, nothing
     catch e
@@ -52,11 +70,11 @@ end
 # moving on only for a retryable status (worker NotFound or Unavailable). A worker NOT_FOUND means
 # the model was unloaded there since discovery, so kick an async route refresh to drop the stale
 # route (the request itself still fails over / returns the error; it is not retried after refresh).
-function _try_replicas(st::GatewayState, urls, model, id, body)
+function _try_replicas(st::GatewayState, urls, model, id, body, deadline_ns::Int64)
     last_status = STATUS_UNAVAILABLE
     last_exc = gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_UNAVAILABLE, "no replica available")
     for url in urls
-        resp, status, exc = _post_infer(st, url, model, id, body)
+        resp, status, exc = _post_infer(st, url, model, id, body, deadline_ns)
         exc === nothing && return resp, status, nothing
         status == STATUS_NOT_FOUND && request_refresh!(st.refresher)
         last_status, last_exc = status, exc
@@ -66,7 +84,7 @@ function _try_replicas(st::GatewayState, urls, model, id, body)
     return nothing, last_status, last_exc
 end
 
-function _dispatch_infer(st::GatewayState, model, id, body)
+function _dispatch_infer(st::GatewayState, model, id, body, deadline_ns::Int64)
     # Ask the scheduler which replicas to try (urls[1] is its choice; the rest are failover order)
     # and for an opaque reservation to release once the request completes. `nothing` means the
     # scheduler has no route for the model: it may have just been loaded on a worker, so refresh the
@@ -86,13 +104,13 @@ function _dispatch_infer(st::GatewayState, model, id, body)
     # Release the reservation exactly once, on every path (success, retryable error, hard error, or
     # timeout), so a scheduler's outstanding counters never leak.
     try
-        return _try_replicas(st, urls, model, id, body)
+        return _try_replicas(st, urls, model, id, body, deadline_ns)
     finally
         release!(st.scheduler, reservation)
     end
 end
 
-function _gw_infer(body::Vector{UInt8}, st::GatewayState)
+function _gw_infer(body::Vector{UInt8}, st::GatewayState, deadline_ns::Integer=0)
     t0 = time()
     local model, id
     try
@@ -108,7 +126,7 @@ function _gw_infer(body::Vector{UInt8}, st::GatewayState)
             "ModelInferRequest.model_name is empty"))
     end
     record_arrival!(st.scheduler, model)
-    resp, status, exc = _dispatch_infer(st, model, id, body)
+    resp, status, exc = _dispatch_infer(st, model, id, body, Int64(deadline_ns))
     observe_request!(st.metrics, "ModelInfer", model, time() - t0)
     inc_requests!(st.metrics, "ModelInfer", model, status)
     exc === nothing || throw(exc)
@@ -247,7 +265,7 @@ function build_gateway_router(state::GatewayState, cfg::GatewayConfig)
         max_send_message_length = cfg.max_send_msg_bytes)
     raw(rpc) = rpc(; TRequest = Vector{UInt8}, TResponse = Vector{UInt8})
     gRPCServer.handle!(router, raw(GRPCInferenceService_ModelInfer_Method),
-        (req, ctx) -> _gw_infer(req, ctx.payload))
+        (req, ctx) -> _gw_infer(req, ctx.payload, ctx.deadline_ns))
     gRPCServer.handle!(router, raw(GRPCInferenceService_SystemSharedMemoryRegister_Method),
         (req, ctx) -> _gw_shm_register(req, ctx.payload))
     gRPCServer.handle!(router, raw(GRPCInferenceService_SystemSharedMemoryUnregister_Method),

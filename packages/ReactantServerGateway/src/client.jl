@@ -13,6 +13,7 @@ const STATUS_RESOURCE_EXHAUSTED = "ResourceExhausted"
 const STATUS_INVALID = "InvalidArgument"
 const STATUS_FAILED_PRE = "FailedPrecondition"
 const STATUS_INTERNAL = "Internal"
+const STATUS_DEADLINE = "DeadlineExceeded"
 
 # A worker's gRPC clients, all sharing one per-worker libcurl multi handle (`grpc`). Each worker
 # gets its own gRPCCURL: HTTP/2 multiplexing only reuses connections within one host:port, so
@@ -43,7 +44,9 @@ function _worker_clients(cfg::GatewayConfig, url::AbstractString)
     # that owns them via @async rather than Threads.@spawn. The gateway terminates and forwards on
     # one event-loop thread, so sticky scheduling keeps the per-request driving on that thread and
     # avoids cross-thread handoff overhead on the hot path.
-    grpc = gRPCClient.gRPCCURL(; sticky = true)   # one running multi handle per worker
+    # one running multi handle per worker; its stream semaphore caps outbound in-flight requests to
+    # this worker (the rest block until a slot frees).
+    grpc = gRPCClient.gRPCCURL(; sticky = true, max_streams = cfg.max_concurrent_streams_per_worker)
     infer = GRPCInferenceService_ModelInfer_Client(host, port; grpc = grpc,
         TRequest = Vector{UInt8}, TResponse = Vector{UInt8},
         deadline = cfg.request_timeout_seconds,
@@ -104,7 +107,14 @@ function close_pool!(p::ClientPool)
     return nothing
 end
 
-invoke_infer(wc::WorkerClients, body::Vector{UInt8}) = gRPCClient.grpc_sync_request(wc.infer, body)
+# `deadline` (seconds, or nothing) overrides the worker client's default per-call timeout so the
+# gateway can forward the request's REMAINING budget as grpc-timeout — decrementing it for the time
+# already spent reaching the gateway, rather than granting the worker a fresh full budget.
+function invoke_infer(wc::WorkerClients, body::Vector{UInt8}; deadline::Union{Real,Nothing}=nothing)
+    deadline === nothing && return gRPCClient.grpc_sync_request(wc.infer, body)
+    req = gRPCClient.grpc_async_request(wc.infer, body; deadline=deadline)
+    return gRPCClient.grpc_async_await(wc.infer, req)
+end
 invoke_shm_register(wc::WorkerClients, body::Vector{UInt8}) = gRPCClient.grpc_sync_request(wc.shm_register, body)
 invoke_shm_unregister(wc::WorkerClients, body::Vector{UInt8}) = gRPCClient.grpc_sync_request(wc.shm_unregister, body)
 

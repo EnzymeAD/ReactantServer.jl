@@ -36,7 +36,13 @@ struct InferContext
     shm::SharedMemoryRegistry
     platform::String
     metrics::Union{WorkerMetrics,Nothing}
+    caller::ModelCaller        # routes meta-model sub-calls (local scheduler or loopback gateway)
 end
+# `caller` defaults to a LocalCaller over this worker's scheduler; `serve` overrides it with a
+# GatewayCaller when a loopback gateway is configured. The 4-arg form is used by control-plane-only
+# contexts (tests) that never serve inference.
+InferContext(sched, registry, shm, platform, metrics) =
+    InferContext(sched, registry, shm, platform, metrics, LocalCaller(sched))
 InferContext(sched, registry, shm, platform) = InferContext(sched, registry, shm, platform, nothing)
 
 # gRPC status code -> Prometheus label string, for worker_requests_total.
@@ -49,7 +55,20 @@ const _GRPC_STATUS_NAME = Dict{Int,String}(
     _G.GRPC_OUT_OF_RANGE => "OUT_OF_RANGE", _G.GRPC_UNIMPLEMENTED => "UNIMPLEMENTED",
     _G.GRPC_INTERNAL => "INTERNAL", _G.GRPC_UNAVAILABLE => "UNAVAILABLE", _G.GRPC_DATA_LOSS => "DATA_LOSS",
 )
-_status_label(e) = e isa _G.gRPCServiceCallException ? get(_GRPC_STATUS_NAME, e.grpc_status, "UNKNOWN") : "INTERNAL"
+_status_label(e) = e isa _G.gRPCServiceCallException ? get(_GRPC_STATUS_NAME, e.grpc_status, "UNKNOWN") :
+                   e isa DeadlineExceeded ? "DEADLINE_EXCEEDED" : "INTERNAL"
+
+# A request's effective absolute deadline (local time_ns()): the TIGHTEST of the in-body KV timeout
+# (carried through the gateway's raw-byte forwarding) and the grpc-timeout (which the gateway
+# recomputes per hop, so it reflects time already burned reaching this worker). Both are absolute
+# local times after decode; 0 means "not set" on that channel. Taking the min means a gateway that
+# decremented grpc-timeout for transit wins over a stale, never-decremented KV budget.
+function _effective_deadline(decoded_dl::Integer, grpc_dl::Integer)
+    a, b = Int64(decoded_dl), Int64(grpc_dl)
+    a == 0 && return b
+    b == 0 && return a
+    return min(a, b)
+end
 
 _not_found(msg) = throw(_G.gRPCServiceCallException(_G.GRPC_NOT_FOUND, msg))
 _invalid(msg) = throw(_G.gRPCServiceCallException(_G.GRPC_INVALID_ARGUMENT, msg))
@@ -70,6 +89,8 @@ end
 # assigned model is always ready because the scheduler loads it on demand. The gateway discovers
 # routes from this readiness, so a control-plane pin/unpin flips routing on the next probe.
 function _model_ready(ctx::InferContext, name::AbstractString)
+    # A meta model has no executable or device residency; it is ready as soon as it is loaded.
+    is_meta_name(ctx.registry, name) && return true
     entry = get_model(ctx.registry, name)
     (entry === nothing || entry.executable === nothing) && return false
     sched = ctx.sched
@@ -87,7 +108,8 @@ _handle_model_ready(ctx::InferContext, req) =
 # guards mainly against a misconfigured model_dirs that left the registry empty.
 function _handle_server_ready(ctx::InferContext)
     entries = values(ctx.registry.by_name)
-    ready = !isempty(entries) && all(e -> e.executable !== nothing, entries)
+    has_any = !isempty(entries) || !isempty(ctx.registry.meta)
+    ready = has_any && all(e -> e.executable !== nothing, entries)
     return inference.ServerReadyResponse(; ready = ready)
 end
 
@@ -97,7 +119,11 @@ _handle_server_metadata(::InferContext) =
 
 function _handle_model_metadata(ctx::InferContext, req)
     entry = get_model(ctx.registry, req.name)
-    entry === nothing && _not_found("unknown model: $(req.name)")
+    if entry === nothing
+        meta = get_meta(ctx.registry, req.name)
+        meta === nothing && _not_found("unknown model: $(req.name)")
+        return encode_model_metadata(req.name, meta.manifest, ctx.platform)
+    end
     return encode_model_metadata(req.name, entry.manifest, ctx.platform)
 end
 
@@ -141,6 +167,8 @@ function _infer_or_not_found(ctx::InferContext, request)
         return infer(ctx.sched, request)
     catch e
         e isa _G.gRPCServiceCallException && rethrow()
+        # A request the scheduler dropped at admission for an expired deadline -> DEADLINE_EXCEEDED.
+        e isa DeadlineExceeded && throw(_G.gRPCServiceCallException(_G.GRPC_DEADLINE_EXCEEDED, sprint(showerror, e)))
         msg = sprint(showerror, e)
         (occursin("unknown model", msg) || occursin("was unloaded", msg)) && _not_found(msg)
         rethrow()
@@ -149,12 +177,12 @@ end
 
 # Time and count every ModelInfer for the worker's Prometheus export (worker_requests_total by
 # model+status, worker_request_latency_seconds), then delegate to the handler body.
-function _handle_infer(ctx::InferContext, req)
-    ctx.metrics === nothing && return _handle_infer_impl(ctx, req)
+function _handle_infer(ctx::InferContext, req, grpc_deadline_ns::Integer=0)
+    ctx.metrics === nothing && return _handle_infer_impl(ctx, req, grpc_deadline_ns)
     t0 = time()
     name = req.model_name
     try
-        resp = _handle_infer_impl(ctx, req)
+        resp = _handle_infer_impl(ctx, req, grpc_deadline_ns)
         observe_request!(ctx.metrics, name, time() - t0)
         inc_request!(ctx.metrics, name, "OK")
         return resp
@@ -165,18 +193,50 @@ function _handle_infer(ctx::InferContext, req)
     end
 end
 
-function _handle_infer_impl(ctx::InferContext, req)
+function _handle_infer_impl(ctx::InferContext, req, grpc_deadline_ns::Integer=0)
     name = req.model_name
     isempty(name) && _invalid("ModelInferRequest.model_name is empty")
+    meta = get_meta(ctx.registry, name)
+    meta === nothing || return _handle_meta_infer(ctx, meta, req, grpc_deadline_ns)
     entry = get_model(ctx.registry, name)
     entry === nothing && _not_found("unknown model: $name")
     decoded = _as_invalid(() -> decode_infer_request(req, ctx.shm))
-    request = InferRequest(name, decoded.request.requested_outputs, decoded.request.inputs)
+    deadline_ns = _effective_deadline(decoded.request.deadline_ns, grpc_deadline_ns)
+    request = InferRequest(name, decoded.request.requested_outputs, decoded.request.inputs, deadline_ns)
     _validate_inputs(entry, request)
     outputs = _infer_or_not_found(ctx, request)   # availability rejections -> NOT_FOUND; else INTERNAL
     # Encoding rejects a requested output the model does not produce: a client mistake, so
     # surface it as INVALID_ARGUMENT (matching the codec's documented contract).
     return _as_invalid(() -> encode_infer_response(name, decoded, outputs, ctx.shm))
+end
+
+# Map a meta model's sub-call availability failures to NOT_FOUND so they are retryable upstream,
+# mirroring `_infer_or_not_found`. This covers the LocalCaller path ("unknown model"/"was
+# unloaded" thrown by the scheduler); the GatewayCaller path surfaces a gRPCClient exception that
+# the worker's gRPC server already renders with its own status.
+function _meta_or_not_found(ctx::InferContext, meta, inputs::Vector{NamedTensor}, deadline_ns::Integer)
+    try
+        return run_meta(meta, ctx.caller, inputs; deadline_ns=deadline_ns)
+    catch e
+        e isa _G.gRPCServiceCallException && rethrow()
+        # The orchestration bailed (or a sub-call was dropped) because the deadline passed.
+        e isa DeadlineExceeded && throw(_G.gRPCServiceCallException(_G.GRPC_DEADLINE_EXCEEDED, sprint(showerror, e)))
+        msg = sprint(showerror, e)
+        (occursin("unknown model", msg) || occursin("was unloaded", msg)) && _not_found(msg)
+        rethrow()
+    end
+end
+
+# A meta model runs its Julia orchestration on this request task (off the GPU dispatch loop). Input
+# validation reuses the regular path (it reads only `manifest`, which MetaEntry also carries). The
+# orchestration's own sub-calls go through `ctx.caller`.
+function _handle_meta_infer(ctx::InferContext, meta, req, grpc_deadline_ns::Integer=0)
+    decoded = _as_invalid(() -> decode_infer_request(req, ctx.shm))
+    deadline_ns = _effective_deadline(decoded.request.deadline_ns, grpc_deadline_ns)
+    request = InferRequest(meta.name, decoded.request.requested_outputs, decoded.request.inputs, deadline_ns)
+    _validate_inputs(meta, request)
+    outputs = _meta_or_not_found(ctx, meta, request.inputs, deadline_ns)
+    return _as_invalid(() -> encode_infer_response(meta.name, decoded, outputs, ctx.shm))
 end
 
 # List models with per-model readiness reflecting residency. `req.ready` filters to ready models
@@ -220,7 +280,7 @@ function build_grpc_router(sched::Scheduler, registry::ModelRegistry, platform::
         ModelReady    = (req, ctx) -> _handle_model_ready(ctx.payload, req),
         ServerMetadata = (req, ctx) -> _handle_server_metadata(ctx.payload),
         ModelMetadata = (req, ctx) -> _handle_model_metadata(ctx.payload, req),
-        ModelInfer    = (req, ctx) -> _handle_infer(ctx.payload, req),
+        ModelInfer    = (req, ctx) -> _handle_infer(ctx.payload, req, ctx.deadline_ns),
         RepositoryIndex = (req, ctx) -> _handle_repository_index(ctx.payload, req),
         SystemSharedMemoryStatus     = (req, ctx) -> _handle_shm_status(ctx.payload.shm, req.name),
         SystemSharedMemoryRegister   = (req, ctx) -> _handle_shm_register(ctx.payload.shm, req),

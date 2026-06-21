@@ -106,3 +106,88 @@ const _EInf = ReactantServer.inference
         end
     end
 end
+
+# A meta model served alongside its backbone, driven over the real gRPC path. With no loopback
+# gateway configured the worker uses a LocalCaller, so the meta orchestration's call to "scale4"
+# re-enters the same scheduler in-process. This exercises the full wire path the unit tests skip:
+# decode -> run_meta -> sub-call -> encode.
+@testset "meta model end-to-end (CPU, LocalCaller)" begin
+    mktempdir() do root
+        # Backbone: y = x .* 2.
+        write_bundle(root, "scale4";
+            manifest_yaml="""
+            format_version: "2.0"
+            name: scale4
+            executable_inputs:
+              - {name: x, dtype: f32, shape: c, dims: {c: 4}}
+            executable_outputs:
+              - {name: y, dtype: f32, shape: c, dims: {c: 4}}
+            batching:
+              compiled_batch_sizes: [1]
+            """,
+            mlir_text="""
+            module {
+              func.func @main(%x: tensor<4xf32>, %w: tensor<4xf32>) -> tensor<4xf32> {
+                %0 = stablehlo.multiply %x, %w : tensor<4xf32>
+                return %0 : tensor<4xf32>
+              }
+            }
+            """,
+            weights=Dict("w" => Float32[2, 2, 2, 2]), argument_order=["w"])
+
+        # Meta model: calls the backbone, then adds one (a stand-in data-dependent tail).
+        mdir = joinpath(root, "detector")
+        mkpath(mdir)
+        write(joinpath(mdir, "manifest.yaml"), """
+        format_version: "2.0"
+        name: detector
+        kind: meta
+        meta:
+          calls: [scale4]
+        client_inputs:
+          - {name: x, dtype: f32, shape: c, dims: {c: 4}}
+        client_outputs:
+          - {name: OUT, dtype: f32, shape: c, dims: {c: 4}}
+        """)
+        write(joinpath(mdir, "model.jl"), """
+        _run(inputs, call) = [ReactantServer.NamedTensor("OUT", call("scale4", inputs)[1].data .+ 1)]
+        register_meta_model("detector"; run=_run)
+        """)
+
+        port = grpc_free_port()
+        cfg = ReactantServer.ServerConfig([root], "",
+            ReactantServer.RuntimeConfig(ReactantServer.CPU_BACKEND, 0, 0.9, true, true),
+            ReactantServer.SchedulerConfig(30.0, 64, 30.0),
+            ReactantServer.EndpointsConfig("127.0.0.1", port))
+
+        # Ensure no stale loopback endpoint leaks in, so build_caller picks LocalCaller.
+        srv = withenv(ReactantServer.LOOPBACK_ENV => nothing) do
+            ReactantServer.serve(cfg; backend=ReactantServer.ReactantBackend(), blocking=false)
+        end
+        sleep(0.3)
+        try
+            # The meta model reports ready and is discoverable, exactly like a regular model.
+            @test grpc_call(_EInf.ModelReadyRequest, _EInf.ModelReadyResponse, "ModelReady", port,
+                            _EInf.ModelReadyRequest(; name="detector")).ready
+            idx = grpc_call(_EInf.RepositoryIndexRequest, _EInf.RepositoryIndexResponse, "RepositoryIndex", port,
+                            _EInf.RepositoryIndexRequest(; ready=true))
+            @test "detector" in [m.name for m in idx.models]
+
+            # Metadata reflects the meta model's client-facing I/O.
+            md = grpc_call(_EInf.ModelMetadataRequest, _EInf.ModelMetadataResponse, "ModelMetadata", port,
+                           _EInf.ModelMetadataRequest(; name="detector"))
+            @test md.inputs[1].name == "x" && md.outputs[1].name == "OUT"
+
+            # Inference: x .* 2 .+ 1.
+            x = Float32[1, 2, 3, 4]
+            inp = _EInf.var"ModelInferRequest.InferInputTensor"(; name="x", datatype="FP32", shape=Int64[4])
+            reqmsg = _EInf.ModelInferRequest(; model_name="detector", inputs=[inp],
+                raw_input_contents=[collect(reinterpret(UInt8, x))])
+            rmsg = grpc_call(_EInf.ModelInferRequest, _EInf.ModelInferResponse, "ModelInfer", port, reqmsg)
+            @test rmsg.model_name == "detector"
+            @test collect(reinterpret(Float32, rmsg.raw_output_contents[1])) == Float32[3, 5, 7, 9]
+        finally
+            ReactantServer.stop!(srv)
+        end
+    end
+end

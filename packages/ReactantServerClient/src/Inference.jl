@@ -164,6 +164,16 @@ function infer_async(m::AbstractInferenceModel, io::AbstractInferenceIO)
     _infer_pool_driven(m, io; force_serial = false)
 end
 
+# Request-level KV params carrying this model's per-request budget as a RELATIVE remaining timeout.
+# The worker (reached through the gateway, which forwards the request body verbatim, so the param
+# rides along unchanged) converts it to a local absolute deadline and drops the request at admission
+# once it passes, instead of spending GPU on work the client has already abandoned. The gRPC client
+# also sends `grpc-timeout`, but the gateway replaces that with its own per-call deadline, so the
+# in-body KV param is what survives the hop. Models without a deadline send an empty map (no change).
+_request_deadline_params(::AbstractInferenceModel) = deadline_params(0)
+_request_deadline_params(m::KServeModel) =
+    deadline_params(deadline(m) > 0 ? round(Int64, deadline(m) * 1e9) : 0)
+
 """
     infer_sync(model, io::AbstractInferenceIO)
     infer_sync(model, network_inputs) -> ModelInferResponse
@@ -322,6 +332,7 @@ function _run_chunk(m, io, pool, client, fill_lock, r, slot)
                 model_name = model_name(m),
                 inputs = _materialize_inputs(inputs, m, pool),
                 outputs = requested,
+                parameters = _request_deadline_params(m),
             ),
         )
         infer_decode_chunk!(io, r, _rehydrate_response(response, out_subslots))
@@ -389,6 +400,7 @@ function infer_sync(m::AbstractInferenceModel, network_inputs)
         ModelInferRequest(
             model_name = model_name(m),
             inputs = network_inputs,
+            parameters = _request_deadline_params(m),
         ),
     )
 end

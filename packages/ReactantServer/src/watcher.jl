@@ -106,7 +106,10 @@ function _apply_change!(w::BundleWatcher, name::AbstractString,
     @info "watcher: change detected" name = name action = action dir = something(dir, "")
     try
         if desired === nothing
-            unload_model!(w.scheduler, name)
+            # A meta model has no executable/device state, so unload it from the registry directly;
+            # otherwise go through the scheduler's evict path (frees device memory).
+            is_meta_name(w.scheduler.registry, name) ? remove_meta!(w.scheduler, name) :
+                unload_model!(w.scheduler, name)
             delete!(w.seen, name)
         else
             entry = load_bundle_entry(dir)
@@ -114,9 +117,14 @@ function _apply_change!(w::BundleWatcher, name::AbstractString,
             # mismatched bundle is rejected rather than served under the wrong name.
             entry.name == name ||
                 throw(BundleError("bundle directory '$name' has manifest name '$(entry.name)'"))
-            state = _resolve_residency(w.cfg, name, w.on_demand)
-            load_model!(w.scheduler, w.backend, w.pool, entry;
-                        state=state, on_demand=w.on_demand, store=w.store)
+            if entry isa MetaEntry
+                # Meta bundles need no compilation; register them straight into the meta map.
+                put_meta!(w.scheduler, entry)
+            else
+                state = _resolve_residency(w.cfg, name, w.on_demand)
+                load_model!(w.scheduler, w.backend, w.pool, entry;
+                            state=state, on_demand=w.on_demand, store=w.store)
+            end
             w.seen[name] = desired
         end
     catch err

@@ -87,6 +87,9 @@ the manifest; without a `model.jl` those keys are not permitted and the executab
 client-facing specs. See [`register_model`](@ref) in the API reference for the exact hook
 signatures.
 
+For a bundle whose `model.jl` chains several models with data-dependent logic rather than wrapping
+one executable, see [Meta Models](meta_models.md).
+
 ## Producing bundles
 
 `ReactantServerExport` produces bundles offline and is kept out of the server's dependency

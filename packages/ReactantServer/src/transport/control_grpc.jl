@@ -44,7 +44,7 @@ function _handle_model_control_status(ctx::InferContext)
               for (name, m) in snap.models]
     return _CTRL.ModelControlStatusResponse(;
         residency_mode = (snap.residency_mode == SELF_MANAGED ? "self_managed" : "externally_managed"),
-        discipline = (snap.discipline == FAIR ? "fair" : "fifo"),
+        discipline = lowercase(string(snap.discipline)),
         models = models,
         weight_cache_max_bytes = UInt64(snap.weight_cache_max_bytes))
 end

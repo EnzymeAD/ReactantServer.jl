@@ -16,6 +16,7 @@ TensorSpec
 Dim
 BatchingSpec
 load_manifest
+is_meta
 ```
 
 ## Boundary
@@ -23,6 +24,7 @@ load_manifest
 ```@docs
 NamedTensor
 InferRequest
+DeadlineExceeded
 ```
 
 ## Datatypes

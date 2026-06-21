@@ -9,14 +9,15 @@ ReactantServer = "faa8a0e4-1926-4c6b-a0e2-e70699715ecf"
 ReactantServerCore = "387a5f05-f7b4-4d57-bca9-cd3358e52bdc"
 ReactantServerExport = "90fa0446-f028-4638-8833-e223884d9b4d"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+YAML = "ddb6d928-2868-570f-bddf-ab3f9cf99eb6"
+gRPCClient = "aaca4a50-36af-4a1d-b878-4c443f2061ad"
 gRPCServer = "b7f0dee4-5e6a-42e7-93b0-9c098bad2317"
 
-# Standalone env: declare the full vendored path-source closure (the round-trip loads the
-# ReactantServer worker, which pulls the Reactant/gRPCServer/HTTP forks + ReactantServerCore).
 [sources]
 HTTP = {path = "../../../lib/HTTP.jl"}
 Reactant = {path = "../../../lib/Reactant.jl"}
 ReactantServer = {path = "../../ReactantServer"}
 ReactantServerCore = {path = "../../ReactantServerCore"}
 ReactantServerExport = {path = ".."}
+gRPCClient = {path = "../../../lib/gRPCClient.jl"}
 gRPCServer = {path = "../../../lib/gRPCServer.jl"}

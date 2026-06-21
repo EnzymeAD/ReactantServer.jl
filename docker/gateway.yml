@@ -12,6 +12,16 @@ listen:
 grpc:
   max_recv_msg_bytes: 268435456
   max_send_msg_bytes: 268435456
+  # Inbound admission cap = this x worker count (0 = uncapped). Past the cap the gateway sheds with
+  # RESOURCE_EXHAUSTED instead of letting in-flight handlers pile up. Kept above the per-worker
+  # outbound stream limit so a startup burst has wiggle room rather than being rejected early.
+  max_concurrent_requests_per_worker: 64
+
+worker_client:
+  request_timeout_seconds: 60
+  # Outbound in-flight RPCs the gateway multiplexes over one worker's shared connection; the rest
+  # block until a slot frees. This is the gateway's per-worker backpressure toward each worker.
+  max_concurrent_streams: 32
 
 logging:
   level: "info"

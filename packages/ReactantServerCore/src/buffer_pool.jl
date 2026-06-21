@@ -41,7 +41,8 @@ disjoint slots to concurrent callers. A SHM-backed pool can be registered with a
 inline pool (`use_shm=false`) is the fallback transport.
 """
 function BufferPool(n_bytes::Integer; n_slots::Integer = 8, use_shm::Bool = true,
-                    name::AbstractString = "reactant_server_pool")
+                    name::AbstractString = "reactant_server_pool",
+                    key::Union{AbstractString,Nothing} = nothing)
     n_bytes > 0 || throw(ArgumentError("BufferPool: n_bytes must be positive (got $n_bytes)"))
     n_slots > 0 || throw(ArgumentError("BufferPool: n_slots must be positive (got $n_slots)"))
     slot_bytes = Int(n_bytes) ÷ Int(n_slots)
@@ -50,9 +51,11 @@ function BufferPool(n_bytes::Integer; n_slots::Integer = 8, use_shm::Bool = true
     usable = slot_bytes * Int(n_slots)
 
     backing, region_name = if use_shm
-        key = shm_key(String(name))
-        shm = SharedMemory(key, usable)
-        shm, (startswith(key, "/") ? key[2:end] : key)
+        # An explicit `key` (e.g. one the supervisor minted and injected so peer workers can attach
+        # the same region) is used verbatim; otherwise derive a per-process key from `name`.
+        k = key === nothing ? shm_key(String(name)) : String(key)
+        shm = SharedMemory(k, usable)
+        shm, (startswith(k, "/") ? k[2:end] : k)
     else
         Memory{UInt8}(undef, usable), ""
     end
@@ -65,10 +68,17 @@ end
 
 Base.sizeof(pool::BufferPool) = pool.n_bytes
 is_shm_backed(pool::BufferPool) = pool.backing isa SharedMemory
+pool_region_name(pool::BufferPool) = pool.name
+pool_slot_bytes(pool::BufferPool) = pool.slot_bytes
 
 function _pool_base_pointer(pool::BufferPool)
     pool.backing isa SharedMemory ? convert(Ptr{UInt8}, pointer(pool.backing)) : pointer(pool.backing)
 end
+
+# Base address of the pool's backing region. Used by the meta fan-out to detect, by pointer range,
+# whether a sub-call input's bytes already live in this pool (so it can be sent by SHM reference
+# instead of inlined) — robust to the caller reshaping/sub-viewing the scratch buffer.
+pool_base_pointer(pool::BufferPool) = _pool_base_pointer(pool)
 
 # ---- PoolSlot: a byte range within a pool, with a cursor for carving subslots ----
 

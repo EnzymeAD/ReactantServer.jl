@@ -47,8 +47,8 @@ function _empty_sched(; discipline=ReactantServer.FAIR)
         SchedulerConfig(30.0, 1024, 30.0; discipline=discipline))
 end
 
-function _qr(model; rows=1, arrival=0.0)
-    req = InferRequest(model, ["y"], [NamedTensor("x", zeros(Float32, 2, rows))])
+function _qr(model; rows=1, arrival=0.0, deadline_ns=0)
+    req = InferRequest(model, ["y"], [NamedTensor("x", zeros(Float32, 2, rows))], Int64(deadline_ns))
     return QueuedRequest(req, req.inputs, arrival, Channel{Any}(1))
 end
 
@@ -192,6 +192,40 @@ end
     d2 = select_dispatch!(s2, now)
     @test d2.size == 4
     @test length(d2.taken) == 2
+end
+
+@testset "EDF serves the soonest-deadline model, degrading to FIFO on ties" begin
+    s = _empty_sched(; discipline=ReactantServer.EDF)
+    now = 1000.0
+    # "old" arrived first but carries a far deadline; "urgent" arrived later with a sooner deadline.
+    # EDF picks the soonest deadline regardless of arrival (the in-flight meta sub-call case).
+    old = ModelSchedState("old", ModelSchedConfig(1.0), now)
+    push!(old.queue, _qr("old"; arrival=now, deadline_ns=Int64(5_000_000_000)))
+    _install!(s, _sched_entry("old", [1]; coalescable=false), old)
+    urgent = ModelSchedState("urgent", ModelSchedConfig(1.0), now)
+    push!(urgent.queue, _qr("urgent"; arrival=now + 1.0, deadline_ns=Int64(1_000_000_000)))
+    _install!(s, _sched_entry("urgent", [1]; coalescable=false), urgent)
+    @test select_dispatch!(s, now).entry.name == "urgent"
+
+    # With equal deadlines (the uniform-deadline case) EDF degrades to FIFO: oldest arrival wins.
+    s2 = _empty_sched(; discipline=ReactantServer.EDF)
+    a = ModelSchedState("a", ModelSchedConfig(1.0), now)
+    push!(a.queue, _qr("a"; arrival=now - 1.0, deadline_ns=Int64(9_000_000_000)))   # older
+    _install!(s2, _sched_entry("a", [1]; coalescable=false), a)
+    b = ModelSchedState("b", ModelSchedConfig(1.0), now)
+    push!(b.queue, _qr("b"; arrival=now, deadline_ns=Int64(9_000_000_000)))         # same deadline, newer
+    _install!(s2, _sched_entry("b", [1]; coalescable=false), b)
+    @test select_dispatch!(s2, now).entry.name == "a"
+
+    # Requests with no deadline (0) are least urgent: a deadline'd model is served first.
+    s3 = _empty_sched(; discipline=ReactantServer.EDF)
+    nod = ModelSchedState("nodeadline", ModelSchedConfig(1.0), now)
+    push!(nod.queue, _qr("nodeadline"; arrival=now - 5.0))                          # oldest, but no deadline
+    _install!(s3, _sched_entry("nodeadline", [1]; coalescable=false), nod)
+    dl = ModelSchedState("hasdeadline", ModelSchedConfig(1.0), now)
+    push!(dl.queue, _qr("hasdeadline"; arrival=now, deadline_ns=Int64(2_000_000_000)))
+    _install!(s3, _sched_entry("hasdeadline", [1]; coalescable=false), dl)
+    @test select_dispatch!(s3, now).entry.name == "hasdeadline"
 end
 
 @testset "submit! caps each model's queue independently and rejects after shutdown" begin
