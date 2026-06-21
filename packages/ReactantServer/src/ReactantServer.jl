@@ -32,11 +32,6 @@ import gRPCServer
 include(ReactantServerCore.inference_server_stubs_path())
 include(ReactantServerCore.control_server_stubs_path())
 
-# Client-side gRPC service stubs (define the per-RPC `_Client` constructors). The worker is a
-# client only for the meta-model loopback path (a GatewayCaller calling back into the gateway).
-import gRPCClient
-include(ReactantServerCore.inference_client_stubs_path())
-
 # Per-model value types (defined before the registry so ModelEntry can hold them precisely).
 include("runtime/model_types.jl")
 
