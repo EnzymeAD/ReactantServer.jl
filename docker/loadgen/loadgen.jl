@@ -317,8 +317,13 @@ function main()
                 spec = specs[rand(1:length(specs))]
                 try
                     fire(spec, pick_shm(i))
-                catch err
-                    record_err(err)
+                catch ex
+                    # NOTE: must NOT be named `err` — `err` is a main()-scope local (the summary at
+                    # the end assigns it), so every closure here would capture and SHARE that one
+                    # variable. A firing task writing the caught exception into it races the reporter,
+                    # which reads `err` as the N_ERR[] count; the reporter would then print/compare an
+                    # exception (isless(::Int, ::Exception)) and die. A distinct name keeps it local.
+                    record_err(ex)
                 end
             end
         end
