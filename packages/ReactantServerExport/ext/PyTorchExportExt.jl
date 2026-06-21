@@ -355,21 +355,61 @@ strict mode drives TorchDynamo, which on recent torch queries the current
 accelerator's stream and raises against torchax's registered "jax" device. Non-strict
 tracing avoids that path and is the recommended default for `torch.export`.
 """
+# The non-batch Julia axes (1-based) of input `i` whose size differs across the shape variants.
+# These become the variable (`-1`) axes of the executable input and define the variant key. The
+# batch axis is the trailing Julia axis and is excluded.
+function _variant_axes_of_input(variants::Vector{<:Tuple}, i::Int)
+    base = variants[1][i]
+    ndim = ndims(base)
+    axes = Int[]
+    for ax in 1:(ndim - 1)
+        any(v -> size(v[i], ax) != size(base, ax), variants) && push!(axes, ax)
+    end
+    return axes
+end
+
+# The variant key for one example-input tuple: the sizes of the variable input axes, in
+# (input, axis) order. Lines up with the manifest input_shapes and the server's runtime key.
+function _variant_key(inputs_tuple::Tuple, var_axes::Vector{Vector{Int}})
+    key = Int[]
+    for i in eachindex(var_axes), ax in var_axes[i]
+        push!(key, size(inputs_tuple[i], ax))
+    end
+    return key
+end
+
 function export_bundle(::Val{:pytorch}, model, example_inputs::Tuple;
                        dir::AbstractString, name::AbstractString,
                        input_names=nothing, output_name::AbstractString="output",
                        output_names=nothing,
                        batch_sizes::AbstractVector{<:Integer}=[1],
+                       shape_variants::Union{Nothing,AbstractVector}=nothing,
                        strict::Bool=false,
                        matmul_precision::Union{Nothing,AbstractString}=nothing,
                        client_inputs=nothing, client_outputs=nothing,
                        provenance=Dict{String,Any}())
     isempty(example_inputs) && error("PyTorchExport: at least one example input is required")
     isempty(batch_sizes) && error("PyTorchExport: batch_sizes cannot be empty")
-    for (i, x) in enumerate(example_inputs)
-        haskey(ReactantServerExport.DTYPE_TOKENS, eltype(x)) || error(
-            "PyTorchExport: input $i has element type $(eltype(x)), " *
-            "which is not registered in ReactantServerExport.DTYPE_TOKENS")
+
+    # The shape variants to trace. With none given this is the single base shape (the original
+    # single-shape path); otherwise each variant is a full example-input tuple at a distinct shape,
+    # all sharing one weight set. `example_inputs` is the first variant.
+    variants = shape_variants === nothing ? Tuple[Tuple(example_inputs)] :
+               Tuple[Tuple(v) for v in shape_variants]
+    multishape = shape_variants !== nothing
+    n_in = length(example_inputs)
+    for (vi, v) in enumerate(variants)
+        length(v) == n_in ||
+            error("PyTorchExport: shape variant $vi has $(length(v)) inputs, expected $n_in")
+        for (i, x) in enumerate(v)
+            haskey(ReactantServerExport.DTYPE_TOKENS, eltype(x)) || error(
+                "PyTorchExport: variant $vi input $i has element type $(eltype(x)), " *
+                "which is not registered in ReactantServerExport.DTYPE_TOKENS")
+            eltype(x) === eltype(variants[1][i]) ||
+                error("PyTorchExport: variant $vi input $i dtype differs from variant 1")
+            ndims(x) === ndims(variants[1][i]) ||
+                error("PyTorchExport: variant $vi input $i rank differs from variant 1")
+        end
     end
 
     _pyimports()
@@ -381,85 +421,114 @@ function export_bundle(::Val{:pytorch}, model, example_inputs::Tuple;
 
     _report_matmul_precision(jax, matmul_precision)
 
-    n_in = length(example_inputs)
     innames = input_names === nothing ?
               ["input_$(i - 1)" for i in 1:n_in] : collect(String, input_names)
     length(innames) == n_in || error("PyTorchExport: input_names length mismatch ($n_in inputs, $(length(innames)) names)")
 
     model.eval()
 
-    modules = Dict{Int,String}()
+    # The variable input axes (those that differ across variants); empty in the single-shape case.
+    var_axes = Vector{Int}[_variant_axes_of_input(variants, i) for i in 1:n_in]
+
+    modules_by_variant = Dict{Vector{Int},Dict{Int,String}}()
+    out_specs_by_variant = Dict{Vector{Int},Vector{ReactantServerExport.IOSpec}}()
     kept_names = String[]
     kept_weights = Any[]
-    out_specs = ReactantServerExport.IOSpec[]   # one per output tensor; filled on the first trace
-    first_trace = true
+    captured = false
 
-    for s in batch_sizes
-        julia_inputs = Tuple(_with_batch(x, s) for x in example_inputs)
-        py_input_tuple = Tuple(_julia_to_torch(x) for x in julia_inputs)
-        py_args = pytuple(py_input_tuple)
+    for v in variants
+        vkey = _variant_key(v, var_axes)
+        modules = Dict{Int,String}()
+        for s in batch_sizes
+            julia_inputs = Tuple(_with_batch(x, s) for x in v)
+            py_input_tuple = Tuple(_julia_to_torch(x) for x in julia_inputs)
+            py_args = pytuple(py_input_tuple)
 
-        exported = torchexport.export(model, py_args; strict=strict)
-        result = _to_stablehlo_inputs_first[](exported)
-        weights_py = result[0]
-        stablehlo = result[1]
-        n_inputs_in_signature = pyconvert(Int, result[2])
+            exported = torchexport.export(model, py_args; strict=strict)
+            result = _to_stablehlo_inputs_first[](exported)
+            weights_py = result[0]
+            stablehlo = result[1]
+            n_inputs_in_signature = pyconvert(Int, result[2])
 
-        modules[Int(s)] = pyconvert(String, stablehlo.mlir_module())
+            modules[Int(s)] = pyconvert(String, stablehlo.mlir_module())
 
-        if first_trace
-            first_trace = false
+            # Capture weights once: they are identical across variants and batch sizes, so the one
+            # weights.safetensors is shared by every compiled program.
+            if !captured
+                captured = true
+                # Weight names in the exact order of `weights_py` (the graph's
+                # placeholder/input_specs order). Both come from
+                # `_reorder_weights_to_placeholder_order`, so `all_names[k]` always pairs
+                # with `weights_py[k-1]` regardless of how torch.export ordered things.
+                all_names = String[pyconvert(String, n) for n in result[3]]
 
-            # Weight names in the exact order of `weights_py` (the graph's
-            # placeholder/input_specs order). Both come from
-            # `_reorder_weights_to_placeholder_order`, so `all_names[k]` always pairs
-            # with `weights_py[k-1]` regardless of how torch.export ordered things.
-            all_names = String[pyconvert(String, n) for n in result[3]]
-
-            # In the inputs-first signature, flattened positions are
-            # [input_0, ..., input_{N-1}, weight_0, ..., weight_{M-1}].
-            # `module_kept_var_idx` indexes into this flat list after DCE.
-            # Indices in [0, n_inputs) reference inputs (skipped — those are
-            # request-time tensors, not bundle weights). Indices >= n_inputs
-            # reference weights at offset `i - n_inputs`.
-            kept_idx = Int[pyconvert(Int, i) for i in stablehlo.module_kept_var_idx]
-            for i in kept_idx
-                i < n_inputs_in_signature && continue
-                w_idx = i - n_inputs_in_signature
-                w_idx < length(all_names) || continue
-                push!(kept_names, all_names[w_idx + 1])
-                jax_arr = weights_py[w_idx]
-                np_arr = np.asarray(jax_arr)
-                T = _numpy_dtype_to_julia(pyconvert(String, np_arr.dtype.name))
-                push!(kept_weights, _numpy_to_julia(np_arr, T))
-            end
-
-            # Sample forward pass at this batch size to capture each output's shape
-            # and dtype. A model may return one tensor or a tuple/list of tensors.
-            py_out = model(py_input_tuple...)
-            out_tensors = _flatten_outputs(py_out)
-            isempty(out_tensors) && error("PyTorchExport: model produced no output tensors")
-            onames = _resolve_output_names(output_names, output_name, length(out_tensors))
-            for (j, t) in enumerate(out_tensors)
-                pyhasattr(t, "shape") ||
-                    error("PyTorchExport: output $j is not a tensor (nested/non-tensor outputs unsupported)")
-                o_np = t.detach().cpu().numpy()
-                o_dtype = _numpy_dtype_to_julia(pyconvert(String, o_np.dtype.name))
-                o_shape_julia = collect(Int, reverse(pyconvert(Vector{Int}, t.shape)))
-                push!(out_specs, ReactantServerExport.IOSpec(onames[j], o_dtype, o_shape_julia;
-                                                     batch_axis=ndims_from_len(length(o_shape_julia))))
+                # In the inputs-first signature, flattened positions are
+                # [input_0, ..., input_{N-1}, weight_0, ..., weight_{M-1}].
+                # `module_kept_var_idx` indexes into this flat list after DCE.
+                # Indices in [0, n_inputs) reference inputs (skipped — those are
+                # request-time tensors, not bundle weights). Indices >= n_inputs
+                # reference weights at offset `i - n_inputs`.
+                kept_idx = Int[pyconvert(Int, i) for i in stablehlo.module_kept_var_idx]
+                for i in kept_idx
+                    i < n_inputs_in_signature && continue
+                    w_idx = i - n_inputs_in_signature
+                    w_idx < length(all_names) || continue
+                    push!(kept_names, all_names[w_idx + 1])
+                    jax_arr = weights_py[w_idx]
+                    np_arr = np.asarray(jax_arr)
+                    T = _numpy_dtype_to_julia(pyconvert(String, np_arr.dtype.name))
+                    push!(kept_weights, _numpy_to_julia(np_arr, T))
+                end
             end
         end
+
+        # Sample forward pass (first batch size) to capture each output's shape and dtype for this
+        # variant; output spatial dims scale with the input shape, so they are reconciled per axis.
+        v0 = Tuple(_with_batch(x, first(batch_sizes)) for x in v)
+        py_out = model(Tuple(_julia_to_torch(x) for x in v0)...)
+        out_tensors = _flatten_outputs(py_out)
+        isempty(out_tensors) && error("PyTorchExport: model produced no output tensors")
+        onames = _resolve_output_names(output_names, output_name, length(out_tensors))
+        specs = ReactantServerExport.IOSpec[]
+        for (j, t) in enumerate(out_tensors)
+            pyhasattr(t, "shape") ||
+                error("PyTorchExport: output $j is not a tensor (nested/non-tensor outputs unsupported)")
+            o_np = t.detach().cpu().numpy()
+            o_dtype = _numpy_dtype_to_julia(pyconvert(String, o_np.dtype.name))
+            o_shape_julia = collect(Int, reverse(pyconvert(Vector{Int}, t.shape)))
+            push!(specs, ReactantServerExport.IOSpec(onames[j], o_dtype, o_shape_julia;
+                                                 batch_axis=ndims_from_len(length(o_shape_julia))))
+        end
+        modules_by_variant[vkey] = modules
+        out_specs_by_variant[vkey] = specs
     end
 
+    variant_keys = Vector{Int}[_variant_key(v, var_axes) for v in variants]
+
+    # executable_inputs: the first variant's shape with the variable axes marked -1.
     inputs = ReactantServerExport.IOSpec[]
     for i in 1:n_in
-        x_at_s = _with_batch(example_inputs[i], first(batch_sizes))
+        x_at_s = _with_batch(variants[1][i], first(batch_sizes))
+        shp = collect(Int, size(x_at_s))
+        for ax in var_axes[i]
+            shp[ax] = -1
+        end
         bax = ndims(x_at_s) - 1
-        push!(inputs, ReactantServerExport.IOSpec(innames[i], eltype(x_at_s),
-                                          collect(Int, size(x_at_s)); batch_axis=bax))
+        push!(inputs, ReactantServerExport.IOSpec(innames[i], eltype(x_at_s), shp; batch_axis=bax))
     end
-    outputs = out_specs
+
+    # executable_outputs: each output axis that varies across variants is marked -1 (the FPN
+    # feature maps scale with the input). The batch axis is left as the batch marker.
+    base_specs = out_specs_by_variant[variant_keys[1]]
+    outputs = ReactantServerExport.IOSpec[]
+    for (j, base) in enumerate(base_specs)
+        shp = collect(Int, base.shape)
+        for ax in 1:length(shp)
+            (base.batch_axis !== nothing && (ax - 1) == base.batch_axis) && continue
+            any(vk -> out_specs_by_variant[vk][j].shape[ax] != shp[ax], variant_keys) && (shp[ax] = -1)
+        end
+        push!(outputs, ReactantServerExport.IOSpec(base.name, base.dtype, shp; batch_axis=base.batch_axis))
+    end
 
     torch_v = _try_version(torch)
     torchax_v = _try_version_of("torchax")
@@ -471,15 +540,28 @@ function export_bundle(::Val{:pytorch}, model, example_inputs::Tuple;
         "torchax_version" => torchax_v,
         "batch_sizes" => collect(Int, batch_sizes),
     ), Dict{String,Any}(provenance))
+    multishape && (prov["input_shapes"] = variant_keys)
 
-    ReactantServerExport.write_bundle(dir;
-        name=name,
-        executable_inputs=inputs,
-        executable_outputs=outputs,
-        modules=modules,
-        weights=[kept_names[i] => kept_weights[i] for i in eachindex(kept_names)],
-        client_inputs=client_inputs, client_outputs=client_outputs,
-        provenance=prov)
+    if multishape
+        ReactantServerExport.write_bundle(dir;
+            name=name,
+            executable_inputs=inputs,
+            executable_outputs=outputs,
+            modules=modules_by_variant,
+            input_shapes=variant_keys,
+            weights=[kept_names[i] => kept_weights[i] for i in eachindex(kept_names)],
+            client_inputs=client_inputs, client_outputs=client_outputs,
+            provenance=prov)
+    else
+        ReactantServerExport.write_bundle(dir;
+            name=name,
+            executable_inputs=inputs,
+            executable_outputs=outputs,
+            modules=modules_by_variant[variant_keys[1]],
+            weights=[kept_names[i] => kept_weights[i] for i in eachindex(kept_names)],
+            client_inputs=client_inputs, client_outputs=client_outputs,
+            provenance=prov)
+    end
     return dir
 end
 
@@ -596,6 +678,7 @@ function export_torchscript_bundle(pt_path::AbstractString,
                                    output_name::AbstractString="output",
                                    output_names=nothing,
                                    batch_sizes::AbstractVector{<:Integer}=[1],
+                                   shape_variants::Union{Nothing,AbstractVector}=nothing,
                                    matmul_precision::Union{Nothing,AbstractString}=nothing,
                                    client_inputs=nothing, client_outputs=nothing,
                                    provenance=Dict{String,Any}(),
@@ -608,7 +691,7 @@ function export_torchscript_bundle(pt_path::AbstractString,
     return export_torchscript_bundle(jit_mod, example_inputs;
         dir=dir, name=name, input_names=input_names,
         output_name=output_name, output_names=output_names,
-        batch_sizes=batch_sizes, matmul_precision=matmul_precision,
+        batch_sizes=batch_sizes, shape_variants=shape_variants, matmul_precision=matmul_precision,
         client_inputs=client_inputs, client_outputs=client_outputs,
         provenance=prov, wrap=wrap)
 end
@@ -620,6 +703,7 @@ function export_torchscript_bundle(jit_module::Py, example_inputs::Tuple;
                                    output_name::AbstractString="output",
                                    output_names=nothing,
                                    batch_sizes::AbstractVector{<:Integer}=[1],
+                                   shape_variants::Union{Nothing,AbstractVector}=nothing,
                                    matmul_precision::Union{Nothing,AbstractString}=nothing,
                                    client_inputs=nothing, client_outputs=nothing,
                                    provenance=Dict{String,Any}(),
@@ -641,7 +725,7 @@ function export_torchscript_bundle(jit_module::Py, example_inputs::Tuple;
     return export_bundle(Val(:pytorch), wrapper, example_inputs;
         dir=dir, name=name, input_names=input_names,
         output_name=output_name, output_names=output_names,
-        batch_sizes=batch_sizes,
+        batch_sizes=batch_sizes, shape_variants=shape_variants,
         strict=false,
         matmul_precision=matmul_precision,
         client_inputs=client_inputs, client_outputs=client_outputs,

@@ -136,13 +136,39 @@ Convenience alias for [`serve`](@ref) that names the worker positionally.
 serve_worker(node_path::AbstractString, worker::AbstractString; kwargs...) =
     serve(node_path; worker=worker, kwargs...)
 
+# Build the worker's local meta-scratch pool (plain Memory, use_shm=false) from env, or nothing to
+# disable. Defaults: 1 GiB across 16 slots. A scratch buffer larger than one slot spans several.
+function _meta_scratch_pool()
+    bytes = something(tryparse(Int, strip(get(ENV, "REACTANT_FANOUT_BYTES", ""))), 1 << 30)
+    slots = something(tryparse(Int, strip(get(ENV, "REACTANT_FANOUT_SLOTS", ""))), 16)
+    (bytes > 0 && slots > 0) || return nothing
+    return BufferPool(bytes; n_slots=slots, use_shm=false)
+end
+
+# How many GPU-using meta orchestrations may run at once on this worker (REACTANT_META_CONCURRENCY,
+# default 2). The committed set tracks this, so one knob sets both how many metas run and how many cut
+# the line; behavior stays consistent at any value because all in-flight metas cut the line symmetrically
+# (no race for a single slot). At 1 two heavy metas cannot overlap: while one holds the gate the other
+# waits, burns its budget, and sheds (measured), so 2 is the floor that lets two heavy pipelines run
+# without serializing. Higher favors meta completion via more concurrency, but more metas share the
+# serial GPU and the scratch pool (size it accordingly). Compute-only metas bypass the gate entirely.
+function _meta_concurrency()
+    n = something(tryparse(Int, strip(get(ENV, "REACTANT_META_CONCURRENCY", ""))), 2)
+    return max(1, n)
+end
+
 function serve(cfg::ServerConfig; backend::AbstractBackend=ReactantBackend(), blocking::Bool=true,
                worker_name::AbstractString="")
-    shm = SharedMemoryRegistry()
-    # Create this worker's fan-out shared-memory region and attach peers' regions BEFORE the slow
-    # model load/compile in `_bring_up`, so the region exists immediately for peers' startup attach.
-    fanout = setup_fanout(shm)
+    shm = SharedMemoryRegistry()   # client-facing SystemSharedMemory feature (decode/encode shm path)
     pool, registry, sched, watcher = _bring_up(cfg, backend)
+    # Local reuse pool for meta-model intermediates: plain Memory, never shared. With one meta at a time
+    # (the gate below) the pool sees no cross-meta contention; it keeps large per-request intermediates
+    # (e.g. an ROI feature tensor) off the allocation path and holds down GC pressure. Sized by env.
+    sched.scratch_pool = _meta_scratch_pool()
+    # Admit one meta orchestration at a time (configurable). A meta holds a permit across its whole run,
+    # including the CPU glue between stages, but not the GPU itself: its sub-calls dispatch on the loop,
+    # so other models run while the meta computes between stages.
+    sched.meta_gate = MetaGate(_meta_concurrency())
     # Admission counters shared with the gRPC server: the cap (endpoints.max_concurrent_requests,
     # 0 = uncapped) sheds past `inflight`, counting each rejection in `shed`. The metrics collector
     # reads both live, so they are exported even while `serve` blocks the calling task.
@@ -151,11 +177,7 @@ function serve(cfg::ServerConfig; backend::AbstractBackend=ReactantBackend(), bl
     metrics = WorkerMetrics(sched, backend, pool, cfg; worker_name=worker_name,
         inflight=inflight, shed=shed)
     router = build_grpc_router(sched, registry, pool.platform, shm)
-    # Meta-model sub-calls route through this caller: a loopback gateway when REACTANT_LOOPBACK_GRPC
-    # is set (multi-worker), otherwise the local scheduler in-process (single-worker). The fan-out
-    # pool (when present) lets a meta stage large sub-call inputs in shared memory via call.scratch.
-    caller = build_caller(sched; pool=fanout)
-    ctx = InferContext(sched, registry, shm, pool.platform, metrics, caller)
+    ctx = InferContext(sched, registry, shm, pool.platform, metrics)
     # Optional Prometheus metrics endpoint (opt-in via endpoints.metrics_port > 0). Request counting
     # is always on (the InferContext carries `metrics`); only the HTTP listener is gated.
     metrics_server = nothing

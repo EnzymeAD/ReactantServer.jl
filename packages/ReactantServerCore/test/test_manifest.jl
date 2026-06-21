@@ -129,3 +129,64 @@ end
     mbad = ReactantServer.parse_manifest(badclient)
     @test_throws ReactantServer.ManifestError ReactantServer.validate_manifest(mbad, "/models/fp8model", true)
 end
+
+@testset "input_shapes variants" begin
+    # A detector compiled for several aspect ratios: w,h are variable (-1), enumerated by
+    # input_shapes. The variant key is the variable-axis sizes in (input, axis) order, so for
+    # shape "whn" with w at axis 1 and h at axis 2 the key is [w, h].
+    base = Dict{String,Any}(
+        "format_version" => "2.0",
+        "name" => "detector",
+        "executable_inputs" => [Dict("name" => "INPUT__0", "dtype" => "f32",
+                                     "shape" => "whn", "dims" => Dict("w" => -1, "h" => -1))],
+        "executable_outputs" => [Dict("name" => "feat", "dtype" => "f32",
+                                      "shape" => "whcn", "dims" => Dict("w" => -1, "h" => -1, "c" => 256))],
+        "batching" => Dict("compiled_batch_sizes" => [1]),
+        "input_shapes" => [Dict("w" => 1024, "h" => 1024),
+                           Dict("w" => 1448, "h" => 720),
+                           Dict("w" => 720, "h" => 1448)],
+    )
+    m = ReactantServer.parse_manifest(base)
+    @test m.input_shapes == [[1024, 1024], [1448, 720], [720, 1448]]
+    @test ReactantServer.validate_manifest(m, "/models/detector", false) === m
+    @test m.executable_inputs[1].shape[1] == ReactantServer.Dim(ReactantServer.VARIABLE)
+    @test m.executable_inputs[1].shape[3] == ReactantServer.Dim(ReactantServer.BATCH)
+
+    # Absent input_shapes => single fixed shape (empty variant list).
+    nofix = copy(base)
+    delete!(nofix, "input_shapes")
+    nofix["executable_inputs"] = [Dict("name" => "INPUT__0", "dtype" => "f32",
+                                       "shape" => "whn", "dims" => Dict("w" => 512, "h" => 512))]
+    nofix["executable_outputs"] = [Dict("name" => "feat", "dtype" => "f32",
+                                        "shape" => "whcn", "dims" => Dict("w" => 128, "h" => 128, "c" => 256))]
+    mno = ReactantServer.parse_manifest(nofix)
+    @test isempty(mno.input_shapes)
+    @test ReactantServer.validate_manifest(mno, "/models/detector", false) === mno
+
+    # A variable executable-input axis with no input_shapes is rejected at validation.
+    novar = copy(base)
+    delete!(novar, "input_shapes")
+    @test_throws ReactantServer.ManifestError ReactantServer.validate_manifest(
+        ReactantServer.parse_manifest(novar), "/models/detector", false)
+
+    # A variant missing a size for a variable axis is rejected at parse time.
+    missing_axis = copy(base)
+    missing_axis["input_shapes"] = [Dict("w" => 1024)]
+    @test_throws ReactantServer.ManifestError ReactantServer.parse_manifest(missing_axis)
+
+    # A variant naming a non-variable axis is rejected.
+    extra_axis = copy(base)
+    extra_axis["input_shapes"] = [Dict("w" => 1024, "h" => 1024, "c" => 3)]
+    @test_throws ReactantServer.ManifestError ReactantServer.parse_manifest(extra_axis)
+
+    # input_shapes with no variable axis present is rejected.
+    fixed_in = copy(base)
+    fixed_in["executable_inputs"] = [Dict("name" => "INPUT__0", "dtype" => "f32",
+                                          "shape" => "whn", "dims" => Dict("w" => 1024, "h" => 1024))]
+    @test_throws ReactantServer.ManifestError ReactantServer.parse_manifest(fixed_in)
+
+    # Duplicate variants are rejected.
+    dup = copy(base)
+    dup["input_shapes"] = [Dict("w" => 1024, "h" => 1024), Dict("w" => 1024, "h" => 1024)]
+    @test_throws ReactantServer.ManifestError ReactantServer.parse_manifest(dup)
+end

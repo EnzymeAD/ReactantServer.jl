@@ -74,11 +74,13 @@ request first. Workers fronted by a gateway in `lpt_packing` mode must run `fifo
 [Multi-GPU Gateway](multi_gpu_gateway.md)).
 
 `edf` (earliest-deadline-first) serves the model whose most-urgent queued request has the
-soonest deadline, where the deadline comes from the request's remaining-budget timeout. It is
-designed for deadline-sensitive serving: while every client uses the same deadline it behaves
-exactly like `fifo`, and it diverges only to promote requests that have less budget left, in
-practice the in-flight meta-model sub-calls that already spent part of their budget on an earlier
-stage, so they finish instead of starving at the deadline line behind fresh full-budget requests.
+soonest deadline, where the deadline comes from the request's remaining-budget timeout. A meta
+model is not scheduled here (it runs on the request task), but each of its in-flight sub-calls
+inherits the meta's deadline, so under `edf` a meta's continuation is ordered ahead of fresher
+regular work. It is designed for
+deadline-sensitive serving: while every client uses the same deadline it behaves exactly like
+`fifo`, and it diverges only to dispatch requests with less budget left ahead of those with more,
+so a request close to its deadline is served before a fresher one rather than missing behind it.
 `edf` also sheds work it cannot finish within its learned compute cost (laxity), trading some
 throughput (batch fragmentation, and no per-model weighting) for meeting more deadlines under
 load. Note that because `edf` derives urgency solely from the deadline, issuing **different

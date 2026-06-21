@@ -15,9 +15,22 @@
 #   Letters `n` and `b` are reserved batch markers; at most one occurrence per tensor.
 #   Other letters are tensor-scoped (no implicit cross-tensor equality) and must be
 #   unique within a single shape. A size of -1 in `dims` marks a variable axis (used
-#   only on non-batch axes; today only client_outputs can carry one). The per-input
-#   batch_dim is derived from the position of n/b in the shape string; the top-level
-#   `batching` block carries only `compiled_batch_sizes`.
+#   only on non-batch axes). The per-input batch_dim is derived from the position of
+#   n/b in the shape string; the top-level `batching` block carries only
+#   `compiled_batch_sizes`.
+#
+#   When a bundle is compiled for several concrete input shapes (e.g. an object
+#   detector compiled for several aspect ratios that share one weight set), the
+#   variable executable-input axes are marked `-1` and an optional top-level
+#   `input_shapes` block enumerates the compiled variants:
+#       executable_inputs:
+#         - {name: INPUT__0, dtype: f32, shape: whn, dims: {w: -1, h: -1}}
+#       input_shapes:
+#         - {w: 1024, h: 1024}
+#         - {w: 1448, h: 720}
+#   Each entry assigns a size to every variable axis letter. The variants are resolved
+#   into `Manifest.input_shapes`, a canonical list of the variable-axis sizes in
+#   (executable-input order, axis order). An empty list means the single fixed shape.
 
 const SUPPORTED_FORMAT_VERSIONS = ("2.0", "2")
 
@@ -104,12 +117,19 @@ struct Manifest
     input_batch_dim::Union{Int,Nothing}   # derived: 0-based batch axis of the inputs (or nothing)
     kind::String                          # "model" (default) or "meta"
     meta_calls::Vector{String}            # for kind=="meta": declared sub-model names; empty otherwise
+    input_shapes::Vector{Vector{Int}}     # compiled input-shape variants: each is the variable-axis
+                                          # sizes in (executable-input, axis) order; empty => single shape
 end
 
-# Backward-compatible 10-arg constructor: a regular model with no meta metadata. Keeps existing
-# positional callers (tests, fixtures) working after the kind/meta_calls fields were appended.
+# Backward-compatible 10-arg constructor: a regular model with no meta metadata and a single fixed
+# input shape. Keeps existing positional callers (tests, fixtures) working after the
+# kind/meta_calls/input_shapes fields were appended.
 Manifest(fv, name, desc, exin, exout, clin, clout, batching, prov, ibd) =
-    Manifest(fv, name, desc, exin, exout, clin, clout, batching, prov, ibd, "model", String[])
+    Manifest(fv, name, desc, exin, exout, clin, clout, batching, prov, ibd, "model", String[], Vector{Int}[])
+
+# 12-arg constructor: kind/meta_calls supplied, single fixed input shape (no variants).
+Manifest(fv, name, desc, exin, exout, clin, clout, batching, prov, ibd, kind, meta_calls) =
+    Manifest(fv, name, desc, exin, exout, clin, clout, batching, prov, ibd, kind, meta_calls, Vector{Int}[])
 
 """
     is_meta(m::Manifest) -> Bool
@@ -240,6 +260,64 @@ function _parse_meta_calls(d::AbstractDict, name::AbstractString)
     return out
 end
 
+# The variable (dynamic, non-batch) axes across the executable inputs, in (input, axis) order:
+# each entry is (input_name, julia_axis_1based, shape_letter). This is the canonical order the
+# `input_shapes` variants and the runtime variant key are both built in. `raw_inputs` is the raw
+# YAML list (parallel to `specs`), needed only to recover each variable axis's shape letter.
+function _variable_axes(raw_inputs, specs::Vector{TensorSpec})
+    out = Tuple{String,Int,Char}[]
+    for (sp, raw) in zip(specs, raw_inputs)
+        chars = collect(String(get(raw, "shape", "")))
+        for (ax, dm) in enumerate(sp.shape)
+            dm.kind == VARIABLE && push!(out, (sp.name, ax, chars[ax]))
+        end
+    end
+    return out
+end
+
+# Parse the optional top-level `input_shapes` block into the canonical list of variants. Each
+# variant is the vector of variable-axis sizes in the `_variable_axes` order, so it lines up with
+# the runtime variant key derived from a request's executable inputs. Returns an empty vector when
+# the block is absent (the single-fixed-shape case).
+function _parse_input_shapes(d::AbstractDict, raw_inputs, specs::Vector{TensorSpec}, name::AbstractString)
+    haskey(d, "input_shapes") || return Vector{Int}[]
+    blk = d["input_shapes"]
+    blk isa AbstractVector || throw(ManifestError("manifest '$name' 'input_shapes' must be a list"))
+    vaxes = _variable_axes(raw_inputs, specs)
+    isempty(vaxes) &&
+        throw(ManifestError("manifest '$name' declares 'input_shapes' but no executable input has a variable axis (a -1 in its dims)"))
+    letters = Set(t[3] for t in vaxes)
+    variants = Vector{Int}[]
+    for (vi, v) in enumerate(blk)
+        v isa AbstractDict ||
+            throw(ManifestError("manifest '$name' input_shapes[$vi] must be a mapping of axis letters to sizes"))
+        lut = Dict{Char,Int}()
+        for (k, val) in v
+            ks = string(k)
+            (length(ks) == 1 && _is_ascii_letter(ks[1])) ||
+                throw(ManifestError("manifest '$name' input_shapes[$vi] key '$k' is not a single ASCII letter"))
+            val isa Integer ||
+                throw(ManifestError("manifest '$name' input_shapes[$vi]['$ks'] is not an integer (got $(typeof(val)))"))
+            Int(val) > 0 ||
+                throw(ManifestError("manifest '$name' input_shapes[$vi]['$ks']=$(Int(val)) must be > 0"))
+            lut[ks[1]] = Int(val)
+        end
+        extra = setdiff(keys(lut), letters)
+        isempty(extra) ||
+            throw(ManifestError("manifest '$name' input_shapes[$vi] has sizes for non-variable axes: $(sort(collect(extra)))"))
+        key = Int[]
+        for (_, _, letter) in vaxes
+            haskey(lut, letter) ||
+                throw(ManifestError("manifest '$name' input_shapes[$vi] missing a size for variable axis '$letter'"))
+            push!(key, lut[letter])
+        end
+        push!(variants, key)
+    end
+    allunique(variants) ||
+        throw(ManifestError("manifest '$name' has duplicate entries in input_shapes"))
+    return variants
+end
+
 function parse_manifest(d::AbstractDict)
     name = get(d, "name", nothing)
     name isa AbstractString || throw(ManifestError("manifest missing string 'name'"))
@@ -275,8 +353,13 @@ function parse_manifest(d::AbstractDict)
 
     input_batch_dim = _derive_input_batch_dim(exin)
 
+    raw_inputs = get(d, "executable_inputs", Any[])
+    raw_inputs isa AbstractVector || (raw_inputs = Any[])
+    input_shapes = _parse_input_shapes(d, raw_inputs, exin, String(name))
+
     return Manifest(string(fv), String(name), desc === nothing ? "" : string(desc),
-                    exin, exout, clin, clout, batching, prov, input_batch_dim, kind, meta_calls)
+                    exin, exout, clin, clout, batching, prov, input_batch_dim, kind, meta_calls,
+                    input_shapes)
 end
 
 function _check_unique_names(tensors::Vector{TensorSpec}, section::AbstractString)
@@ -321,6 +404,21 @@ function validate_manifest(m::Manifest, dir::AbstractString, has_model_jl::Bool)
 
     all(>(0), m.batching.compiled_batch_sizes) ||
         throw(ManifestError("batching.compiled_batch_sizes must be positive integers"))
+
+    # Input-shape variants. A variable executable-input axis is only servable when the compiled
+    # shapes are enumerated, so a regular model with one must declare `input_shapes`; a meta model
+    # carries no executable, so it must not.
+    nvar_axes = sum(t -> count(dm -> dm.kind == VARIABLE, t.shape), m.executable_inputs; init=0)
+    if is_meta(m)
+        isempty(m.input_shapes) ||
+            throw(ManifestError("meta model '$(m.name)' must not declare 'input_shapes'"))
+    else
+        nvar_axes > 0 && isempty(m.input_shapes) &&
+            throw(ManifestError("model '$(m.name)' has a variable executable-input axis but no 'input_shapes' " *
+                                "to enumerate the compiled shapes"))
+        all(v -> length(v) == nvar_axes, m.input_shapes) ||
+            throw(ManifestError("model '$(m.name)' input_shapes entries must each cover the $nvar_axes variable axes"))
+    end
 
     if !has_model_jl
         (m.client_inputs === nothing && m.client_outputs === nothing) ||

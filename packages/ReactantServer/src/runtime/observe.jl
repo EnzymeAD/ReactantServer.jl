@@ -21,11 +21,13 @@ function _format_specs(specs::Vector{TensorSpec})
                  for s in specs), ", ")
 end
 
-# The compiled batch sizes of a built model; the sole key 0 means a single unbatched module.
+# The compiled batch sizes of a built model; the sole key 0 means a single unbatched module. With
+# several input-shape variants the variant count is prefixed (each variant shares one weight set).
 function _compiled_sizes(model::LoadedModel)
-    ks = sort!(collect(keys(model.execs)))
-    ks == [0] && return "unbatched"
-    return string(ks)
+    ks = _all_batch_sizes(model)
+    nvar = length(model.execs)
+    base = ks == [0] ? "unbatched" : string(ks)
+    return nvar > 1 ? "$(nvar) shapes × $(base)" : base
 end
 
 """

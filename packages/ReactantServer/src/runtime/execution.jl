@@ -4,19 +4,28 @@
 # order, then the pinned weights), transferred to the device, executed, and read back.
 # Transient input and output buffers are released after each call; weights stay resident.
 
-# Pick the executable for a request: the only one for a single-module bundle, otherwise the
-# one matching the request's batch size (derived from the first declared input's batch axis).
-# The manifest uses Julia shape order, so batch_dim is a Julia 0-based axis.
+# Pick the executable for a request. First select the input-shape variant from the request's
+# variable input axes (empty `variant_spec` => the single default variant), then the batch size
+# within it (from the first declared input's batch axis). The manifest uses Julia shape order, so
+# batch_dim and variant axes are Julia 1-based once offset.
+function _variant_key(sig::ModelSignature, byname)
+    isempty(sig.variant_spec) && return VariantKey()
+    return Int[size(byname[nm].data, ax) for (nm, ax) in sig.variant_spec]
+end
+
 function _select_exec(model::LoadedModel, byname)
-    execs = model.execs
-    length(execs) == 1 && return first(values(execs))
     sig = model.sig
+    vkey = _variant_key(sig, byname)
+    inner = get(model.execs, vkey, nothing)
+    inner === nothing &&
+        error("no compiled program for input shape variant $vkey (have $(sort(collect(keys(model.execs)))))")
+    length(inner) == 1 && return first(values(inner))
     t = byname[sig.input_names[1]]
     julia_axis = sig.batch_dim + 1                  # Julia 0-based -> 1-based index
     batch = size(t.data, julia_axis)
-    haskey(execs, batch) ||
-        error("no compiled executable for batch size $batch (have $(sort(collect(keys(execs)))))")
-    return execs[batch]
+    haskey(inner, batch) ||
+        error("no compiled executable for batch size $batch (variant $vkey; have $(sort(collect(keys(inner)))))")
+    return inner[batch]
 end
 
 function run_model(backend::AbstractBackend, pool::MemoryPool, model::LoadedModel,

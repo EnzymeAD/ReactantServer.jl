@@ -68,10 +68,16 @@ struct QueuedRequest
                                     # computed on the caller's task before the request is queued
     enqueued_at::Float64
     reply::Channel{Any}      # buffered size 1; holds the raw sliced outputs or a captured exception
+    committed::Bool          # a meta's in-flight continuation sub-call: jumps the queue for the next
+                             # GPU slot and is exempt from the EDF laxity drop (but not the base
+                             # deadline-passed drop). False for every client-originated request.
 end
 # `prepared` defaults to the request's own inputs (the identity-preprocess case, and the form the
 # scheduler unit tests build). The caller passes the preprocessed inputs explicitly when a
 # bundle's `preprocess` hook is non-trivial; the dispatch loop coalesces and executes `prepared`,
-# never re-running the hook.
-QueuedRequest(req::InferRequest, prepared::Vector{NamedTensor}=req.inputs) =
-    QueuedRequest(req, prepared, time(), Channel{Any}(1))
+# never re-running the hook. `committed` defaults false: only the meta sub-call path sets it.
+QueuedRequest(req::InferRequest, prepared::Vector{NamedTensor}=req.inputs; committed::Bool=false) =
+    QueuedRequest(req, prepared, time(), Channel{Any}(1), committed)
+# Four-positional form (scheduler unit tests, fixtures) defaults to a non-committed request.
+QueuedRequest(req::InferRequest, prepared::Vector{NamedTensor}, enqueued_at::Float64,
+              reply::Channel{Any}) = QueuedRequest(req, prepared, enqueued_at, reply, false)

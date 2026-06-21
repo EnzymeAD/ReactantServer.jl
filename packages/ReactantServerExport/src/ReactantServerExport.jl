@@ -80,6 +80,23 @@ function _spec_dict(s::IOSpec)
                             "shape" => String(shape_chars), "dims" => dims)
 end
 
+# The shape letters `_spec_dict` assigns to the variable (size -1) axes of each input, in
+# (input, axis) order. This is the order the manifest `input_shapes` variants and the runtime
+# variant key are both built in, so the emitted letters line up with what the server reads back.
+function _variable_letters(specs::AbstractVector{IOSpec})
+    letters = Char[]
+    for s in specs
+        next_idx = 1
+        for (i, d) in enumerate(s.shape)
+            (s.batch_axis !== nothing && (i - 1) == s.batch_axis) && continue
+            c = _AXIS_LETTERS[next_idx]
+            next_idx += 1
+            d == -1 && push!(letters, c)
+        end
+    end
+    return letters
+end
+
 # --- StableHLO serialization to a portable artifact ---
 
 function _capture(f)
@@ -107,15 +124,38 @@ function _to_artifact(text::AbstractString)
     end
 end
 
+# Write one variant's StableHLO module(s) under a file prefix (`model` or `model.v{i}`) and return
+# the sorted batch-size list. A single entry under key 0 writes `<prefix>.mlir`; otherwise each
+# writes `<prefix>.b{N}.mlir`. The returned sizes feed `batching.compiled_batch_sizes`.
+function _write_variant_modules(dir::AbstractString, prefix::AbstractString, modules::AbstractDict)
+    if length(modules) == 1 && haskey(modules, 0)
+        write(joinpath(dir, "$prefix.mlir"), _to_artifact(modules[0]))
+        return Int[]
+    end
+    sizes = sort!(collect(keys(modules)))
+    for s in sizes
+        write(joinpath(dir, "$prefix.b$s.mlir"), _to_artifact(modules[s]))
+    end
+    return sizes
+end
+
 """
     write_bundle(dir; name, executable_inputs, executable_outputs, modules, weights,
-                 client_inputs=nothing, client_outputs=nothing, provenance=Dict()) -> dir
+                 client_inputs=nothing, client_outputs=nothing, input_shapes=nothing,
+                 provenance=Dict()) -> dir
 
-Write a bundle. `modules` is a `Dict` keyed by batch size of StableHLO modules (or text or
-bytes); a single entry under key `0` writes `model.mlir`, otherwise each writes
-`model.b{N}.mlir`. `weights` is an ordered collection of `name => array` pairs whose order
-becomes the safetensors `argument_order`. The per-input batch axis is recorded in each
+Write a bundle. With `input_shapes === nothing`, `modules` is a `Dict` keyed by batch size of
+StableHLO modules (or text or bytes); a single entry under key `0` writes `model.mlir`, otherwise
+each writes `model.b{N}.mlir`. `weights` is an ordered collection of `name => array` pairs whose
+order becomes the safetensors `argument_order`. The per-input batch axis is recorded in each
 input's `IOSpec.batch_axis`; the manifest derives `batching.batch_dim` from there.
+
+`input_shapes` (a `Vector{Vector{Int}}` of compiled input-shape variants) turns on the multi-shape
+layout: the variable executable-input axes are marked `-1` in `executable_inputs`, and each variant
+gives the concrete sizes of those axes in (input, axis) order. `modules` is then keyed by variant
+(each key a `Vector{Int}` equal to one `input_shapes` entry) and maps to that variant's batch-size
+module dict; the files are written as `model.v{i}.*.mlir` (`i` indexing `input_shapes`), all sharing
+the single `weights.safetensors`. The variants must share one set of batch sizes.
 
 `client_inputs`/`client_outputs` (each `nothing` or a `Vector{IOSpec}`) declare the wire-facing
 spec when it differs from the executable spec, for bundles that ship a `model.jl` whose
@@ -130,6 +170,7 @@ function write_bundle(dir::AbstractString; name::AbstractString,
                       modules::AbstractDict, weights,
                       client_inputs::Union{Nothing,AbstractVector{IOSpec}}=nothing,
                       client_outputs::Union{Nothing,AbstractVector{IOSpec}}=nothing,
+                      input_shapes::Union{Nothing,AbstractVector}=nothing,
                       provenance=Dict{String,Any}())
     basename(normpath(dir)) == String(name) ||
         error("ReactantServerExport: bundle dir basename must equal name '$name' (got '$(basename(normpath(dir)))')")
@@ -140,24 +181,35 @@ function write_bundle(dir::AbstractString; name::AbstractString,
     SafeTensors.serialize(joinpath(dir, "weights.safetensors"), wdata,
                           Dict("argument_order" => JSON3.write(wnames)))
 
-    sizes = Int[]
-    if length(modules) == 1 && haskey(modules, 0)
-        write(joinpath(dir, "model.mlir"), _to_artifact(modules[0]))
-    else
-        sizes = sort!(collect(keys(modules)))
-        for s in sizes
-            write(joinpath(dir, "model.b$s.mlir"), _to_artifact(modules[s]))
-        end
-    end
-
     manifest = Dict{String,Any}(
         "format_version" => "2.0",
         "name" => String(name),
         "executable_inputs" => [_spec_dict(s) for s in executable_inputs],
         "executable_outputs" => [_spec_dict(s) for s in executable_outputs],
-        "batching" => Dict{String,Any}("compiled_batch_sizes" => sizes),
         "provenance" => Dict{String,Any}(string(k) => v for (k, v) in provenance),
     )
+
+    if input_shapes === nothing
+        sizes = _write_variant_modules(dir, "model", modules)
+        manifest["batching"] = Dict{String,Any}("compiled_batch_sizes" => sizes)
+    else
+        vletters = _variable_letters(executable_inputs)
+        sizes = Int[]
+        for (vi, vk) in enumerate(input_shapes)
+            vkey = Int[Int(x) for x in vk]
+            length(vkey) == length(vletters) ||
+                error("ReactantServerExport: input_shapes[$vi] has $(length(vkey)) sizes but the inputs have $(length(vletters)) variable axes")
+            haskey(modules, vkey) ||
+                error("ReactantServerExport: no modules for input_shapes variant $vkey")
+            vsizes = _write_variant_modules(dir, "model.v$(vi - 1)", modules[vkey])
+            vi == 1 ? (sizes = vsizes) :
+                (vsizes == sizes || error("ReactantServerExport: variant $vkey has batch sizes $vsizes, expected $sizes"))
+        end
+        manifest["batching"] = Dict{String,Any}("compiled_batch_sizes" => sizes)
+        manifest["input_shapes"] =
+            [Dict{String,Any}(string(vletters[j]) => Int(vk[j]) for j in eachindex(vletters)) for vk in input_shapes]
+    end
+
     client_inputs === nothing || (manifest["client_inputs"] = [_spec_dict(s) for s in client_inputs])
     client_outputs === nothing || (manifest["client_outputs"] = [_spec_dict(s) for s in client_outputs])
     YAML.write_file(joinpath(dir, "manifest.yaml"), manifest)

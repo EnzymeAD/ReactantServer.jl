@@ -25,6 +25,7 @@ include("grpc_helpers.jl")
 
 @testset "ReactantServer" begin
     include("test_scheduler.jl")
+    include("test_multishape.jl")
     include("test_observe.jl")
     include("test_worker_metrics.jl")
     include("test_mock_runtime.jl")

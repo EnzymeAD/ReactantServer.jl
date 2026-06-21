@@ -36,13 +36,10 @@ struct InferContext
     shm::SharedMemoryRegistry
     platform::String
     metrics::Union{WorkerMetrics,Nothing}
-    caller::ModelCaller        # routes meta-model sub-calls (local scheduler or loopback gateway)
 end
-# `caller` defaults to a LocalCaller over this worker's scheduler; `serve` overrides it with a
-# GatewayCaller when a loopback gateway is configured. The 4-arg form is used by control-plane-only
-# contexts (tests) that never serve inference.
-InferContext(sched, registry, shm, platform, metrics) =
-    InferContext(sched, registry, shm, platform, metrics, LocalCaller(sched))
+# Meta sub-calls are not routed from here: `infer` runs a meta's orchestration on this request task and
+# its sub-calls re-enter the scheduler in-process (see scheduler.jl `_run_meta_request`), so the context
+# needs no caller. The 4-arg form is used by control-plane-only contexts (tests) that never serve inference.
 InferContext(sched, registry, shm, platform) = InferContext(sched, registry, shm, platform, nothing)
 
 # gRPC status code -> Prometheus label string, for worker_requests_total.
@@ -89,14 +86,22 @@ end
 # assigned model is always ready because the scheduler loads it on demand. The gateway discovers
 # routes from this readiness, so a control-plane pin/unpin flips routing on the next probe.
 function _model_ready(ctx::InferContext, name::AbstractString)
-    # A meta model has no executable or device residency; it is ready as soon as it is loaded.
-    is_meta_name(ctx.registry, name) && return true
+    sched = ctx.sched
+    externally_managed = sched.weight_cache !== nothing && sched.weight_cache.mode == EXTERNALLY_MANAGED
+    # A meta runs its sub-models in-process, so it is ready only where they can run. In
+    # externally-managed mode that means every sub's weights must be resident on this worker (the
+    # group is co-placed); in self-managed mode the meta loads them on demand, so it is always ready.
+    meta = get_meta(ctx.registry, name)
+    if meta !== nothing
+        externally_managed || return true
+        return all(meta.calls; init=true) do sub
+            e = get_model(ctx.registry, sub)
+            e !== nothing && e.executable !== nothing && e.executable.weights !== nothing
+        end
+    end
     entry = get_model(ctx.registry, name)
     (entry === nothing || entry.executable === nothing) && return false
-    sched = ctx.sched
-    if sched.weight_cache !== nothing && sched.weight_cache.mode == EXTERNALLY_MANAGED
-        return entry.executable.weights !== nothing
-    end
+    externally_managed && return entry.executable.weights !== nothing
     return true
 end
 
@@ -210,39 +215,24 @@ function _handle_infer_impl(ctx::InferContext, req, grpc_deadline_ns::Integer=0)
     return _as_invalid(() -> encode_infer_response(name, decoded, outputs, ctx.shm))
 end
 
-# Map a meta model's sub-call availability failures to NOT_FOUND so they are retryable upstream,
-# mirroring `_infer_or_not_found`. This covers the LocalCaller path ("unknown model"/"was
-# unloaded" thrown by the scheduler); the GatewayCaller path surfaces a gRPCClient exception that
-# the worker's gRPC server already renders with its own status.
-function _meta_or_not_found(ctx::InferContext, meta, inputs::Vector{NamedTensor}, deadline_ns::Integer)
-    try
-        return run_meta(meta, ctx.caller, inputs; deadline_ns=deadline_ns)
-    catch e
-        e isa _G.gRPCServiceCallException && rethrow()
-        # The orchestration bailed (or a sub-call was dropped) because the deadline passed.
-        e isa DeadlineExceeded && throw(_G.gRPCServiceCallException(_G.GRPC_DEADLINE_EXCEEDED, sprint(showerror, e)))
-        msg = sprint(showerror, e)
-        (occursin("unknown model", msg) || occursin("was unloaded", msg)) && _not_found(msg)
-        rethrow()
-    end
-end
-
-# A meta model runs its Julia orchestration on this request task (off the GPU dispatch loop). Input
-# validation reuses the regular path (it reads only `manifest`, which MetaEntry also carries). The
-# orchestration's own sub-calls go through `ctx.caller`.
+# A meta's orchestration runs on this request task (`infer` -> `_run_meta_request`), under the worker's
+# one-meta-at-a-time gate; its in-process sub-calls dispatch on the loop. Input validation reuses the
+# regular path (it reads only `manifest`, which MetaEntry also carries). `_infer_or_not_found` maps a
+# deadline bail to DEADLINE_EXCEEDED and an unknown/unloaded sub-model to NOT_FOUND, as the regular path.
 function _handle_meta_infer(ctx::InferContext, meta, req, grpc_deadline_ns::Integer=0)
     decoded = _as_invalid(() -> decode_infer_request(req, ctx.shm))
     deadline_ns = _effective_deadline(decoded.request.deadline_ns, grpc_deadline_ns)
     request = InferRequest(meta.name, decoded.request.requested_outputs, decoded.request.inputs, deadline_ns)
     _validate_inputs(meta, request)
-    outputs = _meta_or_not_found(ctx, meta, request.inputs, deadline_ns)
+    outputs = _infer_or_not_found(ctx, request)
     return _as_invalid(() -> encode_infer_response(meta.name, decoded, outputs, ctx.shm))
 end
 
 # List models with per-model readiness reflecting residency. `req.ready` filters to ready models
-# (the gateway's discovery call), matching Triton's RepositoryIndex semantics.
+# (the gateway's discovery call), matching Triton's RepositoryIndex semantics. Internal sub-models
+# (called only in-process by a meta) are hidden: the gateway must not discover, route, or place them.
 function _handle_repository_index(ctx::InferContext, req)
-    entries = [name => _model_ready(ctx, name) for name in model_names(ctx.registry)]
+    entries = [name => _model_ready(ctx, name) for name in routable_model_names(ctx.registry)]
     req.ready && filter!(last, entries)
     return encode_repository_index(entries)
 end

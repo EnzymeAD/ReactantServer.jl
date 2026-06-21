@@ -1,7 +1,9 @@
 # Meta models: a Julia orchestration (a bundle's model.jl that calls register_meta_model) chains
-# other models with data-dependent logic. These tests exercise the worker-mode path (LocalCaller,
-# no gateway): manifest/bundle loading, the injected caller, the declared-call guard, and the
-# cross-bundle recursion check. The multi-worker GatewayCaller path is covered by the e2e suite.
+# other models with data-dependent logic. A meta runs its orchestration on the request task under a
+# one-meta-at-a-time gate, and each sub-call re-enters the local scheduler in-process via a
+# QueueingCaller (no gateway, no shared-memory transport): the sub-model dispatches on the loop as a
+# committed request. These tests exercise that path: manifest/bundle loading, the injected caller, the
+# declared-call guard, the deadline bail, and the cross-bundle recursion check.
 
 const _RS = ReactantServer
 
@@ -19,7 +21,9 @@ _meta_manifest(name, calls) = _RS.parse_manifest(Dict{String,Any}(
     "client_inputs" => [Dict("name" => "x", "dtype" => "f32", "shape" => "c", "dims" => Dict("c" => 4))],
     "client_outputs" => [Dict("name" => "OUT", "dtype" => "f32", "shape" => "c", "dims" => Dict("c" => 4))]))
 
-# A scheduler hosting the "scale" backbone, plus a LocalCaller over it.
+# A registry hosting the "scale" backbone, a started scheduler over it, and a QueueingCaller a meta
+# uses to run sub-models: each sub-call re-enters the started scheduler in-process (the loop dispatches
+# the committed sub-model request). `nothing` for the scratch pool -> `call.scratch` returns plain arrays.
 function _meta_local_caller()
     backend = _RS.MockBackend()
     pool = _RS.MemoryPool(backend, _RS.MockClient(), _RS.MockDevice(0), "mock", nothing)
@@ -28,7 +32,7 @@ function _meta_local_caller()
         "", nothing, _meta_scale_model(), nothing, identity, identity)
     sched = _RS.Scheduler(reg, backend, pool, _RS.SchedulerConfig(30.0, 64, 30.0))
     _RS.start!(sched)
-    return sched, _RS.LocalCaller(sched)
+    return sched, _RS.QueueingCaller(sched, nothing)
 end
 
 @testset "meta manifest parse + validate" begin
@@ -53,7 +57,7 @@ end
     end
 end
 
-@testset "meta model runs in worker mode via LocalCaller" begin
+@testset "meta model runs its sub-models in-process via QueueingCaller" begin
     sched, caller = _meta_local_caller()
 
     # The orchestration calls the backbone (x .* 2), then branches on the data: scale again when the
@@ -186,10 +190,140 @@ end
     @test_throws _RS.BundleError _RS.load_bundles([root])
 end
 
-@testset "build_caller defaults to LocalCaller with no loopback configured" begin
-    sched, _ = _meta_local_caller()
-    withenv(_RS.LOOPBACK_ENV => nothing) do
-        @test _RS.build_caller(sched) isa _RS.LocalCaller
+@testset "meta runs on the request task with in-process sub-calls" begin
+    # End-to-end through the scheduler: register the backbone and a meta, start the loop, and submit
+    # the meta via `infer`. `infer` runs the orchestration on the calling task under the meta gate; its
+    # sub-call re-enters the scheduler and dispatches the backbone on the loop. Confirms a meta returns
+    # its assembled outputs and is shed at admission when its deadline has already passed.
+    backend = _RS.MockBackend()
+    pool = _RS.MemoryPool(backend, _RS.MockClient(), _RS.MockDevice(0), "mock", nothing)
+    reg = _RS.ModelRegistry()
+    reg.by_name["scale"] = _RS.ModelEntry("scale", _trivial_manifest("scale"), Dict{Int,Vector{UInt8}}(),
+        "", nothing, _meta_scale_model(), nothing, identity, identity)
+    run = (inputs, call) -> [_RS.NamedTensor("OUT", call("scale", inputs)[1].data .+ 1)]
+    reg.meta["det"] = _RS.MetaEntry("det", _meta_manifest("det", ["scale"]), ["scale"], run)
+    sched = _RS.Scheduler(reg, backend, pool, _RS.SchedulerConfig(30.0, 64, 30.0))
+    _RS.start!(sched)
+    try
+        out = _RS.infer(sched, _RS.InferRequest("det", String[], [_RS.NamedTensor("x", Float32[1, 2, 3, 4])]))
+        @test out isa Vector{_RS.NamedTensor}
+        @test out[1].name == "OUT"
+        @test out[1].data == Float32[3, 5, 7, 9]   # (x .* 2) .+ 1
+        # A past-deadline meta request is dropped at admission (before taking a gate permit or running
+        # the backbone) and surfaces as DeadlineExceeded.
+        past = _RS.InferRequest("det", String[], [_RS.NamedTensor("x", Float32[1, 2, 3, 4])],
+                                Int64(time_ns()) - Int64(1_000_000))
+        @test_throws _RS.DeadlineExceeded _RS.infer(sched, past)
+        # The meta's serving counters are recorded for the control plane (one successful run above).
+        @test sched.registry.meta["det"].sched.requests_served == 1
+        @test sched.registry.meta["det"].sched.total_compute >= 0.0
+    finally
+        _RS.shutdown!(sched)
     end
-    _RS.shutdown!(sched)
+end
+
+@testset "meta gate admits one meta at a time; a slow meta does not block regular models" begin
+    # While a meta is mid-orchestration (paused in its CPU glue, holding the gate but NOT the GPU), a
+    # concurrently submitted regular request to a different model is still served. This is the core win:
+    # the GPU is free during the meta's glue.
+    backend = _RS.MockBackend()
+    pool = _RS.MemoryPool(backend, _RS.MockClient(), _RS.MockDevice(0), "mock", nothing)
+    reg = _RS.ModelRegistry()
+    reg.by_name["scale"] = _RS.ModelEntry("scale", _trivial_manifest("scale"), Dict{Int,Vector{UInt8}}(),
+        "", nothing, _meta_scale_model(), nothing, identity, identity)
+    reg.by_name["other"] = _RS.ModelEntry("other", _trivial_manifest("other"), Dict{Int,Vector{UInt8}}(),
+        "", nothing, _meta_scale_model(), nothing, identity, identity)
+    gate_open = Channel{Nothing}(1)   # released by the test once the regular request has been served
+    glue_entered = Channel{Nothing}(1)
+    run = function (inputs, call)
+        y = call("scale", inputs)[1].data    # one GPU stage, then "glue" that parks
+        put!(glue_entered, nothing)
+        take!(gate_open)                     # hold the gate here, off the GPU, until the test signals
+        return [_RS.NamedTensor("OUT", y .+ 1)]
+    end
+    reg.meta["det"] = _RS.MetaEntry("det", _meta_manifest("det", ["scale"]), ["scale"], run)
+    sched = _RS.Scheduler(reg, backend, pool, _RS.SchedulerConfig(30.0, 64, 30.0))
+    _RS.start!(sched)
+    try
+        meta_task = Threads.@spawn _RS.infer(sched,
+            _RS.InferRequest("det", String[], [_RS.NamedTensor("x", Float32[1, 2, 3, 4])]))
+        take!(glue_entered)                  # the meta is now parked in its glue, holding the gate
+        # A regular request to another model is served while the meta holds the gate (GPU is free).
+        ot = _RS.infer(sched, _RS.InferRequest("other", String[], [_RS.NamedTensor("x", Float32[5, 6, 7, 8])]))
+        @test ot[1].data == Float32[10, 12, 14, 16]
+        put!(gate_open, nothing)             # let the meta finish
+        out = fetch(meta_task)
+        @test out[1].data == Float32[3, 5, 7, 9]
+    finally
+        _RS.shutdown!(sched)
+    end
+end
+
+@testset "compute-only meta bypasses the gate" begin
+    # A compute-only meta (empty calls) issues no sub-calls, so it must NOT take a gate permit: it runs
+    # even while every gate permit is held by a GPU meta parked in its glue. Capacity-1 gate makes the
+    # contention unambiguous.
+    backend = _RS.MockBackend()
+    pool = _RS.MemoryPool(backend, _RS.MockClient(), _RS.MockDevice(0), "mock", nothing)
+    reg = _RS.ModelRegistry()
+    reg.by_name["scale"] = _RS.ModelEntry("scale", _trivial_manifest("scale"), Dict{Int,Vector{UInt8}}(),
+        "", nothing, _meta_scale_model(), nothing, identity, identity)
+    hold = Channel{Nothing}(1)
+    entered = Channel{Nothing}(1)
+    gpu_run = function (inputs, call)
+        call("scale", inputs)
+        put!(entered, nothing)
+        take!(hold)                                 # park while holding the single gate permit
+        return [_RS.NamedTensor("OUT", inputs[1].data)]
+    end
+    reg.meta["gpu_meta"] = _RS.MetaEntry("gpu_meta", _meta_manifest("gpu_meta", ["scale"]), ["scale"], gpu_run)
+    # Empty calls -> compute-only; does all work in Julia and touches no sub-model.
+    co_run = (inputs, call) -> [_RS.NamedTensor("OUT", inputs[1].data .* 3)]
+    reg.meta["compute_only"] = _RS.MetaEntry("compute_only", _meta_manifest("compute_only", String[]), String[], co_run)
+    sched = _RS.Scheduler(reg, backend, pool, _RS.SchedulerConfig(30.0, 64, 30.0))
+    sched.meta_gate = _RS.MetaGate(1)
+    _RS.start!(sched)
+    try
+        gpu_task = Threads.@spawn _RS.infer(sched,
+            _RS.InferRequest("gpu_meta", String[], [_RS.NamedTensor("x", Float32[1, 2, 3, 4])]))
+        take!(entered)                              # the GPU meta now holds the only permit
+        # The compute-only meta runs to completion despite the gate being fully held.
+        co = _RS.infer(sched, _RS.InferRequest("compute_only", String[], [_RS.NamedTensor("x", Float32[1, 2, 3, 4])]))
+        @test co[1].data == Float32[3, 6, 9, 12]
+        put!(hold, nothing)
+        @test fetch(gpu_task)[1].data == Float32[1, 2, 3, 4]
+    finally
+        _RS.shutdown!(sched)
+    end
+end
+
+@testset "committed sub-calls track the gate (each in-flight meta cuts the line)" begin
+    # The committed set is sized to the gate: with two metas in flight, both their sub-calls are
+    # committed and both cut the line (no single-slot overwrite). Drive selection by hand (loop not
+    # started) so the ordering is deterministic.
+    backend = _RS.MockBackend()
+    pool = _RS.MemoryPool(backend, _RS.MockClient(), _RS.MockDevice(0), "mock", nothing)
+    reg = _RS.ModelRegistry()
+    for nm in ("subA", "subB")
+        reg.by_name[nm] = _RS.ModelEntry(nm, _trivial_manifest(nm), Dict{Int,Vector{UInt8}}(),
+            "", nothing, _meta_scale_model(), nothing, identity, identity)
+    end
+    sched = _RS.Scheduler(reg, backend, pool, _RS.SchedulerConfig(30.0, 64, 30.0))
+    now = time()
+    for e in values(reg.by_name)
+        _RS.init_sched_state!(sched, e, now)
+    end
+    sched.running = true     # allow submit!; the dispatch loop is NOT started, so we select by hand
+    x = [_RS.NamedTensor("x", Float32[1, 2, 3, 4])]
+    qrA = _RS.QueuedRequest(_RS.InferRequest("subA", String[], x); committed=true)
+    qrB = _RS.QueuedRequest(_RS.InferRequest("subB", String[], x); committed=true)
+    _RS.submit!(sched, qrA)
+    _RS.submit!(sched, qrB)
+    @test length(sched.committed) == 2          # both retained; no single-slot overwrite
+    d1 = _RS.select_dispatch!(sched, time())
+    d2 = _RS.select_dispatch!(sched, time())
+    @test d1 isa _RS.Dispatch && d2 isa _RS.Dispatch
+    @test Set([d1.entry.name, d2.entry.name]) == Set(["subA", "subB"])   # both jumped the line
+    @test isempty(sched.committed)
+    @test _RS.select_dispatch!(sched, time()) === nothing                # nothing left to dispatch
 end

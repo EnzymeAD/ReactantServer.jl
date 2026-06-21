@@ -54,9 +54,6 @@ function worker_spec(name::AbstractString, node_file::AbstractString,
                      compute_threads::Integer=_worker_thread_count(Sys.CPU_THREADS, 1),
                      grpc_port::Union{Integer,Nothing}=nothing,
                      metrics_port::Union{Integer,Nothing}=nothing,
-                     loopback::Union{AbstractString,Nothing}=nothing,
-                     fanout_self::Union{AbstractString,Nothing}=nothing,
-                     fanout_peers::Union{AbstractString,Nothing}=nothing,
                      grace_seconds::Real=15.0)
     proj = joinpath(workspace_root, "packages", "ReactantServer")
     # `--threads=<compute_threads>,1`: a default pool sized to this worker's share of the host for
@@ -74,16 +71,8 @@ function worker_spec(name::AbstractString, node_file::AbstractString,
     # to the public ones, so the external interface matches the multi-worker gateway's.
     grpc_port === nothing || push!(pairs, "INFERENCE_SERVER_ENDPOINTS_PORT" => string(Int(grpc_port)))
     metrics_port === nothing || push!(pairs, "INFERENCE_SERVER_ENDPOINTS_METRICS_PORT" => string(Int(metrics_port)))
-    # The loopback gRPC endpoint a meta model's sub-calls route to (the gateway in multi-worker
-    # deployments). An empty string explicitly disables it (single worker: meta calls stay
-    # in-process), overriding any inherited value; `nothing` leaves REACTANT_LOOPBACK_GRPC to the
-    # inherited environment (the external-gateway `workers` role sets it there).
-    loopback === nothing || push!(pairs, "REACTANT_LOOPBACK_GRPC" => String(loopback))
-    # Shared-memory fan-out mesh: this worker's own region to create ("<key>:<bytes>:<slots>") and
-    # its peers' regions to attach ("<key>:<bytes>,..."), so a meta model can stage large sub-call
-    # inputs in shared memory via call.scratch instead of inlining them over the loopback gRPC.
-    fanout_self === nothing || push!(pairs, "REACTANT_FANOUT_SELF" => String(fanout_self))
-    fanout_peers === nothing || push!(pairs, "REACTANT_FANOUT_PEERS" => String(fanout_peers))
+    # Meta sub-calls run in-process now, so no loopback gRPC endpoint or shared-memory fan-out mesh is
+    # injected; each worker builds its own local meta-scratch pool in serve().
     return ChildSpec(String(name), addenv(cmd, pairs...), Float64(grace_seconds))
 end
 

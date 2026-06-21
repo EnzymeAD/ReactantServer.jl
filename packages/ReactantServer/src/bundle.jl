@@ -38,26 +38,46 @@ function _include_model_jl(path::AbstractString, expected_name::AbstractString; 
     return reg
 end
 
-# Discover the StableHLO module(s). A bundle has either per-batch-size files
-# `model.b{N}.mlir` (keyed by N) or a single `model.mlir` (keyed by 0, used for any request).
-function _discover_modules(dir::AbstractString, m::Manifest)
+# Discover the per-batch-size StableHLO modules for one variant prefix. The prefix is `model` for
+# a single-shape bundle and `model.v{i}` for variant `i` of a multi-shape bundle. A variant has
+# either per-batch-size files `<prefix>.b{N}.mlir` (keyed by N) or a single `<prefix>.mlir`
+# (keyed by 0, used for any batch size).
+function _discover_batch_modules(dir::AbstractString, m::Manifest, prefix::AbstractString)
     modules = Dict{Int,Vector{UInt8}}()
+    rx = Regex("^" * replace(prefix, "." => "\\.") * "\\.b(\\d+)\\.mlir\$")
     for f in readdir(dir)
-        mt = match(r"^model\.b(\d+)\.mlir$", f)
+        mt = match(rx, f)
         mt === nothing && continue
         modules[parse(Int, mt.captures[1])] = read(joinpath(dir, f))
     end
     if isempty(modules)
-        single = joinpath(dir, "model.mlir")
-        isfile(single) || throw(BundleError("bundle '$(m.name)' has no model.mlir or model.b{N}.mlir"))
+        single = joinpath(dir, prefix * ".mlir")
+        isfile(single) ||
+            throw(BundleError("bundle '$(m.name)' has no $(prefix).mlir or $(prefix).b{N}.mlir"))
         modules[0] = read(single)
         return modules
     end
     for sz in m.batching.compiled_batch_sizes
         haskey(modules, sz) ||
-            throw(BundleError("bundle '$(m.name)' declares batch size $sz but has no model.b$sz.mlir"))
+            throw(BundleError("bundle '$(m.name)' declares batch size $sz but has no $(prefix).b$sz.mlir"))
     end
     return modules
+end
+
+# Discover every variant's StableHLO module(s), keyed by variant. A single-shape bundle (no
+# `input_shapes`) yields one default variant `Int[]` from `model.mlir`/`model.b{N}.mlir`. A
+# multi-shape bundle yields one entry per declared `input_shapes` variant `i`, read from
+# `model.v{i}.*.mlir`; the variant key is the same variable-axis size vector the manifest resolved
+# and the runtime derives from a request, so dispatch lines up with what was compiled.
+function _discover_modules(dir::AbstractString, m::Manifest)
+    if isempty(m.input_shapes)
+        return Dict{VariantKey,Dict{Int,Vector{UInt8}}}(VariantKey() => _discover_batch_modules(dir, m, "model"))
+    end
+    out = Dict{VariantKey,Dict{Int,Vector{UInt8}}}()
+    for (i, vkey) in enumerate(m.input_shapes)
+        out[vkey] = _discover_batch_modules(dir, m, "model.v$(i - 1)")
+    end
+    return out
 end
 
 """
@@ -91,7 +111,8 @@ function load_bundle_entry(dir::AbstractString; validator::SignatureValidator=Nu
     isfile(weights_path) || throw(BundleError("bundle '$(m.name)' missing weights.safetensors"))
     weights = SafeTensors.deserialize(weights_path; mmap=true)
 
-    validate_against_signature(validator, m, first(values(mlir_bytes)))
+    # Every variant/batch module shares one signature; validate against any one of them.
+    validate_against_signature(validator, m, first(values(first(values(mlir_bytes)))))
 
     pre, post = identity, identity
     if has_jl

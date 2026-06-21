@@ -28,11 +28,20 @@ function build_loaded_model(backend::AbstractBackend, pool::MemoryPool, entry::M
     # sizes (see _select_exec). When the model has no batch axis at all, default to 0;
     # _select_exec returns the sole executable before reading batch_dim in that case.
     input_batch_dim = m.input_batch_dim === nothing ? 0 : m.input_batch_dim
-    if length(entry.mlir_bytes) > 1 && m.input_batch_dim === nothing
+    # The variable input axes, in (input, axis) order, line up with the manifest's input_shapes and
+    # so with the variant keys of entry.mlir_bytes; _select_exec reads the same axes from a request.
+    variant_spec = Tuple{String,Int}[]
+    for t in m.executable_inputs
+        for (ax, dm) in enumerate(t.shape)
+            dm.kind == VARIABLE && push!(variant_spec, (t.name, ax))
+        end
+    end
+    # Multiple compiled batch sizes within a variant need a batch axis to dispatch on.
+    if any(inner -> length(inner) > 1, values(entry.mlir_bytes)) && m.input_batch_dim === nothing
         error("manifest '$(m.name)' has multiple compiled batch sizes but no input with a batch axis ('n'/'b')")
     end
     sig = ModelSignature(input_names, input_eltypes, wnames, n_outputs, output_names, output_eltypes,
-                         input_batch_dim)
+                         input_batch_dim, variant_spec)
 
     # Weights do not vary with batch size, so they are loaded once and shared.
     nbytes = weights_nbytes(entry.weights, wnames)
@@ -52,9 +61,14 @@ function build_loaded_model(backend::AbstractBackend, pool::MemoryPool, entry::M
         host_weights = host_materialize(store, entry.name, entry.weights, wnames)
     end
     np = num_parameters(sig)
-    execs = Dict{Int,Any}()
-    for (sz, bytes) in entry.mlir_bytes
-        execs[sz] = compile_artifact(backend, pool, bytes, np, n_outputs)
+    # One executable per (variant, batch size); all share the single weight set loaded above.
+    execs = Dict{VariantKey,Dict{Int,Any}}()
+    for (vkey, batchmap) in entry.mlir_bytes
+        inner = Dict{Int,Any}()
+        for (sz, bytes) in batchmap
+            inner[sz] = compile_artifact(backend, pool, bytes, np, n_outputs)
+        end
+        execs[vkey] = inner
     end
     model = LoadedModel(sig, execs, weights, state, nbytes, host_weights)
     log_model_loaded(entry, model; source=source, memory=memory_report(backend, pool))
