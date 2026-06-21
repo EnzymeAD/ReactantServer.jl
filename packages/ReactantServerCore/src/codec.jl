@@ -13,11 +13,16 @@ const _SHM_REGION = "shared_memory_region"
 const _SHM_OFFSET = "shared_memory_offset"
 const _SHM_BYTE_SIZE = "shared_memory_byte_size"
 
-# Request-level KV parameter carrying the caller's REMAINING budget in nanoseconds (relative, not
-# an absolute timestamp). Like the SHM region params, this is an extension to KServe V2 passed
-# through `ModelInferRequest.parameters`. It is relative so each hop converts it to its own local
-# absolute deadline (`time_ns() + budget`), which makes it robust to cross-process monotonic-clock
-# differences and lets it ride unchanged through the gateway's raw-byte request forwarding.
+"""
+    TIMEOUT_NS_PARAM
+
+Key of the request-level KV parameter carrying the caller's REMAINING budget in nanoseconds
+(relative, not an absolute timestamp). Like the shared-memory region parameters, this is an
+extension to KServe V2 passed through `ModelInferRequest.parameters`. It is relative so each hop
+converts it to its own local absolute deadline (`time_ns() + budget`), which makes it robust to
+cross-process monotonic-clock differences and lets it ride unchanged through the gateway's raw-byte
+request forwarding. See [`deadline_params`](@ref).
+"""
 const TIMEOUT_NS_PARAM = "reactant_timeout_ns"
 
 """
