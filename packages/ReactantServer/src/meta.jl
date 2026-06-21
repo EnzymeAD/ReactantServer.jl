@@ -1,46 +1,36 @@
 # Meta-model execution: a meta model is a user-authored Julia workflow (a bundle's model.jl that
-# calls register_meta_model) that chains several models with data-dependent logic in between. A meta
-# is a scheduled unit: the dispatch loop selects it and runs its orchestration INLINE, holding the
-# GPU exclusively for the whole run (see scheduler.jl `execute_meta!`). Its sub-calls go through an
-# injected `InlineCaller` that invokes each sub-model's compiled executable directly in-process, with
-# no queue re-entry, no loopback gRPC, and no shared-memory transport. The sub-models are internal to
-# the meta (the gateway never routes to them); placement keeps them resident with their meta.
+# calls register_meta_model) that chains several models with data-dependent logic in between. Its
+# orchestration runs on the gRPC request task (off the GPU dispatch loop, like the pre/post hooks),
+# under a per-worker gate that admits only one meta at a time (see scheduler.jl `infer`). Each sub-call
+# goes through an injected `QueueingCaller` that re-enters the local scheduler in-process: the sub-model
+# dispatches on the loop (so the GPU is free for other models during the meta's CPU glue), but a meta's
+# in-flight sub-call is COMMITTED, so it jumps the queue for the next GPU slot and is never shed on the
+# EDF laxity prediction (only on the base deadline-passed check). There is no loopback gRPC and no
+# shared-memory transport. The sub-models are internal to the meta (the gateway never routes to them);
+# placement keeps them resident with their meta.
 
 abstract type ModelCaller end
 
-# In-process caller. A sub-call runs the sub-model's compiled executable directly on the dispatch
-# thread: this is exactly `infer` minus the queue (preprocess, ensure weights resident, run_model,
-# postprocess). Because the meta holds the GPU exclusively while it runs, these calls execute back to
-# back with no coalescing and no transport. Carries everything `run_model`/`acquire!` need, plus the
-# worker's local reuse pool for `call.scratch`.
-struct InlineCaller <: ModelCaller
-    backend::AbstractBackend
-    pool::MemoryPool
-    registry::ModelRegistry
-    weight_cache::Union{WeightCache,Nothing}
+# In-process caller. A sub-call re-enters the local scheduler's `infer` as a COMMITTED request: it is
+# queued (so it coalesces and the GPU stays serial), jumps the line for the next dispatch, and is
+# exempt from the laxity drop. Carries the worker's local reuse pool for `call.scratch`. The scheduler
+# itself carries the backend/pool/weight-cache, so the sub-call needs only a handle to it.
+struct QueueingCaller <: ModelCaller
+    sched::Scheduler
     scratch::Union{BufferPool,Nothing}
 end
 
 # The local reuse pool a meta's `call.scratch` allocates from (or nothing -> plain heap arrays).
-caller_pool(c::InlineCaller) = c.scratch
+caller_pool(c::QueueingCaller) = c.scratch
 
-# `deadline_ns` is an absolute local `time_ns()` deadline (0 = none). The sub-model runs in-process,
-# so the deadline is just checked here before starting more GPU work; there is no hop to propagate it
-# across. `requested_outputs` is accepted for interface symmetry but unused: `run_model` returns all
-# outputs and the meta selects what it needs by position/name.
-function call_model(c::InlineCaller, name::AbstractString, inputs::Vector{NamedTensor};
-                    requested_outputs::Vector{String}=String[], deadline_ns::Integer=0)
-    sub = get(c.registry.by_name, String(name), nothing)
-    (sub === nothing || sub.executable === nothing) && error("unknown model: $name")
-    deadline_ns != 0 && Int64(time_ns()) >= deadline_ns && throw(DeadlineExceeded(String(name)))
-    # preprocess/postprocess come from the sub-model's model.jl (a newer world age); invokelatest
-    # crosses that boundary, exactly as infer() does. acquire! ensures the sub-model's weights are
-    # resident on this worker (a fast no-op when placement co-resides the meta's group).
-    prepared = Base.invokelatest(sub.preprocess, inputs)
-    c.weight_cache === nothing || acquire!(c.weight_cache, sub)
-    raw = run_model(c.backend, c.pool, sub.executable, prepared)
-    return Base.invokelatest(sub.postprocess, raw)
-end
+# `deadline_ns` is an absolute local `time_ns()` deadline (0 = none). In-process, the sub-call shares
+# this worker's clock, so the deadline is passed straight through to the sub-request; the scheduler
+# drops it at admission only if it has already expired (committed requests skip the laxity drop). The
+# sub-model's own preprocess/postprocess run inside `infer` on this task.
+call_model(c::QueueingCaller, name::AbstractString, inputs::Vector{NamedTensor};
+           requested_outputs::Vector{String}=String[], deadline_ns::Integer=0) =
+    infer(c.sched, InferRequest(String(name), requested_outputs, inputs, Int64(deadline_ns));
+          committed=true)
 
 # The injected `call` handed to a meta model's `run(inputs, call)`. Callable to dispatch a sub-call
 # (`call(name, inputs)`), and exposes `call.scratch(...)` to request reuse buffers. Tracks the pool
@@ -122,8 +112,8 @@ end
     run_meta(entry, caller, inputs; deadline_ns=0) -> Vector{NamedTensor}
 
 Run a meta model's orchestration. The injected `call` (a [`MetaCall`](@ref)) dispatches sub-calls
-through `caller` (an [`InlineCaller`](@ref) on the dispatch thread), rejecting any callee not
-declared in `meta.calls`, and offers `call.scratch` for reuse buffers. `deadline_ns` is an absolute
+through `caller` (a [`QueueingCaller`](@ref) that re-enters the local scheduler), rejecting any callee
+not declared in `meta.calls`, and offers `call.scratch` for reuse buffers. `deadline_ns` is an absolute
 local `time_ns()` deadline for the whole orchestration (0 = none): once it passes, the next
 `call(...)` (or a slot acquire) bails with [`DeadlineExceeded`](@ref) rather than starting more GPU
 work. Any pool slots acquired via `scratch` are released here when it returns (request-scoped).

@@ -51,50 +51,66 @@ end)
 loud error. The loader also rejects a meta bundle whose `model.jl` calls `register_model` instead
 of `register_meta_model`.
 
-## Execution: a scheduled, local unit
+## Execution: local, on the request task, one meta at a time
 
-A meta is a scheduled unit, the same as a regular model. When the worker's dispatch loop selects it,
-the loop runs the whole `run(inputs, call)` orchestration inline, and `call` invokes each sub-model's
-compiled executable directly, in the same process. There is no gateway round-trip and no
-serialization between stages: a sub-call is a local invocation of the sub-model's executable, and a
-tensor handed from one stage to the next is passed by reference. The same `model.jl` runs unchanged
-on a single worker or in a fleet; the author never writes routing and never needs to know where
-anything is placed, because a meta only ever runs where its sub-models already live (see Placement,
-below).
+A meta's `run(inputs, call)` executes on the gRPC request task, off the GPU dispatch loop, exactly
+like a model's pre/post hooks. Each `call(name, inputs)` re-enters the local scheduler in-process:
+the sub-model is dispatched on the loop and its result handed back to the orchestration. There is no
+gateway round-trip and no serialization between stages; a tensor handed from one stage to the next is
+passed by reference. The same `model.jl` runs unchanged on a single worker or in a fleet; the author
+never writes routing and never needs to know where anything is placed, because a meta only ever runs
+where its sub-models already live (see Placement, below).
+
+Two rules shape how a meta shares the GPU with everything else on the worker:
+
+- **One meta at a time.** A per-worker gate admits a single meta orchestration at once (configurable
+  with `REACTANT_META_CONCURRENCY`, default 1). A meta holds its permit across the whole run,
+  including the CPU glue between stages, but it does **not** hold the GPU during that glue. While a
+  meta computes between stages, the dispatch loop is free and serves other models, so the GPU is not
+  idle during the glue. Only one meta's stages ever interleave with regular work, which keeps
+  contention and the scratch pool predictable.
+- **In-flight sub-calls jump the line.** Once a meta holds the gate, each of its GPU stages is
+  dispatched ahead of the queued regular work rather than waiting behind it. Because only one meta is
+  ever in flight and it runs its stages one at a time, there is at most one such priority sub-call at
+  any moment, so a regular model is preempted by at most one meta stage at a time.
 
 ```mermaid
 flowchart TD
     C[Client] -->|"infer(spine_detector)"| GW[Gateway]
-    GW -->|"routes the whole group to the<br/>one worker that holds it"| M["Worker / GPU — meta dispatched by the loop;<br/>runs run(inputs, call) inline, holding the GPU for the whole run"]
-    M -->|"call('stage1', image) — in-process"| S1["stage1 executable (same GPU)"]
-    S1 -.feature maps.-> M
-    M -->|"Julia glue, then call('stage2', roi) — in-process, by reference"| S2["stage2 executable (same GPU)"]
-    S2 -.detections.-> M
-    M -->|assembled outputs| GW
+    GW -->|"routes the whole group to the<br/>one worker that holds it"| RT["Worker request task — run(inputs, call)<br/>holds the meta gate (one meta at a time)"]
+    RT -->|"call('stage1', image)<br/>committed: jumps the queue"| L((Dispatch loop / GPU))
+    L -.feature maps.-> RT
+    RT -->|"Julia glue (GPU free for other models),<br/>then call('stage2', roi) by reference"| L
+    L -.detections.-> RT
+    RT -->|assembled outputs| GW
     GW --> C
+    OQ["Other models' requests"] -.dispatched during the glue.-> L
 
     classDef meta fill:#fff9e6,stroke:#cc9900,stroke-width:2px,color:#000
     classDef gpu fill:#e6f3ff,stroke:#0066cc,stroke-width:2px,color:#000
-    class M meta
-    class S1,S2 gpu
+    class RT meta
+    class L gpu
 ```
 
 ## How it interacts with batch scheduling
 
-Because the dispatch loop runs one execution at a time, the meta holds the GPU exclusively for its
-entire run, including the Julia glue between stages. That is the deliberate trade. The stages run
-back to back with no queue hops, but a stage runs at batch 1 per meta rather than being coalesced
-with other clients' calls to the same model, so the design gives up some batching throughput in
-exchange for removing the multi-hop latency and queue contention that routing each sub-call
-separately would incur. While a meta runs, no other model dispatches and no control command is
-processed on that worker until it returns; because the transport is gone, a meta's wall time is now
-close to the sum of its stages' compute, so that exclusive hold is short.
+A meta no longer holds the GPU for its whole run. Each stage is an ordinary dispatch on the loop, so
+the GPU is occupied only while a stage actually computes and is free during the meta's CPU glue, when
+the loop serves other models. The trade is the gate: while a meta holds its permit, a second meta on
+the same worker waits (its stages cannot start), though the GPU is not wasted because regular models
+run in the meantime. A stage runs at batch 1 for the meta unless other clients' calls to the same
+sub-model happen to coalesce with it on the loop.
 
-A meta carries a deadline like any request: it is dropped at admission if already expired, and the
-orchestration bails (raising `DeadlineExceeded`) before issuing a further sub-call once the budget is
-gone, so an abandoned request stops consuming GPU at the next stage boundary rather than running its
-whole pipeline. Under the `edf` discipline a meta with a sooner deadline is dispatched ahead of work
-with more budget left (see the discipline notes in [Node Configuration](node_config.md)).
+A meta carries a deadline like any request. It is dropped before it starts if the deadline has
+already passed or if it cannot take a gate permit in time, so a meta backlog sheds at admission rather
+than piling up, and no GPU is spent on a meta that will not run. Once a meta is in flight, its
+continuation sub-calls are **committed**: they skip the predictive laxity drop, so a stage is never
+shed merely because it might run long after earlier stages already consumed GPU. They still honor the
+base check, so a meta whose deadline genuinely elapses mid-pipeline stops at the next stage boundary
+(raising `DeadlineExceeded`) instead of running the rest. The net effect is that a meta either runs to
+completion or is shed at a clean boundary, never silently discarding a stage it already paid for.
+Under the `edf` discipline the committed sub-call inherits the meta's deadline, so it is ordered ahead
+of fresher work (see the discipline notes in [Node Configuration](node_config.md)).
 
 ## Placement: the group travels together
 
@@ -128,11 +144,12 @@ The pool is plain memory, local to the worker, and never shared across processes
 keep large intermediates off the per-request allocation path; because the sub-call runs in-process,
 the buffer is handed to the next stage by reference, with no copy. A meta that never calls `scratch`
 just allocates normally, and the same `model.jl` is correct with or without a pool configured.
-Because metas run one at a time, the pool sees no contention.
 
 Request every buffer in one `call.scratch` call (pass a vector of `dims => T` pairs to get several at
 once); calling it more than once per request is rejected, and a scratch buffer must reach the
-sub-call as a contiguous array (a reshape or contiguous prefix is fine).
+sub-call as a contiguous array (a reshape or contiguous prefix is fine). With the default
+one-meta-at-a-time gate the pool sees no contention; raising `REACTANT_META_CONCURRENCY` lets
+concurrent metas share it, so size it for that many in-flight metas.
 
 ## Constraints
 

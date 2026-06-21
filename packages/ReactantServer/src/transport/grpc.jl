@@ -37,9 +37,9 @@ struct InferContext
     platform::String
     metrics::Union{WorkerMetrics,Nothing}
 end
-# Meta sub-calls are no longer routed from here: a meta is queued like any request and the dispatch
-# loop runs it in-process (see scheduler.jl `execute_meta!`), so the context needs no caller. The
-# 4-arg form is used by control-plane-only contexts (tests) that never serve inference.
+# Meta sub-calls are not routed from here: `infer` runs a meta's orchestration on this request task and
+# its sub-calls re-enter the scheduler in-process (see scheduler.jl `_run_meta_request`), so the context
+# needs no caller. The 4-arg form is used by control-plane-only contexts (tests) that never serve inference.
 InferContext(sched, registry, shm, platform) = InferContext(sched, registry, shm, platform, nothing)
 
 # gRPC status code -> Prometheus label string, for worker_requests_total.
@@ -215,10 +215,10 @@ function _handle_infer_impl(ctx::InferContext, req, grpc_deadline_ns::Integer=0)
     return _as_invalid(() -> encode_infer_response(name, decoded, outputs, ctx.shm))
 end
 
-# A meta is queued like any request and run inline by the dispatch loop (`execute_meta!`), holding
-# the GPU exclusively while its in-process sub-calls run. Input validation reuses the regular path
-# (it reads only `manifest`, which MetaEntry also carries). `_infer_or_not_found` maps a deadline
-# bail to DEADLINE_EXCEEDED and an unknown/unloaded sub-model to NOT_FOUND, same as the regular path.
+# A meta's orchestration runs on this request task (`infer` -> `_run_meta_request`), under the worker's
+# one-meta-at-a-time gate; its in-process sub-calls dispatch on the loop. Input validation reuses the
+# regular path (it reads only `manifest`, which MetaEntry also carries). `_infer_or_not_found` maps a
+# deadline bail to DEADLINE_EXCEEDED and an unknown/unloaded sub-model to NOT_FOUND, as the regular path.
 function _handle_meta_infer(ctx::InferContext, meta, req, grpc_deadline_ns::Integer=0)
     decoded = _as_invalid(() -> decode_infer_request(req, ctx.shm))
     deadline_ns = _effective_deadline(decoded.request.deadline_ns, grpc_deadline_ns)

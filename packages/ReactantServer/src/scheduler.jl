@@ -37,6 +37,48 @@ struct ControlCommand
     reply::Channel{Any}
 end
 
+# Admits at most `capacity` meta orchestrations at once on this worker (default 1). A meta holds a
+# permit across its WHOLE run, including the CPU glue between stages, so only one meta's GPU sub-calls
+# ever compete with regular work; the GPU itself is not held during glue (sub-calls dispatch on the
+# loop). `acquire_meta_gate!` is deadline-bounded: a meta that cannot get a permit before its deadline
+# is shed before doing any GPU work, so a meta backlog sheds at admission rather than piling up.
+mutable struct MetaGate
+    cond::Threads.Condition   # guards `n_held`
+    capacity::Int
+    n_held::Int
+end
+MetaGate(capacity::Integer=1) = MetaGate(Threads.Condition(), Int(capacity), 0)
+
+function acquire_meta_gate!(g::MetaGate, who::AbstractString; deadline_ns::Integer=0)
+    dl = Int64(deadline_ns)
+    lock(g.cond)
+    timer = nothing   # one-shot wake at the deadline; armed on first park, closed in finally
+    try
+        while g.n_held >= g.capacity
+            dl != 0 && Int64(time_ns()) >= dl && throw(DeadlineExceeded(String(who)))
+            if dl != 0 && timer === nothing
+                rem = (dl - Int64(time_ns())) / 1e9
+                rem <= 0 && throw(DeadlineExceeded(String(who)))
+                timer = Timer(_ -> (try; @lock g.cond notify(g.cond); catch; end), rem)
+            end
+            wait(g.cond)   # releases the lock while parked, reacquires on wake
+        end
+        g.n_held += 1
+    finally
+        timer === nothing || close(timer)
+        unlock(g.cond)
+    end
+    return nothing
+end
+
+function release_meta_gate!(g::MetaGate)
+    @lock g.cond begin
+        g.n_held -= 1
+        notify(g.cond)
+    end
+    return nothing
+end
+
 """
     Scheduler
 
@@ -59,11 +101,15 @@ mutable struct Scheduler
     weight_cache::Union{WeightCache,Nothing}   # on-demand weight residency, or nothing when disabled
     scratch_pool::Union{BufferPool,Nothing}    # local reuse pool for meta intermediates (plain Memory); nothing disables
     control::Vector{ControlCommand}            # pending control commands, drained by the dispatch loop
+    meta_gate::MetaGate                        # admits one meta orchestration at a time (capacity configurable)
+    committed::Union{QueuedRequest,Nothing}    # an in-flight meta's continuation sub-call awaiting the next GPU slot;
+                                               # selected ahead of the discipline scan. At most one (one meta at a time).
 end
 
 function Scheduler(registry::ModelRegistry, backend::AbstractBackend, pool::MemoryPool, cfg::SchedulerConfig)
     return Scheduler(registry, backend, pool, cfg,
-                     Threads.Condition(), false, nothing, nothing, nothing, ControlCommand[])
+                     Threads.Condition(), false, nothing, nothing, nothing, ControlCommand[],
+                     MetaGate(1), nothing)
 end
 
 # A selected dispatch: the model entry, the chosen executable key (batch size; 0 = unbatched
@@ -74,12 +120,6 @@ struct Dispatch
     taken::Vector{QueuedRequest}
 end
 
-# A meta selected to run. A meta is never coalesced, so it carries exactly one request; the dispatch
-# loop runs its orchestration inline (holding the GPU exclusively) via `execute_meta!`.
-struct MetaDispatch
-    entry::MetaEntry
-    qr::QueuedRequest
-end
 
 # ---------------------------------------------------------------------------------------------
 # EMA and cost-estimate updates
@@ -235,17 +275,15 @@ end
 # Dispatch selection
 # ---------------------------------------------------------------------------------------------
 
-# A model is schedulable when it is prepared (sched + executable set) and has queued work.
+# A model is schedulable when it is prepared (sched + executable set) and has queued work. Metas are
+# not scheduled here: they run on the request task under the meta gate (see `infer`), and their GPU
+# sub-calls enter these queues as ordinary (committed) requests for the sub-models.
 _schedulable(entry::ModelEntry) =
     entry.sched !== nothing && entry.executable !== nothing && !isempty(entry.sched.queue)
 
-# A meta is schedulable when its sched is prepared and it has queued work. It owns no executable;
-# its sub-models' executables are invoked in-process when it runs (see `execute_meta!`).
-_schedulable(entry::MetaEntry) = entry.sched !== nothing && !isempty(entry.sched.queue)
-
-# Both passes iterate a concrete dict, so each `any` call resolves to one `_schedulable` method.
-_has_queued(s::Scheduler) =
-    any(_schedulable, values(s.registry.by_name)) || any(_schedulable, values(s.registry.meta))
+# There is work when any model has a queued request. A committed meta sub-call is pushed onto its
+# sub-model's queue, so it is covered by this scan (and `s.committed` is only ever set with that push).
+_has_queued(s::Scheduler) = any(_schedulable, values(s.registry.by_name))
 
 function _finalize(entry::ModelEntry, plan)
     B, taken = plan
@@ -253,28 +291,30 @@ function _finalize(entry::ModelEntry, plan)
     return Dispatch(entry, B, taken)
 end
 
-# A meta dispatches its single front request (never coalesced).
-function _finalize_meta(entry::MetaEntry)
-    qr = entry.sched.queue[1]
-    deleteat!(entry.sched.queue, 1)
-    return MetaDispatch(entry, qr)
-end
-
-# Select the next dispatch under the lock. Dispatches on the configured discipline; both
-# disciplines coalesce the chosen model's queue via `plan_batch`. Returns a Dispatch or nothing
-# if nothing is queued.
+# Select the next dispatch under the lock. An in-flight meta's committed continuation jumps the line:
+# if one is pending, dispatch its sub-model now, ahead of the discipline scan. Otherwise dispatch on
+# the configured discipline; each discipline coalesces the chosen model's queue via `plan_batch`.
+# Returns a Dispatch or nothing if nothing is queued.
 function select_dispatch!(s::Scheduler, now::Float64)
+    if s.committed !== nothing
+        qr = s.committed
+        s.committed = nothing
+        # The committed request was pushed to the front of its sub-model's queue. Dispatch that model
+        # now (plan_batch draws from the front, so the committed request leads the batch). If the model
+        # is gone or already drained, fall through to a normal selection.
+        entry = get(s.registry.by_name, qr.req.model_name, nothing)
+        entry !== nothing && _schedulable(entry) && return _finalize(entry, plan_batch(entry, entry.sched))
+    end
     s.cfg.discipline == FIFO && return _select_fifo!(s)
     s.cfg.discipline == EDF && return _select_edf!(s)
     return _select_fair!(s, now)
 end
 
-# FIFO: serve the model whose oldest queued request is the oldest overall, then coalesce its
-# queue. Metas compete in the same ordering (a separate, monomorphic pass over `registry.meta`), so
-# an old meta request beats a newer regular one. Ties break by model name for determinism. The only
-# `Union` touch is `chosen.name` in the tiebreak — once per better candidate, not in the arithmetic.
+# FIFO: serve the model whose oldest queued request is the oldest overall, then coalesce its queue.
+# Ties break by model name for determinism. (An in-flight meta's committed sub-call bypasses this scan
+# entirely; it is handled in `select_dispatch!` before any discipline runs.)
 function _select_fifo!(s::Scheduler)
-    chosen = nothing            # Union{ModelEntry,MetaEntry,Nothing}
+    chosen = nothing
     best_t = Inf
     for entry in values(s.registry.by_name)
         _schedulable(entry) || continue
@@ -283,15 +323,7 @@ function _select_fifo!(s::Scheduler)
             chosen, best_t = entry, t
         end
     end
-    for entry in values(s.registry.meta)
-        _schedulable(entry) || continue
-        t = entry.sched.queue[1].enqueued_at
-        if chosen === nothing || t < best_t || (t == best_t && entry.name < chosen.name)
-            chosen, best_t = entry, t
-        end
-    end
     chosen === nothing && return nothing
-    chosen isa MetaEntry && return _finalize_meta(chosen)
     return _finalize(chosen, plan_batch(chosen, chosen.sched))
 end
 
@@ -308,14 +340,15 @@ end
 
 # EDF: serve the model whose most-urgent queued request has the soonest deadline, then coalesce that
 # model's queue (unchanged). Ties break by the model's oldest queued request and then by name, so when
-# deadlines are equal (the common case: one deadline per client) this is exactly `_select_fifo!`. Its
-# only divergence from FIFO is to promote a model carrying a request with less budget left, i.e. an
-# in-flight meta sub-call. Queues stay arrival-ordered (never reordered), so `queue[1]` is always the
-# model's oldest request and the FIFO tiebreak is exact. Coalescing still draws FIFO from the front, so
-# a request deep behind the batch size advances over successive dispatches of its (preferentially
-# selected) model rather than jumping the batch; that keeps coalescing semantics intact.
+# deadlines are equal (the common case: one deadline per client) this is exactly `_select_fifo!`. It
+# diverges only to promote a model carrying a request with less budget left, so a meta's sub-call,
+# which inherits the meta's deadline, is served ahead of fresher regular work. Queues stay
+# arrival-ordered (never reordered), so `queue[1]` is always the model's oldest request and the FIFO
+# tiebreak is exact. Coalescing still draws FIFO from the front, so a request deep behind the batch
+# size advances over successive dispatches of its (preferentially selected) model rather than jumping
+# the batch; that keeps coalescing semantics intact.
 function _select_edf!(s::Scheduler)
-    chosen = nothing            # Union{ModelEntry,MetaEntry,Nothing}
+    chosen = nothing
     best_dl = typemax(Int64)
     best_oldest = Inf
     for entry in values(s.registry.by_name)
@@ -329,39 +362,22 @@ function _select_edf!(s::Scheduler)
             chosen, best_dl, best_oldest = entry, dl, oldest
         end
     end
-    for entry in values(s.registry.meta)
-        _schedulable(entry) || continue
-        st = entry.sched
-        dl = _queue_min_deadline(st)
-        oldest = st.queue[1].enqueued_at
-        if chosen === nothing || dl < best_dl ||
-           (dl == best_dl && oldest < best_oldest) ||
-           (dl == best_dl && oldest == best_oldest && entry.name < chosen.name)
-            chosen, best_dl, best_oldest = entry, dl, oldest
-        end
-    end
     chosen === nothing && return nothing
-    chosen isa MetaEntry && return _finalize_meta(chosen)
     return _finalize(chosen, plan_batch(chosen, chosen.sched))
 end
 
 # Fair: deficit-weighted, cost-aware priority. Decay every EMA to now before reading, then normalize.
-# Metas participate via a separate monomorphic pass; their cost uses batch key 0 (non-coalescable),
-# seeded from the measured meta runtime (recorded under key 0 by `execute_meta!`) or the default.
+# (Metas are not scheduled here; they run under the meta gate and their sub-calls compete as ordinary
+# requests for the sub-models.)
 function _select_fair!(s::Scheduler, now::Float64)
     for entry in values(s.registry.by_name)
         entry.sched === nothing || _decay_ema!(entry.sched, s.cfg.ema_halflife_seconds, now)
     end
-    for entry in values(s.registry.meta)
-        entry.sched === nothing || _decay_ema!(entry.sched, s.cfg.ema_halflife_seconds, now)
-    end
-    total_ema = sum(e.sched.recent_compute_ema for e in values(s.registry.by_name) if e.sched !== nothing; init=0.0) +
-                sum(e.sched.recent_compute_ema for e in values(s.registry.meta) if e.sched !== nothing; init=0.0)
-    total_w = sum(e.sched.weight for e in values(s.registry.by_name) if e.sched !== nothing; init=0.0) +
-              sum(e.sched.weight for e in values(s.registry.meta) if e.sched !== nothing; init=0.0)
+    total_ema = sum(e.sched.recent_compute_ema for e in values(s.registry.by_name) if e.sched !== nothing; init=0.0)
+    total_w = sum(e.sched.weight for e in values(s.registry.by_name) if e.sched !== nothing; init=0.0)
 
-    chosen = nothing            # Union{ModelEntry,MetaEntry,Nothing}
-    chosen_plan = nothing       # the regular batch plan; nothing for a meta
+    chosen = nothing
+    chosen_plan = nothing
     best_p = -Inf
     for entry in values(s.registry.by_name)
         _schedulable(entry) || continue
@@ -380,20 +396,7 @@ function _select_fair!(s::Scheduler, now::Float64)
             chosen, chosen_plan, best_p = entry, plan, p
         end
     end
-    for entry in values(s.registry.meta)
-        _schedulable(entry) || continue
-        st = entry.sched
-        share = total_w == 0 ? 0.0 : st.weight / total_w
-        nema = total_ema == 0 ? 0.0 : st.recent_compute_ema / total_ema
-        p = priority(share, nema, s.cfg.recency_penalty_cap, effective_cost(st, 0, s.cfg.coalescing_discount))
-        if chosen === nothing || p > best_p ||
-           (p == best_p && st.queue[1].enqueued_at < chosen.sched.queue[1].enqueued_at) ||
-           (p == best_p && st.queue[1].enqueued_at == chosen.sched.queue[1].enqueued_at && entry.name < chosen.name)
-            chosen, chosen_plan, best_p = entry, nothing, p
-        end
-    end
     chosen === nothing && return nothing
-    chosen isa MetaEntry && return _finalize_meta(chosen)
     return _finalize(chosen, chosen_plan)
 end
 
@@ -474,10 +477,14 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
     # and when none are feasible we skip run_model entirely. The cost estimate is learned from prior
     # dispatches; unseeded it defaults small, so the laxity drop is a no-op until the model has run once.
     now_ns = Int64(time_ns())
-    margin_ns = s.cfg.discipline == EDF ?
+    laxity_ns = s.cfg.discipline == EDF ?
         round(Int64, get(st.cost_estimate, B, _DEFAULT_COST) * 1e9) : Int64(0)
     live = QueuedRequest[]
     for qr in taken
+        # A committed request is an in-flight meta's continuation: skip the laxity drop (we already
+        # spent GPU on its earlier stages, so we do not abandon it on a prediction), but still honor
+        # the base deadline-passed check, so a meta that has genuinely run out of time stops here.
+        margin_ns = qr.committed ? Int64(0) : laxity_ns
         if qr.req.deadline_ns != 0 && now_ns + margin_ns >= qr.req.deadline_ns
             put!(qr.reply, DeadlineExceeded(qr.req.model_name))
         else
@@ -545,44 +552,36 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
     return nothing
 end
 
-# Run a meta dispatch inline on the dispatch loop, holding the GPU exclusively for the whole
-# orchestration. The injected `InlineCaller` invokes each declared sub-model's executable directly
-# in-process (preprocess -> acquire! -> run_model -> postprocess), with no queue re-entry and no
-# loopback. Sub-model weights load on demand on this (the dispatch) thread, the sole residency
-# mutator, so it is safe. The meta's wall time is recorded under batch key 0 (it is non-coalescable),
-# which also seeds its FAIR cost estimate. A thrown sub-call error or `DeadlineExceeded` is delivered
-# to the reply, never escaping to wedge the loop.
-function execute_meta!(s::Scheduler, d::MetaDispatch)
-    entry, qr = d.entry, d.qr
-    st = entry.sched
-    # Deadline admission (base check only; a meta has no per-batch-size cost for an EDF laxity margin).
-    if qr.req.deadline_ns != 0 && Int64(time_ns()) >= qr.req.deadline_ns
-        put!(qr.reply, DeadlineExceeded(qr.req.model_name))
-        return nothing
-    end
-    caller = InlineCaller(s.backend, s.pool, s.registry, s.weight_cache, s.scratch_pool)
+# Run a meta model's orchestration on the calling (gRPC request) task, off the GPU dispatch loop. A
+# per-worker gate admits one meta at a time, held across the whole run including the CPU glue between
+# stages, so only one meta's GPU sub-calls ever compete with regular work. The GPU itself is not held
+# during the glue: each sub-call (via `QueueingCaller`) re-enters the scheduler as a committed request
+# that dispatches on the loop, so while a meta computes between stages the loop serves other models.
+# A meta whose deadline passes before it can take a permit is shed before any GPU work. The meta's wall
+# time seeds its serving counters under batch key 0 for the control plane (lpt_packing).
+function _run_meta_request(s::Scheduler, meta::MetaEntry, req::InferRequest)
+    # Base deadline check first: no point taking a permit for already-expired work (no GPU spent yet).
+    req.deadline_ns != 0 && Int64(time_ns()) >= req.deadline_ns && throw(DeadlineExceeded(meta.name))
+    acquire_meta_gate!(s.meta_gate, meta.name; deadline_ns=req.deadline_ns)
+    caller = QueueingCaller(s, s.scratch_pool)
     t0 = time()
     try
-        out = run_meta(entry, caller, qr.req.inputs; deadline_ns=qr.req.deadline_ns)
-        compute_time = time() - t0
+        out = run_meta(meta, caller, req.inputs; deadline_ns=req.deadline_ns)
+        wall = time() - t0
+        st = meta.sched
         lock(s.cond) do
             now = time()
             _decay_ema!(st, s.cfg.ema_halflife_seconds, now)
-            st.recent_compute_ema += compute_time
-            _update_cost!(st, 0, compute_time, s.cfg.cost_ema_alpha)
+            st.recent_compute_ema += wall
+            _update_cost!(st, 0, wall, s.cfg.cost_ema_alpha)
             st.dispatch_count += 1
             st.requests_served += 1
-            st.total_compute += compute_time
-            push!(st.wait_samples, now - qr.enqueued_at)
-            while length(st.wait_samples) > _WAIT_SAMPLE_CAP
-                popfirst!(st.wait_samples)
-            end
+            st.total_compute += wall
         end
-        put!(qr.reply, out)
-    catch e
-        put!(qr.reply, e)
+        return out
+    finally
+        release_meta_gate!(s.meta_gate)
     end
-    return nothing
 end
 
 # ---------------------------------------------------------------------------------------------
@@ -720,9 +719,9 @@ function submit!(s::Scheduler, qr::QueuedRequest)
             put!(qr.reply, ErrorException("server is shutting down"))
             return
         end
-        # Target may be a regular model or a meta (both carry a queue once prepared).
-        reg = get(s.registry.by_name, qr.req.model_name, nothing)
-        entry = reg === nothing ? get(s.registry.meta, qr.req.model_name, nothing) : reg
+        # Targets are regular models only: a meta runs on the request task (see `infer`), and its
+        # GPU sub-calls arrive here as committed requests for the sub-models, which live in `by_name`.
+        entry = get(s.registry.by_name, qr.req.model_name, nothing)
         if entry === nothing || entry.sched === nothing
             put!(qr.reply, ErrorException("unknown model: $(qr.req.model_name)"))
             return
@@ -731,7 +730,15 @@ function submit!(s::Scheduler, qr::QueuedRequest)
             put!(qr.reply, ErrorException("queue for model '$(qr.req.model_name)' is full ($(s.cfg.max_queue_depth)); request rejected"))
             return
         end
-        push!(entry.sched.queue, qr)
+        if qr.committed
+            # An in-flight meta's continuation jumps the line: push to the front of its sub-model's
+            # queue and flag it so `select_dispatch!` dispatches this model next, ahead of the
+            # discipline scan. Only one meta runs at a time, so at most one committed request exists.
+            pushfirst!(entry.sched.queue, qr)
+            s.committed = qr
+        else
+            push!(entry.sched.queue, qr)
+        end
         notify(s.cond)
     end
     return nothing
@@ -766,13 +773,7 @@ function dispatch_loop(s::Scheduler)
             end
         end
         (isempty(cmds) && chosen === nothing) && break
-        # One isa discriminates the selection union; a meta runs its whole orchestration inline here,
-        # holding the GPU exclusively until it returns (no other dispatch or control command runs).
-        if chosen isa MetaDispatch
-            execute_meta!(s, chosen)
-        elseif chosen !== nothing
-            execute_and_record!(s, chosen)
-        end
+        chosen === nothing || execute_and_record!(s, chosen)
     end
     return nothing
 end
@@ -999,25 +1000,22 @@ proceeds in parallel and overlaps the single, serialized GPU execution. The disp
 and runs `qr.prepared` and never executes a request whose preprocess has not finished, since a
 request is only enqueued (made visible to the loop) after preprocess returns.
 """
-function infer(s::Scheduler, req::InferRequest)
+function infer(s::Scheduler, req::InferRequest; committed::Bool=false)
     entry = get(s.registry.by_name, req.model_name, nothing)
     if entry === nothing
-        # A meta is queued as-is (no pre/post hook; its `run` is the whole computation). The dispatch
-        # loop runs it inline via `execute_meta!`, which returns its assembled outputs.
+        # A meta has no executable: it runs its orchestration on this task under the meta gate, and its
+        # sub-calls re-enter `infer` (committed) for the sub-models. A meta is never itself a committed
+        # sub-call (metas cannot call metas), so `committed` is irrelevant on this branch.
         meta = get(s.registry.meta, req.model_name, nothing)
         (meta === nothing || meta.sched === nothing) &&
             throw(ErrorException("unknown model: $(req.model_name)"))
-        qr = QueuedRequest(req)            # prepared defaults to req.inputs; unused on the meta path
-        submit!(s, qr)
-        raw = take!(qr.reply)
-        raw isa Exception && throw(raw)
-        return raw
+        return _run_meta_request(s, meta, req)
     end
     entry.sched === nothing && throw(ErrorException("unknown model: $(req.model_name)"))
     # preprocess/postprocess come from a bundle's model.jl, defined in a newer world age;
     # invokelatest crosses that boundary (harmless for identity).
     prepared = Base.invokelatest(entry.preprocess, req.inputs)
-    qr = QueuedRequest(req, prepared)
+    qr = QueuedRequest(req, prepared; committed=committed)
     submit!(s, qr)
     raw = take!(qr.reply)
     raw isa Exception && throw(raw)

@@ -145,14 +145,26 @@ function _meta_scratch_pool()
     return BufferPool(bytes; n_slots=slots, use_shm=false)
 end
 
+# How many meta orchestrations may run at once on this worker (REACTANT_META_CONCURRENCY, default 1).
+# One at a time keeps the scratch pool single-meta and bounds how much a meta's stages interleave with
+# regular work; raise it to overlap one meta's CPU glue with another meta's GPU stage.
+function _meta_concurrency()
+    n = something(tryparse(Int, strip(get(ENV, "REACTANT_META_CONCURRENCY", ""))), 1)
+    return max(1, n)
+end
+
 function serve(cfg::ServerConfig; backend::AbstractBackend=ReactantBackend(), blocking::Bool=true,
                worker_name::AbstractString="")
     shm = SharedMemoryRegistry()   # client-facing SystemSharedMemory feature (decode/encode shm path)
     pool, registry, sched, watcher = _bring_up(cfg, backend)
-    # Local reuse pool for meta-model intermediates: plain Memory, never shared. Metas run exclusively
-    # on the dispatch loop, so a small pool suffices; it keeps large per-request intermediates (e.g. an
-    # ROI feature tensor) off the allocation path and holds down GC pressure. Sized by env.
+    # Local reuse pool for meta-model intermediates: plain Memory, never shared. With one meta at a time
+    # (the gate below) the pool sees no cross-meta contention; it keeps large per-request intermediates
+    # (e.g. an ROI feature tensor) off the allocation path and holds down GC pressure. Sized by env.
     sched.scratch_pool = _meta_scratch_pool()
+    # Admit one meta orchestration at a time (configurable). A meta holds a permit across its whole run,
+    # including the CPU glue between stages, but not the GPU itself: its sub-calls dispatch on the loop,
+    # so other models run while the meta computes between stages.
+    sched.meta_gate = MetaGate(_meta_concurrency())
     # Admission counters shared with the gRPC server: the cap (endpoints.max_concurrent_requests,
     # 0 = uncapped) sheds past `inflight`, counting each rejection in `shed`. The metrics collector
     # reads both live, so they are exported even while `serve` blocks the calling task.

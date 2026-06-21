@@ -76,10 +76,11 @@ ModelEntry(name, manifest, mlir_bytes::Dict{Int,Vector{UInt8}}, weights_path, we
     ModelEntry(name, manifest, Dict{VariantKey,Dict{Int,Vector{UInt8}}}(VariantKey() => mlir_bytes),
                weights_path, weights, executable, sched, preprocess, postprocess)
 
-# A meta model: a Julia orchestration over other models. It owns no compiled executable or weights,
-# but it IS scheduled: the dispatch loop runs `run` inline holding the GPU exclusively, calling its
-# sub-models' executables directly in-process (see meta.jl `InlineCaller`, scheduler.jl
-# `execute_meta!`). `sched` is filled when the scheduler prepares the entry, exactly like a ModelEntry.
+# A meta model: a Julia orchestration over other models. It owns no compiled executable or weights and
+# is not scheduled on the dispatch loop. Its `run` executes on the gRPC request task under a per-worker
+# gate (one meta at a time), and each sub-call re-enters the scheduler in-process for the sub-model (see
+# meta.jl `QueueingCaller`, scheduler.jl `_run_meta_request`). `sched` is filled when the scheduler
+# prepares the entry and holds only its serving counters for the control plane (it has no dispatch queue).
 mutable struct MetaEntry <: AbstractDispatchEntry
     name::String
     manifest::Manifest
