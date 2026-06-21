@@ -73,10 +73,9 @@ Two rules shape how a meta shares the GPU with everything else on the worker:
   below) issues no sub-calls and bypasses the gate entirely, so a heavy pure-Julia meta never holds a
   permit a GPU meta needs.
 - **In-flight sub-calls jump the line.** Once a meta holds the gate, each of its GPU stages is
-  dispatched ahead of the queued regular work rather than waiting behind it. The priority list tracks
-  the gate capacity (one entry per in-flight meta, since each runs its stages one at a time), so every
-  in-flight meta's next stage hard-jumps rather than one of them falling back to discipline order. A
-  regular model is therefore preempted by at most `REACTANT_META_CONCURRENCY` meta stages at a time.
+  dispatched ahead of the queued regular work rather than waiting behind it. Because only one meta is
+  ever in flight and it runs its stages one at a time, there is at most one such priority sub-call at
+  any moment, so a regular model is preempted by at most one meta stage at a time.
 
 ```mermaid
 flowchart TD
