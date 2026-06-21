@@ -146,11 +146,14 @@ function _meta_scratch_pool()
 end
 
 # How many GPU-using meta orchestrations may run at once on this worker (REACTANT_META_CONCURRENCY,
-# default 2). Each permit-holder overlaps its CPU glue with the others' GPU stages, so a small count
-# keeps the GPU fed without letting too many metas' stages interleave with regular work; the scratch
-# pool must be sized for this many concurrent metas. Compute-only metas bypass the gate entirely.
+# default 1). At 1 the in-flight meta's stages cut the line deterministically (no contention for the
+# committed slot) and it sprints to completion before the next meta starts, the most consistent and
+# explainable behavior; regular models still fill the GPU during the meta's CPU glue. Raising it lets
+# metas overlap (one's glue hides behind another's GPU stage) for more meta throughput, at the cost of
+# less predictable line-cutting and a scratch pool that must be sized for that many concurrent metas.
+# Compute-only metas bypass the gate entirely.
 function _meta_concurrency()
-    n = something(tryparse(Int, strip(get(ENV, "REACTANT_META_CONCURRENCY", ""))), 2)
+    n = something(tryparse(Int, strip(get(ENV, "REACTANT_META_CONCURRENCY", ""))), 1)
     return max(1, n)
 end
 

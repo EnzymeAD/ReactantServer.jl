@@ -63,15 +63,15 @@ where its sub-models already live (see Placement, below).
 
 Two rules shape how a meta shares the GPU with everything else on the worker:
 
-- **A bounded number of GPU metas at a time.** A per-worker gate admits a small number of GPU-using
-  meta orchestrations at once (configurable with `REACTANT_META_CONCURRENCY`, default 2). A meta holds
-  its permit across the whole run, including the CPU glue between stages, but it does **not** hold the
-  GPU during that glue. While a meta computes between stages, the dispatch loop is free and serves
-  other models, so the GPU is not idle during the glue. Bounding the count keeps the GPU fed (one
-  meta's glue overlaps another's GPU stage) without letting too many metas' stages interleave with
-  regular work, and keeps scratch-pool sizing predictable. A **compute-only** meta (empty `calls`,
-  below) issues no sub-calls and bypasses the gate entirely, so a heavy pure-Julia meta never holds a
-  permit a GPU meta needs.
+- **One GPU meta at a time (by default).** A per-worker gate admits `REACTANT_META_CONCURRENCY` meta
+  orchestrations at once, default **1**. A meta holds its permit across the whole run, including the CPU
+  glue between stages, but it does **not** hold the GPU during that glue. While a meta computes between
+  stages, the dispatch loop is free and serves other models, so the GPU is not idle during the glue. At
+  the default of 1 the in-flight meta sprints to completion before the next starts, which is the most
+  predictable behavior; raising the count lets metas overlap (one's glue hides behind another's GPU
+  stage) for more meta throughput, at the cost of less predictable line-cutting and a scratch pool that
+  must be sized for that many concurrent metas. A **compute-only** meta (empty `calls`, below) issues no
+  sub-calls and bypasses the gate entirely, so a heavy pure-Julia meta never holds a permit a GPU meta needs.
 - **In-flight sub-calls jump the line.** Once a meta holds the gate, each of its GPU stages is
   dispatched ahead of the queued regular work rather than waiting behind it. Because only one meta is
   ever in flight and it runs its stages one at a time, there is at most one such priority sub-call at
