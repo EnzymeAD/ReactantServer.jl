@@ -148,7 +148,10 @@ function _await_within(client, req, budget_ns::Int64, name::AbstractString)
     # is what actually bounds us at the true budget.
     deadline_s = max(1, cld(budget_ns, 1_000_000_000))
     out = Channel{Tuple{Symbol,Any}}(2)
-    task = @async begin
+    # Threads.@spawn, not @async: these must stay migratable across the worker's compute pool. The
+    # GatewayCaller handle is built sticky=false on purpose so its gRPC driving floats to any thread;
+    # an @async task here would be pinned to the issuing thread and serialize meta sub-calls onto it.
+    Threads.@spawn begin
         try
             r = gRPCClient.grpc_async_request(client, req; deadline=deadline_s)
             put!(out, (:ok, gRPCClient.grpc_async_await(client, r)))
@@ -157,14 +160,17 @@ function _await_within(client, req, budget_ns::Int64, name::AbstractString)
         end
     end
     timer = Timer(budget_s)
-    @async (try; wait(timer); put!(out, (:timeout, nothing)); catch; end)
+    Threads.@spawn (try; wait(timer); put!(out, (:timeout, nothing)); catch; end)
     tag, val = take!(out)
     close(timer)
     if tag === :timeout
-        try
-            istaskdone(task) || schedule(task, InterruptException(); error=true)
-        catch
-        end
+        # Do NOT interrupt the request task. With the shared loopback handle that task may be driving
+        # libcurl's multi-handle callbacks, and throwing an InterruptException into it there corrupts
+        # the request and risks wedging the handle every meta sub-call on this worker shares. Instead
+        # abandon it: its per-call curl deadline (`deadline_s`) terminates the in-flight request and
+        # releases the stream slot in gRPCClient's own cleanup, and a task still parked on the
+        # semaphore acquire holds no slot and drains harmlessly once one frees. The meta's worker
+        # handler slot is freed the moment we return here, which is the point.
         throw(DeadlineExceeded(name))
     elseif tag === :err
         throw(val)
