@@ -258,3 +258,41 @@ end
         _RS.shutdown!(sched)
     end
 end
+
+@testset "compute-only meta bypasses the gate" begin
+    # A compute-only meta (empty calls) issues no sub-calls, so it must NOT take a gate permit: it runs
+    # even while every gate permit is held by a GPU meta parked in its glue. Capacity-1 gate makes the
+    # contention unambiguous.
+    backend = _RS.MockBackend()
+    pool = _RS.MemoryPool(backend, _RS.MockClient(), _RS.MockDevice(0), "mock", nothing)
+    reg = _RS.ModelRegistry()
+    reg.by_name["scale"] = _RS.ModelEntry("scale", _trivial_manifest("scale"), Dict{Int,Vector{UInt8}}(),
+        "", nothing, _meta_scale_model(), nothing, identity, identity)
+    hold = Channel{Nothing}(1)
+    entered = Channel{Nothing}(1)
+    gpu_run = function (inputs, call)
+        call("scale", inputs)
+        put!(entered, nothing)
+        take!(hold)                                 # park while holding the single gate permit
+        return [_RS.NamedTensor("OUT", inputs[1].data)]
+    end
+    reg.meta["gpu_meta"] = _RS.MetaEntry("gpu_meta", _meta_manifest("gpu_meta", ["scale"]), ["scale"], gpu_run)
+    # Empty calls -> compute-only; does all work in Julia and touches no sub-model.
+    co_run = (inputs, call) -> [_RS.NamedTensor("OUT", inputs[1].data .* 3)]
+    reg.meta["compute_only"] = _RS.MetaEntry("compute_only", _meta_manifest("compute_only", String[]), String[], co_run)
+    sched = _RS.Scheduler(reg, backend, pool, _RS.SchedulerConfig(30.0, 64, 30.0))
+    sched.meta_gate = _RS.MetaGate(1)
+    _RS.start!(sched)
+    try
+        gpu_task = Threads.@spawn _RS.infer(sched,
+            _RS.InferRequest("gpu_meta", String[], [_RS.NamedTensor("x", Float32[1, 2, 3, 4])]))
+        take!(entered)                              # the GPU meta now holds the only permit
+        # The compute-only meta runs to completion despite the gate being fully held.
+        co = _RS.infer(sched, _RS.InferRequest("compute_only", String[], [_RS.NamedTensor("x", Float32[1, 2, 3, 4])]))
+        @test co[1].data == Float32[3, 6, 9, 12]
+        put!(hold, nothing)
+        @test fetch(gpu_task)[1].data == Float32[1, 2, 3, 4]
+    finally
+        _RS.shutdown!(sched)
+    end
+end

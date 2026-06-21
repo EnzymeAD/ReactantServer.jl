@@ -145,11 +145,12 @@ function _meta_scratch_pool()
     return BufferPool(bytes; n_slots=slots, use_shm=false)
 end
 
-# How many meta orchestrations may run at once on this worker (REACTANT_META_CONCURRENCY, default 1).
-# One at a time keeps the scratch pool single-meta and bounds how much a meta's stages interleave with
-# regular work; raise it to overlap one meta's CPU glue with another meta's GPU stage.
+# How many GPU-using meta orchestrations may run at once on this worker (REACTANT_META_CONCURRENCY,
+# default 2). Each permit-holder overlaps its CPU glue with the others' GPU stages, so a small count
+# keeps the GPU fed without letting too many metas' stages interleave with regular work; the scratch
+# pool must be sized for this many concurrent metas. Compute-only metas bypass the gate entirely.
 function _meta_concurrency()
-    n = something(tryparse(Int, strip(get(ENV, "REACTANT_META_CONCURRENCY", ""))), 1)
+    n = something(tryparse(Int, strip(get(ENV, "REACTANT_META_CONCURRENCY", ""))), 2)
     return max(1, n)
 end
 

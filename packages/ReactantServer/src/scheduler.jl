@@ -553,16 +553,19 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
 end
 
 # Run a meta model's orchestration on the calling (gRPC request) task, off the GPU dispatch loop. A
-# per-worker gate admits one meta at a time, held across the whole run including the CPU glue between
-# stages, so only one meta's GPU sub-calls ever compete with regular work. The GPU itself is not held
-# during the glue: each sub-call (via `QueueingCaller`) re-enters the scheduler as a committed request
-# that dispatches on the loop, so while a meta computes between stages the loop serves other models.
-# A meta whose deadline passes before it can take a permit is shed before any GPU work. The meta's wall
-# time seeds its serving counters under batch key 0 for the control plane (lpt_packing).
+# per-worker gate admits a bounded number of GPU-using metas at a time, held across the whole run
+# including the CPU glue between stages, so only that many metas' GPU sub-calls ever compete with
+# regular work. The GPU itself is not held during the glue: each sub-call (via `QueueingCaller`)
+# re-enters the scheduler as a committed request that dispatches on the loop, so while a meta computes
+# between stages the loop serves other models. A meta whose deadline passes before it can take a permit
+# is shed before any GPU work. A COMPUTE-ONLY meta (empty `calls`) issues no sub-calls and so contends
+# for nothing the gate protects; it bypasses the gate entirely, so a heavy pure-Julia meta never blocks
+# a GPU meta from a permit. The meta's wall time seeds its serving counters for the control plane.
 function _run_meta_request(s::Scheduler, meta::MetaEntry, req::InferRequest)
-    # Base deadline check first: no point taking a permit for already-expired work (no GPU spent yet).
+    # Base deadline check first: no point starting already-expired work (no GPU spent yet).
     req.deadline_ns != 0 && Int64(time_ns()) >= req.deadline_ns && throw(DeadlineExceeded(meta.name))
-    acquire_meta_gate!(s.meta_gate, meta.name; deadline_ns=req.deadline_ns)
+    gated = !isempty(meta.calls)   # compute-only metas (no sub-calls) skip the gate
+    gated && acquire_meta_gate!(s.meta_gate, meta.name; deadline_ns=req.deadline_ns)
     caller = QueueingCaller(s, s.scratch_pool)
     t0 = time()
     try
@@ -580,7 +583,7 @@ function _run_meta_request(s::Scheduler, meta::MetaEntry, req::InferRequest)
         end
         return out
     finally
-        release_meta_gate!(s.meta_gate)
+        gated && release_meta_gate!(s.meta_gate)
     end
 end
 

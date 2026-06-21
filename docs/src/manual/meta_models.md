@@ -63,12 +63,15 @@ where its sub-models already live (see Placement, below).
 
 Two rules shape how a meta shares the GPU with everything else on the worker:
 
-- **One meta at a time.** A per-worker gate admits a single meta orchestration at once (configurable
-  with `REACTANT_META_CONCURRENCY`, default 1). A meta holds its permit across the whole run,
-  including the CPU glue between stages, but it does **not** hold the GPU during that glue. While a
-  meta computes between stages, the dispatch loop is free and serves other models, so the GPU is not
-  idle during the glue. Only one meta's stages ever interleave with regular work, which keeps
-  contention and the scratch pool predictable.
+- **A bounded number of GPU metas at a time.** A per-worker gate admits a small number of GPU-using
+  meta orchestrations at once (configurable with `REACTANT_META_CONCURRENCY`, default 2). A meta holds
+  its permit across the whole run, including the CPU glue between stages, but it does **not** hold the
+  GPU during that glue. While a meta computes between stages, the dispatch loop is free and serves
+  other models, so the GPU is not idle during the glue. Bounding the count keeps the GPU fed (one
+  meta's glue overlaps another's GPU stage) without letting too many metas' stages interleave with
+  regular work, and keeps scratch-pool sizing predictable. A **compute-only** meta (empty `calls`,
+  below) issues no sub-calls and bypasses the gate entirely, so a heavy pure-Julia meta never holds a
+  permit a GPU meta needs.
 - **In-flight sub-calls jump the line.** Once a meta holds the gate, each of its GPU stages is
   dispatched ahead of the queued regular work rather than waiting behind it. Because only one meta is
   ever in flight and it runs its stages one at a time, there is at most one such priority sub-call at
@@ -147,9 +150,9 @@ just allocates normally, and the same `model.jl` is correct with or without a po
 
 Request every buffer in one `call.scratch` call (pass a vector of `dims => T` pairs to get several at
 once); calling it more than once per request is rejected, and a scratch buffer must reach the
-sub-call as a contiguous array (a reshape or contiguous prefix is fine). With the default
-one-meta-at-a-time gate the pool sees no contention; raising `REACTANT_META_CONCURRENCY` lets
-concurrent metas share it, so size it for that many in-flight metas.
+sub-call as a contiguous array (a reshape or contiguous prefix is fine). Concurrent metas (up to
+`REACTANT_META_CONCURRENCY` gated metas, plus any compute-only metas) share the pool, so size it for
+that many in-flight metas; the deadline-bounded acquire degrades gracefully if it is ever starved.
 
 ## Constraints
 
@@ -157,7 +160,8 @@ concurrent metas share it, so size it for that many in-flight metas.
   one level deep.
 - **Compute-only metas are allowed.** A meta may declare an empty `meta.calls` and do all its work
   in Julia, calling no sub-models at all. This is useful for logic that is awkward to express as a
-  traced graph but needs no separate executable.
+  traced graph but needs no separate executable. A compute-only meta issues no GPU sub-calls, so it
+  bypasses the meta gate and runs on its request task without taking a permit.
 - **Sub-models are internal.** A model named in some meta's `meta.calls` is reachable only through
   that meta, never addressed by clients directly, and is hidden from the gateway's discovery and
   placement; the meta's group carries it.
