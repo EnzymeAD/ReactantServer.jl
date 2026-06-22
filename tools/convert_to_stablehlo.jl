@@ -1,9 +1,10 @@
-# Batch-convert every TorchScript model in the Triton model repositories to
-# ReactantServer StableHLO bundles, driven by a YAML config file.
+# Batch-convert models to ReactantServer StableHLO bundles, driven by a YAML config file. Sources are
+# either TorchScript models discovered in Triton model repositories (the original use) or models a
+# handler builds itself (e.g. a torchvision detector from its weights, with no Triton repo at all).
 #
 # Usage:
 #   julia --project=<env with PythonCall + ReactantServerExport> \
-#       tools/convert_triton_to_stablehlo.jl <config.yaml> [--only a,b] [--force] [--dry-run]
+#       tools/convert_to_stablehlo.jl <config.yaml> [--only a,b] [--force] [--dry-run]
 #
 #   --only a,b   convert only the named models (resume skip still applies;
 #                the per-run report is not written)
@@ -49,7 +50,7 @@ using YAML
 # ---------------------------------------------------------------------------
 function usage_error(msg)
     println(stderr, "ERROR: $msg")
-    println(stderr, "Usage: julia tools/convert_triton_to_stablehlo.jl <config.yaml> [--only a,b] [--force] [--dry-run]")
+    println(stderr, "Usage: julia tools/convert_to_stablehlo.jl <config.yaml> [--only a,b] [--force] [--dry-run]")
     exit(2)
 end
 
@@ -108,9 +109,11 @@ function load_config(path::AbstractString)
     raw isa AbstractDict || config_error("config root must be a mapping")
     base = dirname(abspath(path))
 
-    srcs = get(raw, "source_dirs", nothing)
-    (srcs isa AbstractVector && !isempty(srcs) && all(s -> s isa AbstractString, srcs)) ||
-        config_error("'source_dirs' must be a non-empty list of strings")
+    # source_dirs is optional: a config may convert only handler-declared models that build themselves
+    # (e.g. from torchvision weights), with no Triton repository to scan at all.
+    srcs = get(raw, "source_dirs", String[])
+    (srcs isa AbstractVector && all(s -> s isa AbstractString, srcs)) ||
+        config_error("'source_dirs' must be a list of strings")
     out = get(raw, "output_root", nothing)
     out isa AbstractString || config_error("'output_root' must be a string")
     rep = get(raw, "report_path", nothing)
@@ -152,6 +155,9 @@ function load_config(path::AbstractString)
         push!(handlers, (file=file, models=models, options=resolve_options(opts, base)))
     end
 
+    (isempty(srcs) && isempty(handlers)) &&
+        config_error("config has neither 'source_dirs' nor 'handlers'; nothing to convert")
+
     return (source_dirs=[resolve_path(String(s), base) for s in srcs],
             output_root=resolve_path(String(out), base),
             report_path=resolve_path(String(rep), base),
@@ -183,6 +189,16 @@ function build_worklist(cfg)
             push!(used_names, bundle_name)
             push!(worklist, (source, model, bundle_name))
         end
+    end
+    # Handler-declared models with no source directory are converted too: such a handler builds the
+    # model itself (e.g. from torchvision weights or a state_dict path passed in its options), so it
+    # needs no Triton model dir or config.pbtxt. These carry an empty source; run_handler then builds a
+    # context with empty config-derived I/O.
+    seen = Set(m for (_, m, _) in worklist)
+    for h in cfg.handlers, m in h.models
+        m in seen && continue
+        push!(seen, m)
+        push!(worklist, ("", m, m))
     end
     return worklist
 end
@@ -458,11 +474,21 @@ function run_handler(fn::Function, options::Dict{String,Any}, hname::AbstractStr
                      source::AbstractString, model::AbstractString, bundle_name::AbstractString,
                      output_root::AbstractString)
     cfg_path = joinpath(source, model, "config.pbtxt")
-    isfile(cfg_path) || return Record(source, model, bundle_name, :failed, Int[], "config.pbtxt not found")
-    text = read(cfg_path, String)
+    if isfile(cfg_path)
+        text = read(cfg_path, String)
+        inputs = parse_io_objects(text, "input")
+        outputs = parse_io_objects(text, "output")
+        ladder = batch_ladder(parse_max_batch_size(text))
+    else
+        # Source-free handler model (no Triton dir / config.pbtxt): the handler builds the model from
+        # its options and declares its own I/O, so the config-derived fields are empty.
+        text = ""
+        inputs = IOEntry[]
+        outputs = IOEntry[]
+        ladder = Int[1]
+    end
     ctx = HandlerContext(source, model, bundle_name, joinpath(output_root, bundle_name),
-                         text, parse_io_objects(text, "input"), parse_io_objects(text, "output"),
-                         batch_ladder(parse_max_batch_size(text)), options,
+                         text, inputs, outputs, ladder, options,
                          (; batch_ladder, parse_max_batch_size, example_input, short_error))
     try
         # invokelatest: the handler function was defined by `Base.include` in a newer world age
@@ -558,7 +584,7 @@ end
 function write_report(records, report_path::AbstractString, output_root::AbstractString)
     c = _counts(records)
     open(report_path, "w") do io
-        println(io, "# Triton → StableHLO conversion report\n")
+        println(io, "# Model → StableHLO conversion report\n")
         println(io, "Output root: `$output_root`\n")
         println(io, "| outcome | count |")
         println(io, "|---------|-------|")

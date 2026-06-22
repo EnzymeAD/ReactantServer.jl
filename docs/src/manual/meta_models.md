@@ -24,10 +24,10 @@ the client-facing I/O from):
 
 ```yaml
 format_version: "2.0"
-name: spine_detector
+name: object_detector
 kind: meta
 meta:
-  calls: [spine_detector_stage1, spine_detector_stage2]
+  calls: [object_detector_stage1, object_detector_stage2]
 client_inputs:
   - {name: IMAGE, dtype: f32, shape: chw, dims: {c: 3, h: 1024, w: 1024}}
 client_outputs:
@@ -37,10 +37,10 @@ client_outputs:
 The `model.jl` calls [`register_meta_model`](@ref) with the orchestration function:
 
 ```julia
-register_meta_model("spine_detector"; run = function (inputs, call)
-    feats = call("spine_detector_stage1", inputs)            # backbone
+register_meta_model("object_detector"; run = function (inputs, call)
+    feats = call("object_detector_stage1", inputs)            # backbone
     rois  = compute_rois(feats)                              # ordinary Julia, data-dependent
-    out   = call("spine_detector_stage2", rois)              # head
+    out   = call("object_detector_stage2", rois)              # head
     return [ReactantServer.NamedTensor("BOXES", out[1].data)]
 end)
 ```
@@ -82,8 +82,8 @@ Two rules shape how a meta shares the GPU with everything else on the worker:
 
 ```mermaid
 flowchart TD
-    C[Client] -->|"infer(spine_detector)"| GW[Gateway]
-    GW -->|"routes the whole group to the<br/>one worker that holds it"| RT["Worker request task — run(inputs, call)<br/>holds the meta gate (one meta at a time)"]
+    C[Client] -->|"infer(object_detector)"| GW[Gateway]
+    GW -->|"routes the whole group to the<br/>one worker that holds it"| RT["Worker request task — run(inputs, call)<br/>holds a meta-gate permit (up to REACTANT_META_CONCURRENCY, default 2)"]
     RT -->|"call('stage1', image)<br/>committed: jumps the queue"| L((Dispatch loop / GPU))
     L -.feature maps.-> RT
     RT -->|"Julia glue (GPU free for other models),<br/>then call('stage2', roi) by reference"| L
@@ -143,7 +143,7 @@ The injected `call` exposes a reuse-buffer allocator for this case:
 ```julia
 roi = call.scratch((7, 7, 256, k), Float32)   # from the worker's reuse pool (or a plain array)
 fill_rois!(roi, feats, boxes)                  # write directly into it
-out = call("spine_detector_stage2", [ReactantServer.NamedTensor("ROI_FEATS", roi)])
+out = call("object_detector_stage2", [ReactantServer.NamedTensor("ROI_FEATS", roi)])
 ```
 
 The pool is plain memory, local to the worker, and never shared across processes. It exists purely to
@@ -171,6 +171,8 @@ that many in-flight metas; the deadline-bounded acquire degrades gracefully if i
 
 ## See also
 
+- [Object Detection](object_detection.md) for a worked end-to-end meta model: converting a
+  torchvision Faster R-CNN into two StableHLO stages chained by data-dependent Julia glue
 - [Bundles & model.jl](bundles.md) for the plain (non-meta) bundle path and pre/post hooks
 - [Multi-GPU Gateway](multi_gpu_gateway.md) for how the gateway routes and places models
 - [Node Configuration](node_config.md) for the scheduling disciplines, including `edf`

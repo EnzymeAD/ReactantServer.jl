@@ -1,8 +1,8 @@
-# Example config for tools/convert_triton_to_stablehlo.jl. Copy it somewhere
+# Example config for tools/convert_to_stablehlo.jl. Copy it somewhere
 # outside version control (e.g. private/convert.yaml, private/ is gitignored),
 # fill in the real model names, and pass it on the command line:
 #
-#   julia tools/convert_triton_to_stablehlo.jl private/convert.yaml [--only a,b] [--force] [--dry-run]
+#   julia tools/convert_to_stablehlo.jl private/convert.yaml [--only a,b] [--force] [--dry-run]
 #
 # All relative paths resolve against this file's directory. Handler option
 # values whose key ends in _dir or _path are resolved the same way.
@@ -31,7 +31,7 @@ exclude:
 # data-dependent tails that need a wrapper plus a serve-time postprocess).
 # Each handler file is included into its own module; its last expression must
 # evaluate to a function handler(ctx) -> Vector{Int} (batch sizes written).
-# See the handler contract in tools/convert_triton_to_stablehlo.jl. Handler
+# See the handler contract in tools/convert_to_stablehlo.jl. Handler
 # files must exist at config-load time, so this block ships commented out:
 #
 # handlers:
@@ -39,3 +39,18 @@ exclude:
 #     models: [model_beta, model_gamma]
 #     options:
 #       postprocess_dir: postprocess
+#
+#   # A standard torchvision Faster R-CNN object detector, split into a
+#   # backbone+RPN stage, a box-head stage, and a meta bundle that chains them
+#   # through the data-dependent DetectionGlue (NMS, roi_align, box decode). The
+#   # shipped tools/handlers/torchvision_frcnn_detector.jl drives this via
+#   # torch.export (no torch.jit); see docs/src/manual/object_detection.md.
+#   - file: handlers/torchvision_frcnn_detector.jl
+#     models: [my_detector]
+#     options:
+#       weights: DEFAULT    # DEFAULT = pretrained COCO; "none" = random; or a state_dict .pth path
+#       num_classes: 91     # classes INCLUDING background; set when loading a custom head
+#       image_size: 640     # canonical square input edge, divisible by 64
+#       input_dtype: u8     # client image dtype (u8 | f32)
+#       output_cols: 6      # 5 = [box4, score]; 6 = [box4, score, class]
+#       # input_shapes: [[640, 640], [640, 896]]  # optional aspect-ratio variants sharing one weight set

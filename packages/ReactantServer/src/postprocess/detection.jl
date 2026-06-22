@@ -1,8 +1,10 @@
-# Julia detection glue for the two-stage detectron2 detectors (Family B). Ports the data-dependent
-# pipeline that sits between the two StableHLO executables (validated bit-faithful in Python; see the
-# plan file): anchor generation, box decode, RPN proposal NMS, ROIAlign, and per-class final NMS.
+# Julia detection glue for two-stage object detectors (FPN backbone + RPN + RoIHeads, e.g. a
+# torchvision Faster R-CNN). Ports the data-dependent pipeline that sits between the two StableHLO
+# executables: anchor generation, box decode, RPN proposal NMS, ROIAlign, and per-class final NMS.
 # Pure Julia (no torch at serve time). Conventions: boxes are xyxy rows [N,4]; feature maps are passed
-# channel-first as A[c, h, w] (0-based torch coords map to 1-based Julia indices internally).
+# channel-first as A[c, h, w] (0-based torch coords map to 1-based Julia indices internally). Pixel/class
+# conventions that differ across frameworks are kwargs: `aligned` on roi_align, `bg_first` on
+# fast_rcnn_inference (see those functions).
 
 module DetectionGlue
 
@@ -59,7 +61,7 @@ function batched_nms(boxes::AbstractMatrix, scores::AbstractVector, idxs::Abstra
     return nms(shifted, scores, thresh)
 end
 
-# --- box decode (detectron2 Box2BoxTransform.apply_deltas) ---
+# --- box decode (Faster R-CNN box-to-box transform; torchvision BoxCoder.decode) ---
 
 const SCALE_CLAMP = log(1000.0 / 16.0)
 
@@ -67,7 +69,7 @@ const SCALE_CLAMP = log(1000.0 / 16.0)
     decode_boxes(deltas, boxes, weights) -> [M, B]
 
 `deltas` [M,B] (B a multiple of 4, class-specific groups), `boxes` [M,4] anchors/proposals, `weights`
-(wx,wy,ww,wh). Output xyxy per group, layout [x1,y1,x2,y2] interleaved per class to match detectron2.
+(wx,wy,ww,wh). Output xyxy per group, layout [x1,y1,x2,y2] interleaved per class.
 """
 function decode_boxes(deltas::AbstractMatrix, boxes::AbstractMatrix, weights::NTuple{4,<:Real})
     M, B = size(deltas); nc = B ÷ 4
@@ -126,20 +128,25 @@ end
 end
 
 """
-    roi_align!(out, feat, boxes, scale; pooled=7, ratio=0)
+    roi_align!(out, feat, boxes, scale; pooled=7, ratio=0, aligned=true)
 
 ROIAlign of `feat` [C,H,W] at `boxes` [K,4] (xyxy, input-image coords) into `out` [K,C,pooled,pooled].
 `scale` is the feature/image spatial scale; `ratio`=0 means adaptive sampling (ceil(roi/pooled)).
-Matches torchvision.ops.roi_align(aligned=true).
+`aligned` selects the pixel-coordinate convention of `torchvision.ops.roi_align`: `true` shifts
+sampling by a half pixel (`box*scale - 0.5`); `false` (the torchvision detection MultiScaleRoIAlign
+default) uses no offset and clamps each ROI's width/height to at least one pixel (the legacy
+malformed-ROI guard).
 """
 function roi_align!(out::AbstractArray{<:Real,4}, feat::AbstractArray{<:Real,3},
-                    boxes::AbstractMatrix, scale::Real; pooled::Int=7, ratio::Int=0)
+                    boxes::AbstractMatrix, scale::Real; pooled::Int=7, ratio::Int=0, aligned::Bool=true)
     C, H, W = size(feat)
     K = size(boxes, 1)
+    off = aligned ? 0.5 : 0.0
     @inbounds for k in 1:K
-        sw = boxes[k, 1] * scale - 0.5; sh = boxes[k, 2] * scale - 0.5
-        ew = boxes[k, 3] * scale - 0.5; eh = boxes[k, 4] * scale - 0.5
+        sw = boxes[k, 1] * scale - off; sh = boxes[k, 2] * scale - off
+        ew = boxes[k, 3] * scale - off; eh = boxes[k, 4] * scale - off
         rw = ew - sw; rh = eh - sh
+        aligned || (rw = max(rw, 1.0); rh = max(rh, 1.0))
         bw = rw / pooled; bh = rh / pooled
         gh = ratio > 0 ? ratio : max(1, ceil(Int, rh / pooled))
         gw = ratio > 0 ? ratio : max(1, ceil(Int, rw / pooled))
@@ -160,22 +167,25 @@ function roi_align!(out::AbstractArray{<:Real,4}, feat::AbstractArray{<:Real,3},
 end
 
 """
-    roi_align_wire!(out, feat, boxes, scale; pooled=7, ratio=0)
+    roi_align_wire!(out, feat, boxes, scale; pooled=7, ratio=0, aligned=true)
 
 ROIAlign writing directly into the executable's WIRE layout `out` [pooled,pooled,C,K] =
 (pw,ph,C,K) (the Julia col-major reverse of torch [K,C,7,7]), instead of [K,C,7,7]+permutedims.
 Lets a meta stage ROI features straight into a shared-memory scratch slot. Same per-element math as
 `roi_align!` (the value is computed in Float64 and rounded once on store), so an `out::Array{Float32}`
-is bit-identical to the old `Float64` roi_align + final `Float32` convert.
+is bit-identical to the old `Float64` roi_align + final `Float32` convert. See `roi_align!` for the
+`aligned` convention (half-pixel offset `true` vs torchvision detection `false`).
 """
 function roi_align_wire!(out::AbstractArray{<:Real,4}, feat::AbstractArray{<:Real,3},
-                         boxes::AbstractMatrix, scale::Real; pooled::Int=7, ratio::Int=0)
+                         boxes::AbstractMatrix, scale::Real; pooled::Int=7, ratio::Int=0, aligned::Bool=true)
     C, H, W = size(feat)
     K = size(boxes, 1)
+    off = aligned ? 0.5 : 0.0
     @inbounds for k in 1:K
-        sw = boxes[k, 1] * scale - 0.5; sh = boxes[k, 2] * scale - 0.5
-        ew = boxes[k, 3] * scale - 0.5; eh = boxes[k, 4] * scale - 0.5
+        sw = boxes[k, 1] * scale - off; sh = boxes[k, 2] * scale - off
+        ew = boxes[k, 3] * scale - off; eh = boxes[k, 4] * scale - off
         rw = ew - sw; rh = eh - sh
+        aligned || (rw = max(rw, 1.0); rh = max(rh, 1.0))
         bw = rw / pooled; bh = rh / pooled
         gh = ratio > 0 ? ratio : max(1, ceil(Int, rh / pooled))
         gw = ratio > 0 ? ratio : max(1, ceil(Int, rw / pooled))
@@ -224,25 +234,33 @@ end
 _softmax_row(v) = (e = exp.(v .- maximum(v)); e ./ sum(e))
 
 """
-    fast_rcnn_inference(cls, deltas, proposals, imgH, imgW; score_thresh, nms_thresh, topk, weights)
-        -> (boxes [N,4], scores [N], classes [N])
+    fast_rcnn_inference(cls, deltas, proposals, imgH, imgW; score_thresh, nms_thresh, topk, weights,
+                        bg_first=false) -> (boxes [N,4], scores [N], classes [N])
 
-Second-stage decode + per-class NMS. `cls` [K, nfg+1] logits (background last), `deltas` [K, nrc*4]
-(nrc = nfg or 1 for class-agnostic), `proposals` [K,4]. Mirrors fast_rcnn_inference_single_image.
+Second-stage decode + per-class NMS. `cls` [K, C] softmax logits, `deltas` [K, nrc*4]
+(nrc = number of foreground classes, or `C` when the background also has a delta group, or 1 for
+class-agnostic), `proposals` [K,4]. Mirrors fast_rcnn_inference_single_image.
+
+`bg_first` selects where the background score sits: `false` treats the **last** column as background
+and columns `1:end-1` as foreground; `true` (torchvision FastRCNNPredictor) treats column **1** as
+background and columns `2:end` as foreground. In both cases the per-class delta group for foreground
+column `c` is `c-1` (0-based), and the emitted class id is `c-1`.
 """
 function fast_rcnn_inference(cls::AbstractMatrix, deltas::AbstractMatrix, proposals::AbstractMatrix,
                              imgH::Real, imgW::Real; score_thresh::Real, nms_thresh::Real,
-                             topk::Int, weights::NTuple{4,<:Real}=(10.0, 10.0, 5.0, 5.0))
-    K = size(cls, 1); nfg = size(cls, 2) - 1; nrc = size(deltas, 2) ÷ 4
+                             topk::Int, weights::NTuple{4,<:Real}=(10.0, 10.0, 5.0, 5.0),
+                             bg_first::Bool=false)
+    K = size(cls, 1); nrc = size(deltas, 2) ÷ 4
     dec = decode_boxes(deltas, proposals, weights)            # [K, nrc*4]
     @inbounds for m in 1:K, c in 0:(nrc - 1)
         dec[m, 4c + 1] = clamp(dec[m, 4c + 1], 0, imgW); dec[m, 4c + 3] = clamp(dec[m, 4c + 3], 0, imgW)
         dec[m, 4c + 2] = clamp(dec[m, 4c + 2], 0, imgH); dec[m, 4c + 4] = clamp(dec[m, 4c + 4], 0, imgH)
     end
+    fg_cols = bg_first ? (2:size(cls, 2)) : (1:(size(cls, 2) - 1))
     cb = Vector{Float64}[]; cs = Float64[]; cc = Int[]
     @inbounds for k in 1:K
         p = _softmax_row(@view cls[k, :])
-        for c in 1:nfg
+        for c in fg_cols
             if p[c] > score_thresh
                 ci = nrc == 1 ? 0 : (c - 1)
                 push!(cb, dec[k, (4ci + 1):(4ci + 4)]); push!(cs, p[c]); push!(cc, c - 1)
@@ -293,7 +311,7 @@ end
 "feature map (W,H,C,1) -> [C,H,W] for roi_align!"
 feature_chw(F::AbstractArray) = permutedims(dropdims(F; dims=4), (3, 2, 1))
 
-"detectron2 ROIPooler level for a box: clamp(floor(log2(sqrt(area)/canon_size+1e-8)+canon_level),min,max)-min"
+"FPN ROIPooler level for a box (FPN paper Eqn.1): clamp(floor(log2(sqrt(area)/canon_size+1e-8)+canon_level),min,max)-min"
 function assign_level(box::AbstractVector; canon_level::Int=4, canon_size::Real=224,
                       min_level::Int=2, max_level::Int=5)
     area = max(0.0, (box[3] - box[1]) * (box[4] - box[2]))

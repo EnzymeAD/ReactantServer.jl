@@ -23,7 +23,7 @@ using PythonCall
 
 # torch / torchax / triton must dlopen before Reactant's LLVM loads, or triton's statically
 # linked LLVM/MLIR option registration SIGSEGVs when Reactant compiles the bundle. This mirrors
-# the import order in tools/convert_triton_to_stablehlo.jl. ReactantServerExport pulls Reactant,
+# the import order in tools/convert_to_stablehlo.jl. ReactantServerExport pulls Reactant,
 # so the Python stack is imported first.
 for m in ("torch", "torch.export", "torchax.export", "torchax.ops.jaten", "triton._C.libtriton", "numpy")
     try
@@ -32,8 +32,8 @@ for m in ("torch", "torch.export", "torchax.export", "torchax.ops.jaten", "trito
         println("FATAL: cannot import '$m'."); println(sprint(showerror, err)[1:min(end, 400)]); exit(1)
     end
 end
-# Optional: torchvision registers torchvision::nms/roi_align so detectron2 models load. Not needed
-# for non-detectron2 models, so a missing torchvision is not fatal.
+# Optional: torchvision registers torchvision::nms/roi_align so models that reference those custom ops
+# load. Not needed for models that don't, so a missing torchvision is not fatal.
 try
     pyimport("torchvision")
 catch
@@ -147,8 +147,8 @@ def load_reference(pt_path, device):
     # so they must load and run on CUDA. TF32 is disabled so the GPU reference stays full float32,
     # matching the CPU-lowered bundle.
     m = torch.jit.load(pt_path, map_location=device)
-    # Some scripted models (the detectron2 detectors) bake training=False as a constant, so .eval()
-    # raises "Can't set constant training". They are already in eval mode; ignore that.
+    # Some scripted models bake training=False as a constant, so .eval() raises "Can't set constant
+    # training". They are already in eval mode; ignore that.
     try:
         m.eval()
     except RuntimeError:

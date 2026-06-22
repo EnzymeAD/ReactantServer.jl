@@ -710,8 +710,8 @@ function export_torchscript_bundle(jit_module::Py, example_inputs::Tuple;
                                    wrap=nothing)
     _pyimports()
     _pyimports_torchscript()
-    # Most scripted modules want eval mode, but some (e.g. detectron2 detectors) bake training=False
-    # as a constant and raise "Can't set constant training" on .eval(); they are already in eval, so
+    # Most scripted modules want eval mode, but some bake training=False as a constant and raise
+    # "Can't set constant training" on .eval(); they are already in eval, so
     # ignore that specific failure.
     try
         jit_module.eval()
