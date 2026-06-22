@@ -40,7 +40,7 @@ dtype_token(::Type{T}) where {T} =
     get(() -> error("ReactantServerExport: no manifest dtype token for Julia type $T"), DTYPE_TOKENS, T)
 
 """
-    IOSpec(name, dtype, shape; batch_axis=nothing)
+    IOSpec(name, dtype, shape; batch_axis=nothing, letters=nothing)
 
 A tensor's client-facing spec. `shape` is the network (row-major) shape with a concrete
 value at the batch axis; `batch_axis` is the 0-based network axis that carries the batch
@@ -48,30 +48,55 @@ dimension, or `nothing`. The manifest serialization encodes the shape as an eins
 letter string (`"chwn"`) plus a `dims` map of letter→size; the batch axis is emitted as
 `n`. Non-batch letters are auto-allocated from `_AXIS_LETTERS` and carry no semantic
 meaning across tensors.
+
+`letters` optionally overrides that auto-allocation with explicit non-batch axis letters,
+one per non-batch axis in `shape` order (the batch axis is still emitted as `n`). Pass it to
+give axes meaningful names, e.g. `['w','h']` for an image input so its manifest reads `whn`.
+The reserved markers `n`/`b` are rejected.
 """
 struct IOSpec
     name::String
     dtype::DataType
     shape::Vector{Int}
     batch_axis::Union{Int,Nothing}
+    letters::Union{Nothing,Vector{Char}}
 end
-IOSpec(name, dtype, shape; batch_axis=nothing) = IOSpec(String(name), dtype, Int[shape...], batch_axis)
+IOSpec(name, dtype, shape; batch_axis=nothing, letters=nothing) =
+    IOSpec(String(name), dtype, Int[shape...], batch_axis,
+           letters === nothing ? nothing : Char[letters...])
 
 # 'n' and 'b' are reserved batch markers; everything else is fair game for non-batch axes.
 const _AXIS_LETTERS = "acdefghijklmopqrstuvwxyz"
 
+# The letters for `s`'s non-batch axes, in `shape` order: the explicit `s.letters` if given (validated),
+# otherwise auto-allocated from `_AXIS_LETTERS`.
+function _nonbatch_letters(s::IOSpec)
+    nax = count(i -> !(s.batch_axis !== nothing && (i - 1) == s.batch_axis), eachindex(s.shape))
+    if s.letters !== nothing
+        length(s.letters) == nax ||
+            error("ReactantServerExport: tensor '$(s.name)' has $nax non-batch axes but $(length(s.letters)) letters $(s.letters)")
+        any(c -> c in ('n', 'b'), s.letters) &&
+            error("ReactantServerExport: tensor '$(s.name)' axis letters may not use the reserved batch markers 'n'/'b'")
+        allunique(s.letters) ||
+            error("ReactantServerExport: tensor '$(s.name)' has duplicate axis letters $(s.letters)")
+        return s.letters
+    end
+    nax <= length(_AXIS_LETTERS) ||
+        error("ReactantServerExport: tensor '$(s.name)' has more non-batch axes than available axis letters")
+    return collect(Char, _AXIS_LETTERS[1:nax])
+end
+
 function _spec_dict(s::IOSpec)
+    letters = _nonbatch_letters(s)
     shape_chars = Char[]
     dims = Dict{String,Any}()
-    next_idx = 1
+    k = 0
     for (i, d) in enumerate(s.shape)               # network axis = i - 1
         if s.batch_axis !== nothing && (i - 1) == s.batch_axis
             push!(shape_chars, 'n')
         else
-            next_idx <= length(_AXIS_LETTERS) ||
-                error("ReactantServerExport: tensor '$(s.name)' has more non-batch axes than available axis letters")
-            c = _AXIS_LETTERS[next_idx]
-            next_idx += 1
+            k += 1
+            c = letters[k]
             push!(shape_chars, c)
             dims[string(c)] = Int(d)
         end
@@ -84,17 +109,17 @@ end
 # (input, axis) order. This is the order the manifest `input_shapes` variants and the runtime
 # variant key are both built in, so the emitted letters line up with what the server reads back.
 function _variable_letters(specs::AbstractVector{IOSpec})
-    letters = Char[]
+    out = Char[]
     for s in specs
-        next_idx = 1
+        letters = _nonbatch_letters(s)
+        k = 0
         for (i, d) in enumerate(s.shape)
             (s.batch_axis !== nothing && (i - 1) == s.batch_axis) && continue
-            c = _AXIS_LETTERS[next_idx]
-            next_idx += 1
-            d == -1 && push!(letters, c)
+            k += 1
+            d == -1 && push!(out, letters[k])
         end
     end
-    return letters
+    return out
 end
 
 # --- StableHLO serialization to a portable artifact ---
