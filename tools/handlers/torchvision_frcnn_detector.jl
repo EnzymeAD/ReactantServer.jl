@@ -138,7 +138,8 @@ function handler(ctx)
     RSE.export_bundle(Val(:pytorch), stage1, multishape ? first(s1_variants) : (ex1,);
         dir=s1_dir, name=s1_name, input_names=["INPUT__0"], output_names=s1_outs,
         batch_sizes=[1], shape_variants=s1_variants, matmul_precision="highest",
-        axis_letters=Dict("INPUT__0" => ['w', 'h', 'c']))   # image input (W,H,3,1) -> manifest "whcn"
+        # image input (W,H,3,1) -> "whcn"; the 14 feature/obj/delta maps (W,H,C,1) -> "whcn".
+        axis_letters=merge(Dict("INPUT__0" => ['w', 'h', 'c']), Dict(n => ['w', 'h', 'c'] for n in s1_outs)))
 
     # stage2: box head + predictor on fixed-K roi features. torch [K,256,7,7] == julia (7,7,256,K).
     roi_k = Int(pyconvert(Int, pyeval("int", @__MODULE__)(model.rpn._post_nms_top_n["testing"])))

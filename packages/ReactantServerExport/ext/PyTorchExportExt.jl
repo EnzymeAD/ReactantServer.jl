@@ -355,10 +355,11 @@ strict mode drives TorchDynamo, which on recent torch queries the current
 accelerator's stream and raises against torchax's registered "jax" device. Non-strict
 tracing avoids that path and is the recommended default for `torch.export`.
 
-`axis_letters` optionally names the non-batch manifest axis letters per input: a `Dict` from
-input name to a vector of letters in Julia-shape order (batch excluded), forwarded to that
-input's [`IOSpec`](@ref). For example `Dict("INPUT__0" => ['w','h'])` makes an image input's
-manifest read `whn` instead of the auto-allocated `acn`.
+`axis_letters` optionally names the non-batch manifest axis letters per tensor: a `Dict` from a
+tensor name (input *or* output) to a vector of letters in Julia-shape order (batch excluded),
+forwarded to that tensor's [`IOSpec`](@ref). For example `Dict("INPUT__0" => ['w','h'])` makes
+an image input's manifest read `whn` instead of the auto-allocated `acn`, and naming an output
+`['w','h','c']` makes a feature map read `whcn`.
 """
 # The non-batch Julia axes (1-based) of input `i` whose size differs across the shape variants.
 # These become the variable (`-1`) axes of the executable input and define the variant key. The
@@ -534,7 +535,8 @@ function export_bundle(::Val{:pytorch}, model, example_inputs::Tuple;
             (base.batch_axis !== nothing && (ax - 1) == base.batch_axis) && continue
             any(vk -> out_specs_by_variant[vk][j].shape[ax] != shp[ax], variant_keys) && (shp[ax] = -1)
         end
-        push!(outputs, ReactantServerExport.IOSpec(base.name, base.dtype, shp; batch_axis=base.batch_axis))
+        lets = axis_letters === nothing ? nothing : get(axis_letters, base.name, nothing)
+        push!(outputs, ReactantServerExport.IOSpec(base.name, base.dtype, shp; batch_axis=base.batch_axis, letters=lets))
     end
 
     torch_v = _try_version(torch)
