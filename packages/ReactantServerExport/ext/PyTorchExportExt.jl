@@ -354,6 +354,12 @@ deployment GPU, determines whether reduced (TF32-style) precision is baked in.
 strict mode drives TorchDynamo, which on recent torch queries the current
 accelerator's stream and raises against torchax's registered "jax" device. Non-strict
 tracing avoids that path and is the recommended default for `torch.export`.
+
+`axis_letters` optionally names the non-batch manifest axis letters per tensor: a `Dict` from a
+tensor name (input *or* output) to a vector of letters in Julia-shape order (batch excluded),
+forwarded to that tensor's [`IOSpec`](@ref). For example `Dict("INPUT__0" => ['w','h'])` makes
+an image input's manifest read `whn` instead of the auto-allocated `acn`, and naming an output
+`['w','h','c']` makes a feature map read `whcn`.
 """
 # The non-batch Julia axes (1-based) of input `i` whose size differs across the shape variants.
 # These become the variable (`-1`) axes of the executable input and define the variant key. The
@@ -387,6 +393,7 @@ function export_bundle(::Val{:pytorch}, model, example_inputs::Tuple;
                        strict::Bool=false,
                        matmul_precision::Union{Nothing,AbstractString}=nothing,
                        client_inputs=nothing, client_outputs=nothing,
+                       axis_letters::Union{Nothing,AbstractDict}=nothing,
                        provenance=Dict{String,Any}())
     isempty(example_inputs) && error("PyTorchExport: at least one example input is required")
     isempty(batch_sizes) && error("PyTorchExport: batch_sizes cannot be empty")
@@ -514,7 +521,8 @@ function export_bundle(::Val{:pytorch}, model, example_inputs::Tuple;
             shp[ax] = -1
         end
         bax = ndims(x_at_s) - 1
-        push!(inputs, ReactantServerExport.IOSpec(innames[i], eltype(x_at_s), shp; batch_axis=bax))
+        lets = axis_letters === nothing ? nothing : get(axis_letters, innames[i], nothing)
+        push!(inputs, ReactantServerExport.IOSpec(innames[i], eltype(x_at_s), shp; batch_axis=bax, letters=lets))
     end
 
     # executable_outputs: each output axis that varies across variants is marked -1 (the FPN
@@ -527,7 +535,8 @@ function export_bundle(::Val{:pytorch}, model, example_inputs::Tuple;
             (base.batch_axis !== nothing && (ax - 1) == base.batch_axis) && continue
             any(vk -> out_specs_by_variant[vk][j].shape[ax] != shp[ax], variant_keys) && (shp[ax] = -1)
         end
-        push!(outputs, ReactantServerExport.IOSpec(base.name, base.dtype, shp; batch_axis=base.batch_axis))
+        lets = axis_letters === nothing ? nothing : get(axis_letters, base.name, nothing)
+        push!(outputs, ReactantServerExport.IOSpec(base.name, base.dtype, shp; batch_axis=base.batch_axis, letters=lets))
     end
 
     torch_v = _try_version(torch)
@@ -681,6 +690,7 @@ function export_torchscript_bundle(pt_path::AbstractString,
                                    shape_variants::Union{Nothing,AbstractVector}=nothing,
                                    matmul_precision::Union{Nothing,AbstractString}=nothing,
                                    client_inputs=nothing, client_outputs=nothing,
+                                   axis_letters::Union{Nothing,AbstractDict}=nothing,
                                    provenance=Dict{String,Any}(),
                                    map_location="cpu",
                                    wrap=nothing)
@@ -692,7 +702,7 @@ function export_torchscript_bundle(pt_path::AbstractString,
         dir=dir, name=name, input_names=input_names,
         output_name=output_name, output_names=output_names,
         batch_sizes=batch_sizes, shape_variants=shape_variants, matmul_precision=matmul_precision,
-        client_inputs=client_inputs, client_outputs=client_outputs,
+        client_inputs=client_inputs, client_outputs=client_outputs, axis_letters=axis_letters,
         provenance=prov, wrap=wrap)
 end
 
@@ -706,6 +716,7 @@ function export_torchscript_bundle(jit_module::Py, example_inputs::Tuple;
                                    shape_variants::Union{Nothing,AbstractVector}=nothing,
                                    matmul_precision::Union{Nothing,AbstractString}=nothing,
                                    client_inputs=nothing, client_outputs=nothing,
+                                   axis_letters::Union{Nothing,AbstractDict}=nothing,
                                    provenance=Dict{String,Any}(),
                                    wrap=nothing)
     _pyimports()
@@ -728,7 +739,7 @@ function export_torchscript_bundle(jit_module::Py, example_inputs::Tuple;
         batch_sizes=batch_sizes, shape_variants=shape_variants,
         strict=false,
         matmul_precision=matmul_precision,
-        client_inputs=client_inputs, client_outputs=client_outputs,
+        client_inputs=client_inputs, client_outputs=client_outputs, axis_letters=axis_letters,
         provenance=prov)
 end
 
