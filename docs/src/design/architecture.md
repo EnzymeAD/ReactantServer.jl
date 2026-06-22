@@ -129,11 +129,13 @@ language task scheduler, and adds no threading of its own. Exactly one GPU execu
 time by design, which keeps memory and concurrency reasoning simple and is what makes the
 single-resident-model strategy above safe.
 
-Two disciplines are supported. `fair` (the default) is a deficit-weighted, cost-aware share that
+Three disciplines are supported. `fair` (the default) is a deficit-weighted, cost-aware share that
 balances GPU time across models on the worker. `fifo` ignores per-model weights and serves in
 global arrival order; it is the right choice when the worker sits behind a gateway running
 `lpt_packing`, which moves the placement decisions upstream (the two would otherwise
-fight). Coalescing applies under both.
+fight). `edf` (earliest-deadline-first) serves the model whose most urgent queued request has the
+soonest deadline, so latency-bounded work, notably meta sub-calls, is not starved under load; with
+equal deadlines it reduces to `fifo`. Coalescing applies under all three.
 
 ### Structure
 
@@ -161,7 +163,12 @@ on the lone interactive thread so a blocking GPU call never starves it of CPU. (
 
 Each time the GPU frees up, the scheduler decides in this order:
 
-1. **Select the next model**, according to the configured `discipline`. Under `fair` (the
+1. **Dispatch a committed meta sub-call first, if one is pending.** A meta model's orchestration
+   (see [Meta models](#meta-models) below) runs off the dispatch loop and re-enters the scheduler
+   for each sub-call; those continuations are *committed* and jump ahead of the discipline scan, at
+   most one per in-flight meta, so a meta already in progress is not stalled behind newly arrived
+   work.
+2. **Otherwise select the next model**, according to the configured `discipline`. Under `fair` (the
    default), each model has a relative weight that defines its share of compute; the scheduler
    tracks a decaying exponential moving average of how much GPU time each model has recently
    consumed, and scores every model with a non-empty queue by how far below its share it is,
@@ -169,13 +176,17 @@ Each time the GPU frees up, the scheduler decides in this order:
    higher, and dividing by cost stops an expensive model from blocking cheaper ones on a marginal
    edge; a clamp bounds both lockout and domination. Under `fifo`, weights are ignored and the
    model with the oldest queued request wins (chosen behind an `lpt_packing` gateway, as above).
-2. **Coalesce the winner.** The selected model's queued requests are taken in FIFO order and
+   Under `edf`, the model whose most urgent queued request has the soonest deadline wins.
+3. **Coalesce the winner.** The selected model's queued requests are taken in FIFO order and
    packed into the largest compiled batch size that fits, padding a partial batch up to the
    smallest size when needed and always making forward progress on at least the oldest request.
    The remainder stays queued for the next round.
 
-Per-model latency budgets (earliest-deadline-first escalation ahead of the discipline) are a
-planned extension; they are not implemented today.
+Requests may carry a latency deadline. Expired requests are dropped at admission, before any GPU
+work and never interrupting a running execution; under `edf` a laxity margin also sheds requests
+predicted to miss, so the GPU is not spent on work that will be late anyway (committed meta
+sub-calls honor the hard deadline but skip the predictive drop). See [Meta models](#meta-models)
+for how a meta propagates its remaining budget to the sub-calls it issues.
 
 ### Cost learning and coalescing
 
@@ -184,7 +195,10 @@ estimate with an exponential moving average, seeded by a warmup pass at startup 
 real requests are scheduled sensibly. Coalescing concatenates the inputs of several same-model
 requests along the batch axis into one execution, then slices the outputs back per caller. Only
 models whose inputs and outputs carry a batch axis are coalesced; others serve one request per
-dispatch.
+dispatch. A model compiled for several input shapes (aspect-ratio variants) keeps one executable
+set per variant over a single shared set of weights, and only requests resolving to the same
+variant coalesce together, since different input shapes cannot be concatenated along the batch
+axis.
 
 Coalescing is the throughput lever. Packing many requests into one execution amortizes the fixed
 per-launch overhead and, for a model that had to be loaded on demand, the one-time weight
@@ -201,6 +215,19 @@ smoothing, a per-model maximum queue depth, and the GPU weight-cache byte budget
 is typed YAML with environment-variable overrides. The scheduler exposes per-model metrics:
 dispatch count, total compute, current recent-compute load, queue depth, queue-wait percentiles,
 and the histogram of coalesced batch sizes, plus weight cache residency and load/evict counters.
+
+### Meta models
+
+A `kind: meta` bundle does not wrap a single executable. Its `model.jl` registers a `run` hook that
+chains several ordinary models with data-dependent Julia between the stages, the shape that an
+exported static graph cannot capture (a detector's per-image proposal count, for instance). The
+orchestration runs on the request task, off the dispatch loop, under a gate that admits one meta at
+a time by default so meta glue never blocks the GPU; each sub-call it makes re-enters the scheduler
+as a committed request (step 1 of the decision order above) and is dispatched and coalesced like
+any other work. The meta's remaining deadline budget rides along to those sub-calls. The
+[Object Detection](../manual/object_detection.md) guide is a worked example, a torchvision Faster
+R-CNN split into two StableHLO stages joined by Julia detection glue. See
+[Meta Models](../manual/meta_models.md) for the full model.
 
 ## The compiler advantage
 

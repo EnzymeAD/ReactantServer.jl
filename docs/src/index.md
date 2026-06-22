@@ -36,12 +36,18 @@ clients connect to it directly.
   [Multi-GPU Gateway](manual/multi_gpu_gateway.md)).
 - Multiple compiled batch sizes per model and custom per-model pre/post-processing via a
   bundle's `model.jl` (see [Bundles & model.jl](manual/bundles.md)).
+- Meta models: `kind: meta` bundles whose `model.jl` chains several models with data-dependent
+  Julia between stages, running off the dispatch loop and re-entering the scheduler for each
+  sub-call (see [Meta Models](manual/meta_models.md)). The
+  [Object Detection](manual/object_detection.md) guide is a worked end-to-end example, a
+  torchvision Faster R-CNN split into two StableHLO stages chained by Julia detection glue.
 
-ReactantServer.jl is a Julia workspace of four packages: **ReactantServerCore** (the shared,
+ReactantServer.jl is a Julia workspace of five packages: **ReactantServerCore** (the shared,
 Reactant-free substrate), **ReactantServer** (the worker, the only package that loads Reactant),
-**ReactantServerGateway** (the multi-GPU reverse proxy), and **ReactantServerClient** (a
-Reactant-free inference client), plus the non-member **ReactantServerExport** (offline bundle
-export). See [Architecture](design/architecture.md) for the split.
+**ReactantServerGateway** (the multi-GPU reverse proxy), **ReactantServerClient** (a
+Reactant-free inference client), and **ReactantServerNode** (the single-container node
+supervisor), plus the non-member **ReactantServerExport** (offline bundle export). See
+[Architecture](design/architecture.md) for the split.
 
 ## Where to go next
 
@@ -52,6 +58,8 @@ export). See [Architecture](design/architecture.md) for the split.
 - Configuring a deployment: [Node Configuration](manual/node_config.md).
 - Scaling to multiple GPUs: [Scaling to Multiple GPUs](manual/scaling.md).
 - Packaging a model: [Bundles & model.jl](manual/bundles.md).
+- Chaining models with data-dependent Julia: [Meta Models](manual/meta_models.md), with a worked
+  [Object Detection](manual/object_detection.md) example.
 - Serving more models than fit on the GPU: [On-demand Weights](manual/on_demand_weights.md).
 - Scaling across GPUs: [Multi-GPU Gateway](manual/multi_gpu_gateway.md) and
   [Docker Deployment](manual/docker.md).
