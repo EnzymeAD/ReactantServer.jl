@@ -21,6 +21,13 @@ the generated `model.jl` is small and the conversion is config-driven.
 This page walks through converting a standard torchvision detector end to end. For the underlying
 execution model (the meta gate, committed sub-calls, placement) see [Meta Models](meta_models.md).
 
+!!! tip "Runnable example"
+    `examples/object_detection/` in the repository is a complete, runnable version of this walkthrough.
+    It is split into three copy-pasteable commands, each with its own environment: **export** the
+    bundles, **serve** them on a single GPU, and a **client** that sends an image and draws the
+    detections back onto it with CairoMakie (`detections.jpg`). See
+    `examples/object_detection/README.md`.
+
 ## The shape of the conversion
 
 One source model is emitted as three bundles under the output root:
@@ -170,6 +177,7 @@ Two assumptions are worth calling out:
 
 ## See also
 
+- `examples/object_detection/` for the runnable end-to-end example (export, serve, client + drawing)
 - [Meta Models](meta_models.md) for the execution model, gating, deadlines, and placement
 - [Bundles & model.jl](bundles.md) for the plain bundle path and the manifest encoding
 - [`register_meta_model`](@ref) in the API reference
