@@ -1,0 +1,5 @@
+# torch / torchax / jax / numpy come from ReactantServerExport's CondaPkg.toml (merged into this
+# environment because we path-source it). The object detection converter additionally needs
+# torchvision; left unpinned so pip resolves the build matching the resolved torch.
+[pip.deps]
+torchvision = ""

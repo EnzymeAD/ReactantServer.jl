@@ -1,0 +1,8 @@
+# Generated bundles and run artifacts
+bundles/
+test_image.jpg
+detections.jpg
+
+# Per-environment resolution / Python state (each subproject resolves on first run)
+**/Manifest.toml
+**/.CondaPkg/

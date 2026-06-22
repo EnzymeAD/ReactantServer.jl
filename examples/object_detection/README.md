@@ -1,39 +1,49 @@
 # Object detection demo
 
-An end-to-end walkthrough of serving an object detector with ReactantServer: it exports a torchvision
-Faster R-CNN (`fasterrcnn_resnet50_fpn`, pretrained on COCO) into StableHLO bundles, serves them on a
-single GPU, sends an image with `ReactantServerClient`, and draws the predicted boxes and COCO labels
-back onto the image with CairoMakie.
+Serving an object detector with ReactantServer, end to end: export a torchvision Faster R-CNN
+(`fasterrcnn_resnet50_fpn`, pretrained on COCO) into StableHLO bundles, serve them on a single GPU,
+send an image, and draw the predicted boxes + COCO labels back onto it with CairoMakie.
 
-## Run
+It is split into three single-purpose Julia environments so each loads only what it needs (and they
+stop invalidating each other's precompilation): **export** is the only one with PythonCall + torch,
+**server** is the only one with Reactant, and **client** has CairoMakie but no Reactant.
 
-```
-julia --project=examples/object_detection -e 'using Pkg; Pkg.instantiate()'
-julia --project=examples/object_detection examples/object_detection/demo.jl
-```
+Each environment resolves independently the first time you use it:
 
-The first run exports the bundles into `examples/object_detection/bundles/` (skipped afterward),
-downloads a test image, serves the model, runs inference, and writes annotated boxes to
-`examples/object_detection/detections.jpg` (a JPEG, convenient to copy off a remote machine). Pass
-your own image as the first argument:
-
-```
-julia --project=examples/object_detection examples/object_detection/demo.jl path/to/image.jpg
+```sh
+for env in export server client; do
+  julia --project=examples/object_detection/$env -e 'using Pkg; Pkg.instantiate()'
+done
 ```
 
-## Requirements
+Then run the three steps in order (the server stays running; drive it from a second terminal):
 
-- **GPU:** the default uses the Reactant CUDA backend (device 0). For a GPU-free smoke test pass
-  `--cpu`, which serves on the CPU backend (much slower).
-- **Export stack:** step 1 runs `tools/convert_to_stablehlo.jl`, which needs a Python with
-  `torch` / `torchax` / `torchvision` / `triton` wired into PythonCall (the same stack any model
-  conversion needs). If this project's PythonCall is not set up for that, point the export step at a
-  project that is via `DEMO_CONVERT_PROJECT=/path/to/convert/env`. Once `bundles/object_detector/`
-  exists, the export step is skipped and no Python is needed for the serve/infer/draw steps.
+```sh
+# 1. Export the bundles (first time only; writes ./bundles/). Needs network for the COCO weights.
+julia --project=examples/object_detection/export examples/object_detection/export/export.jl
 
-## What the model predicts
+# 2. Serve on a single GPU (blocks; Ctrl-C to stop). Add --cpu for a GPU-free smoke test.
+CUDA_VISIBLE_DEVICES=0 julia --project=examples/object_detection/server examples/object_detection/server/serve.jl
 
-COCO's 80 everyday object classes (person, bicycle, car, bus, dog, cat, ...). The served model bakes a
-0.05 score threshold, 0.5 NMS, and up to 100 detections; the demo additionally only draws detections
-scoring at least 0.5. Each output row is `[x1, y1, x2, y2, score, class]` with boxes in the 640×640
-input pixel space and `class` a COCO id (1..90), mapped to a name via the table in `demo.jl`.
+# 3. In another terminal: send an image and draw the result -> ./detections.jpg
+julia --project=examples/object_detection/client examples/object_detection/client/detect.jl
+```
+
+Pass your own image to step 3 as the first argument (a local path). The server port defaults to 8080;
+set `OD_PORT` (and `OD_HOST` for the client) to change it on both step 2 and step 3.
+
+## Notes
+
+- **What it predicts:** COCO's 80 everyday object classes (person, bicycle, car, bus, dog, cat, ...).
+  Each output row is `[x1, y1, x2, y2, score, class]`, boxes in the 640×640 input pixel space, `class`
+  a COCO id mapped to a name in `client/detect.jl`. The model bakes a 0.05 score threshold; the client
+  additionally only draws detections scoring at least 0.5.
+- **Python deps (export only):** torch/torchax/jax come from `ReactantServerExport`'s CondaPkg and
+  `torchvision` from `export/CondaPkg.toml`; CondaPkg resolves and installs them on the first export
+  (needs network).
+- **Corporate SSL:** `export.jl` points Python's TLS at the OS CA bundle (`SSL_CERT_FILE`,
+  defaulting from `REQUESTS_CA_BUNDLE`/`CURL_CA_BUNDLE`/`JULIA_SSL_CA_ROOTS_PATH` or
+  `/etc/ssl/certs/ca-certificates.crt`) so the torchvision weight download trusts a MitM proxy's CA.
+- **First true end-to-end run:** watch the client's `Raw output size=...` line — it confirms the
+  `OUTPUT__0` orientation (`parse_detections` handles either) — and sanity-check that the drawn boxes
+  land on the right objects.
