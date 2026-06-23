@@ -279,3 +279,29 @@ pool_fsa(slot::PoolSlot, ::Type{T}, dims::NTuple{N,<:Integer}) where {T,N} =
     fsa_from_memory(pool_memory(slot, T, prod(dims)), dims)
 
 pool_fsa(slot::PoolSlot, ::Type{T}, dims::Vararg{Integer,N}) where {T,N} = pool_fsa(slot, T, dims)
+
+"""
+    scratch(slot, dims, T) -> Array{T}
+    scratch(slot, [dims1 => T1, dims2 => T2, ...]) -> Vector{Array}
+
+Carve one typed buffer per `dims => T` spec from `slot` in a single call, advancing the slot's
+cursor so the buffers occupy disjoint, contiguous byte ranges. Each buffer is an `Array{T}`
+aliasing the pool's backing (via [`pool_view`](@ref); zero-copy, and uniform across SHM- and
+`Memory`-backed pools since it is just `pool_base + offset`); write into the returned arrays
+directly. `dims` is a shape tuple (or a bare integer for a vector).
+
+This is the buffer-request interface shared by the meta-model `call.scratch` and the client driver:
+ask for ALL buffers up front in one call. The carved buffers' lifetime is bounded by `slot` (and by
+the pool, which the caller keeps alive); they become invalid once it is released.
+"""
+scratch(slot::PoolSlot, dims, ::Type{T}) where {T} =
+    first(scratch(slot, Pair[(dims isa Tuple ? dims : (dims,)) => T]))
+
+function scratch(slot::PoolSlot, specs::AbstractVector)
+    return Any[_carve_scratch(slot, first(s), last(s)) for s in specs]
+end
+
+function _carve_scratch(slot::PoolSlot, dims, ::Type{T}) where {T}
+    d = dims isa Tuple ? dims : (dims,)
+    return pool_view(subslot(slot, sizeof(T) * prod(d)), T, d...)
+end

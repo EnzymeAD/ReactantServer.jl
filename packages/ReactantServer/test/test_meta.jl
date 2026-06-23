@@ -23,7 +23,8 @@ _meta_manifest(name, calls) = _RS.parse_manifest(Dict{String,Any}(
 
 # A registry hosting the "scale" backbone, a started scheduler over it, and a QueueingCaller a meta
 # uses to run sub-models: each sub-call re-enters the started scheduler in-process (the loop dispatches
-# the committed sub-model request). `nothing` for the scratch pool -> `call.scratch` returns plain arrays.
+# the committed sub-model request). `nothing` for the scratch pool -> `call.scratch` buffers are
+# backed by fresh heap Memory (still FixedSizeArrays, like the pooled path).
 function _meta_local_caller()
     backend = _RS.MockBackend()
     pool = _RS.MemoryPool(backend, _RS.MockClient(), _RS.MockDevice(0), "mock", nothing)
@@ -80,6 +81,34 @@ end
     @test out2[1].data == fill(Float32(81), 4)
 
     _RS.shutdown!(sched)
+end
+
+@testset "call.scratch carves buffers up front (pooled and heap)" begin
+    # The orchestration requests all its buffers up front, writes into them, and returns one.
+    run = function (inputs, call)
+        x = call("scale", inputs)[1].data            # [2, 4, 6, 8]
+        a, b = call.scratch([(4,) => Float32, (2,) => Int32])
+        @test a isa Vector{Float32}                  # plain Array aliasing the pool backing
+        @test b isa Vector{Int32}
+        a .= x
+        b .= Int32[0, 0]
+        return [_RS.NamedTensor("OUT", a .+ 1)]
+    end
+    meta = _RS.MetaEntry("detector", _meta_manifest("detector", ["scale"]), ["scale"], run)
+
+    # No-pool caller: buffers are backed by fresh heap Memory.
+    sched, _ = _meta_local_caller()
+    out = _RS.run_meta(meta, _RS.QueueingCaller(sched, nothing),
+                       [_RS.NamedTensor("x", Float32[1, 2, 3, 4])])
+    @test out[1].data == Float32[3, 5, 7, 9]
+    _RS.shutdown!(sched)
+
+    # Pooled caller: buffers are carved from one acquired slot and released when run_meta returns.
+    sched2, _ = _meta_local_caller()
+    pooled = _RS.QueueingCaller(sched2, _RS.BufferPool(4096; n_slots = 4, use_shm = false))
+    out2 = _RS.run_meta(meta, pooled, [_RS.NamedTensor("x", Float32[1, 2, 3, 4])])
+    @test out2[1].data == Float32[3, 5, 7, 9]
+    _RS.shutdown!(sched2)
 end
 
 @testset "meta call guard rejects undeclared sub-calls" begin

@@ -217,4 +217,28 @@
         @test length(unique(s.index for s in drained)) == n_slots
         foreach(ReactantServerCore.release_slot!, drained)
     end
+
+    @testset "scratch carves several typed buffers at once" begin
+        p = ReactantServerCore.BufferPool(4096; n_slots = 4, use_shm = false)
+        s = ReactantServerCore.acquire_slot!(p, 2)
+        f, i = ReactantServerCore.scratch(s, [(4,) => Float32, (2,) => Int32])
+        # Arrays aliasing the pool backing (handed to NamedTensor by reference downstream).
+        @test f isa Vector{Float32}
+        @test i isa Vector{Int32}
+        @test size(f) == (4,) && size(i) == (2,)
+        # Disjoint, contiguous offsets within the slot.
+        base = Int(ReactantServerCore.pool_base_pointer(p))
+        @test Int(pointer(f)) - base == s.offset
+        @test Int(pointer(i)) - base == s.offset + 4 * sizeof(Float32)
+        # Writes land in the right bytes and the buffers do not alias.
+        f .= Float32[1, 2, 3, 4]
+        i .= Int32[10, 20]
+        @test f == Float32[1, 2, 3, 4] && i == Int32[10, 20]
+        # Scalar form returns a single buffer with the given shape.
+        s2 = ReactantServerCore.acquire_slot!(p)
+        m = ReactantServerCore.scratch(s2, (3, 3), Float64)
+        @test size(m) == (3, 3) && m isa Matrix{Float64}
+        ReactantServerCore.release_slot!(s2)
+        ReactantServerCore.release_slot!(s)
+    end
 end

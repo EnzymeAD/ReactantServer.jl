@@ -16,9 +16,9 @@ using gRPCClient
 using ReactantServerCore
 using ReactantServerCore.inference   # KServe message types in scope for the client stubs
 
-# These Core functions get new methods on InferenceBufferPool below, so they must be imported
-# (not merely `using`-visible) to extend rather than shadow them.
-import ReactantServerCore: acquire_slot!, is_shm_backed
+# These Core functions get new methods below (on InferenceBufferPool, and the client `scratch`
+# overload returning wire descriptors), so they must be imported to extend rather than shadow them.
+import ReactantServerCore: acquire_slot!, is_shm_backed, scratch, pool_view
 
 import Base: length, sizeof, rm, elsize
 
@@ -89,7 +89,7 @@ export infer_decode_chunk!
 export model_name
 
 export InferenceBufferPool, PoolSlot, PoolInferInput
-export subslot, pool_view, pool_memory, pool_fsa, item_input_bytes, infer_encode_chunk!
+export subslot, pool_view, pool_memory, pool_fsa, scratch, item_input_bytes, infer_encode_chunk!
 export OutputSpec, output_specs, item_output_bytes
 export acquire_slot!, release_slot!
 

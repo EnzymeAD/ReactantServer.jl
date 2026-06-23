@@ -56,9 +56,10 @@ or [`infer_sync`](@ref)`(model, io)` (serial). The driver stages each chunk thro
 `ReactantServerCore.BufferPool`: when the server shares the client's IPC namespace, inputs travel
 over the Triton system shared-memory data plane (zero extra copies on the wire); otherwise the
 driver transparently falls back to inline transport. Your IO implements `length`,
-`item_input_bytes`, `infer_encode_chunk!` (write a chunk's inputs into the provided pool slot and return
-the input descriptors), and `infer_decode_chunk!` (consume the response). The pool's fixed-slot
-allocator hands every chunk a disjoint slot, so concurrent `infer_async` calls are safe.
+`item_input_bytes`, `infer_encode_chunk!` (request the chunk's input buffers with `scratch`, write
+into them, and return them tagged with their tensor names), and `infer_decode_chunk!` (consume the
+response). The pool's fixed-slot allocator hands every chunk a disjoint slot, so concurrent
+`infer_async` calls are safe.
 
 `kserve_init(; pool_bytes, n_slots)` sizes the staging pool and the number of slots
 (the dispatch concurrency); `kserve_shutdown()` tears it down.
@@ -81,13 +82,16 @@ ReactantServerClient.item_input_bytes(::VectorIO) = 4 * sizeof(Float32)
 
 function ReactantServerClient.infer_encode_chunk!(io::VectorIO, r::UnitRange, slot::PoolSlot)
     n = length(r)
-    sub = subslot(slot, n * 4 * sizeof(Float32))
-    buf = pool_view(sub, Float32, n * 4)
+    # Request all input buffers up front by name (Julia column-major: per-item dims, batch axis
+    # last). `scratch` carves them from the chunk's slot and returns wire descriptors; write into
+    # each with pool_view. The SHM-vs-inline transport is handled by the driver, so this is the same
+    # code either way.
+    inputs = scratch(slot, ["INPUT__0" => ((4, n), Float32)])
+    buf = pool_view(inputs[1])                        # one input; multiple: feats, mask = pool_view(inputs...)
     @infer_inbounds for (k, i) in enumerate(r)        # hot path: elided normally, checked under validate_io
-        buf[(4k - 3):(4k)] .= io.inputs[i]
+        buf[:, k] .= io.inputs[i]
     end
-    # Julia column-major shape: the per-item dims, then the batch axis last.
-    return [InferInput("INPUT__0", sub, [4, n], Float32)]
+    return inputs
 end
 
 function ReactantServerClient.infer_decode_chunk!(io::VectorIO, r::UnitRange, response)
@@ -101,6 +105,11 @@ end
 io = VectorIO([Float32[i, i, i, i] for i in 1:100], [Float32[] for _ in 1:100])
 infer_async(model, io)                                # results land in io.outputs
 ```
+
+`scratch` is the same buffer-request interface meta models use through `call.scratch` (see the meta
+models manual). The lower-level path is still supported: carve a `subslot`, `pool_view` it, and
+return an `InferInput(name, sub, shape, T)` descriptor; both forms may be mixed in the returned
+vector.
 
 ## Validating an IO against a model
 

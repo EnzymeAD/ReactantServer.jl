@@ -78,7 +78,8 @@ end
 
 Request reuse buffers for this request. With a pool, all requested buffers are carved from ONE
 contiguous acquired block (released when the orchestration returns); without a pool, plain heap
-arrays are returned. Identical model.jl code either way. The pool exists purely to keep large
+arrays are returned. Identical model.jl code either way: each buffer is an `Array` that can be
+handed straight to the next stage as a `NamedTensor` by reference. The pool exists purely to keep large
 intermediates (e.g. an ROI feature tensor) off the per-request allocation path and hold down GC
 pressure: a meta writes into the pooled buffer and hands it to the next stage by reference (the call
 is in-process, so there is no copy). The pool is plain `Memory`, local to the worker, never shared.
@@ -112,7 +113,8 @@ function _scratch(mc::MetaCall, reqs::AbstractVector)
         rethrow()
     end
     push!(getfield(mc, :slots), slot)
-    return Any[pool_view(subslot(slot, sizeof(T) * prod(d)), T, d...) for (d, T) in specs]
+    # Carve all N buffers from the one acquired block (advances the slot cursor in order).
+    return scratch(slot, [d => T for (d, T) in specs])
 end
 
 """

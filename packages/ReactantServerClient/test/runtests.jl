@@ -145,6 +145,69 @@ end
         foreach(release_slot!, slots)
     end
 
+    @testset "scratch + pool_view staging (inline)" begin
+        p = InferenceBufferPool(4096; n_slots = 4, use_shm = false)
+        m = KServeModel("grpc://h:1", "x"; max_batch_size = 100000)
+        s = acquire_slot!(p, 2)                                   # fresh slot: cursor at 0
+        inputs = scratch(s, ["INPUT__0" => ((4, 3), Float32), "MASK" => ((3,), Int32)])
+
+        # One contiguous block, carved into disjoint descriptors with the right shape/dtype/offset.
+        @test inputs isa Vector{PoolInferInput}
+        @test inputs[1].subslot.offset == s.offset
+        @test inputs[2].subslot.offset == s.offset + 4 * 3 * sizeof(Float32)
+        @test inputs[1].shape == [4, 3] && inputs[1].dtype == Float32
+        @test inputs[2].shape == [3] && inputs[2].dtype == Int32
+
+        feats, mask = pool_view(inputs...)            # splat the descriptors, destructure the views
+        @test feats isa Matrix{Float32} && mask isa Vector{Int32}
+        feats .= reshape(collect(Float32, 1:12), 4, 3)
+        mask  .= Int32[7, 8, 9]
+
+        # Inline materialization builds the same wire tensors the manual InferInput path would.
+        wire = ReactantServerClient._materialize_inputs(inputs, m, p)
+        @test wire[1].name == "INPUT__0" && wire[1].datatype == "FP32"
+        @test wire[1].shape == [3, 4]                             # reversed col-major -> row-major
+        @test wire[1].contents.fp32_contents == collect(Float32, 1:12)
+        @test wire[2].datatype == "INT32"
+        @test wire[2].contents.int_contents == Int32[7, 8, 9]
+        release_slot!(s)
+    end
+
+    @testset "scratch staging (shm) references the pool region by offset" begin
+        p = InferenceBufferPool(4096; n_slots = 4, use_shm = true, name = "rsc_scratch_pool")
+        try
+            m = KServeModel("grpc://h:1", "x"; max_batch_size = 100000)
+            s = acquire_slot!(p, 2)
+            inputs = scratch(s, ["A" => ((4,), Float32), "B" => ((2,), Int32)])
+            wire = ReactantServerClient._materialize_inputs(inputs, m, p)
+            pa = wire[1].parameters
+            @test pa["shared_memory_region"].parameter_choice[] == ReactantServerClient.pool_name(p)
+            @test pa["shared_memory_offset"].parameter_choice[] == s.offset
+            @test pa["shared_memory_byte_size"].parameter_choice[] == 4 * sizeof(Float32)
+            pb = wire[2].parameters
+            @test pb["shared_memory_offset"].parameter_choice[] == s.offset + 4 * sizeof(Float32)
+            @test pb["shared_memory_byte_size"].parameter_choice[] == 2 * sizeof(Int32)
+            release_slot!(s)
+        finally
+            rm(p.pool.backing)
+        end
+    end
+
+    @testset "scratch returns a homogeneous descriptor vector (no element promotion)" begin
+        p = InferenceBufferPool(4096; n_slots = 4, use_shm = false)
+        s = acquire_slot!(p, 2)
+        # Mixed dtypes stay one concrete type: returning these never promotes/copies a buffer the
+        # way a literal vector of differently-typed arrays would.
+        inputs = scratch(s, ["F" => ((4,), Float32), "I" => ((2,), Int32)])
+        @test inputs isa Vector{PoolInferInput}
+        @test pool_view(inputs[1]) isa Vector{Float32}
+        @test pool_view(inputs[2]) isa Vector{Int32}
+        # Scalar form returns a single descriptor.
+        one = scratch(s, "X", (3,), Float64)
+        @test one isa PoolInferInput && one.shape == [3] && one.dtype == Float64
+        release_slot!(s)
+    end
+
     @testset "InferInput builds wire tensors" begin
         x = reshape(collect(Float32, 1:6), 2, 3)        # Julia (W=2, H=3)
         t = InferInput("INPUT__0", x)

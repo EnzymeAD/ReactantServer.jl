@@ -1,14 +1,31 @@
 # ============================================================================
 # AbstractInferenceIO contract
 #
-#   infer_encode_chunk!(io, r::UnitRange, slot::PoolSlot)::AbstractVector{PoolInferInput}
+#   infer_encode_chunk!(io, r::UnitRange, slot::PoolSlot)::AbstractVector
 #   item_input_bytes(io)::Int    # total bytes per item summed across all inputs
 #   infer_decode_chunk!(io, r::UnitRange, response)::Nothing
 #   length(io)::Int
+#
+# `infer_encode_chunk!` stages a chunk's inputs into the driver-provided `slot` and returns one
+# descriptor per network input. The recommended way is `scratch`, which mirrors the meta-model
+# `call.scratch`: request all input buffers up front by name, write into them, and return them —
+#
+#   function infer_encode_chunk!(io, r, slot)
+#       n = length(r)
+#       inputs = scratch(slot, ["INPUT__0" => ((4, n), Float32), "MASK" => ((n,), Int32)])
+#       feats, mask = pool_view(inputs...)
+#       for (j, i) in enumerate(r); feats[:, j] .= io.feats[i]; mask[j] = io.labels[i]; end
+#       return inputs
+#   end
+#
+# `item_input_bytes` must equal the per-item sum over those buffers, since the driver sizes the
+# slot from it before calling `infer_encode_chunk!`. The lower-level path — carve `subslot`s,
+# `pool_view` them, and return `InferInput(name, sub, shape, T)` (`PoolInferInput`) — is still
+# accepted; both forms may be mixed in the returned vector.
 # ============================================================================
 
-# A deferred descriptor produced by infer_encode_chunk!. The SHM-vs-inline choice is
-# resolved by `materialize_input` at gRPC-request time, based on whether the
+# A deferred descriptor produced by infer_encode_chunk! (directly, or by `scratch`). The
+# SHM-vs-inline choice is resolved by `materialize_input` at gRPC-request time, based on whether the
 # pool that owns the slot is SHM-backed.
 struct PoolInferInput
     name::String
@@ -122,6 +139,55 @@ end
 function _materialize_inputs(inputs, model, pool::InferenceBufferPool)
     [materialize_input(d, model, pool) for d in inputs]
 end
+
+# ---- scratch: request all of a chunk's input buffers at once (mirrors the meta `call.scratch`) ----
+
+"""
+    scratch(slot, name, dims, T) -> PoolInferInput
+    scratch(slot, ["name1" => (dims1, T1), "name2" => (dims2, T2), ...]) -> Vector{PoolInferInput}
+
+Carve one input buffer per named spec from the chunk's `slot`, advancing its cursor so the buffers
+occupy disjoint, contiguous byte ranges, and return the wire descriptors ready to hand back from
+[`infer_encode_chunk!`](@ref). `dims` is the Julia column-major shape (per-item dims then the batch
+axis), or a bare integer for a vector. Get the writable views with [`pool_view`](@ref): one
+descriptor returns one view, and splatting the vector returns all of them to destructure at once.
+
+```julia
+function infer_encode_chunk!(io, r, slot)
+    n = length(r)
+    inputs = scratch(slot, ["INPUT__0" => ((4, n), Float32), "MASK" => ((n,), Int32)])
+    feats, mask = pool_view(inputs...)
+    for (j, i) in enumerate(r); feats[:, j] .= io.feats[i]; mask[j] = io.labels[i]; end
+    return inputs
+end
+```
+
+The returned vector is homogeneous (`Vector{PoolInferInput}`), so it never triggers element
+promotion the way a literal of differently-typed arrays would. `item_input_bytes(io)` must equal the
+per-item sum over these buffers, since the driver sizes the slot from it before `infer_encode_chunk!`
+runs. The lower-level path (carve a `subslot`, `pool_view` it, build `InferInput` by hand) is still
+supported and may be mixed into the returned vector.
+"""
+scratch(slot::PoolSlot, name::AbstractString, dims, ::Type{T}) where {T} =
+    first(scratch(slot, [String(name) => (dims, T)]))
+
+function scratch(slot::PoolSlot, specs::AbstractVector{<:Pair{<:AbstractString}})
+    return PoolInferInput[_scratch_input(slot, first(s), last(s)) for s in specs]
+end
+
+function _scratch_input(slot::PoolSlot, name::AbstractString, spec)
+    dims, T = first(spec), last(spec)
+    d = dims isa Tuple ? dims : (dims,)
+    sub = subslot(slot, sizeof(T) * prod(d))
+    return PoolInferInput(String(name), sub, Int[d...], T)
+end
+
+# Writable view of a scratch-carved input buffer, typed and shaped from its descriptor.
+pool_view(d::PoolInferInput) = pool_view(d.subslot, d.dtype, d.shape...)
+
+# Splat the descriptor vector to get every view at once and destructure them:
+#   feats, mask = pool_view(inputs...)
+pool_view(d1::PoolInferInput, ds::PoolInferInput...) = map(pool_view, (d1, ds...))
 
 # ---- Chunking math ----
 #

@@ -74,7 +74,7 @@ export memory_from_shm, memory_from_bytes, fsa_from_memory
 
 # ---- buffer pool ----
 export BufferPool, PoolSlot, acquire_slot!, release_slot!, subslot, reset_slot!, PoolAcquireTimeout
-export pool_view, pool_memory, pool_fsa, is_shm_backed
+export pool_view, pool_memory, pool_fsa, is_shm_backed, scratch
 export pool_base_pointer, pool_region_name, pool_slot_bytes
 
 # ---- weight store ----

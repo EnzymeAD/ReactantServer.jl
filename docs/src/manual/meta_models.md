@@ -146,10 +146,13 @@ fill_rois!(roi, feats, boxes)                  # write directly into it
 out = call("object_detector_stage2", [ReactantServer.NamedTensor("ROI_FEATS", roi)])
 ```
 
-The pool is plain memory, local to the worker, and never shared across processes. It exists purely to
-keep large intermediates off the per-request allocation path; because the sub-call runs in-process,
-the buffer is handed to the next stage by reference, with no copy. A meta that never calls `scratch`
-just allocates normally, and the same `model.jl` is correct with or without a pool configured.
+`call.scratch` returns plain `Array`s aliasing the pool's backing (or, with no pool configured, fresh
+heap arrays), so a buffer can be handed straight to the next stage as a `NamedTensor` by reference;
+either way the `model.jl` is identical. The pool is plain memory, local to the worker, and never
+shared across processes. It exists purely to keep large intermediates off the per-request allocation
+path; because the sub-call runs in-process, the buffer is handed to the next stage by reference, with
+no copy. A meta that never calls `scratch` just allocates normally. The client driver exposes the
+same `scratch` interface for staging inference inputs (see the client usage manual).
 
 Request every buffer in one `call.scratch` call (pass a vector of `dims => T` pairs to get several at
 once); calling it more than once per request is rejected, and a scratch buffer must reach the
