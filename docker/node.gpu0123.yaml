@@ -14,9 +14,13 @@
 # (node.gpu23.yaml), no `models:` map is needed; the on-demand weight cache (weight_cache_bytes)
 # keeps each GPU memory-safe by loading weights lazily and evicting LRU within the byte budget.
 #
-# These are NVIDIA T4 cards (16 GiB each), so weight_cache_bytes is set to 10 GiB rather than the
-# 24 GiB used on the larger cards in node.gpu23.yaml: with mem_fraction 0.9 preallocating ~14.4 GiB,
-# the weight cache must leave headroom for activations and the autotune workspace.
+# These are NVIDIA T4 cards (~15.4 GiB usable each). After enabling the large detection input-shape
+# variants (text_fuse_net_gpu up to 2816x2816), the old 10 GiB weight cache left too little room inside
+# the pool for activations and autotune scratch, causing OOM under load. The budget is now rebalanced:
+# weight_cache_bytes 8 GiB (roughly half the card), mem_fraction raised to 0.95, and the BFC arena
+# replaced by the CUDA stream-ordered allocator (TF_GPU_ALLOCATOR=cuda_malloc_async, set in the compose
+# file) with preallocate off so memory grows on demand and transient buffers return cleanly, reducing
+# fragmentation.
 model_repo: /var/lib/reactantserver/models
 base_port: 8080
 # Per-worker Prometheus metrics port (metrics_base_port + worker index): worker0 -> 9100,
@@ -28,13 +32,19 @@ global:
   cache_dir: /var/cache/reactantserver
   runtime:
     backend: cuda
-    mem_fraction: 0.9
-    preallocate: true
+    # Aggressive on dedicated cards: 0.95 of ~15.4 GiB leaves ~0.5 GiB for the CUDA context/driver.
+    # With the async allocator (TF_GPU_ALLOCATOR=cuda_malloc_async in the compose env) this caps the
+    # pool's release threshold rather than preallocating an arena.
+    mem_fraction: 0.95
+    # Off so the stream-ordered allocator grows on demand and returns transient buffers to the driver
+    # pool. If the async allocator is ever disabled (BFC fallback), set this back to true: BFC with
+    # preallocate off fragments more, not less.
+    preallocate: false
     allow_cpu_fallback: false
     # On-demand weight cache per GPU: weights load lazily and evict LRU within this byte budget
-    # (10 GiB, sized for the T4's 16 GiB), so all models need not be resident at once. 0 would keep
-    # every weight resident.
-    weight_cache_bytes: 10737418240
+    # (8 GiB, roughly half the T4), so all models need not be resident at once and activations/autotune
+    # scratch keep room inside the budget. 0 would keep every weight resident.
+    weight_cache_bytes: 8589934592
     # Share the PINNED_SYSTEM host weight floor across all four worker subprocesses via POSIX shm
     # regions (keyed by model name + content digest) instead of each worker holding its own private
     # anonymous-RAM copy. Since every worker loads every bundle here, this collapses the host floor
