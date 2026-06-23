@@ -29,6 +29,11 @@ services:
       # /dev/shm explicitly, which podman-compose honors and which fully shares POSIX shm.
       - /dev/shm:/dev/shm
     ipc: host
+    environment:
+      # Use the CUDA stream-ordered (async) allocator instead of XLA's default BFC arena, matching the
+      # production stacks so the e2e path exercises the same allocator. Pairs with `preallocate: false`
+      # in the node file.
+      TF_GPU_ALLOCATOR: "cuda_malloc_async"
     # Host ports are remapped off 8001/8002/8080 to avoid colliding with a co-resident Triton
     # (whose gRPC default is 8001 and metrics 8002). Container-internal ports are the supervisor's
     # public 8001/8002 plus worker0's own 8080 (for the client's ModelMetadata introspection,
