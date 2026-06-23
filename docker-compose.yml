@@ -35,6 +35,12 @@ services:
     # Share the host IPC namespace so POSIX shared-memory regions (KServe system shared memory)
     # created by a client are visible to the workers via shm_open.
     ipc: host
+    environment:
+      # Use the CUDA stream-ordered (async) allocator instead of XLA's default BFC arena. It grows on
+      # demand and returns transient buffers to the driver pool, which avoids the fragmentation
+      # out-of-memory that variable input shapes (e.g. multi-aspect-ratio detection models) can drive
+      # in BFC. Pairs with `preallocate: false` in the node file; remove it to fall back to BFC.
+      TF_GPU_ALLOCATOR: "cuda_malloc_async"
     ports:
       - "8001:8001"   # KServe V2 gRPC endpoint for clients (Triton-compatible)
       - "8002:8002"   # Prometheus metrics / health / admin HTTP (Triton-compatible)

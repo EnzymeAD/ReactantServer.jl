@@ -47,6 +47,11 @@ services:
       # Physical GPUs 2 and 3; the supervisor assigns one to each worker child, which CUDA
       # renumbers to ordinal 0 inside its subprocess.
       CUDA_VISIBLE_DEVICES: "2,3"
+      # Use the CUDA stream-ordered (async) allocator instead of XLA's default BFC arena. It grows on
+      # demand and returns transient buffers to the driver pool, which avoids the fragmentation
+      # out-of-memory that variable input shapes (e.g. multi-aspect-ratio detection models) can drive
+      # in BFC. Pairs with `preallocate: false` in the node file; remove it to fall back to BFC.
+      TF_GPU_ALLOCATOR: "cuda_malloc_async"
       # Put the embedded gateway in lpt_packing mode without replication: each model is placed on a
       # single GPU and its traffic concentrated there for batch coalescing. The embedded gateway
       # inherits these REACTANT_GATEWAY_SCHEDULING_* variables from this environment.

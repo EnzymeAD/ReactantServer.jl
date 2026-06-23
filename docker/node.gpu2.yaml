@@ -23,7 +23,10 @@ global:
   runtime:
     backend: cuda
     mem_fraction: 0.9
-    preallocate: true
+    # Off to pair with the CUDA async allocator (TF_GPU_ALLOCATOR=cuda_malloc_async in the compose
+    # file), which grows on demand and returns transient buffers to the driver pool. Set true only
+    # when running without the async allocator (BFC), where preallocating one arena cuts fragmentation.
+    preallocate: false
     allow_cpu_fallback: false
     # On-demand weight cache: weights load lazily and evict LRU within this GPU byte budget, so all
     # models need not be resident at once. 0 would keep every weight resident.
