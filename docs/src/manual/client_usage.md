@@ -86,12 +86,12 @@ function ReactantServerClient.infer_encode_chunk!(io::VectorIO, r::UnitRange, sl
     # last). `scratch` carves them from the chunk's slot and returns wire descriptors; write into
     # each with pool_view. The SHM-vs-inline transport is handled by the driver, so this is the same
     # code either way.
-    inputs = scratch(slot, ["INPUT__0" => ((4, n), Float32)])
-    buf = pool_view(inputs[1])                        # one input; multiple: feats, mask = pool_view(inputs...)
+    input = scratch(slot, "INPUT__0", (4, n), Float32)  # single input: scalar form returns one descriptor
+    buf = pool_view(input)                            # multiple inputs: feats, mask = pool_view(inputs...)
     @infer_inbounds for (k, i) in enumerate(r)        # hot path: elided normally, checked under validate_io
         buf[:, k] .= io.inputs[i]
     end
-    return inputs
+    return input                                      # a lone PoolInferInput is accepted; no vector needed
 end
 
 function ReactantServerClient.infer_decode_chunk!(io::VectorIO, r::UnitRange, response)

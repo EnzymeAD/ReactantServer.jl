@@ -1,7 +1,7 @@
 # ============================================================================
 # AbstractInferenceIO contract
 #
-#   infer_encode_chunk!(io, r::UnitRange, slot::PoolSlot)::AbstractVector
+#   infer_encode_chunk!(io, r::UnitRange, slot::PoolSlot)::Union{PoolInferInput, AbstractVector}
 #   item_input_bytes(io)::Int    # total bytes per item summed across all inputs
 #   infer_decode_chunk!(io, r::UnitRange, response)::Nothing
 #   length(io)::Int
@@ -140,6 +140,13 @@ function _materialize_inputs(inputs, model, pool::InferenceBufferPool)
     [materialize_input(d, model, pool) for d in inputs]
 end
 
+# `infer_encode_chunk!` may return a single `PoolInferInput` (e.g. straight from the scalar
+# `scratch(slot, name, dims, T)` form, the common single-input case) or a vector of them.
+# Normalize either to an iterable of descriptors so the driver and `validate_io` treat both
+# the same; a lone descriptor would otherwise be iterated field-by-field.
+_encoded_inputs(d::PoolInferInput) = (d,)
+_encoded_inputs(ds) = ds
+
 # ---- scratch: request all of a chunk's input buffers at once (mirrors the meta `call.scratch`) ----
 
 """
@@ -151,6 +158,10 @@ occupy disjoint, contiguous byte ranges, and return the wire descriptors ready t
 `infer_encode_chunk!`. `dims` is the Julia column-major shape (per-item dims then the batch
 axis), or a bare integer for a vector. Get the writable views with `pool_view`: one
 descriptor returns one view, and splatting the vector returns all of them to destructure at once.
+
+The scalar form returns one `PoolInferInput`; the vector form returns a `Vector{PoolInferInput}`.
+`infer_encode_chunk!` accepts either as its return value, so a single-input IO can return the
+scalar form directly without wrapping it in a vector.
 
 ```julia
 function infer_encode_chunk!(io, r, slot)
@@ -386,9 +397,9 @@ end
 function _run_chunk(m, io, pool, client, fill_lock, r, slot)
     try
         reset_slot!(slot)
-        inputs = lock(fill_lock) do
+        inputs = _encoded_inputs(lock(fill_lock) do
             infer_encode_chunk!(io, r, slot)
-        end
+        end)
         # Output subslots are carved from the same slot, after the inputs, so a request can stage
         # both through one registered region. Outputs are read back before the slot is released.
         requested, out_subslots = _build_requested_outputs(output_specs(io), slot, r, pool)

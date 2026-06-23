@@ -17,11 +17,12 @@ abstract type AbstractInferenceIO end
 #=
 AbstractInferenceIO children *MUST* implement:
 
-    infer_encode_chunk!(io, r::UnitRange, slot::PoolSlot) ::AbstractVector{PoolInferInput}
+    infer_encode_chunk!(io, r::UnitRange, slot::PoolSlot) ::Union{PoolInferInput, AbstractVector{PoolInferInput}}
         Carve subslots from `slot`, write the inputs for items `r` into them,
-        and return one PoolInferInput descriptor per network input. The pool
-        owns the bytes; the IO must not retain references to the slot or
-        subslots past this call's return.
+        and return the network input descriptors. Return a single PoolInferInput
+        for a single-input model (e.g. straight from `scratch(slot, name, dims, T)`),
+        or a vector of them for multiple inputs. The pool owns the bytes; the IO
+        must not retain references to the slot or subslots past this call's return.
 
     item_input_bytes(io) ::Int
         Bytes consumed per item, summed across every input the IO stages.

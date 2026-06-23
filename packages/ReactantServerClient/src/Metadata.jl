@@ -277,7 +277,7 @@ function validate_io(spec::ModelIOSpec, io::AbstractInferenceIO; items::Integer 
             error("infer_encode_chunk!($(typeof(io)), $r) failed during validate_io: " *
                   "$(sprint(showerror, ex))")
         end
-        _validate_input_descriptors(spec, inputs)
+        _validate_input_descriptors(spec, _encoded_inputs(inputs))
 
         response = _synth_response(spec, io, r)
         try
