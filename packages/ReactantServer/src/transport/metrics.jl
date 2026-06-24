@@ -28,7 +28,8 @@ end
 Prometheus.metric_names(::WorkerSnapshotCollector) = (
     "worker_dispatch_total", "worker_compute_seconds_total", "worker_queue_depth",
     "worker_queue_wait_seconds", "worker_model_resident", "worker_model_pinned",
-    "worker_model_weight_bytes", "worker_requests_served_total", "worker_model_max_batch_size",
+    "worker_model_weight_bytes", "worker_requests_served_total", "worker_rows_served_total",
+    "worker_model_max_batch_size",
     "worker_weight_cache_resident_bytes",
     "worker_weight_cache_max_bytes", "worker_weight_cache_pinned_bytes",
     "worker_weight_cache_max_scratch_bytes", "worker_weight_pool_bytes",
@@ -89,8 +90,12 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
         Prometheus.Metric("gauge", "worker_model_weight_bytes",
             "Per-model weight footprint (bytes).", persamples(m -> m.weight_nbytes)),
         Prometheus.Metric("counter", "worker_requests_served_total",
-            "Requests coalesced into dispatches per model (the coalescing-factor numerator; "
-            * "served/dispatch = average effective batch size).", persamples(m -> m.requests_served)),
+            "Separate requests coalesced into dispatches per model (served/dispatch = server-side "
+            * "request merging; stays 1 when each request is dispatched alone).", persamples(m -> m.requests_served)),
+        Prometheus.Metric("counter", "worker_rows_served_total",
+            "Batch-axis rows processed per model (rows/dispatch = effective batch size; counts "
+            * "client-prebatched rows too, so it reveals batching that request-merging misses).",
+            persamples(m -> m.rows_served)),
         Prometheus.Metric("gauge", "worker_model_max_batch_size",
             "Largest batch size the worker coalesces this model to (<=1 means non-coalescable).",
             persamples(m -> m.max_batch_size)),

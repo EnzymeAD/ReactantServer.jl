@@ -107,6 +107,7 @@ mutable struct ModelSchedState
     # observability
     dispatch_count::Int                   # coalesced batch executions
     requests_served::Int                  # individual requests served (>= dispatch_count under coalescing)
+    rows_served::Int                      # batch-axis rows processed; rows/dispatch = effective batch size (counts client-prebatched rows, not just server-coalesced requests)
     total_compute::Float64
     wait_samples::Vector{Float64}
     batch_size_hist::Dict{Int,Int}
@@ -114,5 +115,5 @@ end
 
 function ModelSchedState(name::AbstractString, mc::ModelSchedConfig, now::Float64)
     return ModelSchedState(String(name), mc.weight, mc.max_batch_size, QueuedRequest[],
-        0.0, now, Dict{Int,Float64}(), 0, 0, 0.0, Float64[], Dict{Int,Int}())
+        0.0, now, Dict{Int,Float64}(), 0, 0, 0, 0.0, Float64[], Dict{Int,Int}())
 end

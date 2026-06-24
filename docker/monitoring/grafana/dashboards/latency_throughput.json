@@ -200,7 +200,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (worker) (rate(worker_requests_served_total{worker=~\"$worker\"}[$__rate_interval])) / clamp_min(sum by (worker) (rate(worker_dispatch_total{worker=~\"$worker\"}[$__rate_interval])), 1e-9)",
+          "expr": "sum by (worker) (rate(worker_rows_served_total{worker=~\"$worker\"}[$__rate_interval])) / clamp_min(sum by (worker) (rate(worker_dispatch_total{worker=~\"$worker\"}[$__rate_interval])), 1e-9)",
           "legendFormat": "{{worker}}"
         }
       ]

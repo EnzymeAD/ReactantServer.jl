@@ -542,6 +542,7 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
             _update_cost!(st, B, compute_time, s.cfg.cost_ema_alpha)
             st.dispatch_count += 1
             st.requests_served += length(taken)
+            st.rows_served += total
             st.total_compute += compute_time
             st.batch_size_hist[B] = get(st.batch_size_hist, B, 0) + 1
             _record_wait!(st, now, taken)
@@ -589,6 +590,7 @@ function _run_meta_request(s::Scheduler, meta::MetaEntry, req::InferRequest)
             _update_cost!(st, 0, compute, s.cfg.cost_ema_alpha)
             st.dispatch_count += 1
             st.requests_served += 1
+            st.rows_served += 1
             st.total_compute += compute
         end
         return out
@@ -1200,6 +1202,7 @@ function scheduler_metrics(s::Scheduler)
         return Dict(entry.name => (
             dispatch_count = entry.sched.dispatch_count,
             requests_served = entry.sched.requests_served,
+            rows_served = entry.sched.rows_served,
             total_compute = entry.sched.total_compute,
             recent_compute_ema = _decay_ema!(entry.sched, s.cfg.ema_halflife_seconds, now),
             queue_depth = length(entry.sched.queue),

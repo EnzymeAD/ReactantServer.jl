@@ -618,7 +618,7 @@
             "uid": "prometheus"
           },
           "expr": "worker_device_memory_in_use_bytes{worker=~\"$worker\"} / worker_device_memory_limit_bytes{worker=~\"$worker\"}",
-          "legendFormat": "{{worker}} ({{worker}})"
+          "legendFormat": "{{worker}}"
         }
       ]
     }
