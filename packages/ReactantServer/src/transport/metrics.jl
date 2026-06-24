@@ -35,6 +35,7 @@ Prometheus.metric_names(::WorkerSnapshotCollector) = (
     "worker_weight_load_seconds_total", "worker_device_memory_in_use_bytes",
     "worker_device_memory_limit_bytes", "worker_device_memory_free_bytes",
     "worker_device_memory_peak_in_use_bytes", "worker_device_memory_pool_bytes",
+    "worker_device_memory_process_used_bytes", "worker_device_memory_out_of_pool_bytes",
     "worker_models_loaded", "worker_models_resident", "worker_resident_weight_bytes",
     "worker_info",
 )
@@ -142,6 +143,21 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
             _scalar("worker_device_memory_pool_bytes", "gauge",
                 "Bytes the allocator has claimed from the device for its pool.", dm.pool_bytes),
         )
+        # Out-of-pool driver memory: what the driver says this process holds (nvidia-smi) minus the
+        # BFC arena. The arena is preallocated, so the remainder is the CUDA context + loaded modules
+        # + command buffers / CUDA graphs, i.e. the memory that lives OUTSIDE the pool and competes
+        # for the headroom between the arena and the card. This is the quantity behind intermittent
+        # command-buffer startup OOMs, and the allocator stats above cannot see it.
+        proc = process_device_used_bytes()
+        if proc !== nothing
+            push!(metrics,
+                _scalar("worker_device_memory_process_used_bytes", "gauge",
+                    "Device bytes this worker process holds per the driver (nvidia-smi): BFC arena + out-of-pool.", proc),
+                _scalar("worker_device_memory_out_of_pool_bytes", "gauge",
+                    "Driver memory outside the BFC arena (CUDA context + modules + command buffers/graphs); process used minus arena.",
+                    max(0, proc - dm.limit)),
+            )
+        end
     end
 
     # Identity + config, for grouping. Every exported series additionally carries worker/gpu
