@@ -27,7 +27,7 @@ function _node_backend(node::AbstractDict)
 end
 
 # The node's global.runtime dict, or an empty dict when absent/malformed. Used to inspect the
-# runtime knobs (e.g. weight_cache_bytes, shared_host_weights) for the multi-worker advisories
+# runtime knobs (e.g. weight_cache_fraction, shared_host_weights) for the multi-worker advisories
 # below, without parsing the typed ServerConfig the workers build for themselves.
 function _node_runtime(node::AbstractDict)
     g = get(node, "global", nothing)
@@ -128,16 +128,19 @@ function build_supervisor(node_path::AbstractString;
         ws = _node_workers(node)
 
         # Multiple workers each materialize their own private host weight floor unless the shared
-        # store is on. With the on-demand cache enabled (weight_cache_bytes > 0), an unspecified
-        # residency resolves to system-pinned, so that floor is one full host copy of every model's
-        # weights per worker: Nx host RAM on a single multi-GPU node. Warn so the operator opts into
-        # shared_host_weights (one shm-backed copy shared across the workers) rather than discovering
-        # the blowup under load. shared_host_weights only takes effect with the on-demand cache, so
-        # this is gated on weight_cache_bytes > 0.
+        # store is on. With the on-demand cache enabled (weight_cache_fraction > 0, the default), an
+        # unspecified residency resolves to system-pinned, so that floor is one full host copy of
+        # every model's weights per worker: Nx host RAM on a single multi-GPU node. Warn so the
+        # operator opts into shared_host_weights (one shm-backed copy shared across the workers)
+        # rather than discovering the blowup under load. shared_host_weights only takes effect with
+        # the on-demand cache, so this is gated on weight_cache_fraction > 0 (default 1.0).
         if length(ws) > 1
             rt = _node_runtime(node)
-            wcb = get(rt, "weight_cache_bytes", 0)
-            on_demand = wcb isa Real && wcb > 0
+            frac = get(rt, "weight_cache_fraction", 1.0)
+            # The on-demand cache (and its host floors) is GPU-only; on CPU there is no arena, so it
+            # never engages and the host-RAM-blowup advisory does not apply.
+            gpu = lowercase(string(get(rt, "backend", "cpu"))) in ("cuda", "gpu")
+            on_demand = gpu && frac isa Real && frac > 0
             shared = get(rt, "shared_host_weights", false) === true
             on_demand && !shared && push!(notes,
                 "WARNING: $(length(ws)) workers with the on-demand weight cache but " *

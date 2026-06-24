@@ -190,6 +190,12 @@ mutable struct LptPackingState <: GatewayScheduler
     # label pairs / models previously exported to the gauges, zeroed when dropped
     exported::Set{Tuple{String,String}}
     replicas_exported::Set{String}
+    # memory-compaction cadence (prober task only): mode, interval in repacks, and the number of
+    # repacks since the last fan-out (so the first placement-changing repack at or after the interval
+    # fires it). See `_maybe_compact_fleet!`.
+    compaction_mode::Symbol
+    compaction_interval::Int
+    repacks_since_compact::Int
 end
 
 LptPackingState(cfg::GatewayConfig) = LptPackingState(
@@ -204,7 +210,8 @@ LptPackingState(cfg::GatewayConfig) = LptPackingState(
     Dict{Tuple{String,String},Threads.Atomic{Int}}(),
     Dict{String,Threads.Atomic{Float64}}(),
     Dict{String,ReentrantLock}(), Dict{String,Threads.Atomic{Int}}(),
-    Set{Tuple{String,String}}(), Set{String}())
+    Set{Tuple{String,String}}(), Set{String}(),
+    cfg.compaction_mode, cfg.compaction_interval, 0)
 
 # Hot path: one dict lookup on an immutable snapshot plus an atomic increment. Insertion of a
 # never-seen model takes the lock once to swap in an extended copy.
@@ -380,12 +387,21 @@ function _repack!(s::LptPackingState, poll, metrics::Union{GatewayMetrics,Nothin
     s.last_fleet_compute = poll.fleet_compute
 
     # Count models whose worker set changed from the previous assignment (a model new this repack is
-    # an initial placement, not a move, so it is not counted).
+    # an initial placement, not a move, so it is not counted), and collect the workers affected by a
+    # move (gained or lost a model) so the caller can compact just those.
     moved = 0
+    changed_workers = Set{String}()
     for (m, placement) in next
         prevpl = get(prev, m, nothing)
         prevpl === nothing && continue
-        Set(first.(placement)) == Set(first.(prevpl)) || (moved += 1)
+        nextws = Set(first.(placement)); prevws = Set(first.(prevpl))
+        nextws == prevws && continue
+        moved += 1
+        union!(changed_workers, symdiff(nextws, prevws))
+    end
+    for (m, prevpl) in prev          # models dropped entirely this repack: their old workers lose them
+        haskey(next, m) && continue
+        union!(changed_workers, Set(first.(prevpl)))
     end
     @info "lpt_packing: repack" models = length(next) moved = moved held_by_hysteresis = stats.held max_improvement = round(stats.max_improvement; digits = 3) hysteresis = s.hysteresis compute_seconds = round(compute_elapsed; digits = 2) wall_seconds = round(wall_elapsed; digits = 1)
 
@@ -429,6 +445,30 @@ function _repack!(s::LptPackingState, poll, metrics::Union{GatewayMetrics,Nothin
             set_model_utilization!(metrics, m, um)
         end
     end
+    return changed_workers
+end
+
+# After a repack, fan a CompactMemory out to the workers whose assignment changed, on the gateway's
+# compaction cadence. Counts every repack; once `compaction_interval` repacks have elapsed, the first
+# one that actually moved a model (non-empty `changed`) fires the fan-out and resets the counter, so
+# it can land later than exactly N. `:off` disables; `:eager` sends an empty reload list (the
+# on-demand region refills lazily as requests arrive); `:scheduled` sends each changed worker the set
+# of models this repack assigned to it, warming the new placement. Runs on the prober task.
+function _maybe_compact_fleet!(s::LptPackingState, pool::ClientPool,
+                               metrics::Union{GatewayMetrics,Nothing}, changed::Set{String})
+    (s.compaction_mode == :off || s.compaction_interval <= 0) && return nothing
+    s.repacks_since_compact += 1
+    (s.repacks_since_compact >= s.compaction_interval && !isempty(changed)) || return nothing
+    s.repacks_since_compact = 0
+
+    perworker = Dict{String,Vector{String}}(w => String[] for w in changed)
+    if s.compaction_mode == :scheduled
+        for (m, placement) in @atomic(s.assignment), (w, _) in placement
+            haskey(perworker, w) && push!(perworker[w], m)
+        end
+    end
+    total, ok, failed = _compact_workers(pool, metrics, perworker)
+    @info "lpt_packing: compaction" mode = s.compaction_mode workers = ok reloaded = total failed = failed
     return nothing
 end
 
@@ -467,7 +507,10 @@ function tick_packing!(s::LptPackingState, pool::ClientPool, ready_urls::Vector{
     now = time()
     triggered = s.compute_accum >= s.rebalance_compute_seconds &&
                 (s.last_rebalance == 0.0 || now - s.last_rebalance >= s.min_rebalance_seconds)
-    triggered && _repack!(s, poll, metrics)
+    if triggered
+        changed = _repack!(s, poll, metrics)
+        _maybe_compact_fleet!(s, pool, metrics, changed)
+    end
     return nothing
 end
 

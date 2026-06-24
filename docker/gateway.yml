@@ -42,6 +42,12 @@ logging:
 #   default_replicas: 1             # GPUs per model unless overridden below (a number, or "all")
 #   routing_fill_factor: 1.0        # per-replica fill target as a multiple of max batch size (lpt_packing only)
 #   routing_policy: fill_rr         # fill_rr (default) | fill_least  (lpt_packing only)
+#   compaction_mode: off            # off (default) | eager | scheduled: after a placement-changing repack,
+#                                   # defragment the affected workers' on-demand weight memory. eager frees and
+#                                   # refills lazily; scheduled also reloads each worker's newly assigned models.
+#   compaction_interval: 0          # repacks between compactions; 0 disables. The first placement-changing
+#                                   # repack at or after this many repacks fires it. Workers behind the gateway
+#                                   # should leave scheduler.compaction_interval at 0 so the gateway owns this.
 #   models:
 #     resnet50:
 #       replicas: 2                 # this model on 2 distinct GPUs (a number, or "all")

@@ -41,6 +41,7 @@ import ReactantServerCore:
 include(ReactantServerCore.inference_client_stubs_path())
 include(ReactantServerCore.inference_server_stubs_path())
 include(ReactantServerCore.control_client_stubs_path())
+include(ReactantServerCore.control_server_stubs_path())   # gateway terminates ControlService/CompactMemory and fans it out
 
 include("headers.jl")
 include("config.jl")

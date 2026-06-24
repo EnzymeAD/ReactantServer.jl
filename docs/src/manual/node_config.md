@@ -50,12 +50,15 @@ global:
     mem_fraction: 0.9      # fraction of device memory claimed for the pool (GPU only)
     preallocate: true      # claim the pool up front (GPU only)
     allow_cpu_fallback: false
-    weight_cache_bytes: 0  # GPU byte budget for on-demand weights; 0 keeps all resident
+    weight_cache_fraction: 1.0          # arena fraction for all weights (pinned + on-demand); 0 disables, GPU only
+    weight_cache_wiggle_fraction: 0.1   # arena fraction kept free; drives startup peak probe + auto-sizing
   scheduler:               # -> SchedulerConfig
     discipline: fair       # fair | fifo | edf (use fifo or edf behind a gateway running lpt_packing)
     ema_halflife_seconds: 30.0
     max_queue_depth: 1024  # per-model queue cap; a full model rejects new requests
     dispatch_timeout_seconds: 30.0
+    compaction_interval: 0 # worker-local: defragment device memory every N on-demand weight loads;
+                           # 0 disables (the default). Leave 0 behind a gateway (see On-demand Weights)
     models: {}             # per-model overrides -> ModelSchedConfig (see below)
   endpoints:               # -> EndpointsConfig
     host: 0.0.0.0          # bind all interfaces so the gateway/clients can reach the worker
@@ -197,7 +200,7 @@ Any worker value can be overridden per process by an environment variable of the
 ```
 INFERENCE_SERVER_ENDPOINTS_PORT=9100
 INFERENCE_SERVER_RUNTIME_BACKEND=cpu
-INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_BYTES=8589934592
+INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_FRACTION=0.8
 ```
 
 List-valued overrides (`INFERENCE_SERVER_MODEL_DIRS`, `INFERENCE_SERVER_MODELS_INCLUDE`) are

@@ -147,7 +147,7 @@ end
         cfg, _, _ = load_single_worker(dir, """
         model_control_mode: explicit
         runtime:
-          weight_cache_bytes: 4000000000
+          weight_cache_fraction: 0.5
           shared_host_weights: true
         scheduler:
           models:
@@ -159,7 +159,7 @@ end
               weight: 1.5
         """; model_repo=modeldir)
         @test ReactantServer.validate_config(cfg) === cfg
-        @test cfg.runtime.weight_cache_bytes == 4_000_000_000
+        @test cfg.runtime.weight_cache_fraction == 0.5
         # residency_mode is derived from the control mode: explicit ⇒ externally-managed.
         @test cfg.model_control_mode == ReactantServer.EXPLICIT
         @test cfg.runtime.residency_mode == ReactantServer.EXTERNALLY_MANAGED
@@ -168,26 +168,48 @@ end
         @test cfg.scheduler.models["spine"].residency == ReactantServer.PINNED_SYSTEM
         @test cfg.scheduler.models["yolo"].residency === nothing   # unspecified; resolved at startup
 
-        # defaults: on-demand disabled, dynamic control mode (self-managed residency), private host weights
+        # defaults: self-sizing cache (fraction 1.0, wiggle 0.1), dynamic mode, self-managed, private host weights
         cfgb, _, _ = load_single_worker(dir, ""; model_repo=modeldir)
-        @test cfgb.runtime.weight_cache_bytes == 0
+        @test cfgb.runtime.weight_cache_fraction == 1.0
+        @test cfgb.runtime.weight_cache_wiggle_fraction == 0.1
         @test cfgb.model_control_mode == ReactantServer.DYNAMIC
         @test cfgb.model_poll_seconds == 15.0
         @test cfgb.runtime.residency_mode == ReactantServer.SELF_MANAGED
         @test cfgb.runtime.shared_host_weights == false
         @test cfgb.runtime.shared_host_weights_mode == 0o666
+    end
+end
 
-        # env override of the byte budget
-        withenv("INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_BYTES" => "123456") do
+@testset "weight cache fraction + wiggle: parse, env, validation, disable" begin
+    mktempdir() do dir
+        modeldir = joinpath(dir, "models"); mkpath(modeldir)
+
+        cfg, _, _ = load_single_worker(dir, """
+        runtime:
+          weight_cache_fraction: 0.6
+          weight_cache_wiggle_fraction: 0.05
+        """; model_repo=modeldir)
+        @test ReactantServer.validate_config(cfg) === cfg
+        @test cfg.runtime.weight_cache_fraction == 0.6
+        @test cfg.runtime.weight_cache_wiggle_fraction == 0.05
+
+        # 0 disables the on-demand cache (all weights resident).
+        cfg0, _, _ = load_single_worker(dir, "runtime:\n  weight_cache_fraction: 0.0"; model_repo=modeldir)
+        @test cfg0.runtime.weight_cache_fraction == 0.0
+
+        withenv("INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_FRACTION" => "0.75",
+                "INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_WIGGLE_FRACTION" => "0.2") do
             cfge, applied, _ = load_single_worker(dir, ""; model_repo=modeldir)
-            @test cfge.runtime.weight_cache_bytes == 123456
-            @test ("INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_BYTES", "123456") in applied
+            @test cfge.runtime.weight_cache_fraction == 0.75
+            @test cfge.runtime.weight_cache_wiggle_fraction == 0.2
+            @test ("INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_FRACTION", "0.75") in applied
         end
 
-        # validation rejects a negative budget
-        cbad, _, _ = load_single_worker(dir,
-            "runtime:\n  weight_cache_bytes: -1"; model_repo=modeldir)
-        @test_throws ReactantServer.ConfigError ReactantServer.validate_config(cbad)
+        # validation: fraction in [0,1], wiggle in [0,1)
+        cf, _, _ = load_single_worker(dir, "runtime:\n  weight_cache_fraction: 1.5"; model_repo=modeldir)
+        @test_throws ReactantServer.ConfigError ReactantServer.validate_config(cf)
+        cw, _, _ = load_single_worker(dir, "runtime:\n  weight_cache_wiggle_fraction: 1.0"; model_repo=modeldir)
+        @test_throws ReactantServer.ConfigError ReactantServer.validate_config(cw)
     end
 end
 

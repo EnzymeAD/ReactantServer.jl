@@ -220,6 +220,121 @@ end
     end
 end
 
+@testset "compaction frees on-demand weights and leaves pinned in place (eager)" begin
+    sched = _od_scheduler(_od_entry("P"; pinned=true, nbytes=_WBYTES),
+                          _od_entry("A"; pinned=false, nbytes=_WBYTES); budget=_WBYTES * 4)
+    _dispatch1!(sched, "A")                              # load A on demand
+    A = sched.registry.by_name["A"].executable
+    P = sched.registry.by_name["P"].executable
+    a_bufs = A.weights; p_bufs = P.weights
+    @test a_bufs !== nothing && p_bufs !== nothing
+
+    n = ReactantServer.compact!(sched.weight_cache, sched.registry)   # eager: free non-pinned only
+    @test n == 0                                         # nothing eagerly reloaded
+    @test all(b -> b.freed, a_bufs)                      # on-demand A's device buffers freed
+    @test A.weights === nothing                          # ...and left freed (reloads lazily)
+    @test P.weights === p_bufs                           # pinned P untouched (not freed, not reloaded)
+    @test !any(b -> b.freed, p_bufs)
+    @test !("A" in sched.weight_cache.lru)
+    @test sched.weight_cache.resident_bytes == 0         # on-demand region emptied; pinned is off-budget
+    @test sched.weight_cache.compactions == 1
+
+    res = _dispatch1!(sched, "A")                        # A reloads on its next dispatch
+    @test res[1].data == reshape(Float32[10, 100], 2, 1)
+    @test A.weights !== nothing
+end
+
+@testset "compaction reloads the requested non-pinned models eagerly" begin
+    sched = _od_scheduler(_od_entry("A"; pinned=false, nbytes=_WBYTES),
+                          _od_entry("B"; pinned=false, nbytes=_WBYTES); budget=_WBYTES * 4)
+    _dispatch1!(sched, "A"); _dispatch1!(sched, "B")
+    A = sched.registry.by_name["A"].executable
+    B = sched.registry.by_name["B"].executable
+    @test A.weights !== nothing && B.weights !== nothing
+
+    n = ReactantServer.compact!(sched.weight_cache, sched.registry; reload=["A"])
+    @test n == 1
+    @test A.weights !== nothing                          # listed: reloaded eagerly
+    @test B.weights === nothing                          # unlisted: left for lazy reload
+    @test "A" in sched.weight_cache.lru
+    @test sched.weight_cache.resident_bytes == _WBYTES
+end
+
+@testset "compaction is a no-op without the on-demand weight cache" begin
+    sched = _od_scheduler(_od_entry("A"; pinned=false, nbytes=_WBYTES); budget=_WBYTES)
+    A = sched.registry.by_name["A"].executable
+    A.weights = Any[ReactantServer.MockBuffer(copy(_W))]   # always-resident (no on-demand cache to churn)
+    sched.weight_cache = nothing
+    bufs = A.weights
+    @test ReactantServer._compact_entry!(sched) == 0
+    @test A.weights === bufs                              # untouched: nothing churns without the cache
+    @test !any(b -> b.freed, bufs)
+end
+
+@testset "worker auto-compaction fires once on-demand loads advance by the interval" begin
+    sched = _od_scheduler(_od_entry("A"; pinned=false, nbytes=_WBYTES),
+                          _od_entry("B"; pinned=false, nbytes=_WBYTES); budget=_WBYTES * 8)
+    sched.cfg = ReactantServer.SchedulerConfig(30.0, 1024, 30.0; compaction_interval=2)
+
+    _dispatch1!(sched, "A")                              # loads = 1
+    ReactantServer._maybe_compact!(sched)
+    @test sched.weight_cache.compactions == 0            # one load, below the interval
+    @test sched.registry.by_name["A"].executable.weights !== nothing
+
+    _dispatch1!(sched, "B")                              # loads = 2
+    ReactantServer._maybe_compact!(sched)
+    @test sched.weight_cache.compactions == 1            # loads advanced by the interval -> compacted (eager)
+    @test sched.registry.by_name["A"].executable.weights === nothing
+    @test sched.registry.by_name["B"].executable.weights === nothing
+    @test sched.weight_cache.resident_bytes == 0
+end
+
+@testset "CompactMemory handler runs compaction through the dispatch loop" begin
+    sched = _od_scheduler(_od_entry("P"; pinned=true, nbytes=_WBYTES),
+                          _od_entry("A"; pinned=false, nbytes=_WBYTES); budget=_WBYTES * 4)
+    ctx = ReactantServer.InferContext(sched, sched.registry, ReactantServer.SharedMemoryRegistry(), "mock")
+    _Ctl = ReactantServer.control
+    ReactantServer.start!(sched)
+    try
+        ReactantServer.infer(sched, ReactantServer.InferRequest("A", ["y"],
+            [ReactantServer.NamedTensor("x", reshape(Float32[1, 1], 2, 1))]))
+        @test sched.registry.by_name["A"].executable.weights !== nothing
+
+        p_bufs = sched.registry.by_name["P"].executable.weights
+        resp = ReactantServer._handle_compact_memory(ctx, _Ctl.CompactMemoryRequest())
+        @test resp.reloaded_models == 0                  # eager: nothing eagerly reloaded
+        @test sched.registry.by_name["A"].executable.weights === nothing   # on-demand A freed (lazy reload)
+        @test sched.registry.by_name["P"].executable.weights === p_bufs    # pinned P untouched
+    finally
+        ReactantServer.shutdown!(sched)
+    end
+end
+
+@testset "weight_budget reserves pinned + scratch + wiggle from the arena" begin
+    wb(; kw...) = ReactantServer.weight_budget(; kw...)
+    # No pinned, no scratch: on-demand gets fraction*arena, capped by (1-wiggle)*arena.
+    b = wb(arena=1000, fraction=1.0, wiggle=0.1, max_scratch=0, pinned_bytes=0)
+    @test b.scratch_ceiling == 900 && b.weight_pool == 900 && b.on_demand_budget == 900
+    # Fraction caps below the scratch ceiling.
+    b = wb(arena=1000, fraction=0.5, wiggle=0.1, max_scratch=0, pinned_bytes=0)
+    @test b.weight_pool == 500 && b.on_demand_budget == 500
+    # Scratch eats into the pool.
+    b = wb(arena=1000, fraction=1.0, wiggle=0.1, max_scratch=300, pinned_bytes=0)
+    @test b.weight_pool == 600 && b.on_demand_budget == 600
+    # Pinned reserves its portion off the top.
+    b = wb(arena=1000, fraction=1.0, wiggle=0.1, max_scratch=300, pinned_bytes=200)
+    @test b.weight_pool == 600 && b.on_demand_budget == 400 && !b.pinned_over_commit
+    # Pinned over-commit: pinned exceed the pool -> on-demand 0, flagged.
+    b = wb(arena=1000, fraction=1.0, wiggle=0.1, max_scratch=300, pinned_bytes=700)
+    @test b.on_demand_budget == 0 && b.pinned_over_commit
+    # Scratch alone exceeds the ceiling -> empty pool.
+    b = wb(arena=1000, fraction=1.0, wiggle=0.1, max_scratch=950, pinned_bytes=0)
+    @test b.weight_pool == 0 && b.on_demand_budget == 0
+    # Arena 0 (CPU/mock): everything zero.
+    b = wb(arena=0, fraction=1.0, wiggle=0.1, max_scratch=0, pinned_bytes=0)
+    @test b.weight_pool == 0 && b.on_demand_budget == 0
+end
+
 @testset "shared weight store backs a system-pinned model and unlinks on unpin" begin
     if !(Sys.islinux() && isdir("/dev/shm"))
         @test_skip "shared weight store requires Linux /dev/shm"

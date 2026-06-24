@@ -18,6 +18,10 @@ service ControlService
 
   // Update a model's live scheduler policy (currently its fair-discipline weight).
   rpc SetModelPolicy(SetModelPolicyRequest) returns (SetModelPolicyResponse) {}
+
+  // Free all resident device weights so the allocator coalesces its free list, then reload the
+  // pinned models (always) plus any named in reload_models. Used to defragment the device arena.
+  rpc CompactMemory(CompactMemoryRequest) returns (CompactMemoryResponse) {}
 }
 
 // Residency floor for a model's weights. UNSPECIFIED is never returned; it is the proto3 zero
@@ -87,3 +91,16 @@ message SetModelPolicyRequest
 }
 
 message SetModelPolicyResponse {}
+
+message CompactMemoryRequest
+{
+  // Non-pinned models to reload eagerly after freeing (pinned models are always reloaded). Empty
+  // reloads the pinned set only; the rest reload lazily as requests arrive (self-managed mode).
+  repeated string reload_models = 1;
+}
+
+message CompactMemoryResponse
+{
+  int64 reloaded_models = 1;
+  uint64 resident_bytes_after = 2;
+}

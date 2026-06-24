@@ -113,7 +113,7 @@ end
 @testset "verify_lpt_packing_preconditions!: gates on worker reachability" begin
     cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", ["127.0.0.1:1"], String[], 1, 1, 1, "info",
                            "json", "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr",
-                           Dict{String,GW.GatewayModelConfig}(), 32, 64)
+                           Dict{String,GW.GatewayModelConfig}(), 32, 64, :off, 0)
     pool = GW.ClientPool(cfg)
     # Default (wait_seconds = 0) fails fast when a worker is unreachable.
     @test_throws ErrorException GW.verify_lpt_packing_preconditions!(pool; wait_seconds = 0)
@@ -177,6 +177,35 @@ end
     @test asn3["a"][1][1] in W
 end
 
+@testset "gateway compaction cadence: fires on the Nth repack that moves a model" begin
+    mk(mode, interval) = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], 60, 1, 1,
+        "info", "json", "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr",
+        Dict{String,GW.GatewayModelConfig}(), 32, 64, mode, interval)
+    cfg = mk(:eager, 2)
+    s = GW.LptPackingState(cfg)
+    pool = GW.ClientPool(cfg)               # no workers; the ghost URL below is skipped (no network)
+    moved = Set(["ghost:1"])
+    none = Set{String}()
+
+    GW._maybe_compact_fleet!(s, pool, nothing, moved)
+    @test s.repacks_since_compact == 1      # below the interval: counts, no fan-out
+    GW._maybe_compact_fleet!(s, pool, nothing, moved)
+    @test s.repacks_since_compact == 0      # reached the interval with a move: fired and reset
+
+    # A no-move repack still counts but cannot fire, so the trigger can land later than exactly N.
+    GW._maybe_compact_fleet!(s, pool, nothing, none)
+    @test s.repacks_since_compact == 1
+    GW._maybe_compact_fleet!(s, pool, nothing, none)
+    @test s.repacks_since_compact == 2      # at/over the interval but nothing moved: still waiting
+    GW._maybe_compact_fleet!(s, pool, nothing, moved)
+    @test s.repacks_since_compact == 0      # first move after the interval fires and resets
+
+    # mode :off never counts or fires.
+    s_off = GW.LptPackingState(mk(:off, 2))
+    GW._maybe_compact_fleet!(s_off, GW.ClientPool(mk(:off, 2)), nothing, moved)
+    @test s_off.repacks_since_compact == 0
+end
+
 # Build a packing state directly for routing unit tests. Defaults to a single two-replica model
 # "m" on w0/w1; callers can install their own placement, per-model costs, and max batches.
 function _pk_state(; routing_policy = "fill_rr", fill_factor = 1.0, max_batch = 8,
@@ -184,7 +213,7 @@ function _pk_state(; routing_policy = "fill_rr", fill_factor = 1.0, max_batch = 
                    costs = nothing)
     cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], 60, 1, 1, "info", "json",
                            "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, fill_factor, routing_policy,
-                           Dict{String,GW.GatewayModelConfig}(), 32, 64)
+                           Dict{String,GW.GatewayModelConfig}(), 32, 64, :off, 0)
     s = GW.LptPackingState(cfg)
     @atomic s.assignment = assignment
     @atomic s.max_batch = Dict(m => max_batch for m in keys(assignment))
@@ -291,7 +320,7 @@ end
     @test bounded_call(3.0) == :ok          # first request times out at its 0.5s deadline, returns
     @test bounded_call(3.0) == :timed_out   # second reuses the poisoned connection and hangs
 
-    wc = GW.WorkerClients("127.0.0.1:$port", grpc, client, client, client, client, client, client)
+    wc = GW.WorkerClients("127.0.0.1:$port", grpc, client, client, client, client, client, client, client)
     GW.reset_clients!(wc)                    # close + reopen the handle: drops the poisoned connection
 
     @test bounded_call(3.0) == :ok          # fresh connection: times out at the deadline, no hang

@@ -24,3 +24,24 @@ ControlService_ModelControlStatus_Client(
 	max_recieve_message_length=max_recieve_message_length,
 )
 export ControlService_ModelControlStatus_Client
+
+ControlService_CompactMemory_Client(
+	host, port;
+	TRequest=CompactMemoryRequest,
+	TResponse=CompactMemoryResponse,
+	secure=false,
+	grpc=gRPCClient.grpc_global_handle(),
+	deadline=120,
+	keepalive=60,
+	max_send_message_length = 4*1024*1024,
+	max_recieve_message_length = 4*1024*1024,
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+	host, port, "/reactant_control.ControlService/CompactMemory";
+	secure=secure,
+	grpc=grpc,
+	deadline=deadline,
+	keepalive=keepalive,
+	max_send_message_length=max_send_message_length,
+	max_recieve_message_length=max_recieve_message_length,
+)
+export ControlService_CompactMemory_Client

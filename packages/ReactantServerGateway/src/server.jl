@@ -251,6 +251,61 @@ function _gw_shm_unregister(body::Vector{UInt8}, st::GatewayState)
     return resp === nothing ? UInt8[] : resp
 end
 
+# --- Memory compaction ------------------------------------------------------------------------
+
+# Fan CompactMemory out to a set of workers concurrently, each with its own reload list, keyed by
+# worker URL (no register gate: compaction is not a SHM region op). Returns (total_reloaded,
+# succeeded_urls, failed_urls). One slow or failing worker is isolated to its own @async branch and
+# never aborts the others. Shared by the operator RPC (`_gw_compact`, all workers, one list) and the
+# placement-driven path (lpt_packing's `_maybe_compact_fleet!`, changed workers, per-worker lists).
+function _compact_workers(pool::ClientPool, metrics::Union{GatewayMetrics,Nothing}, perworker::AbstractDict)
+    succeeded = String[]
+    failed = String[]
+    total = Ref(0)
+    lk = ReentrantLock()
+    @sync for (url, reload) in perworker
+        wc = get_clients(pool, url)
+        wc === nothing && continue
+        @async begin
+            t0 = time()
+            try
+                resp = invoke_compact(wc, CompactMemoryRequest(; reload_models = collect(String, reload)))
+                metrics === nothing || observe_worker!(metrics, "CompactMemory", url, time() - t0)
+                lock(lk) do
+                    push!(succeeded, url)
+                    total[] += Int(resp.reloaded_models)
+                end
+            catch e
+                metrics === nothing || observe_worker!(metrics, "CompactMemory", url, time() - t0)
+                lock(lk) do
+                    push!(failed, url)
+                end
+                @warn "compact: worker failed" worker = url exception = e
+            end
+        end
+    end
+    return total[], succeeded, failed
+end
+
+function _gw_compact(req::CompactMemoryRequest, st::GatewayState)
+    t0 = time()
+    reload = collect(String, req.reload_models)
+    perworker = Dict(wc.url => reload for wc in all_clients(st.pool))
+    total, succeeded, failed = _compact_workers(st.pool, st.metrics, perworker)
+    observe_request!(st.metrics, "CompactMemory", "", time() - t0)
+
+    if isempty(succeeded) && !isempty(failed)
+        inc_requests!(st.metrics, "CompactMemory", "", STATUS_UNAVAILABLE)
+        @warn "compact: every worker failed" failed_workers = failed
+        throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_UNAVAILABLE,
+            "compaction failed on all workers: $(failed)"))
+    end
+    isempty(failed) ? (@info "compact: ok" workers = succeeded reloaded = total) :
+        (@warn "compact: partial failures" ok_workers = succeeded failed_workers = failed reloaded = total)
+    inc_requests!(st.metrics, "CompactMemory", "", STATUS_OK)
+    return CompactMemoryResponse(; reloaded_models = Int64(total))
+end
+
 # --- Router -----------------------------------------------------------------------------------
 
 """
@@ -270,5 +325,8 @@ function build_gateway_router(state::GatewayState, cfg::GatewayConfig)
         (req, ctx) -> _gw_shm_register(req, ctx.payload))
     gRPCServer.handle!(router, raw(GRPCInferenceService_SystemSharedMemoryUnregister_Method),
         (req, ctx) -> _gw_shm_unregister(req, ctx.payload))
+    # Control plane: a single CompactMemory RPC to the gateway fans out to every worker.
+    register_ControlService!(router;
+        CompactMemory = (req, ctx) -> _gw_compact(req, ctx.payload))
     return router
 end

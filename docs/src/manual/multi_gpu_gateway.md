@@ -64,6 +64,8 @@ scheduling:
   default_replicas: 1           # GPUs per model unless overridden below (a number, or "all")
   routing_fill_factor: 1.0      # per-replica fill target as a multiple of max batch size (lpt_packing only)
   routing_policy: fill_rr       # fill_rr (default) | fill_least  (lpt_packing only)
+  compaction_mode: off          # off (default) | eager | scheduled  (defragment workers after a repack)
+  compaction_interval: 0        # repacks between compactions; 0 disables  (see On-demand Weights)
   models:
     big-model:
       replicas: 2               # this model is placed on 2 distinct GPUs (a number, or "all")

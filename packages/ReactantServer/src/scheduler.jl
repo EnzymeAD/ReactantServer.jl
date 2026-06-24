@@ -105,12 +105,15 @@ mutable struct Scheduler
     committed::Vector{QueuedRequest}           # in-flight metas' continuation sub-calls awaiting the next GPU slot, each
                                                # dispatched ahead of the discipline scan. One entry per in-flight meta, so
                                                # it is bounded by the gate: committed count == REACTANT_META_CONCURRENCY.
+    compact_loads_mark::Int                    # weight-cache load count at the last automatic compaction; sole
+                                               # writer is the dispatch thread. Drives load-driven compaction:
+                                               # compact once `weight_cache.loads` advances by `cfg.compaction_interval`.
 end
 
 function Scheduler(registry::ModelRegistry, backend::AbstractBackend, pool::MemoryPool, cfg::SchedulerConfig)
     return Scheduler(registry, backend, pool, cfg,
                      Threads.Condition(), false, nothing, nothing, nothing, ControlCommand[],
-                     MetaGate(1), QueuedRequest[])
+                     MetaGate(1), QueuedRequest[], 0)
 end
 
 # A selected dispatch: the model entry, the chosen executable key (batch size; 0 = unbatched
@@ -606,9 +609,83 @@ function init_sched_state!(s::Scheduler, entry::AbstractDispatchEntry, now::Floa
     return entry
 end
 
-# Prepare every registered entry's scheduling state, seed cost estimates from a warmup pass, then
-# spawn the dispatch loop. Entries are already in the registry (loaded and compiled by `serve`).
-function start!(s::Scheduler)
+# Measure the worst-case execution scratch (transient device memory beyond resident weights) by
+# probing each model in ISOLATION: free all non-pinned device weights so only pinned + the probed
+# model are resident, run every compiled (variant,size), and read the allocator's peak. Subtracting
+# the KNOWN isolated resident floor (pinned + the model's own footprint) from the global peak keeps
+# the estimate sound despite `peak_bytes_in_use` being a monotone, non-resettable high-water (later
+# models inherit earlier peaks, so the result is a conservative over-estimate, the safe direction).
+# The per-model run also seeds the fair discipline's cost estimates. Returns max scratch in bytes
+# (0 when the backend reports no device stats, e.g. CPU/mock).
+function _probe_max_scratch!(s::Scheduler, pinned_bytes::Int)
+    (s.weight_cache === nothing || device_memory_stats(s.backend, s.pool) === nothing) && return 0
+    max_scratch = 0
+    for entry in values(s.registry.by_name)
+        model = entry.executable
+        (model === nothing || is_device_pinned(model)) && continue
+        isempty(entry.manifest.executable_inputs) && continue   # cannot synthesize inputs
+        _free_nonpinned!(s.weight_cache)                         # isolate: only pinned + M will be resident
+        try
+            acquire!(s.weight_cache, entry)
+        catch err
+            err isa NotResidentError && continue                 # externally-managed: cannot load to measure
+            rethrow()
+        end
+        for (variant, inner) in model.execs
+            for sz in keys(inner)
+                inputs = _zero_inputs(entry, variant, sz)
+                inputs === nothing && continue
+                try
+                    t0 = time()
+                    run_model(s.backend, s.pool, model, inputs)
+                    entry.sched.cost_estimate[sz] = max(time() - t0, eps())
+                catch err
+                    @warn "memory probe / warmup run failed; using default cost" model = entry.name variant = variant size = sz exception = err
+                end
+            end
+        end
+        dm = device_memory_stats(s.backend, s.pool)
+        dm === nothing && continue
+        max_scratch = max(max_scratch, dm.peak_in_use - (pinned_bytes + model.nbytes))
+    end
+    return max(0, max_scratch)
+end
+
+# Size the on-demand cache from the unified memory model: pinned reserve their footprint, the
+# isolation probe measures worst-case scratch, and the cache gets whatever the arena has left after
+# pinned + scratch + the wiggle slack (`weight_budget`). Runs on the startup thread before the
+# dispatch loop spawns (so mutating `max_bytes` does not race the loop).
+function _autosize_weight_cache!(s::Scheduler, arena::Int, fraction::Float64, wiggle::Float64)
+    s.weight_cache === nothing && return nothing
+    pinned = pinned_weight_bytes(s.registry)
+    max_scratch = _probe_max_scratch!(s, pinned)
+    b = weight_budget(; arena = arena, fraction = fraction, wiggle = wiggle,
+                       max_scratch = max_scratch, pinned_bytes = pinned)
+    lock(s.weight_cache.lock) do
+        s.weight_cache.max_bytes = b.on_demand_budget
+        s.weight_cache.pinned_bytes = pinned
+        s.weight_cache.max_scratch = max_scratch
+        s.weight_cache.weight_pool = b.weight_pool
+    end
+    has_ondemand = any(e -> e.executable !== nothing && !is_device_pinned(e.executable),
+                       values(s.registry.by_name))
+    if b.pinned_over_commit
+        @warn "weight budget: pinned weights plus execution scratch exceed the arena minus wiggle; pinned models may not fit" arena = arena pinned_bytes = pinned max_scratch = max_scratch weight_pool = b.weight_pool wiggle = wiggle
+    elseif b.on_demand_budget == 0 && has_ondemand
+        @warn "weight budget: no room for the on-demand cache after pinned weights + scratch + wiggle; non-pinned models reload on every dispatch" arena = arena pinned_bytes = pinned max_scratch = max_scratch
+    else
+        @info "weight budget resolved" arena = arena fraction = fraction wiggle = wiggle pinned_bytes = pinned max_scratch = max_scratch weight_pool = b.weight_pool on_demand_budget = b.on_demand_budget
+    end
+    return nothing
+end
+
+# Prepare every registered entry's scheduling state, then spawn the dispatch loop. Entries are
+# already in the registry (loaded and compiled by `serve`). When `autosize_arena > 0` (set by the
+# worker when the on-demand cache is enabled), the isolation probe runs every model regardless of
+# discipline, doubling as the FAIR cost warmup and the scratch measurement, and the cache is sized
+# before serving begins.
+function start!(s::Scheduler; autosize_arena::Integer=0, autosize_fraction::Real=0.0,
+                autosize_wiggle::Real=0.0)
     now = time()
     for entry in values(s.registry.by_name)
         init_sched_state!(s, entry, now)
@@ -617,8 +694,11 @@ function start!(s::Scheduler)
         init_sched_state!(s, entry, now)
     end
     s.weight_cache === nothing || preload_pinned!(s.weight_cache, s.registry)
-    # Cost learning only feeds the fair discipline; FIFO needs no per-batch-size estimates.
-    if s.cfg.discipline == FAIR
+    if autosize_arena > 0 && s.weight_cache !== nothing
+        # The probe runs every model (seeding FAIR costs too) and sizes the cache.
+        _autosize_weight_cache!(s, Int(autosize_arena), Float64(autosize_fraction), Float64(autosize_wiggle))
+    elseif s.cfg.discipline == FAIR
+        # No auto-size (cache off, or no device stats): just seed FAIR costs.
         for entry in values(s.registry.by_name)
             _warmup_entry!(s, entry)
         end
@@ -785,7 +865,10 @@ function dispatch_loop(s::Scheduler)
             end
         end
         (isempty(cmds) && chosen === nothing) && break
-        chosen === nothing || execute_and_record!(s, chosen)
+        if chosen !== nothing
+            execute_and_record!(s, chosen)
+            _maybe_compact!(s)
+        end
     end
     return nothing
 end
@@ -819,7 +902,7 @@ until applied. Raises on an unknown model or in self-managed mode.
 function set_residency!(s::Scheduler, name::AbstractString, target::ResidencyState)
     return _run_control(s, function (sch)
         sch.weight_cache === nothing &&
-            throw(ErrorException("residency control requires the on-demand weight cache (set runtime.weight_cache_bytes > 0)"))
+            throw(ErrorException("residency control requires the on-demand weight cache (set runtime.weight_cache_fraction > 0)"))
         sch.weight_cache.mode == EXTERNALLY_MANAGED ||
             throw(ErrorException("worker is self-managed; residency is not externally controllable"))
         nm = String(name)
@@ -858,6 +941,54 @@ function set_policy!(s::Scheduler, name::AbstractString; weight::Union{Real,Noth
         entry = get(s.registry.by_name, String(name), nothing)
         (entry === nothing || entry.sched === nothing) && throw(ErrorException("unknown model: $name"))
         weight === nothing || (entry.sched.weight = Float64(weight))
+    end
+    return nothing
+end
+
+# ---------------------------------------------------------------------------------------------
+# Memory compaction: free all resident device weights so the allocator coalesces its free list,
+# then reload the working set. Defragments the device arena (see `compact!` on the WeightCache).
+# ---------------------------------------------------------------------------------------------
+
+# Body assuming it already runs on the dispatch thread (mirrors `_admit_entry!`/`_evict_entry!`).
+# A no-op without the on-demand cache: there, every model is permanently device-resident from
+# startup (nothing churns), so there is no fragmenting working set to compact.
+function _compact_entry!(sch::Scheduler; reload_models::Vector{String}=String[])
+    sch.weight_cache === nothing && return 0
+    return compact!(sch.weight_cache, sch.registry; reload=reload_models)
+end
+
+"""
+    compact!(scheduler; reload_models=String[]) -> Int
+
+Free the resident non-pinned device weights so the allocator coalesces its free list, then reload
+each model named in `reload_models`. An empty list frees only; non-pinned models not listed reload
+lazily on their next dispatch (self-managed mode). Device-pinned models are left in place (loaded
+once at startup, never reloaded from disk). A no-op when the on-demand weight cache is disabled.
+Runs on the dispatch thread (the sole residency mutator) and blocks until applied. Returns the
+number of models reloaded.
+"""
+compact!(s::Scheduler; reload_models::Vector{String}=String[]) =
+    _run_control(s, sch -> _compact_entry!(sch; reload_models=reload_models))
+
+# Automatic, worker-local compaction driven by `cfg.compaction_interval` (0 disables), counting
+# on-demand weight-cache loads, not dispatches: a load is what places a variable-size weight block
+# and so drives fragmentation, while a dispatch to an already-resident model does not. This is the
+# standalone (no-gateway) trigger and is off by default, so a gateway-fronted worker never
+# self-compacts (the gateway owns compaction there, via the CompactMemory RPC). It is eager: the
+# on-demand region is freed and refills lazily as requests arrive.
+#
+# Called from the dispatch loop after a dispatch, so it is already on the dispatch thread and must
+# NOT go through `_run_control` (nesting it would deadlock). A failure must not kill the loop.
+function _maybe_compact!(s::Scheduler)
+    n = s.cfg.compaction_interval
+    (n > 0 && s.weight_cache !== nothing) || return nothing
+    s.weight_cache.loads - s.compact_loads_mark >= n || return nothing
+    s.compact_loads_mark = s.weight_cache.loads
+    try
+        _compact_entry!(s)
+    catch e
+        @warn "automatic compaction failed" exception = (e, catch_backtrace())
     end
     return nothing
 end

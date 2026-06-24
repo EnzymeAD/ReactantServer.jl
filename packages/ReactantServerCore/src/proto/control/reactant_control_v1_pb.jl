@@ -8,6 +8,7 @@ using ProtoBuf.EnumX: @enumx
 export SetModelPolicyResponse, ModelControlStatusRequest, SetModelPolicyRequest, Residency
 export SetModelResidencyRequest, ModelStatus, SetModelResidencyResponse
 export ModelControlStatusResponse
+export CompactMemoryRequest, CompactMemoryResponse
 
 
 struct SetModelPolicyResponse end
@@ -298,6 +299,74 @@ function PB._encoded_size(x::ModelControlStatusResponse)
     !isempty(x.discipline) && (encoded_size += PB._encoded_size(x.discipline, 2))
     !isempty(x.models) && (encoded_size += PB._encoded_size(x.models, 3))
     x.weight_cache_max_bytes != zero(UInt64) && (encoded_size += PB._encoded_size(x.weight_cache_max_bytes, 4))
+    return encoded_size
+end
+
+struct CompactMemoryRequest
+    reload_models::Vector{String}
+end
+CompactMemoryRequest(;reload_models = Vector{String}()) = CompactMemoryRequest(reload_models)
+PB.default_values(::Type{CompactMemoryRequest}) = (;reload_models = Vector{String}())
+PB.field_numbers(::Type{CompactMemoryRequest}) = (;reload_models = 1)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:CompactMemoryRequest}, _endpos::Int=0, _group::Bool=false)
+    reload_models = PB.BufferedVector{String}()
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            PB.decode!(d, reload_models)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return CompactMemoryRequest(reload_models[])
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::CompactMemoryRequest)
+    initpos = position(e.io)
+    !isempty(x.reload_models) && PB.encode(e, 1, x.reload_models)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::CompactMemoryRequest)
+    encoded_size = 0
+    !isempty(x.reload_models) && (encoded_size += PB._encoded_size(x.reload_models, 1))
+    return encoded_size
+end
+
+struct CompactMemoryResponse
+    reloaded_models::Int64
+    resident_bytes_after::UInt64
+end
+CompactMemoryResponse(;reloaded_models = zero(Int64), resident_bytes_after = zero(UInt64)) = CompactMemoryResponse(reloaded_models, resident_bytes_after)
+PB.default_values(::Type{CompactMemoryResponse}) = (;reloaded_models = zero(Int64), resident_bytes_after = zero(UInt64))
+PB.field_numbers(::Type{CompactMemoryResponse}) = (;reloaded_models = 1, resident_bytes_after = 2)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:CompactMemoryResponse}, _endpos::Int=0, _group::Bool=false)
+    reloaded_models = zero(Int64)
+    resident_bytes_after = zero(UInt64)
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            reloaded_models = PB.decode(d, Int64)
+        elseif field_number == 2
+            resident_bytes_after = PB.decode(d, UInt64)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return CompactMemoryResponse(reloaded_models, resident_bytes_after)
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::CompactMemoryResponse)
+    initpos = position(e.io)
+    x.reloaded_models != zero(Int64) && PB.encode(e, 1, x.reloaded_models)
+    x.resident_bytes_after != zero(UInt64) && PB.encode(e, 2, x.resident_bytes_after)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::CompactMemoryResponse)
+    encoded_size = 0
+    x.reloaded_models != zero(Int64) && (encoded_size += PB._encoded_size(x.reloaded_models, 1))
+    x.resident_bytes_after != zero(UInt64) && (encoded_size += PB._encoded_size(x.resident_bytes_after, 2))
     return encoded_size
 end
 

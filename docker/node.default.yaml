@@ -24,8 +24,24 @@ global:
     # (CUDA graph) instantiation.
     preallocate: true
     allow_cpu_fallback: false
+    # On-demand weight cache, sized as a fraction of the BFC arena devoted to all weights (pinned +
+    # on-demand). 1.0 (the default, GPU only) uses the whole arena and self-sizes at startup: the
+    # worker probes each model's peak device usage, reserves that scratch plus the wiggle fraction
+    # below and any pinned weights, and gives the rest to the on-demand cache (weights load lazily and
+    # evict LRU within it). When everything fits, all weights stay resident. 0 disables the cache
+    # (every weight resident, no probe).
+    weight_cache_fraction: 1.0
+    # Fraction of the arena kept free as anti-fragmentation slack; feeds the startup auto-sizing.
+    weight_cache_wiggle_fraction: 0.1
   scheduler:
     ema_halflife_seconds: 30.0
     max_queue_depth: 1024
+    # Worker-local memory compaction (standalone / no-gateway deployments). Every N on-demand
+    # weight-cache loads, free the resident on-demand device weights so the BFC allocator coalesces
+    # its free list (pinned models are loaded once at startup and left in place; freed models reload
+    # lazily as requests arrive). 0 disables (the default), so a gateway-fronted worker never
+    # self-compacts: behind a gateway, compaction is driven by the gateway instead. No-op when
+    # weight_cache_fraction is 0 (nothing churns). Prefer larger intervals.
+    compaction_interval: 0
   endpoints:
     host: 0.0.0.0

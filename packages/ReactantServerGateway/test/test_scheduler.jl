@@ -9,7 +9,7 @@ const GW = ReactantServerGateway
 function _sched_cfg(mode)
     return GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", ["127.0.0.1:7001", "127.0.0.1:7002"],
                             String[], 60, 1, 1, "info", "json", mode, 30.0, 0.0, 0.8, 0.1, 30.0,
-                            1, 1.0, "fill_rr", Dict{String,GW.GatewayModelConfig}(), 32, 64)
+                            1, 1.0, "fill_rr", Dict{String,GW.GatewayModelConfig}(), 32, 64, :off, 0)
 end
 
 # Build a ScheduleContext for `model` over a routing table mapping each model to worker URLs.

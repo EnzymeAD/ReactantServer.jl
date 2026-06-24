@@ -16,10 +16,15 @@ ControlService_SetModelPolicy_Method(; TRequest=SetModelPolicyRequest, TResponse
     gRPCServer.gRPCMethod{TRequest, false, TResponse, false}("/reactant_control.ControlService/SetModelPolicy")
 export ControlService_SetModelPolicy_Method
 
-function register_ControlService!(router; ModelControlStatus=nothing, SetModelResidency=nothing, SetModelPolicy=nothing)
+ControlService_CompactMemory_Method(; TRequest=CompactMemoryRequest, TResponse=CompactMemoryResponse) =
+    gRPCServer.gRPCMethod{TRequest, false, TResponse, false}("/reactant_control.ControlService/CompactMemory")
+export ControlService_CompactMemory_Method
+
+function register_ControlService!(router; ModelControlStatus=nothing, SetModelResidency=nothing, SetModelPolicy=nothing, CompactMemory=nothing)
     ModelControlStatus === nothing || gRPCServer.handle!(router, ControlService_ModelControlStatus_Method(), ModelControlStatus)
     SetModelResidency === nothing || gRPCServer.handle!(router, ControlService_SetModelResidency_Method(), SetModelResidency)
     SetModelPolicy === nothing || gRPCServer.handle!(router, ControlService_SetModelPolicy_Method(), SetModelPolicy)
+    CompactMemory === nothing || gRPCServer.handle!(router, ControlService_CompactMemory_Method(), CompactMemory)
     return router
 end
 export register_ControlService!

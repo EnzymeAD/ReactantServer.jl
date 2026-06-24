@@ -62,6 +62,14 @@ function _handle_set_model_policy(ctx::InferContext, req)
     end
 end
 
+function _handle_compact_memory(ctx::InferContext, req)
+    return _as_control() do
+        reloaded = compact!(ctx.sched; reload_models = collect(String, req.reload_models))
+        resident = ctx.sched.weight_cache === nothing ? 0 : weight_cache_stats(ctx.sched.weight_cache).resident_bytes
+        _CTRL.CompactMemoryResponse(; reloaded_models = Int64(reloaded), resident_bytes_after = UInt64(resident))
+    end
+end
+
 # Register the ControlService handlers on an existing router (the inference router), reusing the
 # InferContext payload so both services share the scheduler.
 function register_control_service!(router)
@@ -69,6 +77,7 @@ function register_control_service!(router)
         ModelControlStatus = (req, ctx) -> _handle_model_control_status(ctx.payload),
         SetModelResidency  = (req, ctx) -> _handle_set_model_residency(ctx.payload, req),
         SetModelPolicy     = (req, ctx) -> _handle_set_model_policy(ctx.payload, req),
+        CompactMemory      = (req, ctx) -> _handle_compact_memory(ctx.payload, req),
     )
     return router
 end

@@ -179,8 +179,8 @@ compose file and mount only those bundles.
 Load parameters are the `loadgen` service's `LOADGEN_*` environment variables:
 `LOADGEN_TRANSPORT` (`tcp`, `shm`, or `mixed`; `shm` exercises shared-memory
 register/unregister), `LOADGEN_CONCURRENCY`, `LOADGEN_DURATION_SECONDS`,
-`LOADGEN_REPORT_SECONDS`, and `LOADGEN_MODELS`. The generator's weight cache budget is
-`WEIGHT_CACHE_BYTES` (default 24 GiB). The loadgen prints rolling throughput, latency, and error
+`LOADGEN_REPORT_SECONDS`, and `LOADGEN_MODELS`. The server under test sizes its on-demand weight
+cache from `runtime.weight_cache_fraction` (default 1.0, auto-sized at startup). The loadgen prints rolling throughput, latency, and error
 counts, plus the fleet weight-cache `loads=`/`evicts=` totals (with per-window deltas, scraped
 from the aggregated `/metrics`), and exits nonzero if any request errored. A steadily rising
 `evicts` means the model set does not fit resident and the workers are reloading weights from host

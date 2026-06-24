@@ -6,8 +6,8 @@
 
 Derive the signature from the manifest and compile the StableHLO artifact for the pool's
 device. Compilation needs only the parameter count, not the weight buffers, so it always
-runs at startup. When on-demand loading is disabled (`weight_cache_bytes == 0`) every model's
-weights are loaded to the device and kept resident, the original behavior. When on-demand is
+runs at startup. When on-demand loading is disabled (`weight_cache_fraction == 0`, or CPU) every
+model's weights are loaded to the device and kept resident, the original behavior. When on-demand is
 enabled the initial residency follows `state`: `PINNED_DEVICE` loads to the device at startup;
 `PINNED_SYSTEM` materializes the host floor and starts evicted from the device; `UNPINNED`
 holds no floor and starts fully evicted (the weight cache loads it from the mmap on first

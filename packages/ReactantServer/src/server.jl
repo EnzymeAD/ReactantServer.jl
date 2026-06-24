@@ -65,9 +65,16 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     include = isempty(cfg.models_include) ? nothing : cfg.models_include
     registry = load_bundles(cfg.model_dirs; include=include)
     isempty(registry.by_name) && @warn "no model bundles found" model_dirs = cfg.model_dirs models_include = cfg.models_include
-    on_demand = cfg.runtime.weight_cache_bytes > 0
+    # On-demand weight residency is sized as a fraction of the BFC arena (`mem_fraction * device`),
+    # resolved now that the device pool exists. The cache is GPU-only: `arena` is 0 when the device
+    # cannot report its pool ceiling (CPU / mock), so on-demand is off there (all weights resident).
+    arena = let dm = device_memory_stats(backend, pool)
+        dm === nothing ? 0 : dm.limit
+    end
+    frac = cfg.runtime.weight_cache_fraction
+    on_demand = frac > 0 && arena > 0
     if cfg.runtime.residency_mode == EXTERNALLY_MANAGED && !on_demand
-        @warn "externally-managed residency has no effect without the on-demand weight cache; set runtime.weight_cache_bytes > 0 to enable residency control"
+        @warn "externally-managed residency has no effect without the on-demand weight cache; set runtime.weight_cache_fraction > 0 (GPU only) to enable residency control"
     end
     # One host-weight store for the worker: node-shared SHM when opted in, otherwise private.
     store = if cfg.runtime.shared_host_weights
@@ -89,10 +96,21 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     end
     sched = Scheduler(registry, backend, pool, cfg.scheduler)
     if on_demand
-        sched.weight_cache = WeightCache(backend, pool, registry, cfg.runtime.weight_cache_bytes;
+        # Provisional budget for the probe; the isolation probe (in start!) frees between models so
+        # this never fills the arena, then auto-sizing replaces it with pinned + scratch + wiggle aware
+        # value before serving.
+        provisional = floor(Int, frac * arena)
+        sched.weight_cache = WeightCache(backend, pool, registry, provisional;
                                          mode=cfg.runtime.residency_mode, store=store)
     end
-    start!(sched)
+    # On-demand enabled => probe every model at startup and size the cache so pinned weights +
+    # measured scratch + the wiggle slack fit the arena.
+    if on_demand
+        start!(sched; autosize_arena=arena, autosize_fraction=frac,
+               autosize_wiggle=cfg.runtime.weight_cache_wiggle_fraction)
+    else
+        start!(sched)
+    end
     # Model lifecycle is governed by model_control_mode. Only `dynamic` runs the filesystem
     # watcher (Triton-style POLL): it polls the model dirs on a background task and hot-swaps
     # bundles via the scheduler's control queue, reusing the residency/on-demand/store decisions

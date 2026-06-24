@@ -4,8 +4,8 @@
 # honored as-is (the one visible device is assigned to it).
 #
 # No `models:` map is needed: every bundle in the model repository is loaded and served by the
-# worker. The on-demand weight cache (weight_cache_bytes below) keeps it memory-safe by loading
-# weights lazily and evicting LRU within the GPU byte budget, so all the models need not be
+# worker. The on-demand weight cache (weight_cache_fraction below) keeps it memory-safe by loading
+# weights lazily and evicting LRU within its auto-sized budget, so all the models need not be
 # resident at once. Add a `models:` map only to pin specific models to device memory (see
 # node.yaml for the format).
 model_repo: /var/lib/reactantserver/models
@@ -29,9 +29,10 @@ global:
     # (CUDA graph) instantiation.
     preallocate: true
     allow_cpu_fallback: false
-    # On-demand weight cache: weights load lazily and evict LRU within this GPU byte budget, so all
-    # models need not be resident at once. 0 would keep every weight resident.
-    weight_cache_bytes: 25769803776
+    # On-demand weight cache, sized as a fraction of the BFC arena. 1.0 (default) uses the whole
+    # arena for weights and auto-sizes at startup (probe scratch, reserve pinned + scratch + wiggle,
+    # give the rest to the cache); weights load lazily and evict LRU within it. 0 keeps all resident.
+    weight_cache_fraction: 1.0
   scheduler:
     ema_halflife_seconds: 30.0
     max_queue_depth: 1024

@@ -46,9 +46,9 @@ On-demand loading is what makes this work for "a ton of models": a card serves f
 This is the recommended starting point for small labs. It is also the conceptual foundation for the multi-GPU distributed case, which scales this same idea across cards.
 
 **Example configuration.** A node file with a single worker on the visible GPU. The on-demand
-weight cache (`weight_cache_bytes`) lets the model library exceed VRAM: weights load lazily and
-evict LRU within the budget. The `fair` discipline shares GPU time across models so a busy model
-does not starve the rest. Mount it over `/etc/reactantserver/node.yaml`.
+weight cache (`weight_cache_fraction`, default 1.0) lets the model library exceed VRAM: weights
+load lazily and evict LRU within the auto-sized budget. The `fair` discipline shares GPU time
+across models so a busy model does not starve the rest. Mount it over `/etc/reactantserver/node.yaml`.
 
 ```yaml
 # node.yaml — one GPU, many models served on demand.
@@ -62,9 +62,9 @@ global:
   runtime:
     backend: cuda
     mem_fraction: 0.9
-    # Weights load lazily and evict LRU within this GPU byte budget (here 24 GiB), so the model
-    # library need not fit in VRAM at once. 0 keeps every weight resident.
-    weight_cache_bytes: 25769803776
+    # Weights load lazily and evict LRU within the on-demand cache, so the model library need not
+    # fit in VRAM at once. 1.0 (default) uses the whole arena and self-sizes; 0 keeps all resident.
+    weight_cache_fraction: 1.0
   scheduler:
     discipline: fair                # cost-aware share of GPU time across models (the default)
     ema_halflife_seconds: 30.0
@@ -119,7 +119,7 @@ global:
   runtime:
     backend: cuda
     mem_fraction: 0.9
-    weight_cache_bytes: 25769803776 # on-demand cache per GPU, as in the single-GPU case
+    weight_cache_fraction: 1.0      # on-demand cache per GPU (self-sized), as in the single-GPU case
   scheduler:
     discipline: fifo                # required by lpt_packing (placement moves to the gateway)
     ema_halflife_seconds: 30.0
@@ -221,8 +221,9 @@ flowchart TD
 
 **The endpoint contract.** Each node exposes the same interface a control plane integrates
 against: the KServe V2 gRPC data plane (`ModelInfer`, `RepositoryIndex`, `ServerReady`) plus the
-worker control RPCs (`ModelControlStatus`, `SetModelResidency`, `SetModelPolicy`) for residency and
-policy, and an admin HTTP port serving `/healthz`, `/readyz`, and Prometheus `/metrics`. Your
+worker control RPCs (`ModelControlStatus`, `SetModelResidency`, `SetModelPolicy` for residency and
+policy, `CompactMemory` to defragment device memory), and an admin HTTP port serving `/healthz`,
+`/readyz`, and Prometheus `/metrics`. Your
 control plane discovers which models each node serves via `RepositoryIndex` and routes `ModelInfer`
 to a node that reports the model ready.
 

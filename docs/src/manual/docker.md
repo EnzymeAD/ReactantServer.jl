@@ -158,8 +158,8 @@ not just a lone worker.
 The `loadgen` report line includes the fleet weight-cache `loads=`/`evicts=` totals with
 per-window deltas (scraped from the aggregated `/metrics`). A steadily rising `evicts` means the
 model set does not fit resident and the workers are thrashing weights (host-to-device reloads,
-which cost CPU) — a different problem from CPU oversubscription, addressed by more
-`weight_cache_bytes`, pinning hot models, or more GPUs.
+which cost CPU) — a different problem from CPU oversubscription, addressed by a larger
+`weight_cache_fraction`, pinning hot models, or more GPUs.
 
 ## Security
 

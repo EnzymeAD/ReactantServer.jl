@@ -21,7 +21,7 @@ const STATUS_DEADLINE = "DeadlineExceeded"
 # budget and request semaphore, isolating a slow or wedged worker to its own slots. The struct is
 # parametric so every field keeps its concrete client type (the request path forwards through
 # `infer` with no dynamic dispatch); the type parameters are inferred at construction.
-struct WorkerClients{G,I,SR,SU,RD,RI,CS}
+struct WorkerClients{G,I,SR,SU,RD,RI,CS,CM}
     url::String
     grpc::G
     infer::I
@@ -30,6 +30,7 @@ struct WorkerClients{G,I,SR,SU,RD,RI,CS}
     ready::RD
     repo_index::RI
     control_status::CS    # ControlService/ModelControlStatus (lpt_packing cost polling + preconditions)
+    compact::CM           # ControlService/CompactMemory (memory-compaction fan-out)
 end
 
 struct ClientPool{W<:WorkerClients}
@@ -61,7 +62,11 @@ function _worker_clients(cfg::GatewayConfig, url::AbstractString)
     ready = GRPCInferenceService_ServerReady_Client(host, port; grpc = grpc, deadline = 5)
     repo_index = GRPCInferenceService_RepositoryIndex_Client(host, port; grpc = grpc, deadline = 5)
     control_status = ControlService_ModelControlStatus_Client(host, port; grpc = grpc, deadline = 5)
-    return WorkerClients(url, grpc, infer, shm_reg, shm_unreg, ready, repo_index, control_status)
+    # Compaction frees and reloads weights (device-pinned models re-read from the mmap), so it can
+    # run far longer than a status probe; give it a generous deadline rather than the 5s probe one.
+    compact = ControlService_CompactMemory_Client(host, port; grpc = grpc,
+        deadline = max(cfg.request_timeout_seconds, 300))
+    return WorkerClients(url, grpc, infer, shm_reg, shm_unreg, ready, repo_index, control_status, compact)
 end
 
 function ClientPool(cfg::GatewayConfig)
@@ -117,6 +122,9 @@ function invoke_infer(wc::WorkerClients, body::Vector{UInt8}; deadline::Union{Re
 end
 invoke_shm_register(wc::WorkerClients, body::Vector{UInt8}) = gRPCClient.grpc_sync_request(wc.shm_register, body)
 invoke_shm_unregister(wc::WorkerClients, body::Vector{UInt8}) = gRPCClient.grpc_sync_request(wc.shm_unregister, body)
+
+# Forward a CompactMemory request to the worker; returns its CompactMemoryResponse.
+invoke_compact(wc::WorkerClients, req::CompactMemoryRequest) = gRPCClient.grpc_sync_request(wc.compact, req)
 
 # Returns the worker's ServerReadyResponse.ready, or false on any transport error.
 function probe_ready(wc::WorkerClients)
