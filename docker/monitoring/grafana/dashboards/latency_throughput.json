@@ -80,7 +80,7 @@
     {
       "type": "table",
       "title": "Per-model latency & GPU cost (worst offenders)",
-      "description": "Per model: req/s, average GPU compute per dispatch (pure GPU time = compute-heaviness), and worker-side handler-latency percentiles p50/p95/p99 (queue + GPU + pre/post). Sorted by p99. The gap between p99 and GPU/disp is queue + overhead, not the model being heavy. Idle models excluded.",
+      "description": "Per model, aggregated over the dashboard's selected time range (not the instant): req/s, average GPU compute per dispatch (pure GPU time = compute-heaviness), and worker-side handler-latency percentiles p50/p95/p99 (queue + GPU + pre/post). Sorted by p99. The gap between p99 and GPU/disp is queue + overhead, not the model being heavy. Models with no traffic in the range are excluded, so during a total lull the table is empty; widen the time range to see recent offenders.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 10, "w": 24, "x": 0, "y": 24 },
       "fieldConfig": {
@@ -96,11 +96,11 @@
       },
       "options": { "showHeader": true, "sortBy": [ { "displayName": "p99", "desc": true } ] },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (model) (rate(worker_request_latency_seconds_count[$__rate_interval])) > 0", "format": "table", "instant": true },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (model) (rate(worker_compute_seconds_total[$__rate_interval])) / clamp_min(sum by (model) (rate(worker_dispatch_total[$__rate_interval])), 1e-9) and on (model) (sum by (model) (rate(worker_dispatch_total[$__rate_interval])) > 0)", "format": "table", "instant": true },
-        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.50, sum by (model, le) (rate(worker_request_latency_seconds_bucket[$__rate_interval]))) and on (model) (sum by (model) (rate(worker_request_latency_seconds_count[$__rate_interval])) > 0)", "format": "table", "instant": true },
-        { "refId": "D", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (model, le) (rate(worker_request_latency_seconds_bucket[$__rate_interval]))) and on (model) (sum by (model) (rate(worker_request_latency_seconds_count[$__rate_interval])) > 0)", "format": "table", "instant": true },
-        { "refId": "E", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.99, sum by (model, le) (rate(worker_request_latency_seconds_bucket[$__rate_interval]))) and on (model) (sum by (model) (rate(worker_request_latency_seconds_count[$__rate_interval])) > 0)", "format": "table", "instant": true }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (model) (rate(worker_request_latency_seconds_count[$__range])) > 0", "format": "table", "instant": true },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (model) (rate(worker_compute_seconds_total[$__range])) / clamp_min(sum by (model) (rate(worker_dispatch_total[$__range])), 1e-9) and on (model) (sum by (model) (rate(worker_dispatch_total[$__range])) > 0)", "format": "table", "instant": true },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.50, sum by (model, le) (rate(worker_request_latency_seconds_bucket[$__range]))) and on (model) (sum by (model) (rate(worker_request_latency_seconds_count[$__range])) > 0)", "format": "table", "instant": true },
+        { "refId": "D", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (model, le) (rate(worker_request_latency_seconds_bucket[$__range]))) and on (model) (sum by (model) (rate(worker_request_latency_seconds_count[$__range])) > 0)", "format": "table", "instant": true },
+        { "refId": "E", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.99, sum by (model, le) (rate(worker_request_latency_seconds_bucket[$__range]))) and on (model) (sum by (model) (rate(worker_request_latency_seconds_count[$__range])) > 0)", "format": "table", "instant": true }
       ],
       "transformations": [
         { "id": "merge", "options": {} },
