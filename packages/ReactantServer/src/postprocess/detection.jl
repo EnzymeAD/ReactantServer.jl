@@ -115,16 +115,51 @@ end
 
 # --- ROIAlign (torchvision semantics: aligned=True, sampling_ratio=0 -> adaptive) ---
 
-@inline function _bilinear(feat::AbstractArray{<:Real,3}, c::Int, y::Float64, x::Float64, H::Int, W::Int)
-    (y < -1.0 || y > H || x < -1.0 || x > W) && return 0.0
-    y = y <= 0 ? 0.0 : y; x = x <= 0 ? 0.0 : x
-    yl = floor(Int, y); xl = floor(Int, x)
-    if yl >= H - 1; yl = H - 1; yh = H - 1; y = Float64(yl) else yh = yl + 1 end
-    if xl >= W - 1; xl = W - 1; xh = W - 1; x = Float64(xl) else xh = xl + 1 end
-    ly = y - yl; lx = x - xl; hy = 1 - ly; hx = 1 - lx
-    # +1 for 1-based Julia (feat[c, row, col])
-    @inbounds return hy * hx * feat[c, yl + 1, xl + 1] + hy * lx * feat[c, yl + 1, xh + 1] +
-                    ly * hx * feat[c, yh + 1, xl + 1] + ly * lx * feat[c, yh + 1, xh + 1]
+# ROIAlign for one output bin, accumulated across every channel into `acc` (length C, Float64).
+# The sampling geometry (sample coordinates, the four neighbour indices, the four bilinear weights) is
+# channel-independent, so it is computed once per sample point; the channel sweep then runs over `c`,
+# the stride-1 (contiguous) dimension of `feat` ([C,H,W]) in column-major Julia, so each of the four
+# neighbour reads is a contiguous C-length run and every loaded cache line is fully used (rather than
+# loading a fresh line per channel, as a per-channel bilinear call did). The per-channel arithmetic
+# and the per-channel accumulation order over samples match the previous per-channel formulation
+# exactly, so the result is bit-for-bit unchanged. `acc` is reset here for this bin.
+function _roi_bin_accum!(acc::AbstractVector{Float64}, feat::AbstractArray{<:Real,3},
+                         C::Int, H::Int, W::Int, sh::Float64, sw::Float64, bh::Float64, bw::Float64,
+                         ph::Int, pw::Int, gh::Int, gw::Int)
+    @inbounds for c in 1:C
+        acc[c] = 0.0
+    end
+    @inbounds for iy in 0:(gh - 1)
+        y = sh + ph * bh + (iy + 0.5) * bh / gh
+        for ix in 0:(gw - 1)
+            x = sw + pw * bw + (ix + 0.5) * bw / gw
+            # Out-of-range sample contributes 0 to every channel (the old `_bilinear` early-returned 0;
+            # skipping the add is the same no-op for every channel).
+            (y < -1.0 || y > H || x < -1.0 || x > W) && continue
+            yy = y <= 0 ? 0.0 : y
+            xx = x <= 0 ? 0.0 : x
+            yl = floor(Int, yy); xl = floor(Int, xx)
+            if yl >= H - 1
+                yl = H - 1; yh = H - 1; yy = Float64(yl)
+            else
+                yh = yl + 1
+            end
+            if xl >= W - 1
+                xl = W - 1; xh = W - 1; xx = Float64(xl)
+            else
+                xh = xl + 1
+            end
+            ly = yy - yl; lx = xx - xl; hy = 1 - ly; hx = 1 - lx
+            w00 = hy * hx; w01 = hy * lx; w10 = ly * hx; w11 = ly * lx
+            # +1 for 1-based Julia (feat[c, row, col]); c is the contiguous axis.
+            r0 = yl + 1; r1 = yh + 1; q0 = xl + 1; q1 = xh + 1
+            for c in 1:C
+                acc[c] += w00 * feat[c, r0, q0] + w01 * feat[c, r0, q1] +
+                          w10 * feat[c, r1, q0] + w11 * feat[c, r1, q1]
+            end
+        end
+    end
+    return acc
 end
 
 """
@@ -142,6 +177,7 @@ function roi_align!(out::AbstractArray{<:Real,4}, feat::AbstractArray{<:Real,3},
     C, H, W = size(feat)
     K = size(boxes, 1)
     off = aligned ? 0.5 : 0.0
+    acc = Vector{Float64}(undef, C)
     @inbounds for k in 1:K
         sw = boxes[k, 1] * scale - off; sh = boxes[k, 2] * scale - off
         ew = boxes[k, 3] * scale - off; eh = boxes[k, 4] * scale - off
@@ -151,16 +187,11 @@ function roi_align!(out::AbstractArray{<:Real,4}, feat::AbstractArray{<:Real,3},
         gh = ratio > 0 ? ratio : max(1, ceil(Int, rh / pooled))
         gw = ratio > 0 ? ratio : max(1, ceil(Int, rw / pooled))
         cnt = gh * gw
-        for c in 1:C, ph in 0:(pooled - 1), pw in 0:(pooled - 1)
-            s = 0.0
-            for iy in 0:(gh - 1)
-                y = sh + ph * bh + (iy + 0.5) * bh / gh
-                for ix in 0:(gw - 1)
-                    x = sw + pw * bw + (ix + 0.5) * bw / gw
-                    s += _bilinear(feat, c, y, x, H, W)
-                end
+        for ph in 0:(pooled - 1), pw in 0:(pooled - 1)
+            _roi_bin_accum!(acc, feat, C, H, W, sh, sw, bh, bw, ph, pw, gh, gw)
+            for c in 1:C
+                out[k, c, ph + 1, pw + 1] = acc[c] / cnt
             end
-            out[k, c, ph + 1, pw + 1] = s / cnt
         end
     end
     return out
@@ -181,6 +212,7 @@ function roi_align_wire!(out::AbstractArray{<:Real,4}, feat::AbstractArray{<:Rea
     C, H, W = size(feat)
     K = size(boxes, 1)
     off = aligned ? 0.5 : 0.0
+    acc = Vector{Float64}(undef, C)
     @inbounds for k in 1:K
         sw = boxes[k, 1] * scale - off; sh = boxes[k, 2] * scale - off
         ew = boxes[k, 3] * scale - off; eh = boxes[k, 4] * scale - off
@@ -190,16 +222,11 @@ function roi_align_wire!(out::AbstractArray{<:Real,4}, feat::AbstractArray{<:Rea
         gh = ratio > 0 ? ratio : max(1, ceil(Int, rh / pooled))
         gw = ratio > 0 ? ratio : max(1, ceil(Int, rw / pooled))
         cnt = gh * gw
-        for c in 1:C, ph in 0:(pooled - 1), pw in 0:(pooled - 1)
-            s = 0.0
-            for iy in 0:(gh - 1)
-                y = sh + ph * bh + (iy + 0.5) * bh / gh
-                for ix in 0:(gw - 1)
-                    x = sw + pw * bw + (ix + 0.5) * bw / gw
-                    s += _bilinear(feat, c, y, x, H, W)
-                end
+        for ph in 0:(pooled - 1), pw in 0:(pooled - 1)
+            _roi_bin_accum!(acc, feat, C, H, W, sh, sw, bh, bw, ph, pw, gh, gw)
+            for c in 1:C
+                out[pw + 1, ph + 1, c, k] = acc[c] / cnt
             end
-            out[pw + 1, ph + 1, c, k] = s / cnt
         end
     end
     return out
