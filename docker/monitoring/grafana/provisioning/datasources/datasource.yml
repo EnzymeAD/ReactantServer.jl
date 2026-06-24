@@ -1,0 +1,14 @@
+# Provision the Prometheus datasource so dashboards can reference it by the fixed uid `prometheus`.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 15s          # matches the scrape interval; sizes $__rate_interval sensibly
+      httpMethod: POST
+    editable: true

@@ -1,0 +1,25 @@
+# Prometheus scrape config for the ReactantServer monitoring stack.
+#
+# A single target is enough: the embedded gateway's admin endpoint (:8002 /metrics) serves its own
+# gateway_* series AND fans out to every worker's metrics endpoint, merging them into one exposition.
+# Each worker self-tags its series with `worker` and `gpu` labels, so they never collide. Reachable
+# as `reactantserver:8002` because this Prometheus runs on the same external `netai02` Docker network
+# (see docker-compose.monitoring.yml).
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    deployment: netai02
+
+scrape_configs:
+  - job_name: reactantserver
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["reactantserver:8002"]
+        labels:
+          node: netai02
+
+  # Prometheus self-monitoring (optional but handy for diagnosing scrape health).
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
