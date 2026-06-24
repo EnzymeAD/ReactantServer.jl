@@ -190,10 +190,10 @@ on your hardware: it relies on the allocator returning freed buffers to the aren
 them, which the log lets you verify rather than assume.
 
 The worker also exports the BFC allocator's live numbers as Prometheus gauges (aggregated through
-the gateway's `/metrics`), so you can watch the two gating factors directly rather than infer
-them: `worker_device_memory_peak_in_use_bytes` (the session high-water, your empirical scratch +
-resident ceiling), `worker_device_memory_largest_free_block_bytes` and
-`worker_device_memory_fragmentation_ratio` (largest contiguous free block over total free; 1.0 is
-unfragmented, a low value with ample total free means fragmentation is biting), and
-`worker_device_memory_pool_bytes`. A falling fragmentation ratio is the signal to enable or
-shorten compaction; the peak gauge is what the startup auto-sizing measured.
+the gateway's `/metrics`): `worker_device_memory_in_use_bytes`, `_free_bytes`,
+`_peak_in_use_bytes` (the session high-water, your empirical scratch + resident ceiling), and
+`_pool_bytes`. The peak gauge is what the startup auto-sizing measured; a rising peak over a long
+uptime is the signal to revisit the budget. Note the GPU BFC allocator does not report a
+largest-contiguous-free-block figure, so fragmentation is not directly observable here; in
+practice it surfaces as an allocation failing despite ample reported free bytes, which is what
+compaction (above) addresses.

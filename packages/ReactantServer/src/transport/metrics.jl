@@ -34,8 +34,7 @@ Prometheus.metric_names(::WorkerSnapshotCollector) = (
     "worker_weight_loads_total", "worker_weight_evicts_total",
     "worker_weight_load_seconds_total", "worker_device_memory_in_use_bytes",
     "worker_device_memory_limit_bytes", "worker_device_memory_free_bytes",
-    "worker_device_memory_peak_in_use_bytes", "worker_device_memory_largest_free_block_bytes",
-    "worker_device_memory_pool_bytes", "worker_device_memory_fragmentation_ratio",
+    "worker_device_memory_peak_in_use_bytes", "worker_device_memory_pool_bytes",
     "worker_models_loaded", "worker_models_resident", "worker_resident_weight_bytes",
     "worker_info",
 )
@@ -132,7 +131,6 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
     # Device memory, when the backend can report it (absent on CPU / MockBackend).
     dm = device_memory_stats(c.backend, c.pool)
     if dm !== nothing
-        frag = dm.free > 0 ? dm.largest_free_block / dm.free : 1.0
         push!(metrics,
             _scalar("worker_device_memory_in_use_bytes", "gauge", "Device bytes in use.", dm.in_use),
             _scalar("worker_device_memory_limit_bytes", "gauge",
@@ -141,12 +139,8 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
                 "Device bytes free to allocate.", dm.free),
             _scalar("worker_device_memory_peak_in_use_bytes", "gauge",
                 "Peak device bytes in use since startup (allocator high-water mark).", dm.peak_in_use),
-            _scalar("worker_device_memory_largest_free_block_bytes", "gauge",
-                "Largest contiguous free block (bytes); a fragmentation signal.", dm.largest_free_block),
             _scalar("worker_device_memory_pool_bytes", "gauge",
                 "Bytes the allocator has claimed from the device for its pool.", dm.pool_bytes),
-            _scalar("worker_device_memory_fragmentation_ratio", "gauge",
-                "Largest free block / total free (1.0 = unfragmented).", frag),
         )
     end
 
