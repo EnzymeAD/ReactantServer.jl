@@ -24,6 +24,16 @@ global:
     # (CUDA graph) instantiation.
     preallocate: true
     allow_cpu_fallback: false
+    # On-demand weight cache budget. Either give an absolute byte count (weight_cache_bytes) or, more
+    # intuitively, a fraction of the BFC arena (weight_cache_fraction, which wins when > 0). 0 keeps
+    # every model's weights resident (no on-demand cache).
+    # weight_cache_bytes: 0
+    weight_cache_fraction: 0.0
+    # Anti-fragmentation / scratch headroom, as a fraction of the arena. At startup the worker probes
+    # every model once (loads + runs it), measures peak device usage, and auto-shrinks the cache so
+    # that peak + this headroom fits the arena (logged; never errors unless even a zero cache cannot
+    # fit). Set 0 to disable the probe and keep the configured budget as-is.
+    weight_cache_wiggle_fraction: 0.1
   scheduler:
     ema_halflife_seconds: 30.0
     max_queue_depth: 1024

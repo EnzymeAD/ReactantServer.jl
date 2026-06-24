@@ -310,6 +310,22 @@ end
     end
 end
 
+@testset "resolve_cache_budget trims the cache to fit peak + wiggle" begin
+    rcb = ReactantServer.resolve_cache_budget
+    # Under budget: observed peak below the ceiling -> no trim.
+    r = rcb(500, 1000, 800, 0.1)          # ceiling = 900
+    @test r.ceiling == 900 && r.overage == 0 && r.effective == 500
+    # Over budget: trim the cache by the overage.
+    r = rcb(500, 1000, 950, 0.1)          # over by 50
+    @test r.overage == 50 && r.effective == 450
+    # Unfixable: even a zero cache does not fit (overage exceeds the base budget).
+    r = rcb(30, 1000, 950, 0.1)
+    @test r.overage == 50 && r.effective == 0 && r.overage > 30
+    # Zero wiggle: ceiling is the whole arena.
+    r = rcb(500, 1000, 1000, 0.0)
+    @test r.ceiling == 1000 && r.overage == 0 && r.effective == 500
+end
+
 @testset "shared weight store backs a system-pinned model and unlinks on unpin" begin
     if !(Sys.islinux() && isdir("/dev/shm"))
         @test_skip "shared weight store requires Linux /dev/shm"

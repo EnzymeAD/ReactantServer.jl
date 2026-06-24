@@ -609,9 +609,33 @@ function init_sched_state!(s::Scheduler, entry::AbstractDispatchEntry, now::Floa
     return entry
 end
 
+# Auto-size the on-demand weight cache against measured peak device usage. Runs on the startup
+# thread before the dispatch loop spawns (so mutating `cache.max_bytes` does not race the loop). The
+# warmup pass above has already exercised every model, so the allocator's peak high-water reflects a
+# realistic worst case; trim the budget so peak + wiggle headroom fits the arena. See
+# `resolve_cache_budget`.
+function _autosize_weight_cache!(s::Scheduler, base::Int, arena::Int, wiggle::Float64)
+    s.weight_cache === nothing && return nothing
+    dm = device_memory_stats(s.backend, s.pool)
+    dm === nothing && return nothing
+    res = resolve_cache_budget(base, arena, dm.peak_in_use, wiggle)
+    res.overage > 0 || return nothing
+    s.weight_cache.max_bytes = res.effective
+    if res.effective == 0 && res.overage > base
+        @warn "weight cache auto-size: even a zero-size cache does not fit; pinned weights plus execution scratch exceed the arena minus the wiggle headroom" arena = arena observed_peak = dm.peak_in_use wiggle = wiggle base = base
+    else
+        @info "weight cache auto-sized to fit measured peak plus wiggle headroom" base = base effective = res.effective observed_peak = dm.peak_in_use ceiling = res.ceiling arena = arena wiggle = wiggle
+    end
+    return nothing
+end
+
 # Prepare every registered entry's scheduling state, seed cost estimates from a warmup pass, then
 # spawn the dispatch loop. Entries are already in the registry (loaded and compiled by `serve`).
-function start!(s::Scheduler)
+# When `autosize_arena > 0` (set by the worker when the on-demand cache + a wiggle fraction are
+# configured), the warmup pass runs for every model regardless of discipline so it doubles as a
+# memory probe, then the cache is auto-sized to the measured peak before serving begins.
+function start!(s::Scheduler; autosize_arena::Integer=0, autosize_wiggle::Real=0.0,
+                autosize_base::Integer=0)
     now = time()
     for entry in values(s.registry.by_name)
         init_sched_state!(s, entry, now)
@@ -620,12 +644,16 @@ function start!(s::Scheduler)
         init_sched_state!(s, entry, now)
     end
     s.weight_cache === nothing || preload_pinned!(s.weight_cache, s.registry)
-    # Cost learning only feeds the fair discipline; FIFO needs no per-batch-size estimates.
-    if s.cfg.discipline == FAIR
+    autosize = autosize_arena > 0 && s.weight_cache !== nothing
+    # Warmup seeds the fair discipline's per-batch-size cost estimates; the memory probe (auto-size)
+    # needs the same per-model run to drive the allocator's peak high-water. Run the pass once when
+    # either wants it.
+    if s.cfg.discipline == FAIR || autosize
         for entry in values(s.registry.by_name)
             _warmup_entry!(s, entry)
         end
     end
+    autosize && _autosize_weight_cache!(s, Int(autosize_base), Int(autosize_arena), Float64(autosize_wiggle))
     s.running = true
     # Run the dispatch loop on the interactive threadpool when one exists (the worker is started
     # with `--threads=auto,1`), so the GPU dispatch is scheduled promptly and is never starved by

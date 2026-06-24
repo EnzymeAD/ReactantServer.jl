@@ -68,7 +68,7 @@ function memory_report(backend::AbstractBackend, pool::MemoryPool;
     if stats === nothing
         push!(parts, "device n/a")
     else
-        push!(parts, "device $(Base.format_bytes(stats.free)) free / $(Base.format_bytes(stats.limit)) ($(_pct(stats.free, stats.limit))% free)")
+        push!(parts, "device $(Base.format_bytes(stats.free)) free / $(Base.format_bytes(stats.limit)) ($(_pct(stats.free, stats.limit))% free), peak $(Base.format_bytes(stats.peak_in_use)), largest free block $(Base.format_bytes(stats.largest_free_block))")
     end
     if registry !== nothing
         rw = resident_weight_bytes(registry)

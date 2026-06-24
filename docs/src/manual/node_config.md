@@ -50,7 +50,9 @@ global:
     mem_fraction: 0.9      # fraction of device memory claimed for the pool (GPU only)
     preallocate: true      # claim the pool up front (GPU only)
     allow_cpu_fallback: false
-    weight_cache_bytes: 0  # GPU byte budget for on-demand weights; 0 keeps all resident
+    weight_cache_bytes: 0  # absolute GPU byte budget for on-demand weights; 0 keeps all resident
+    weight_cache_fraction: 0.0          # same budget as a fraction of the arena; wins over _bytes when > 0
+    weight_cache_wiggle_fraction: 0.1   # arena fraction kept free; drives startup peak probe + auto-sizing
   scheduler:               # -> SchedulerConfig
     discipline: fair       # fair | fifo | edf (use fifo or edf behind a gateway running lpt_packing)
     ema_halflife_seconds: 30.0

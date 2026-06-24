@@ -65,7 +65,15 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     include = isempty(cfg.models_include) ? nothing : cfg.models_include
     registry = load_bundles(cfg.model_dirs; include=include)
     isempty(registry.by_name) && @warn "no model bundles found" model_dirs = cfg.model_dirs models_include = cfg.models_include
-    on_demand = cfg.runtime.weight_cache_bytes > 0
+    # The on-demand cache budget can be given as an arena fraction (resolved now that the device
+    # pool exists) or as an absolute byte count; the fraction wins when set. `arena` is 0 when the
+    # device cannot report its pool ceiling (CPU / mock), so the fraction falls back to bytes.
+    arena = let dm = device_memory_stats(backend, pool)
+        dm === nothing ? 0 : dm.limit
+    end
+    base_W = (cfg.runtime.weight_cache_fraction > 0 && arena > 0) ?
+        round(Int, cfg.runtime.weight_cache_fraction * arena) : cfg.runtime.weight_cache_bytes
+    on_demand = base_W > 0
     if cfg.runtime.residency_mode == EXTERNALLY_MANAGED && !on_demand
         @warn "externally-managed residency has no effect without the on-demand weight cache; set runtime.weight_cache_bytes > 0 to enable residency control"
     end
@@ -89,10 +97,17 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     end
     sched = Scheduler(registry, backend, pool, cfg.scheduler)
     if on_demand
-        sched.weight_cache = WeightCache(backend, pool, registry, cfg.runtime.weight_cache_bytes;
+        sched.weight_cache = WeightCache(backend, pool, registry, base_W;
                                          mode=cfg.runtime.residency_mode, store=store)
     end
-    start!(sched)
+    # When on-demand + a wiggle fraction are configured, probe every model once at startup and
+    # auto-size the cache down so measured peak usage plus wiggle headroom fits the arena.
+    wiggle = cfg.runtime.weight_cache_wiggle_fraction
+    if on_demand && wiggle > 0 && arena > 0
+        start!(sched; autosize_arena=arena, autosize_wiggle=wiggle, autosize_base=base_W)
+    else
+        start!(sched)
+    end
     # Model lifecycle is governed by model_control_mode. Only `dynamic` runs the filesystem
     # watcher (Triton-style POLL): it polls the model dirs on a background task and hot-swaps
     # bundles via the scheduler's control queue, reusing the residency/on-demand/store decisions

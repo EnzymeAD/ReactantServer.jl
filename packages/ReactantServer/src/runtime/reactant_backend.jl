@@ -88,7 +88,14 @@ function device_memory_stats(::ReactantBackend, pool::MemoryPool)
         limit = stats.bytes_limit
         limit = (limit === nothing || limit <= 0) ?
             Int(_RXLA.device_properties(pool.device).totalGlobalMem) : Int(limit)
-        return (in_use = in_use, limit = limit, free = max(limit - in_use, 0))
+        _orz(x) = x === nothing ? 0 : Int(x)   # the BFC reports pool sizes only once it has allocated
+        # `peak_in_use` is the allocator's session high-water mark (the empirical scratch + resident
+        # ceiling); `largest_free_block` is the biggest contiguous allocation possible now, the direct
+        # fragmentation signal (a small block with lots of total free = fragmented).
+        return (in_use = in_use, limit = limit, free = max(limit - in_use, 0),
+                peak_in_use = Int(stats.peak_bytes_in_use),
+                largest_free_block = Int(stats.largest_free_block_bytes),
+                pool_bytes = _orz(stats.pool_bytes), peak_pool_bytes = _orz(stats.peak_pool_bytes))
     catch
         return nothing
     end

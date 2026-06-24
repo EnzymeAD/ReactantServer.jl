@@ -34,6 +34,23 @@ WeightCache(backend::AbstractBackend, pool::MemoryPool, registry::ModelRegistry,
             mode::ResidencyMode=SELF_MANAGED, store::WeightStore=PrivateWeightStore()) =
     WeightCache(backend, pool, registry, mode, store, Int(max_bytes), 0, String[], 0, 0, 0.0, 0, ReentrantLock())
 
+"""
+    resolve_cache_budget(base, arena, observed_peak, wiggle) -> (; effective, overage, ceiling)
+
+Shrink an on-demand cache budget `base` (bytes) so the measured `observed_peak` device usage plus a
+`wiggle` fraction of the `arena` fits within the arena. `ceiling = (1 - wiggle) * arena`; the cache
+is trimmed by `overage = max(0, observed_peak - ceiling)`. Because the empirical peak already
+includes whatever weights were resident at the peak moment, trimming the cache by the overage
+brings the next peak back under the ceiling. Pure arithmetic, no device access (so it is unit
+testable); `overage > base` signals the unfixable case (even a zero cache does not fit).
+"""
+function resolve_cache_budget(base::Integer, arena::Integer, observed_peak::Integer, wiggle::Real)
+    ceiling = floor(Int, (1 - Float64(wiggle)) * arena)
+    overage = max(0, Int(observed_peak) - ceiling)
+    effective = max(0, Int(base) - overage)
+    return (effective = effective, overage = overage, ceiling = ceiling)
+end
+
 _touch_mru!(cache::WeightCache, name::AbstractString) = begin
     i = findfirst(==(name), cache.lru)
     i !== nothing && (deleteat!(cache.lru, i); push!(cache.lru, name))

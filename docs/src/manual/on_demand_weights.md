@@ -29,19 +29,39 @@ same order of magnitude as a single inference.
 
 ## Enabling it
 
-Set the GPU byte budget for on-demand (unpinned) weights via `runtime.weight_cache_bytes`. A
-value of `0` keeps every model resident (the original behavior); any positive value enables the
-on-demand cache and bounds the device memory used for unpinned models.
+Give the on-demand cache a GPU budget. The intuitive way is a **fraction of the BFC arena**
+(`mem_fraction * device memory`) via `runtime.weight_cache_fraction`; an absolute
+`runtime.weight_cache_bytes` is also accepted, and the fraction wins when both are set. `0` for
+both keeps every model resident (the original behavior); any positive value enables the on-demand
+cache.
 
 ```yaml
 global:
   runtime:
     backend: cuda
-    weight_cache_bytes: 8589934592   # 8 GiB budget for on-demand weights
+    weight_cache_fraction: 0.7         # 70% of the arena for on-demand weights (vs a raw byte count)
+    weight_cache_wiggle_fraction: 0.1  # keep 10% of the arena free as headroom (see below)
 ```
 
-This is the `weight_cache_bytes` field of [`RuntimeConfig`](@ref). It can also be set with the
-`INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_BYTES` environment variable.
+These are the `weight_cache_fraction` / `weight_cache_bytes` / `weight_cache_wiggle_fraction`
+fields of [`RuntimeConfig`](@ref), also settable via `INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_*`
+environment variables.
+
+### Self-sizing against the scratch ceiling
+
+The budget you set is an upper bound, not a promise it fits. Each execution also needs transient
+device memory (activations, conv/GEMM workspace, IO) on top of resident weights, and the arena
+must hold the weights **and** that scratch at once. Rather than make you hand-compute it, the
+worker measures it: at startup, when the on-demand cache and a non-zero
+`weight_cache_wiggle_fraction` are set, it probes every model once (loads and runs it), reads the
+allocator's peak device usage, and auto-shrinks the cache budget so that `peak + wiggle` fits the
+arena. The reduction is logged at info; the budget is only ever lowered, never raised. The probe
+adds bounded one-time startup work (each model is loaded and run once) and doubles as an
+execution smoke test. Set `weight_cache_wiggle_fraction: 0` to skip the probe and keep your
+configured budget verbatim.
+
+If even a zero-size cache would not fit (pinned weights plus scratch alone exceed the wiggled
+arena) the worker logs a warning, since that is a genuine misconfiguration no auto-sizing can fix.
 
 ## Pinning hot models
 
@@ -167,3 +187,12 @@ budget before and after, and the weight cache tracks a `compactions` counter. Co
 before/after device free figures to confirm that compaction actually recovered contiguous space
 on your hardware: it relies on the allocator returning freed buffers to the arena and coalescing
 them, which the log lets you verify rather than assume.
+
+The worker also exports the BFC allocator's live numbers as Prometheus gauges (aggregated through
+the gateway's `/metrics`), so you can watch the two gating factors directly rather than infer
+them: `worker_device_memory_peak_in_use_bytes` (the session high-water, your empirical scratch +
+resident ceiling), `worker_device_memory_largest_free_block_bytes` and
+`worker_device_memory_fragmentation_ratio` (largest contiguous free block over total free; 1.0 is
+unfragmented, a low value with ample total free means fragmentation is biting), and
+`worker_device_memory_pool_bytes`. A falling fragmentation ratio is the signal to enable or
+shorten compaction; the peak gauge is what the startup auto-sizing measured.

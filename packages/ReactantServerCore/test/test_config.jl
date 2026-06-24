@@ -191,6 +191,40 @@ end
     end
 end
 
+@testset "weight cache fraction + wiggle: defaults, parse, env, validation" begin
+    mktempdir() do dir
+        modeldir = joinpath(dir, "models"); mkpath(modeldir)
+
+        # defaults: no fraction, wiggle 0.1
+        cfgd, _, _ = load_single_worker(dir, ""; model_repo=modeldir)
+        @test cfgd.runtime.weight_cache_fraction == 0.0
+        @test cfgd.runtime.weight_cache_wiggle_fraction == 0.1
+
+        cfg, _, _ = load_single_worker(dir, """
+        runtime:
+          weight_cache_fraction: 0.6
+          weight_cache_wiggle_fraction: 0.05
+        """; model_repo=modeldir)
+        @test ReactantServer.validate_config(cfg) === cfg
+        @test cfg.runtime.weight_cache_fraction == 0.6
+        @test cfg.runtime.weight_cache_wiggle_fraction == 0.05
+
+        withenv("INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_FRACTION" => "0.75",
+                "INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_WIGGLE_FRACTION" => "0.2") do
+            cfge, applied, _ = load_single_worker(dir, ""; model_repo=modeldir)
+            @test cfge.runtime.weight_cache_fraction == 0.75
+            @test cfge.runtime.weight_cache_wiggle_fraction == 0.2
+            @test ("INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_FRACTION", "0.75") in applied
+        end
+
+        # validation: fraction in [0,1], wiggle in [0,1)
+        cf, _, _ = load_single_worker(dir, "runtime:\n  weight_cache_fraction: 1.5"; model_repo=modeldir)
+        @test_throws ReactantServer.ConfigError ReactantServer.validate_config(cf)
+        cw, _, _ = load_single_worker(dir, "runtime:\n  weight_cache_wiggle_fraction: 1.0"; model_repo=modeldir)
+        @test_throws ReactantServer.ConfigError ReactantServer.validate_config(cw)
+    end
+end
+
 @testset "model_control_mode: parse, default, residency, validation, migration" begin
     mktempdir() do dir
         modeldir = joinpath(dir, "models"); mkpath(modeldir)
