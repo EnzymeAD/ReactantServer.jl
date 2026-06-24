@@ -181,7 +181,8 @@ function build_supervisor(node_path::AbstractString;
                 push!(notes, "WARNING: worker port(s) $(sort!(collect(overlap))) collide with the gateway listen ports; adjust base_port / metrics_base_port")
             push!(specs, gateway_spec(root; gateway_path=gw_path,
                                       endpoints=gw_path === nothing ? worker_endpoints(node) : nothing,
-                                      metrics_endpoints=gw_path === nothing ? worker_metrics_endpoints(node) : nothing))
+                                      metrics_endpoints=gw_path === nothing ? worker_metrics_endpoints(node) : nothing,
+                                      worker_names=gw_path === nothing ? String[_worker_name(w) for w in ws] : nothing))
         end
     end
 

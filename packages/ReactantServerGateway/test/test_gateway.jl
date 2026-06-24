@@ -283,8 +283,8 @@ end
             @test occursin("worker_models_loaded{worker=\"worker0\",gpu=\"0\"} 1", body)
             @test occursin("worker_models_loaded{worker=\"worker1\",gpu=\"1\"} 1", body)
             @test count("# TYPE gateway_worker_metrics_up gauge", body) == 1
-            @test occursin("gateway_worker_metrics_up{endpoint=\"$ep0\"} 1", body)
-            @test occursin("gateway_worker_metrics_up{endpoint=\"$dead\"} 0", body)
+            @test occursin("gateway_worker_metrics_up{worker=\"$ep0\"} 1", body)
+            @test occursin("gateway_worker_metrics_up{worker=\"$dead\"} 0", body)
         finally
             close(admin.server)
             close(s0)

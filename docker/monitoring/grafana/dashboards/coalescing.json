@@ -1,0 +1,402 @@
+{
+  "uid": "rs-coalescing",
+  "title": "ReactantServer / Coalescing & Batching",
+  "tags": [
+    "reactantserver",
+    "coalescing",
+    "batching"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-3h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "worker",
+        "label": "Worker",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "query": "label_values(worker_info, worker)",
+          "refId": "worker"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "text",
+      "title": "How to read this",
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Coalescing factor** = requests merged per device dispatch (`worker_requests_served_total / worker_dispatch_total`), i.e. the average effective batch size. **Max batch** = largest size the model is compiled to coalesce to (`<=1` means no batch axis: it *cannot* be batched). **Fill** = coalescing / max batch. **device s/s** = device-seconds consumed per wall-second (1.0 = one full device), sort by it to find the heaviest models; **device/disp** is the per-execution device cost. Targeting: a model with high **device s/s** and **max batch <=1** is expensive yet non-batchable , a candidate to invest in making batchable; high device s/s with low **fill** is batchable but underused (raise the batch window or arrival concurrency). Aggregated over the selected time range and worker(s); covers every device-executing model, including meta sub-models."
+      }
+    },
+    {
+      "type": "table",
+      "title": "Per-model device cost & coalescing (sorted by device usage)",
+      "description": "Each model's device consumption alongside how well it batches. Default-sorted by device s/s (heaviest first); click any header to re-sort, e.g. by fill for batching headroom. A heavy model with max batch <=1 is the make-it-batchable candidate. Models with no dispatches in the range are excluded.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 13,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "model"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 360
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "device s/s"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 0.2
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.5
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "device/disp"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "decimals",
+                "value": 3
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "disp/s"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ops"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "coalescing"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "max batch"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "fill"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "gradient"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 0.5
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.85
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "device s/s",
+            "desc": true
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (model) (rate(worker_dispatch_total{worker=~\"$worker\"}[$__range])) > 0",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (model) (rate(worker_requests_served_total{worker=~\"$worker\"}[$__range])) / clamp_min(sum by (model) (rate(worker_dispatch_total{worker=~\"$worker\"}[$__range])), 1e-9) and on (model) (sum by (model) (rate(worker_dispatch_total{worker=~\"$worker\"}[$__range])) > 0)",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (model) (worker_model_max_batch_size{worker=~\"$worker\"}) and on (model) (sum by (model) (rate(worker_dispatch_total{worker=~\"$worker\"}[$__range])) > 0)",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "(sum by (model) (rate(worker_requests_served_total{worker=~\"$worker\"}[$__range])) / clamp_min(sum by (model) (rate(worker_dispatch_total{worker=~\"$worker\"}[$__range])), 1e-9)) / clamp_min(max by (model) (worker_model_max_batch_size{worker=~\"$worker\"}), 1) and on (model) (sum by (model) (rate(worker_dispatch_total{worker=~\"$worker\"}[$__range])) > 0)",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (model) (rate(worker_compute_seconds_total{worker=~\"$worker\"}[$__range])) and on (model) (sum by (model) (rate(worker_dispatch_total{worker=~\"$worker\"}[$__range])) > 0)",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "F",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (model) (rate(worker_compute_seconds_total{worker=~\"$worker\"}[$__range])) / clamp_min(sum by (model) (rate(worker_dispatch_total{worker=~\"$worker\"}[$__range])), 1e-9) and on (model) (sum by (model) (rate(worker_dispatch_total{worker=~\"$worker\"}[$__range])) > 0)",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "Value #A": "disp/s",
+              "Value #B": "coalescing",
+              "Value #C": "max batch",
+              "Value #D": "fill",
+              "Value #E": "device s/s",
+              "Value #F": "device/disp"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "type": "bargauge",
+      "title": "Most under-filled models (bottom 20 by fill)",
+      "description": "The 20 coalescable models running furthest below their compiled max batch , the clearest batching-improvement candidates. Bars near 100% are already well-batched.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.5
+              },
+              {
+                "color": "green",
+                "value": 0.85
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "bottomk(20, (sum by (model) (rate(worker_requests_served_total{worker=~\"$worker\"}[$__range])) / clamp_min(sum by (model) (rate(worker_dispatch_total{worker=~\"$worker\"}[$__range])), 1e-9)) / clamp_min(max by (model) (worker_model_max_batch_size{worker=~\"$worker\"}), 1) and on (model) (max by (model) (worker_model_max_batch_size{worker=~\"$worker\"}) > 1))",
+          "format": "time_series",
+          "instant": true,
+          "legendFormat": "{{model}}"
+        }
+      ]
+    }
+  ]
+}

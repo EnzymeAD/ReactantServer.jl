@@ -1,141 +1,690 @@
 {
   "uid": "rs-model-drilldown",
   "title": "ReactantServer / Per-Model Drilldown",
-  "tags": ["reactantserver", "model"],
+  "tags": [
+    "reactantserver",
+    "model"
+  ],
   "timezone": "browser",
   "schemaVersion": 39,
   "version": 2,
   "refresh": "10s",
-  "time": { "from": "now-3h", "to": "now" },
+  "time": {
+    "from": "now-3h",
+    "to": "now"
+  },
   "templating": {
     "list": [
-      { "name": "model", "label": "Model", "type": "query", "datasource": { "type": "prometheus", "uid": "prometheus" }, "query": { "query": "label_values(worker_model_weight_bytes, model)", "refId": "model" }, "refresh": 2, "sort": 1, "includeAll": false, "multi": false }
+      {
+        "name": "model",
+        "label": "Model",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "query": "label_values(worker_model_weight_bytes, model)",
+          "refId": "model"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "includeAll": false,
+        "multi": false
+      }
     ]
   },
   "panels": [
     {
       "type": "text",
       "title": "",
-      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 0 },
-      "options": { "mode": "markdown", "content": "Request-based panels (**req/s**, **error rate**, **handler-latency heatmap**) are populated only for **gateway-fronted** models, those called directly over gRPC. A **meta sub-model** (e.g. `*_stage1`/`*_stage2`) is invoked in-process by its parent and never hits the gateway or the gRPC handler, so for those use the **dispatch**-based panels: Dispatches/s, GPU compute, residency." }
+      "gridPos": {
+        "h": 2,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Request-based panels (**req/s**, **error rate**, **handler-latency heatmap**) are populated only for **gateway-fronted** models, those called directly over gRPC. A **meta sub-model** (e.g. `*_stage1`/`*_stage2`) is invoked in-process by its parent and never hits the gateway or the gRPC handler, so for those use the **dispatch**-based panels: Dispatches/s, device compute, residency."
+      }
     },
     {
       "type": "stat",
       "title": "Requests / s (gateway)",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 2 },
-      "fieldConfig": { "defaults": { "unit": "reqps", "color": { "mode": "fixed", "fixedColor": "blue" } } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area", "colorMode": "value" },
-      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(gateway_requests_total{model=~\"$model\"}[$__rate_interval]))" } ]
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 2
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area",
+        "colorMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(gateway_requests_total{model=~\"$model\"}[$__rate_interval]))"
+        }
+      ]
     },
     {
       "type": "stat",
       "title": "Dispatches / s",
-      "description": "GPU executions per second (works for meta sub-models too).",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 2 },
-      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" } } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area", "colorMode": "value" },
-      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(worker_dispatch_total{model=~\"$model\"}[$__rate_interval]))" } ]
+      "description": "Device executions per second (works for meta sub-models too).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 2
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area",
+        "colorMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(worker_dispatch_total{model=~\"$model\"}[$__rate_interval]))"
+        }
+      ]
     },
     {
       "type": "stat",
-      "title": "Avg GPU / dispatch",
-      "description": "All-time mean GPU compute per dispatch = compute-heaviness. Cumulative ratio, so it's meaningful even for infrequently-called models.",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 2 },
-      "fieldConfig": { "defaults": { "unit": "s", "color": { "mode": "fixed", "fixedColor": "orange" } } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "none", "colorMode": "value" },
-      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(worker_compute_seconds_total{model=~\"$model\"}) / clamp_min(sum(worker_dispatch_total{model=~\"$model\"}), 1)" } ]
+      "title": "Avg device / dispatch",
+      "description": "All-time mean device compute per dispatch = compute-heaviness. Cumulative ratio, so it's meaningful even for infrequently-called models.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 2
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "orange"
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "none",
+        "colorMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(worker_compute_seconds_total{model=~\"$model\"}) / clamp_min(sum(worker_dispatch_total{model=~\"$model\"}), 1)"
+        }
+      ]
     },
     {
       "type": "stat",
       "title": "Error rate (gateway)",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 2 },
-      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 0.01 }, { "color": "red", "value": 0.05 } ] } } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area", "colorMode": "background" },
-      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(gateway_requests_total{model=~\"$model\", status!=\"OK\"}[$__rate_interval])) / clamp_min(sum(rate(gateway_requests_total{model=~\"$model\"}[$__rate_interval])), 1e-9)" } ]
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 2
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.01
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area",
+        "colorMode": "background"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(gateway_requests_total{model=~\"$model\", status!=\"OK\"}[$__rate_interval])) / clamp_min(sum(rate(gateway_requests_total{model=~\"$model\"}[$__rate_interval])), 1e-9)"
+        }
+      ]
     },
     {
       "type": "stat",
       "title": "Resident on (workers)",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 2 },
-      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "green" } } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "none", "colorMode": "value" },
-      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(worker_model_resident{model=~\"$model\"})" } ]
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 2
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "none",
+        "colorMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(worker_model_resident{model=~\"$model\"})"
+        }
+      ]
     },
     {
       "type": "stat",
       "title": "Weight footprint",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 2 },
-      "fieldConfig": { "defaults": { "unit": "bytes", "color": { "mode": "fixed", "fixedColor": "purple" } } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "none", "colorMode": "value" },
-      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "max(worker_model_weight_bytes{model=~\"$model\"})" } ]
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 2
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "purple"
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "none",
+        "colorMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(worker_model_weight_bytes{model=~\"$model\"})"
+        }
+      ]
     },
     {
       "type": "heatmap",
       "title": "Handler latency distribution - $model (gateway-fronted only)",
-      "description": "Worker-side ModelInfer latency distribution. Empty for meta sub-models (no gRPC handler invocation); see Dispatch rate / GPU compute for those.",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 6 },
-      "options": { "calculate": false, "cellGap": 1, "color": { "mode": "scheme", "scheme": "Spectral", "reverse": true, "steps": 64 }, "yAxis": { "unit": "s" }, "tooltip": { "show": true, "yHistogram": true }, "legend": { "show": true } },
-      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (le) (rate(worker_request_latency_seconds_bucket{model=~\"$model\"}[$__rate_interval]))", "format": "heatmap", "legendFormat": "{{le}}" } ]
-    },
-    {
-      "type": "timeseries",
-      "title": "Dispatch rate by worker - $model",
-      "description": "GPU executions per second on each worker. This is where an internally-called meta sub-model shows its activity (and which worker actually runs it).",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 6 },
-      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15, "showPoints": "auto" } } },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "rate(worker_dispatch_total{model=~\"$model\"}[$__rate_interval])", "legendFormat": "{{worker}}" } ]
-    },
-    {
-      "type": "timeseries",
-      "title": "Queue depth & wait - $model",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 13 },
-      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 8 } }, "overrides": [ { "matcher": { "id": "byRegexp", "options": ".*wait.*" }, "properties": [ { "id": "unit", "value": "s" }, { "id": "custom.axisPlacement", "value": "right" } ] }, { "matcher": { "id": "byRegexp", "options": ".*depth.*" }, "properties": [ { "id": "unit", "value": "short" } ] } ] },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "description": "Worker-side ModelInfer latency distribution. Empty for meta sub-models (no gRPC handler invocation); see Dispatch rate / device compute for those.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "color": {
+          "mode": "scheme",
+          "scheme": "Spectral",
+          "reverse": true,
+          "steps": 64
+        },
+        "yAxis": {
+          "unit": "s"
+        },
+        "tooltip": {
+          "show": true,
+          "yHistogram": true
+        },
+        "legend": {
+          "show": true
+        }
+      },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (worker) (worker_queue_depth{model=~\"$model\"})", "legendFormat": "depth {{worker}}" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "max(worker_queue_wait_seconds{model=~\"$model\", quantile=\"0.99\"})", "legendFormat": "wait p99" }
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (le) (rate(worker_request_latency_seconds_bucket{model=~\"$model\"}[$__rate_interval]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}"
+        }
       ]
     },
     {
       "type": "timeseries",
-      "title": "GPU compute by worker - $model",
-      "description": "GPU-seconds consumed per second by this model on each worker (its real GPU load), and works for meta sub-models. Compare against Avg GPU/dispatch above.",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 13 },
-      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15 } } },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "rate(worker_compute_seconds_total{model=~\"$model\"}[$__rate_interval])", "legendFormat": "{{worker}} GPU-s/s" } ]
+      "title": "Dispatch rate by worker - $model",
+      "description": "Device executions per second on each worker. This is where an internally-called meta sub-model shows its activity (and which worker actually runs it).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "auto"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(worker_dispatch_total{model=~\"$model\"}[$__rate_interval])",
+          "legendFormat": "{{worker}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue depth & wait - $model",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 13
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*wait.*"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*depth.*"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (worker) (worker_queue_depth{model=~\"$model\"})",
+          "legendFormat": "depth {{worker}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(worker_queue_wait_seconds{model=~\"$model\", quantile=\"0.99\"})",
+          "legendFormat": "wait p99"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Device compute by worker - $model",
+      "description": "device-seconds consumed per second by this model on each worker (its real device load), and works for meta sub-models. Compare against Avg device/dispatch above.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 13
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(worker_compute_seconds_total{model=~\"$model\"}[$__rate_interval])",
+          "legendFormat": "{{worker}} device-s/s"
+        }
+      ]
     },
     {
       "type": "state-timeline",
       "title": "Residency by worker - $model",
       "description": "Where this model is device-resident over time. Gaps after a compaction flush or eviction; it re-warms on the next call (a meta sub-model re-warms when its parent runs).",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 20 },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "dark-red", "value": null }, { "color": "green", "value": 1 } ] }, "mappings": [ { "type": "value", "options": { "0": { "text": "evicted", "color": "dark-red" }, "1": { "text": "resident", "color": "green" } } } ], "max": 1, "min": 0 } },
-      "options": { "showValue": "never", "mergeValues": true, "legend": { "displayMode": "list", "placement": "bottom" } },
-      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "worker_model_resident{model=~\"$model\"}", "legendFormat": "{{worker}}" } ]
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "dark-red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "evicted",
+                  "color": "dark-red"
+                },
+                "1": {
+                  "text": "resident",
+                  "color": "green"
+                }
+              }
+            }
+          ],
+          "max": 1,
+          "min": 0
+        }
+      },
+      "options": {
+        "showValue": "never",
+        "mergeValues": true,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "worker_model_resident{model=~\"$model\"}",
+          "legendFormat": "{{worker}}"
+        }
+      ]
     },
     {
       "type": "table",
       "title": "Gateway placement - $model",
       "description": "Which worker(s) the gateway routes this model to (host:port). A meta sub-model may be unplaced here (it's not directly routed); its real worker shows in the dispatch/residency panels.",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 20 },
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "align": "auto" } } },
-      "options": { "showHeader": true },
-      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "gateway_placement_weight{model=~\"$model\"} > 0", "format": "table", "instant": true } ],
-      "transformations": [ { "id": "organize", "options": { "excludeByName": { "Time": true, "model": true, "__name__": true, "job": true, "instance": true, "node": true, "deployment": true }, "renameByName": { "Value": "weight" } } } ]
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "align": "auto"
+          }
+        }
+      },
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "gateway_placement_weight{model=~\"$model\"} > 0",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "model": true,
+              "__name__": true,
+              "job": true,
+              "instance": true,
+              "node": true,
+              "deployment": true
+            },
+            "renameByName": {
+              "Value": "weight"
+            }
+          }
+        }
+      ]
     }
   ]
 }

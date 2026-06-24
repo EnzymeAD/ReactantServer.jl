@@ -111,7 +111,7 @@ end
 end
 
 @testset "verify_lpt_packing_preconditions!: gates on worker reachability" begin
-    cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", ["127.0.0.1:1"], String[], 1, 1, 1, "info",
+    cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", ["127.0.0.1:1"], String[], String[], 1, 1, 1, "info",
                            "json", "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr",
                            Dict{String,GW.GatewayModelConfig}(), 32, 64, :off, 0)
     pool = GW.ClientPool(cfg)
@@ -178,7 +178,7 @@ end
 end
 
 @testset "gateway compaction cadence: fires on the Nth repack that moves a model" begin
-    mk(mode, interval) = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], 60, 1, 1,
+    mk(mode, interval) = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], String[], 60, 1, 1,
         "info", "json", "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr",
         Dict{String,GW.GatewayModelConfig}(), 32, 64, mode, interval)
     cfg = mk(:eager, 2)
@@ -211,7 +211,7 @@ end
 function _pk_state(; routing_policy = "fill_rr", fill_factor = 1.0, max_batch = 8,
                    assignment = Dict{String,GW.Placement}("m" => [("w0", 0.5), ("w1", 0.5)]),
                    costs = nothing)
-    cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], 60, 1, 1, "info", "json",
+    cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], String[], 60, 1, 1, "info", "json",
                            "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, fill_factor, routing_policy,
                            Dict{String,GW.GatewayModelConfig}(), 32, 64, :off, 0)
     s = GW.LptPackingState(cfg)
