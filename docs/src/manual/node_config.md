@@ -50,8 +50,7 @@ global:
     mem_fraction: 0.9      # fraction of device memory claimed for the pool (GPU only)
     preallocate: true      # claim the pool up front (GPU only)
     allow_cpu_fallback: false
-    weight_cache_bytes: 0  # absolute GPU byte budget for on-demand weights; 0 keeps all resident
-    weight_cache_fraction: 0.0          # same budget as a fraction of the arena; wins over _bytes when > 0
+    weight_cache_fraction: 1.0          # arena fraction for all weights (pinned + on-demand); 0 disables, GPU only
     weight_cache_wiggle_fraction: 0.1   # arena fraction kept free; drives startup peak probe + auto-sizing
   scheduler:               # -> SchedulerConfig
     discipline: fair       # fair | fifo | edf (use fifo or edf behind a gateway running lpt_packing)
@@ -201,7 +200,7 @@ Any worker value can be overridden per process by an environment variable of the
 ```
 INFERENCE_SERVER_ENDPOINTS_PORT=9100
 INFERENCE_SERVER_RUNTIME_BACKEND=cpu
-INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_BYTES=8589934592
+INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_FRACTION=0.8
 ```
 
 List-valued overrides (`INFERENCE_SERVER_MODEL_DIRS`, `INFERENCE_SERVER_MODELS_INCLUDE`) are

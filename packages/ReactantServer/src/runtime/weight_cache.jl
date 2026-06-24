@@ -27,28 +27,59 @@ mutable struct WeightCache
     evicts::Int                    # observability: evictions performed
     load_seconds::Float64          # observability: cumulative time spent loading weights
     compactions::Int               # observability: compaction passes performed
+    pinned_bytes::Int              # observability: device-pinned footprint reserved (set at startup)
+    max_scratch::Int               # observability: measured worst-case execution scratch (set at startup)
+    weight_pool::Int               # observability: arena bytes allotted to all weights (pinned + on-demand)
     lock::ReentrantLock
 end
 
 WeightCache(backend::AbstractBackend, pool::MemoryPool, registry::ModelRegistry, max_bytes::Integer;
             mode::ResidencyMode=SELF_MANAGED, store::WeightStore=PrivateWeightStore()) =
-    WeightCache(backend, pool, registry, mode, store, Int(max_bytes), 0, String[], 0, 0, 0.0, 0, ReentrantLock())
+    WeightCache(backend, pool, registry, mode, store, Int(max_bytes), 0, String[], 0, 0, 0.0, 0, 0, 0, 0, ReentrantLock())
 
 """
-    resolve_cache_budget(base, arena, observed_peak, wiggle) -> (; effective, overage, ceiling)
+    weight_budget(; arena, fraction, wiggle, max_scratch, pinned_bytes) -> (; on_demand_budget, weight_pool, scratch_ceiling, pinned_over_commit)
 
-Shrink an on-demand cache budget `base` (bytes) so the measured `observed_peak` device usage plus a
-`wiggle` fraction of the `arena` fits within the arena. `ceiling = (1 - wiggle) * arena`; the cache
-is trimmed by `overage = max(0, observed_peak - ceiling)`. Because the empirical peak already
-includes whatever weights were resident at the peak moment, trimming the cache by the overage
-brings the next peak back under the ceiling. Pure arithmetic, no device access (so it is unit
-testable); `overage > base` signals the unfixable case (even a zero cache does not fit).
+Solve for the on-demand weight-cache byte budget from the unified memory model. The arena holds, at
+the worst instant, pinned weights + on-demand weights + one model's execution `max_scratch` + a
+`wiggle` fraction of free slack:
+
+    scratch_ceiling  = (1 - wiggle) * arena
+    weight_pool      = min(fraction * arena, scratch_ceiling - max_scratch)   # for pinned + on-demand
+    on_demand_budget = clamp(weight_pool - pinned_bytes, 0, weight_pool)
+
+`fraction` caps the share of the arena devoted to weights (1.0 = all of it, minus scratch + wiggle).
+Pinned models reserve their footprint off the top, so the operator never subtracts it by hand.
+`pinned_over_commit` (pinned exceed the pool) flags a genuine over-commit no sizing can fix. Pure
+arithmetic, no device access, so it is unit testable.
 """
-function resolve_cache_budget(base::Integer, arena::Integer, observed_peak::Integer, wiggle::Real)
-    ceiling = floor(Int, (1 - Float64(wiggle)) * arena)
-    overage = max(0, Int(observed_peak) - ceiling)
-    effective = max(0, Int(base) - overage)
-    return (effective = effective, overage = overage, ceiling = ceiling)
+function weight_budget(; arena::Integer, fraction::Real, wiggle::Real,
+                       max_scratch::Integer, pinned_bytes::Integer)
+    scratch_ceiling = floor(Int, (1 - Float64(wiggle)) * arena)
+    weight_pool = max(0, min(floor(Int, Float64(fraction) * arena), scratch_ceiling - Int(max_scratch)))
+    on_demand_budget = clamp(weight_pool - Int(pinned_bytes), 0, weight_pool)
+    return (on_demand_budget = on_demand_budget, weight_pool = weight_pool,
+            scratch_ceiling = scratch_ceiling, pinned_over_commit = Int(pinned_bytes) > weight_pool)
+end
+
+# Free every resident non-pinned device buffer (no reload, no logging, no counters). Used by the
+# startup scratch probe to isolate one model at a time; pinned weights and host floors are untouched.
+function _free_nonpinned!(cache::WeightCache)
+    to_free = Any[]
+    lock(cache.lock) do
+        for entry in values(cache.registry.by_name)
+            model = entry.executable
+            (model === nothing || model.weights === nothing || is_device_pinned(model)) && continue
+            push!(to_free, model.weights)
+            model.weights = nothing
+        end
+        empty!(cache.lru)
+        cache.resident_bytes = 0
+    end
+    for fb in to_free
+        free_weights!(cache.backend, fb)
+    end
+    return nothing
 end
 
 _touch_mru!(cache::WeightCache, name::AbstractString) = begin
@@ -330,6 +361,8 @@ function weight_cache_stats(cache::WeightCache)
     lock(cache.lock) do
         return (resident_bytes = cache.resident_bytes, max_bytes = cache.max_bytes,
                 resident_models = copy(cache.lru), loads = cache.loads, evicts = cache.evicts,
-                load_seconds = cache.load_seconds, compactions = cache.compactions)
+                load_seconds = cache.load_seconds, compactions = cache.compactions,
+                pinned_bytes = cache.pinned_bytes, max_scratch = cache.max_scratch,
+                weight_pool = cache.weight_pool)
     end
 end

@@ -24,15 +24,14 @@ global:
     # (CUDA graph) instantiation.
     preallocate: true
     allow_cpu_fallback: false
-    # On-demand weight cache budget. Either give an absolute byte count (weight_cache_bytes) or, more
-    # intuitively, a fraction of the BFC arena (weight_cache_fraction, which wins when > 0). 0 keeps
-    # every model's weights resident (no on-demand cache).
-    # weight_cache_bytes: 0
-    weight_cache_fraction: 0.0
-    # Anti-fragmentation / scratch headroom, as a fraction of the arena. At startup the worker probes
-    # every model once (loads + runs it), measures peak device usage, and auto-shrinks the cache so
-    # that peak + this headroom fits the arena (logged; never errors unless even a zero cache cannot
-    # fit). Set 0 to disable the probe and keep the configured budget as-is.
+    # On-demand weight cache, sized as a fraction of the BFC arena devoted to all weights (pinned +
+    # on-demand). 1.0 (the default, GPU only) uses the whole arena and self-sizes at startup: the
+    # worker probes each model's peak device usage, reserves that scratch plus the wiggle fraction
+    # below and any pinned weights, and gives the rest to the on-demand cache (weights load lazily and
+    # evict LRU within it). When everything fits, all weights stay resident. 0 disables the cache
+    # (every weight resident, no probe).
+    weight_cache_fraction: 1.0
+    # Fraction of the arena kept free as anti-fragmentation slack; feeds the startup auto-sizing.
     weight_cache_wiggle_fraction: 0.1
   scheduler:
     ema_halflife_seconds: 30.0
@@ -42,7 +41,7 @@ global:
     # its free list (pinned models are loaded once at startup and left in place; freed models reload
     # lazily as requests arrive). 0 disables (the default), so a gateway-fronted worker never
     # self-compacts: behind a gateway, compaction is driven by the gateway instead. No-op when
-    # weight_cache_bytes is 0 (nothing churns). Prefer larger intervals.
+    # weight_cache_fraction is 0 (nothing churns). Prefer larger intervals.
     compaction_interval: 0
   endpoints:
     host: 0.0.0.0

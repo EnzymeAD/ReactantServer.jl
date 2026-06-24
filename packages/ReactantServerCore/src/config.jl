@@ -80,19 +80,19 @@ Runtime and device settings (the `runtime:` config block). `backend` selects CPU
 execution; `device_ordinal` picks the GPU among several visible ones; `mem_fraction` is the
 fraction of device memory claimed for the pool; `preallocate` claims that pool up front;
 `allow_cpu_fallback` permits falling back to CPU when the device is unavailable;
-`weight_cache_bytes` is the GPU byte budget for on-demand (unpinned) weights (`0` keeps every
-model's weights resident, the original behavior); `weight_cache_fraction` is the same budget
-expressed as a fraction of the BFC arena (`mem_fraction * device memory`), resolved to bytes at
-startup and taking precedence over `weight_cache_bytes` when `> 0` (far more intuitive to set
-than a raw byte count); `weight_cache_wiggle_fraction` is the fraction of the arena kept free as
-anti-fragmentation / scratch headroom, used at startup to auto-shrink the cache so measured peak
-usage plus this slack fits the arena; `residency_mode` selects self-managed or
-externally-managed residency; `shared_host_weights` opts the node into the shared-memory
-host-weight store so same-node workers share one host copy of each system-pinned model; and
-`shared_host_weights_mode` sets the permission bits (an octal string, default `"666"`) for
-those shared regions and their lock files. The `"666"` default keeps cross-UID container
-setups working but is world-writable; `"660"` is recommended for production and multi-user
-systems.
+`weight_cache_fraction` is the single knob sizing on-demand (unpinned) weight residency, the
+fraction of the BFC arena (`mem_fraction * device memory`) devoted to all weights, pinned plus
+on-demand (`1.0`, the default, uses the whole arena minus measured scratch and wiggle; `0`
+disables the cache so every model's weights stay resident; resolved to a byte budget at startup,
+GPU only); `weight_cache_wiggle_fraction` is the fraction of the arena kept free as
+anti-fragmentation slack and feeds the startup auto-sizing (the worker probes each model's peak
+device usage and sizes the cache so pinned weights + on-demand + scratch + this slack fit);
+`residency_mode` selects self-managed or externally-managed residency; `shared_host_weights` opts
+the node into the shared-memory host-weight store so same-node workers share one host copy of each
+system-pinned model; and `shared_host_weights_mode` sets the permission bits (an octal string,
+default `"666"`) for those shared regions and their lock files. The `"666"` default keeps cross-UID
+container setups working but is world-writable; `"660"` is recommended for production and
+multi-user systems.
 """
 struct RuntimeConfig
     backend::BackendKind
@@ -100,40 +100,28 @@ struct RuntimeConfig
     mem_fraction::Float64
     preallocate::Bool
     allow_cpu_fallback::Bool
-    weight_cache_bytes::Int      # GPU byte budget for on-demand (unpinned) weights; 0 = keep all resident
     residency_mode::ResidencyMode
     shared_host_weights::Bool
     shared_host_weights_mode::UInt16   # permission bits for the shared host-weight regions
-    weight_cache_fraction::Float64        # on-demand budget as a fraction of the arena; 0 = use weight_cache_bytes
+    weight_cache_fraction::Float64        # arena fraction for all weights (pinned + on-demand); 0 = cache off
     weight_cache_wiggle_fraction::Float64 # arena fraction kept free as headroom (drives startup auto-sizing)
 end
 
-# Preserve the original five-argument form; later fields take their defaults (on-demand disabled,
-# self-managed residency, private host weights, no fraction/wiggle auto-sizing).
+# Five-argument form: device/backend only; residency self-managed, private host weights, and the
+# on-demand cache off (fraction 0). Used by tests and programmatic construction; the YAML path
+# (`build_config`) supplies the 1.0 fraction default.
 RuntimeConfig(backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
     preallocate::Bool, allow_cpu_fallback::Bool) =
     RuntimeConfig(backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
-        0, SELF_MANAGED, false, 0o666, 0.0, 0.0)
+        SELF_MANAGED, false, 0o666, 0.0, 0.0)
 
-# Preserve the six-argument form (adds weight_cache_bytes); residency defaults stay.
+# Seven-argument form: adds residency mode and the shared-host-weights flag (cache still off unless
+# a fraction is given). Used where a test needs to exercise externally-managed residency.
 RuntimeConfig(backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
-    preallocate::Bool, allow_cpu_fallback::Bool, weight_cache_bytes::Integer) =
+    preallocate::Bool, allow_cpu_fallback::Bool, residency_mode::ResidencyMode,
+    shared_host_weights::Bool) =
     RuntimeConfig(backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
-        Int(weight_cache_bytes), SELF_MANAGED, false, 0o666, 0.0, 0.0)
-
-# Preserve the eight-argument form (everything but the shared-store mode).
-RuntimeConfig(backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
-    preallocate::Bool, allow_cpu_fallback::Bool, weight_cache_bytes::Integer,
-    residency_mode::ResidencyMode, shared_host_weights::Bool) =
-    RuntimeConfig(backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
-        Int(weight_cache_bytes), residency_mode, shared_host_weights, 0o666, 0.0, 0.0)
-
-# Preserve the nine-argument form (everything but the fraction/wiggle auto-sizing knobs).
-RuntimeConfig(backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
-    preallocate::Bool, allow_cpu_fallback::Bool, weight_cache_bytes::Integer,
-    residency_mode::ResidencyMode, shared_host_weights::Bool, shared_host_weights_mode::Integer) =
-    RuntimeConfig(backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
-        Int(weight_cache_bytes), residency_mode, shared_host_weights, UInt16(shared_host_weights_mode), 0.0, 0.0)
+        residency_mode, shared_host_weights, 0o666, 0.0, 0.0)
 
 """
     ModelSchedConfig
@@ -273,7 +261,6 @@ const ENV_PATHS = Tuple{String,Vector{String},DataType}[
     ("RUNTIME_MEM_FRACTION", ["runtime", "mem_fraction"], Float64),
     ("RUNTIME_PREALLOCATE", ["runtime", "preallocate"], Bool),
     ("RUNTIME_ALLOW_CPU_FALLBACK", ["runtime", "allow_cpu_fallback"], Bool),
-    ("RUNTIME_WEIGHT_CACHE_BYTES", ["runtime", "weight_cache_bytes"], Int),
     ("RUNTIME_WEIGHT_CACHE_FRACTION", ["runtime", "weight_cache_fraction"], Float64),
     ("RUNTIME_WEIGHT_CACHE_WIGGLE_FRACTION", ["runtime", "weight_cache_wiggle_fraction"], Float64),
     ("RUNTIME_SHARED_HOST_WEIGHTS", ["runtime", "shared_host_weights"], Bool),
@@ -467,11 +454,10 @@ function build_config(raw::AbstractDict)
         _opt(rt, "mem_fraction", Float64, 0.9),
         _opt(rt, "preallocate", Bool, true),
         _opt(rt, "allow_cpu_fallback", Bool, true),
-        _opt(rt, "weight_cache_bytes", Int, 0),
         residency_mode,
         _opt(rt, "shared_host_weights", Bool, false),
         _parse_shm_mode(_opt(rt, "shared_host_weights_mode", String, "666")),
-        _opt(rt, "weight_cache_fraction", Float64, 0.0),
+        _opt(rt, "weight_cache_fraction", Float64, 1.0),
         _opt(rt, "weight_cache_wiggle_fraction", Float64, 0.1),
     )
 
@@ -534,9 +520,8 @@ function validate_config(cfg::ServerConfig)
             throw(ConfigError("scheduler.models.$name.max_batch_size must be >= 1"))
     end
     0 < cfg.runtime.mem_fraction <= 1 || throw(ConfigError("runtime.mem_fraction must be in (0, 1]"))
-    cfg.runtime.weight_cache_bytes >= 0 || throw(ConfigError("runtime.weight_cache_bytes must be non-negative"))
     0 <= cfg.runtime.weight_cache_fraction <= 1 ||
-        throw(ConfigError("runtime.weight_cache_fraction must be in [0, 1] (0 = use weight_cache_bytes)"))
+        throw(ConfigError("runtime.weight_cache_fraction must be in [0, 1] (0 disables the on-demand cache)"))
     0 <= cfg.runtime.weight_cache_wiggle_fraction < 1 ||
         throw(ConfigError("runtime.weight_cache_wiggle_fraction must be in [0, 1)"))
     cfg.model_poll_seconds >= 0 || throw(ConfigError("model_poll_seconds must be non-negative"))
@@ -550,7 +535,7 @@ end
 # `apply_env_overrides!` is applied on top by `node_server_config`.
 
 function log_effective_config(cfg::ServerConfig, applied)
-    @info "Effective configuration" model_dirs=cfg.model_dirs models_include=cfg.models_include model_control_mode=cfg.model_control_mode model_poll_seconds=cfg.model_poll_seconds cache_dir=cfg.cache_dir backend=cfg.runtime.backend device_ordinal=cfg.runtime.device_ordinal mem_fraction=cfg.runtime.mem_fraction preallocate=cfg.runtime.preallocate allow_cpu_fallback=cfg.runtime.allow_cpu_fallback weight_cache_bytes=cfg.runtime.weight_cache_bytes weight_cache_fraction=cfg.runtime.weight_cache_fraction weight_cache_wiggle_fraction=cfg.runtime.weight_cache_wiggle_fraction residency_mode=cfg.runtime.residency_mode shared_host_weights=cfg.runtime.shared_host_weights shared_host_weights_mode=string(cfg.runtime.shared_host_weights_mode; base=8) host=cfg.endpoints.host port=cfg.endpoints.port metrics_port=cfg.endpoints.metrics_port max_concurrent_requests=cfg.endpoints.max_concurrent_requests discipline=cfg.scheduler.discipline ema_halflife_seconds=cfg.scheduler.ema_halflife_seconds recency_penalty_cap=cfg.scheduler.recency_penalty_cap coalescing_discount=cfg.scheduler.coalescing_discount cost_ema_alpha=cfg.scheduler.cost_ema_alpha max_queue_depth=cfg.scheduler.max_queue_depth compaction_interval=cfg.scheduler.compaction_interval scheduler_models=collect(keys(cfg.scheduler.models))
+    @info "Effective configuration" model_dirs=cfg.model_dirs models_include=cfg.models_include model_control_mode=cfg.model_control_mode model_poll_seconds=cfg.model_poll_seconds cache_dir=cfg.cache_dir backend=cfg.runtime.backend device_ordinal=cfg.runtime.device_ordinal mem_fraction=cfg.runtime.mem_fraction preallocate=cfg.runtime.preallocate allow_cpu_fallback=cfg.runtime.allow_cpu_fallback weight_cache_fraction=cfg.runtime.weight_cache_fraction weight_cache_wiggle_fraction=cfg.runtime.weight_cache_wiggle_fraction residency_mode=cfg.runtime.residency_mode shared_host_weights=cfg.runtime.shared_host_weights shared_host_weights_mode=string(cfg.runtime.shared_host_weights_mode; base=8) host=cfg.endpoints.host port=cfg.endpoints.port metrics_port=cfg.endpoints.metrics_port max_concurrent_requests=cfg.endpoints.max_concurrent_requests discipline=cfg.scheduler.discipline ema_halflife_seconds=cfg.scheduler.ema_halflife_seconds recency_penalty_cap=cfg.scheduler.recency_penalty_cap coalescing_discount=cfg.scheduler.coalescing_discount cost_ema_alpha=cfg.scheduler.cost_ema_alpha max_queue_depth=cfg.scheduler.max_queue_depth compaction_interval=cfg.scheduler.compaction_interval scheduler_models=collect(keys(cfg.scheduler.models))
     isempty(applied) || @info "Configuration overridden by environment" overrides=first.(applied)
     return nothing
 end

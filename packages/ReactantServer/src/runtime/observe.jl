@@ -50,6 +50,18 @@ function resident_weight_bytes(registry::ModelRegistry)
     return (bytes = bytes, count = count)
 end
 
+# Total device footprint of the device-pinned (PINNED_DEVICE) models. They are always resident, so
+# they reserve their share of the arena ahead of the on-demand cache (see `weight_budget`).
+function pinned_weight_bytes(registry::ModelRegistry)
+    bytes = 0
+    for e in values(registry.by_name)
+        m = e.executable
+        (m === nothing || !is_device_pinned(m)) && continue
+        bytes += m.nbytes
+    end
+    return bytes
+end
+
 _pct(part::Integer, whole::Integer) = whole > 0 ? round(Int, 100 * part / whole) : 0
 
 """
@@ -78,6 +90,8 @@ function memory_report(backend::AbstractBackend, pool::MemoryPool;
         st = weight_cache_stats(weight_cache)
         freeb = max(st.max_bytes - st.resident_bytes, 0)
         push!(parts, "on-demand budget $(Base.format_bytes(st.resident_bytes))/$(Base.format_bytes(st.max_bytes)) ($(_pct(freeb, st.max_bytes))% free)")
+        (st.pinned_bytes > 0 || st.max_scratch > 0) &&
+            push!(parts, "pinned $(Base.format_bytes(st.pinned_bytes)), scratch $(Base.format_bytes(st.max_scratch)), pool $(Base.format_bytes(st.weight_pool))")
     end
     return join(parts, " | ")
 end

@@ -609,33 +609,83 @@ function init_sched_state!(s::Scheduler, entry::AbstractDispatchEntry, now::Floa
     return entry
 end
 
-# Auto-size the on-demand weight cache against measured peak device usage. Runs on the startup
-# thread before the dispatch loop spawns (so mutating `cache.max_bytes` does not race the loop). The
-# warmup pass above has already exercised every model, so the allocator's peak high-water reflects a
-# realistic worst case; trim the budget so peak + wiggle headroom fits the arena. See
-# `resolve_cache_budget`.
-function _autosize_weight_cache!(s::Scheduler, base::Int, arena::Int, wiggle::Float64)
+# Measure the worst-case execution scratch (transient device memory beyond resident weights) by
+# probing each model in ISOLATION: free all non-pinned device weights so only pinned + the probed
+# model are resident, run every compiled (variant,size), and read the allocator's peak. Subtracting
+# the KNOWN isolated resident floor (pinned + the model's own footprint) from the global peak keeps
+# the estimate sound despite `peak_bytes_in_use` being a monotone, non-resettable high-water (later
+# models inherit earlier peaks, so the result is a conservative over-estimate, the safe direction).
+# The per-model run also seeds the fair discipline's cost estimates. Returns max scratch in bytes
+# (0 when the backend reports no device stats, e.g. CPU/mock).
+function _probe_max_scratch!(s::Scheduler, pinned_bytes::Int)
+    (s.weight_cache === nothing || device_memory_stats(s.backend, s.pool) === nothing) && return 0
+    max_scratch = 0
+    for entry in values(s.registry.by_name)
+        model = entry.executable
+        (model === nothing || is_device_pinned(model)) && continue
+        isempty(entry.manifest.executable_inputs) && continue   # cannot synthesize inputs
+        _free_nonpinned!(s.weight_cache)                         # isolate: only pinned + M will be resident
+        try
+            acquire!(s.weight_cache, entry)
+        catch err
+            err isa NotResidentError && continue                 # externally-managed: cannot load to measure
+            rethrow()
+        end
+        for (variant, inner) in model.execs
+            for sz in keys(inner)
+                inputs = _zero_inputs(entry, variant, sz)
+                inputs === nothing && continue
+                try
+                    t0 = time()
+                    run_model(s.backend, s.pool, model, inputs)
+                    entry.sched.cost_estimate[sz] = max(time() - t0, eps())
+                catch err
+                    @warn "memory probe / warmup run failed; using default cost" model = entry.name variant = variant size = sz exception = err
+                end
+            end
+        end
+        dm = device_memory_stats(s.backend, s.pool)
+        dm === nothing && continue
+        max_scratch = max(max_scratch, dm.peak_in_use - (pinned_bytes + model.nbytes))
+    end
+    return max(0, max_scratch)
+end
+
+# Size the on-demand cache from the unified memory model: pinned reserve their footprint, the
+# isolation probe measures worst-case scratch, and the cache gets whatever the arena has left after
+# pinned + scratch + the wiggle slack (`weight_budget`). Runs on the startup thread before the
+# dispatch loop spawns (so mutating `max_bytes` does not race the loop).
+function _autosize_weight_cache!(s::Scheduler, arena::Int, fraction::Float64, wiggle::Float64)
     s.weight_cache === nothing && return nothing
-    dm = device_memory_stats(s.backend, s.pool)
-    dm === nothing && return nothing
-    res = resolve_cache_budget(base, arena, dm.peak_in_use, wiggle)
-    res.overage > 0 || return nothing
-    s.weight_cache.max_bytes = res.effective
-    if res.effective == 0 && res.overage > base
-        @warn "weight cache auto-size: even a zero-size cache does not fit; pinned weights plus execution scratch exceed the arena minus the wiggle headroom" arena = arena observed_peak = dm.peak_in_use wiggle = wiggle base = base
+    pinned = pinned_weight_bytes(s.registry)
+    max_scratch = _probe_max_scratch!(s, pinned)
+    b = weight_budget(; arena = arena, fraction = fraction, wiggle = wiggle,
+                       max_scratch = max_scratch, pinned_bytes = pinned)
+    lock(s.weight_cache.lock) do
+        s.weight_cache.max_bytes = b.on_demand_budget
+        s.weight_cache.pinned_bytes = pinned
+        s.weight_cache.max_scratch = max_scratch
+        s.weight_cache.weight_pool = b.weight_pool
+    end
+    has_ondemand = any(e -> e.executable !== nothing && !is_device_pinned(e.executable),
+                       values(s.registry.by_name))
+    if b.pinned_over_commit
+        @warn "weight budget: pinned weights plus execution scratch exceed the arena minus wiggle; pinned models may not fit" arena = arena pinned_bytes = pinned max_scratch = max_scratch weight_pool = b.weight_pool wiggle = wiggle
+    elseif b.on_demand_budget == 0 && has_ondemand
+        @warn "weight budget: no room for the on-demand cache after pinned weights + scratch + wiggle; non-pinned models reload on every dispatch" arena = arena pinned_bytes = pinned max_scratch = max_scratch
     else
-        @info "weight cache auto-sized to fit measured peak plus wiggle headroom" base = base effective = res.effective observed_peak = dm.peak_in_use ceiling = res.ceiling arena = arena wiggle = wiggle
+        @info "weight budget resolved" arena = arena fraction = fraction wiggle = wiggle pinned_bytes = pinned max_scratch = max_scratch weight_pool = b.weight_pool on_demand_budget = b.on_demand_budget
     end
     return nothing
 end
 
-# Prepare every registered entry's scheduling state, seed cost estimates from a warmup pass, then
-# spawn the dispatch loop. Entries are already in the registry (loaded and compiled by `serve`).
-# When `autosize_arena > 0` (set by the worker when the on-demand cache + a wiggle fraction are
-# configured), the warmup pass runs for every model regardless of discipline so it doubles as a
-# memory probe, then the cache is auto-sized to the measured peak before serving begins.
-function start!(s::Scheduler; autosize_arena::Integer=0, autosize_wiggle::Real=0.0,
-                autosize_base::Integer=0)
+# Prepare every registered entry's scheduling state, then spawn the dispatch loop. Entries are
+# already in the registry (loaded and compiled by `serve`). When `autosize_arena > 0` (set by the
+# worker when the on-demand cache is enabled), the isolation probe runs every model regardless of
+# discipline, doubling as the FAIR cost warmup and the scratch measurement, and the cache is sized
+# before serving begins.
+function start!(s::Scheduler; autosize_arena::Integer=0, autosize_fraction::Real=0.0,
+                autosize_wiggle::Real=0.0)
     now = time()
     for entry in values(s.registry.by_name)
         init_sched_state!(s, entry, now)
@@ -644,16 +694,15 @@ function start!(s::Scheduler; autosize_arena::Integer=0, autosize_wiggle::Real=0
         init_sched_state!(s, entry, now)
     end
     s.weight_cache === nothing || preload_pinned!(s.weight_cache, s.registry)
-    autosize = autosize_arena > 0 && s.weight_cache !== nothing
-    # Warmup seeds the fair discipline's per-batch-size cost estimates; the memory probe (auto-size)
-    # needs the same per-model run to drive the allocator's peak high-water. Run the pass once when
-    # either wants it.
-    if s.cfg.discipline == FAIR || autosize
+    if autosize_arena > 0 && s.weight_cache !== nothing
+        # The probe runs every model (seeding FAIR costs too) and sizes the cache.
+        _autosize_weight_cache!(s, Int(autosize_arena), Float64(autosize_fraction), Float64(autosize_wiggle))
+    elseif s.cfg.discipline == FAIR
+        # No auto-size (cache off, or no device stats): just seed FAIR costs.
         for entry in values(s.registry.by_name)
             _warmup_entry!(s, entry)
         end
     end
-    autosize && _autosize_weight_cache!(s, Int(autosize_base), Int(autosize_arena), Float64(autosize_wiggle))
     s.running = true
     # Run the dispatch loop on the interactive threadpool when one exists (the worker is started
     # with `--threads=auto,1`), so the GPU dispatch is scheduled promptly and is never starved by
@@ -853,7 +902,7 @@ until applied. Raises on an unknown model or in self-managed mode.
 function set_residency!(s::Scheduler, name::AbstractString, target::ResidencyState)
     return _run_control(s, function (sch)
         sch.weight_cache === nothing &&
-            throw(ErrorException("residency control requires the on-demand weight cache (set runtime.weight_cache_bytes > 0)"))
+            throw(ErrorException("residency control requires the on-demand weight cache (set runtime.weight_cache_fraction > 0)"))
         sch.weight_cache.mode == EXTERNALLY_MANAGED ||
             throw(ErrorException("worker is self-managed; residency is not externally controllable"))
         nm = String(name)

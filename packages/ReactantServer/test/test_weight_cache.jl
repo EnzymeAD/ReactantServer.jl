@@ -310,20 +310,29 @@ end
     end
 end
 
-@testset "resolve_cache_budget trims the cache to fit peak + wiggle" begin
-    rcb = ReactantServer.resolve_cache_budget
-    # Under budget: observed peak below the ceiling -> no trim.
-    r = rcb(500, 1000, 800, 0.1)          # ceiling = 900
-    @test r.ceiling == 900 && r.overage == 0 && r.effective == 500
-    # Over budget: trim the cache by the overage.
-    r = rcb(500, 1000, 950, 0.1)          # over by 50
-    @test r.overage == 50 && r.effective == 450
-    # Unfixable: even a zero cache does not fit (overage exceeds the base budget).
-    r = rcb(30, 1000, 950, 0.1)
-    @test r.overage == 50 && r.effective == 0 && r.overage > 30
-    # Zero wiggle: ceiling is the whole arena.
-    r = rcb(500, 1000, 1000, 0.0)
-    @test r.ceiling == 1000 && r.overage == 0 && r.effective == 500
+@testset "weight_budget reserves pinned + scratch + wiggle from the arena" begin
+    wb(; kw...) = ReactantServer.weight_budget(; kw...)
+    # No pinned, no scratch: on-demand gets fraction*arena, capped by (1-wiggle)*arena.
+    b = wb(arena=1000, fraction=1.0, wiggle=0.1, max_scratch=0, pinned_bytes=0)
+    @test b.scratch_ceiling == 900 && b.weight_pool == 900 && b.on_demand_budget == 900
+    # Fraction caps below the scratch ceiling.
+    b = wb(arena=1000, fraction=0.5, wiggle=0.1, max_scratch=0, pinned_bytes=0)
+    @test b.weight_pool == 500 && b.on_demand_budget == 500
+    # Scratch eats into the pool.
+    b = wb(arena=1000, fraction=1.0, wiggle=0.1, max_scratch=300, pinned_bytes=0)
+    @test b.weight_pool == 600 && b.on_demand_budget == 600
+    # Pinned reserves its portion off the top.
+    b = wb(arena=1000, fraction=1.0, wiggle=0.1, max_scratch=300, pinned_bytes=200)
+    @test b.weight_pool == 600 && b.on_demand_budget == 400 && !b.pinned_over_commit
+    # Pinned over-commit: pinned exceed the pool -> on-demand 0, flagged.
+    b = wb(arena=1000, fraction=1.0, wiggle=0.1, max_scratch=300, pinned_bytes=700)
+    @test b.on_demand_budget == 0 && b.pinned_over_commit
+    # Scratch alone exceeds the ceiling -> empty pool.
+    b = wb(arena=1000, fraction=1.0, wiggle=0.1, max_scratch=950, pinned_bytes=0)
+    @test b.weight_pool == 0 && b.on_demand_budget == 0
+    # Arena 0 (CPU/mock): everything zero.
+    b = wb(arena=0, fraction=1.0, wiggle=0.1, max_scratch=0, pinned_bytes=0)
+    @test b.weight_pool == 0 && b.on_demand_budget == 0
 end
 
 @testset "shared weight store backs a system-pinned model and unlinks on unpin" begin

@@ -11,8 +11,8 @@
 # This is the no-replication setup: with the gateway's default_replicas: 1, lpt_packing places each
 # model on ONE of the two GPUs (chosen by balancing memory and compute), so a model's weights live
 # on a single card and its traffic concentrates there for batch coalescing. As in the single-GPU
-# soak (node.gpu2.yaml), no `models:` map is needed; the on-demand weight cache (weight_cache_bytes)
-# keeps each GPU memory-safe by loading weights lazily and evicting LRU within the byte budget.
+# soak (node.gpu2.yaml), no `models:` map is needed; the on-demand weight cache (weight_cache_fraction)
+# keeps each GPU memory-safe by loading weights lazily and evicting LRU within its auto-sized budget.
 model_repo: /var/lib/reactantserver/models
 base_port: 8080
 # Per-worker Prometheus metrics port (metrics_base_port + worker index): worker0 -> 9100,
@@ -30,10 +30,11 @@ global:
     # (CUDA graph) instantiation.
     preallocate: true
     allow_cpu_fallback: false
-    # On-demand weight cache per GPU: weights load lazily and evict LRU within this byte budget
-    # (24 GiB, sized for this box's larger cards; the T4-based node.gpu0123.yaml uses 10 GiB), so all
-    # models need not be resident at once. 0 would keep every weight resident.
-    weight_cache_bytes: 25769803776
+    # On-demand weight cache per GPU, sized as a fraction of the BFC arena. 1.0 (default) uses the
+    # whole arena for weights and auto-sizes at startup (probe scratch, reserve pinned + scratch +
+    # wiggle, give the rest to the cache); weights load lazily and evict LRU within it. 0 keeps all
+    # weights resident.
+    weight_cache_fraction: 1.0
     # Share the PINNED_SYSTEM host weight floor across both worker subprocesses via POSIX shm regions
     # (keyed by model name + content digest) instead of each worker holding its own private
     # anonymous-RAM copy. Since every worker loads every bundle here, this collapses the host floor

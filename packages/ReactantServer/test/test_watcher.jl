@@ -144,9 +144,10 @@ end
     mktempdir() do root
         _write_scale_bundle(root, "scale4")
         sched_cfg() = ReactantServer.SchedulerConfig(30.0, 64, 30.0)
-        # weight_cache_bytes > 0 so explicit (externally-managed) residency is meaningful.
+        # CPU has no device arena, so the on-demand cache is off here; the watcher-gating assertion
+        # below does not depend on it. Pass the residency mode through the 7-arg constructor.
         _runtime(residency) = ReactantServer.RuntimeConfig(ReactantServer.CPU_BACKEND, 0, 0.9, true,
-            true, 1 << 30, residency, false)
+            true, residency, false)
         # explicit ⇒ externally-managed residency, mirroring build_config's derivation.
         _cfg(mode) = ReactantServer.ServerConfig([root], "",
             _runtime(mode == ReactantServer.EXPLICIT ? ReactantServer.EXTERNALLY_MANAGED : ReactantServer.SELF_MANAGED),

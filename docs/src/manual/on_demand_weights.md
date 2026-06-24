@@ -29,39 +29,40 @@ same order of magnitude as a single inference.
 
 ## Enabling it
 
-Give the on-demand cache a GPU budget. The intuitive way is a **fraction of the BFC arena**
-(`mem_fraction * device memory`) via `runtime.weight_cache_fraction`; an absolute
-`runtime.weight_cache_bytes` is also accepted, and the fraction wins when both are set. `0` for
-both keeps every model resident (the original behavior); any positive value enables the on-demand
-cache.
+There is one knob: `runtime.weight_cache_fraction`, the fraction of the BFC arena
+(`mem_fraction * device memory`) devoted to all weights, pinned plus on-demand. It defaults to
+**1.0** (use the whole arena, GPU only), and `0` disables the cache so every model's weights stay
+resident. You normally do not set it at all.
 
 ```yaml
 global:
   runtime:
     backend: cuda
-    weight_cache_fraction: 0.7         # 70% of the arena for on-demand weights (vs a raw byte count)
-    weight_cache_wiggle_fraction: 0.1  # keep 10% of the arena free as headroom (see below)
+    weight_cache_fraction: 1.0         # default: use the whole arena, self-sized (see below)
+    weight_cache_wiggle_fraction: 0.1  # default: keep 10% of the arena free as headroom
 ```
 
-These are the `weight_cache_fraction` / `weight_cache_bytes` / `weight_cache_wiggle_fraction`
-fields of [`RuntimeConfig`](@ref), also settable via `INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_*`
-environment variables.
+These are the `weight_cache_fraction` / `weight_cache_wiggle_fraction` fields of
+[`RuntimeConfig`](@ref), also settable via `INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_*` environment
+variables. The cache is GPU-only; on CPU there is no arena, so weights stay resident regardless.
 
-### Self-sizing against the scratch ceiling
+### Self-sizing: pinned + scratch + wiggle
 
-The budget you set is an upper bound, not a promise it fits. Each execution also needs transient
-device memory (activations, conv/GEMM workspace, IO) on top of resident weights, and the arena
-must hold the weights **and** that scratch at once. Rather than make you hand-compute it, the
-worker measures it: at startup, when the on-demand cache and a non-zero
-`weight_cache_wiggle_fraction` are set, it probes every model once (loads and runs it), reads the
-allocator's peak device usage, and auto-shrinks the cache budget so that `peak + wiggle` fits the
-arena. The reduction is logged at info; the budget is only ever lowered, never raised. The probe
-adds bounded one-time startup work (each model is loaded and run once) and doubles as an
-execution smoke test. Set `weight_cache_wiggle_fraction: 0` to skip the probe and keep your
-configured budget verbatim.
+The fraction is a ceiling on weight memory, not a promise it all fits as cache: each execution
+also needs transient device memory (activations, conv/GEMM workspace, IO) on top of resident
+weights, and pinned models occupy the arena too. The worker resolves the on-demand budget for you
+at startup. It probes each model once in isolation (loads and runs it), reads the allocator's peak
+device usage to measure the worst-case scratch, and sets
 
-If even a zero-size cache would not fit (pinned weights plus scratch alone exceed the wiggled
-arena) the worker logs a warning, since that is a genuine misconfiguration no auto-sizing can fix.
+```
+on_demand_budget = min(fraction*arena, (1-wiggle)*arena - max_scratch) - pinned_weights
+```
+
+so pinned weights reserve their share, the measured scratch and the wiggle slack are held back,
+and the rest is the on-demand cache. When everything fits, the cache simply holds all weights
+resident (no eviction); when it does not, it is memory-safe. The probe is bounded one-time startup
+work and doubles as an execution smoke test; the resolved budget is logged. Pinned weights or
+scratch large enough to leave no room are logged as a warning, since no sizing can fix that.
 
 ## Pinning hot models
 
@@ -166,7 +167,7 @@ independent of the repack cadence, for a one-off fleet defragment.
 
 #### Cost and when to enable
 
-With the on-demand cache disabled (`weight_cache_bytes: 0`) every model is permanently resident
+With the on-demand cache disabled (`weight_cache_fraction: 0`) every model is permanently resident
 from startup and nothing churns, so compaction has no working set to defragment and is a no-op in
 both modes. When it does run it has a cost: freeing the on-demand region drops models that were
 warm, so they pay a host-to-device reload (lazily on next request for `eager`, or up front for

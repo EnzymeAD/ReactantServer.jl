@@ -193,7 +193,7 @@ end
         global:
           runtime:
             backend: cuda
-            weight_cache_bytes: 10737418240
+            weight_cache_fraction: 0.6
             shared_host_weights: $shared
         """)
         path
