@@ -107,6 +107,7 @@ function gateway_spec(workspace_root::AbstractString;
                       gateway_path::Union{AbstractString,Nothing}=nothing,
                       endpoints::Union{Vector{String},Nothing}=nothing,
                       metrics_endpoints::Union{Vector{String},Nothing}=nothing,
+                      worker_names::Union{Vector{String},Nothing}=nothing,
                       grace_seconds::Real=10.0)
     proj = joinpath(workspace_root, "packages", "ReactantServerGateway")
     cmd = gateway_path === nothing ?
@@ -117,6 +118,10 @@ function gateway_spec(workspace_root::AbstractString;
         endpoints === nothing || push!(pairs, "REACTANT_GATEWAY_WORKERS" => join(endpoints, ","))
         metrics_endpoints === nothing || isempty(metrics_endpoints) ||
             push!(pairs, "REACTANT_GATEWAY_WORKER_METRICS" => join(metrics_endpoints, ","))
+        # Friendly names (worker0..N), index-aligned to the endpoint lists, so the gateway labels its
+        # worker series with the same `worker` names the workers self-tag (host:port disappears).
+        worker_names === nothing || isempty(worker_names) ||
+            push!(pairs, "REACTANT_GATEWAY_WORKER_NAMES" => join(worker_names, ","))
         # The supervisor co-launches the workers, which compile every model before answering. Under
         # lpt_packing the gateway must wait for all of them before its startup checks pass, so make
         # the embedded gateway wait indefinitely by default (the worker subprocesses are this

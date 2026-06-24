@@ -47,6 +47,10 @@ services:
       # Physical GPUs 2 and 3; the supervisor assigns one to each worker child, which CUDA
       # renumbers to ordinal 0 inside its subprocess.
       CUDA_VISIBLE_DEVICES: "2,3"
+      # Inject nvidia-smi + NVML (the "utility" driver capability) alongside the compute libraries,
+      # so the entrypoint GPU-reclaim gate and the worker out-of-pool memory metric work. Pinned here
+      # rather than relying on the host container-runtime default capability set.
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
       # Put the embedded gateway in lpt_packing mode without replication: each model is placed on a
       # single GPU and its traffic concentrated there for batch coalescing. The embedded gateway
       # inherits these REACTANT_GATEWAY_SCHEDULING_* variables from this environment.

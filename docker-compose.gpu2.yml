@@ -43,6 +43,10 @@ services:
       # Physical GPU 2; the supervisor passes it to the worker child, which CUDA renumbers to
       # ordinal 0 inside the container.
       CUDA_VISIBLE_DEVICES: "2"
+      # Inject nvidia-smi + NVML (the "utility" driver capability) alongside the compute libraries,
+      # so the entrypoint GPU-reclaim gate and the worker out-of-pool memory metric work. Pinned here
+      # rather than relying on the host container-runtime default capability set.
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
     # The supervisor forwards SIGTERM to its children and waits for them before exiting.
     stop_grace_period: 30s
     healthcheck:

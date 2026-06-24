@@ -1,121 +1,668 @@
 {
   "uid": "rs-gpu-memory",
-  "title": "ReactantServer / GPU Memory Anatomy",
-  "tags": ["reactantserver", "memory", "use"],
+  "title": "ReactantServer / Device Memory Anatomy",
+  "tags": [
+    "reactantserver",
+    "memory",
+    "use"
+  ],
   "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,
   "refresh": "10s",
-  "time": { "from": "now-6h", "to": "now" },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
   "templating": {
     "list": [
-      { "name": "worker", "label": "Worker", "type": "query", "datasource": { "type": "prometheus", "uid": "prometheus" }, "query": { "query": "label_values(worker_info, worker)", "refId": "worker" }, "refresh": 2, "sort": 1, "includeAll": true, "multi": true, "current": { "text": "All", "value": "$__all" } },
-      { "name": "gpu", "label": "GPU", "type": "query", "datasource": { "type": "prometheus", "uid": "prometheus" }, "query": { "query": "label_values(worker_info, gpu)", "refId": "gpu" }, "refresh": 2, "sort": 3, "includeAll": true, "multi": true, "current": { "text": "All", "value": "$__all" } }
+      {
+        "name": "worker",
+        "label": "Worker",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "query": "label_values(worker_info, worker)",
+          "refId": "worker"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
     ]
   },
   "panels": [
     {
       "type": "timeseries",
-      "title": "Live occupancy - GPU $gpu",
+      "title": "Live occupancy - $worker",
       "description": "What is actually on the card now, stacked to the pool limit: resident weights + transient (activations / scratch / IO) + free. Part-to-whole, so a stacked area is the right encoding.",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 0 },
-      "repeat": "gpu",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "repeat": "worker",
       "repeatDirection": "h",
       "maxPerRow": 4,
       "fieldConfig": {
-        "defaults": { "unit": "bytes", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 50, "stacking": { "mode": "normal" } } },
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 50,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
         "overrides": [
-          { "matcher": { "id": "byName", "options": "resident weights" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } } ] },
-          { "matcher": { "id": "byName", "options": "transient" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ] },
-          { "matcher": { "id": "byName", "options": "free" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ] }
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "resident weights"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "transient"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "free"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          }
         ]
       },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "worker_resident_weight_bytes{gpu=~\"$gpu\"}", "legendFormat": "resident weights" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "clamp_min(worker_device_memory_in_use_bytes{gpu=~\"$gpu\"} - worker_resident_weight_bytes{gpu=~\"$gpu\"}, 0)", "legendFormat": "transient" },
-        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "worker_device_memory_free_bytes{gpu=~\"$gpu\"}", "legendFormat": "free" }
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "worker_resident_weight_bytes{worker=~\"$worker\"}",
+          "legendFormat": "resident weights"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "clamp_min(worker_device_memory_in_use_bytes{worker=~\"$worker\"} - worker_resident_weight_bytes{worker=~\"$worker\"}, 0)",
+          "legendFormat": "transient"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "worker_device_memory_free_bytes{worker=~\"$worker\"}",
+          "legendFormat": "free"
+        }
       ]
     },
     {
       "type": "timeseries",
-      "title": "Budget plan - GPU $gpu",
+      "title": "Budget plan - $worker",
       "description": "How the startup auto-sizer carved the arena: pinned weights + on-demand cache budget + reserved scratch + wiggle slack = pool limit. This is the plan; Live occupancy above is the reality.",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 8 },
-      "repeat": "gpu",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 8
+      },
+      "repeat": "worker",
       "repeatDirection": "h",
       "maxPerRow": 4,
       "fieldConfig": {
-        "defaults": { "unit": "bytes", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 50, "stacking": { "mode": "normal" } } },
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 50,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
         "overrides": [
-          { "matcher": { "id": "byName", "options": "pinned" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "purple" } } ] },
-          { "matcher": { "id": "byName", "options": "on-demand budget" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } } ] },
-          { "matcher": { "id": "byName", "options": "scratch reserve" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ] },
-          { "matcher": { "id": "byName", "options": "wiggle" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ] }
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "pinned"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "purple"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "on-demand budget"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "scratch reserve"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "wiggle"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          }
         ]
       },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "worker_weight_cache_pinned_bytes{gpu=~\"$gpu\"}", "legendFormat": "pinned" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "worker_weight_cache_max_bytes{gpu=~\"$gpu\"}", "legendFormat": "on-demand budget" },
-        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "worker_weight_cache_max_scratch_bytes{gpu=~\"$gpu\"}", "legendFormat": "scratch reserve" },
-        { "refId": "D", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "clamp_min(worker_device_memory_limit_bytes{gpu=~\"$gpu\"} - worker_weight_cache_pinned_bytes{gpu=~\"$gpu\"} - worker_weight_cache_max_bytes{gpu=~\"$gpu\"} - worker_weight_cache_max_scratch_bytes{gpu=~\"$gpu\"}, 0)", "legendFormat": "wiggle" }
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "worker_weight_cache_pinned_bytes{worker=~\"$worker\"}",
+          "legendFormat": "pinned"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "worker_weight_cache_max_bytes{worker=~\"$worker\"}",
+          "legendFormat": "on-demand budget"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "worker_weight_cache_max_scratch_bytes{worker=~\"$worker\"}",
+          "legendFormat": "scratch reserve"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "clamp_min(worker_device_memory_limit_bytes{worker=~\"$worker\"} - worker_weight_cache_pinned_bytes{worker=~\"$worker\"} - worker_weight_cache_max_bytes{worker=~\"$worker\"} - worker_weight_cache_max_scratch_bytes{worker=~\"$worker\"}, 0)",
+          "legendFormat": "wiggle"
+        }
       ]
     },
     {
       "type": "timeseries",
       "title": "Peak in-use vs pool limit",
       "description": "Allocator high-water against the arena ceiling, per worker. A flat peak over a long uptime confirms the command-buffer set is fixed; a creeping peak is the signal to revisit headroom.",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 16 },
-      "fieldConfig": { "defaults": { "unit": "bytes", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 5 } }, "overrides": [ { "matcher": { "id": "byRegexp", "options": ".*limit.*" }, "properties": [ { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 6] } }, { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] } ] },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*limit.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "worker_device_memory_peak_in_use_bytes{worker=~\"$worker\"}", "legendFormat": "{{worker}} peak" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "worker_device_memory_limit_bytes{worker=~\"$worker\"}", "legendFormat": "{{worker}} limit" }
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "worker_device_memory_peak_in_use_bytes{worker=~\"$worker\"}",
+          "legendFormat": "{{worker}} peak"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "worker_device_memory_limit_bytes{worker=~\"$worker\"}",
+          "legendFormat": "{{worker}} limit"
+        }
       ]
     },
     {
       "type": "timeseries",
       "title": "Weight loads / s",
       "description": "On-demand weight loads (host->device) per worker. Routine: a load happens on any cold request and on every eager-compaction reload (compaction's free is NOT counted as an eviction). Spikes after a compaction flush are expected, not a problem.",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 16 },
-      "fieldConfig": { "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 15 } } },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "rate(worker_weight_loads_total{worker=~\"$worker\"}[$__rate_interval])", "legendFormat": "{{worker}}" } ]
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 15
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(worker_weight_loads_total{worker=~\"$worker\"}[$__rate_interval])",
+          "legendFormat": "{{worker}}"
+        }
+      ]
     },
     {
       "type": "timeseries",
       "title": "Weight evictions / s",
       "description": "On-demand LRU evictions per worker. Unlike loads, a sustained eviction rate is a tuning signal: the working set does not fit the on-demand budget and weights are thrashing. Compaction's free does NOT show here, so any nonzero rate is genuine budget-pressure eviction.",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 16 },
-      "fieldConfig": { "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 25, "gradientMode": "opacity" }, "color": { "mode": "continuous-YlOrRd" } } },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "rate(worker_weight_evicts_total{worker=~\"$worker\"}[$__rate_interval])", "legendFormat": "{{worker}}" } ]
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 25,
+            "gradientMode": "opacity"
+          },
+          "color": {
+            "mode": "continuous-YlOrRd"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(worker_weight_evicts_total{worker=~\"$worker\"}[$__rate_interval])",
+          "legendFormat": "{{worker}}"
+        }
+      ]
     },
     {
       "type": "bargauge",
       "title": "On-demand budget utilization",
-      "description": "Resident on-demand weight bytes over the auto-sized budget, per GPU. Near 100% means the cache is full and evicting.",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 23 },
-      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 0.85 }, { "color": "red", "value": 0.98 } ] } } },
-      "options": { "orientation": "horizontal", "displayMode": "gradient", "showUnfilled": true, "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "worker_weight_cache_resident_bytes{gpu=~\"$gpu\"} / clamp_min(worker_weight_cache_max_bytes{gpu=~\"$gpu\"}, 1)", "legendFormat": "gpu {{gpu}}" } ]
+      "description": "Resident on-demand weight bytes over the auto-sized budget, per worker. Near 100% means the cache is full and evicting.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 23
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.85
+              },
+              {
+                "color": "red",
+                "value": 0.98
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "worker_weight_cache_resident_bytes{worker=~\"$worker\"} / clamp_min(worker_weight_cache_max_bytes{worker=~\"$worker\"}, 1)",
+          "legendFormat": "{{worker}}"
+        }
+      ]
     },
     {
       "type": "timeseries",
       "title": "Resident models per worker",
       "description": "How many models are currently device-resident on each worker. Drops to 0 on an eager compaction flush, then climbs as traffic re-warms.",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 23 },
-      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 } } },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi" } },
-      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "worker_models_resident{worker=~\"$worker\"}", "legendFormat": "{{worker}}" } ]
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 23
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "worker_models_resident{worker=~\"$worker\"}",
+          "legendFormat": "{{worker}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Out-of-pool driver memory (command buffers + context)",
+      "description": "Device memory each worker holds BEYOND the BFC arena: CUDA context + loaded modules + command buffers / CUDA graphs (process used per nvidia-smi minus the arena). It lives outside the preallocated pool and competes for the headroom between the arena and the card, so it is the quantity behind intermittent command-buffer startup OOMs (and the allocator stats above cannot see it). After warmup it should be flat, every program is instantiated at launch; a rising line, or a value near the card-minus-arena headroom, is the signal to lower mem_fraction.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 29
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "worker_device_memory_out_of_pool_bytes{worker=~\"$worker\"}",
+          "legendFormat": "{{worker}} out-of-pool"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "worker_device_memory_process_used_bytes{worker=~\"$worker\"}",
+          "legendFormat": "{{worker}} process total"
+        }
+      ]
     }
   ]
 }

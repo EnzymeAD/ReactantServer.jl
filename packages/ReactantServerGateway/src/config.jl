@@ -21,6 +21,7 @@ struct GatewayConfig
     listen_metrics::String
     workers::Vector{String}                 # worker URLs (host:port) to discover and forward to
     worker_metrics::Vector{String}          # worker metrics URLs (host:port) aggregated into /metrics
+    worker_names::Vector{String}            # friendly names (worker0..N), index-aligned to workers/worker_metrics; empty -> labels show the raw url
     request_timeout_seconds::Int
     max_recv_msg_bytes::Int
     max_send_msg_bytes::Int
@@ -196,6 +197,16 @@ function _build_gateway_config(raw::Dict{String,Any})
         push!(applied, (menv, ENV[menv]))
     end
 
+    # Optional friendly worker names (worker0..N), index-aligned to the endpoint lists. The supervisor
+    # synthesizes these from each worker's REACTANT_WORKER_NAME so gateway series carry the same
+    # `worker` label the workers self-tag; absent (standalone gateway), worker labels stay as the url.
+    worker_names = String[String(x) for x in get(raw, "worker_names", String[])]
+    nenv = GW_ENV_PREFIX * "WORKER_NAMES"
+    if haskey(ENV, nenv)
+        worker_names = String[strip(String(x)) for x in split(ENV[nenv], ','; keepempty = false)]
+        push!(applied, (nenv, ENV[nenv]))
+    end
+
     scheduling_mode = lowercase(strip(_opt(sched, "mode", String, "round_robin")))
     scheduling_mode in ("round_robin", "least_outstanding", "lpt_packing") ||
         throw(ConfigError("scheduling.mode must be 'round_robin', 'least_outstanding', or 'lpt_packing', got '$scheduling_mode'"))
@@ -211,6 +222,7 @@ function _build_gateway_config(raw::Dict{String,Any})
         _opt(listen, "metrics", String, "0.0.0.0:8002"),
         workers,
         worker_metrics,
+        worker_names,
         _opt(wc, "request_timeout_seconds", Int, 60),
         _opt(grpc, "max_recv_msg_bytes", Int, 256 * 1024 * 1024),
         _opt(grpc, "max_send_msg_bytes", Int, 256 * 1024 * 1024),

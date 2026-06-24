@@ -35,6 +35,11 @@ services:
     # Share the host IPC namespace so POSIX shared-memory regions (KServe system shared memory)
     # created by a client are visible to the workers via shm_open.
     ipc: host
+    environment:
+      # Inject nvidia-smi + NVML (the "utility" driver capability) alongside the compute libraries,
+      # so the entrypoint GPU-reclaim gate and the worker out-of-pool memory metric work. Pinned here
+      # rather than relying on the host container-runtime default capability set.
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
     ports:
       - "8001:8001"   # KServe V2 gRPC endpoint for clients (Triton-compatible)
       - "8002:8002"   # Prometheus metrics / health / admin HTTP (Triton-compatible)

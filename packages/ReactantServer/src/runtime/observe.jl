@@ -62,6 +62,40 @@ function pinned_weight_bytes(registry::ModelRegistry)
     return bytes
 end
 
+# Device memory this worker process holds according to the driver (`nvidia-smi`), in bytes, or
+# `nothing` when unavailable (no driver/nvidia-smi, or our PID not yet listed). This is the WHOLE
+# process footprint: the preallocated BFC arena PLUS the out-of-pool driver memory the allocator
+# cannot see (CUDA context, loaded modules, command buffers / CUDA graphs). Subtracting the BFC arena
+# yields that out-of-pool memory, which is the headroom that command buffers compete for and the
+# quantity behind intermittent startup OOMs. We match our own PID (rather than a GPU index) because
+# `nvidia-smi` ignores `CUDA_VISIBLE_DEVICES` and lists every device the container can see. Reactant-
+# free, like the rest of this file; shelling out keeps it independent of any CUDA/NVML Julia binding.
+function process_device_used_bytes()
+    smi = Sys.which("nvidia-smi")
+    if smi === nothing
+        # Reached only on a GPU worker (the caller gates on device_memory_stats != nothing). Warn
+        # ONCE (maxlog=1, despite per-scrape calls): out-of-pool / command-buffer device memory is
+        # unobservable without nvidia-smi, which usually means the container lacks the NVIDIA
+        # "utility" driver capability. Observability-only , the worker runs fine without it.
+        @warn "nvidia-smi not found; out-of-pool device-memory metrics disabled (set NVIDIA_DRIVER_CAPABILITIES=compute,utility on the container)." maxlog = 1
+        return nothing
+    end
+    pid = string(getpid())
+    try
+        out = readchomp(`$smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits`)
+        for line in eachline(IOBuffer(out))
+            parts = split(line, ',')
+            length(parts) >= 2 && strip(parts[1]) == pid || continue
+            mib = tryparse(Int, strip(parts[2]))
+            mib === nothing && return nothing
+            return mib * 1024 * 1024                       # nvidia-smi reports MiB
+        end
+    catch
+        return nothing                                     # nvidia-smi missing/failed/unparseable
+    end
+    return nothing                                         # our PID holds no device memory yet
+end
+
 _pct(part::Integer, whole::Integer) = whole > 0 ? round(Int, 100 * part / whole) : 0
 
 """

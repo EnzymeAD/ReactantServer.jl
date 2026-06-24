@@ -20,9 +20,13 @@ struct GatewayMetrics
     model_replicas::Prometheus.Family{Prometheus.Gauge}
     replica_outstanding::Prometheus.Family{Prometheus.Gauge}
     worker_metrics_up::Prometheus.Family{Prometheus.Gauge}
+    # Maps a worker endpoint url (gRPC or metrics) to its friendly name (worker0..N), so every
+    # worker-labelled gateway series matches the workers' own self-tagged `worker` label instead of
+    # showing a host:port. Empty for a standalone gateway given no names: labels fall back to the url.
+    worker_names::Dict{String,String}
 end
 
-function GatewayMetrics()
+function GatewayMetrics(worker_names::Dict{String,String} = Dict{String,String}())
     reg = Prometheus.CollectorRegistry()
     requests_total = Prometheus.Family{Prometheus.Counter}(
         "gateway_requests_total",
@@ -60,11 +64,14 @@ function GatewayMetrics()
     worker_metrics_up = Prometheus.Family{Prometheus.Gauge}(
         "gateway_worker_metrics_up",
         "1 if the worker's metrics endpoint answered the most recent aggregated scrape, else 0.",
-        (:endpoint,); registry = reg)
+        (:worker,); registry = reg)
     return GatewayMetrics(reg, requests_total, request_latency, worker_latency,
         routing_table_size, worker_ready, placement_weight, model_utilization,
-        model_replicas, replica_outstanding, worker_metrics_up)
+        model_replicas, replica_outstanding, worker_metrics_up, worker_names)
 end
+
+# Friendly name (worker0..N) for a worker endpoint url; identity if no name was supplied for it.
+_wname(m::GatewayMetrics, w) = get(m.worker_names, String(w), String(w))
 
 inc_requests!(m::GatewayMetrics, rpc, model, status) =
     Prometheus.inc(Prometheus.labels(m.requests_total, (String(rpc), String(model), String(status))))
@@ -73,15 +80,15 @@ observe_request!(m::GatewayMetrics, rpc, model, secs) =
     Prometheus.observe(Prometheus.labels(m.request_latency, (String(rpc), String(model))), secs)
 
 observe_worker!(m::GatewayMetrics, rpc, worker, secs) =
-    Prometheus.observe(Prometheus.labels(m.worker_latency, (String(rpc), String(worker))), secs)
+    Prometheus.observe(Prometheus.labels(m.worker_latency, (String(rpc), _wname(m, worker))), secs)
 
 set_routing_size!(m::GatewayMetrics, n) = Prometheus.set(m.routing_table_size, Float64(n))
 
 set_worker_ready!(m::GatewayMetrics, worker, ready::Bool) =
-    Prometheus.set(Prometheus.labels(m.worker_ready, (String(worker),)), ready ? 1.0 : 0.0)
+    Prometheus.set(Prometheus.labels(m.worker_ready, (_wname(m, worker),)), ready ? 1.0 : 0.0)
 
 set_placement_weight!(m::GatewayMetrics, model, worker, w) =
-    Prometheus.set(Prometheus.labels(m.placement_weight, (String(model), String(worker))), Float64(w))
+    Prometheus.set(Prometheus.labels(m.placement_weight, (String(model), _wname(m, worker))), Float64(w))
 
 set_model_utilization!(m::GatewayMetrics, model, u) =
     Prometheus.set(Prometheus.labels(m.model_utilization, (String(model),)), Float64(u))
@@ -90,7 +97,7 @@ set_model_replicas!(m::GatewayMetrics, model, k) =
     Prometheus.set(Prometheus.labels(m.model_replicas, (String(model),)), Float64(k))
 
 set_replica_outstanding!(m::GatewayMetrics, model, worker, n) =
-    Prometheus.set(Prometheus.labels(m.replica_outstanding, (String(model), String(worker))), Float64(n))
+    Prometheus.set(Prometheus.labels(m.replica_outstanding, (String(model), _wname(m, worker))), Float64(n))
 
 # Reads the gRPC server's live admission counters at scrape time: in-flight RPCs, the cumulative
 # count shed at the inbound concurrency cap, and the configured cap (0 = uncapped). Holds only
@@ -203,7 +210,7 @@ function _fetch_worker_metrics(m::GatewayMetrics, endpoints::Vector{String}; rea
             catch e
                 @debug "worker metrics scrape failed" endpoint = ep exception = e
             end
-            Prometheus.set(Prometheus.labels(m.worker_metrics_up, (ep,)), ok ? 1.0 : 0.0)
+            Prometheus.set(Prometheus.labels(m.worker_metrics_up, (_wname(m, ep),)), ok ? 1.0 : 0.0)
         end
     end
     return String[b for b in bodies if b !== nothing]

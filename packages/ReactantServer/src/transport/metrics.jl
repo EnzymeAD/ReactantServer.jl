@@ -28,13 +28,15 @@ end
 Prometheus.metric_names(::WorkerSnapshotCollector) = (
     "worker_dispatch_total", "worker_compute_seconds_total", "worker_queue_depth",
     "worker_queue_wait_seconds", "worker_model_resident", "worker_model_pinned",
-    "worker_model_weight_bytes", "worker_weight_cache_resident_bytes",
+    "worker_model_weight_bytes", "worker_requests_served_total", "worker_model_max_batch_size",
+    "worker_weight_cache_resident_bytes",
     "worker_weight_cache_max_bytes", "worker_weight_cache_pinned_bytes",
     "worker_weight_cache_max_scratch_bytes", "worker_weight_pool_bytes",
     "worker_weight_loads_total", "worker_weight_evicts_total",
     "worker_weight_load_seconds_total", "worker_device_memory_in_use_bytes",
     "worker_device_memory_limit_bytes", "worker_device_memory_free_bytes",
     "worker_device_memory_peak_in_use_bytes", "worker_device_memory_pool_bytes",
+    "worker_device_memory_process_used_bytes", "worker_device_memory_out_of_pool_bytes",
     "worker_models_loaded", "worker_models_resident", "worker_resident_weight_bytes",
     "worker_info",
 )
@@ -86,6 +88,12 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
             "1 if the model is device-pinned, else 0.", persamples(m -> m.pinned ? 1 : 0)),
         Prometheus.Metric("gauge", "worker_model_weight_bytes",
             "Per-model weight footprint (bytes).", persamples(m -> m.weight_nbytes)),
+        Prometheus.Metric("counter", "worker_requests_served_total",
+            "Requests coalesced into dispatches per model (the coalescing-factor numerator; "
+            * "served/dispatch = average effective batch size).", persamples(m -> m.requests_served)),
+        Prometheus.Metric("gauge", "worker_model_max_batch_size",
+            "Largest batch size the worker coalesces this model to (<=1 means non-coalescable).",
+            persamples(m -> m.max_batch_size)),
     )
 
     # Queue-wait quantiles, labelled by model and quantile.
@@ -142,6 +150,21 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
             _scalar("worker_device_memory_pool_bytes", "gauge",
                 "Bytes the allocator has claimed from the device for its pool.", dm.pool_bytes),
         )
+        # Out-of-pool driver memory: what the driver says this process holds (nvidia-smi) minus the
+        # BFC arena. The arena is preallocated, so the remainder is the CUDA context + loaded modules
+        # + command buffers / CUDA graphs, i.e. the memory that lives OUTSIDE the pool and competes
+        # for the headroom between the arena and the card. This is the quantity behind intermittent
+        # command-buffer startup OOMs, and the allocator stats above cannot see it.
+        proc = process_device_used_bytes()
+        if proc !== nothing
+            push!(metrics,
+                _scalar("worker_device_memory_process_used_bytes", "gauge",
+                    "Device bytes this worker process holds per the driver (nvidia-smi): BFC arena + out-of-pool.", proc),
+                _scalar("worker_device_memory_out_of_pool_bytes", "gauge",
+                    "Driver memory outside the BFC arena (CUDA context + modules + command buffers/graphs); process used minus arena.",
+                    max(0, proc - dm.limit)),
+            )
+        end
     end
 
     # Identity + config, for grouping. Every exported series additionally carries worker/gpu

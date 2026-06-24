@@ -109,7 +109,16 @@ function serve_gateway(gateway_path::Union{AbstractString,Nothing} = nothing; bl
     pool = ClientPool(cfg)
     routes = DiscoveredRoutes()
     gate = RegisterGate()
-    metrics = GatewayMetrics()
+    # Map every worker endpoint url (gRPC and metrics, index-aligned to worker_names) to its friendly
+    # name so gateway series read worker0..N instead of host:port and join the workers' own labels.
+    name_by_url = Dict{String,String}()
+    for (i, u) in enumerate(cfg.workers)
+        i <= length(cfg.worker_names) && (name_by_url[u] = cfg.worker_names[i])
+    end
+    for (i, u) in enumerate(cfg.worker_metrics)
+        i <= length(cfg.worker_names) && (name_by_url[u] = cfg.worker_names[i])
+    end
+    metrics = GatewayMetrics(name_by_url)
     refresher = RouteRefresher(pool, routes, metrics)
     # Build the gateway scheduler for the configured mode and run its startup hook before anything
     # else starts: lpt_packing verifies hard preconditions (all workers reachable, FIFO discipline,
