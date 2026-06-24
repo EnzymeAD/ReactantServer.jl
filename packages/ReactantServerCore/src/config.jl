@@ -536,6 +536,6 @@ end
 
 function log_effective_config(cfg::ServerConfig, applied)
     @info "Effective configuration" model_dirs=cfg.model_dirs models_include=cfg.models_include model_control_mode=cfg.model_control_mode model_poll_seconds=cfg.model_poll_seconds cache_dir=cfg.cache_dir backend=cfg.runtime.backend device_ordinal=cfg.runtime.device_ordinal mem_fraction=cfg.runtime.mem_fraction preallocate=cfg.runtime.preallocate allow_cpu_fallback=cfg.runtime.allow_cpu_fallback weight_cache_fraction=cfg.runtime.weight_cache_fraction weight_cache_wiggle_fraction=cfg.runtime.weight_cache_wiggle_fraction residency_mode=cfg.runtime.residency_mode shared_host_weights=cfg.runtime.shared_host_weights shared_host_weights_mode=string(cfg.runtime.shared_host_weights_mode; base=8) host=cfg.endpoints.host port=cfg.endpoints.port metrics_port=cfg.endpoints.metrics_port max_concurrent_requests=cfg.endpoints.max_concurrent_requests discipline=cfg.scheduler.discipline ema_halflife_seconds=cfg.scheduler.ema_halflife_seconds recency_penalty_cap=cfg.scheduler.recency_penalty_cap coalescing_discount=cfg.scheduler.coalescing_discount cost_ema_alpha=cfg.scheduler.cost_ema_alpha max_queue_depth=cfg.scheduler.max_queue_depth compaction_interval=cfg.scheduler.compaction_interval scheduler_models=collect(keys(cfg.scheduler.models))
-    isempty(applied) || @info "Configuration overridden by environment" overrides=first.(applied)
+    isempty(applied) || @info "Configuration overridden by environment" overrides=["$k=$v" for (k, v) in applied]
     return nothing
 end

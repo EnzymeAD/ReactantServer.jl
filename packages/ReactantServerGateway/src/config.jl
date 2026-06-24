@@ -108,12 +108,12 @@ const GW_ENV_PATHS = Tuple{String,Vector{String},DataType}[
 ]
 
 function _apply_gateway_env!(raw::AbstractDict)
-    applied = String[]
+    applied = Tuple{String,String}[]
     for (suffix, path, T) in GW_ENV_PATHS
         var = GW_ENV_PREFIX * suffix
         haskey(ENV, var) || continue
         _set_nested!(raw, path, _parse_env_var(T, var, ENV[var]))
-        push!(applied, var)
+        push!(applied, (var, ENV[var]))
     end
     return applied
 end
@@ -183,7 +183,7 @@ function _build_gateway_config(raw::Dict{String,Any})
     env_workers = _env_endpoints(wenv)
     if env_workers !== nothing
         workers = env_workers
-        push!(applied, wenv)
+        push!(applied, (wenv, ENV[wenv]))
     end
 
     # Optional worker metrics endpoints, aggregated into the admin /metrics so one scrape covers
@@ -193,7 +193,7 @@ function _build_gateway_config(raw::Dict{String,Any})
     env_metrics = _env_endpoints(menv)
     if env_metrics !== nothing
         worker_metrics = env_metrics
-        push!(applied, menv)
+        push!(applied, (menv, ENV[menv]))
     end
 
     scheduling_mode = lowercase(strip(_opt(sched, "mode", String, "round_robin")))
@@ -251,7 +251,7 @@ function _build_gateway_config(raw::Dict{String,Any})
     end
 
     isempty(cfg.workers) && throw(ConfigError("gateway has no endpoints; set 'endpoints:' in gateway.yml or REACTANT_GATEWAY_WORKERS"))
-    isempty(applied) || @info "gateway configuration overridden by environment" overrides = applied
+    isempty(applied) || @info "gateway configuration overridden by environment" overrides = ["$k=$v" for (k, v) in applied]
     return cfg
 end
 
