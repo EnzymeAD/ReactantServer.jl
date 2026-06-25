@@ -427,6 +427,7 @@ end
         aff = gw.prober.scheduler
         @test aff isa GW.LptPackingState
         GW.rebalance!(aff, gw.pool, copy(gw.pool.order), gw.metrics)
+        @test aff.did_first_tick_repack == false    # the startup cold placement does not count as the first run
 
         # Both models now have a single-worker placement (default replicas = 1): every route for a
         # model returns the same worker.
@@ -466,6 +467,26 @@ end
         GW.tick_packing!(aff, gw.pool, copy(gw.pool.order), gw.metrics)
         @test aff.last_rebalance > before           # repacked
         @test aff.compute_accum == 0.0              # accumulator reset on repack
+
+        # First-run vs steady-state budget: the first tick-driven repack uses the smaller
+        # first_rebalance_compute_seconds, then repacks after need the larger steady-state budget.
+        aff.did_first_tick_repack = false
+        aff.first_rebalance_compute_seconds = 1.0e-9   # tiny first budget: any compute triggers it
+        aff.rebalance_compute_seconds = 1.0e9          # large steady-state budget: effectively never
+        before2 = aff.last_rebalance
+        for _ in 1:10
+            _aff_infer(gw_port, "alpha")
+        end
+        GW.tick_packing!(aff, gw.pool, copy(gw.pool.order), gw.metrics)
+        @test aff.last_rebalance > before2             # first repack fired on the small budget
+        @test aff.did_first_tick_repack               # flag now set
+
+        before3 = aff.last_rebalance
+        for _ in 1:10
+            _aff_infer(gw_port, "alpha")
+        end
+        GW.tick_packing!(aff, gw.pool, copy(gw.pool.order), gw.metrics)
+        @test aff.last_rebalance == before3            # steady-state budget too large -> no repack
 
         # Placement is observable in the metrics.
         body = String(HTTP.get("http://127.0.0.1:$admin_port/metrics"; retry = false).body)

@@ -22,8 +22,10 @@
 # separate `least_outstanding` scheduling mode, not an lpt_packing policy; see scheduler.jl.)
 #
 # Repacks are driven by accumulated fleet compute, not wall-clock: the prober polls the workers
-# every tick and a repack fires once the fleet has consumed `rebalance_compute_seconds`
-# GPU-seconds since the last one, subject to a `min_rebalance_seconds` wall-clock floor.
+# every tick and a repack fires once the fleet has consumed `rebalance_compute_seconds` GPU-seconds
+# since the last one. The first tick-driven repack can use a separate, smaller
+# `first_rebalance_compute_seconds` budget (a quick early rebalance), then steady-state uses the
+# larger `rebalance_compute_seconds`; the startup cold placement does not consume the first budget.
 #
 # LPT-packing mode requires worker FIFO discipline and all models on all workers, verified as a hard
 # failure at gateway startup (see verify_lpt_packing_preconditions!). Runtime drift degrades
@@ -145,7 +147,7 @@ mutable struct LptPackingState <: GatewayScheduler
     hysteresis::Float64
     rate_halflife::Float64
     rebalance_compute_seconds::Float64       # fleet GPU-seconds consumed that triggers a repack
-    min_rebalance_seconds::Float64           # wall-clock floor between repacks (0 = none)
+    first_rebalance_compute_seconds::Float64 # smaller budget for the first tick-driven repack (0 = same as rebalance_compute_seconds)
     default_replicas::Int
     model_replicas::Dict{String,Int}         # per-model replica overrides (immutable after build)
     routing_fill_factor::Float64
@@ -165,6 +167,9 @@ mutable struct LptPackingState <: GatewayScheduler
     # previous fleet cumulative-compute total used to derive the per-tick delta.
     compute_accum::Float64
     last_fleet_compute::Float64
+    # whether a tick-driven repack has fired yet. The startup cold placement does not count; the
+    # first tick repack sets this, after which the steady-state `rebalance_compute_seconds` applies.
+    did_first_tick_repack::Bool
     # routing metadata, swapped atomically each tick; the request hot path reads the snapshot.
     @atomic max_batch::Dict{String,Int}      # model -> effective max batch (largest compiled, capped)
     # Per-model measured per-request compute cost (GPU-seconds/request), published from cost_ewma at
@@ -200,12 +205,12 @@ end
 
 LptPackingState(cfg::GatewayConfig) = LptPackingState(
     cfg.hysteresis, cfg.rate_halflife_seconds, cfg.rebalance_compute_seconds,
-    cfg.min_rebalance_seconds, cfg.default_replicas,
+    cfg.first_rebalance_compute_seconds, cfg.default_replicas,
     Dict{String,Int}(name => mc.replicas for (name, mc) in cfg.models),
     cfg.routing_fill_factor, cfg.routing_policy,
     Dict{String,Threads.Atomic{Int}}(), ReentrantLock(),
     Dict{String,Float64}(), Dict{String,Float64}(), Dict{String,Tuple{Float64,UInt64}}(),
-    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, false,
     Dict{String,Int}(), Dict{String,Float64}(), Dict{String,Placement}(),
     Dict{Tuple{String,String},Threads.Atomic{Int}}(),
     Dict{String,Threads.Atomic{Float64}}(),
@@ -489,9 +494,10 @@ end
     tick_packing!(s, pool, ready_urls, metrics) -> nothing
 
 One prober tick: poll the ready workers, refresh the routing metadata, accumulate the fleet's
-consumed compute, and repack only when the accumulated compute crosses `rebalance_compute_seconds`
-and the `min_rebalance_seconds` wall-clock floor has elapsed. The cheap per-tick work is the poll
-and the accumulator; the EWMA fold and `compute_assignment` run only on a triggered repack.
+consumed compute, and repack only when the accumulated compute crosses the active budget. The first
+tick-driven repack uses `first_rebalance_compute_seconds` (when set); every repack after uses
+`rebalance_compute_seconds`. The cheap per-tick work is the poll and the accumulator; the EWMA fold
+and `compute_assignment` run only on a triggered repack.
 """
 function tick_packing!(s::LptPackingState, pool::ClientPool, ready_urls::Vector{String},
                        metrics::Union{GatewayMetrics,Nothing}=nothing)
@@ -504,10 +510,13 @@ function tick_packing!(s::LptPackingState, pool::ClientPool, ready_urls::Vector{
         s.last_fleet_compute = poll.fleet_compute
         delta > 0 && (s.compute_accum += delta)     # negative delta = worker restart: re-baseline
     end
-    now = time()
-    triggered = s.compute_accum >= s.rebalance_compute_seconds &&
-                (s.last_rebalance == 0.0 || now - s.last_rebalance >= s.min_rebalance_seconds)
-    if triggered
+    # The first tick-driven repack may use a smaller budget so an early rebalance corrects the cold
+    # placement quickly; steady-state then uses the larger budget. The flag is flipped here, not in
+    # `_repack!`, because the startup `rebalance!` also calls `_repack!` and must not consume it.
+    threshold = (!s.did_first_tick_repack && s.first_rebalance_compute_seconds > 0) ?
+                s.first_rebalance_compute_seconds : s.rebalance_compute_seconds
+    if s.compute_accum >= threshold
+        s.did_first_tick_repack = true
         changed = _repack!(s, poll, metrics)
         _maybe_compact_fleet!(s, pool, metrics, changed)
     end
@@ -660,7 +669,7 @@ scheduler_tick!(s::LptPackingState, pool::ClientPool, ready_urls, metrics) =
 # initial rebalance so the first requests already route by packing rather than waiting a prober tick.
 function scheduler_start!(s::LptPackingState, pool::ClientPool, metrics)
     verify_lpt_packing_preconditions!(pool; wait_seconds = _startup_wait_seconds())
-    @info "gateway scheduling: lpt_packing" rebalance_compute_seconds = s.rebalance_compute_seconds min_rebalance_seconds = s.min_rebalance_seconds default_replicas = (s.default_replicas == REPLICAS_ALL ? "all" : s.default_replicas) routing_policy = s.routing_policy
+    @info "gateway scheduling: lpt_packing" rebalance_compute_seconds = s.rebalance_compute_seconds first_rebalance_compute_seconds = s.first_rebalance_compute_seconds default_replicas = (s.default_replicas == REPLICAS_ALL ? "all" : s.default_replicas) routing_policy = s.routing_policy
     rebalance!(s, pool, copy(pool.order), metrics)
     return nothing
 end

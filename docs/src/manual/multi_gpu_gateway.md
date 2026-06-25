@@ -61,7 +61,7 @@ The gateway routes each model's requests across its replicas according to `sched
 scheduling:
   mode: lpt_packing             # round_robin (default) | least_outstanding | lpt_packing
   rebalance_compute_seconds: 30 # fleet GPU-seconds consumed that triggers a repack
-  min_rebalance_seconds: 0      # wall-clock floor between repacks (0 = none)
+  first_rebalance_compute_seconds: 0 # smaller budget for the first repack (0 = use rebalance_compute_seconds)
   rate_halflife_seconds: 30
   hysteresis: 0.1               # minimum improvement before a model moves workers
   default_replicas: 1           # GPUs per model unless overridden below (a number, or "all")
@@ -115,8 +115,11 @@ only; load no longer determines a model's GPU count.)
 
 Repacks are driven by accumulated compute, not wall-clock: the gateway polls the workers every
 probe round and recomputes the placement once the fleet has consumed `rebalance_compute_seconds`
-GPU-seconds since the last repack, subject to the `min_rebalance_seconds` wall-clock floor. An
-idle fleet does not repack until traffic resumes.
+GPU-seconds since the last repack. The first traffic-driven repack can use a smaller
+`first_rebalance_compute_seconds` budget so an early rebalance corrects the cold placement quickly,
+then later repacks use the larger steady-state budget to limit memory churn (`0` means the first
+repack uses `rebalance_compute_seconds` like the rest). An idle fleet does not repack until traffic
+resumes.
 
 For a model with more than one replica, the gateway routes to fill one replica's batch before
 moving to the next, so the workers receive favorable groupings to coalesce (the coalescing itself
@@ -204,8 +207,8 @@ e.g. `REACTANT_GATEWAY_LOGGING_LEVEL=debug` or `REACTANT_GATEWAY_SCHEDULING_MODE
   `gateway_worker_ready` metric.
 - Under `lpt_packing`, the gateway polls the workers on every 10s probe round to refresh routing
   metadata and accumulate consumed compute, but recomputes the placement only once the fleet has
-  consumed `scheduling.rebalance_compute_seconds` GPU-seconds (subject to the
-  `scheduling.min_rebalance_seconds` floor). Each repack logs a `lpt_packing: repack` line with the
+  consumed `scheduling.rebalance_compute_seconds` GPU-seconds (the first repack uses
+  `scheduling.first_rebalance_compute_seconds` when set). Each repack logs a `lpt_packing: repack` line with the
   number of models placed, how many `moved` workers, how many were `held_by_hysteresis`, the largest
   available `max_improvement` against the `hysteresis` threshold, and the `compute_seconds`/
   `wall_seconds` since the last repack — useful for watching placement churn and the trigger cadence.

@@ -38,7 +38,7 @@ logging:
 # scheduling:
 #   mode: lpt_packing               # round_robin | least_outstanding | lpt_packing
 #   rebalance_compute_seconds: 30.0 # fleet GPU-seconds consumed that triggers a repack
-#   min_rebalance_seconds: 0.0      # wall-clock floor between repacks (0 = none)
+#   first_rebalance_compute_seconds: 0.0 # smaller budget for the FIRST repack (0 = use rebalance_compute_seconds)
 #   default_replicas: 1             # GPUs per model unless overridden below (a number, or "all")
 #   routing_fill_factor: 1.0        # per-replica fill target as a multiple of max batch size (lpt_packing only)
 #   routing_policy: fill_rr         # fill_rr (default) | fill_least  (lpt_packing only)

@@ -37,10 +37,14 @@ struct GatewayConfig
     # The remaining knobs apply to lpt_packing only.
     scheduling_mode::String                 # "round_robin" | "least_outstanding" | "lpt_packing"
     # Repack cadence is driven by accumulated fleet compute, not wall-clock: a repack fires once the
-    # fleet has consumed `rebalance_compute_seconds` GPU-seconds since the last one, subject to a
-    # `min_rebalance_seconds` wall-clock floor (0 = none).
+    # fleet has consumed `rebalance_compute_seconds` GPU-seconds since the last one. The first
+    # tick-driven repack can use a separate, typically smaller, budget so an early rebalance corrects
+    # the cold placement quickly; later repacks use the larger steady-state budget to avoid memory
+    # churn and fragmentation. `first_rebalance_compute_seconds` of 0 means "use
+    # `rebalance_compute_seconds`" (no separate first budget). The startup cold placement does not
+    # consume the first budget; only the first repack driven by real traffic does.
     rebalance_compute_seconds::Float64
-    min_rebalance_seconds::Float64
+    first_rebalance_compute_seconds::Float64
     max_worker_share::Float64               # advisory only: load no longer drives a model's GPU count
     hysteresis::Float64                     # min relative max-load improvement required to move a placement
     rate_halflife_seconds::Float64          # EWMA halflife for per-model arrival-rate and cost smoothing
@@ -87,7 +91,7 @@ const GW_ENV_PATHS = Tuple{String,Vector{String},DataType}[
     ("LISTEN_METRICS", ["listen", "metrics"], String),
     ("SCHEDULING_MODE", ["scheduling", "mode"], String),
     ("SCHEDULING_REBALANCE_COMPUTE_SECONDS", ["scheduling", "rebalance_compute_seconds"], Float64),
-    ("SCHEDULING_MIN_REBALANCE_SECONDS", ["scheduling", "min_rebalance_seconds"], Float64),
+    ("SCHEDULING_FIRST_REBALANCE_COMPUTE_SECONDS", ["scheduling", "first_rebalance_compute_seconds"], Float64),
     ("SCHEDULING_MAX_WORKER_SHARE", ["scheduling", "max_worker_share"], Float64),
     ("SCHEDULING_HYSTERESIS", ["scheduling", "hysteresis"], Float64),
     ("SCHEDULING_RATE_HALFLIFE_SECONDS", ["scheduling", "rate_halflife_seconds"], Float64),
@@ -230,7 +234,7 @@ function _build_gateway_config(raw::Dict{String,Any})
         _opt(logging, "format", String, "json"),
         scheduling_mode,
         _opt(sched, "rebalance_compute_seconds", Float64, 30.0),
-        _opt(sched, "min_rebalance_seconds", Float64, 0.0),
+        _opt(sched, "first_rebalance_compute_seconds", Float64, 0.0),
         _opt(sched, "max_worker_share", Float64, 0.8),
         _opt(sched, "hysteresis", Float64, 0.1),
         _opt(sched, "rate_halflife_seconds", Float64, 30.0),
@@ -251,7 +255,7 @@ function _build_gateway_config(raw::Dict{String,Any})
         cfg.max_concurrent_requests_per_worker > cfg.max_concurrent_streams_per_worker ||
         @warn "gateway inbound cap per worker is not above the outbound stream limit; a burst may shed before workers saturate" inbound_per_worker = cfg.max_concurrent_requests_per_worker outbound_streams = cfg.max_concurrent_streams_per_worker
     cfg.rebalance_compute_seconds > 0 || throw(ConfigError("scheduling.rebalance_compute_seconds must be positive"))
-    cfg.min_rebalance_seconds >= 0 || throw(ConfigError("scheduling.min_rebalance_seconds must be non-negative"))
+    cfg.first_rebalance_compute_seconds >= 0 || throw(ConfigError("scheduling.first_rebalance_compute_seconds must be non-negative (0 = use rebalance_compute_seconds)"))
     0 < cfg.max_worker_share <= 1 || throw(ConfigError("scheduling.max_worker_share must be in (0, 1]"))
     0 <= cfg.hysteresis < 1 || throw(ConfigError("scheduling.hysteresis must be in [0, 1)"))
     cfg.rate_halflife_seconds > 0 || throw(ConfigError("scheduling.rate_halflife_seconds must be positive"))
