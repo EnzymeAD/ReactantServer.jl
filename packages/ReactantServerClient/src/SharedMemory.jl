@@ -24,8 +24,10 @@ end
 # At most two pools exist per client:
 #   - one SHM-backed pool registered with every server that shares this client's IPC namespace,
 #   - one inline (Memory{UInt8}) pool for every server that doesn't.
-# Membership is decided per (host, port) by probing the SHM pool with a
-# SystemSharedMemoryRegister; the result is cached in `_pool_routes`.
+# Membership is decided per (host, port) by an explicit IsSameIPCNamespace probe (see
+# get_or_create_pool!); the result is cached in `_pool_routes`. There is no silent runtime
+# fallback: once a URL is routed to the SHM pool, a register or inference failure surfaces to
+# the caller.
 # ============================================================================
 
 mutable struct InferenceBufferPool
@@ -106,7 +108,11 @@ end
 
 # ---- Pool registry (two singletons + per-URL routing) ----
 
-const PoolKey = Tuple{String,UInt16}
+# Routes are keyed by (host, port, shared_memory mode): the chosen transport depends not only on
+# the server but on the model's mode, so two models hitting the same endpoint with different modes
+# (e.g. one :off and one :on) must not share a cached route -- otherwise :on could silently inherit
+# an inline route instead of failing loudly.
+const PoolKey = Tuple{String,UInt16,Symbol}
 const _shm_pool = Ref{Union{InferenceBufferPool,Nothing}}(nothing)
 const _inline_pool = Ref{Union{InferenceBufferPool,Nothing}}(nothing)
 const _pool_routes = Dict{PoolKey,InferenceBufferPool}()
@@ -156,14 +162,60 @@ function _teardown_shm_pool!()
     return
 end
 
-# Route a model to the SHM pool if its server can map our region, otherwise to the inline pool.
-# The decision is made by attempting a SystemSharedMemoryRegister against the SHM pool the first
-# time we see this (host, port); the result is cached. The server's register call only stores
-# metadata, so the actual shm_open at inference time can still fail; callers handle that via
-# migrate_to_inline!. The per-URL lock prevents N concurrent first-time callers from each
-# sending their own register RPC and racing to overwrite _pool_routes.
+# Send the IsSameIPCNamespace probe and classify the answer. :yes / :no are the server's boolean;
+# :unknown means the server does not implement the RPC (UNIMPLEMENTED, e.g. stock Triton). Any
+# other gRPC error propagates: a probe that fails for an unrelated reason must not be silently
+# read as "no shared memory".
+function query_same_ipc_namespace(model::KServeModel, name::AbstractString)
+    client = grpc_is_same_ipc_namespace_client(model)
+    try
+        resp = grpc_sync_request(client, IsSameIPCNamespaceRequest(name = name))
+        return resp.same ? :yes : :no
+    catch ex
+        if ex isa gRPCClient.gRPCServiceCallException && ex.grpc_status == gRPCClient.GRPC_UNIMPLEMENTED
+            return :unknown
+        end
+        rethrow()
+    end
+end
+
+# Decide which pool a model's (host, port) routes to, per its `shared_memory` mode. See the
+# KServeModel docstring for the full matrix. Register failures and the :on + different-namespace
+# case surface to the caller; there is no silent fallback once SHM is chosen.
+function _decide_pool!(model::KServeModel)
+    mode = model.shared_memory
+    mode === :off && return _get_inline_pool!()
+
+    shm_pool = _get_shm_pool!()
+    verdict = query_same_ipc_namespace(model, shmid(shm_pool.pool.backing))
+
+    if verdict === :yes
+        register_pool_with_model!(shm_pool, model)
+        return shm_pool
+    elseif verdict === :no
+        if mode === :on
+            error("shared_memory=:on for $(model.host):$(model.port), but the server reports it is " *
+                  "not in this client's IPC namespace, so system shared memory cannot work. Use " *
+                  "shared_memory=:auto to fall back to inline transport, or run the client and " *
+                  "server in the same IPC namespace.")
+        end
+        return _get_inline_pool!()
+    else  # :unknown -- the server does not implement IsSameIPCNamespace
+        if mode === :on
+            # Explicit opt-in (e.g. stock Triton): attempt SHM via the legacy register path.
+            # Making it work across namespaces is the caller's responsibility.
+            register_pool_with_model!(shm_pool, model)
+            return shm_pool
+        end
+        return _get_inline_pool!()
+    end
+end
+
+# Route a model to the SHM or inline pool the first time we see its (host, port); cache the
+# result so every later call to the same URL skips the probe. The per-URL lock prevents N
+# concurrent first-time callers from each probing and racing to overwrite _pool_routes.
 function get_or_create_pool!(model::KServeModel)
-    key = (model.host, model.port)
+    key = (model.host, model.port, model.shared_memory)
     cached = @lock _pools_lock get(_pool_routes, key, nothing)
     cached === nothing || return cached
 
@@ -171,53 +223,8 @@ function get_or_create_pool!(model::KServeModel)
         cached = @lock _pools_lock get(_pool_routes, key, nothing)
         cached === nothing || return cached
 
-        shm_pool = _get_shm_pool!()
-        try
-            register_pool_with_model!(shm_pool, model)
-            @lock _pools_lock _pool_routes[key] = shm_pool
-            return shm_pool
-        catch ex
-            @info "SHM probe failed for $(model.host):$(model.port); using inline transport" exception = ex
-            inline_pool = _get_inline_pool!()
-            @lock _pools_lock _pool_routes[key] = inline_pool
-            return inline_pool
-        end
-    end
-end
-
-# Predicate for the at-inference SHM mmap failure: the server reports NOT_FOUND when our
-# register call recorded metadata but the actual shm_open at ModelInfer time could not see our
-# region. Scoped narrowly so other gRPC errors (deadline, model-execution INTERNAL) propagate.
-function _is_shm_not_found_error(ex)
-    occursin("Unable to find shared memory region", sprint(showerror, ex))
-end
-
-# Force a model's URL onto the inline pool and tell its server to forget our SHM region.
-# Idempotent and serialized per URL by _route_lock_for.
-function migrate_to_inline!(model::KServeModel)
-    key = (model.host, model.port)
-    inline_pool = _get_inline_pool!()
-
-    lock(_route_lock_for(key)) do
-        already = @lock _pools_lock get(_pool_routes, key, nothing)
-        already === inline_pool && return inline_pool
-        @lock _pools_lock _pool_routes[key] = inline_pool
-
-        shm = _shm_pool[]
-        if shm !== nothing
-            lock(shm.register_lock) do
-                if key in shm.registered_keys
-                    try
-                        grpc_sync_request(grpc_shm_unregister_client(model),
-                                          SystemSharedMemoryUnregisterRequest(name = pool_name(shm)))
-                    catch ex
-                        @info ex
-                    end
-                    delete!(shm.registered_keys, key)
-                    filter!(m -> (m.host, m.port) != key, shm.registered_models)
-                end
-            end
-        end
-        inline_pool
+        pool = _decide_pool!(model)
+        @lock _pools_lock _pool_routes[key] = pool
+        return pool
     end
 end

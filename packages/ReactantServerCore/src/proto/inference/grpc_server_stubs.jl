@@ -33,7 +33,10 @@ export GRPCInferenceService_SystemSharedMemoryRegister_Method
 GRPCInferenceService_SystemSharedMemoryUnregister_Method(; TRequest=SystemSharedMemoryUnregisterRequest, TResponse=SystemSharedMemoryUnregisterResponse) = gRPCServer.gRPCMethod{TRequest, false, TResponse, false}("/inference.GRPCInferenceService/SystemSharedMemoryUnregister")
 export GRPCInferenceService_SystemSharedMemoryUnregister_Method
 
-function register_GRPCInferenceService!(router; ServerLive=nothing, ServerReady=nothing, ModelReady=nothing, ServerMetadata=nothing, ModelMetadata=nothing, ModelInfer=nothing, RepositoryIndex=nothing, SystemSharedMemoryStatus=nothing, SystemSharedMemoryRegister=nothing, SystemSharedMemoryUnregister=nothing)
+GRPCInferenceService_IsSameIPCNamespace_Method(; TRequest=IsSameIPCNamespaceRequest, TResponse=IsSameIPCNamespaceResponse) = gRPCServer.gRPCMethod{TRequest, false, TResponse, false}("/inference.GRPCInferenceService/IsSameIPCNamespace")
+export GRPCInferenceService_IsSameIPCNamespace_Method
+
+function register_GRPCInferenceService!(router; ServerLive=nothing, ServerReady=nothing, ModelReady=nothing, ServerMetadata=nothing, ModelMetadata=nothing, ModelInfer=nothing, RepositoryIndex=nothing, SystemSharedMemoryStatus=nothing, SystemSharedMemoryRegister=nothing, SystemSharedMemoryUnregister=nothing, IsSameIPCNamespace=nothing)
 	ServerLive === nothing || gRPCServer.handle!(router, GRPCInferenceService_ServerLive_Method(), ServerLive)
 	ServerReady === nothing || gRPCServer.handle!(router, GRPCInferenceService_ServerReady_Method(), ServerReady)
 	ModelReady === nothing || gRPCServer.handle!(router, GRPCInferenceService_ModelReady_Method(), ModelReady)
@@ -44,6 +47,7 @@ function register_GRPCInferenceService!(router; ServerLive=nothing, ServerReady=
 	SystemSharedMemoryStatus === nothing || gRPCServer.handle!(router, GRPCInferenceService_SystemSharedMemoryStatus_Method(), SystemSharedMemoryStatus)
 	SystemSharedMemoryRegister === nothing || gRPCServer.handle!(router, GRPCInferenceService_SystemSharedMemoryRegister_Method(), SystemSharedMemoryRegister)
 	SystemSharedMemoryUnregister === nothing || gRPCServer.handle!(router, GRPCInferenceService_SystemSharedMemoryUnregister_Method(), SystemSharedMemoryUnregister)
+	IsSameIPCNamespace === nothing || gRPCServer.handle!(router, GRPCInferenceService_IsSameIPCNamespace_Method(), IsSameIPCNamespace)
 	return router
 end
 export register_GRPCInferenceService!

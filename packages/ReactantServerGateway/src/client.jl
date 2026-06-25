@@ -21,7 +21,7 @@ const STATUS_DEADLINE = "DeadlineExceeded"
 # budget and request semaphore, isolating a slow or wedged worker to its own slots. The struct is
 # parametric so every field keeps its concrete client type (the request path forwards through
 # `infer` with no dynamic dispatch); the type parameters are inferred at construction.
-struct WorkerClients{G,I,SR,SU,RD,RI,CS,CM}
+struct WorkerClients{G,I,SR,SU,RD,RI,CS,CM,NS}
     url::String
     grpc::G
     infer::I
@@ -31,6 +31,7 @@ struct WorkerClients{G,I,SR,SU,RD,RI,CS,CM}
     repo_index::RI
     control_status::CS    # ControlService/ModelControlStatus (lpt_packing cost polling + preconditions)
     compact::CM           # ControlService/CompactMemory (memory-compaction fan-out)
+    is_same_ns::NS        # GRPCInferenceService/IsSameIPCNamespace (SHM-namespace probe fan-out)
 end
 
 struct ClientPool{W<:WorkerClients}
@@ -66,7 +67,9 @@ function _worker_clients(cfg::GatewayConfig, url::AbstractString)
     # run far longer than a status probe; give it a generous deadline rather than the 5s probe one.
     compact = ControlService_CompactMemory_Client(host, port; grpc = grpc,
         deadline = max(cfg.request_timeout_seconds, 300))
-    return WorkerClients(url, grpc, infer, shm_reg, shm_unreg, ready, repo_index, control_status, compact)
+    # Typed (decoded response) so the gateway can read `.same` to aggregate across workers.
+    is_same_ns = GRPCInferenceService_IsSameIPCNamespace_Client(host, port; grpc = grpc, deadline = 5)
+    return WorkerClients(url, grpc, infer, shm_reg, shm_unreg, ready, repo_index, control_status, compact, is_same_ns)
 end
 
 function ClientPool(cfg::GatewayConfig)
@@ -125,6 +128,10 @@ invoke_shm_unregister(wc::WorkerClients, body::Vector{UInt8}) = gRPCClient.grpc_
 
 # Forward a CompactMemory request to the worker; returns its CompactMemoryResponse.
 invoke_compact(wc::WorkerClients, req::CompactMemoryRequest) = gRPCClient.grpc_sync_request(wc.compact, req)
+
+# Forward an IsSameIPCNamespace probe to the worker; returns its IsSameIPCNamespaceResponse.
+invoke_is_same_ipc_namespace(wc::WorkerClients, req::IsSameIPCNamespaceRequest) =
+    gRPCClient.grpc_sync_request(wc.is_same_ns, req)
 
 # Returns the worker's ServerReadyResponse.ready, or false on any transport error.
 function probe_ready(wc::WorkerClients)

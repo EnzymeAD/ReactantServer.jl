@@ -429,3 +429,6 @@ end
 
 encode_shm_register_response() = _PB_INF.SystemSharedMemoryRegisterResponse()
 encode_shm_unregister_response() = _PB_INF.SystemSharedMemoryUnregisterResponse()
+
+encode_is_same_ipc_namespace_response(same::Bool) =
+    _PB_INF.IsSameIPCNamespaceResponse(; same=same)

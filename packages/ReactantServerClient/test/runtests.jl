@@ -566,3 +566,22 @@ end
     h, p, sec = ReactantServerClient.parse_grpc_url("localhost:8080")
     @test h == "localhost" && p == 0x1f90 && sec == false
 end
+
+@testset "shared_memory mode: validation and :off routing" begin
+    # Default is :auto; :on / :off accepted; anything else rejected at construction.
+    @test KServeModel("grpc://h:1", "x").shared_memory == :auto
+    @test KServeModel("grpc://h:1", "x"; shared_memory = :on).shared_memory == :on
+    @test KServeModel("grpc://h:1", "x"; shared_memory = :off).shared_memory == :off
+    @test_throws ArgumentError KServeModel("grpc://h:1", "x"; shared_memory = :sometimes)
+
+    # :off never probes the server and always routes to a non-SHM pool. Small pools so the
+    # test does not allocate the 256 MiB default.
+    kserve_init(; pool_bytes = 4096, n_slots = 4)
+    try
+        m = KServeModel("grpc://127.0.0.1:1", "x"; shared_memory = :off)
+        pool = ReactantServerClient._decide_pool!(m)
+        @test !ReactantServerClient.is_shm_backed(pool)
+    finally
+        kserve_shutdown()
+    end
+end

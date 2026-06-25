@@ -42,6 +42,9 @@ gRPC-to-gRPC pass-through that never re-marshals the body.
   POSIX SHM regions are host-local; every worker attaches via `shm_open` independently. Register
   succeeds only if all workers succeed (it rolls back partial success); unregister succeeds if
   any worker does.
+- **SHM namespace probe:** `IsSameIPCNamespace` is fanned out to every worker and the gateway
+  returns `true` only if all of them can see the client's region (any worker may service a later
+  `ModelInfer`). A worker that errors or does not implement the RPC counts as `false`.
 - **Observability:** structured logs, Prometheus metrics, `/healthz`, and `/readyz` on a
   separate admin HTTP port.
 
@@ -166,7 +169,8 @@ reports its estimated demand in GPU-seconds per second.
 - Streaming RPCs.
 - The repository / model-config / statistics / trace / log RPCs in the Triton spec, plus
   `ServerLive`, `ServerReady`, `ModelMetadata`, and `RepositoryIndex` for clients (only
-  `ModelInfer` and the two SHM RPCs are proxied; everything else returns `UNIMPLEMENTED`).
+  `ModelInfer`, the two SHM register/unregister RPCs, and `IsSameIPCNamespace` are proxied;
+  everything else returns `UNIMPLEMENTED`).
 - TLS: parsed but not yet enforced; the listener and the worker back-hop are cleartext h2c.
 - CUDA shared memory.
 - Dynamic worker membership: the worker endpoint list is fixed at startup (from `gateway.yml`

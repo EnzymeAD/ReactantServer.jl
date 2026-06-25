@@ -254,6 +254,11 @@ function _handle_shm_unregister(shm::SharedMemoryRegistry, name)
     end
 end
 
+# Non-Triton extension: answer whether we can see the client's shared-memory object, i.e.
+# whether system shared-memory transport can work with this client. No registry interaction.
+_handle_is_same_ipc_namespace(name) =
+    _as_invalid(() -> encode_is_same_ipc_namespace_response(same_ipc_namespace(name)))
+
 """
     build_grpc_router(sched, registry, platform, shm) -> gRPCRouter
 
@@ -275,6 +280,7 @@ function build_grpc_router(sched::Scheduler, registry::ModelRegistry, platform::
         SystemSharedMemoryStatus     = (req, ctx) -> _handle_shm_status(ctx.payload.shm, req.name),
         SystemSharedMemoryRegister   = (req, ctx) -> _handle_shm_register(ctx.payload.shm, req),
         SystemSharedMemoryUnregister = (req, ctx) -> _handle_shm_unregister(ctx.payload.shm, req.name),
+        IsSameIPCNamespace = (req, ctx) -> _handle_is_same_ipc_namespace(req.name),
     )
     # The worker control plane (residency + live policy) rides on the same router and payload.
     register_control_service!(router)

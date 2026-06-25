@@ -320,7 +320,7 @@ end
     @test bounded_call(3.0) == :ok          # first request times out at its 0.5s deadline, returns
     @test bounded_call(3.0) == :timed_out   # second reuses the poisoned connection and hangs
 
-    wc = GW.WorkerClients("127.0.0.1:$port", grpc, client, client, client, client, client, client, client)
+    wc = GW.WorkerClients("127.0.0.1:$port", grpc, client, client, client, client, client, client, client, client)
     GW.reset_clients!(wc)                    # close + reopen the handle: drops the poisoned connection
 
     @test bounded_call(3.0) == :ok          # fresh connection: times out at the deadline, no hang

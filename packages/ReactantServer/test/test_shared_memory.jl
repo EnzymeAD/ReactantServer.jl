@@ -65,6 +65,23 @@ end
     end
 end
 
+@testset "IsSameIPCNamespace probe" begin
+    shm, key, _ = _make_region(64)
+    try
+        # The helper sees an object we created in this (the server's) own namespace.
+        @test same_ipc_namespace(key) == true
+        # Absent objects and empty names are "not same", never an error.
+        @test same_ipc_namespace("/reactantserver-test-no-such-object-$(getpid())") == false
+        @test same_ipc_namespace("") == false
+
+        # The worker handler wraps the helper and returns an IsSameIPCNamespaceResponse.
+        @test ReactantServer._handle_is_same_ipc_namespace(key).same == true
+        @test ReactantServer._handle_is_same_ipc_namespace("/nope-$(getpid())").same == false
+    finally
+        finalize(shm)
+    end
+end
+
 @testset "shared memory data plane (CPU)" begin
     mktempdir() do root
         manifest = """

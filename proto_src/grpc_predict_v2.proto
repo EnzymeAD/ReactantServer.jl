@@ -58,6 +58,14 @@ service GRPCInferenceService
 
   rpc SystemSharedMemoryUnregister(SystemSharedMemoryUnregisterRequest)
       returns (SystemSharedMemoryUnregisterResponse) {}
+
+  // Non-Triton extension: returns whether the named POSIX shared-memory object is
+  // visible in the server's IPC namespace, i.e. whether system shared-memory
+  // transport can work between this client and the server. The client passes the
+  // name of a shared-memory object it created; the server answers true only if it
+  // can open that object itself.
+  rpc IsSameIPCNamespace(IsSameIPCNamespaceRequest)
+      returns (IsSameIPCNamespaceResponse) {}
 }
 
 message ServerLiveRequest {}
@@ -391,6 +399,20 @@ message SystemSharedMemoryUnregisterRequest
 }
 
 message SystemSharedMemoryUnregisterResponse {}
+
+message IsSameIPCNamespaceRequest
+{
+  // The name of a POSIX shared-memory object the client created. The server
+  // tries to open it to decide whether the two processes share an IPC namespace.
+  string name = 1;
+}
+
+message IsSameIPCNamespaceResponse
+{
+  // True if the server can see the named shared-memory object in its own IPC
+  // namespace, i.e. system shared-memory transport can work.
+  bool same = 1;
+}
 
 // Model repository index (Triton-compatible). Field numbers match the
 // vendored gateway proto so the two stay wire-compatible.

@@ -269,27 +269,11 @@ function _infer_pool_driven(
     io::AbstractInferenceIO;
     force_serial::Bool,
 )
+    # Transport is decided up front by get_or_create_pool! (an IsSameIPCNamespace probe for a
+    # KServeModel). There is no silent runtime fallback: a shared-memory failure here surfaces to
+    # the caller rather than being retried inline.
     pool = get_or_create_pool!(m)
-    try
-        _drive_pool_inference(m, io, pool; force_serial = force_serial)
-    catch ex
-        # Triton's SHM register only stores metadata, so the real shm_open can
-        # still fail at inference time when /dev/shm is not shared. Recover by
-        # routing this URL to the inline pool and replaying the call.
-        #
-        # _is_shm_not_found_error must stay narrow: any other gRPC failure
-        # (DEADLINE_EXCEEDED, INTERNAL from a model-execution error, etc.)
-        # has to surface to the caller unmodified. A false positive here would
-        # silently retry a non-SHM error through the inline pool and mask the
-        # real cause.
-        if is_shm_backed(pool) && _is_shm_not_found_error(ex)
-            @info "Triton at $(m.host):$(m.port) can't map our SHM region; migrating to inline transport" exception = ex
-            pool = migrate_to_inline!(m)
-            _drive_pool_inference(m, io, pool; force_serial = force_serial)
-        else
-            rethrow()
-        end
-    end
+    _drive_pool_inference(m, io, pool; force_serial = force_serial)
     nothing
 end
 

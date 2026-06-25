@@ -105,6 +105,27 @@ function shm_unregister!(reg::SharedMemoryRegistry, name::AbstractString)
     return nothing
 end
 
+"""
+    same_ipc_namespace(name) -> Bool
+
+Return whether the POSIX shared-memory object `name` is visible in this process's IPC
+namespace. The client passes the name of an object it created; we answer `true` only if we can
+open that same object ourselves, which is what determines whether system shared-memory transport
+can work between the two processes. The open is read-only and detached immediately; nothing is
+registered or kept mapped. Any failure (object absent because we are in a different namespace,
+permission error, malformed name) is reported as `false`.
+"""
+function same_ipc_namespace(name::AbstractString)
+    isempty(name) && return false
+    shm = try
+        IPC.SharedMemory(String(name); readonly=true)
+    catch
+        return false
+    end
+    finalize(shm)
+    return true
+end
+
 shm_regions(reg::SharedMemoryRegistry) = (@lock reg.lock copy(reg.regions))
 
 shm_teardown!(reg::SharedMemoryRegistry) = shm_unregister!(reg, "")

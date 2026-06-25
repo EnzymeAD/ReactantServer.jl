@@ -18,6 +18,7 @@ export var"ModelInferRequest.InferRequestedOutputTensor"
 export var"ModelInferRequest.InferInputTensor", var"ModelInferResponse.InferOutputTensor"
 export SystemSharedMemoryStatusResponse, RepositoryIndexResponse, ModelInferRequest
 export ModelInferResponse
+export IsSameIPCNamespaceRequest, IsSameIPCNamespaceResponse
 
 
 struct ModelMetadataRequest
@@ -203,6 +204,68 @@ function PB.encode(e::PB.AbstractProtoEncoder, x::SystemSharedMemoryUnregisterRe
 end
 function PB._encoded_size(x::SystemSharedMemoryUnregisterResponse)
     encoded_size = 0
+    return encoded_size
+end
+
+struct IsSameIPCNamespaceRequest
+    name::String
+end
+IsSameIPCNamespaceRequest(;name = "") = IsSameIPCNamespaceRequest(name)
+PB.default_values(::Type{IsSameIPCNamespaceRequest}) = (;name = "")
+PB.field_numbers(::Type{IsSameIPCNamespaceRequest}) = (;name = 1)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:IsSameIPCNamespaceRequest}, _endpos::Int=0, _group::Bool=false)
+    name = ""
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            name = PB.decode(d, String)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return IsSameIPCNamespaceRequest(name)
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::IsSameIPCNamespaceRequest)
+    initpos = position(e.io)
+    !isempty(x.name) && PB.encode(e, 1, x.name)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::IsSameIPCNamespaceRequest)
+    encoded_size = 0
+    !isempty(x.name) && (encoded_size += PB._encoded_size(x.name, 1))
+    return encoded_size
+end
+
+struct IsSameIPCNamespaceResponse
+    same::Bool
+end
+IsSameIPCNamespaceResponse(;same = false) = IsSameIPCNamespaceResponse(same)
+PB.default_values(::Type{IsSameIPCNamespaceResponse}) = (;same = false)
+PB.field_numbers(::Type{IsSameIPCNamespaceResponse}) = (;same = 1)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:IsSameIPCNamespaceResponse}, _endpos::Int=0, _group::Bool=false)
+    same = false
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            same = PB.decode(d, Bool)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return IsSameIPCNamespaceResponse(same)
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::IsSameIPCNamespaceResponse)
+    initpos = position(e.io)
+    x.same != false && PB.encode(e, 1, x.same)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::IsSameIPCNamespaceResponse)
+    encoded_size = 0
+    x.same != false && (encoded_size += PB._encoded_size(x.same, 1))
     return encoded_size
 end
 

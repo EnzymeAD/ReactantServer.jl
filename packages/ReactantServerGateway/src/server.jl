@@ -251,6 +251,37 @@ function _gw_shm_unregister(body::Vector{UInt8}, st::GatewayState)
     return resp === nothing ? UInt8[] : resp
 end
 
+# --- SHM namespace probe ----------------------------------------------------------------------
+
+# Answer the client's IsSameIPCNamespace probe. Any worker may service a later ModelInfer, so
+# system shared memory is only usable if EVERY worker can see the client's region: fan the probe
+# out and AND the results. A worker that errors or does not implement the RPC (UNIMPLEMENTED)
+# counts as "not same", and a pool with no workers is "not same". The probed name carries a
+# random per-client token, so it is never used as a metric label (cardinality).
+function _gw_is_same_ipc_namespace(req::IsSameIPCNamespaceRequest, st::GatewayState)
+    t0 = time()
+    workers = all_clients(st.pool)
+    same = if isempty(workers)
+        false
+    else
+        results = Vector{Bool}(undef, length(workers))
+        @sync for (i, wc) in enumerate(workers)
+            @async begin
+                results[i] = try
+                    invoke_is_same_ipc_namespace(wc, req).same
+                catch e
+                    @warn "is_same_ipc_namespace: worker probe failed" worker = wc.url exception = e
+                    false
+                end
+            end
+        end
+        all(results)
+    end
+    observe_request!(st.metrics, "IsSameIPCNamespace", "", time() - t0)
+    inc_requests!(st.metrics, "IsSameIPCNamespace", "", STATUS_OK)
+    return IsSameIPCNamespaceResponse(; same = same)
+end
+
 # --- Memory compaction ------------------------------------------------------------------------
 
 # Fan CompactMemory out to a set of workers concurrently, each with its own reload list, keyed by
@@ -311,9 +342,10 @@ end
 """
     build_gateway_router(state, cfg) -> gRPCRouter
 
-Register the three forwarded RPCs as raw `Vector{UInt8}` methods. Every other
-GRPCInferenceService RPC is left unimplemented (clients get UNIMPLEMENTED), matching the Go
-gateway's service descriptor.
+Register the forwarded RPCs. ModelInfer and the two SHM register/unregister RPCs are raw
+`Vector{UInt8}` methods (bytes pass through unchanged); IsSameIPCNamespace is typed because the
+gateway aggregates each worker's answer rather than forwarding one. Every other
+GRPCInferenceService RPC is left unimplemented (clients get UNIMPLEMENTED).
 """
 function build_gateway_router(state::GatewayState, cfg::GatewayConfig)
     router = gRPCServer.gRPCRouter(; max_receive_message_length = cfg.max_recv_msg_bytes,
@@ -325,6 +357,9 @@ function build_gateway_router(state::GatewayState, cfg::GatewayConfig)
         (req, ctx) -> _gw_shm_register(req, ctx.payload))
     gRPCServer.handle!(router, raw(GRPCInferenceService_SystemSharedMemoryUnregister_Method),
         (req, ctx) -> _gw_shm_unregister(req, ctx.payload))
+    # Typed (decoded) so the handler can read each worker's `.same` and aggregate; not forwarded raw.
+    gRPCServer.handle!(router, GRPCInferenceService_IsSameIPCNamespace_Method(),
+        (req, ctx) -> _gw_is_same_ipc_namespace(req, ctx.payload))
     # Control plane: a single CompactMemory RPC to the gateway fans out to every worker.
     register_ControlService!(router;
         CompactMemory = (req, ctx) -> _gw_compact(req, ctx.payload))

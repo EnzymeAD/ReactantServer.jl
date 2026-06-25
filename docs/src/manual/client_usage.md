@@ -53,9 +53,14 @@ worker on the e2e `scale4` bundle).
 
 For many items, implement [`AbstractInferenceIO`](@ref) and use [`infer_async`](@ref) (concurrent)
 or [`infer_sync`](@ref)`(model, io)` (serial). The driver stages each chunk through a shared
-`ReactantServerCore.BufferPool`: when the server shares the client's IPC namespace, inputs travel
-over the Triton system shared-memory data plane (zero extra copies on the wire); otherwise the
-driver transparently falls back to inline transport. Your IO implements `length`,
+`ReactantServerCore.BufferPool`. The first call to each server probes it with the
+`IsSameIPCNamespace` RPC: if the server confirms it shares the client's IPC namespace, inputs
+travel over the system shared-memory data plane (zero extra copies on the wire); otherwise, or if
+the server does not implement the probe, the driver uses inline transport. The `shared_memory`
+keyword on [`KServeModel`](@ref) controls this: `:auto` (default) probes and uses shared memory
+when available, `:on` forces it (and errors loudly if the server is in a different namespace), and
+`:off` always sends inline. There is no silent runtime fallback once shared memory is chosen. Your
+IO implements `length`,
 `item_input_bytes`, `infer_encode_chunk!` (request the chunk's input buffers with `scratch`, write
 into them, and return them tagged with their tensor names), and `infer_decode_chunk!` (consume the
 response). The pool's fixed-slot allocator hands every chunk a disjoint slot, so concurrent

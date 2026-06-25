@@ -357,6 +357,100 @@ function export_bundle(::Val{:lux}, model, ps, st, example_input::AbstractArray;
 end
 
 """
+    export_bundle(:lux, model, ps, st, example_inputs::Tuple; dir, name,
+                  input_names=nothing, output_names=nothing,
+                  output_select = y -> (y isa Tuple ? y : (y,)),
+                  input_batch_axes=nothing, output_batch_axes=nothing,
+                  client_inputs=nothing, client_outputs=nothing,
+                  batch_sizes=[1], provenance=Dict()) -> dir
+
+Multi-input / multi-output Lux export. `client_inputs`/`client_outputs` (each `nothing` or a
+`Vector{IOSpec}`) declare the wire-facing spec when a shipped `model.jl` postprocess transforms
+the executable tensors into different client tensors; they are passed through to `write_bundle`. Traces `model(x_tuple, ps, st)` where `x_tuple` is the
+tuple of array inputs the model's forward expects as its single positional argument.
+`output_select(first(model(...)))` maps the raw model output to the ordered tuple of arrays to
+export; non-array returns (e.g. an `Int` step count) are dropped by the selector and must not
+appear in its result. Weights are extracted from `ps` automatically (same as the single-array
+method). Per-tensor batch axes default to each array's last Julia axis (Lux convention) but can
+be overridden with `input_batch_axes`/`output_batch_axes` (1-based Julia axes), which is required
+when the batch axis is not last (e.g. a `(D, N, K+1)` output whose batch axis N is the middle one).
+"""
+function export_bundle(::Val{:lux}, model, ps, st, example_inputs::Tuple;
+                       dir::AbstractString, name::AbstractString,
+                       input_names=nothing, output_names=nothing,
+                       output_select = y -> (y isa Tuple ? y : (y,)),
+                       input_batch_axes::Union{Nothing,AbstractVector}=nothing,
+                       output_batch_axes::Union{Nothing,AbstractVector}=nothing,
+                       client_inputs::Union{Nothing,AbstractVector{IOSpec}}=nothing,
+                       client_outputs::Union{Nothing,AbstractVector{IOSpec}}=nothing,
+                       batch_sizes::AbstractVector{<:Integer}=[1], provenance=Dict{String,Any}())
+    leaves = _named_leaves(ps)
+    isempty(leaves) && error("ReactantServerExport: model has no array parameters to export")
+    wnames = String[p[1] for p in leaves]
+    warrays = Any[p[2] for p in leaves]
+
+    nin = length(example_inputs)
+    in_axes = input_batch_axes === nothing ? [ndims(x) for x in example_inputs] :
+              collect(Int, input_batch_axes)
+    length(in_axes) == nin ||
+        error("ReactantServerExport: input_batch_axes has $(length(in_axes)) entries but $nin inputs")
+    innames = input_names === nothing ? ["input_$(i - 1)" for i in 1:nin] :
+              collect(String, input_names)
+
+    # `output_select` may return a single array or a tuple of arrays; normalize to a tuple.
+    _as_tuple(y) = y isa Tuple ? y : (y,)
+    # Lux convention: a model takes ONE input object. With several inputs that object is the tuple
+    # itself (`do (a, b)`); with one input it is that array directly (`do x`). Unwrap accordingly so
+    # both shapes work. (Reactant still flattens a tuple arg into one MLIR input per element.)
+    _modelarg(t) = nin == 1 ? t[1] : t
+    mk_inputs(s) = ntuple(i -> _with_batch(example_inputs[i], in_axes[i], s), nin)
+    y0 = _as_tuple(output_select(first(model(_modelarg(mk_inputs(first(batch_sizes))), ps, st))))
+    all(o -> o isa AbstractArray, y0) ||
+        error("ReactantServerExport: output_select must return only arrays; got $(map(typeof, y0))")
+    nout = length(y0)
+    outnames = output_names === nothing ? ["output_$(i - 1)" for i in 1:nout] :
+               collect(String, output_names)
+    out_axes = output_batch_axes === nothing ? [ndims(o) for o in y0] :
+               collect(Int, output_batch_axes)
+    length(out_axes) == nout ||
+        error("ReactantServerExport: output_batch_axes has $(length(out_axes)) entries but $nout outputs")
+
+    # ws... are the rebuilt parameter leaves. Returning a Tuple makes the compiled MLIR func emit
+    # one result per selected output.
+    g = (a, ws...) -> _as_tuple(output_select(first(model(a, _rebuild(ps, collect(ws)), st))))
+
+    ctxs = Any[]                                   # keep contexts alive through serialization
+    modules = Dict{Int,Any}()
+    in_shapes = [Int[] for _ in 1:nin]
+    for s in batch_sizes
+        xs = mk_inputs(s)
+        ctx = Reactant.ReactantContext()
+        push!(ctxs, ctx)
+        args = (_modelarg(map(Reactant.to_rarray, xs)), map(Reactant.to_rarray, warrays)...)
+        mod, _ = Compiler.compile_mlir(ctx, g, args; drop_unsupported_attributes=true)
+        modules[Int(s)] = mod
+        for i in 1:nin
+            in_shapes[i] = collect(Int, size(xs[i]))
+        end
+    end
+
+    # Manifest is Julia order; batch axis is the 0-based Julia axis.
+    in_specs = [IOSpec(innames[i], eltype(example_inputs[i]), in_shapes[i]; batch_axis=in_axes[i] - 1)
+                for i in 1:nin]
+    out_specs = [IOSpec(outnames[i], eltype(y0[i]), collect(Int, size(y0[i])); batch_axis=out_axes[i] - 1)
+                 for i in 1:nout]
+    prov = merge(Dict{String,Any}("source_framework" => "reactant", "converter" => "ReactantServerExport.jl"),
+                 Dict{String,Any}(provenance))
+
+    GC.@preserve ctxs begin
+        write_bundle(dir; name=name, executable_inputs=in_specs, executable_outputs=out_specs,
+            modules=modules, weights=[wnames[i] => warrays[i] for i in eachindex(wnames)],
+            client_inputs=client_inputs, client_outputs=client_outputs, provenance=prov)
+    end
+    return dir
+end
+
+"""
     export_bundle(:reactant, f, inputs::Tuple, weights; dir, name, input_names=nothing,
                   output_name="output", provenance=Dict()) -> dir
 

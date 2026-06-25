@@ -7,8 +7,10 @@ stack and installs quickly on a plain client machine.
 
 Public surface: `KServeModel`, `infer_sync`, `infer_async`, `InferInput`, `InferOutput`,
 `AbstractInferenceIO`, `kserve_init`, `kserve_shutdown`. Batched inference stages
-tensors through the shared-memory `BufferPool` and falls back to inline transport when the
-server cannot map the client's shared memory.
+tensors through the shared-memory `BufferPool`. Each server is probed once with the
+`IsSameIPCNamespace` RPC to decide whether shared memory can work; servers in a different
+namespace (or that lack the probe) use inline transport instead. The `shared_memory` keyword on
+`KServeModel` (`:auto`/`:on`/`:off`) overrides this per model.
 
 ```julia
 using ReactantServerClient

@@ -91,6 +91,16 @@ gateway). The second form parses a `url` of the form `grpc://host:port` (or `hos
 [`infer_async`](@ref) / [`infer_sync`](@ref) drivers coalesce per request; `deadline` is the
 per-request timeout in seconds. `max_send_message_length` / `max_receive_message_length`
 bound a single gRPC message (default 256 MiB, matching the gateway's limits).
+
+`shared_memory` controls system shared-memory transport for staged inputs/outputs:
+- `:auto` (default): probe the server with `IsSameIPCNamespace`; use shared memory only if the
+  server confirms it shares this client's IPC namespace. If the server returns false, or does
+  not implement the RPC, fall back to inline transport. There is no silent runtime fallback.
+- `:on`: force shared memory. The server confirming a different namespace is a hard error (fail
+  loudly, no fallback). If the server does not implement `IsSameIPCNamespace` (e.g. stock
+  Triton), shared memory is still attempted via `SystemSharedMemoryRegister`; making that work
+  is then the caller's responsibility.
+- `:off`: never use shared memory; always send inline. The probe is not sent.
 """
 struct KServeModel <: AbstractInferenceModel
     host::String
@@ -101,6 +111,7 @@ struct KServeModel <: AbstractInferenceModel
     deadline::Float64
     max_send_message_length::Int64
     max_receive_message_length::Int64
+    shared_memory::Symbol
     # The gRPCCURL handle (libcurl multi handle + connection pool + concurrent-stream semaphore) all
     # of this model's client calls share. Defaults to the process-global handle (GRPC_MAX_STREAMS=16
     # concurrent requests). Pass a dedicated handle with a larger `max_streams` to drive more
@@ -116,8 +127,11 @@ struct KServeModel <: AbstractInferenceModel
         deadline = 10.0,
         max_send_message_length = DEFAULT_MAX_MESSAGE_BYTES,
         max_receive_message_length = DEFAULT_MAX_MESSAGE_BYTES,
+        shared_memory = :auto,
         grpc = gRPCClient.grpc_global_handle(),
     )
+        shared_memory in (:auto, :on, :off) ||
+            throw(ArgumentError("shared_memory must be :auto, :on, or :off, got $(repr(shared_memory))"))
         new(
             host,
             port,
@@ -127,6 +141,7 @@ struct KServeModel <: AbstractInferenceModel
             deadline,
             max_send_message_length,
             max_receive_message_length,
+            shared_memory,
             grpc,
         )
     end
@@ -138,6 +153,7 @@ struct KServeModel <: AbstractInferenceModel
         deadline = 10.0,
         max_send_message_length = DEFAULT_MAX_MESSAGE_BYTES,
         max_receive_message_length = DEFAULT_MAX_MESSAGE_BYTES,
+        shared_memory = :auto,
         grpc = gRPCClient.grpc_global_handle(),
     )
         host, port, secure = parse_grpc_url(url)
@@ -151,6 +167,7 @@ struct KServeModel <: AbstractInferenceModel
             max_send_message_length = max_send_message_length,
             max_receive_message_length = max_receive_message_length,
             deadline = deadline,
+            shared_memory = shared_memory,
             grpc = grpc,
         )
     end
@@ -185,6 +202,15 @@ end
 
 function grpc_shm_register_client(x::KServeModel)
     GRPCInferenceService_SystemSharedMemoryRegister_Client(
+        x.host,
+        x.port;
+        secure = x.secure,
+        grpc = x.grpc,
+    )
+end
+
+function grpc_is_same_ipc_namespace_client(x::KServeModel)
+    GRPCInferenceService_IsSameIPCNamespace_Client(
         x.host,
         x.port;
         secure = x.secure,

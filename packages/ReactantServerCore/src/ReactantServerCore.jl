@@ -108,11 +108,12 @@ export node_gpus, materialize_node!
 
 # ---- shared-memory registry ----
 export ShmRegion, SharedMemoryRegistry, shm_register!, shm_unregister!, shm_read, shm_write!
-export shm_regions, shm_teardown!
+export shm_regions, shm_teardown!, same_ipc_namespace
 
 # ---- codec ----
 export OutputTarget, DecodedRequest, decode_infer_request, encode_infer_response, encode_model_metadata
 export encode_repository_index, encode_shm_status, encode_shm_register_response, encode_shm_unregister_response, id_of
+export encode_is_same_ipc_namespace_response
 export encode_infer_request, encode_infer_request_shm, decode_infer_response
 export deadline_params, TIMEOUT_NS_PARAM
 

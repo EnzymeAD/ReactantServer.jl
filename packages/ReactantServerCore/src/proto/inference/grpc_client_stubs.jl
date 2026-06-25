@@ -212,4 +212,25 @@ GRPCInferenceService_SystemSharedMemoryUnregister_Client(
 	max_recieve_message_length=max_recieve_message_length,
 )
 export GRPCInferenceService_SystemSharedMemoryUnregister_Client
+
+GRPCInferenceService_IsSameIPCNamespace_Client(
+	host, port;
+	TRequest=IsSameIPCNamespaceRequest,
+	TResponse=IsSameIPCNamespaceResponse,
+	secure=false,
+	grpc=gRPCClient.grpc_global_handle(),
+	deadline=10,
+	keepalive=60,
+	max_send_message_length = 4*1024*1024,
+	max_recieve_message_length = 4*1024*1024,
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+	host, port, "/inference.GRPCInferenceService/IsSameIPCNamespace";
+	secure=secure,
+	grpc=grpc,
+	deadline=deadline,
+	keepalive=keepalive,
+	max_send_message_length=max_send_message_length,
+	max_recieve_message_length=max_recieve_message_length,
+)
+export GRPCInferenceService_IsSameIPCNamespace_Client
 # gRPCClient.jl END
