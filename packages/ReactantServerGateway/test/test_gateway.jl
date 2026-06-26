@@ -216,6 +216,16 @@ end
         @test cfg.workers == ["127.0.0.1:8080", "127.0.0.1:8081"]
         @test cfg.listen_grpc == "0.0.0.0:9001"
         @test cfg.listen_metrics == "0.0.0.0:8002"       # default
+        # gRPC message-size limits default to 512 MiB and honor the env override.
+        @test cfg.max_recv_msg_bytes == 512 * 1024 * 1024
+        @test cfg.max_send_msg_bytes == 512 * 1024 * 1024
+    end
+
+    withenv("REACTANT_GATEWAY_WORKERS" => "127.0.0.1:8080",
+            "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES" => "4096") do
+        cfg = ReactantServerGateway.load_gateway(nothing)
+        @test cfg.max_recv_msg_bytes == 4096
+        @test cfg.max_send_msg_bytes == 512 * 1024 * 1024   # unset -> default
     end
 
     # Without an endpoint list the env-only path keeps the existing guard.

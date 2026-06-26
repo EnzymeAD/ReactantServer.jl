@@ -194,7 +194,8 @@ function serve(cfg::ServerConfig; backend::AbstractBackend=ReactantBackend(), bl
     shed = Threads.Atomic{Int}(0)
     metrics = WorkerMetrics(sched, backend, pool, cfg; worker_name=worker_name,
         inflight=inflight, shed=shed)
-    router = build_grpc_router(sched, registry, pool.platform, shm)
+    router = build_grpc_router(sched, registry, pool.platform, shm;
+        max_recv_msg_bytes=cfg.grpc.max_recv_msg_bytes, max_send_msg_bytes=cfg.grpc.max_send_msg_bytes)
     ctx = InferContext(sched, registry, shm, pool.platform, metrics)
     # Optional Prometheus metrics endpoint (opt-in via endpoints.metrics_port > 0). Request counting
     # is always on (the InferContext carries `metrics`); only the HTTP listener is gated.

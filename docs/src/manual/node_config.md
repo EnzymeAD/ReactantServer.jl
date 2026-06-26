@@ -65,7 +65,17 @@ global:
     max_concurrent_requests: 64  # in-flight RPC cap; 0 = uncapped. Past the cap the worker sheds
                                  # with RESOURCE_EXHAUSTED. Keep it above the gateway's per-worker
                                  # outbound stream limit (worker_client.max_concurrent_streams)
+  grpc:                    # -> GrpcConfig
+    max_recv_msg_bytes: 536870912   # 512 MiB; max inbound gRPC message (a decode cap, not an allocation)
+    max_send_msg_bytes: 536870912   # 512 MiB; max outbound gRPC message
 ```
+
+The `global.grpc` block is the single node-level place for gRPC message-size limits: every worker
+reads it directly, and the supervisor also mirrors it into the embedded gateway (as
+`REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES` / `_SEND_MSG_BYTES`), so one block sizes the whole node.
+Per-component environment overrides still apply (`INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES` for a
+worker, `REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES` for the gateway, which wins over the mirrored
+value).
 
 `model_control_mode` sets how the loaded model set evolves: `dynamic` (the default) watches
 the repository and loads, unloads, and reloads bundles online as files change; `static` fixes
@@ -174,8 +184,8 @@ listen:
   grpc: "0.0.0.0:8001"
   metrics: "0.0.0.0:8002"
 grpc:
-  max_recv_msg_bytes: 268435456   # 256 MiB
-  max_send_msg_bytes: 268435456
+  max_recv_msg_bytes: 536870912   # 512 MiB
+  max_send_msg_bytes: 536870912
   max_concurrent_requests_per_worker: 64   # inbound cap is this x worker count; 0 = uncapped.
                                            # Sized above the outbound stream limit so a startup
                                            # burst has headroom rather than being shed early

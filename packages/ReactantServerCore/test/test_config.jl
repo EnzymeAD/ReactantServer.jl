@@ -213,6 +213,40 @@ end
     end
 end
 
+@testset "grpc config: defaults, node-global parse, env override, validation" begin
+    mktempdir() do dir
+        modeldir = joinpath(dir, "models"); mkpath(modeldir)
+
+        # Default: 512 MiB in each direction when no grpc block is given.
+        cfg0, _, _ = load_single_worker(dir, "runtime:\n  backend: cpu"; model_repo=modeldir)
+        @test cfg0.grpc.max_recv_msg_bytes == 512 * 1024 * 1024
+        @test cfg0.grpc.max_send_msg_bytes == 512 * 1024 * 1024
+        @test ReactantServer.validate_config(cfg0) === cfg0
+
+        # A node-level global.grpc block resolves into the worker's ServerConfig.grpc.
+        cfg, _, _ = load_single_worker(dir, """
+        grpc:
+          max_recv_msg_bytes: 1048576
+          max_send_msg_bytes: 2097152
+        """; model_repo=modeldir)
+        @test cfg.grpc.max_recv_msg_bytes == 1048576
+        @test cfg.grpc.max_send_msg_bytes == 2097152
+
+        # Environment overrides win over the file.
+        withenv("INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES" => "4096",
+                "INFERENCE_SERVER_GRPC_MAX_SEND_MSG_BYTES" => "8192") do
+            cfge, applied, _ = load_single_worker(dir, "grpc:\n  max_recv_msg_bytes: 1048576"; model_repo=modeldir)
+            @test cfge.grpc.max_recv_msg_bytes == 4096
+            @test cfge.grpc.max_send_msg_bytes == 8192
+            @test ("INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES", "4096") in applied
+        end
+
+        # Non-positive is rejected.
+        cbad, _, _ = load_single_worker(dir, "grpc:\n  max_recv_msg_bytes: 0"; model_repo=modeldir)
+        @test_throws ReactantServer.ConfigError ReactantServer.validate_config(cbad)
+    end
+end
+
 @testset "model_control_mode: parse, default, residency, validation, migration" begin
     mktempdir() do dir
         modeldir = joinpath(dir, "models"); mkpath(modeldir)

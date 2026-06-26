@@ -215,6 +215,28 @@ end
 EndpointsConfig(host, port) = EndpointsConfig(host, port, 0, 0)
 EndpointsConfig(host, port, metrics_port) = EndpointsConfig(host, port, metrics_port, 0)
 
+# Default gRPC message-size cap, shared by the worker, gateway, and client. The 4 MiB gRPC default
+# is far below what inference tensors routinely need, so the whole stack sizes generously; 512 MiB
+# is the common default. These are decode/encode caps, not allocations: raising them costs nothing
+# until a message that large actually arrives.
+const DEFAULT_GRPC_MSG_BYTES = 512 * 1024 * 1024
+
+"""
+    GrpcConfig
+
+gRPC transport limits for a worker's server. `max_recv_msg_bytes` / `max_send_msg_bytes` bound a
+single gRPC message in each direction (decode/encode caps, not allocations). Configured under the
+`grpc:` block of a worker (or node `global:`) config, with `INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES`
+/ `INFERENCE_SERVER_GRPC_MAX_SEND_MSG_BYTES` environment overrides. Default `DEFAULT_GRPC_MSG_BYTES`
+(512 MiB).
+"""
+struct GrpcConfig
+    max_recv_msg_bytes::Int
+    max_send_msg_bytes::Int
+end
+
+GrpcConfig() = GrpcConfig(DEFAULT_GRPC_MSG_BYTES, DEFAULT_GRPC_MSG_BYTES)
+
 """
     ServerConfig
 
@@ -225,7 +247,8 @@ applied, then checked by `validate_config`. Fields: `model_dirs` (bundle search 
 [`EndpointsConfig`](@ref) sub-configs, `models_include` (an allowlist of model names to
 load; empty means load all), `model_poll_seconds` (the `dynamic`-mode interval at which the
 worker re-scans its `model_dirs` for added, changed, or removed bundles and hot-swaps them),
-and `model_control_mode` (see [`ModelControlMode`](@ref): `static`, `dynamic`, or `explicit`).
+`model_control_mode` (see [`ModelControlMode`](@ref): `static`, `dynamic`, or `explicit`), and the
+[`GrpcConfig`](@ref) `grpc` sub-config (gRPC message-size limits).
 `ReactantServer.serve` also accepts a `ServerConfig` directly.
 """
 struct ServerConfig
@@ -237,6 +260,7 @@ struct ServerConfig
     models_include::Vector{String}   # allowlist of model names to load; empty means load all
     model_poll_seconds::Float64      # dynamic-mode model-repository poll interval
     model_control_mode::ModelControlMode   # static | dynamic | explicit
+    grpc::GrpcConfig                 # gRPC server message-size limits
 end
 
 # Preserve the positional forms. Programmatic construction defaults to STATIC (no surprise
@@ -248,6 +272,12 @@ ServerConfig(model_dirs, cache_dir, runtime::RuntimeConfig, scheduler::Scheduler
 ServerConfig(model_dirs, cache_dir, runtime::RuntimeConfig, scheduler::SchedulerConfig,
     endpoints::EndpointsConfig, models_include) =
     ServerConfig(model_dirs, cache_dir, runtime, scheduler, endpoints, models_include, 0.0, STATIC)
+
+# Pre-grpc positional form (eight args): default the gRPC limits so existing callers keep working.
+ServerConfig(model_dirs, cache_dir, runtime::RuntimeConfig, scheduler::SchedulerConfig,
+    endpoints::EndpointsConfig, models_include, model_poll_seconds, model_control_mode::ModelControlMode) =
+    ServerConfig(model_dirs, cache_dir, runtime, scheduler, endpoints, models_include,
+        model_poll_seconds, model_control_mode, GrpcConfig())
 
 const ENV_PREFIX = "INFERENCE_SERVER_"
 
@@ -277,6 +307,8 @@ const ENV_PATHS = Tuple{String,Vector{String},DataType}[
     ("ENDPOINTS_PORT", ["endpoints", "port"], Int),
     ("ENDPOINTS_METRICS_PORT", ["endpoints", "metrics_port"], Int),
     ("ENDPOINTS_MAX_CONCURRENT_REQUESTS", ["endpoints", "max_concurrent_requests"], Int),
+    ("GRPC_MAX_RECV_MSG_BYTES", ["grpc", "max_recv_msg_bytes"], Int),
+    ("GRPC_MAX_SEND_MSG_BYTES", ["grpc", "max_send_msg_bytes"], Int),
 ]
 
 _parse_env(::Type{Int}, s) = parse(Int, s)
@@ -491,8 +523,14 @@ function build_config(raw::AbstractDict)
     # Default to a sensible interval so `dynamic` (the default mode) watches out of the box.
     model_poll_seconds = _opt(raw, "model_poll_seconds", Float64, 15.0)
 
+    gc = _subdict(raw, "grpc")
+    grpc = GrpcConfig(
+        _opt(gc, "max_recv_msg_bytes", Int, DEFAULT_GRPC_MSG_BYTES),
+        _opt(gc, "max_send_msg_bytes", Int, DEFAULT_GRPC_MSG_BYTES),
+    )
+
     return ServerConfig(model_dirs, cache_dir, runtime, scheduler, endpoints, models_include,
-        model_poll_seconds, model_control_mode)
+        model_poll_seconds, model_control_mode, grpc)
 end
 
 function validate_config(cfg::ServerConfig)
@@ -507,6 +545,8 @@ function validate_config(cfg::ServerConfig)
         throw(ConfigError("endpoints.metrics_port must differ from endpoints.port ($(cfg.endpoints.port))"))
     cfg.endpoints.max_concurrent_requests >= 0 ||
         throw(ConfigError("endpoints.max_concurrent_requests must be non-negative (0 = uncapped)"))
+    cfg.grpc.max_recv_msg_bytes > 0 || throw(ConfigError("grpc.max_recv_msg_bytes must be positive"))
+    cfg.grpc.max_send_msg_bytes > 0 || throw(ConfigError("grpc.max_send_msg_bytes must be positive"))
     cfg.scheduler.ema_halflife_seconds > 0 || throw(ConfigError("scheduler.ema_halflife_seconds must be positive"))
     0 < cfg.scheduler.recency_penalty_cap <= 1 || throw(ConfigError("scheduler.recency_penalty_cap must be in (0, 1]"))
     0 <= cfg.scheduler.coalescing_discount < 1 || throw(ConfigError("scheduler.coalescing_discount must be in [0, 1)"))

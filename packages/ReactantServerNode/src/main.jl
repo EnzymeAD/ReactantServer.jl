@@ -36,6 +36,27 @@ function _node_runtime(node::AbstractDict)
     return rt isa AbstractDict ? rt : Dict{String,Any}()
 end
 
+# The node's global.grpc dict, or an empty dict when absent/malformed. Workers pick this block up
+# directly through their own config (it deep-merges via `global:`); the supervisor reads it here only
+# to mirror the message-size limits into the embedded gateway's REACTANT_GATEWAY_GRPC_* env, so one
+# node-level `global.grpc` block configures the workers and the gateway alike.
+function _node_grpc(node::AbstractDict)
+    g = get(node, "global", nothing)
+    g isa AbstractDict || return Dict{String,Any}()
+    gc = get(g, "grpc", nothing)
+    return gc isa AbstractDict ? gc : Dict{String,Any}()
+end
+
+# A node-level grpc message-size value as an Int, or nothing when absent (so the gateway falls back
+# to its own default). Errors loudly on a non-integer rather than silently ignoring a typo.
+function _node_grpc_bytes(node::AbstractDict, key::AbstractString)
+    gc = _node_grpc(node)
+    haskey(gc, key) || return nothing
+    v = gc[key]
+    v isa Integer || throw(ArgumentError("node config 'global.grpc.$key' must be an integer, got $(repr(v))"))
+    return Int(v)
+end
+
 # Write the materialized (workers synthesized, devices assigned) node file where children and
 # the healthcheck can read it. /run/reactantserver in the container; a temp dir elsewhere.
 function _write_materialized(node::AbstractDict, runtime_dir::Union{AbstractString,Nothing})
@@ -182,7 +203,9 @@ function build_supervisor(node_path::AbstractString;
             push!(specs, gateway_spec(root; gateway_path=gw_path,
                                       endpoints=gw_path === nothing ? worker_endpoints(node) : nothing,
                                       metrics_endpoints=gw_path === nothing ? worker_metrics_endpoints(node) : nothing,
-                                      worker_names=gw_path === nothing ? String[_worker_name(w) for w in ws] : nothing))
+                                      worker_names=gw_path === nothing ? String[_worker_name(w) for w in ws] : nothing,
+                                      grpc_max_recv=gw_path === nothing ? _node_grpc_bytes(node, "max_recv_msg_bytes") : nothing,
+                                      grpc_max_send=gw_path === nothing ? _node_grpc_bytes(node, "max_send_msg_bytes") : nothing))
         end
     end
 

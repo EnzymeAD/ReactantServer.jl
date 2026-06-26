@@ -243,3 +243,53 @@ end
         @test _envval(sup.children[1].spec.cmd, "CUDA_VISIBLE_DEVICES") == ""
     end
 end
+
+@testset "gateway_spec: grpc message-size env synthesis" begin
+    withenv("REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES" => nothing,
+            "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES" => nothing) do
+        # Provided sizes are synthesized into the gateway's env.
+        gw = RSN.gateway_spec("/opt/rs"; endpoints=["127.0.0.1:8080"],
+                              grpc_max_recv=111, grpc_max_send=222)
+        @test _envval(gw.cmd, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES") == "111"
+        @test _envval(gw.cmd, "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES") == "222"
+
+        # Omitted -> not synthesized (the gateway uses its own default).
+        gw0 = RSN.gateway_spec("/opt/rs"; endpoints=["127.0.0.1:8080"])
+        @test _envval(gw0.cmd, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES") === nothing
+
+        # A mounted gateway.yml suppresses synthesis (the gateway reads its own file).
+        gwf = RSN.gateway_spec("/opt/rs"; gateway_path="/etc/x/gateway.yml", grpc_max_recv=111)
+        @test _envval(gwf.cmd, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES") === nothing
+    end
+
+    # An explicit process env wins over the synthesized value.
+    withenv("REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES" => "999") do
+        gwe = RSN.gateway_spec("/opt/rs"; endpoints=["127.0.0.1:8080"], grpc_max_recv=111)
+        @test _envval(gwe.cmd, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES") == "999"
+    end
+end
+
+@testset "build_supervisor: node global.grpc reaches the embedded gateway" begin
+    mktempdir() do dir
+        path = joinpath(dir, "node.yaml")
+        write(path, """
+        model_repo: /repo
+        base_port: 8080
+        metrics_base_port: 9100
+        global:
+          runtime:
+            backend: cuda
+          grpc:
+            max_recv_msg_bytes: 111
+            max_send_msg_bytes: 222
+        """)
+        withenv("REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES" => nothing,
+                "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES" => nothing) do
+            sup = RSN.build_supervisor(path; env=Dict("REACTANT_GPUS" => "2"),
+                sink=IOBuffer(), workspace_root="/opt/rs", runtime_dir=joinpath(dir, "run"))
+            gw = sup.children[end].spec.cmd   # the gateway is the last child
+            @test _envval(gw, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES") == "111"
+            @test _envval(gw, "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES") == "222"
+        end
+    end
+end

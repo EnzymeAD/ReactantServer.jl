@@ -10,8 +10,8 @@ listen:
   metrics: "0.0.0.0:8002"
 
 grpc:
-  max_recv_msg_bytes: 268435456
-  max_send_msg_bytes: 268435456
+  max_recv_msg_bytes: 536870912   # 512 MiB; max gRPC message size in each direction
+  max_send_msg_bytes: 536870912
   # Inbound admission cap = this x worker count (0 = uncapped). Past the cap the gateway sheds with
   # RESOURCE_EXHAUSTED instead of letting in-flight handlers pile up. Kept above the per-worker
   # outbound stream limit so a startup burst has wiggle room rather than being rejected early.

@@ -550,6 +550,29 @@ end
     end
 end
 
+@testset "KServeModel gRPC message-size default + env fallback" begin
+    # Default is 512 MiB in each direction.
+    m = KServeModel("grpc://h:1", "x")
+    @test m.max_send_message_length == 512 * 1024 * 1024
+    @test m.max_receive_message_length == 512 * 1024 * 1024
+
+    # An explicit kwarg wins.
+    m2 = KServeModel("grpc://h:1", "x"; max_send_message_length = 123, max_receive_message_length = 456)
+    @test m2.max_send_message_length == 123
+    @test m2.max_receive_message_length == 456
+
+    # The env var supplies the default when the kwarg is omitted (per direction); a kwarg still wins.
+    withenv("REACTANT_CLIENT_GRPC_MAX_RECV_MSG_BYTES" => "4096",
+            "REACTANT_CLIENT_GRPC_MAX_SEND_MSG_BYTES" => "8192") do
+        me = KServeModel("grpc://h:1", "x")
+        @test me.max_receive_message_length == 4096
+        @test me.max_send_message_length == 8192
+        mo = KServeModel("grpc://h:1", "x"; max_receive_message_length = 7)
+        @test mo.max_receive_message_length == 7
+        @test mo.max_send_message_length == 8192
+    end
+end
+
 @testset "parse_grpc_url rejects malformed URLs with a clear error" begin
     @test_throws ErrorException ReactantServerClient.parse_grpc_url("not-a-url")
     @test_throws ErrorException ReactantServerClient.parse_grpc_url("ftp://h:1")

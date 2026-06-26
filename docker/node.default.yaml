@@ -45,3 +45,9 @@ global:
     compaction_interval: 0
   endpoints:
     host: 0.0.0.0
+  # gRPC message-size limits, shared by every worker and mirrored into the embedded gateway by the
+  # supervisor (so this one block sizes the whole node). Defaults to 512 MiB each; the 4 MiB gRPC
+  # default is far below what inference tensors need. These are decode/encode caps, not allocations.
+  # grpc:
+  #   max_recv_msg_bytes: 536870912   # 512 MiB
+  #   max_send_msg_bytes: 536870912

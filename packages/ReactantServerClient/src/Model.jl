@@ -75,11 +75,18 @@ function parse_grpc_url(url::String)
 end
 
 # Per-message wire caps. The 4 MiB gRPC default is far below what inference tensors routinely
-# need (a single 768x768x4 f32 output is ~9.4 MB), and the rest of the stack already sizes for
-# this: the worker router allows 512 MiB and the gateway 256 MiB. Match the gateway, the
-# endpoint clients normally talk to. These are decode-time caps, not allocations; raising them
-# costs nothing until a message that large actually arrives.
-const DEFAULT_MAX_MESSAGE_BYTES = 256 * 1024 * 1024
+# need (a single 768x768x4 f32 output is ~9.4 MB), so the whole stack sizes generously: the worker
+# and gateway both default to 512 MiB and the client matches them. These are decode-time caps, not
+# allocations; raising them costs nothing until a message that large actually arrives.
+const DEFAULT_MAX_MESSAGE_BYTES = 512 * 1024 * 1024
+
+# Per-direction default used when the constructor kwarg is omitted: the env var if set, else
+# DEFAULT_MAX_MESSAGE_BYTES. Consulted per `KServeModel` construction (the kwarg default is a call),
+# mirroring the `..._GRPC_MAX_RECV_MSG_BYTES` / `_SEND_MSG_BYTES` override the worker and gateway use.
+_env_msg_bytes(var::AbstractString) =
+    (s = get(ENV, var, ""); isempty(s) ? DEFAULT_MAX_MESSAGE_BYTES : parse(Int, strip(s)))
+default_recv_msg_bytes() = _env_msg_bytes("REACTANT_CLIENT_GRPC_MAX_RECV_MSG_BYTES")
+default_send_msg_bytes() = _env_msg_bytes("REACTANT_CLIENT_GRPC_MAX_SEND_MSG_BYTES")
 
 """
     KServeModel(host, port, model_name; secure=false, max_batch_size=1, deadline=10.0, ...)
@@ -90,7 +97,9 @@ gateway). The second form parses a `url` of the form `grpc://host:port` (or `hos
 `grpcs`/`https` selects a secure channel. `max_batch_size` caps how many items the batched
 [`infer_async`](@ref) / [`infer_sync`](@ref) drivers coalesce per request; `deadline` is the
 per-request timeout in seconds. `max_send_message_length` / `max_receive_message_length`
-bound a single gRPC message (default 256 MiB, matching the gateway's limits).
+bound a single gRPC message; each defaults to 512 MiB (matching the worker and gateway), or the
+`REACTANT_CLIENT_GRPC_MAX_SEND_MSG_BYTES` / `REACTANT_CLIENT_GRPC_MAX_RECV_MSG_BYTES` environment
+variable when set and the kwarg is omitted.
 
 `shared_memory` controls system shared-memory transport for staged inputs/outputs:
 - `:auto` (default): probe the server with `IsSameIPCNamespace`; use shared memory only if the
@@ -125,8 +134,8 @@ struct KServeModel <: AbstractInferenceModel
         secure = false,
         max_batch_size = 1,
         deadline = 10.0,
-        max_send_message_length = DEFAULT_MAX_MESSAGE_BYTES,
-        max_receive_message_length = DEFAULT_MAX_MESSAGE_BYTES,
+        max_send_message_length = default_send_msg_bytes(),
+        max_receive_message_length = default_recv_msg_bytes(),
         shared_memory = :auto,
         grpc = gRPCClient.grpc_global_handle(),
     )
@@ -151,8 +160,8 @@ struct KServeModel <: AbstractInferenceModel
         model_name;
         max_batch_size = 1,
         deadline = 10.0,
-        max_send_message_length = DEFAULT_MAX_MESSAGE_BYTES,
-        max_receive_message_length = DEFAULT_MAX_MESSAGE_BYTES,
+        max_send_message_length = default_send_msg_bytes(),
+        max_receive_message_length = default_recv_msg_bytes(),
         shared_memory = :auto,
         grpc = gRPCClient.grpc_global_handle(),
     )

@@ -41,6 +41,17 @@ end
         @test_throws ArgumentError ReactantServer.shm_write!(reg, "r", 24, payload)
         @test_throws ArgumentError ReactantServer.shm_read(reg, "missing", 0, 4)
 
+        # unregister is idempotent: an unknown name is a successful no-op (so the gateway fan-out and
+        # the client's pre-emptive cleanup unregister never error on a region that was never
+        # registered), and a repeated unregister is harmless.
+        @test ReactantServer.shm_unregister!(reg, "missing") === nothing
+        @test ReactantServer.shm_unregister!(reg, "r") === nothing
+        @test ReactantServer.shm_unregister!(reg, "r") === nothing   # already gone: still a no-op
+        ReactantServer.shm_register!(reg, "r", key, 0, 32)           # re-register for the churn loop below
+        # register still fails loudly (fail early, not at inference time): a region that does not fit
+        # its shared-memory object is rejected at register time rather than silently accepted.
+        @test_throws ArgumentError ReactantServer.shm_register!(reg, "bad", key, 0, 1024)
+
         # a concurrent unregister/re-register churn during repeated read/write must not fault:
         # the locked accessors copy under reg.lock, so the mapping can never be munmapped
         # mid-copy. Reaching the end without a segfault is the assertion.

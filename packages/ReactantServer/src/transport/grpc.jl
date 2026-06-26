@@ -260,15 +260,19 @@ _handle_is_same_ipc_namespace(name) =
     _as_invalid(() -> encode_is_same_ipc_namespace_response(same_ipc_namespace(name)))
 
 """
-    build_grpc_router(sched, registry, platform, shm) -> gRPCRouter
+    build_grpc_router(sched, registry, platform, shm;
+                      max_recv_msg_bytes=_MAX_MESSAGE_BYTES, max_send_msg_bytes=_MAX_MESSAGE_BYTES) -> gRPCRouter
 
 Register the KServe V2 GRPCInferenceService handlers. The returned router is served by
-gRPCServer with an `InferContext` payload (see `serve`).
+gRPCServer with an `InferContext` payload (see `serve`). The message-size caps default to
+`_MAX_MESSAGE_BYTES`; `serve` passes the configured `grpc.max_recv_msg_bytes` / `max_send_msg_bytes`.
 """
 function build_grpc_router(sched::Scheduler, registry::ModelRegistry, platform::AbstractString,
-                           shm::SharedMemoryRegistry)
-    router = _G.gRPCRouter(; max_receive_message_length=_MAX_MESSAGE_BYTES,
-                           max_send_message_length=_MAX_MESSAGE_BYTES)
+                           shm::SharedMemoryRegistry;
+                           max_recv_msg_bytes::Integer=_MAX_MESSAGE_BYTES,
+                           max_send_msg_bytes::Integer=_MAX_MESSAGE_BYTES)
+    router = _G.gRPCRouter(; max_receive_message_length=max_recv_msg_bytes,
+                           max_send_message_length=max_send_msg_bytes)
     register_GRPCInferenceService!(router;
         ServerLive    = (req, ctx) -> inference.ServerLiveResponse(; live=true),
         ServerReady   = (req, ctx) -> _handle_server_ready(ctx.payload),

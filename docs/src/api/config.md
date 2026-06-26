@@ -14,6 +14,7 @@ RuntimeConfig
 SchedulerConfig
 ModelSchedConfig
 EndpointsConfig
+GrpcConfig
 ModelControlMode
 SchedulingDiscipline
 ResidencyMode

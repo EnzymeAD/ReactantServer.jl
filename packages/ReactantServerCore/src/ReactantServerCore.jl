@@ -99,7 +99,7 @@ export ResidencyState, UNPINNED, PINNED_SYSTEM, PINNED_DEVICE
 export ResidencyMode, SELF_MANAGED, EXTERNALLY_MANAGED
 export ModelControlMode, STATIC, DYNAMIC, EXPLICIT
 export SchedulingDiscipline, FAIR, FIFO, EDF
-export RuntimeConfig, ModelSchedConfig, SchedulerConfig, EndpointsConfig, ServerConfig
+export RuntimeConfig, ModelSchedConfig, SchedulerConfig, EndpointsConfig, GrpcConfig, ServerConfig
 export build_config, validate_config, apply_env_overrides!, log_effective_config
 
 # ---- node ----

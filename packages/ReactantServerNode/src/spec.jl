@@ -108,6 +108,8 @@ function gateway_spec(workspace_root::AbstractString;
                       endpoints::Union{Vector{String},Nothing}=nothing,
                       metrics_endpoints::Union{Vector{String},Nothing}=nothing,
                       worker_names::Union{Vector{String},Nothing}=nothing,
+                      grpc_max_recv::Union{Integer,Nothing}=nothing,
+                      grpc_max_send::Union{Integer,Nothing}=nothing,
                       grace_seconds::Real=10.0)
     proj = joinpath(workspace_root, "packages", "ReactantServerGateway")
     cmd = gateway_path === nothing ?
@@ -128,6 +130,12 @@ function gateway_spec(workspace_root::AbstractString;
         # supervisor's responsibility) rather than fail fast. An explicit env value wins.
         haskey(ENV, "REACTANT_GATEWAY_STARTUP_WAIT_SECONDS") ||
             push!(pairs, "REACTANT_GATEWAY_STARTUP_WAIT_SECONDS" => "inf")
+        # Mirror the node-level gRPC message-size limits (global.grpc) into the embedded gateway, so a
+        # single node knob configures the workers and the gateway alike. An explicit env value wins.
+        grpc_max_recv === nothing || haskey(ENV, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES") ||
+            push!(pairs, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES" => string(grpc_max_recv))
+        grpc_max_send === nothing || haskey(ENV, "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES") ||
+            push!(pairs, "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES" => string(grpc_max_send))
         isempty(pairs) || (cmd = addenv(cmd, pairs...))
     end
     return ChildSpec("gateway", cmd, Float64(grace_seconds))

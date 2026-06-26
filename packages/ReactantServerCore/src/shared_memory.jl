@@ -84,7 +84,11 @@ end
 """
     shm_unregister!(registry, name)
 
-Unregister and detach a region, or all regions when `name` is empty.
+Unregister and detach a region, or all regions when `name` is empty. Idempotent: unregistering a
+name that is not registered is a successful no-op (it matches KServe semantics and lets the gateway
+fan-out and the client's pre-emptive cleanup unregister succeed without a spurious error).
+Registration, by contrast, fails loudly (see [`shm_register!`](@ref)) so a bad region surfaces at
+register time rather than during inference.
 """
 function shm_unregister!(reg::SharedMemoryRegistry, name::AbstractString)
     removed = @lock reg.lock begin
@@ -94,9 +98,12 @@ function shm_unregister!(reg::SharedMemoryRegistry, name::AbstractString)
             rs
         else
             r = get(reg.regions, name, nothing)
-            r === nothing && throw(ArgumentError("unknown shared memory region: $name"))
-            delete!(reg.regions, name)
-            ShmRegion[r]
+            if r === nothing
+                ShmRegion[]                 # not registered: idempotent no-op
+            else
+                delete!(reg.regions, name)
+                ShmRegion[r]
+            end
         end
     end
     for r in removed
