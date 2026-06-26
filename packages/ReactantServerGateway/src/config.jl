@@ -47,7 +47,13 @@ struct GatewayConfig
     first_rebalance_compute_seconds::Float64
     max_worker_share::Float64               # advisory only: load no longer drives a model's GPU count
     hysteresis::Float64                     # min relative max-load improvement required to move a placement
-    rate_halflife_seconds::Float64          # EWMA halflife for per-model arrival-rate and cost smoothing
+    # EWMA halflife for the per-model arrival-rate and cost smoothing, measured in fleet
+    # compute-seconds (the same clock that triggers repacks), not wall-clock. The EWMA folds only at
+    # a repack and decays against the compute consumed since the last one, so the demand signal ages
+    # in proportion to how much inference the fleet is doing (faster when busy, coasting when idle)
+    # and stays aligned to the repack cadence regardless of GPU count. 0 means "track the rebalance
+    # interval" (use `rebalance_compute_seconds`), which gives about 50% decay per rebalance.
+    ema_halflife_compute_seconds::Float64
     # Replica placement: a model lives on exactly `replicas` distinct GPUs (per-model override under
     # `scheduling.models`, else `default_replicas`). Set at startup; never grows automatically.
     # `default_replicas: all` (stored as REPLICAS_ALL) places every model on every ready worker.
@@ -83,6 +89,15 @@ struct GatewayConfig
     # at or after this many repacks fires it (so it can land later than exactly N).
     compaction_mode::Symbol
     compaction_interval::Int
+    # No-eviction guarantee (lpt_packing only). When true, the packer treats each worker's weight
+    # budget as a hard constraint: a model is placed only on workers where its weights still fit,
+    # so a feasible non-oversubscribed placement is never passed over in favor of one that strands a
+    # model on-demand (the worker LRU evicting a placed model). It falls back to the unconstrained
+    # choice only when no worker can fit the model (the total weights genuinely outgrew the fleet),
+    # so it never throws and never does worse than the soft max-norm. Being greedy (first-fit
+    # decreasing) it is not guaranteed to find a feasible packing that exists, but it never strands a
+    # model when the greedy pass can avoid it. Default on.
+    forbid_memory_oversubscription::Bool
 end
 
 const GW_ENV_PREFIX = "REACTANT_GATEWAY_"
@@ -94,7 +109,8 @@ const GW_ENV_PATHS = Tuple{String,Vector{String},DataType}[
     ("SCHEDULING_FIRST_REBALANCE_COMPUTE_SECONDS", ["scheduling", "first_rebalance_compute_seconds"], Float64),
     ("SCHEDULING_MAX_WORKER_SHARE", ["scheduling", "max_worker_share"], Float64),
     ("SCHEDULING_HYSTERESIS", ["scheduling", "hysteresis"], Float64),
-    ("SCHEDULING_RATE_HALFLIFE_SECONDS", ["scheduling", "rate_halflife_seconds"], Float64),
+    ("SCHEDULING_EMA_HALFLIFE_COMPUTE_SECONDS", ["scheduling", "ema_halflife_compute_seconds"], Float64),
+    ("SCHEDULING_FORBID_MEMORY_OVERSUBSCRIPTION", ["scheduling", "forbid_memory_oversubscription"], Bool),
     ("SCHEDULING_DEFAULT_REPLICAS", ["scheduling", "default_replicas"], String),
     ("SCHEDULING_ROUTING_FILL_FACTOR", ["scheduling", "routing_fill_factor"], Float64),
     ("SCHEDULING_ROUTING_POLICY", ["scheduling", "routing_policy"], String),
@@ -219,7 +235,7 @@ function _build_gateway_config(raw::Dict{String,Any})
         throw(ConfigError("scheduling.routing_policy no longer accepts 'least_outstanding'; it is now a top-level scheduling mode. Set scheduling.mode: least_outstanding instead."))
     routing_policy in ("fill_rr", "fill_least") ||
         throw(ConfigError("scheduling.routing_policy must be 'fill_rr' or 'fill_least', got '$routing_policy'"))
-    compaction_mode = _parse_gateway_compaction_mode(_opt(sched, "compaction_mode", String, "off"))
+    compaction_mode = _parse_gateway_compaction_mode(_opt(sched, "compaction_mode", String, "eager"))
 
     cfg = GatewayConfig(
         _opt(listen, "grpc", String, "0.0.0.0:8001"),
@@ -233,11 +249,11 @@ function _build_gateway_config(raw::Dict{String,Any})
         _opt(logging, "level", String, "info"),
         _opt(logging, "format", String, "json"),
         scheduling_mode,
-        _opt(sched, "rebalance_compute_seconds", Float64, 30.0),
-        _opt(sched, "first_rebalance_compute_seconds", Float64, 0.0),
+        _opt(sched, "rebalance_compute_seconds", Float64, 300.0),
+        _opt(sched, "first_rebalance_compute_seconds", Float64, 60.0),
         _opt(sched, "max_worker_share", Float64, 0.8),
-        _opt(sched, "hysteresis", Float64, 0.1),
-        _opt(sched, "rate_halflife_seconds", Float64, 30.0),
+        _opt(sched, "hysteresis", Float64, 0.0),
+        _opt(sched, "ema_halflife_compute_seconds", Float64, 0.0),
         _parse_replicas(get(sched, "default_replicas", 1), "scheduling.default_replicas"),
         _opt(sched, "routing_fill_factor", Float64, 1.0),
         routing_policy,
@@ -245,7 +261,8 @@ function _build_gateway_config(raw::Dict{String,Any})
         _opt(wc, "max_concurrent_streams", Int, 32),
         _opt(grpc, "max_concurrent_requests_per_worker", Int, 64),
         compaction_mode,
-        _opt(sched, "compaction_interval", Int, 0),
+        _opt(sched, "compaction_interval", Int, 1),
+        _opt(sched, "forbid_memory_oversubscription", Bool, true),
     )
     cfg.max_concurrent_streams_per_worker > 0 ||
         throw(ConfigError("worker_client.max_concurrent_streams must be positive"))
@@ -258,7 +275,7 @@ function _build_gateway_config(raw::Dict{String,Any})
     cfg.first_rebalance_compute_seconds >= 0 || throw(ConfigError("scheduling.first_rebalance_compute_seconds must be non-negative (0 = use rebalance_compute_seconds)"))
     0 < cfg.max_worker_share <= 1 || throw(ConfigError("scheduling.max_worker_share must be in (0, 1]"))
     0 <= cfg.hysteresis < 1 || throw(ConfigError("scheduling.hysteresis must be in [0, 1)"))
-    cfg.rate_halflife_seconds > 0 || throw(ConfigError("scheduling.rate_halflife_seconds must be positive"))
+    cfg.ema_halflife_compute_seconds >= 0 || throw(ConfigError("scheduling.ema_halflife_compute_seconds must be non-negative (0 = use rebalance_compute_seconds)"))
     cfg.routing_fill_factor > 0 || throw(ConfigError("scheduling.routing_fill_factor must be positive"))
     cfg.compaction_interval >= 0 || throw(ConfigError("scheduling.compaction_interval must be non-negative (0 = disabled)"))
 

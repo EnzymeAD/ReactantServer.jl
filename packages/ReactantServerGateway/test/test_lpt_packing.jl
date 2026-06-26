@@ -114,7 +114,7 @@ end
 @testset "verify_lpt_packing_preconditions!: gates on worker reachability" begin
     cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", ["127.0.0.1:1"], String[], String[], 1, 1, 1, "info",
                            "json", "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr",
-                           Dict{String,GW.GatewayModelConfig}(), 32, 64, :off, 0)
+                           Dict{String,GW.GatewayModelConfig}(), 32, 64, :off, 0, false)
     pool = GW.ClientPool(cfg)
     # Default (wait_seconds = 0) fails fast when a worker is unreachable.
     @test_throws ErrorException GW.verify_lpt_packing_preconditions!(pool; wait_seconds = 0)
@@ -192,10 +192,82 @@ end
     @test asn3["a"][1][1] in W
 end
 
+@testset "EMA decay: gamma tracks compute elapsed against the halflife" begin
+    # _ewma(old, sample, dt, h): one halflife of elapsed compute folds ~50% toward the sample, so a
+    # halflife equal to the rebalance interval gives about 50% decay per rebalance.
+    @test GW._ewma(0.0, 1.0, 300.0, 300.0) ≈ 0.5
+    @test GW._ewma(2.0, 2.0, 300.0, 300.0) ≈ 2.0                 # steady state holds
+    # A fraction of a halflife (the early first_rebalance budget, 60 of 300) folds gently.
+    @test GW._ewma(0.0, 1.0, 60.0, 300.0) ≈ 1 - 2.0^(-0.2)
+    # Zero elapsed compute (the startup rebalance) is a no-op: the EWMA does not move.
+    @test GW._ewma(0.7, 5.0, 0.0, 300.0) ≈ 0.7
+end
+
+@testset "config: lpt_packing defaults and compute-clock EMA resolution" begin
+    function _load(yaml)
+        path = tempname() * ".yaml"
+        write(path, yaml)
+        try
+            return GW.load_gateway(path)
+        finally
+            rm(path; force = true)
+        end
+    end
+    eps = "endpoints:\n  - \"127.0.0.1:7001\"\n"
+    cfg = _load(eps)
+    @test cfg.rebalance_compute_seconds == 300.0
+    @test cfg.first_rebalance_compute_seconds == 60.0
+    @test cfg.hysteresis == 0.0
+    @test cfg.ema_halflife_compute_seconds == 0.0
+    @test cfg.compaction_mode == :eager
+    @test cfg.compaction_interval == 1
+    @test cfg.forbid_memory_oversubscription == true
+    # 0 resolves to the rebalance interval (~50% decay per rebalance); a set value is honored.
+    @test GW.LptPackingState(cfg).ema_halflife_compute == cfg.rebalance_compute_seconds
+    cfg2 = _load("scheduling:\n  ema_halflife_compute_seconds: 120\n  rebalance_compute_seconds: 300\n" * eps)
+    @test GW.LptPackingState(cfg2).ema_halflife_compute == 120.0
+    @test _load("scheduling:\n  forbid_memory_oversubscription: false\n" * eps).forbid_memory_oversubscription == false
+end
+
+@testset "forbid_memory_oversubscription: vacates an over-budget home, falls back when infeasible" begin
+    W = ["w0", "w1"]
+    GB = 1.0e9
+    caps = Dict("w0" => 10GB, "w1" => 10GB)
+    # cpu1 saturates w1's compute; occ0 + m together exceed w0's budget. Hysteresis (unconstrained)
+    # pins m on w0 because moving it to the compute-busy w1 barely improves its max-norm pressure.
+    prev = Dict{String,GW.Placement}("m" => [("w0", 1.0)], "occ0" => [("w0", 1.0)],
+                                     "cpu1" => [("w1", 1.0)])
+    u = Dict("cpu1" => 1.0, "occ0" => 0.0, "m" => 0.0)
+    mem = Dict("cpu1" => 1GB, "occ0" => 7GB, "m" => 3.5GB)
+    soft = GW.compute_assignment(u, W, prev; mem = mem, mem_cap = caps, hysteresis = 0.1)
+    @test soft["m"] == [("w0", 1.0)]                            # pinned: w0 now holds 10.5 GB > 10
+    hard = GW.compute_assignment(u, W, prev; mem = mem, mem_cap = caps, hysteresis = 0.1,
+                                 forbid_memory_oversubscription = true)
+    @test hard["m"] == [("w1", 1.0)]                            # forced onto the feasible worker
+    for w in W                                                  # no worker exceeds its budget
+        load = sum((get(mem, mm, 0.0) for (mm, pl) in hard for (ww, _) in pl if ww == w); init = 0.0)
+        @test load <= caps[w]
+    end
+
+    # Roomy memory: the guarantee is a no-op (every worker fits), matching the unconstrained packing.
+    u2 = Dict("a" => 0.6, "b" => 0.5, "c" => 0.1)
+    mem2 = Dict("a" => 1GB, "b" => 1GB, "c" => 1GB)
+    big = Dict("w0" => 1000GB, "w1" => 1000GB)
+    @test GW.compute_assignment(u2, W, NOPREV; mem = mem2, mem_cap = big,
+                                forbid_memory_oversubscription = true) ==
+          GW.compute_assignment(u2, W, NOPREV; mem = mem2, mem_cap = big)
+
+    # Genuinely infeasible (a model larger than any budget) is still placed, not dropped.
+    huge = GW.compute_assignment(Dict("x" => 0.5), W, NOPREV;
+                                 mem = Dict("x" => 20GB), mem_cap = caps,
+                                 forbid_memory_oversubscription = true)
+    @test length(huge["x"]) == 1 && huge["x"][1][1] in W
+end
+
 @testset "gateway compaction cadence: fires on the Nth repack that moves a model" begin
     mk(mode, interval) = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], String[], 60, 1, 1,
         "info", "json", "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr",
-        Dict{String,GW.GatewayModelConfig}(), 32, 64, mode, interval)
+        Dict{String,GW.GatewayModelConfig}(), 32, 64, mode, interval, false)
     cfg = mk(:eager, 2)
     s = GW.LptPackingState(cfg)
     pool = GW.ClientPool(cfg)               # no workers; the ghost URL below is skipped (no network)
@@ -228,7 +300,7 @@ function _pk_state(; routing_policy = "fill_rr", fill_factor = 1.0, max_batch = 
                    costs = nothing)
     cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], String[], 60, 1, 1, "info", "json",
                            "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, fill_factor, routing_policy,
-                           Dict{String,GW.GatewayModelConfig}(), 32, 64, :off, 0)
+                           Dict{String,GW.GatewayModelConfig}(), 32, 64, :off, 0, false)
     s = GW.LptPackingState(cfg)
     @atomic s.assignment = assignment
     @atomic s.max_batch = Dict(m => max_batch for m in keys(assignment))
@@ -384,6 +456,9 @@ function _aff_router()
                           for m in w.models],
                 weight_cache_max_bytes = UInt64(8) * 1024^3)
         end,
+        # Eager compaction is the default now, so the gateway may fan CompactMemory out after a
+        # placement-changing repack; answer it so the call never hits the generous client deadline.
+        CompactMemory = (req, c) -> ACtl.CompactMemoryResponse(; reloaded_models = Int64(0)),
     )
     return router
 end
@@ -465,7 +540,9 @@ end
         @test max(d0, d1) == 20                       # all on the placed worker
 
         # Compute-driven trigger: tick_packing! accumulates fleet compute and repacks only once the
-        # budget is crossed.
+        # budget is crossed. Disable the separate first-repack budget here so this block exercises the
+        # steady-state threshold directly (the first-vs-steady budget is covered in the block below).
+        aff.first_rebalance_compute_seconds = 0.0
         aff.rebalance_compute_seconds = 1.0e9      # effectively never
         before = aff.last_rebalance
         for _ in 1:10
