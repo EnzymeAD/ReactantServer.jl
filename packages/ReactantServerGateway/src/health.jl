@@ -26,11 +26,17 @@ const PROBE_TIMEOUT_SECONDS = 8.0
 const WEDGE_EXIT_ROUNDS = 3
 
 # Returns (value, timed_out). On timeout the abandoned task keeps running detached; `default`
-# is returned in its place.
-function _bounded(f, secs, default, what::String, url::String)
+# is returned in its place. `level` sets the log level of the timeout message: the default `:warn`
+# suits the runtime prober (a worker that was ready and stops answering is a real event), while the
+# startup precondition wait passes `:debug` because timeouts there are the expected warmup window
+# (workers compiling before their control plane answers) and are already summarized by the caller.
+function _bounded(f, secs, default, what::String, url::String; level::Symbol = :warn)
     t = @async f()
     if timedwait(() -> istaskdone(t), secs) !== :ok
-        @warn "health: $what timed out; treating as unavailable" worker = url timeout_s = secs
+        msg = "health: $what timed out; treating as unavailable"
+        level === :debug ? (@debug msg worker = url timeout_s = secs) :
+        level === :info  ? (@info msg worker = url timeout_s = secs) :
+                           (@warn msg worker = url timeout_s = secs)
         return default, true
     end
     v = try

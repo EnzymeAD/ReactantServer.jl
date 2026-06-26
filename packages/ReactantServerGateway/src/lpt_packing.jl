@@ -730,8 +730,12 @@ function verify_lpt_packing_preconditions!(pool::ClientPool; wait_seconds::Real=
         pending = String[]
         timed_out = 0
         for wc in clients
+            # level=:debug: at startup a worker not answering is the expected warmup window (it
+            # compiles before its control plane answers), not a fault. The per-worker timeout is
+            # quieted to debug; the once-per-round "waiting for all workers" @info below is the
+            # operator-facing progress line. The runtime prober keeps the default :warn.
             resp, to = _bounded(() -> fetch_control_status(wc), call_timeout, nothing,
-                                "ModelControlStatus poll", wc.url)
+                                "ModelControlStatus poll", wc.url; level = :debug)
             if resp === nothing
                 push!(pending, wc.url)
                 # A hung call (not a fast refuse) means the worker was caught mid-stall and its
@@ -757,6 +761,11 @@ function verify_lpt_packing_preconditions!(pool::ClientPool; wait_seconds::Real=
         @info "lpt_packing: waiting for all workers before serving (workers compile before they answer the control plane)" ready = sort(collect(keys(statuses))) pending = sort(pending)
         sleep(poll_interval)
     end
+    # The loop only falls through here once every worker answered (its other exits are error()/exit(1)),
+    # so log an explicit all-ready confirmation: the "waiting" line above never prints in the all-ready
+    # state (it is past the `isempty(pending) && break`), and a fast start answers on the first poll
+    # without ever logging "waiting".
+    @info "lpt_packing: all workers ready" count = length(statuses) workers = sort(collect(keys(statuses)))
     for (url, resp) in statuses
         # FIFO and EDF are both compatible with lpt_packing: neither imposes a competing per-model
         # fairness policy (EDF only reorders by request deadline, degrading to FIFO for equal

@@ -6,6 +6,7 @@ import gRPCServer
 import gRPCClient
 import HTTP
 import Sockets
+import Logging
 using ReactantServerCore.control   # bare message types for the included server stubs
 
 const AInf = ReactantServerCore.inference
@@ -122,6 +123,20 @@ end
     @test_throws ErrorException GW.verify_lpt_packing_preconditions!(pool; wait_seconds = 0.3,
                                                                      poll_interval = 0.05)
     @test time() - t0 >= 0.25
+end
+
+@testset "_bounded: timeout log level is controllable (quiet startup wait)" begin
+    slow() = (sleep(5); 1)   # never finishes within the watchdog, forcing the timeout branch
+    # Default :warn (the runtime health prober) warns on a timeout.
+    @test_logs (:warn, r"timed out; treating as unavailable") match_mode = :any begin
+        v, to = GW._bounded(slow, 0.05, nothing, "ModelControlStatus poll", "127.0.0.1:0")
+        @test v === nothing && to === true
+    end
+    # :debug (the startup precondition wait) stays quiet: no record at Warn or above.
+    @test_logs min_level = Logging.Warn begin
+        v, to = GW._bounded(slow, 0.05, nothing, "ModelControlStatus poll", "127.0.0.1:0"; level = :debug)
+        @test v === nothing && to === true
+    end
 end
 
 @testset "compute_assignment: memory dimension steers placement" begin
