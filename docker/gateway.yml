@@ -37,15 +37,18 @@ logging:
 # thrashes (loads/evicts weights on nearly every request). Size replica counts to your GPU memory.
 # scheduling:
 #   mode: lpt_packing               # round_robin | least_outstanding | lpt_packing
-#   rebalance_compute_seconds: 30.0 # fleet GPU-seconds consumed that triggers a repack
-#   first_rebalance_compute_seconds: 0.0 # smaller budget for the FIRST repack (0 = use rebalance_compute_seconds)
+#   rebalance_compute_seconds: 300.0 # fleet GPU-seconds consumed that triggers a repack
+#   first_rebalance_compute_seconds: 60.0 # smaller budget for the FIRST repack (0 = use rebalance_compute_seconds)
+#   ema_halflife_compute_seconds: 0 # demand-EMA halflife in fleet compute-seconds (0 = track rebalance_compute_seconds)
+#   hysteresis: 0.0                 # extra improvement required before a model moves workers (0 = move on any gain)
 #   default_replicas: 1             # GPUs per model unless overridden below (a number, or "all")
 #   routing_fill_factor: 1.0        # per-replica fill target as a multiple of max batch size (lpt_packing only)
 #   routing_policy: fill_rr         # fill_rr (default) | fill_least  (lpt_packing only)
-#   compaction_mode: off            # off (default) | eager | scheduled: after a placement-changing repack,
+#   forbid_memory_oversubscription: true # never strand a model on-demand when it could fit resident (default on)
+#   compaction_mode: eager          # eager (default) | off | scheduled: after a placement-changing repack,
 #                                   # defragment the affected workers' on-demand weight memory. eager frees and
 #                                   # refills lazily; scheduled also reloads each worker's newly assigned models.
-#   compaction_interval: 0          # repacks between compactions; 0 disables. The first placement-changing
+#   compaction_interval: 1          # repacks between compactions; 0 disables. The first placement-changing
 #                                   # repack at or after this many repacks fires it. Workers behind the gateway
 #                                   # should leave scheduler.compaction_interval at 0 so the gateway owns this.
 #   models:

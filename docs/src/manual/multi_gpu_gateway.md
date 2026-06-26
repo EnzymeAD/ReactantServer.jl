@@ -60,15 +60,16 @@ The gateway routes each model's requests across its replicas according to `sched
 ```yaml
 scheduling:
   mode: lpt_packing             # round_robin (default) | least_outstanding | lpt_packing
-  rebalance_compute_seconds: 30 # fleet GPU-seconds consumed that triggers a repack
-  first_rebalance_compute_seconds: 0 # smaller budget for the first repack (0 = use rebalance_compute_seconds)
-  rate_halflife_seconds: 30
-  hysteresis: 0.1               # minimum improvement before a model moves workers
+  rebalance_compute_seconds: 300 # fleet GPU-seconds consumed that triggers a repack
+  first_rebalance_compute_seconds: 60 # smaller budget for the first repack (0 = use rebalance_compute_seconds)
+  ema_halflife_compute_seconds: 0 # demand-EMA halflife in fleet compute-seconds (0 = track rebalance_compute_seconds)
+  hysteresis: 0.0               # extra improvement required before a model moves workers (0 = move on any gain)
   default_replicas: 1           # GPUs per model unless overridden below (a number, or "all")
   routing_fill_factor: 1.0      # per-replica fill target as a multiple of max batch size (lpt_packing only)
   routing_policy: fill_rr       # fill_rr (default) | fill_least  (lpt_packing only)
-  compaction_mode: off          # off (default) | eager | scheduled  (defragment workers after a repack)
-  compaction_interval: 0        # repacks between compactions; 0 disables  (see On-demand Weights)
+  forbid_memory_oversubscription: true # never strand a model on-demand when it could fit resident (default on)
+  compaction_mode: eager        # eager (default) | off | scheduled  (defragment workers after a repack)
+  compaction_interval: 1        # repacks between compactions; 0 disables  (see On-demand Weights)
   models:
     big-model:
       replicas: 2               # this model is placed on 2 distinct GPUs (a number, or "all")
@@ -108,14 +109,32 @@ demand (the gateway-measured arrival rate times the true per-request compute cos
 report over the control plane) and resident weight footprint against each worker's weight-memory
 budget, placing models heaviest-first onto the least pressured workers, where pressure is
 whichever of compute or memory is closer to full. Packing by memory keeps each GPU's resident
-weight set bounded so evictions stay rare. Placements are sticky: a single-replica model moves
-only when the move improves its resulting pressure by more than `hysteresis`, because batching
-depends on traffic staying where the queues are. (`max_worker_share` is accepted but advisory
-only; load no longer determines a model's GPU count.)
+weight set bounded so evictions stay rare. With `forbid_memory_oversubscription` enabled (the
+default), this becomes a hard guarantee: a model is placed only on a worker where its weights still
+fit whenever some worker can hold it, so a feasible fully-resident placement is never passed over
+for one that strands a model on-demand (the worker LRU evicting a placed model). The packer falls
+back to the unconstrained choice, and logs the oversubscription warning above, only when the weights
+genuinely exceed every worker's budget.
+
+Placement is kept stable mainly by smoothing the demand signal rather than by a large dead band: the
+arrival rate and per-request cost are each tracked with an exponential moving average whose halflife
+is measured in fleet compute-seconds (`ema_halflife_compute_seconds`, defaulting to one
+`rebalance_compute_seconds` interval, so the signal decays about half per repack and ages with how
+busy the fleet is rather than with wall-clock). `hysteresis` adds an optional dead band on top: a
+single-replica model moves only when the move improves its resulting pressure by more than
+`hysteresis` (default `0.0`, i.e. move on any improvement), because batching depends on traffic
+staying where the queues are. (`max_worker_share` is accepted but advisory only; load no longer
+determines a model's GPU count.)
 
 Repacks are driven by accumulated compute, not wall-clock: the gateway polls the workers every
 probe round and recomputes the placement once the fleet has consumed `rebalance_compute_seconds`
-GPU-seconds since the last repack. The first traffic-driven repack can use a smaller
+GPU-seconds since the last repack. This compute is **cumulative across every GPU**: the gateway sums
+each worker's consumed GPU-seconds, so a fleet of N busy GPUs accrues the budget about N times as
+fast as one (the accrual rate is the sum of the per-GPU utilizations). The budget is therefore in
+GPU-work, not real time, and the wall-clock gap between repacks shrinks as the fleet gets busier or
+larger and stretches out when it is idle (`rebalance_compute_seconds / sum-of-utilizations`). The
+same cumulative clock drives `ema_halflife_compute_seconds`, so the demand signal also ages in
+GPU-work rather than wall-clock. The first traffic-driven repack can use a smaller
 `first_rebalance_compute_seconds` budget so an early rebalance corrects the cold placement quickly,
 then later repacks use the larger steady-state budget to limit memory churn (`0` means the first
 repack uses `rebalance_compute_seconds` like the rest). An idle fleet does not repack until traffic

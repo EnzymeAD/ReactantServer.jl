@@ -44,7 +44,8 @@ const POLL_TIMEOUT_SECONDS = 8.0
 
 """
     compute_assignment(u, workers, prev; mem=Dict(), mem_cap=Dict(),
-                       replicas=Dict(), default_replicas=1, hysteresis=0.1)
+                       replicas=Dict(), default_replicas=1, hysteresis=0.1,
+                       forbid_memory_oversubscription=false)
         -> Dict{String,Placement}
 
 Pure assignment math (no I/O): greedy two-dimensional (vector) bin packing onto a fixed number of
@@ -66,6 +67,13 @@ are chosen, previous members winning ties for stability, and weights are even (`
 longer present are ignored in `prev`. Cold models (no traffic yet) carry `u[m] == 0` and are placed
 like any other, packed by memory; models absent from `u` entirely are not placed and the caller
 routes them uniformly. Load never changes a model's `k`; replica count is fixed by configuration.
+
+When `forbid_memory_oversubscription` is true the budget becomes a hard constraint: a model is
+placed only on workers where its weights still fit (for `k == 1` the candidate set is filtered and
+hysteresis only holds a previous home that still fits; for `k > 1` feasible workers are ranked
+first), falling back to the unconstrained choice only when no worker can fit it. This is greedy
+first-fit-decreasing, so it never oversubscribes when the greedy pass can avoid it, but it does not
+guarantee finding a feasible packing that exists.
 """
 # Optional per-repack diagnostics filled by `compute_assignment` (single-replica hysteresis only).
 # `held` counts models whose lowest-pressure worker differed from their current one but that stayed
@@ -84,6 +92,7 @@ function compute_assignment(u::Dict{String,Float64}, workers::Vector{String},
                             mem_cap::Dict{String,Float64}=Dict{String,Float64}(),
                             replicas::Dict{String,Int}=Dict{String,Int}(),
                             default_replicas::Int=1, hysteresis::Float64=0.1,
+                            forbid_memory_oversubscription::Bool=false,
                             stats::Union{Nothing,RepackStats}=nothing)
     out = Dict{String,Placement}()
     isempty(workers) && return out
@@ -93,6 +102,9 @@ function compute_assignment(u::Dict{String,Float64}, workers::Vector{String},
     # Pressure of worker `w` after placing compute `uc` and memory `wm` on it.
     score_after(w, uc, wm) = max(cload[w] + uc,
                                  capof(w) == Inf ? 0.0 : (mload[w] + wm) / capof(w))
+    # Whether `w` can still hold a model of footprint `wm` within its budget (unconstrained always
+    # fits). Used only when `forbid_memory_oversubscription` is set.
+    fits(w, wm) = (c = capof(w); c == Inf || mload[w] + wm <= c)
     # Descending compute demand, then descending memory (pack the bulky cold models early),
     # ties broken by name for determinism.
     order = sort!(collect(keys(u)); by = m -> (-u[m], -get(mem, m, 0.0), m))
@@ -102,10 +114,18 @@ function compute_assignment(u::Dict{String,Float64}, workers::Vector{String},
         prev_pl = get(prev, m, nothing)
         k = clamp(get(replicas, m, default_replicas), 1, length(workers))
         if k == 1
-            best = argmin(w -> score_after(w, um, wm), workers)
+            # Optionally restrict to workers where the weights still fit, so a feasible home is never
+            # passed over for one that oversubscribes; fall back to all workers when none fit.
+            cands = workers
+            if forbid_memory_oversubscription
+                feasible = filter(w -> fits(w, wm), workers)
+                isempty(feasible) || (cands = feasible)
+            end
+            best = argmin(w -> score_after(w, um, wm), cands)
             chosen = best
             # Hysteresis: stick with the previous single placement unless the move improves the
-            # model's resulting pressure by more than the threshold.
+            # model's resulting pressure by more than the threshold. Under the guarantee, only stay if
+            # the previous home is still a candidate (still fits), so an over-budget home is vacated.
             if prev_pl !== nothing && length(prev_pl) == 1 && haskey(cload, prev_pl[1][1])
                 wp = prev_pl[1][1]
                 bestscore = score_after(best, um, wm)
@@ -114,7 +134,7 @@ function compute_assignment(u::Dict{String,Float64}, workers::Vector{String},
                     impr = bestscore > 0 ? (prevscore / bestscore - 1.0) : 0.0
                     impr > stats.max_improvement && (stats.max_improvement = impr)
                 end
-                if prevscore <= bestscore * (1 + hysteresis)
+                if wp in cands && prevscore <= bestscore * (1 + hysteresis)
                     chosen = wp
                     stats !== nothing && best != wp && (stats.held += 1)
                 end
@@ -127,7 +147,11 @@ function compute_assignment(u::Dict{String,Float64}, workers::Vector{String},
             # ties for stability). Even weights keep every share identical and the sum at 1.
             # Weights are resident on every member, so each is charged the full footprint.
             prevset = prev_pl === nothing ? Set{String}() : Set(first.(prev_pl))
-            ranked = sort(workers; by = w -> (score_after(w, um / k, wm), w in prevset ? 0 : 1, w))
+            # Under the guarantee, rank workers that still fit ahead of those that do not, so the `k`
+            # replicas fill feasible workers first and only spill onto an infeasible one when fewer
+            # than `k` can fit. With the guarantee off the lead term is a constant 0 (no reordering).
+            fitrank(w) = (forbid_memory_oversubscription && !fits(w, wm)) ? 1 : 0
+            ranked = sort(workers; by = w -> (fitrank(w), score_after(w, um / k, wm), w in prevset ? 0 : 1, w))
             chosen = ranked[1:k]
             wshare = 1.0 / k
             for w in chosen
@@ -145,13 +169,14 @@ end
 mutable struct LptPackingState <: GatewayScheduler
     # knobs (from GatewayConfig)
     hysteresis::Float64
-    rate_halflife::Float64
+    ema_halflife_compute::Float64            # EWMA halflife in fleet compute-seconds (resolved: 0 in config => rebalance_compute_seconds)
     rebalance_compute_seconds::Float64       # fleet GPU-seconds consumed that triggers a repack
     first_rebalance_compute_seconds::Float64 # smaller budget for the first tick-driven repack (0 = same as rebalance_compute_seconds)
     default_replicas::Int
     model_replicas::Dict{String,Int}         # per-model replica overrides (immutable after build)
     routing_fill_factor::Float64
     routing_policy::String                    # "fill_rr" | "fill_least"
+    forbid_memory_oversubscription::Bool      # hard memory constraint in compute_assignment (graceful fallback)
     # arrival counting: a copy-on-write snapshot dict of per-model atomic counters. Reads (the
     # request hot path) touch only the immutable snapshot; insertion of a new model swaps in a
     # copy under the lock.
@@ -204,10 +229,12 @@ mutable struct LptPackingState <: GatewayScheduler
 end
 
 LptPackingState(cfg::GatewayConfig) = LptPackingState(
-    cfg.hysteresis, cfg.rate_halflife_seconds, cfg.rebalance_compute_seconds,
+    cfg.hysteresis,
+    cfg.ema_halflife_compute_seconds > 0 ? cfg.ema_halflife_compute_seconds : cfg.rebalance_compute_seconds,
+    cfg.rebalance_compute_seconds,
     cfg.first_rebalance_compute_seconds, cfg.default_replicas,
     Dict{String,Int}(name => mc.replicas for (name, mc) in cfg.models),
-    cfg.routing_fill_factor, cfg.routing_policy,
+    cfg.routing_fill_factor, cfg.routing_policy, cfg.forbid_memory_oversubscription,
     Dict{String,Threads.Atomic{Int}}(), ReentrantLock(),
     Dict{String,Float64}(), Dict{String,Float64}(), Dict{String,Tuple{Float64,UInt64}}(),
     0.0, 0.0, 0.0, false,
@@ -330,14 +357,18 @@ function _repack!(s::LptPackingState, poll, metrics::Union{GatewayMetrics,Nothin
     # accumulated (the compute that triggered this repack). Captured before they are reset below.
     wall_elapsed = s.last_rebalance == 0.0 ? 0.0 : now - s.last_rebalance
     compute_elapsed = s.compute_accum
-    dt = s.last_rebalance == 0.0 ? s.rate_halflife : max(now - s.last_rebalance, 1e-3)
     s.last_rebalance = now
 
-    # Arrival rates.
+    # Arrival rates. The sample is the wall-clock arrival rate over the interval (so u = rate * cost
+    # stays in GPU-sec/wall-sec, comparable to a worker's capacity 1.0); the EWMA decays against the
+    # fleet compute consumed this interval, with halflife `ema_halflife_compute`. On the startup
+    # rebalance (no interval yet) `compute_elapsed` is 0, so the fold is a no-op and the EWMAs stay at
+    # 0 until real traffic drives a tick repack; that is correct, since nothing has run yet.
     counters = @atomic s.arrivals
     for (m, c) in counters
         n = Threads.atomic_xchg!(c, 0)
-        s.rate_ewma[m] = _ewma(get(s.rate_ewma, m, 0.0), n / dt, dt, s.rate_halflife)
+        sample = wall_elapsed > 0 ? n / wall_elapsed : 0.0
+        s.rate_ewma[m] = _ewma(get(s.rate_ewma, m, 0.0), sample, compute_elapsed, s.ema_halflife_compute)
     end
 
     # Worker-reported costs: delta the per-model cumulative (compute, requests) against the previous
@@ -347,7 +378,7 @@ function _repack!(s::LptPackingState, poll, metrics::Union{GatewayMetrics,Nothin
         dtc, drq = tc - prev_tc, Int(rq) - Int(prev_rq)
         s.last_cum[m] = (tc, rq)
         (dtc < 0 || drq < 0) && continue          # worker restart: re-baseline only
-        drq > 0 && (s.cost_ewma[m] = _ewma(get(s.cost_ewma, m, dtc / drq), dtc / drq, dt, s.rate_halflife))
+        drq > 0 && (s.cost_ewma[m] = _ewma(get(s.cost_ewma, m, dtc / drq), dtc / drq, compute_elapsed, s.ema_halflife_compute))
     end
 
     @atomic s.max_batch = poll.max_batch
@@ -383,7 +414,9 @@ function _repack!(s::LptPackingState, poll, metrics::Union{GatewayMetrics,Nothin
     next = compute_assignment(full, sort(poll.polled), prev;
                               mem=poll.mem, mem_cap=poll.mem_cap,
                               replicas=s.model_replicas, default_replicas=s.default_replicas,
-                              hysteresis=s.hysteresis, stats=stats)
+                              hysteresis=s.hysteresis,
+                              forbid_memory_oversubscription=s.forbid_memory_oversubscription,
+                              stats=stats)
     merge!(next, drifted)
     @atomic s.assignment = next
     _swap_outstanding!(s, next)
@@ -669,7 +702,7 @@ scheduler_tick!(s::LptPackingState, pool::ClientPool, ready_urls, metrics) =
 # initial rebalance so the first requests already route by packing rather than waiting a prober tick.
 function scheduler_start!(s::LptPackingState, pool::ClientPool, metrics)
     verify_lpt_packing_preconditions!(pool; wait_seconds = _startup_wait_seconds())
-    @info "gateway scheduling: lpt_packing" rebalance_compute_seconds = s.rebalance_compute_seconds first_rebalance_compute_seconds = s.first_rebalance_compute_seconds default_replicas = (s.default_replicas == REPLICAS_ALL ? "all" : s.default_replicas) routing_policy = s.routing_policy
+    @info "gateway scheduling: lpt_packing" rebalance_compute_seconds = s.rebalance_compute_seconds first_rebalance_compute_seconds = s.first_rebalance_compute_seconds ema_halflife_compute = s.ema_halflife_compute default_replicas = (s.default_replicas == REPLICAS_ALL ? "all" : s.default_replicas) routing_policy = s.routing_policy forbid_memory_oversubscription = s.forbid_memory_oversubscription
     rebalance!(s, pool, copy(pool.order), metrics)
     return nothing
 end

@@ -137,7 +137,7 @@ variables) or by mounting a `gateway.yml` with:
 scheduling:
   mode: lpt_packing
   default_replicas: 1               # each model on a single GPU; the packer balances which one
-  rebalance_compute_seconds: 30     # repack after the fleet consumes this many GPU-seconds
+  rebalance_compute_seconds: 300    # repack after the fleet consumes this many GPU-seconds
 ```
 
 See [Multi-GPU Gateway](multi_gpu_gateway.md) and [Scaling to Multiple GPUs](scaling.md).
@@ -167,7 +167,7 @@ the next.
 scheduling:
   mode: lpt_packing
   default_replicas: 1               # most models on one GPU
-  rebalance_compute_seconds: 30
+  rebalance_compute_seconds: 300
   routing_fill_factor: 1.0          # raise above 1 to keep the next batch queued under bursty load
   routing_policy: fill_rr           # fill_least when replicas share GPUs with other models
   models:

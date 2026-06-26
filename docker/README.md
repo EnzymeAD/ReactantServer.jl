@@ -130,8 +130,8 @@ embedded gateway) selects how requests spread across workers. `round_robin` (def
 each model's requests uniformly over its replicas. `lpt_packing` concentrates each model's
 traffic on as few GPUs as the load allows, computed from the measured arrival rate and the
 workers' reported compute cost, so the workers' batch coalescing sees deep same-model queues;
-placement is rebalanced periodically with hysteresis and is observable via
-`gateway_placement_weight{model,worker}`. It requires `scheduler.discipline: fifo` in the node
+placement is rebalanced as the fleet consumes compute, with the demand signal smoothed so it stays
+stable, and is observable via `gateway_placement_weight{model,worker}`. It requires `scheduler.discipline: fifo` in the node
 file and all models loaded on all workers (the load-all default); the gateway refuses to start
 otherwise. See the `scheduling:` block in `docker/gateway.yml` for the knobs (or set
 `REACTANT_GATEWAY_SCHEDULING_*` for the embedded gateway).

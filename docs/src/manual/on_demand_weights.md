@@ -143,24 +143,25 @@ gateway's `scheduling:` block control it:
 ```yaml
 scheduling:
   mode: lpt_packing
-  compaction_mode: scheduled   # off | eager | scheduled
-  compaction_interval: 5       # every 5 repacks (see below)
+  compaction_mode: eager       # eager (default) | off | scheduled
+  compaction_interval: 1       # every placement-changing repack (see below)
 ```
 
 `compaction_mode` selects what each affected worker reloads eagerly after the free:
 
-- **`off`** disables gateway-driven compaction (the default).
-- **`eager`** frees the on-demand region on each worker whose placement changed and lets it refill
-  with live traffic. Models the worker no longer serves are dropped immediately; the ones it still
-  serves reload on their next request.
+- **`eager`** (the default) frees the on-demand region on each worker whose placement changed and
+  lets it refill with live traffic. Models the worker no longer serves are dropped immediately; the
+  ones it still serves reload on their next request.
+- **`off`** disables gateway-driven compaction.
 - **`scheduled`** also reloads the set of models the repack just assigned to that worker, so the
   worker's new placement is warm right away instead of cold-loading on first request. The gateway
   computes that per-worker list from the placement, which is why this is a gateway concept.
 
-`compaction_interval` is the cadence in repacks. Because placement is deliberately stable
-(hysteresis keeps most repacks from moving anything), the counter advances on every repack but
-the fan-out only fires on the first placement-changing repack at or after the interval, so it can
-land a little later than exactly N. Both settings are also exposed as
+`compaction_interval` is the cadence in repacks (default `1`, so every placement-changing repack
+compacts). Because the demand signal is smoothed, most repacks recompute the same placement and do
+nothing; the counter advances on every repack but the fan-out only fires on the first
+placement-changing repack at or after the interval, so it can land a little later than exactly N.
+Both settings are also exposed as
 `REACTANT_GATEWAY_SCHEDULING_COMPACTION_MODE` and `REACTANT_GATEWAY_SCHEDULING_COMPACTION_INTERVAL`.
 A single client `CompactMemory` call to the gateway also fans out to every worker on demand,
 independent of the repack cadence, for a one-off fleet defragment.
@@ -168,12 +169,18 @@ independent of the repack cadence, for a one-off fleet defragment.
 #### Cost and when to enable
 
 With the on-demand cache disabled (`weight_cache_fraction: 0`) every model is permanently resident
-from startup and nothing churns, so compaction has no working set to defragment and is a no-op in
-both modes. When it does run it has a cost: freeing the on-demand region drops models that were
-warm, so they pay a host-to-device reload (lazily on next request for `eager`, or up front for
-`scheduled`). Prefer a larger interval over a small one, start with compaction off, watch for
-failed or eviction-heavy loads under memory pressure, and enable it only if fragmentation is the
-cause.
+from startup and nothing churns, so compaction has no working set to defragment and is a no-op. When
+it does run it has a cost: freeing the on-demand region drops models that were warm, so they pay a
+host-to-device reload (lazily on next request for `eager`, or up front for `scheduled`).
+
+The default is `eager` on every placement-changing repack (`compaction_interval: 1`), which keeps
+fragmentation from ever accumulating: whenever placement shifts, the affected workers defragment and
+refill from live traffic. The trade is a one-time reload on the first request per moved model, which
+the relatively infrequent repack cadence (`rebalance_compute_seconds`, 300 GPU-seconds by default)
+keeps modest. To cut reloads further, raise `compaction_interval` so it fires less often, switch to
+`scheduled` to warm the new placement up front instead of lazily, or set `compaction_mode: off` to
+disable it and watch for allocation failures under memory pressure (the signal that fragmentation
+has become the bottleneck).
 
 ## Observability
 
