@@ -46,6 +46,4 @@ test = ["Test", "Logging", "Sockets", "gRPCClient"]
 ReactantServerCore = {path = "../ReactantServerCore"}
 Reactant = {path = "../../lib/Reactant.jl"}
 Prometheus = {path = "../../lib/Prometheus.jl"}
-HTTP = {path = "../../lib/HTTP.jl"}
 gRPCServer = {path = "../../lib/gRPCServer.jl"}
-gRPCClient = {path = "../../lib/gRPCClient.jl"}

@@ -30,4 +30,3 @@ test = ["Test"]
 
 [sources]
 ReactantServerCore = {path = "../ReactantServerCore"}
-gRPCClient = {path = "../../lib/gRPCClient.jl"}
