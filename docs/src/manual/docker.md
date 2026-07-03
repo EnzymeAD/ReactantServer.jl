@@ -51,7 +51,7 @@ spawns one more worker.
    ```
    git submodule update --init --recursive
    ```
-   This fetches `lib/Reactant.jl`, `lib/gRPCServer.jl`, `lib/gRPCClient.jl`, and `lib/HTTP.jl`.
+   This fetches `lib/gRPCServer.jl`, the only remaining vendored submodule.
 2. Install the NVIDIA Container Toolkit on the host (for GPU access).
 3. Have a model bundle repository on the host. Each immediate subdirectory with a
    `manifest.yaml` is a bundle; its directory name is the model name (see

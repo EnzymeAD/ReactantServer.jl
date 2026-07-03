@@ -18,7 +18,7 @@ PyTorchExportExt = "PythonCall"
 [compat]
 JSON3 = "1.14.3"
 PythonCall = "0.9"
-Reactant = "0.2.262"
+Reactant = "=0.2.270"
 SafeTensors = "1.2.1"
 YAML = "0.4.16"
 julia = "1.12"

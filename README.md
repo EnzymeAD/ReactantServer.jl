@@ -57,7 +57,7 @@ The image is built locally (it is not published to a registry), so build it once
 directory of model bundles from the container (it scales to all visible GPUs):
 
 ```
-git submodule update --init --recursive   # fetch the vendored lib/ forks the build needs
+git submodule update --init --recursive   # fetch the vendored lib/gRPCServer.jl fork the build needs
 make image                                 # build reactantserver:latest (or: docker compose build)
 
 docker run --gpus all --ipc=host -p 8001:8001 -p 8002:8002 \
@@ -109,8 +109,8 @@ pulls in the heavy Reactant/XLA stack:
 
 Offline model export lives in `packages/ReactantServerExport` (a Reactant tracing frontend plus a
 PythonCall-triggered PyTorch extension); it is deliberately **not** a workspace member, so its
-Lux/PythonCall weakdeps stay out of the server images. The vendored forks/unregistered deps
-(`Reactant`, `gRPCServer`, `gRPCClient`, `HTTP`) are git submodules under `lib/`.
+Lux/PythonCall weakdeps stay out of the server images. The vendored `gRPCServer` fork is the only
+remaining git submodule under `lib/`.
 
 ## Acknowledgments
 

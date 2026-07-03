@@ -12,7 +12,6 @@ gRPCServer = "b7f0dee4-5e6a-42e7-93b0-9c098bad2317"
 
 [sources]
 HTTP = {path = "../../../lib/HTTP.jl"}
-Reactant = {path = "../../../lib/Reactant.jl"}
 ReactantServer = {path = "../../../packages/ReactantServer"}
 ReactantServerCore = {path = "../../../packages/ReactantServerCore"}
 gRPCClient = {path = "../../../lib/gRPCClient.jl"}
