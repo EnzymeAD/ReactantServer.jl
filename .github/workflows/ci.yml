@@ -56,32 +56,16 @@ jobs:
             client:
               - *common
               - 'packages/ReactantServerClient/**'
-              - 'lib/gRPCClient.jl'
-              - 'lib/gRPCClient.jl/**'
             gateway:
               - *common
               - 'packages/ReactantServerGateway/**'
               - 'lib/gRPCServer.jl'
               - 'lib/gRPCServer.jl/**'
-              - 'lib/gRPCClient.jl'
-              - 'lib/gRPCClient.jl/**'
-              - 'lib/HTTP.jl'
-              - 'lib/HTTP.jl/**'
-              - 'lib/Prometheus.jl'
-              - 'lib/Prometheus.jl/**'
             server:
               - *common
               - 'packages/ReactantServer/**'
-              - 'lib/Reactant.jl'
-              - 'lib/Reactant.jl/**'
               - 'lib/gRPCServer.jl'
               - 'lib/gRPCServer.jl/**'
-              - 'lib/gRPCClient.jl'        # test target only, but the server suite uses it
-              - 'lib/gRPCClient.jl/**'
-              - 'lib/HTTP.jl'
-              - 'lib/HTTP.jl/**'
-              - 'lib/Prometheus.jl'
-              - 'lib/Prometheus.jl/**'
             node:
               - *common
               - 'packages/ReactantServerNode/**'
@@ -90,14 +74,8 @@ jobs:
               - *common
               - 'packages/ReactantServerExport/**'
               - 'packages/ReactantServer/**'
-              - 'lib/Reactant.jl'
-              - 'lib/Reactant.jl/**'
               - 'lib/gRPCServer.jl'
               - 'lib/gRPCServer.jl/**'
-              - 'lib/HTTP.jl'
-              - 'lib/HTTP.jl/**'
-              - 'lib/Prometheus.jl'
-              - 'lib/Prometheus.jl/**'
             # The PyTorch round-trip is heavy (it provisions torch/jax/tensorflow via conda), so it
             # runs only when the PyTorch-specific surface changes: the extension, its conda pins, the
             # test runner, or the workflow files themselves. It deliberately omits the `common`

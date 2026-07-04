@@ -18,9 +18,10 @@ that is handy for following along without a GPU.
 ReactantServer is a Julia workspace of five packages under `packages/` (`ReactantServerCore`,
 `ReactantServer`, `ReactantServerGateway`, `ReactantServerClient`, `ReactantServerNode`), plus the
 non-member `ReactantServerExport` for offline bundle export (see
-[Architecture](../design/architecture.md)). It vendors its forked/unregistered dependencies
-(Reactant, gRPCServer, gRPCClient, HTTP) as git submodules under `lib/` and wires them in through
-the workspace `[sources]`. After cloning, populate the submodules and instantiate the workspace:
+[Architecture](../design/architecture.md)). It vendors its forked gRPCServer dependency as a git
+submodule under `lib/` and wires it in through the workspace `[sources]`; the remaining
+dependencies resolve from the package registries. After cloning, populate the submodule and
+instantiate the workspace:
 
 ```
 git submodule update --init --recursive

@@ -4,7 +4,7 @@
 # line prefixes. Adding a GPU to the host means adding nothing here.
 #
 # Prerequisites:
-#   - git submodule update --init --recursive   (populates lib/Reactant.jl, gRPCServer.jl, HTTP.jl)
+#   - git submodule update --init --recursive   (populates lib/gRPCServer.jl)
 #   - NVIDIA Container Toolkit on the host for GPU access
 #   - a model bundle repository on the host; point REACTANTSERVER_MODELS at it (defaults to ./bundles)
 #

@@ -8,7 +8,7 @@
 #   - images built: `make image loadgen`
 #   - the NVIDIA container runtime is available to Docker (sudo nvidia-ctk runtime configure
 #     --runtime=docker && sudo systemctl restart docker)
-#   - git submodules checked out (lib/Reactant.jl, gRPC*, HTTP, Prometheus)
+#   - git submodules checked out (lib/gRPCServer.jl)
 #
 # Usage:
 #   REACTANTSERVER_MODELS=/path/to/bundles docker compose -f docker-compose.gpu2.yml up

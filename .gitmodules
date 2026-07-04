@@ -1,9 +1,3 @@
 [submodule "lib/gRPCServer.jl"]
 	path = lib/gRPCServer.jl
 	url = https://github.com/csvance/gRPCServer.jl.git
-[submodule "lib/Reactant.jl"]
-	path = lib/Reactant.jl
-	url = https://github.com/csvance/Reactant.jl.git
-[submodule "lib/Prometheus.jl"]
-	path = lib/Prometheus.jl
-	url = https://github.com/csvance/Prometheus.jl.git

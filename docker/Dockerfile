@@ -43,19 +43,13 @@ RUN update-ca-certificates
 
 WORKDIR /opt/reactantserver
 
-# Workspace root environment, the member packages, and the vendored submodules. The worker is
-# built on the workspace root so the shared Manifest.toml keeps the HTTP/Reactant forks pinned;
-# the entrypoint then runs on the ReactantServer member project. .dockerignore drops the package
-# test trees (e.g. the large e2e weights) from the packages/ copy.
+# Workspace root environment, the member packages, and the vendored gRPCServer submodule (the
+# remaining forks resolve from the registries via the shared Manifest.toml). The worker is
+# built on the workspace root; the entrypoint then runs on the ReactantServer member project.
+# .dockerignore drops the package test trees (e.g. the large e2e weights) from the packages/ copy.
 COPY Project.toml Manifest.toml ./
 COPY packages/ ./packages/
-COPY lib/Reactant.jl/   ./lib/Reactant.jl/
 COPY lib/gRPCServer.jl/ ./lib/gRPCServer.jl/
-COPY lib/gRPCClient.jl/ ./lib/gRPCClient.jl/
-COPY lib/HTTP.jl/       ./lib/HTTP.jl/
-# Resolved transitively via the gateway workspace member (which depends on Prometheus); the
-# worker never loads it, but the workspace-root instantiate needs the source present.
-COPY lib/Prometheus.jl/ ./lib/Prometheus.jl/
 
 # CUDA artifact selection for Reactant_jll. Its platform augmentation honors the REACTANT_GPU
 # and REACTANT_GPU_VERSION environment variables to choose the prebuilt artifact. Without them a

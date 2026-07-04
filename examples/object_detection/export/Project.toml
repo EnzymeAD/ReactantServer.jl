@@ -9,7 +9,6 @@ ReactantServerExport = "90fa0446-f028-4638-8833-e223884d9b4d"
 YAML = "ddb6d928-2868-570f-bddf-ab3f9cf99eb6"
 
 [sources]
-Reactant = {path = "../../../lib/Reactant.jl"}
 ReactantServerExport = {path = "../../../packages/ReactantServerExport"}
 
 [compat]

@@ -1,6 +1,6 @@
 name = "ReactantServerExport"
 uuid = "90fa0446-f028-4638-8833-e223884d9b4d"
-version = "0.1.0"
+version = "0.1.3"
 authors = ["Carroll Vance <cvance@medicalmetrics.com>"]
 
 [deps]
@@ -18,7 +18,7 @@ PyTorchExportExt = "PythonCall"
 [compat]
 JSON3 = "1.14.3"
 PythonCall = "0.9"
-Reactant = "0.2.262"
+Reactant = "0.2.264 - 0.2.270"
 SafeTensors = "1.2.1"
 YAML = "0.4.16"
 julia = "1.12"

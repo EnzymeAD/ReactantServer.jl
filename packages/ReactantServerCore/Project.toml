@@ -1,6 +1,6 @@
 name = "ReactantServerCore"
 uuid = "387a5f05-f7b4-4d57-bca9-cd3358e52bdc"
-version = "0.1.0"
+version = "0.1.3"
 authors = ["Carroll Vance <cvance@medicalmetrics.com>"]
 
 [deps]

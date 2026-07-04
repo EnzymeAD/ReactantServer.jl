@@ -23,6 +23,7 @@ using SafeTensors
 using JSON3
 using BFloat16s
 using DLFP8Types
+using NNlib
 using ProtoBuf
 
 # Server-side gRPC service stubs (define register_GRPCInferenceService! and the per-RPC
