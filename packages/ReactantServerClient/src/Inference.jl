@@ -250,6 +250,47 @@ end
 _request_deadline_params(::AbstractInferenceModel) = deadline_params(0)
 _request_deadline_params(m::KServeModel) =
     deadline_params(deadline(m) > 0 ? round(Int64, deadline(m) * 1e9) : 0)
+# Per-attempt variant: carry an explicit remaining budget (seconds) rather than the model's full
+# deadline, so each retry admits against what is actually left of the original budget.
+_request_deadline_params(budget_s::Real) =
+    deadline_params(budget_s > 0 ? round(Int64, budget_s * 1e9) : 0)
+
+# A shed the client should back off and retry: RESOURCE_EXHAUSTED (a worker or the gateway at its
+# concurrency cap) always, and UNAVAILABLE (no replica reachable) when the policy allows. Deadline,
+# NOT_FOUND, INVALID_ARGUMENT, and INTERNAL are not retried, so a doomed request fails fast.
+function _retryable_shed(e, p::RetryPolicy)
+    e isa gRPCClient.gRPCServiceCallException || return false
+    e.grpc_status == gRPCClient.GRPC_RESOURCE_EXHAUSTED && return true
+    return p.retry_unavailable && e.grpc_status == gRPCClient.GRPC_UNAVAILABLE
+end
+
+# Run `attempt(budget_s)` (one ModelInfer round trip given the remaining budget in seconds),
+# retrying with exponential backoff while the server sheds the request under overload. Each attempt
+# is handed the remaining slice of the model's original deadline, which `attempt` forwards both as
+# the gRPC call timeout and as the in-body admission budget, so the retries never push total wall
+# time past that deadline. A shed with no budget left to sleep-and-retry surfaces the last error.
+# Full jitter (wait uniform in [0, backoff]) keeps concurrent chunk retries from synchronizing.
+function _infer_with_retry(attempt, m::AbstractInferenceModel)
+    p = retry_policy(m)
+    overall = overall_deadline(m)
+    (!p.enabled || overall <= 0) && return attempt(overall)
+    start = time()
+    backoff = p.initial_backoff
+    while true
+        try
+            return attempt(overall - (time() - start))
+        catch e
+            _retryable_shed(e, p) || rethrow()
+            wait_s = min(backoff, p.max_backoff)
+            p.jitter && (wait_s *= rand())
+            # Give up if a retry could not run after the sleep, so we never sleep away the budget
+            # only to send a request the server would immediately deadline-shed.
+            (time() - start) + wait_s >= overall - p.min_budget && rethrow()
+            sleep(wait_s)
+            backoff *= p.factor
+        end
+    end
+end
 
 """
     infer_sync(model, io::AbstractInferenceIO)
@@ -378,7 +419,7 @@ end
 # Run one chunk end-to-end on a freshly acquired slot: fill the staging buffer, send the
 # request, handle the response, and always return the slot to the pool. `infer_encode_chunk!` is
 # serialized by `fill_lock` because concrete IOs commonly read from shared source state.
-function _run_chunk(m, io, pool, client, fill_lock, r, slot)
+function _run_chunk(m, io, pool, fill_lock, r, slot)
     try
         reset_slot!(slot)
         inputs = _encoded_inputs(lock(fill_lock) do
@@ -387,15 +428,20 @@ function _run_chunk(m, io, pool, client, fill_lock, r, slot)
         # Output subslots are carved from the same slot, after the inputs, so a request can stage
         # both through one registered region. Outputs are read back before the slot is released.
         requested, out_subslots = _build_requested_outputs(output_specs(io), slot, r, pool)
-        response = grpc_sync_request(
-            client,
-            ModelInferRequest(
-                model_name = model_name(m),
-                inputs = _materialize_inputs(inputs, m, pool),
-                outputs = requested,
-                parameters = _request_deadline_params(m),
-            ),
-        )
+        # Materialize inputs once; only the per-attempt deadline (client timeout + in-body budget)
+        # changes across retries, and SHM-backed inputs stay valid until the slot is released below.
+        materialized = _materialize_inputs(inputs, m, pool)
+        response = _infer_with_retry(m) do budget_s
+            grpc_sync_request(
+                grpc_infer_client(m, budget_s),
+                ModelInferRequest(
+                    model_name = model_name(m),
+                    inputs = materialized,
+                    outputs = requested,
+                    parameters = _request_deadline_params(budget_s),
+                ),
+            )
+        end
         infer_decode_chunk!(io, r, _rehydrate_response(response, out_subslots))
     finally
         release_slot!(slot)
@@ -409,13 +455,12 @@ function _drive_pool_inference(
     force_serial::Bool,
 )
     chunk, span = _chunk_geometry(io, m, pool)
-    client = grpc_infer_client(m)
     fill_lock = ReentrantLock()
 
     if force_serial
         for r in BatchIterator(length(io), chunk)
             slot = acquire_slot!(pool, span)
-            _run_chunk(m, io, pool, client, fill_lock, r, slot)
+            _run_chunk(m, io, pool, fill_lock, r, slot)
         end
         return nothing
     end
@@ -439,7 +484,7 @@ function _drive_pool_inference(
         t = Threads.@spawn begin
             slot = acquire_slot!(pool, span)
             try
-                _run_chunk(m, io, pool, client, fill_lock, local_r, slot)
+                _run_chunk(m, io, pool, fill_lock, local_r, slot)
             catch ex
                 err[] = ex
                 rethrow()
@@ -454,16 +499,16 @@ function _drive_pool_inference(
 end
 
 function infer_sync(m::AbstractInferenceModel, network_inputs)
-    client = grpc_infer_client(m)
-
-    grpc_sync_request(
-        client,
-        ModelInferRequest(
-            model_name = model_name(m),
-            inputs = network_inputs,
-            parameters = _request_deadline_params(m),
-        ),
-    )
+    _infer_with_retry(m) do budget_s
+        grpc_sync_request(
+            grpc_infer_client(m, budget_s),
+            ModelInferRequest(
+                model_name = model_name(m),
+                inputs = network_inputs,
+                parameters = _request_deadline_params(budget_s),
+            ),
+        )
+    end
 end
 
 

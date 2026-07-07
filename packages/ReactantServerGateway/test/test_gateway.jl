@@ -14,6 +14,7 @@ mutable struct MockWorker
     models::Vector{String}     # models this worker reports READY via RepositoryIndex
     fail_infer::Bool
     fail_shm::Bool
+    fail_exhausted::Bool        # shed ModelInfer with RESOURCE_EXHAUSTED (worker concurrency cap)
 end
 
 function _mock_router()
@@ -26,6 +27,7 @@ function _mock_router()
         ModelInfer = (req, c) -> begin
             w = c.payload
             w.fail_infer && throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_UNAVAILABLE, "mock $(w.name) down"))
+            w.fail_exhausted && throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_RESOURCE_EXHAUSTED, "mock $(w.name) at capacity"))
             # A real worker NOT_FOUNDs a model it no longer serves; mirror that so the gateway's
             # unloaded-model handling (route refresh on worker NOT_FOUND) can be exercised.
             (req.model_name in w.models) ||
@@ -59,8 +61,8 @@ end
 @testset "gateway" begin
     # worker0 serves replicated + only0; worker1 serves replicated. The gateway discovers this
     # from each worker's RepositoryIndex rather than from any config.
-    w0 = MockWorker("worker0", ["replicated", "only0"], false, false)
-    w1 = MockWorker("worker1", ["replicated"], false, false)
+    w0 = MockWorker("worker0", ["replicated", "only0"], false, false, false)
+    w1 = MockWorker("worker1", ["replicated"], false, false, false)
     p0 = grpc_free_port()
     p1 = grpc_free_port()
     gw_port = grpc_free_port()
@@ -133,6 +135,22 @@ end
             end
             @test err isa gRPCClient.gRPCServiceCallException
             w0.fail_infer = false
+        end
+
+        @testset "worker overload shed surfaces as RESOURCE_EXHAUSTED" begin
+            # only0 is served solely by w0, so the gateway must route there. A worker shedding at
+            # its concurrency cap must reach the client as RESOURCE_EXHAUSTED (a retryable overload
+            # signal), not be remapped to FAILED_PRECONDITION.
+            w0.fail_exhausted = true
+            err = try
+                _infer(gw_port, "only0")
+                nothing
+            catch e
+                e
+            end
+            @test err isa gRPCClient.gRPCServiceCallException
+            @test err.grpc_status == gRPCClient.GRPC_RESOURCE_EXHAUSTED
+            w0.fail_exhausted = false
         end
 
         @testset "SHM register fan-out and rollback" begin
