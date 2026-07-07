@@ -89,6 +89,39 @@ default_recv_msg_bytes() = _env_msg_bytes("REACTANT_CLIENT_GRPC_MAX_RECV_MSG_BYT
 default_send_msg_bytes() = _env_msg_bytes("REACTANT_CLIENT_GRPC_MAX_SEND_MSG_BYTES")
 
 """
+    RetryPolicy(; enabled=true, initial_backoff=1.0, factor=2.0, max_backoff=Inf,
+                  min_budget=0.05, jitter=true, retry_unavailable=true)
+
+Client-side retry policy for requests the server sheds under overload. When a `ModelInfer`
+call is rejected with `RESOURCE_EXHAUSTED` (a worker or gateway at its concurrency cap, see
+`endpoints.max_concurrent_requests`), the client waits `initial_backoff` seconds and retries,
+growing the interval by `factor` each attempt (1s, 2s, 4s, ...) up to `max_backoff`, until the
+model's `deadline` budget is spent. The per-attempt deadline sent to the server shrinks to the
+remaining budget, so the retries never push total wall time past the original `deadline`.
+
+`jitter` picks each wait uniformly in `[0, backoff]` (full jitter) so that concurrent chunk
+requests do not synchronize into a retry storm against the same worker. `min_budget` (seconds)
+is the smallest remaining budget worth another attempt; below it the client stops and surfaces
+the shed error. `retry_unavailable` also retries `UNAVAILABLE` (no replica reachable). Deadline,
+NOT_FOUND, and INVALID_ARGUMENT errors always fail fast. Set `enabled=false` to restore the old
+fail-fast behavior.
+"""
+struct RetryPolicy
+    enabled::Bool
+    initial_backoff::Float64
+    factor::Float64
+    max_backoff::Float64
+    min_budget::Float64
+    jitter::Bool
+    retry_unavailable::Bool
+end
+RetryPolicy(; enabled::Bool = true, initial_backoff::Real = 1.0, factor::Real = 2.0,
+            max_backoff::Real = Inf, min_budget::Real = 0.05, jitter::Bool = true,
+            retry_unavailable::Bool = true) =
+    RetryPolicy(enabled, Float64(initial_backoff), Float64(factor), Float64(max_backoff),
+                Float64(min_budget), jitter, retry_unavailable)
+
+"""
     KServeModel(host, port, model_name; secure=false, max_batch_size=1, deadline=10.0, ...)
     KServeModel(url, model_name; max_batch_size=1, deadline=10.0, ...)
 
@@ -121,6 +154,8 @@ struct KServeModel <: AbstractInferenceModel
     max_send_message_length::Int64
     max_receive_message_length::Int64
     shared_memory::Symbol
+    # Retry-with-backoff policy for requests shed under overload; see `RetryPolicy`.
+    retry::RetryPolicy
     # The gRPCCURL handle (libcurl multi handle + connection pool + concurrent-stream semaphore) all
     # of this model's client calls share. Defaults to the process-global handle (GRPC_MAX_STREAMS=16
     # concurrent requests). Pass a dedicated handle with a larger `max_streams` to drive more
@@ -137,6 +172,7 @@ struct KServeModel <: AbstractInferenceModel
         max_send_message_length = default_send_msg_bytes(),
         max_receive_message_length = default_recv_msg_bytes(),
         shared_memory = :auto,
+        retry = RetryPolicy(),
         grpc = gRPCClient.grpc_global_handle(),
     )
         shared_memory in (:auto, :on, :off) ||
@@ -151,6 +187,7 @@ struct KServeModel <: AbstractInferenceModel
             max_send_message_length,
             max_receive_message_length,
             shared_memory,
+            retry,
             grpc,
         )
     end
@@ -163,6 +200,7 @@ struct KServeModel <: AbstractInferenceModel
         max_send_message_length = default_send_msg_bytes(),
         max_receive_message_length = default_recv_msg_bytes(),
         shared_memory = :auto,
+        retry = RetryPolicy(),
         grpc = gRPCClient.grpc_global_handle(),
     )
         host, port, secure = parse_grpc_url(url)
@@ -177,6 +215,7 @@ struct KServeModel <: AbstractInferenceModel
             max_receive_message_length = max_receive_message_length,
             deadline = deadline,
             shared_memory = shared_memory,
+            retry = retry,
             grpc = grpc,
         )
     end
@@ -187,12 +226,22 @@ max_batch_size(x::KServeModel) = x.max_batch_size
 deadline(x::KServeModel) = x.deadline
 timeout(x::KServeModel) = deadline(x)
 
-function grpc_infer_client(x::KServeModel)
+# The retry policy and the overall (original) deadline budget, in seconds. Generic fallbacks keep
+# `_infer_with_retry` valid for any AbstractInferenceModel: no policy means one fail-fast attempt.
+retry_policy(x::KServeModel) = x.retry
+retry_policy(::AbstractInferenceModel) = RetryPolicy(enabled = false)
+overall_deadline(x::KServeModel) = x.deadline
+overall_deadline(::AbstractInferenceModel) = 0.0
+
+# `deadline_s` overrides the per-call gRPC/curl timeout so a retry attempt gets only the request's
+# remaining budget instead of a fresh full deadline. `grpc_infer_client(x)` keeps the full budget.
+grpc_infer_client(x::KServeModel) = grpc_infer_client(x, x.deadline)
+function grpc_infer_client(x::KServeModel, deadline_s::Real)
     GRPCInferenceService_ModelInfer_Client(
         x.host,
         x.port;
         secure = x.secure,
-        deadline = x.deadline,
+        deadline = deadline_s,
         max_send_message_length = x.max_send_message_length,
         # The generated client stub's keyword spells it 'recieve'; the public field does not.
         max_recieve_message_length = x.max_receive_message_length,

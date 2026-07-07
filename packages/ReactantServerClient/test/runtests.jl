@@ -573,6 +573,76 @@ end
     end
 end
 
+@testset "retry-with-backoff on overload sheds" begin
+    RSC = ReactantServerClient
+    shed() = RSC.gRPCClient.gRPCServiceCallException(RSC.gRPCClient.GRPC_RESOURCE_EXHAUSTED, "cap")
+
+    # Default policy is enabled with the 1s/2s/4s schedule and jitter.
+    @test RSC.RetryPolicy().enabled
+    @test KServeModel("grpc://h:1", "x").retry.enabled
+    @test KServeModel("grpc://h:1", "x").retry.initial_backoff == 1.0
+
+    # Only sheds (and, per policy, UNAVAILABLE) are retried; deadline/argument errors fail fast.
+    p = RSC.RetryPolicy()
+    @test RSC._retryable_shed(shed(), p)
+    @test RSC._retryable_shed(RSC.gRPCClient.gRPCServiceCallException(RSC.gRPCClient.GRPC_UNAVAILABLE, ""), p)
+    @test !RSC._retryable_shed(RSC.gRPCClient.gRPCServiceCallException(RSC.gRPCClient.GRPC_DEADLINE_EXCEEDED, ""), p)
+    @test !RSC._retryable_shed(RSC.gRPCClient.gRPCServiceCallException(RSC.gRPCClient.GRPC_INVALID_ARGUMENT, ""), p)
+    @test !RSC._retryable_shed(ErrorException("x"), p)
+    # With retry_unavailable off, RESOURCE_EXHAUSTED is still retried but UNAVAILABLE is not.
+    @test RSC._retryable_shed(shed(), RSC.RetryPolicy(retry_unavailable = false))
+    @test !RSC._retryable_shed(RSC.gRPCClient.gRPCServiceCallException(RSC.gRPCClient.GRPC_UNAVAILABLE, ""),
+                               RSC.RetryPolicy(retry_unavailable = false))
+
+    fast = RSC.RetryPolicy(; initial_backoff = 0.02, factor = 2.0, jitter = false, min_budget = 0.01)
+
+    # Succeeds after two sheds; each attempt gets a strictly smaller remaining budget.
+    m = KServeModel("grpc://h:1", "x"; deadline = 1.0, retry = fast)
+    budgets = Float64[]
+    got = RSC._infer_with_retry(m) do budget_s
+        push!(budgets, budget_s)
+        length(budgets) < 3 && throw(shed())
+        :ok
+    end
+    @test got === :ok
+    @test length(budgets) == 3
+    @test issorted(budgets; rev = true)
+    @test budgets[1] <= 1.0 && budgets[end] < budgets[1]
+
+    # Non-retryable throws on the first attempt.
+    attempts = Ref(0)
+    @test_throws RSC.gRPCClient.gRPCServiceCallException RSC._infer_with_retry(m) do _
+        attempts[] += 1
+        throw(RSC.gRPCClient.gRPCServiceCallException(RSC.gRPCClient.GRPC_INVALID_ARGUMENT, "bad"))
+    end
+    @test attempts[] == 1
+
+    # Persistent shedding surfaces the shed error and never runs past the deadline.
+    t0 = time()
+    n = Ref(0)
+    err = try
+        RSC._infer_with_retry(m) do _; n[] += 1; throw(shed()); end
+        nothing
+    catch e
+        e
+    end
+    @test err isa RSC.gRPCClient.gRPCServiceCallException
+    @test err.grpc_status == RSC.gRPCClient.GRPC_RESOURCE_EXHAUSTED
+    @test n[] >= 2
+    @test time() - t0 <= 1.0 + 0.3
+
+    # A disabled policy makes exactly one attempt with the full budget.
+    md = KServeModel("grpc://h:1", "x"; deadline = 5.0, retry = RSC.RetryPolicy(enabled = false))
+    d_attempts = Ref(0)
+    d_budget = Ref(0.0)
+    try
+        RSC._infer_with_retry(md) do b; d_attempts[] += 1; d_budget[] = b; throw(shed()); end
+    catch
+    end
+    @test d_attempts[] == 1
+    @test d_budget[] == 5.0
+end
+
 @testset "parse_grpc_url rejects malformed URLs with a clear error" begin
     @test_throws ErrorException ReactantServerClient.parse_grpc_url("not-a-url")
     @test_throws ErrorException ReactantServerClient.parse_grpc_url("ftp://h:1")

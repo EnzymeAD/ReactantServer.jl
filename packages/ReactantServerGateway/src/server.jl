@@ -19,7 +19,10 @@ end
 # Map a gateway status string to a server-side gRPC exception with the matching code.
 function _server_exc(status::AbstractString, msg::AbstractString)
     status == STATUS_NOT_FOUND && return gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_NOT_FOUND, msg)
-    status == STATUS_RESOURCE_EXHAUSTED && return gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_FAILED_PRECONDITION, msg)
+    # A worker shedding at its concurrency cap is transient overload, so surface it verbatim as
+    # RESOURCE_EXHAUSTED (not FAILED_PRECONDITION): it is the standard signal for a client to back
+    # off and retry, which ReactantServerClient does within the request's deadline budget.
+    status == STATUS_RESOURCE_EXHAUSTED && return gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_RESOURCE_EXHAUSTED, msg)
     status == STATUS_INTERNAL && return gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_INTERNAL, msg)
     return gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_UNAVAILABLE, msg)
 end
