@@ -371,9 +371,14 @@ tuple of array inputs the model's forward expects as its single positional argum
 `output_select(first(model(...)))` maps the raw model output to the ordered tuple of arrays to
 export; non-array returns (e.g. an `Int` step count) are dropped by the selector and must not
 appear in its result. Weights are extracted from `ps` automatically (same as the single-array
-method). Per-tensor batch axes default to each array's last Julia axis (Lux convention) but can
-be overridden with `input_batch_axes`/`output_batch_axes` (1-based Julia axes), which is required
-when the batch axis is not last (e.g. a `(D, N, K+1)` output whose batch axis N is the middle one).
+method). Per-tensor batch axes default to each array's last Julia axis (natural Julia batch-last,
+the Lux convention) so every exported input and output is batch-last without the caller
+hand-specifying it. Override with `input_batch_axes`/`output_batch_axes` (1-based Julia axes) when
+the batch axis is not last (e.g. a `(D, N, K+1)` output whose batch axis N is the middle one). An
+entry of `nothing` in either vector opts that one tensor out of batching (a genuinely unbatched
+tensor), so single-dispatch or partially-unbatched models can still be exported; note the server
+requires all executable inputs to be batched or none, so a per-tensor opt-out that leaves a mix of
+batched and unbatched inputs is rejected at load time.
 """
 function export_bundle(::Val{:lux}, model, ps, st, example_inputs::Tuple;
                        dir::AbstractString, name::AbstractString,
@@ -390,8 +395,11 @@ function export_bundle(::Val{:lux}, model, ps, st, example_inputs::Tuple;
     warrays = Any[p[2] for p in leaves]
 
     nin = length(example_inputs)
-    in_axes = input_batch_axes === nothing ? [ndims(x) for x in example_inputs] :
-              collect(Int, input_batch_axes)
+    # Default every input to natural Julia batch-last (its last axis); an explicit vector may carry
+    # `nothing` for a tensor that is genuinely unbatched. Keep entries as `Any` so both Int and
+    # nothing survive.
+    in_axes = input_batch_axes === nothing ? Any[ndims(x) for x in example_inputs] :
+              collect(Any, input_batch_axes)
     length(in_axes) == nin ||
         error("ReactantServerExport: input_batch_axes has $(length(in_axes)) entries but $nin inputs")
     innames = input_names === nothing ? ["input_$(i - 1)" for i in 1:nin] :
@@ -403,15 +411,19 @@ function export_bundle(::Val{:lux}, model, ps, st, example_inputs::Tuple;
     # itself (`do (a, b)`); with one input it is that array directly (`do x`). Unwrap accordingly so
     # both shapes work. (Reactant still flattens a tuple arg into one MLIR input per element.)
     _modelarg(t) = nin == 1 ? t[1] : t
-    mk_inputs(s) = ntuple(i -> _with_batch(example_inputs[i], in_axes[i], s), nin)
+    # A batched input is resized to the current batch size along its axis; an unbatched one
+    # (axis === nothing) keeps its example shape at every batch size.
+    mk_inputs(s) = ntuple(i -> in_axes[i] === nothing ? zeros(eltype(example_inputs[i]), size(example_inputs[i])...) :
+                               _with_batch(example_inputs[i], in_axes[i], s), nin)
     y0 = _as_tuple(output_select(first(model(_modelarg(mk_inputs(first(batch_sizes))), ps, st))))
     all(o -> o isa AbstractArray, y0) ||
         error("ReactantServerExport: output_select must return only arrays; got $(map(typeof, y0))")
     nout = length(y0)
     outnames = output_names === nothing ? ["output_$(i - 1)" for i in 1:nout] :
                collect(String, output_names)
-    out_axes = output_batch_axes === nothing ? [ndims(o) for o in y0] :
-               collect(Int, output_batch_axes)
+    # Outputs default batch-last too; an explicit `nothing` marks an unbatched output.
+    out_axes = output_batch_axes === nothing ? Any[ndims(o) for o in y0] :
+               collect(Any, output_batch_axes)
     length(out_axes) == nout ||
         error("ReactantServerExport: output_batch_axes has $(length(out_axes)) entries but $nout outputs")
 
@@ -434,11 +446,11 @@ function export_bundle(::Val{:lux}, model, ps, st, example_inputs::Tuple;
         end
     end
 
-    # Manifest is Julia order; batch axis is the 0-based Julia axis.
-    in_specs = [IOSpec(innames[i], eltype(example_inputs[i]), in_shapes[i]; batch_axis=in_axes[i] - 1)
-                for i in 1:nin]
-    out_specs = [IOSpec(outnames[i], eltype(y0[i]), collect(Int, size(y0[i])); batch_axis=out_axes[i] - 1)
-                 for i in 1:nout]
+    # Manifest is Julia order; batch axis is the 0-based Julia axis (nothing stays unbatched).
+    in_specs = [IOSpec(innames[i], eltype(example_inputs[i]), in_shapes[i];
+                       batch_axis = in_axes[i] === nothing ? nothing : in_axes[i] - 1) for i in 1:nin]
+    out_specs = [IOSpec(outnames[i], eltype(y0[i]), collect(Int, size(y0[i]));
+                        batch_axis = out_axes[i] === nothing ? nothing : out_axes[i] - 1) for i in 1:nout]
     prov = merge(Dict{String,Any}("source_framework" => "reactant", "converter" => "ReactantServerExport.jl"),
                  Dict{String,Any}(provenance))
 

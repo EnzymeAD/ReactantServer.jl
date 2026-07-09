@@ -174,25 +174,31 @@ function _request_rows(entry::ModelEntry, req::InferRequest)
 end
 
 # Rows present along the executable batch axis after preprocessing. Used to size output slices.
+# Each executable input carries its OWN batch axis (per-input, batch-last), so read the count at
+# each matched input's own `sp.batch_axis` rather than one shared position. The batch size comes
+# from the first executable input that has a batch axis.
 function _executable_rows(entry::ModelEntry, inputs::AbstractVector{NamedTensor})
     m = entry.manifest
     m.input_batch_dim === nothing && return 1
-    axis = m.input_batch_dim + 1
     for sp in m.executable_inputs
         sp.batch_axis === nothing && continue
         for t in inputs
-            t.name == sp.name && return size(t.data, axis)
+            t.name == sp.name && return size(t.data, sp.batch_axis)
         end
     end
     return 1
 end
 
-# A model can coalesce multiple requests only when its inputs carry a batch axis and every
-# output does too (so outputs can be split per request). Otherwise it serves one request per
-# dispatch. Single unbatched modules (batch key 0) are never coalesced.
+# A model can coalesce multiple requests only when EVERY executable input carries a batch axis and
+# every output does too (so inputs concatenate and outputs split per request). Otherwise it serves
+# one request per dispatch. Single unbatched modules (batch key 0) are never coalesced. The strict
+# all-or-nothing requirement mirrors the loader's manifest check, but is encoded here too so the
+# runtime gate is self-contained (input_batch_dim !== nothing means at least one input is batched,
+# not all, so it is not sufficient on its own).
 function _coalescable(entry::ModelEntry)
     m = entry.manifest
-    m.input_batch_dim === nothing && return false
+    isempty(m.executable_inputs) && return false
+    all(sp -> sp.batch_axis !== nothing, m.executable_inputs) || return false
     _has_unbatched(entry.executable) && return false
     return all(o -> o.batch_axis !== nothing, m.executable_outputs)
 end

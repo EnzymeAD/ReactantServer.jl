@@ -45,7 +45,9 @@
                                        "shape" => "nb", "dims" => Dict())]
     @test_throws ReactantServer.ManifestError ReactantServer.parse_manifest(bothNB)
 
-    # inputs disagree on batch-axis position
+    # Inputs may place the batch axis at DIFFERENT positions (per-input, natural batch-last across
+    # ranks): input x has batch at axis 0 ("nc") and input y at axis 1 ("cn"). This is legal; the
+    # derived input_batch_dim is the FIRST batched input's axis (x -> 0).
     disagree = Dict{String,Any}(
         "format_version" => "2.0", "name" => "m",
         "executable_inputs" => [Dict("name" => "x", "dtype" => "f32",
@@ -56,7 +58,11 @@
                                       "shape" => "n", "dims" => Dict())],
         "batching" => Dict("compiled_batch_sizes" => [1]),
     )
-    @test_throws ReactantServer.ManifestError ReactantServer.parse_manifest(disagree)
+    md = ReactantServer.parse_manifest(disagree)
+    @test md.input_batch_dim == 0
+    @test md.executable_inputs[1].batch_axis == 1     # x: 'n' at Julia index 1
+    @test md.executable_inputs[2].batch_axis == 2     # y: 'n' at Julia index 2
+    @test ReactantServer.validate_manifest(md, "/models/m", false) === md
 
     # missing dims entry for a non-batch letter
     miss = copy(good)
@@ -97,6 +103,74 @@
     baddt["executable_inputs"] = [Dict("name" => "x", "dtype" => "float",
                                        "shape" => "c", "dims" => Dict("c" => 4))]
     @test_throws ReactantServer.ManifestError ReactantServer.parse_manifest(baddt)
+end
+
+@testset "per-input batch axis: multi-rank batch-last loads" begin
+    # A multi-input model whose inputs are of different ranks, each carrying the batch axis LAST
+    # (natural Julia batch-last). Batch-last lands at a different position per rank, which the old
+    # single-shared-axis rule rejected; per-input batch axes make it legal.
+    #   img: whdn  (rank 4, batch 'n' at Julia axis 4)
+    #   geom: ckn  (rank 3, batch 'n' at Julia axis 3)
+    #   item: kn   (rank 2, batch 'n' at Julia axis 2)
+    multirank = Dict{String,Any}(
+        "format_version" => "2.0", "name" => "spine",
+        "executable_inputs" => [
+            Dict("name" => "img", "dtype" => "f32", "shape" => "whdn",
+                 "dims" => Dict("w" => 32, "h" => 32, "d" => 16)),
+            Dict("name" => "geom", "dtype" => "f32", "shape" => "ckn",
+                 "dims" => Dict("c" => 3, "k" => 24)),
+            Dict("name" => "item", "dtype" => "f32", "shape" => "kn",
+                 "dims" => Dict("k" => 24)),
+        ],
+        "executable_outputs" => [Dict("name" => "y", "dtype" => "f32",
+                                      "shape" => "kn", "dims" => Dict("k" => 24))],
+        "batching" => Dict("compiled_batch_sizes" => [1, 2]),
+    )
+    m = ReactantServer.parse_manifest(multirank)
+    @test m.executable_inputs[1].batch_axis == 4      # img 'n' at Julia axis 4
+    @test m.executable_inputs[2].batch_axis == 3      # geom 'n' at Julia axis 3
+    @test m.executable_inputs[3].batch_axis == 2      # item 'n' at Julia axis 2
+    # input_batch_dim is the FIRST batched input's 0-based axis (img -> axis 4 -> 3).
+    @test m.input_batch_dim == 3
+    @test ReactantServer.validate_manifest(m, "/models/spine", false) === m
+end
+
+@testset "per-input batch axis: mixed batched/unbatched rejected" begin
+    # If any executable input is batched, every one must be. A model that mixes a batched input
+    # (img) with an unbatched one (const) is rejected loudly at load time, not silently broadcast.
+    mixed = Dict{String,Any}(
+        "format_version" => "2.0", "name" => "mixed",
+        "executable_inputs" => [
+            Dict("name" => "img", "dtype" => "f32", "shape" => "chwn",
+                 "dims" => Dict("c" => 3, "h" => 8, "w" => 8)),
+            Dict("name" => "const", "dtype" => "f32", "shape" => "k",
+                 "dims" => Dict("k" => 4)),
+        ],
+        "executable_outputs" => [Dict("name" => "y", "dtype" => "f32",
+                                      "shape" => "kn", "dims" => Dict("k" => 4))],
+        "batching" => Dict("compiled_batch_sizes" => [1]),
+    )
+    m = ReactantServer.parse_manifest(mixed)        # parse succeeds; the rule is a validate check
+    err = try
+        ReactantServer.validate_manifest(m, "/models/mixed", false); nothing
+    catch e
+        e
+    end
+    @test err isa ReactantServer.ManifestError
+    @test occursin("const", err.msg)               # names the offending unbatched input
+    @test occursin("mixes batched and unbatched", err.msg)
+
+    # All-unbatched (no input carries a batch axis) is fine: the all-or-nothing rule is satisfied.
+    allun = copy(mixed)
+    allun["executable_inputs"] = [
+        Dict("name" => "a", "dtype" => "f32", "shape" => "k", "dims" => Dict("k" => 4)),
+        Dict("name" => "const", "dtype" => "f32", "shape" => "k", "dims" => Dict("k" => 4)),
+    ]
+    allun["executable_outputs"] = [Dict("name" => "y", "dtype" => "f32",
+                                        "shape" => "k", "dims" => Dict("k" => 4))]
+    mu = ReactantServer.parse_manifest(allun)
+    @test mu.input_batch_dim === nothing
+    @test ReactantServer.validate_manifest(mu, "/models/mixed", false) === mu
 end
 
 @testset "manifest rejects FP8 client-facing dtypes" begin
