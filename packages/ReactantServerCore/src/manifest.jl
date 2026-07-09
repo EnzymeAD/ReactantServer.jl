@@ -227,22 +227,17 @@ function parse_batching(b)
     return BatchingSpec(Int[Int(x) for x in sizes])
 end
 
-# Cross-input consistency: every executable input that carries a batch axis must
-# place it at the same 0-based position. The derived input_batch_dim is that
-# position, or nothing if no input has a batch axis.
+# The representative input batch axis: the 0-based batch axis of the FIRST executable input that
+# carries one, or nothing when no input is batched. Each executable input keeps its OWN batch axis
+# (per-input, natural Julia batch-last), so inputs of different rank legally place the batch axis
+# at different positions; we do not require them to agree. This value feeds `_select_exec`, which
+# reads the batch count from `input_names[1]` at this axis; strict all-or-nothing batchability
+# (enforced in `validate_manifest`) guarantees input 1 carries a batch axis whenever any input does.
 function _derive_input_batch_dim(inputs::Vector{TensorSpec})
-    bd::Union{Int,Nothing} = nothing
     for t in inputs
-        t.batch_axis === nothing && continue
-        axis0 = t.batch_axis - 1
-        if bd === nothing
-            bd = axis0
-        elseif bd != axis0
-            throw(ManifestError("executable_inputs disagree on batch axis position: " *
-                                "tensor '$(t.name)' has batch at $axis0, expected $bd"))
-        end
+        t.batch_axis === nothing || return t.batch_axis - 1
     end
-    return bd
+    return nothing
 end
 
 # Parse the `meta` block of a meta manifest into the declared list of called sub-model names.
@@ -398,9 +393,22 @@ function validate_manifest(m::Manifest, dir::AbstractString, has_model_jl::Bool)
 
     _check_unique_names(m.executable_inputs, "executable_inputs")
     _check_unique_names(m.executable_outputs, "executable_outputs")
-    # Cross-input batch-axis consistency is enforced at parse time via
-    # _derive_input_batch_dim. Outputs are deliberately not cross-checked:
-    # classifiers and detectors routinely have lower-rank outputs than inputs.
+    # Strict all-or-nothing batchability, scoped to the BATCH dim only: if ANY executable input
+    # carries a batch axis, EVERY executable input must carry one. A model that mixes a batched
+    # and an unbatched executable input cannot be coalesced (the data plane broadcasts non-batch
+    # inputs from the first request, which would silently corrupt a genuinely per-item input), so
+    # reject it loudly at load time rather than serve wrong results. Inputs need NOT share the
+    # batch-axis position: per-input, natural batch-last across different ranks is legal, and
+    # VARIABLE non-batch axes stay per-input via the variant machinery. Outputs are deliberately
+    # not cross-checked for position (classifiers and detectors routinely have lower-rank outputs
+    # than inputs); the runtime's coalescable gate still requires all outputs batched to coalesce.
+    if any(t -> t.batch_axis !== nothing, m.executable_inputs)
+        unbatched = String[t.name for t in m.executable_inputs if t.batch_axis === nothing]
+        isempty(unbatched) ||
+            throw(ManifestError("model '$(m.name)' mixes batched and unbatched executable inputs; " *
+                                "every executable input must carry a batch axis ('n'/'b') or none may. " *
+                                "Unbatched input(s): $(join(unbatched, ", "))"))
+    end
 
     all(>(0), m.batching.compiled_batch_sizes) ||
         throw(ManifestError("batching.compiled_batch_sizes must be positive integers"))

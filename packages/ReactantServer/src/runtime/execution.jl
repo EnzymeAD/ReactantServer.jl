@@ -20,6 +20,10 @@ function _select_exec(model::LoadedModel, byname)
     inner === nothing &&
         error("no compiled program for input shape variant $vkey (have $(sort(collect(keys(model.execs)))))")
     length(inner) == 1 && return first(values(inner))
+    # sig.batch_dim is input 1's own 0-based batch axis (from _derive_input_batch_dim, which returns
+    # the FIRST batched input's axis). Strict all-or-nothing batchability guarantees input 1 carries
+    # a batch axis whenever the model has multiple compiled batch sizes, so reading input 1 here is
+    # sound even when inputs place their batch axis at different positions.
     t = byname[sig.input_names[1]]
     julia_axis = sig.batch_dim + 1                  # Julia 0-based -> 1-based index
     batch = size(t.data, julia_axis)
