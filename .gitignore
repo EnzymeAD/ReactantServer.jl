@@ -10,7 +10,7 @@ build
 validation/gpu_memory_sharing/results/
 private/
 # Corporate TLS-inspection CA certs, dropped in locally; never commit them.
-config/certs
+docker/certs/*.crt
 # Stray generated e2e model (leftover from removed tooling); not tracked.
 packages/ReactantServer/test/e2e/models/bit_resnet50/
 # Julia resolved-dependency lockfiles: not checked in, resolved fresh per environment (incl. CI)

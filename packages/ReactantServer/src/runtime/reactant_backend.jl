@@ -12,12 +12,46 @@ const _RMLIR = Reactant.MLIR
 
 struct ReactantBackend <: AbstractBackend end
 
+# Apply the persistent autotune-cache config (runtime.autotune_cache / autotune_cache_dir) to
+# Reactant's compile cache. These settings live in mutable module-level Refs in
+# Reactant.PersistentCompileCache, populated once from Preferences at its __init__ but read LIVE per
+# compile by get_debug_options, so assigning them here (after `import Reactant`, before the first
+# GPU compile) takes effect. They are unexported internals, so we guard with isdefined and no-op
+# with a warning if a future Reactant renames them. `nothing` / "" mean "inherit LocalPreferences".
+function _apply_compile_cache_prefs(autotune_cache::Union{Bool,Nothing}, autotune_cache_dir::AbstractString)
+    (autotune_cache === nothing && isempty(autotune_cache_dir)) && return nothing
+    if !isdefined(Reactant, :PersistentCompileCache)
+        @warn "runtime.autotune_cache* set but Reactant.PersistentCompileCache not found; ignoring"
+        return nothing
+    end
+    pcc = Reactant.PersistentCompileCache
+    if !isdefined(pcc, :CACHE_DIR) || !isdefined(pcc, :AUTOTUNE_CACHE_ENABLED)
+        @warn "runtime.autotune_cache* set but Reactant.PersistentCompileCache internals not found; ignoring"
+        return nothing
+    end
+    isempty(autotune_cache_dir) || (pcc.CACHE_DIR[] = String(autotune_cache_dir))
+    if autotune_cache !== nothing
+        # autotune_cache_enabled() also requires CACHE_DIR !== nothing, so enabling without a
+        # directory (neither configured here nor already set by LocalPreferences) cannot work.
+        if autotune_cache && pcc.CACHE_DIR[] === nothing
+            @warn "runtime.autotune_cache=true but no cache directory is set; also set runtime.autotune_cache_dir. Leaving the autotune cache disabled."
+        else
+            pcc.AUTOTUNE_CACHE_ENABLED[] = autotune_cache
+        end
+    end
+    return nothing
+end
+
 function make_client(::ReactantBackend, platform::String; mem_fraction::Float64=0.9,
-                     preallocate::Bool=true, kwargs...)
+                     preallocate::Bool=true, autotune_cache::Union{Bool,Nothing}=nothing,
+                     autotune_cache_dir::AbstractString="", kwargs...)
     if platform == "cuda" || platform == "gpu"
         # These BFC allocator knobs must be set before the GPU client is first created.
         _RXLA.XLA_REACTANT_GPU_MEM_FRACTION[] = mem_fraction
         _RXLA.XLA_REACTANT_GPU_PREALLOCATE[] = preallocate
+        # Persistent autotune cache prefs must be set before the first compile (they are read per
+        # compile); do it here, before the client/first executable exists.
+        _apply_compile_cache_prefs(autotune_cache, autotune_cache_dir)
         return _RXLA.client("cuda")
     end
     return _RXLA.client("cpu")

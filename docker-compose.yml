@@ -1,0 +1,76 @@
+# Single-container ReactantServer deployment. One service runs the whole node: the supervisor
+# detects every GPU granted to the container, spawns one single-GPU worker subprocess per device,
+# runs the embedded gateway, and multiplexes all logs onto this container's stdout with [name]
+# line prefixes. Adding a GPU to the host means adding nothing here.
+#
+# Prerequisites:
+#   - git submodule update --init lib/gRPCServer.jl
+#   - NVIDIA Container Toolkit on the host for GPU access
+#   - a locally generated Manifest.toml in the build context (it is gitignored; see docker/README.md)
+#   - a model bundle repository on the host; point REACTANTSERVER_MODELS at it (defaults to ./bundles)
+#
+# Usage:
+#   docker compose build
+#   REACTANTSERVER_MODELS=/path/to/bundles docker compose up
+#
+# Equivalent without compose:
+#   docker run --gpus all --ipc=host -p 8001:8001 -p 8002:8002 \
+#     -v /path/to/bundles:/var/lib/reactantserver/models:ro reactantserver
+#
+# Clients speak KServe V2 gRPC to :8001; metrics and health (/readyz, /metrics) are on :8002.
+# With one GPU the supervisor runs a single worker (no gateway) on those ports; with more, it
+# runs one worker per GPU behind the embedded gateway. Either way the ports are the same.
+
+services:
+  reactantserver:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: reactantserver:latest
+    volumes:
+      - ${REACTANTSERVER_MODELS:-./bundles}:/var/lib/reactantserver/models:ro
+      # Persistent Reactant compile cache (autotune results): survives container recreation so tuned
+      # kernels are reused. Matches the persistent_cache_directory in ReactantServer's
+      # LocalPreferences.toml (and the INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE_DIR default below).
+      - reactant-compile-cache:/var/cache/reactant-compile
+      # The image bakes a zero-config default node file (gpus: auto, one worker per device).
+      # Mount your own over it to pin models to device memory, change ports, or list workers
+      # explicitly; see config/node.yaml for the commented template.
+      # - ./config/node.yaml:/etc/reactantserver/node.yaml:ro
+    # Share the host IPC namespace so POSIX shared-memory regions (KServe system shared memory)
+    # created by a client are visible to the workers via shm_open.
+    ipc: host
+    environment:
+      # Inject nvidia-smi + NVML (the "utility" driver capability) alongside the compute libraries,
+      # so the entrypoint GPU-reclaim gate and the worker out-of-pool memory metric work. Pinned here
+      # rather than relying on the host container-runtime default capability set.
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      # Autotune knobs, settable here (see docker/README.md). Defaults shown; uncomment to change.
+      #   RUNTIME_AUTOTUNE=false disables the GPU compile autotuner (deterministic kernels, cleaner
+      #   startup memory probe); AUTOTUNE_CACHE toggles the persistent per-fusion autotune cache and
+      #   AUTOTUNE_CACHE_DIR is where it lives (mount a volume there, as above, to persist it).
+      # INFERENCE_SERVER_RUNTIME_AUTOTUNE: "true"
+      # INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE: "true"
+      # INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE_DIR: "/var/cache/reactant-compile"
+    ports:
+      - "8001:8001"   # KServe V2 gRPC endpoint for clients (Triton-compatible)
+      - "8002:8002"   # Prometheus metrics / health / admin HTTP (Triton-compatible)
+    # The supervisor forwards SIGTERM to its workers and waits for them; give it room before
+    # Docker escalates to SIGKILL.
+    stop_grace_period: 30s
+    # Health comes from the image's HEALTHCHECK (the gateway's /readyz: ready once at least one
+    # worker serves). Its start_period is generous because every model compiles before the gRPC
+    # plane accepts traffic; raise it here for large model sets:
+    # healthcheck:
+    #   start_period: 3600s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+              count: all
+
+volumes:
+  # Survives `docker compose down/up` so the workers' first-run autotune/compile work is reused.
+  reactant-compile-cache:

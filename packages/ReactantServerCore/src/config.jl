@@ -95,7 +95,10 @@ container setups working but is world-writable; `"660"` is recommended for produ
 multi-user systems. `autotune` (default `true`) enables XLA's GPU compile autotuner; set it `false`
 to compile with `xla_gpu_autotune_level=0` (default gemm/conv algorithm selection, no timing trials),
 which removes autotuning's run-to-run non-determinism and its device scratch that otherwise inflates
-the startup memory probe (`_probe_max_scratch!`) on the first, un-cached start.
+the startup memory probe (`_probe_max_scratch!`) on the first, un-cached start. `autotune_cache`
+(default `nothing`, meaning inherit Reactant's `LocalPreferences.toml`) toggles the persistent
+per-fusion autotune cache, and `autotune_cache_dir` (default `""`, inherit) sets its directory; both
+are applied to Reactant's compile cache at worker startup, so a container can drive them by env.
 """
 struct RuntimeConfig
     backend::BackendKind
@@ -109,6 +112,8 @@ struct RuntimeConfig
     weight_cache_fraction::Float64        # arena fraction for all weights (pinned + on-demand); 0 = cache off
     weight_cache_wiggle_fraction::Float64 # arena fraction kept free as headroom (drives startup auto-sizing)
     autotune::Bool                        # false disables the GPU compile autotuner (xla_gpu_autotune_level=0)
+    autotune_cache::Union{Bool,Nothing}   # persistent per-fusion autotune cache; nothing = inherit Reactant's LocalPreferences
+    autotune_cache_dir::String            # persistent autotune cache directory; "" = inherit Reactant's LocalPreferences
 end
 
 # Five-argument form: device/backend only; residency self-managed, private host weights, and the
@@ -117,7 +122,7 @@ end
 RuntimeConfig(backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
     preallocate::Bool, allow_cpu_fallback::Bool) =
     RuntimeConfig(backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
-        SELF_MANAGED, false, 0o666, 0.0, 0.0, true)
+        SELF_MANAGED, false, 0o666, 0.0, 0.0, true, nothing, "")
 
 # Seven-argument form: adds residency mode and the shared-host-weights flag (cache still off unless
 # a fraction is given). Used where a test needs to exercise externally-managed residency.
@@ -125,7 +130,7 @@ RuntimeConfig(backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
     preallocate::Bool, allow_cpu_fallback::Bool, residency_mode::ResidencyMode,
     shared_host_weights::Bool) =
     RuntimeConfig(backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
-        residency_mode, shared_host_weights, 0o666, 0.0, 0.0, true)
+        residency_mode, shared_host_weights, 0o666, 0.0, 0.0, true, nothing, "")
 
 """
     ModelSchedConfig
@@ -297,6 +302,9 @@ const ENV_PATHS = Tuple{String,Vector{String},DataType}[
     ("RUNTIME_ALLOW_CPU_FALLBACK", ["runtime", "allow_cpu_fallback"], Bool),
     ("RUNTIME_WEIGHT_CACHE_FRACTION", ["runtime", "weight_cache_fraction"], Float64),
     ("RUNTIME_WEIGHT_CACHE_WIGGLE_FRACTION", ["runtime", "weight_cache_wiggle_fraction"], Float64),
+    ("RUNTIME_AUTOTUNE", ["runtime", "autotune"], Bool),
+    ("RUNTIME_AUTOTUNE_CACHE", ["runtime", "autotune_cache"], Bool),
+    ("RUNTIME_AUTOTUNE_CACHE_DIR", ["runtime", "autotune_cache_dir"], String),
     ("RUNTIME_SHARED_HOST_WEIGHTS", ["runtime", "shared_host_weights"], Bool),
     ("RUNTIME_SHARED_HOST_WEIGHTS_MODE", ["runtime", "shared_host_weights_mode"], String),
     ("SCHEDULER_DISCIPLINE", ["scheduler", "discipline"], String),
@@ -496,6 +504,8 @@ function build_config(raw::AbstractDict)
         _opt(rt, "weight_cache_fraction", Float64, 1.0),
         _opt(rt, "weight_cache_wiggle_fraction", Float64, 0.1),
         _opt(rt, "autotune", Bool, true),
+        _opt(rt, "autotune_cache", Bool, nothing),
+        _opt(rt, "autotune_cache_dir", String, ""),
     )
 
     sc = _subdict(raw, "scheduler")
@@ -580,7 +590,7 @@ end
 # `apply_env_overrides!` is applied on top by `node_server_config`.
 
 function log_effective_config(cfg::ServerConfig, applied)
-    @info "Effective configuration" model_dirs=cfg.model_dirs models_include=cfg.models_include model_control_mode=cfg.model_control_mode model_poll_seconds=cfg.model_poll_seconds cache_dir=cfg.cache_dir backend=cfg.runtime.backend device_ordinal=cfg.runtime.device_ordinal mem_fraction=cfg.runtime.mem_fraction preallocate=cfg.runtime.preallocate allow_cpu_fallback=cfg.runtime.allow_cpu_fallback weight_cache_fraction=cfg.runtime.weight_cache_fraction weight_cache_wiggle_fraction=cfg.runtime.weight_cache_wiggle_fraction autotune=cfg.runtime.autotune residency_mode=cfg.runtime.residency_mode shared_host_weights=cfg.runtime.shared_host_weights shared_host_weights_mode=string(cfg.runtime.shared_host_weights_mode; base=8) host=cfg.endpoints.host port=cfg.endpoints.port metrics_port=cfg.endpoints.metrics_port max_concurrent_requests=cfg.endpoints.max_concurrent_requests discipline=cfg.scheduler.discipline ema_halflife_seconds=cfg.scheduler.ema_halflife_seconds recency_penalty_cap=cfg.scheduler.recency_penalty_cap coalescing_discount=cfg.scheduler.coalescing_discount cost_ema_alpha=cfg.scheduler.cost_ema_alpha max_queue_depth=cfg.scheduler.max_queue_depth compaction_interval=cfg.scheduler.compaction_interval scheduler_models=collect(keys(cfg.scheduler.models))
+    @info "Effective configuration" model_dirs=cfg.model_dirs models_include=cfg.models_include model_control_mode=cfg.model_control_mode model_poll_seconds=cfg.model_poll_seconds cache_dir=cfg.cache_dir backend=cfg.runtime.backend device_ordinal=cfg.runtime.device_ordinal mem_fraction=cfg.runtime.mem_fraction preallocate=cfg.runtime.preallocate allow_cpu_fallback=cfg.runtime.allow_cpu_fallback weight_cache_fraction=cfg.runtime.weight_cache_fraction weight_cache_wiggle_fraction=cfg.runtime.weight_cache_wiggle_fraction autotune=cfg.runtime.autotune autotune_cache=cfg.runtime.autotune_cache autotune_cache_dir=cfg.runtime.autotune_cache_dir residency_mode=cfg.runtime.residency_mode shared_host_weights=cfg.runtime.shared_host_weights shared_host_weights_mode=string(cfg.runtime.shared_host_weights_mode; base=8) host=cfg.endpoints.host port=cfg.endpoints.port metrics_port=cfg.endpoints.metrics_port max_concurrent_requests=cfg.endpoints.max_concurrent_requests discipline=cfg.scheduler.discipline ema_halflife_seconds=cfg.scheduler.ema_halflife_seconds recency_penalty_cap=cfg.scheduler.recency_penalty_cap coalescing_discount=cfg.scheduler.coalescing_discount cost_ema_alpha=cfg.scheduler.cost_ema_alpha max_queue_depth=cfg.scheduler.max_queue_depth compaction_interval=cfg.scheduler.compaction_interval scheduler_models=collect(keys(cfg.scheduler.models))
     isempty(applied) || @info "Configuration overridden by environment" overrides=["$k=$v" for (k, v) in applied]
     return nothing
 end

@@ -102,6 +102,26 @@ until curl -sf http://127.0.0.1:8002/readyz; do sleep 15; done; echo READY
 within `TimeoutStopSec` before exiting. Run the workspace `Pkg.instantiate()` once (as in the
 previous section) before enabling the unit, so the first start is not also resolving dependencies.
 
+## Docker (container) deployment
+
+A container image is an alternative to running the supervisor directly. It runs the same node
+(supervisor + workers + embedded gateway) with the same `:8001`/`:8002` interface:
+
+```bash
+git submodule update --init lib/gRPCServer.jl
+REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1 julia --project=. -e 'using Pkg; Pkg.instantiate()'  # Manifest.toml is gitignored
+make image        # or: docker build -f docker/Dockerfile -t reactantserver .
+REACTANTSERVER_MODELS=/path/to/bundles docker compose up
+```
+
+The image is a multi-stage build on `julia:1.12.6-trixie` that copies only `libnvJitLink.so.13`
+(the one CUDA userspace library Reactant needs but does not bundle) from an official CUDA 13.1
+image; it deliberately does not bring the rest of the CUDA userspace, so the base cannot shadow
+Reactant's bundled cuDNN/NCCL. The autotune knobs are settable as container env
+(`INFERENCE_SERVER_RUNTIME_AUTOTUNE`, `INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE`,
+`INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE_DIR`), and the compose file mounts a volume for the
+persistent autotune cache. See `docker/README.md` for details.
+
 ## Configuring
 
 The node is described by one YAML node file (see [Node Configuration](@ref)); the supervisor

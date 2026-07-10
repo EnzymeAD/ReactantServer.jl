@@ -8,7 +8,7 @@
 abstract type AbstractBackend end
 
 # Lifecycle and device selection.
-function make_client end                 # (backend, platform::String; mem_fraction, preallocate) -> client
+function make_client end                 # (backend, platform::String; mem_fraction, preallocate, autotune_cache, autotune_cache_dir) -> client
 make_context(::AbstractBackend) = nothing  # opaque per-backend compilation context (or nothing)
 function select_device end               # (backend, client, ordinal::Int) -> device
 function device_ordinal end              # (backend, device) -> Int
