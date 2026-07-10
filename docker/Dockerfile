@@ -1,3 +1,13 @@
+# ============================================================================================
+# DEPRECATED — do not use for deployment. The supported path is the NATIVE launcher + systemd:
+# see private/deploy/INSTALL.native.md. This image aborts at GPU-compile time inside the
+# container with `Invalid handle. Cannot load symbol cublasLtCreate` + SIGABRT (a container
+# CDI / cuBLASLt issue); running the same supervisor natively uses the host driver directly and
+# does not hit it. Kept only for reference / a future container fix. NOTE: Manifest.toml is
+# gitignored, so `COPY ... Manifest.toml` below needs a locally-generated Manifest in the build
+# context (run `julia --project=. -e 'using Pkg; Pkg.instantiate()'` first); a fresh clone has none.
+# ============================================================================================
+#
 # ReactantServer.jl node image. The default entrypoint is the supervisor (ReactantServerNode):
 # it detects the visible GPUs, runs one worker subprocess per device, and multiplexes their
 # logs. With two or more workers it also runs an embedded gateway; with a single worker it binds
@@ -9,9 +19,9 @@
 # The single-worker entrypoint.worker.sh escape hatch and the REACTANT_ROLE roles are documented
 # in docker/README.md.
 #
-# Build context is the repository root. The vendored dependencies are git submodules under
-# lib/ (Reactant.jl, gRPCServer.jl, gRPCClient.jl, HTTP.jl); run
-# `git submodule update --init --recursive` before building.
+# Build context is the repository root. After the migration to a workspace monorepo, the only
+# remaining git submodule is lib/gRPCServer.jl (Reactant, HTTP, Prometheus, gRPCClient are now
+# registry deps); run `git submodule update --init lib/gRPCServer.jl` before building.
 #
 # Build (from the repo root):
 #   docker build -f docker/Dockerfile -t reactantserver .   # or: make image

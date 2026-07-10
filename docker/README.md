@@ -1,5 +1,15 @@
 # Docker deployment
 
+> **DEPRECATED — do not use this to deploy.** The supported path is the **native launcher +
+> systemd**, documented in `private/deploy/INSTALL.native.md` (the `private/` tree is site-local and
+> gitignored, so it is not in a fresh public clone; deployers have it on the host). In short: run the
+> node supervisor natively with `private/deploy/serve_native.sh` (or the `reactantserver.service`
+> systemd unit) instead of this image. This image aborts at GPU-compile time inside the container
+> with `Invalid handle. Cannot load symbol cublasLtCreate` + SIGABRT (a container CDI / cuBLASLt
+> issue); the same supervisor run natively uses the host driver directly and does not hit it. The
+> single-GPU / two-GPU soak stacks below still exercise the code but share the same limitation.
+> Everything below is kept for reference.
+
 One container runs the whole node. The image's default entrypoint is the supervisor
 (`ReactantServerNode`): it detects every GPU granted to the container, spawns one single-GPU
 worker subprocess per device, multiplexes all logs onto the container's stdout with `[worker0]` /
