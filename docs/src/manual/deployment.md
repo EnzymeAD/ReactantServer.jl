@@ -24,7 +24,7 @@ REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1 \
 # run the supervisor across four GPUs, serving a bundle directory:
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 INFERENCE_SERVER_MODEL_DIRS=/path/to/bundles \
-REACTANT_NODE_FILE=config/node.gpu0123.yaml \
+REACTANT_NODE_FILE=config/node.default.yaml \
   julia --handle-signals=no --project=packages/ReactantServerNode \
     -e 'using ReactantServerNode; ReactantServerNode.main()'
 ```
@@ -52,7 +52,7 @@ path, and the GPU list for your host.
 ```ini
 CUDA_VISIBLE_DEVICES=0,1,2,3
 INFERENCE_SERVER_MODEL_DIRS=/path/to/bundles
-REACTANT_NODE_FILE=config/node.gpu0123.yaml
+REACTANT_NODE_FILE=config/node.default.yaml
 REACTANT_GPU=cuda
 REACTANT_GPU_VERSION=13.1
 ```
@@ -107,7 +107,7 @@ previous section) before enabling the unit, so the first start is not also resol
 The node is described by one YAML node file (see [Node Configuration](@ref)); the supervisor
 synthesizes one worker per visible GPU when no `workers:` list is given. Gateway scheduling
 (`round_robin` or `lpt_packing`) is covered in [Multi-GPU Gateway](@ref). The commented templates
-under `config/` (`node.default.yaml`, `node.yaml`, `node.gpu0123.yaml`) are reference configs.
+under `config/` (`node.default.yaml`, `node.yaml`) are reference configs.
 
 ## Roles
 

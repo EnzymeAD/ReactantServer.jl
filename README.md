@@ -61,7 +61,7 @@ git submodule update --init lib/gRPCServer.jl   # the one vendored fork the buil
 REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 INFERENCE_SERVER_MODEL_DIRS=/path/to/bundles \
-REACTANT_NODE_FILE=config/node.gpu0123.yaml \
+REACTANT_NODE_FILE=config/node.default.yaml \
   julia --handle-signals=no --project=packages/ReactantServerNode \
     -e 'using ReactantServerNode; ReactantServerNode.main()'
 ```
