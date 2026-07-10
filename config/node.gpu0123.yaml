@@ -10,8 +10,8 @@
 #
 # This is the no-replication setup: with the gateway's default_replicas: 1, lpt_packing places each
 # model on ONE of the four GPUs (chosen by balancing memory and compute), so a model's weights live
-# on a single card and its traffic concentrates there for batch coalescing. As in the two-GPU soak
-# (node.gpu23.yaml), no `models:` map is needed; the on-demand weight cache (weight_cache_fraction)
+# on a single card and its traffic concentrates there for batch coalescing. No `models:` map is
+# needed; the on-demand weight cache (weight_cache_fraction)
 # keeps each GPU memory-safe by loading weights lazily and evicting LRU within its auto-sized budget.
 #
 # These are NVIDIA T4 cards (~15.4 GiB usable each) and run the large detection input-shape variants

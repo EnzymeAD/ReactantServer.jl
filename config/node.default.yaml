@@ -1,9 +1,8 @@
-# Default node config baked into the reactantserver image at /etc/reactantserver/node.yaml.
-# With it, `docker run --gpus all` needs no configuration at all: the supervisor detects the
-# visible GPUs and spawns one worker per device (worker0..workerN-1, ports base_port+i), plus
-# the embedded gateway on 8001 (gRPC) / 8002 (metrics, health). Mount your own file over
-# /etc/reactantserver/node.yaml to override anything here; see config/node.yaml for the fully
-# commented multi-worker template (explicit workers lists, per-model device pinning, roles).
+# Zero-config default node file: `gpus: auto` with no workers list, so the supervisor detects the
+# visible GPUs and spawns one worker per device (worker0..workerN-1, ports base_port+i), plus the
+# embedded gateway on 8001 (gRPC) / 8002 (metrics, health). Point REACTANT_NODE_FILE at your own
+# file to override anything here; see config/node.yaml for the fully commented multi-worker template
+# (explicit workers lists, per-model device pinning, roles).
 
 model_repo: /var/lib/reactantserver/models
 base_port: 8080

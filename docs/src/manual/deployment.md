@@ -107,8 +107,7 @@ previous section) before enabling the unit, so the first start is not also resol
 The node is described by one YAML node file (see [Node Configuration](@ref)); the supervisor
 synthesizes one worker per visible GPU when no `workers:` list is given. Gateway scheduling
 (`round_robin` or `lpt_packing`) is covered in [Multi-GPU Gateway](@ref). The commented templates
-under `config/` (`node.default.yaml`, `node.yaml`, `node.gpu0123.yaml`, `gateway.yml`) remain as
-reference configs.
+under `config/` (`node.default.yaml`, `node.yaml`, `node.gpu0123.yaml`) are reference configs.
 
 ## Roles
 
