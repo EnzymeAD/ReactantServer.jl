@@ -17,6 +17,12 @@ global:
   cache_dir: /var/cache/reactantserver
   runtime:
     backend: cuda
+    # autotune (default true) enables XLA's GPU compile autotuner. Set false to compile with
+    # xla_gpu_autotune_level=0 (default gemm/conv algorithm selection, no timing trials), which makes
+    # kernel choice deterministic run-to-run and keeps the autotuner's compile-time scratch from
+    # inflating the startup weight-cache memory probe on the first, un-cached start. The trade-off is
+    # losing timing-tuned kernels.
+    # autotune: true
     mem_fraction: 0.9
     # Preallocate one BFC arena up front so every sub-allocation (activations, autotune/recompile
     # scratch, weight-cache reloads) is served from it and never fragments the driver memory map.

@@ -35,6 +35,11 @@ global:
   cache_dir: /var/cache/reactantserver
   runtime:
     backend: cuda
+    # Disable the GPU compile autotuner (xla_gpu_autotune_level=0, default gemm/conv algorithm
+    # selection). netai02 keeps this off for deterministic kernel choice and so the autotuner's
+    # compile-time scratch does not inflate the startup memory probe on the first, un-cached start.
+    # Trade-off: no timing-tuned gemm/conv kernels. Default (omitted) is true.
+    autotune: false
     # 0.9 of ~15.4 GiB is preallocated as the BFC arena, leaving ~1.3 GiB outside the pool for the CUDA
     # context and, critically, for instantiating the fixed set of CUDA graphs / command buffers (the
     # driver allocates these outside the XLA pool). 0.95 starved that and OOM'd on command-buffer

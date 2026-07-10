@@ -114,7 +114,15 @@ function compile_artifact(backend::ReactantBackend, pool::MemoryPool, mlir_bytes
         # is a hard compile error on non-Ampere targets. Strip it when this device cannot run it,
         # before XLA sees the module; on a TF32-capable GPU leave it intact.
         tf32_supported(pool.client, pool.device) || maybe_strip_tf32!(mod)
-        opts = _RXLA.make_compile_options(; device_id=Int64(device_ordinal(backend, pool.device)))
+        # When autotuning is disabled, force xla_gpu_autotune_level=0: XLA uses default gemm/conv
+        # algorithm selection with no device timing trials. This removes the autotuner's run-to-run
+        # non-determinism and the compile-time scratch that otherwise inflates the startup memory
+        # probe on the first (un-cached) start. When enabled, pass no override so the compile is
+        # byte-identical to the previous behavior (XLA's default autotune level).
+        opts = pool.autotune ?
+            _RXLA.make_compile_options(; device_id=Int64(device_ordinal(backend, pool.device))) :
+            _RXLA.make_compile_options(; device_id=Int64(device_ordinal(backend, pool.device)),
+                xla_debug_options=(; xla_gpu_autotune_level=Int32(0)))
         return _RXLA.compile(pool.client, mod;
             compile_options=opts,
             num_parameters=Int64(n_parameters),
