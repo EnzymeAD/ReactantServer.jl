@@ -2,7 +2,7 @@
 
 [Getting Started](getting_started.md) ran one model on one GPU. This page adds GPUs. The key
 point: **nothing about your model, client, or external interface changes.** You run the same
-container (or the same `supervise` call), the supervisor puts one worker on each GPU, and it
+launcher (or the same `supervise` call), the supervisor puts one worker on each GPU, and it
 fronts them with an embedded gateway so clients still send one request to one endpoint and it is
 routed to a worker that serves the model.
 
@@ -37,13 +37,14 @@ A model listed on more than one worker is replicated, and the gateway load-balan
 it across those workers. See [Node Configuration](node_config.md) for the `models:` map and
 [On-demand Weights](on_demand_weights.md) for fitting more models than GPU memory holds.
 
-## Run it with docker compose
+## Run it natively
 
-Same container as before; just grant it all the GPUs (the shipped `docker-compose.yml` already
-reserves every GPU):
+Same command as before; just grant it all the GPUs (list them in `CUDA_VISIBLE_DEVICES`):
 
 ```
-REACTANTSERVER_MODELS=$PWD/models docker compose up
+CUDA_VISIBLE_DEVICES=0,1,2,3 INFERENCE_SERVER_MODEL_DIRS=$PWD/models REACTANT_NODE_FILE=node.yaml \
+  julia --handle-signals=no --project=packages/ReactantServerNode \
+    -e 'using ReactantServerNode; ReactantServerNode.main()'
 ```
 
 The supervisor detects N GPUs, runs `worker0..workerN-1` (each pinned to one device), and runs
@@ -64,7 +65,7 @@ This single parent process spawns one [`ReactantServer.serve`](@ref) worker subp
 and the gateway as another subprocess, multiplexes their logs onto its stdout with `[worker0]` /
 `[gateway]` prefixes, and restarts any child that dies. (You can still run each worker and the
 gateway by hand, as separate `serve` / `serve_gateway` processes, but the supervisor is the
-intended path and the only one the container uses.)
+intended path and the one the launcher uses.)
 
 ## How the supervisor decides what to start
 
@@ -77,7 +78,7 @@ child processes. It does so in three steps.
 1. `REACTANT_GPUS` environment variable: a count (`2`) or an explicit list (`0,2` or GPU UUIDs);
    `0` means a CPU node.
 2. the node file's `gpus:` key (`auto`, a count, or a list).
-3. a `CUDA_VISIBLE_DEVICES` already set on the container.
+3. a `CUDA_VISIBLE_DEVICES` already set on the host.
 4. `nvidia-smi` enumeration.
 5. `/dev/nvidiaN` device nodes.
 
@@ -111,7 +112,7 @@ sit near its actual working set (dispatch, GPU sync, and the data plane), not al
   gateway needs no config of its own.
 
 The external interface (8001 for gRPC, 8002 for metrics/health) is therefore identical whether
-you run 1 GPU or 8, which is why your client and compose ports never change as you scale.
+you run 1 GPU or 8, which is why your client and the public ports never change as you scale.
 
 The `REACTANT_ROLE` environment variable can override the default `all` role (`workers` runs only
 the workers, `gateway` runs only the gateway) for splitting a deployment across machines; that
@@ -137,5 +138,5 @@ One scrape on `8002` still covers the whole node: the embedded gateway serves it
 `gateway_*` series and merges in every worker's `/metrics`. Each worker tags its series with
 `worker` and `gpu` labels itself (the `gpu` value is the physical device behind its
 `CUDA_VISIBLE_DEVICES`), so per-GPU and per-worker breakdowns need no Prometheus relabeling, e.g.
-`sum by (gpu) (rate(worker_dispatch_total[1m]))`. See [Docker Deployment](docker.md) for the
+`sum by (gpu) (rate(worker_dispatch_total[1m]))`. See [Deployment](deployment.md) for the
 scrape config.

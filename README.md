@@ -31,10 +31,10 @@ an example configuration for each.
   describes a machine; manifests declare tensors with an einsum-style named-axis notation. → [Node Configuration](https://enzymead.github.io/ReactantServer.jl/dev/manual/node_config/), [Bundles & model.jl](https://enzymead.github.io/ReactantServer.jl/dev/manual/bundles/)
 - **Standard inference protocol.** KServe V2 over gRPC. Tensor data travels inline or through the
   Triton-compatible system-shared-memory extension for zero-copy local clients. → [Client Usage](https://enzymead.github.io/ReactantServer.jl/dev/manual/client_usage/)
-- **One container, single or multi-GPU.** A node supervisor runs one worker per visible GPU: a
+- **One process, single or multi-GPU.** A node supervisor runs one worker per visible GPU: a
   single worker serves the public ports directly; two or more get an embedded gateway behind one
   endpoint. The external interface (`:8001` gRPC, `:8002` metrics/health) is identical either way.
-  → [Docker Deployment](https://enzymead.github.io/ReactantServer.jl/dev/manual/docker/), [Scaling to Multiple GPUs](https://enzymead.github.io/ReactantServer.jl/dev/manual/scaling/)
+  → [Deployment](https://enzymead.github.io/ReactantServer.jl/dev/manual/deployment/), [Scaling to Multiple GPUs](https://enzymead.github.io/ReactantServer.jl/dev/manual/scaling/)
 - **Balances memory and compute.** Every model's weights stay resident in host RAM and stream
   onto the GPU on demand, evicted LRU under a byte budget — so a card serves far more models than
   fit in VRAM, paying a single host-to-device transfer on a cold call. → [On-demand Weights](https://enzymead.github.io/ReactantServer.jl/dev/manual/on_demand_weights/)
@@ -53,32 +53,34 @@ an example configuration for each.
 
 ## Quick start
 
-The image is built locally (it is not published to a registry), so build it once and then serve a
-directory of model bundles from the container (it scales to all visible GPUs):
+The node runs natively (no containers): run the supervisor over a directory of model bundles and it
+scales to all visible GPUs.
 
 ```
-git submodule update --init --recursive   # fetch the vendored lib/gRPCServer.jl fork the build needs
-make image                                 # build reactantserver:latest (or: docker compose build)
+git submodule update --init lib/gRPCServer.jl   # the one vendored fork the build needs
+REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 
-docker run --gpus all --ipc=host -p 8001:8001 -p 8002:8002 \
-  -v /path/to/bundles:/var/lib/reactantserver/models:ro reactantserver
+CUDA_VISIBLE_DEVICES=0,1,2,3 INFERENCE_SERVER_MODEL_DIRS=/path/to/bundles \
+REACTANT_NODE_FILE=config/node.default.yaml \
+  julia --handle-signals=no --project=packages/ReactantServerNode \
+    -e 'using ReactantServerNode; ReactantServerNode.main()'
 ```
 
-The build is large and the first server startup is slow, since every model compiles before the
-gRPC plane accepts traffic. See [Docker Deployment](https://enzymead.github.io/ReactantServer.jl/dev/manual/docker/) for the
-`docker compose` workflow and configuration.
+The first server startup is slow, since every model compiles before the gRPC plane accepts
+traffic. See [Deployment](https://enzymead.github.io/ReactantServer.jl/dev/manual/deployment/) for
+configuration and running it as a service.
 
 Or from pure Julia:
 
 ```julia
 using ReactantServerNode
-ReactantServerNode.supervise("docker/node.yaml")   # one worker per GPU (+ gateway if >1)
+ReactantServerNode.supervise("config/node.yaml")   # one worker per GPU (+ gateway if >1)
 ```
 
 Clients speak KServe V2 gRPC to `:8001`; health and metrics are on `:8002`. Walk through exporting
 a model, configuring a node, and querying it in [Getting Started](https://enzymead.github.io/ReactantServer.jl/dev/manual/getting_started/).
-ReactantServer is designed for a trusted network — read
-[Security](https://enzymead.github.io/ReactantServer.jl/dev/manual/docker/#security) before exposing an endpoint.
+ReactantServer is designed for a trusted network; read
+[Security](https://enzymead.github.io/ReactantServer.jl/dev/manual/deployment/#Security) before exposing an endpoint.
 
 ## Status
 

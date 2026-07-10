@@ -55,7 +55,7 @@ makedocs(;
             "Object Detection"         => "manual/object_detection.md",
             "On-demand Weights"        => "manual/on_demand_weights.md",
             "Multi-GPU Gateway"        => "manual/multi_gpu_gateway.md",
-            "Docker Deployment"        => "manual/docker.md",
+            "Deployment"               => "manual/deployment.md",
         ],
         "Design" => [
             "Philosophy"   => "design/philosophy.md",

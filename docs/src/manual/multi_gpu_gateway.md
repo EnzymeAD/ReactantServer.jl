@@ -7,12 +7,12 @@ and the generated KServe protobuf. Because it builds only on `ReactantServerCore
 layer, the gateway carries no Reactant dependency.
 
 You do not start the gateway yourself. When a node has two or more workers, the supervisor
-([`ReactantServerNode.supervise`](@ref ReactantServerNode.supervise), the container's default
+([`ReactantServerNode.supervise`](@ref ReactantServerNode.supervise), the node's default
 entry point) runs the gateway as an embedded child and synthesizes its worker endpoint list from
 the node file; a single-worker node skips it entirely (one worker already serves the full KServe
 V2 API). This page describes what that embedded gateway does. See
-[Scaling to Multiple GPUs](scaling.md) for when it appears and [Docker Deployment](@ref) for the
-container.
+[Scaling to Multiple GPUs](scaling.md) for when it appears and [Deployment](@ref) for the
+node.
 
 Clients connect to a single gRPC endpoint. The gateway extracts the model name from each
 `ModelInferRequest` and forwards the raw protobuf bytes over gRPC to the worker that hosts that
@@ -207,9 +207,9 @@ The supervisor configures the embedded gateway for you: it synthesizes the worke
 about model placement is configured on the gateway; it autodiscovers which models each worker
 serves via `RepositoryIndex` and refreshes its routing table periodically.
 
-To tune the gateway, mount a `docker/gateway.yml` over `/etc/reactantserver/gateway.yml` (or set
-`REACTANT_GATEWAY_FILE`); it carries the gateway's own settings (listen addresses, message
-limits, logging, and the `scheduling:` block above). Settings can also be overridden by
+To tune the gateway, provide a `gateway.yml` and point `REACTANT_GATEWAY_FILE` at it (or, for the
+embedded gateway, set the `REACTANT_GATEWAY_*` environment below); it carries the gateway's own
+settings (listen addresses, message limits, logging, and the `scheduling:` block above). Settings can also be overridden by
 environment with the prefix `REACTANT_GATEWAY_` and the dotted path uppercased with underscores,
 e.g. `REACTANT_GATEWAY_LOGGING_LEVEL=debug` or `REACTANT_GATEWAY_SCHEDULING_MODE=lpt_packing`.
 

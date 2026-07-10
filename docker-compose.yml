@@ -4,8 +4,9 @@
 # line prefixes. Adding a GPU to the host means adding nothing here.
 #
 # Prerequisites:
-#   - git submodule update --init --recursive   (populates lib/gRPCServer.jl)
+#   - git submodule update --init lib/gRPCServer.jl
 #   - NVIDIA Container Toolkit on the host for GPU access
+#   - a locally generated Manifest.toml in the build context (it is gitignored; see docker/README.md)
 #   - a model bundle repository on the host; point REACTANTSERVER_MODELS at it (defaults to ./bundles)
 #
 # Usage:
@@ -28,10 +29,14 @@ services:
     image: reactantserver:latest
     volumes:
       - ${REACTANTSERVER_MODELS:-./bundles}:/var/lib/reactantserver/models:ro
+      # Persistent Reactant compile cache (autotune results): survives container recreation so tuned
+      # kernels are reused. Matches the persistent_cache_directory in ReactantServer's
+      # LocalPreferences.toml (and the INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE_DIR default below).
+      - reactant-compile-cache:/var/cache/reactant-compile
       # The image bakes a zero-config default node file (gpus: auto, one worker per device).
       # Mount your own over it to pin models to device memory, change ports, or list workers
-      # explicitly; see docker/node.yaml for the commented template.
-      # - ./docker/node.yaml:/etc/reactantserver/node.yaml:ro
+      # explicitly; see config/node.yaml for the commented template.
+      # - ./config/node.yaml:/etc/reactantserver/node.yaml:ro
     # Share the host IPC namespace so POSIX shared-memory regions (KServe system shared memory)
     # created by a client are visible to the workers via shm_open.
     ipc: host
@@ -40,6 +45,13 @@ services:
       # so the entrypoint GPU-reclaim gate and the worker out-of-pool memory metric work. Pinned here
       # rather than relying on the host container-runtime default capability set.
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      # Autotune knobs, settable here (see docker/README.md). Defaults shown; uncomment to change.
+      #   RUNTIME_AUTOTUNE=false disables the GPU compile autotuner (deterministic kernels, cleaner
+      #   startup memory probe); AUTOTUNE_CACHE toggles the persistent per-fusion autotune cache and
+      #   AUTOTUNE_CACHE_DIR is where it lives (mount a volume there, as above, to persist it).
+      # INFERENCE_SERVER_RUNTIME_AUTOTUNE: "true"
+      # INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE: "true"
+      # INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE_DIR: "/var/cache/reactant-compile"
     ports:
       - "8001:8001"   # KServe V2 gRPC endpoint for clients (Triton-compatible)
       - "8002:8002"   # Prometheus metrics / health / admin HTTP (Triton-compatible)
@@ -58,3 +70,7 @@ services:
             - driver: nvidia
               capabilities: [gpu]
               count: all
+
+volumes:
+  # Survives `docker compose down/up` so the workers' first-run autotune/compile work is reused.
+  reactant-compile-cache:

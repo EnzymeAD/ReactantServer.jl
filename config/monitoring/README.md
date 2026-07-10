@@ -1,33 +1,37 @@
 # ReactantServer monitoring stack (Grafana + Prometheus)
 
 A self-contained Grafana + Prometheus stack that scrapes a running ReactantServer node and ships a
-six-dashboard suite. It runs as its own compose project on the **same external Docker network** as
-the server, so it reaches the gateway's metrics by container name and has an independent lifecycle
-(restart the server without touching Grafana, and vice versa).
+six-dashboard suite. It runs as its own compose project with an independent lifecycle (restart the
+server without touching Grafana, and vice versa). The node runs natively on the host, so Prometheus
+scrapes the host's metrics port rather than a container over a shared network.
 
 ## Run it
 
-The shared network is created by the server deploy (`deploy.netai02.sh`); bring the server up first.
+Bring the node up first (see the Deployment guide), then:
 
 ```bash
-sudo ./private/deploy/deploy.monitoring.sh up        # start (joins the netai02 network)
-sudo ./private/deploy/deploy.monitoring.sh logs -f
-sudo ./private/deploy/deploy.monitoring.sh ps
-sudo ./private/deploy/deploy.monitoring.sh down       # leaves the server stack + network in place
+COMPOSE=config/monitoring/docker-compose.monitoring.yml
+docker compose -f "$COMPOSE" up -d
+docker compose -f "$COMPOSE" logs -f
+docker compose -f "$COMPOSE" ps
+docker compose -f "$COMPOSE" down
 ```
+
+Prometheus reaches the natively-running node at `host.docker.internal:8002`, mapped to the host
+gateway by `extra_hosts` in the compose file (Docker 20.10+). If the node listens on a **different
+host**, edit the target in `prometheus.yml` to that host's `address:8002` instead.
 
 - **Grafana**: `http://<host>:3000` — anonymous viewing is on; log in `admin` / `admin` to edit
   (override with `GRAFANA_ADMIN_PASSWORD`). Lands on Fleet Overview.
-- **Prometheus**: `http://<host>:9090` — check `Status -> Targets` shows `reactantserver:8002` UP.
+- **Prometheus**: `http://<host>:9090` — check `Status -> Targets` shows the `reactantserver` job UP.
 
-Environment overrides: `REACTANTSERVER_NETWORK` (network to join, default `netai02`),
-`PROJECT` (compose project, default `netai02-mon`), `GRAFANA_ADMIN_PASSWORD`.
+Environment overrides: `GRAFANA_ADMIN_PASSWORD`.
 
 ## How it scrapes
 
 One target is enough. The embedded gateway's `:8002/metrics` serves its own `gateway_*` series and
 fans out to every worker's metrics endpoint, merging them into a single exposition; each worker
-self-tags its series with `worker` and `gpu` labels, so a single scrape of `reactantserver:8002`
+self-tags its series with `worker` and `gpu` labels, so a single scrape of the node's `:8002`
 covers the whole fleet (`prometheus.yml`). No model names are configured anywhere, dashboards
 discover models dynamically via Grafana template variables (`$worker`, `$model`).
 

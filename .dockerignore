@@ -1,12 +1,12 @@
-# Build context is the repository root for both images. Keep what the images need
-# (Project.toml, Manifest.toml, src/, the lib/ runtime submodules, docker/) and
-# drop everything else, especially the large submodule .git dirs.
+# Build context is the repository root. Keep what the image needs (Project.toml, Manifest.toml,
+# packages/, the lib/ runtime submodule, docker/, config/) and drop everything else, especially the
+# large submodule .git dirs.
 
 **/.git
 **/.gitignore
 
-# Not needed in any image. **/test/ drops the per-package test trees under packages/*/test/
-# (e.g. the large e2e weights) from the worker image's `COPY packages/`.
+# Not needed in the image. **/test/ drops the per-package test trees under packages/*/test/
+# (e.g. the large e2e weights) from `COPY packages/`.
 bundles/
 validation/
 test/

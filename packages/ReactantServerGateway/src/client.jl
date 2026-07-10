@@ -169,6 +169,10 @@ function client_status(e::gRPCClient.gRPCServiceCallException)
     st = e.grpc_status
     st == gRPCClient.GRPC_NOT_FOUND && return STATUS_NOT_FOUND
     st == gRPCClient.GRPC_RESOURCE_EXHAUSTED && return STATUS_RESOURCE_EXHAUSTED
+    # A deadline observed at the worker (admission shed, server-enforced grpc-timeout, or a
+    # local curl timeout) is a distinct outcome from a worker being down; give it its own status
+    # so metrics and logs do not fold it into STATUS_UNAVAILABLE.
+    st == gRPCClient.GRPC_DEADLINE_EXCEEDED && return STATUS_DEADLINE
     return STATUS_UNAVAILABLE
 end
 

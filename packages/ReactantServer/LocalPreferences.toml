@@ -4,9 +4,9 @@
 # The worker entrypoint serves under --project=.../packages/ReactantServer, so this is the
 # active project whose LocalPreferences.toml is consulted.
 #
-# persistent_cache_directory is pinned to a fixed path so a persistent Docker volume can be
-# mounted there (docker-compose.gpu2.yml); the default would land in an ephemeral depot
-# scratchspace that is lost on container recreation. Only the autotune cache is persisted,
+# persistent_cache_directory is pinned to a fixed path so the compile cache survives across
+# process restarts; the default would land in an ephemeral depot scratchspace that a clean
+# environment loses. Only the autotune cache is persisted,
 # which is the larger GPU-compile cost (gemm/conv algorithm selection, ~5-10s/model).
 #
 # The kernel cache is OFF. Enabling it on this Reactant_jll/XLA build produced incorrect

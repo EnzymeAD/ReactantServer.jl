@@ -252,7 +252,7 @@ endpoints:
 #   - "node2-worker1:9101"
 ```
 
-See [Multi-GPU Gateway](multi_gpu_gateway.md) and [Docker Deployment](docker.md) for the node interface, ports, and health/metrics endpoints a control plane would use.
+See [Multi-GPU Gateway](multi_gpu_gateway.md) and [Deployment](deployment.md) for the node interface, ports, and health/metrics endpoints a control plane would use.
 
 ## Summary
 

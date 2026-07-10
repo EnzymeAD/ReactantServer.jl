@@ -13,7 +13,7 @@ A single GPU is just a one-worker node: keep one entry under `workers:` (or omit
 entirely under the supervisor, below). Growing to more GPUs means adding workers, not changing
 the config format.
 
-Under the node supervisor (the container default, see [Docker Deployment](@ref)) the `workers:`
+Under the node supervisor (the supervisor default, see [Deployment](@ref)) the `workers:`
 list is optional: omit it and add `gpus: auto` (or an integer count, or an explicit device
 list) and the supervisor synthesizes one worker per detected GPU, assigning each its device.
 An explicit `workers:` list still wins when present. The keys below describe that explicit form,
@@ -115,13 +115,13 @@ workers:
 `name` is the routing identity (and, under Docker, the compose service name). The listen port
 is `base_port + index` unless the worker sets an explicit `port:`.
 
-Under the supervisor (the container default) you do not assign GPUs yourself: it detects the
+Under the supervisor (the supervisor default) you do not assign GPUs yourself: it detects the
 visible devices, gives each worker one of them, and sets that worker's own
 `CUDA_VISIBLE_DEVICES`, so every worker sees a single GPU at ordinal `0`. Influence the assignment
 with `gpus:` above (`auto`, a count, or an explicit device list), the `REACTANT_GPUS` environment
 variable, or by adding `gpu: N` to a worker entry to pin it to a specific visible device. A
-container-level `CUDA_VISIBLE_DEVICES` acts as a coarse filter on which physical GPUs the
-supervisor sees (see [Docker Deployment](docker.md)). Running a single worker by hand without the
+a host-level `CUDA_VISIBLE_DEVICES` acts as a coarse filter on which physical GPUs the
+supervisor sees (see [Deployment](deployment.md)). Running a single worker by hand without the
 supervisor (a bare `serve`), the worker uses device ordinal `0`, or `gpu: N` to pick another.
 
 A worker entry may also carry override blocks (for example a `runtime:` block) that merge over

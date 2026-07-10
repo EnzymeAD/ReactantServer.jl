@@ -16,8 +16,8 @@
 #   PROBE_MODEL     model to probe            (default text_fuse_net_gpu)
 #   PROBE_DEADLINE  per-request seconds       (default 300; first run may compile/autotune)
 #
-# Run it with the same project/deps as the loadgen (ReactantServerClient + gRPCClient), e.g. inside
-# the loadgen container or:  julia --project=packages/ReactantServerClient docker/loadgen/probe_large_variants.jl
+# Run it with the same project as the loadgen (ReactantServerClient pulls in gRPCClient):
+#   julia --project=packages/ReactantServerClient tools/loadgen/probe_large_variants.jl
 
 using ReactantServerClient
 import gRPCClient
