@@ -7,12 +7,12 @@ and the generated KServe protobuf. Because it builds only on `ReactantServerCore
 layer, the gateway carries no Reactant dependency.
 
 You do not start the gateway yourself. When a node has two or more workers, the supervisor
-([`ReactantServerNode.supervise`](@ref ReactantServerNode.supervise), the container's default
+([`ReactantServerNode.supervise`](@ref ReactantServerNode.supervise), the node's default
 entry point) runs the gateway as an embedded child and synthesizes its worker endpoint list from
 the node file; a single-worker node skips it entirely (one worker already serves the full KServe
 V2 API). This page describes what that embedded gateway does. See
-[Scaling to Multiple GPUs](scaling.md) for when it appears and [Docker Deployment](@ref) for the
-container.
+[Scaling to Multiple GPUs](scaling.md) for when it appears and [Deployment](@ref) for the
+node.
 
 Clients connect to a single gRPC endpoint. The gateway extracts the model name from each
 `ModelInferRequest` and forwards the raw protobuf bytes over gRPC to the worker that hosts that

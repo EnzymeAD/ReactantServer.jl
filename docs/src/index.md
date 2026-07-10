@@ -45,7 +45,7 @@ clients connect to it directly.
 ReactantServer.jl is a Julia workspace of five packages: **ReactantServerCore** (the shared,
 Reactant-free substrate), **ReactantServer** (the worker, the only package that loads Reactant),
 **ReactantServerGateway** (the multi-GPU reverse proxy), **ReactantServerClient** (a
-Reactant-free inference client), and **ReactantServerNode** (the single-container node
+Reactant-free inference client), and **ReactantServerNode** (the node
 supervisor), plus the non-member **ReactantServerExport** (offline bundle export). See
 [Architecture](design/architecture.md) for the split.
 
@@ -62,7 +62,7 @@ supervisor), plus the non-member **ReactantServerExport** (offline bundle export
   [Object Detection](manual/object_detection.md) example.
 - Serving more models than fit on the GPU: [On-demand Weights](manual/on_demand_weights.md).
 - Scaling across GPUs: [Multi-GPU Gateway](manual/multi_gpu_gateway.md) and
-  [Docker Deployment](manual/docker.md).
+  [Deployment](manual/deployment.md).
 - The why and the how: [Philosophy](design/philosophy.md) and
   [Architecture](design/architecture.md).
 - The full [API Reference](api/server.md).

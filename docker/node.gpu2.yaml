@@ -1,5 +1,5 @@
-# Single-GPU soak node config, mounted into the supervised all-in-one container
-# (docker-compose.gpu2.yml). The supervisor runs one worker on the GPU selected by
+# Single-GPU soak node config (reference; serve it with the native launcher or supervise()).
+# The supervisor runs one worker on the GPU selected by
 # CUDA_VISIBLE_DEVICES plus the embedded gateway; the explicit single-worker list below is
 # honored as-is (the one visible device is assigned to it).
 #
@@ -11,7 +11,7 @@
 model_repo: /var/lib/reactantserver/models
 base_port: 8080
 # Per-worker Prometheus metrics port (metrics_base_port + worker index). Each worker serves
-# /metrics, /healthz, /readyz here; scrape them as separate targets (see docker/README.md).
+# /metrics, /healthz, /readyz here; scrape them as separate targets (see the Deployment docs).
 metrics_base_port: 9100
 
 global:

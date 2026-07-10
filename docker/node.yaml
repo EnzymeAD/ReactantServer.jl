@@ -17,7 +17,7 @@ model_repo: /var/lib/reactantserver/models
 base_port: 8080
 # Per-worker Prometheus metrics port (metrics_base_port + worker index): worker0 -> 9100,
 # worker1 -> 9101, ... Each worker serves /metrics, /healthz, /readyz. Scrape them as separate
-# Prometheus targets, one per GPU (see docker/README.md).
+# Prometheus targets, one per GPU (see the Deployment docs).
 metrics_base_port: 9100
 
 global:

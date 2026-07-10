@@ -5,7 +5,7 @@ CurrentModule = ReactantServer
 # Getting Started
 
 This is a complete walkthrough: export a small Lux model into a bundle, configure a single-GPU
-node, run it (both with `docker compose` and from pure Julia), and query it with the Julia
+node, run it (with the launcher or from pure Julia), and query it with the Julia
 client. When you are ready for more than one GPU, continue to
 [Scaling to Multiple GPUs](scaling.md).
 
@@ -87,33 +87,31 @@ workers:
 The explicit one-entry `workers:` list works with every run path below, including a bare
 `ReactantServer.serve` (which expects the workers list). Under the supervisor you can instead
 omit `workers:` and write `gpus: auto`, and it synthesizes one worker per detected GPU; that is
-how the image's baked default and [Scaling to Multiple GPUs](scaling.md) work. See
+how the `gpus: auto` default and [Scaling to Multiple GPUs](scaling.md) work. See
 [Node Configuration](node_config.md) for the full surface (scheduler, on-demand weights,
 per-model pinning, environment overrides).
 
-## Step 3: Run it with docker compose
+## Step 3: Run it natively
 
-Build the image and start the node, pointing `REACTANTSERVER_MODELS` at the repository from
-Step 1:
+Start the node with the launcher, pointing `MODELS` at the repository from Step 1:
 
 ```
-make image
-REACTANTSERVER_MODELS=$PWD/models docker compose up
+MODELS=$PWD/models GPUS=0 private/deploy/serve_native.sh
 ```
 
 With a single GPU the node runs one worker and **no gateway**: the worker serves the KServe V2
 gRPC API on `localhost:8001` and metrics/health on `localhost:8002` (`/readyz`, `/healthz`,
 `/metrics`). The first start compiles every model before accepting traffic, so give it a moment;
-`curl localhost:8002/readyz` returns 200 once it is serving. See [Docker Deployment](docker.md)
-for the image, healthcheck, and metrics details.
+`curl localhost:8002/readyz` returns 200 once it is serving. See [Deployment](deployment.md) for
+the launcher, systemd unit, health, and metrics details.
 
 ## Step 4: Or run it from pure Julia
 
 Two entry points, differing only in which ports are exposed:
 
 ```julia
-# The supervisor: same behavior as the container. One worker (no gateway) on the public
-# ports 8001 (gRPC) and 8002 (metrics), just like `docker compose up`.
+# The supervisor: same behavior as the launcher. One worker (no gateway) on the public
+# ports 8001 (gRPC) and 8002 (metrics), just like `serve_native.sh`.
 using ReactantServerNode
 ReactantServerNode.supervise("node.yaml")
 ```
@@ -134,13 +132,13 @@ server = ReactantServer.serve("node.yaml"; blocking=false)
 ReactantServer.stop!(server)
 ```
 
-`supervise` is the right choice for deployment (it is what the container runs and it scales to
+`supervise` is the right choice for deployment (it is what the launcher runs and it scales to
 many GPUs unchanged); a bare `serve` is convenient for a quick single-worker REPL session.
 
 Start Julia multithreaded so per-request `preprocess`/`postprocess` overlap the GPU execution
 (`julia --threads=auto,1`: a default pool for the hooks plus one interactive thread for the GPU
-dispatch loop). Set this yourself only for a bare `serve`; under the supervisor (the container
-image) each worker is instead sized to its share of the host, `min(cores ÷ workers, 16)` threads
+dispatch loop). Set this yourself only for a bare `serve`; under the supervisor each worker is
+instead sized to its share of the host, `min(cores ÷ workers, 16)` threads
 plus the interactive one, so co-located workers do not oversubscribe the CPU (see
 [Scaling to Multiple GPUs](scaling.md)). With a single thread the server still works, just without
 the overlap.
@@ -149,7 +147,7 @@ the overlap.
 
 The server speaks KServe V2 over gRPC, so any Triton/KServe client works; this repository ships
 the Reactant-free `ReactantServerClient`. Point it at the port your server is using (8001 for the
-supervisor or compose, 8080 for a bare `serve`), and use the bundle's tensor names `input` /
+supervisor, 8080 for a bare `serve`), and use the bundle's tensor names `input` /
 `output`:
 
 ```julia
@@ -178,7 +176,7 @@ shared-memory data path.
 - [Node Configuration](node_config.md): the full config surface and environment overrides.
 - [Bundles & model.jl](bundles.md): the bundle format and custom pre/post-processing.
 - [On-demand Weights](on_demand_weights.md): serving more models than fit in GPU memory.
-- [Docker Deployment](docker.md): the image, roles, health, and metrics.
+- [Deployment](deployment.md): the launcher, roles, health, and metrics.
 
 ## Testing
 

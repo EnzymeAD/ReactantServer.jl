@@ -32,7 +32,7 @@ Reactant/XLA stack:
 - **ReactantServerClient** — the inference client (`KServeModel`, `infer_sync`,
   `infer_async`, `InferInput`, `InferOutput`). Also Reactant-free, so it installs on a plain
   client machine. See [Client Usage](../manual/client_usage.md).
-- **ReactantServerNode** — the single-container node supervisor (`supervise`). It detects the
+- **ReactantServerNode** — the node supervisor (`supervise`). It detects the
   visible GPUs and runs one worker subprocess per device, plus the embedded gateway when there
   is more than one worker. Reactant-free (it only orchestrates subprocesses).
 
@@ -67,9 +67,9 @@ The broader mission, the target audience, and the explicit non-goals are on the
   (`model.b{N}.mlir`, one per compiled batch size), a shared `weights.safetensors`, and an
   optional `model.jl` for pre/post-processing. Bundles are produced by offline conversion
   tooling from Lux or PyTorch models and loaded at server startup.
-- **One process per GPU, one container per node.** Each worker drives a single GPU, holds a
+- **One process per GPU, one supervisor per node.** Each worker drives a single GPU, holds a
   single shared memory pool, and serves the full KServe V2 gRPC surface on its own. A node
-  supervisor (`ReactantServerNode`) runs the whole node from one container: it detects the
+  supervisor (`ReactantServerNode`) runs the whole node from one process: it detects the
   visible GPUs and starts one worker process per device. With a single worker it binds that
   worker to the public ports directly (no gateway); with two or more it also starts a thin
   embedded gateway that gives clients one endpoint and routes each model's traffic across

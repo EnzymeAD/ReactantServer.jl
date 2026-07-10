@@ -1,5 +1,5 @@
-# Two-GPU lpt_packing soak node config, mounted into the supervised all-in-one container
-# (docker-compose.gpu23.yml). The supervisor runs two workers (one per visible GPU, selected by
+# Two-GPU lpt_packing soak node config (reference; serve it with the native launcher or supervise()).
+# The supervisor runs two workers (one per visible GPU, selected by
 # CUDA_VISIBLE_DEVICES=2,3) plus the embedded gateway on 8001/8002. The gateway is put in
 # lpt_packing mode via the REACTANT_GATEWAY_SCHEDULING_* environment in the compose file. That mode
 # requires every worker to run the fifo or edf discipline (set below, so placement decisions stay with

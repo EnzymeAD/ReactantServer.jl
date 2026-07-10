@@ -1,15 +1,25 @@
-# Dummy-data inference load generator for the single-GPU soak stack.
+# Dummy-data inference load generator (standalone soak / benchmark tool).
 #
-# Connects to the gateway over KServe V2 gRPC and drives sustained, concurrent inference with
-# zero-filled inputs across every model, to surface memory leaks, races, and instability. Input
-# shapes and dtypes come from each bundle's manifest (manifest_io_spec), read from the mounted
-# model repository, so no dependency on the gateway's ModelMetadata RPC (the gateway does not serve
-# it). Runs to a fixed duration, then prints a summary and exits nonzero if any request errored.
+# Connects to a running node's gateway over KServe V2 gRPC and drives sustained, concurrent
+# inference with zero-filled inputs across every model, to surface memory leaks, races, and
+# instability. Input shapes and dtypes come from each bundle's manifest (manifest_io_spec), read
+# from the model repository directory, so no dependency on the gateway's ModelMetadata RPC (the
+# gateway does not serve it). Runs to a fixed duration, then prints a summary and exits nonzero if
+# any request errored.
+#
+# Reactant-free: it needs only ReactantServerClient (which pulls in ReactantServerCore and
+# gRPCClient), so run it under that package's project. Point it at any node (native launcher or
+# otherwise) via the LOADGEN_* env below; run it as:
+#   LOADGEN_GATEWAY=grpc://127.0.0.1:8001 LOADGEN_METRICS=http://127.0.0.1:8002/metrics \
+#   LOADGEN_MODEL_REPO=/path/to/bundles LOADGEN_DURATION_SECONDS=300 \
+#     julia --project=packages/ReactantServerClient tools/loadgen/loadgen.jl
+# The default host names (gateway:8001/8002) are legacy container-network defaults; set the LOADGEN_*
+# values above for a native run.
 #
 # Env knobs (all optional):
 #   LOADGEN_GATEWAY           grpc URL of the gateway          (default grpc://gateway:8001)
 #   LOADGEN_METRICS           gateway /metrics URL to scrape   (default http://gateway:8002/metrics)
-#   LOADGEN_MODEL_REPO        path to mounted bundles          (default /var/lib/reactantserver/models)
+#   LOADGEN_MODEL_REPO        path to bundles directory        (default /var/lib/reactantserver/models)
 #   LOADGEN_CONCURRENCY       number of concurrent requesters  (default 32)
 #   LOADGEN_DURATION_SECONDS  soak duration                    (default 3600)
 #   LOADGEN_TRANSPORT         tcp | shm | mixed                (default tcp)
@@ -405,8 +415,8 @@ function main()
     exit(err == 0 ? 0 : 1)
 end
 
-# Run only when invoked as the program (the entrypoint runs `julia loadgen.jl`); skip on `include`
-# so the driver can be loaded for a syntax/symbol check without connecting to a server.
+# Run only when invoked as the program (`julia loadgen.jl`); skip on `include` so the driver can be
+# loaded for a syntax/symbol check without connecting to a server.
 if abspath(PROGRAM_FILE) == @__FILE__
     main()
 end
