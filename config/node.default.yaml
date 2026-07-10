@@ -2,7 +2,7 @@
 # With it, `docker run --gpus all` needs no configuration at all: the supervisor detects the
 # visible GPUs and spawns one worker per device (worker0..workerN-1, ports base_port+i), plus
 # the embedded gateway on 8001 (gRPC) / 8002 (metrics, health). Mount your own file over
-# /etc/reactantserver/node.yaml to override anything here; see docker/node.yaml for the fully
+# /etc/reactantserver/node.yaml to override anything here; see config/node.yaml for the fully
 # commented multi-worker template (explicit workers lists, per-model device pinning, roles).
 
 model_repo: /var/lib/reactantserver/models

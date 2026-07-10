@@ -71,8 +71,8 @@ supervisor), plus the non-member **ReactantServerExport** (offline bundle export
 
 ```julia
 using ReactantServer
-ReactantServer.serve("docker/node.yaml")                    # single worker: name optional
-ReactantServer.serve("docker/node.yaml"; worker="worker0")  # multi-worker: name the worker
+ReactantServer.serve("config/node.yaml")                    # single worker: name optional
+ReactantServer.serve("config/node.yaml"; worker="worker0")  # multi-worker: name the worker
 ```
 
 All tests run on CPU and need no GPU. Each package is tested in its own environment:

@@ -207,7 +207,7 @@ The supervisor configures the embedded gateway for you: it synthesizes the worke
 about model placement is configured on the gateway; it autodiscovers which models each worker
 serves via `RepositoryIndex` and refreshes its routing table periodically.
 
-To tune the gateway, mount a `docker/gateway.yml` over `/etc/reactantserver/gateway.yml` (or set
+To tune the gateway, mount a `config/gateway.yml` over `/etc/reactantserver/gateway.yml` (or set
 `REACTANT_GATEWAY_FILE`); it carries the gateway's own settings (listen addresses, message
 limits, logging, and the `scheduling:` block above). Settings can also be overridden by
 environment with the prefix `REACTANT_GATEWAY_` and the dotted path uppercased with underscores,

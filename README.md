@@ -53,23 +53,28 @@ an example configuration for each.
 
 ## Quick start
 
-The node runs natively (no containers): serve a directory of model bundles and it scales to all
-visible GPUs.
+The node runs natively (no containers): run the supervisor over a directory of model bundles and it
+scales to all visible GPUs.
 
 ```
 git submodule update --init lib/gRPCServer.jl   # the one vendored fork the build needs
-MODELS=/path/to/bundles GPUS=0,1,2,3 private/deploy/serve_native.sh
+REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1 julia --project=. -e 'using Pkg; Pkg.instantiate()'
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 INFERENCE_SERVER_MODEL_DIRS=/path/to/bundles \
+REACTANT_NODE_FILE=config/node.gpu0123.yaml \
+  julia --handle-signals=no --project=packages/ReactantServerNode \
+    -e 'using ReactantServerNode; ReactantServerNode.main()'
 ```
 
 The first server startup is slow, since every model compiles before the gRPC plane accepts
 traffic. See [Deployment](https://enzymead.github.io/ReactantServer.jl/dev/manual/deployment/) for
-the launcher, the systemd unit, and configuration.
+configuration and running it as a service.
 
 Or from pure Julia:
 
 ```julia
 using ReactantServerNode
-ReactantServerNode.supervise("docker/node.yaml")   # one worker per GPU (+ gateway if >1)
+ReactantServerNode.supervise("config/node.yaml")   # one worker per GPU (+ gateway if >1)
 ```
 
 Clients speak KServe V2 gRPC to `:8001`; health and metrics are on `:8002`. Walk through exporting

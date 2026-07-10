@@ -2,9 +2,11 @@
 #
 # A single target is enough: the embedded gateway's admin endpoint (:8002 /metrics) serves its own
 # gateway_* series AND fans out to every worker's metrics endpoint, merging them into one exposition.
-# Each worker self-tags its series with `worker` and `gpu` labels, so they never collide. Reachable
-# as `reactantserver:8002` because this Prometheus runs on the same external `netai02` Docker network
-# (see docker-compose.monitoring.yml).
+# Each worker self-tags its series with `worker` and `gpu` labels, so they never collide.
+#
+# The node runs natively on the host, so the target is `host.docker.internal:8002` (mapped to the
+# host gateway by docker-compose.monitoring.yml). For a node on a different host, replace it with
+# that host's `address:8002`.
 global:
   scrape_interval: 15s
   scrape_timeout: 10s
@@ -15,7 +17,7 @@ scrape_configs:
   - job_name: reactantserver
     metrics_path: /metrics
     static_configs:
-      - targets: ["reactantserver:8002"]
+      - targets: ["host.docker.internal:8002"]
         labels:
           node: netai02
 

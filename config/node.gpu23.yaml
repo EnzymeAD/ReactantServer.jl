@@ -1,4 +1,4 @@
-# Two-GPU lpt_packing soak node config (reference; serve it with the native launcher or supervise()).
+# Two-GPU lpt_packing soak node config (reference; serve it via REACTANT_NODE_FILE or ReactantServerNode.supervise).
 # The supervisor runs two workers (one per visible GPU, selected by
 # CUDA_VISIBLE_DEVICES=2,3) plus the embedded gateway on 8001/8002. The gateway is put in
 # lpt_packing mode via the REACTANT_GATEWAY_SCHEDULING_* environment in the compose file. That mode

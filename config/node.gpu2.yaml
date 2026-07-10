@@ -1,4 +1,4 @@
-# Single-GPU soak node config (reference; serve it with the native launcher or supervise()).
+# Single-GPU soak node config (reference; serve it via REACTANT_NODE_FILE or ReactantServerNode.supervise).
 # The supervisor runs one worker on the GPU selected by
 # CUDA_VISIBLE_DEVICES plus the embedded gateway; the explicit single-worker list below is
 # honored as-is (the one visible device is assigned to it).

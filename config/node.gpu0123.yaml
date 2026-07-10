@@ -1,5 +1,5 @@
-# Four-GPU lpt_packing node config (the netai02 reference layout; serve it with the native launcher
-# via NODE_TEMPLATE, or with supervise()). The supervisor runs four workers (one per visible GPU, selected by
+# Four-GPU lpt_packing node config (the netai02 reference layout; serve it by pointing
+# REACTANT_NODE_FILE at it, or ReactantServerNode.supervise). The supervisor runs four workers (one per visible GPU, selected by
 # CUDA_VISIBLE_DEVICES=0,1,2,3) plus the embedded gateway on 8001/8002. The gateway is put in
 # lpt_packing mode via the REACTANT_GATEWAY_SCHEDULING_* environment in the compose file. That mode
 # requires every worker to run the fifo or edf discipline (set below, so placement decisions stay with

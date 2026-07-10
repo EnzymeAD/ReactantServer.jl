@@ -1,10 +1,10 @@
 # Node config template: one machine, one shared IPC space. The image bakes a zero-config
-# default (docker/node.default.yaml: `gpus: auto`, no workers list, one worker synthesized per
+# default (config/node.default.yaml: `gpus: auto`, no workers list, one worker synthesized per
 # detected GPU); mount a file like this one over /etc/reactantserver/node.yaml only to override
 # it, e.g. to pin models to device memory, change ports, or list workers explicitly. Each worker
 # loads (and can serve) every bundle in the mounted model repository. The embedded gateway is
 # configured by the supervisor automatically; a standalone gateway (multi-node) reads its own
-# docker/gateway.yml and discovers what each worker serves, so it never reads this file.
+# config/gateway.yml and discovers what each worker serves, so it never reads this file.
 #
 # The `workers:` list below is optional under the supervisor: omit it (optionally setting
 # `gpus:` to auto, a count, or an explicit device list) and one worker per detected GPU is

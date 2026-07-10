@@ -1,6 +1,5 @@
-# Developer tasks for ReactantServer. The container image builds were removed with the Docker
-# deployment tooling; the supported deployment is the native launcher + systemd (see
-# private/deploy/INSTALL.native.md).
+# Developer tasks for ReactantServer. The container image builds were removed; the supported
+# deployment is running the node supervisor natively (see the Deployment page in the docs).
 #
 #   make e2e        # native CPU end-to-end test (host processes; no containers)
 #   make docs       # build the Documenter site into docs/build/ (CPU only; no GPU needed)

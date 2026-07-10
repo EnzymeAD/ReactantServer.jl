@@ -39,10 +39,12 @@ it across those workers. See [Node Configuration](node_config.md) for the `model
 
 ## Run it natively
 
-Same launcher as before; just grant it all the GPUs (list them in `GPUS`):
+Same command as before; just grant it all the GPUs (list them in `CUDA_VISIBLE_DEVICES`):
 
 ```
-MODELS=$PWD/models GPUS=0,1,2,3 private/deploy/serve_native.sh
+CUDA_VISIBLE_DEVICES=0,1,2,3 INFERENCE_SERVER_MODEL_DIRS=$PWD/models REACTANT_NODE_FILE=node.yaml \
+  julia --handle-signals=no --project=packages/ReactantServerNode \
+    -e 'using ReactantServerNode; ReactantServerNode.main()'
 ```
 
 The supervisor detects N GPUs, runs `worker0..workerN-1` (each pinned to one device), and runs

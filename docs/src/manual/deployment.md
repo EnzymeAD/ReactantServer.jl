@@ -13,31 +13,101 @@ container (`Cannot load symbol cublasLtCreate`), which a native run does not hit
 
 ## Running natively
 
-The launcher and systemd unit, with full site-specific install/enable/journal steps, are documented
-in `private/deploy/INSTALL.native.md`. In short:
+Instantiate the workspace once, then run the node supervisor. `ReactantServerNode.main()` reads
+`REACTANT_NODE_FILE` for the node config and honors the standard environment overrides:
 
 ```bash
-# manual (from the checkout):
-MODELS=/path/to/bundles GPUS=0,1,2,3 CUDA_MAJOR_MINOR=13.1 \
-  private/deploy/serve_native.sh
+# once, to resolve and precompile the workspace (selects the CUDA build via REACTANT_GPU_*):
+REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1 \
+  julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
+
+# run the supervisor across four GPUs, serving a bundle directory:
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+INFERENCE_SERVER_MODEL_DIRS=/path/to/bundles \
+REACTANT_NODE_FILE=config/node.gpu0123.yaml \
+  julia --handle-signals=no --project=packages/ReactantServerNode \
+    -e 'using ReactantServerNode; ReactantServerNode.main()'
 ```
 
-`serve_native.sh` instantiates the workspace, generates the node config, exports the runtime
-environment, and execs the supervisor. `CUDA_MAJOR_MINOR` selects the Reactant CUDA build (`12.9`
-or `13.1`). For an always-on service, install the `reactantserver.service` systemd unit (see the
-install notes): it runs the launcher as the deploy user with `Restart=on-failure` and a graceful
-SIGTERM stop that drains the workers.
+`--handle-signals=no` lets the supervisor's own handler run so it shuts its worker children down on
+SIGTERM. `REACTANT_GPU_VERSION` selects the Reactant CUDA build (`12.9` or `13.1`) and must be set
+before `instantiate`. `INFERENCE_SERVER_MODEL_DIRS` overrides the node file's model repository
+(colon-separated); the runtime tunables under [Node Configuration](@ref) take
+`INFERENCE_SERVER_*` overrides the same way. For an always-on service, run this command under a
+process manager such as systemd, with `Restart=on-failure` and a `SIGTERM`-based graceful stop
+(`KillMode=mixed` pairs with `--handle-signals=no`).
 
 Every model compiles to a device executable on every worker before the gRPC plane accepts traffic,
 so first startup is slow (minutes to hours for a large model set). Watch readiness with
 `curl -sf http://127.0.0.1:8002/readyz`, not the process state.
+
+## Running under systemd
+
+For an always-on node, run the supervisor from a system service. Put the tunables in an
+`EnvironmentFile` and let the unit run the same command as above. Adjust the user, the checkout
+path, and the GPU list for your host.
+
+`/etc/reactantserver/reactantserver.env`:
+
+```ini
+CUDA_VISIBLE_DEVICES=0,1,2,3
+INFERENCE_SERVER_MODEL_DIRS=/path/to/bundles
+REACTANT_NODE_FILE=config/node.gpu0123.yaml
+REACTANT_GPU=cuda
+REACTANT_GPU_VERSION=13.1
+```
+
+`/etc/systemd/system/reactantserver.service`:
+
+```ini
+[Unit]
+Description=ReactantServer node supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=YOUR_DEPLOY_USER
+WorkingDirectory=/path/to/ReactantServer.jl
+EnvironmentFile=/etc/reactantserver/reactantserver.env
+# Absolute path to julia: systemd does not source your shell rc, so a juliaup install under the
+# user's home is not on PATH. `julia --version` in a login shell shows the binary to use here.
+ExecStart=/home/YOUR_DEPLOY_USER/.juliaup/bin/julia --handle-signals=no --project=packages/ReactantServerNode -e 'using ReactantServerNode; ReactantServerNode.main()'
+Restart=on-failure
+RestartSec=10
+# First boot compiles every model on every worker (minutes to hours) AFTER the unit is already
+# active; systemd cannot gate that (the supervisor sends no sd_notify). Check readiness with
+# `curl -sf http://127.0.0.1:8002/readyz`, not `systemctl is-active`.
+TimeoutStartSec=infinity
+# Graceful stop: SIGTERM to the supervisor only, which drains its workers; pairs with
+# --handle-signals=no. Anything still alive after TimeoutStopSec is SIGKILLed.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and watch it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now reactantserver.service
+journalctl -u reactantserver -f
+until curl -sf http://127.0.0.1:8002/readyz; do sleep 15; done; echo READY
+```
+
+`sudo systemctl stop reactantserver` sends SIGTERM to the supervisor, which drains its workers
+within `TimeoutStopSec` before exiting. Run the workspace `Pkg.instantiate()` once (as in the
+previous section) before enabling the unit, so the first start is not also resolving dependencies.
 
 ## Configuring
 
 The node is described by one YAML node file (see [Node Configuration](@ref)); the supervisor
 synthesizes one worker per visible GPU when no `workers:` list is given. Gateway scheduling
 (`round_robin` or `lpt_packing`) is covered in [Multi-GPU Gateway](@ref). The commented templates
-under `docker/` (`node.default.yaml`, `node.yaml`, `node.gpu0123.yaml`, `gateway.yml`) remain as
+under `config/` (`node.default.yaml`, `node.yaml`, `node.gpu0123.yaml`, `gateway.yml`) remain as
 reference configs.
 
 ## Roles
@@ -51,7 +121,9 @@ the code to split a deployment across machines, but multi-node is not a shipped 
 One scrape on `:8002` covers everything: with multiple workers the embedded gateway serves its own
 `gateway_*` series and fans out to each worker's metrics endpoint, merging them; with a single
 worker `:8002` is that worker's own `/metrics`. Each worker tags its series with `worker` and `gpu`
-labels. A ready-to-run Prometheus + Grafana stack lives under `docker/monitoring/`.
+labels. A ready-to-run Prometheus + Grafana stack lives under `config/monitoring/`; because the node
+runs natively (not in a container), that stack's Prometheus scrapes the host at
+`host.docker.internal:8002` rather than over a Docker network (see `config/monitoring/README.md`).
 
 ## Security
 

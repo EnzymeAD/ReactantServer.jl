@@ -91,19 +91,22 @@ how the `gpus: auto` default and [Scaling to Multiple GPUs](scaling.md) work. Se
 [Node Configuration](node_config.md) for the full surface (scheduler, on-demand weights,
 per-model pinning, environment overrides).
 
-## Step 3: Run it natively
+## Step 3: Run it
 
-Start the node with the launcher, pointing `MODELS` at the repository from Step 1:
+Run the node supervisor, pointing it at the repository from Step 1
+(`INFERENCE_SERVER_MODEL_DIRS` overrides the node file's model repo):
 
 ```
-MODELS=$PWD/models GPUS=0 private/deploy/serve_native.sh
+CUDA_VISIBLE_DEVICES=0 INFERENCE_SERVER_MODEL_DIRS=$PWD/models REACTANT_NODE_FILE=node.yaml \
+  julia --handle-signals=no --project=packages/ReactantServerNode \
+    -e 'using ReactantServerNode; ReactantServerNode.main()'
 ```
 
 With a single GPU the node runs one worker and **no gateway**: the worker serves the KServe V2
 gRPC API on `localhost:8001` and metrics/health on `localhost:8002` (`/readyz`, `/healthz`,
 `/metrics`). The first start compiles every model before accepting traffic, so give it a moment;
 `curl localhost:8002/readyz` returns 200 once it is serving. See [Deployment](deployment.md) for
-the launcher, systemd unit, health, and metrics details.
+configuration, running as a service, health, and metrics details.
 
 ## Step 4: Or run it from pure Julia
 

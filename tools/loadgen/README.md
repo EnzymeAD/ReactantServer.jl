@@ -3,7 +3,7 @@
 Standalone soak / benchmark tools for a running ReactantServer node. Reactant-free: they need only
 `ReactantServerClient` (which pulls in `ReactantServerCore` and `gRPCClient`), so run them under that
 package's project. They connect to a node's gateway over KServe V2 gRPC; they do not build or manage
-the server (previously these lived under `docker/loadgen/` alongside the removed container tooling).
+the server (they were relocated here from the removed container tooling).
 
 - `loadgen.jl` — drives sustained, concurrent, zero-input inference across every model to surface
   memory leaks, races, and instability. Synthesizes inputs from each bundle's manifest, runs to a
