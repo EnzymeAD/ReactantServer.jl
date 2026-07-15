@@ -7,9 +7,11 @@ the server (they were relocated here from the removed container tooling).
 
 - `loadgen.jl` — drives sustained, concurrent, zero-input inference across every model to surface
   memory leaks, races, and instability. Synthesizes inputs from each bundle's manifest, runs to a
-  fixed duration, prints a rolling summary, and exits nonzero if any request errored. Configured
-  entirely through `LOADGEN_*` environment variables (documented in the file header), including the
-  `tcp` / `shm` / `mixed` transports.
+  fixed duration, prints a rolling summary and a per-model table. Configured entirely through
+  `LOADGEN_*` environment variables (documented in the file header), including the `tcp` / `shm` /
+  `mixed` transports, per-model coverage floors, `rows` / `burst` batch modes, deadline pressure,
+  and a shed-ceiling concurrency ramp. Exit codes: 1 request errors, 3 coverage shortfall,
+  4 wedged transport (stall watchdog).
 - `probe_large_variants.jl` — sends one correctly-sized zero image per declared input shape of a
   multi-shape detection model (e.g. `text_fuse_net_gpu`), so every compiled variant actually executes
   and allocates its full scratch. Use it to confirm the largest programs fit on the card.
