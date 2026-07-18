@@ -36,10 +36,11 @@ end
         got[1] = 0xff
         @test vbuf[17] != 0xff
 
-        # bounds and unknown-region errors are enforced
+        # bounds errors stay ArgumentError; an unknown region is the distinct UnregisteredRegionError
+        # (mapped to FAILED_PRECONDITION at the transport, so a client can re-register and retry).
         @test_throws ArgumentError ReactantServer.shm_read(reg, "r", 24, 16)
         @test_throws ArgumentError ReactantServer.shm_write!(reg, "r", 24, payload)
-        @test_throws ArgumentError ReactantServer.shm_read(reg, "missing", 0, 4)
+        @test_throws ReactantServer.UnregisteredRegionError ReactantServer.shm_read(reg, "missing", 0, 4)
 
         # unregister is idempotent: an unknown name is a successful no-op (so the gateway fan-out and
         # the client's pre-emptive cleanup unregister never error on a region that was never
@@ -176,7 +177,8 @@ end
                 "SystemSharedMemoryStatus", port, _ShmInf.SystemSharedMemoryStatusRequest(; name=""))
             @test !haskey(st2.regions, "rin") && haskey(st2.regions, "rio")
 
-            # referencing an unregistered region is a client error (INVALID_ARGUMENT)
+            # referencing an unregistered region is recoverable (the client re-registers), so it
+            # surfaces as FAILED_PRECONDITION, distinct from a malformed-request INVALID_ARGUMENT.
             inBad = _ShmInf.var"ModelInferRequest.InferInputTensor"(; name="x", datatype="FP32", shape=Int64[4],
                 parameters=Dict("shared_memory_region" => _sp("rin"),
                                 "shared_memory_byte_size" => _ip(16)))
@@ -186,7 +188,24 @@ end
                 @test false
             catch ex
                 @test ex isa gRPCClient.gRPCServiceCallException
-                @test ex.grpc_status == ReactantServer._G.GRPC_INVALID_ARGUMENT
+                @test ex.grpc_status == ReactantServer._G.GRPC_FAILED_PRECONDITION
+            end
+
+            # simulate a server restart: wipe the in-memory registry while the process keeps serving.
+            # A request against the still-registered "rio" region now fails the same recoverable way,
+            # which is exactly the stale-registration signal the client keys its recovery on.
+            ReactantServer.shm_teardown!(srv.shm)
+            inStale = _ShmInf.var"ModelInferRequest.InferInputTensor"(; name="x", datatype="FP32", shape=Int64[4],
+                parameters=Dict("shared_memory_region" => _sp("rio"),
+                                "shared_memory_offset" => _ip(0),
+                                "shared_memory_byte_size" => _ip(16)))
+            try
+                grpc_call(_ShmInf.ModelInferRequest, _ShmInf.ModelInferResponse, "ModelInfer", port,
+                    _ShmInf.ModelInferRequest(; model_name="scale4", inputs=[inStale]))
+                @test false
+            catch ex
+                @test ex isa gRPCClient.gRPCServiceCallException
+                @test ex.grpc_status == ReactantServer._G.GRPC_FAILED_PRECONDITION
             end
         finally
             ReactantServer.stop!(srv)

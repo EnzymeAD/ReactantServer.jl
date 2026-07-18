@@ -14,6 +14,16 @@
 
 import InterProcessCommunication as IPC
 
+# Thrown when a tensor references a shared-memory region name the registry does not know. This is
+# a distinct type (not a bare ArgumentError) so the transport can map it to a distinct gRPC status
+# (FAILED_PRECONDITION): it is the exact signal a client gets after a server restart wiped the
+# in-memory registry, and it is recoverable by re-registering, unlike a malformed-argument error.
+struct UnregisteredRegionError <: Exception
+    name::String
+end
+Base.showerror(io::IO, e::UnregisteredRegionError) =
+    print(io, "unregistered shared memory region: ", e.name)
+
 mutable struct ShmRegion
     name::String
     key::String
@@ -141,7 +151,7 @@ shm_teardown!(reg::SharedMemoryRegistry) = shm_unregister!(reg, "")
 # the caller takes that lock and re-checks `attached` before touching the mapping.
 function _lookup_region(reg::SharedMemoryRegistry, name::AbstractString)
     r = @lock reg.lock get(reg.regions, name, nothing)
-    r === nothing && throw(ArgumentError("unregistered shared memory region: $name"))
+    r === nothing && throw(UnregisteredRegionError(String(name)))
     return r
 end
 
@@ -171,7 +181,7 @@ cannot detach the mapping underneath the read.
 function shm_read(reg::SharedMemoryRegistry, name::AbstractString, offset::Integer, byte_size::Integer)
     r = _lookup_region(reg, name)
     @lock r.lock begin
-        r.attached || throw(ArgumentError("unregistered shared memory region: $name"))
+        r.attached || throw(UnregisteredRegionError(String(name)))
         base, bs = _region_base(r, offset, byte_size)
         out = Vector{UInt8}(undef, bs)
         GC.@preserve r out unsafe_copyto!(pointer(out), base, bs)
@@ -190,7 +200,7 @@ function shm_write!(reg::SharedMemoryRegistry, name::AbstractString, offset::Int
                     bytes::Vector{UInt8})
     r = _lookup_region(reg, name)
     @lock r.lock begin
-        r.attached || throw(ArgumentError("unregistered shared memory region: $name"))
+        r.attached || throw(UnregisteredRegionError(String(name)))
         base, bs = _region_base(r, offset, length(bytes))
         GC.@preserve r bytes unsafe_copyto!(base, pointer(bytes), bs)
         return nothing

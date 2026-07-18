@@ -678,3 +678,6 @@ end
         kserve_shutdown()
     end
 end
+
+# Shared-memory recovery against a mock KServe gRPC server (restart, coalescing, latch, unlatch).
+include("test_shm_recovery.jl")

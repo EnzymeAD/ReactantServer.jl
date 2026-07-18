@@ -255,13 +255,60 @@ _request_deadline_params(m::KServeModel) =
 _request_deadline_params(budget_s::Real) =
     deadline_params(budget_s > 0 ? round(Int64, budget_s * 1e9) : 0)
 
+# A stale shared-memory registration: the server no longer knows the region our request references,
+# because it restarted (or otherwise dropped its registry) since we registered. The worker maps it to
+# FAILED_PRECONDITION; the message substring is a fallback for the case where the status is rewritten
+# in transit (e.g. an older gateway folding it into UNAVAILABLE) but the worker's message survives.
+function _is_stale_registration(e)
+    e isa gRPCClient.gRPCServiceCallException || return false
+    e.grpc_status == gRPCClient.GRPC_FAILED_PRECONDITION && return true
+    return occursin("unregistered shared memory region", e.message)
+end
+
+# Thrown when shared memory could not be recovered in-band (re-registration failed, or the retried
+# request was still stale). Signals the drive loop to latch the endpoint to inline transport.
+struct ShmUnrecoverableError <: Exception
+    model::Any
+    cause::Any
+end
+
 # A shed the client should back off and retry: RESOURCE_EXHAUSTED (a worker or the gateway at its
 # concurrency cap) always, and UNAVAILABLE (no replica reachable) when the policy allows. Deadline,
-# NOT_FOUND, INVALID_ARGUMENT, and INTERNAL are not retried, so a doomed request fails fast.
+# NOT_FOUND, INVALID_ARGUMENT, and INTERNAL are not retried, so a doomed request fails fast. A stale
+# shared-memory registration is never retried here: it is handled by _send_with_shm_recovery, which
+# re-registers and retries once, so the backoff loop must surface it immediately instead of burning
+# the budget re-sending a request the server will keep rejecting.
 function _retryable_shed(e, p::RetryPolicy)
     e isa gRPCClient.gRPCServiceCallException || return false
+    _is_stale_registration(e) && return false
     e.grpc_status == gRPCClient.GRPC_RESOURCE_EXHAUSTED && return true
     return p.retry_unavailable && e.grpc_status == gRPCClient.GRPC_UNAVAILABLE
+end
+
+# Wrap a chunk send with one-shot, coalesced shared-memory recovery. On the SHM path, snapshot the
+# endpoint's registration generation, send, and on a stale-registration error re-register once (only
+# the first concurrent failer actually re-registers; see recover_registration!) and retry the send.
+# If re-registration throws, or the retry is still stale, raise ShmUnrecoverableError so the drive
+# loop latches this endpoint to inline. Inline pools (and non-KServe models) send with no recovery.
+function _send_with_shm_recovery(send, m, pool::InferenceBufferPool)
+    (is_shm_backed(pool) && m isa KServeModel) || return send()
+    observed = registration_gen(pool, (m.host, m.port))
+    try
+        return send()
+    catch e
+        _is_stale_registration(e) || rethrow()
+        try
+            recover_registration!(pool, m, observed)
+        catch reg_err
+            throw(ShmUnrecoverableError(m, reg_err))
+        end
+        try
+            return send()
+        catch e2
+            _is_stale_registration(e2) && throw(ShmUnrecoverableError(m, e2))
+            rethrow()
+        end
+    end
 end
 
 # Run `attempt(budget_s)` (one ModelInfer round trip given the remaining budget in seconds),
@@ -311,10 +358,21 @@ function _infer_pool_driven(
     force_serial::Bool,
 )
     # Transport is decided up front by get_or_create_pool! (an IsSameIPCNamespace probe for a
-    # KServeModel). There is no silent runtime fallback: a shared-memory failure here surfaces to
-    # the caller rather than being retried inline.
+    # KServeModel). A stale shared-memory registration self-heals in _send_with_shm_recovery (one
+    # re-register + retry, keeping SHM). Only if that fails does the batch surface a
+    # ShmUnrecoverableError here, and we latch the endpoint to inline and re-run inline as a last
+    # resort; a background poller restores SHM later if the server recovers.
     pool = get_or_create_pool!(m)
-    _drive_pool_inference(m, io, pool; force_serial = force_serial)
+    try
+        _drive_pool_inference(m, io, pool; force_serial = force_serial)
+    catch e
+        (e isa ShmUnrecoverableError && is_shm_backed(pool) && m isa KServeModel) || rethrow()
+        inline = latch_inline!(m)
+        # Re-run the whole batch inline. Chunks decoded before the SHM failure are decoded again;
+        # this is benign for the typical preallocated-output IO, and a stale registration normally
+        # fails the batch wholesale anyway.
+        _drive_pool_inference(m, io, inline; force_serial = force_serial)
+    end
     nothing
 end
 
@@ -431,16 +489,18 @@ function _run_chunk(m, io, pool, fill_lock, r, slot)
         # Materialize inputs once; only the per-attempt deadline (client timeout + in-body budget)
         # changes across retries, and SHM-backed inputs stay valid until the slot is released below.
         materialized = _materialize_inputs(inputs, m, pool)
-        response = _infer_with_retry(m) do budget_s
-            grpc_sync_request(
-                grpc_infer_client(m, budget_s),
-                ModelInferRequest(
-                    model_name = model_name(m),
-                    inputs = materialized,
-                    outputs = requested,
-                    parameters = _request_deadline_params(budget_s),
-                ),
-            )
+        response = _send_with_shm_recovery(m, pool) do
+            _infer_with_retry(m) do budget_s
+                grpc_sync_request(
+                    grpc_infer_client(m, budget_s),
+                    ModelInferRequest(
+                        model_name = model_name(m),
+                        inputs = materialized,
+                        outputs = requested,
+                        parameters = _request_deadline_params(budget_s),
+                    ),
+                )
+            end
         end
         infer_decode_chunk!(io, r, _rehydrate_response(response, out_subslots))
     finally

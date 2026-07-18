@@ -108,7 +108,7 @@ export node_gpus, materialize_node!
 
 # ---- shared-memory registry ----
 export ShmRegion, SharedMemoryRegistry, shm_register!, shm_unregister!, shm_read, shm_write!
-export shm_regions, shm_teardown!, same_ipc_namespace
+export shm_regions, shm_teardown!, same_ipc_namespace, UnregisteredRegionError
 
 # ---- codec ----
 export OutputTarget, DecodedRequest, decode_infer_request, encode_infer_response, encode_model_metadata
