@@ -266,6 +266,11 @@ end
 # retire it.
 function _ensure_reprobe_running!()
     _reprobe_interval[] > 0 || return
+    # Never spawn the background poller while generating precompile output: its `sleep` keeps a libuv
+    # timer handle open, which makes precompilation of any downstream package that exercises a latch
+    # warn ("waiting for IO to finish") or hang. Latching still routes to inline during precompile;
+    # the poller starts on the first latch at real runtime instead.
+    ccall(:jl_generating_output, Cint, ()) == 0 || return
     @lock _pools_lock begin
         t = _reprobe_task[]
         (t !== nothing && !istaskdone(t)) && return
