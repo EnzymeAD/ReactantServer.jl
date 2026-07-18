@@ -1,6 +1,6 @@
 name = "ReactantServerNode"
 uuid = "49f09047-4fb9-4260-828b-8494ed8e9881"
-version = "0.1.5"
+version = "0.1.6"
 authors = ["Carroll Vance <cvance@medicalmetrics.com>"]
 
 [deps]
@@ -8,7 +8,7 @@ ReactantServerCore = "387a5f05-f7b4-4d57-bca9-cd3358e52bdc"
 YAML = "ddb6d928-2868-570f-bddf-ab3f9cf99eb6"
 
 [compat]
-ReactantServerCore = "=0.1.5"
+ReactantServerCore = "=0.1.6"
 YAML = "0.4.16"
 julia = "1.12"
 
