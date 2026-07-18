@@ -267,12 +267,13 @@ function grpc_shm_register_client(x::KServeModel)
     )
 end
 
-function grpc_is_same_ipc_namespace_client(x::KServeModel)
+function grpc_is_same_ipc_namespace_client(x::KServeModel; deadline = 10)
     GRPCInferenceService_IsSameIPCNamespace_Client(
         x.host,
         x.port;
         secure = x.secure,
         grpc = x.grpc,
+        deadline = deadline,
     )
 end
 

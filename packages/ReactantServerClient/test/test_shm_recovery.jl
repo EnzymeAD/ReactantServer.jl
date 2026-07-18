@@ -32,12 +32,13 @@ mutable struct MockState
     regions::Set{String}                 # region names the server currently "knows"
     same_ns::Bool                        # IsSameIPCNamespace answer
     reject_register::Bool                # when true, register throws (SHM unrecoverable)
+    probe_sleep::Float64                 # seconds the IsSameIPCNamespace handler stalls before replying
     register_calls::Threads.Atomic{Int}  # total SystemSharedMemoryRegister invocations
     infer_calls::Threads.Atomic{Int}
     lock::ReentrantLock
 end
-MockState() = MockState(Set{String}(), true, false, Threads.Atomic{Int}(0), Threads.Atomic{Int}(0),
-                        ReentrantLock())
+MockState() = MockState(Set{String}(), true, false, 0.0, Threads.Atomic{Int}(0),
+                        Threads.Atomic{Int}(0), ReentrantLock())
 
 # Extract a tensor's shared_memory_region string parameter, or nothing when the tensor is inline.
 function _region_of(t)
@@ -50,7 +51,10 @@ function _mk_router(st::MockState)
     router = gRPCServer.gRPCRouter(; max_receive_message_length = 64 * 1024 * 1024,
                                    max_send_message_length = 64 * 1024 * 1024)
     register_GRPCInferenceService!(router;
-        IsSameIPCNamespace = (req, ctx) -> inf.IsSameIPCNamespaceResponse(; same = st.same_ns),
+        IsSameIPCNamespace = (req, ctx) -> begin
+            st.probe_sleep > 0 && sleep(st.probe_sleep)   # simulate a restarted-but-unresponsive server
+            inf.IsSameIPCNamespaceResponse(; same = st.same_ns)
+        end,
         SystemSharedMemoryRegister = (req, ctx) -> begin
             Threads.atomic_add!(st.register_calls, 1)
             st.reject_register &&
@@ -176,7 +180,7 @@ end
 end
 
 @testset "re-probe poller lifecycle" begin
-    # A positive interval starts a single background task; _stop_reprobe! joins it cleanly.
+    # A positive interval starts a single background task; kserve_shutdown retires it.
     kserve_init(; shm_reprobe_interval = 0.1)
     RSC._ensure_reprobe_running!()
     t = RSC._reprobe_task[]
@@ -190,6 +194,29 @@ end
     RSC._ensure_reprobe_running!()
     @test RSC._reprobe_task[] === nothing
     kserve_shutdown()
+end
+
+@testset "shutdown does not block on an in-flight re-probe" begin
+    # Regression: kserve_shutdown must return promptly even while the poller is parked in a probe
+    # against a restarted-but-unresponsive server (the old code did wait(t) and hung).
+    st = MockState()
+    st.same_ns = true
+    st.probe_sleep = 2.0                         # the IsSameIPCNamespace handler stalls 2s
+    port = free_port()
+    server = gRPCServer.serve!(_mk_router(st), "127.0.0.1", port)
+    try
+        kserve_init(; pool_bytes = 1 << 20, n_slots = 4, shm_reprobe_interval = 0.02)
+        m = KServeModel("127.0.0.1", port, "m"; shared_memory = :on)
+        RSC.latch_inline!(m)                     # populates _latched and starts the poller
+        sleep(0.4)                               # let the poller enter (and stall inside) a probe
+        t0 = time()
+        kserve_shutdown()
+        dt = time() - t0
+        @test dt < 1.0                           # must not wait out the 2s probe
+        @test RSC._reprobe_task[] === nothing
+    finally
+        close(server)
+    end
 end
 
 end # module

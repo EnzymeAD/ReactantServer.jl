@@ -159,7 +159,13 @@ const _pool_slots = Ref{Int}(DEFAULT_POOL_SLOTS)
 const _latched = Dict{PoolKey,KServeModel}()
 const _reprobe_interval = Ref{Float64}(60.0)      # seconds; <= 0 disables the poller
 const _reprobe_task = Ref{Union{Task,Nothing}}(nothing)
-const _reprobe_stop = Ref{Bool}(false)
+# The running loop is identified by a generation number. Bumping it (in _stop_reprobe!) invalidates
+# the current loop so it returns at its next checkpoint, WITHOUT anyone blocking on the task -- the
+# task may be parked in a gRPC probe, and waiting on that is the shutdown hang we must avoid.
+const _reprobe_gen = Ref{Int}(0)
+# Short per-probe deadline for the poller's own IsSameIPCNamespace call. A restarted-but-not-yet-ready
+# or wedged server must not pin the background task; the normal request path keeps the 10s default.
+const _REPROBE_RPC_DEADLINE = 3
 
 function _route_lock_for(key::PoolKey)
     @lock _pools_lock get!(() -> ReentrantLock(), _route_locks, key)
@@ -206,8 +212,8 @@ end
 # :unknown means the server does not implement the RPC (UNIMPLEMENTED, e.g. stock Triton). Any
 # other gRPC error propagates: a probe that fails for an unrelated reason must not be silently
 # read as "no shared memory".
-function query_same_ipc_namespace(model::KServeModel, name::AbstractString)
-    client = grpc_is_same_ipc_namespace_client(model)
+function query_same_ipc_namespace(model::KServeModel, name::AbstractString; deadline = 10)
+    client = grpc_is_same_ipc_namespace_client(model; deadline = deadline)
     try
         resp = grpc_sync_request(client, IsSameIPCNamespaceRequest(name = name))
         return resp.same ? :yes : :no
@@ -256,42 +262,45 @@ function unlatch_shm!(key::PoolKey)
 end
 
 # Start the re-probe loop once (idempotent), unless the interval is non-positive (poller disabled).
+# Each loop carries the generation it was started under; _stop_reprobe! bumps the generation to
+# retire it.
 function _ensure_reprobe_running!()
     _reprobe_interval[] > 0 || return
     @lock _pools_lock begin
         t = _reprobe_task[]
         (t !== nothing && !istaskdone(t)) && return
-        _reprobe_stop[] = false
-        _reprobe_task[] = Threads.@spawn _shm_reprobe_loop()
+        g = (_reprobe_gen[] += 1)
+        _reprobe_task[] = errormonitor(Threads.@spawn _shm_reprobe_loop(g))
     end
     return
 end
 
-# Stop the re-probe loop and wait for it to exit. MUST be called without holding _pools_lock, since
-# the loop takes that lock; waiting on it while holding the lock would deadlock.
+# Retire the re-probe loop. Non-blocking by design: we bump the generation (so the loop returns at
+# its next checkpoint) and drop our handle to it, but we do NOT wait for the task. The task may be
+# parked in a blocking gRPC probe against a down/wedged server, and blocking shutdown on that is
+# exactly the hang this avoids; the orphaned task observes the generation change and exits on its own.
+# Safe to call with or without _pools_lock held.
 function _stop_reprobe!()
-    _reprobe_stop[] = true
-    t = _reprobe_task[]
-    if t !== nothing
-        try
-            wait(t)
-        catch
-        end
+    @lock _pools_lock begin
+        _reprobe_gen[] += 1
         _reprobe_task[] = nothing
     end
     return
 end
 
 # One re-probe pass over the latched endpoints. For each, ask whether the server can see our SHM
-# object again (IsSameIPCNamespace); only on :yes do we attempt a real re-registration and, on
-# success, unlatch back to SHM. A :no/:unknown answer or any error leaves the endpoint latched.
+# object again (IsSameIPCNamespace, under a short deadline); only on :yes do we attempt a real
+# re-registration and, on success, unlatch back to SHM. A :no/:unknown answer or any error leaves the
+# endpoint latched. Failed probes log at @debug only, so a persistently-degraded endpoint does not
+# spam the log every tick.
 function _reprobe_once()
     latched = @lock _pools_lock collect(_latched)   # snapshot of (key => model)
     isempty(latched) && return
     shm = _get_shm_pool!()
     for (key, model) in latched
         try
-            query_same_ipc_namespace(model, shmid(shm.pool.backing)) === :yes || continue
+            query_same_ipc_namespace(model, shmid(shm.pool.backing);
+                                     deadline = _REPROBE_RPC_DEADLINE) === :yes || continue
             # Force an actual re-register even if the endpoint is still in registered_keys.
             @lock shm.register_lock delete!(shm.registered_keys, (model.host, model.port))
             register_pool_with_model!(shm, model)
@@ -303,16 +312,17 @@ function _reprobe_once()
     return
 end
 
-function _shm_reprobe_loop()
-    while !_reprobe_stop[]
-        # Sleep in short slices up to the interval so a shutdown request is picked up promptly.
+# Background loop: re-probe every `interval` seconds until this generation is retired. Sleeps in short
+# slices so a stop (generation bump) is picked up within a slice even while idle.
+function _shm_reprobe_loop(mygen::Int)
+    while _reprobe_gen[] == mygen
         slept = 0.0
-        while slept < _reprobe_interval[] && !_reprobe_stop[]
+        while slept < _reprobe_interval[] && _reprobe_gen[] == mygen
             dt = min(0.5, _reprobe_interval[] - slept)
             sleep(dt)
             slept += dt
         end
-        _reprobe_stop[] && break
+        _reprobe_gen[] == mygen || break
         try
             _reprobe_once()
         catch ex
