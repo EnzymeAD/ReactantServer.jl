@@ -90,6 +90,14 @@ end
 # the safe way to trigger it without reaching into Reactant's field layout.
 free_buffer!(::ReactantBackend, buffer) = (Base.finalize(buffer); nothing)
 
+# Eager executable release, same rationale and mechanism as free_buffer!. Reactant's
+# PJRT.LoadedExecutable frees the underlying PjRtLoadedExecutable in its GC finalizer
+# (free_exec -> ExecutableFree); the executable object itself is tiny, so under low allocation
+# pressure that finalizer can be deferred indefinitely while the executable's command buffers
+# (CUDA graphs, allocated by the driver outside the BFC arena) stay resident. XLA destroys the
+# command buffers when the executable is destroyed, so finalizing now reclaims them now.
+free_executable!(::ReactantBackend, exec) = (Base.finalize(exec); nothing)
+
 function _flatten_buffers!(acc, x)
     if x isa _RXLA.AbstractBuffer
         push!(acc, x)

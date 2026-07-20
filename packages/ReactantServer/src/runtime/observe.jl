@@ -141,6 +141,10 @@ end
 log_model_unloaded(name::AbstractString, nbytes::Integer; memory::AbstractString) =
     (@info "model unloaded" name = name freed = Base.format_bytes(nbytes) memory = memory; nothing)
 
+# A rename keeps the compiled executables and resident weights; nothing is freed or compiled.
+log_model_renamed(old::AbstractString, new::AbstractString) =
+    (@info "model renamed" from = old to = new; nothing)
+
 # Debug level: residency moves happen on the request path (on-demand weight cache churn), which
 # is far too chatty for the default log surface. Enable with JULIA_DEBUG=ReactantServer.
 log_residency_change(name::AbstractString, from, to, nbytes::Integer; memory::AbstractString) =

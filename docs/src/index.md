@@ -27,7 +27,8 @@ clients connect to it directly.
 - The KServe V2 control plane over gRPC: liveness/readiness, model and server metadata,
   inference, a `RepositoryIndex`, and the Triton-compatible system shared-memory data plane.
 - Model lifecycle control: the default `dynamic` mode watches the model repository and
-  loads/unloads/reloads bundles online (weights, MLIR, and `model.jl` changes alike); `static`
+  loads/unloads/reloads/renames bundles online (weights, MLIR, and `model.jl` changes alike;
+  a renamed bundle directory renames the live model in place with no recompile); `static`
   fixes the startup set; `explicit` cedes lifecycle and residency to an external control plane
   over the worker control RPCs.
 - Multi-GPU scheduling in the gateway: `round_robin` or `lpt_packing`, which places each model on a

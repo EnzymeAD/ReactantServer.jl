@@ -375,12 +375,52 @@ end
         @test !haskey(sched.registry.by_name, "B")
         @test bexec.weights === nothing
         @test all(b -> b.freed, bufs)                       # device buffers released
+        # The compiled executables are freed eagerly too (their command buffers live outside the
+        # BFC arena and would otherwise linger until GC happens to run the finalizer).
+        @test all(e -> e.freed, collect(values(bexec.execs[Int[]])))
 
         # A request to the unloaded model now errors; eviction is idempotent; re-admitting a live
         # name errors.
         @test_throws Exception ReactantServer.infer(sched, req("B"))
         @test ReactantServer.evict!(sched, "B") === nothing
         @test_throws Exception ReactantServer.admit!(sched, _od_entry("A"; pinned=false, nbytes=_WBYTES))
+    finally
+        ReactantServer.shutdown!(sched)
+    end
+end
+
+@testset "rename_model! renames in place: no reload, no recompile, residency rekeyed" begin
+    sched = _od_scheduler(_od_entry("A"; pinned=false, nbytes=_WBYTES); budget=_WBYTES * 8)
+    ReactantServer.start!(sched)
+    req(name) = ReactantServer.InferRequest(name, ["y"], [ReactantServer.NamedTensor("x", reshape(Float32[1, 1], 2, 1))])
+    try
+        # Serve once so A's weights are LRU-resident under the old name.
+        @test ReactantServer.infer(sched, req("A"))[1].data == reshape(Float32[10, 100], 2, 1)
+        entry = sched.registry.by_name["A"]
+        exec = entry.executable.execs[Int[]][1]
+        @test "A" in sched.weight_cache.lru
+
+        ReactantServer.rename_model!(sched, "A", "B")
+        @test !haskey(sched.registry.by_name, "A")
+        e2 = sched.registry.by_name["B"]
+        @test e2 === entry                              # the same live entry: nothing was reloaded
+        @test e2.executable.execs[Int[]][1] === exec    # the same executable: nothing was recompiled
+        @test !exec.freed                               # and it was NOT freed (rename is not evict)
+        @test e2.name == "B" && e2.sched.name == "B"
+        @test !("A" in sched.weight_cache.lru) && ("B" in sched.weight_cache.lru)
+        @test ReactantServer.infer(sched, req("B"))[1].data == reshape(Float32[10, 100], 2, 1)
+        @test_throws Exception ReactantServer.infer(sched, req("A"))
+
+        # The residency floor resolved for the new name is applied when it differs (the config is
+        # keyed by model name, e.g. a `-production` name may be pinned where `-staging` was not).
+        ReactantServer.rename_model!(sched, "B", "C"; residency=ReactantServer.PINNED_DEVICE)
+        @test sched.registry.by_name["C"].executable.state == ReactantServer.PINNED_DEVICE
+        @test !("C" in sched.weight_cache.lru)          # device-pinned models leave the LRU budget
+
+        # An unknown old name and a colliding new name are rejected.
+        @test_throws Exception ReactantServer.rename_model!(sched, "missing", "X")
+        ReactantServer.admit!(sched, _od_entry("D"; pinned=false, nbytes=_WBYTES))
+        @test_throws Exception ReactantServer.rename_model!(sched, "D", "C")
     finally
         ReactantServer.shutdown!(sched)
     end

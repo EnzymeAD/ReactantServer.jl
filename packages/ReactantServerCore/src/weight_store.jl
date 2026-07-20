@@ -236,6 +236,24 @@ references to the arrays first.
 """
 release_host_weights!(::PrivateWeightStore, key) = nothing
 
+"""
+    rename_host_weights!(store, old, new) -> nothing
+
+Rekey a model's attached host-weight region from `old` to `new` (a model rename; the weights are
+unchanged). The region itself keeps its original content-addressed SHM name; only this worker's
+bookkeeping key moves, so a later `release_host_weights!(store, new)` detaches the same region.
+A no-op for the private store and when nothing is attached under `old`.
+"""
+rename_host_weights!(::PrivateWeightStore, old, new) = nothing
+
+function rename_host_weights!(store::SharedWeightStore, old, new)
+    @lock store.lock begin
+        ent = pop!(store.attached, String(old), nothing)
+        ent === nothing || (store.attached[String(new)] = ent)
+    end
+    return nothing
+end
+
 function release_host_weights!(store::SharedWeightStore, key)
     ent = @lock store.lock get(store.attached, String(key), nothing)
     ent === nothing && return nothing

@@ -34,8 +34,16 @@ end
         arrs = materialize_host_weights!(store, key, dg, specs, a -> (a[1] .= Float32[10, 20, 30, 40]))
         @test arrs[1] == Float32[10, 20, 30, 40]
         @test isfile(region)
-        release_host_weights!(store, key)
+
+        # A model rename rekeys the attachment; the region (content-addressed under the OLD name)
+        # stays mapped and a release under the NEW key detaches and unlinks it.
+        rename_host_weights!(store, key, key * "_renamed")
+        @test isfile(region)
+        release_host_weights!(store, key)                  # old key: no longer attached, no-op
+        @test isfile(region)
+        release_host_weights!(store, key * "_renamed")
         @test !isfile(region)         # sole holder unlinks on release
+        rename_host_weights!(PrivateWeightStore(), "a", "b")   # no-op
     end
 end
 

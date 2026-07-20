@@ -26,6 +26,12 @@ function free_buffer! end                # (backend, buffer) -> nothing
 # Execution. inputs are in StableHLO main argument order (model inputs, then weights).
 function execute_single_device end       # (backend, exec, device, buffers, donated, num_outputs) -> Vector{buffer}
 
+# Eager release of a compiled executable's device-side state (command buffers / CUDA graphs live
+# outside the BFC arena and are otherwise only reclaimed when GC happens to run the finalizer).
+# Called by evict on the dispatch thread once no execution can be in flight. Default: no-op
+# (backends whose executables hold no device state, e.g. MockBackend).
+free_executable!(::AbstractBackend, exec) = nothing
+
 # Device memory introspection (optional, for observability). Returns a NamedTuple
 # `(in_use, limit, free)` of byte counts, or `nothing` when the backend/device cannot report it
 # (e.g. the CPU client or MockBackend). Callers degrade gracefully on `nothing`.

@@ -20,8 +20,14 @@
     @test m.input_batch_dim == 0
     @test ReactantServer.validate_manifest(m, "/models/resnet", false) === m
 
-    # name must match the directory name
-    @test_throws ReactantServer.ManifestError ReactantServer.validate_manifest(m, "/models/other", false)
+    # The manifest `name` is informational; identity comes from the bundle directory, so a
+    # mismatching (or absent) name validates fine.
+    @test ReactantServer.validate_manifest(m, "/models/other", false) === m
+    unnamed = copy(good)
+    delete!(unnamed, "name")
+    mu = ReactantServer.parse_manifest(unnamed)
+    @test mu.name == ""
+    @test ReactantServer.validate_manifest(mu, "/models/resnet", false) === mu
 
     # 'b' is the alternate batch marker; variable dim with -1
     withclient = copy(good)

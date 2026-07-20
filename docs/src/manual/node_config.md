@@ -78,7 +78,8 @@ worker, `REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES` for the gateway, which wins o
 value).
 
 `model_control_mode` sets how the loaded model set evolves: `dynamic` (the default) watches
-the repository and loads, unloads, and reloads bundles online as files change; `static` fixes
+the repository and loads, unloads, reloads, and renames bundles online as files change (a
+renamed directory with unchanged contents renames the model in place, no recompile); `static` fixes
 the startup set; `explicit` cedes the lifecycle to an external control plane via the worker
 control RPCs. `scheduler.discipline` selects the dispatch policy: `fair` shares GPU time
 across models by weighted deficit and learned cost, while `fifo` serves the oldest queued

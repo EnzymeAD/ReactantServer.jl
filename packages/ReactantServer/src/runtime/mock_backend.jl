@@ -17,10 +17,13 @@ end
 MockBuffer(a::Array) = MockBuffer(a, false)
 
 # fn maps a vector of argument arrays (inputs then weights) to a vector of output arrays.
-struct MockExecutable
+# `freed` mirrors MockBuffer: set by free_executable! so tests can assert eager release on evict.
+mutable struct MockExecutable
     fn::Function
     num_outputs::Int
+    freed::Bool
 end
+MockExecutable(fn::Function, num_outputs::Int) = MockExecutable(fn, num_outputs, false)
 
 make_client(::MockBackend, platform::String; kwargs...) = MockClient()
 select_device(::MockBackend, ::MockClient, ordinal::Int) = MockDevice(ordinal)
@@ -34,6 +37,7 @@ buffer_eltype(::MockBackend, b::MockBuffer) = eltype(b.data)
 buffer_size(::MockBackend, b::MockBuffer) = reverse(size(b.data))
 to_host!(::MockBackend, b::MockBuffer, dest::Array) = (copyto!(dest, b.data); dest)
 free_buffer!(::MockBackend, b::MockBuffer) = (b.freed = true; nothing)
+free_executable!(::MockBackend, e::MockExecutable) = (e.freed = true; nothing)
 
 function execute_single_device(::MockBackend, exec::MockExecutable, ::MockDevice,
                                buffers::AbstractVector, donated::AbstractVector{Bool}, num_outputs::Int)

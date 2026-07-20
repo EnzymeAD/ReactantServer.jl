@@ -79,6 +79,14 @@ host_release!(::PrivateWeightStore, key) = nothing
 host_release!(store::SharedWeightStore, key) = release_host_weights!(store, key)
 
 """
+    host_rename!(store, old, new) -> nothing
+
+Rekey a model's host weight floor from `old` to `new` after a model rename (the weights are
+unchanged, so nothing is re-materialized). A no-op for the private store.
+"""
+host_rename!(store::WeightStore, old, new) = rename_host_weights!(store, old, new)
+
+"""
     transfer_to_device(backend, pool, hosts) -> Vector{Any}
 
 Transfer already-materialized host weight Arrays to device buffers, in order. This is the only
