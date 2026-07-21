@@ -225,7 +225,8 @@ function set_residency_state!(cache::WeightCache, entry::ModelEntry, target::Res
     new_host = model.host_weights
     drop_host = false
     if target == PINNED_SYSTEM && model.host_weights === nothing
-        new_host = host_materialize(cache.store, entry.name, entry.weights, model.sig.weight_names)
+        new_host = host_materialize(cache.store, entry.name, entry.weights, model.sig.weight_names;
+                                    content=weights_file_token(entry.weights_path))
     elseif target == UNPINNED && model.host_weights !== nothing
         new_host = nothing        # drop the host floor
         drop_host = true
