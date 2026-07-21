@@ -17,6 +17,7 @@ EndpointsConfig
 GrpcConfig
 ModelControlMode
 SchedulingDiscipline
+NumericsMode
 ResidencyMode
 ResidencyState
 ```
