@@ -85,6 +85,41 @@ _load_manifest(dir) = ReactantServer.parse_manifest(
     ReactantServer.YAML.load_file(joinpath(dir, "manifest.yaml"); dicttype = Dict{String,Any}))
 
 @testset "ReactantServerExport" begin
+    @testset "collect_provenance" begin
+        # Inside a git work tree: all fields present.
+        mktempdir() do repo
+            run(`git -C $repo init -q`)
+            write(joinpath(repo, "f.txt"), "x")
+            run(`git -C $repo add f.txt`)
+            run(`git -C $repo -c user.name=t -c user.email=t@t commit -qm init`)
+            prov = collect_provenance(repo; extra = Dict("model" => "M"))
+            for k in ("exported_at", "julia_version", "reactantserverexport_version",
+                      "git_commit", "git_tree_sha1", "git_branch", "git_dirty")
+                @test haskey(prov, k)
+            end
+            @test prov["model"] == "M"
+            @test prov["git_dirty"] == false
+            @test length(prov["git_commit"]) == 40
+            @test length(prov["git_tree_sha1"]) == 40
+            @test !haskey(prov, "repo_remote")   # no origin in a fresh init
+            @test !haskey(prov, "git_diff")      # clean tree carries no patch
+            write(joinpath(repo, "f.txt"), "y")
+            dirty = collect_provenance(repo)
+            @test dirty["git_dirty"] == true
+            @test occursin("f.txt", dirty["git_diff"])
+            @test endswith(dirty["git_diff"], "\n")   # patch must keep its trailing newline
+        end
+        # Outside a work tree: git fields omitted, base fields still present, no throw.
+        mktempdir() do plain
+            prov = collect_provenance(plain)
+            @test haskey(prov, "exported_at")
+            @test haskey(prov, "julia_version")
+            @test !haskey(prov, "git_commit")
+        end
+        # `extra` overrides a collected field.
+        @test collect_provenance(; extra = Dict("julia_version" => "override"))["julia_version"] == "override"
+    end
+
     @testset "Reactant model -> bundle -> server (multi-batch)" begin
         rng = Random.Xoshiro(0)
         model = Lux.Chain(Lux.Dense(4 => 8, tanh), Lux.Dense(8 => 3))
@@ -93,7 +128,14 @@ _load_manifest(dir) = ReactantServer.parse_manifest(
         mktempdir() do root
             example = randn(Float32, 4, 1)            # (features, batch); batch is the last Julia axis
             export_bundle(:lux, model, ps, st, example;
-                dir = joinpath(root, "mlp"), name = "mlp", batch_sizes = [1, 4])
+                dir = joinpath(root, "mlp"), name = "mlp", batch_sizes = [1, 4],
+                provenance = Dict{String,Any}("git_diff" => "--- fake patch\n"))
+
+            # write_bundle extracts git_diff into a patch file instead of the manifest.
+            @test read(joinpath(root, "mlp", "working_tree.patch"), String) == "--- fake patch\n"
+            manifest_text = read(joinpath(root, "mlp", "manifest.yaml"), String)
+            @test occursin("git_diff_file", manifest_text)
+            @test !occursin("fake patch", manifest_text)
 
             @test isfile(joinpath(root, "mlp", "model.b1.mlir"))
             @test isfile(joinpath(root, "mlp", "model.b4.mlir"))
@@ -103,6 +145,7 @@ _load_manifest(dir) = ReactantServer.parse_manifest(
             man = _load_manifest(joinpath(root, "mlp"))
             @test man.name == "mlp"
             @test man.batching.compiled_batch_sizes == [1, 4]
+            @test occursin("reactant_version", read(joinpath(root, "mlp", "manifest.yaml"), String))
             @test man.executable_inputs[1].shape[end] == ReactantServer.Dim(ReactantServer.BATCH)
             @test man.input_batch_dim == ndims(randn(Float32, 4, 1)) - 1
 

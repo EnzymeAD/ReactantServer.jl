@@ -1,9 +1,10 @@
 name = "ReactantServerExport"
 uuid = "90fa0446-f028-4638-8833-e223884d9b4d"
-version = "0.1.8"
+version = "0.1.9"
 authors = ["Carroll Vance <cvance@medicalmetrics.com>"]
 
 [deps]
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 SafeTensors = "eeda0dda-7046-4914-a807-2495fc7abb89"
@@ -16,6 +17,7 @@ PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
 PyTorchExportExt = "PythonCall"
 
 [compat]
+Dates = "1"
 JSON3 = "1.14.3"
 PythonCall = "0.9"
 Reactant = "0.2.264 - 0.2.270"
