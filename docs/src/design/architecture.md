@@ -112,7 +112,11 @@ How the set of loaded models changes over a worker's lifetime is set by `model_c
   detection covers the weights, the MLIR, the manifest, and the bundle's `model.jl`, so
   updating a model's weights or its Julia pre/post-processing is just writing the files. A
   two-poll debounce keeps half-written bundles from loading, and a reload swaps one model
-  atomically while every other model keeps serving.
+  atomically while every other model keeps serving. A renamed bundle directory (same inode,
+  unchanged contents, e.g. a registry promotion from `model-staging` to `model-production`)
+  is recognized as a rename and applied in place: the live model is rekeyed under the new
+  name with its compiled executables and resident weights intact, so only new or changed
+  bundles ever compile.
 - **`static`** loads the startup set once and never changes it.
 - **`explicit`** cedes the lifecycle to an external control plane: the worker takes no
   autonomous action, and model residency is driven entirely over a small gRPC control surface

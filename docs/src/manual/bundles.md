@@ -20,8 +20,11 @@ A bundle is a directory containing:
 - `weights.safetensors` — the model weights, memory-mapped at load time.
 - `model.jl` — optional; registers custom pre/post-processing (see below).
 
-The directory name is the model name and must match the manifest's `name`. Each immediate
-subdirectory of `model_repo` that contains a `manifest.yaml` is a bundle.
+The directory name is the model name: renaming the directory renames the model, with no edits to
+the manifest or `model.jl` (a `name` declared in either is informational and ignored). Each
+immediate subdirectory of `model_repo` that contains a `manifest.yaml` is a bundle. In `dynamic`
+mode a renamed bundle directory (same contents) is detected by the watcher and renamed in place,
+keeping the compiled executables and resident weights; only new or changed bundles are compiled.
 
 ## Manifest shape encoding
 

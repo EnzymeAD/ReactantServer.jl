@@ -71,12 +71,18 @@ _not_found(msg) = throw(_G.gRPCServiceCallException(_G.GRPC_NOT_FOUND, msg))
 _invalid(msg) = throw(_G.gRPCServiceCallException(_G.GRPC_INVALID_ARGUMENT, msg))
 
 # Run `f`, converting any thrown error into INVALID_ARGUMENT unless it is already a
-# gRPCServiceCallException (which carries its own status, e.g. NOT_FOUND).
+# gRPCServiceCallException (which carries its own status, e.g. NOT_FOUND). A reference to a
+# shared-memory region the registry does not know (e.g. the client registered with a previous
+# incarnation of this process, before a restart wiped the in-memory registry) is mapped to
+# FAILED_PRECONDITION instead: it is recoverable by re-registering, so it is a distinct signal
+# from a genuinely malformed request. The client re-registers and retries on this status.
 function _as_invalid(f)
     try
         return f()
     catch e
         e isa _G.gRPCServiceCallException && rethrow()
+        e isa UnregisteredRegionError &&
+            throw(_G.gRPCServiceCallException(_G.GRPC_FAILED_PRECONDITION, sprint(showerror, e)))
         _invalid(sprint(showerror, e))
     end
 end

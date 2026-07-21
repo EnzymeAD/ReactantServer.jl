@@ -27,6 +27,7 @@ gRPCServer = "b7f0dee4-5e6a-42e7-93b0-9c098bad2317"
 [sources]
 ReactantServerCore = {path = "packages/ReactantServerCore"}
 gRPCServer = {path = "lib/gRPCServer.jl"}
+gRPCClient = {url = "https://github.com/JuliaIO/gRPCClient.jl", rev = "formal-cancellation-fix-wedge"}
 
 [compat]
 julia = "1.12"

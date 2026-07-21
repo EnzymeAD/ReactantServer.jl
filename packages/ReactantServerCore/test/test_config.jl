@@ -26,6 +26,38 @@ function load_single_worker(dir, global_body::AbstractString;
     return ReactantServer.node_server_config(cluster, nothing)
 end
 
+@testset "runtime.numerics parsing and validation" begin
+    mktempdir() do dir
+        modeldir = joinpath(dir, "models"); mkpath(modeldir)
+        rt(body) = load_single_worker(dir, body; model_repo=modeldir)[1].runtime
+
+        # Default and the three explicit values.
+        @test rt("runtime:\n  backend: cpu").numerics == ReactantServer.NUMERICS_AUTO
+        @test rt("runtime:\n  backend: cpu\n  numerics: f32").numerics == ReactantServer.NUMERICS_F32
+        @test rt("runtime:\n  backend: cpu\n  numerics: auto").numerics == ReactantServer.NUMERICS_AUTO
+        @test rt("runtime:\n  backend: cuda\n  numerics: tf32").numerics == ReactantServer.NUMERICS_TF32
+
+        # Invalid value fails at parse time with a ConfigError naming the knob.
+        @test_throws ReactantServer.ConfigError rt("runtime:\n  backend: cpu\n  numerics: fast")
+
+        # Env override wins over the file.
+        withenv("INFERENCE_SERVER_RUNTIME_NUMERICS" => "f32") do
+            cfg, applied, _ = load_single_worker(dir, "runtime:\n  backend: cpu"; model_repo=modeldir)
+            @test cfg.runtime.numerics == ReactantServer.NUMERICS_F32
+            @test length(applied) == 1
+        end
+
+        # tf32 can never be satisfied on the CPU backend: validation fails loudly.
+        cfgbad, _, _ = load_single_worker(dir, "runtime:\n  backend: cpu\n  numerics: tf32";
+                                          model_repo=modeldir)
+        @test_throws ReactantServer.ConfigError ReactantServer.validate_config(cfgbad)
+
+        # The 5-arg programmatic constructor defaults to auto.
+        @test ReactantServer.RuntimeConfig(ReactantServer.CPU_BACKEND, 0, 0.9, true, true).numerics ==
+              ReactantServer.NUMERICS_AUTO
+    end
+end
+
 @testset "config load + env overrides" begin
     mktempdir() do dir
         modeldir = joinpath(dir, "models"); mkpath(modeldir)

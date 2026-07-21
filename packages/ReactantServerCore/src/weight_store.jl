@@ -7,9 +7,13 @@
 # mapping.
 #
 # Coordination is peer-to-peer with no daemon; crash safety comes from an advisory file lock
-# (`flock`), never an in-band flag. The region is content-addressed (`/rsw-<model>-<digest>`), so
-# any fully-populated region with a matching digest is immutable and safe to reuse, including one
-# left by a prior run. The lock file lives in `/dev/shm` next to the region: with Docker `ipc:
+# (`flock`), never an in-band flag. The region is content-addressed (`/rsw-<model>-<digest>`,
+# where the digest covers the model name, the tensor layout, AND a size+mtime token of the
+# weights file), so any fully-populated region with a matching digest is immutable and safe to
+# reuse, including one left by a prior run. A weights-only update changes the token and thus the
+# region key: reloading workers materialize the new version while stragglers keep holding the old
+# region until the last releases it (rolling updates never serve a mix within one worker), and
+# holder-free old-version regions are swept when the new version attaches. The lock file lives in `/dev/shm` next to the region: with Docker `ipc:
 # host` (one container per worker), `/dev/shm` is the host's single tmpfs shared across all worker
 # containers, so `flock` (a kernel lock on the shared inode) coordinates them with no extra
 # volumes and no involvement of the image's overlay filesystem. Without a shared `/dev/shm` the
@@ -95,17 +99,39 @@ end
 _sanitize_name(s::AbstractString) = replace(String(s), r"[^A-Za-z0-9_]" => "_")
 
 """
-    weights_digest(key, specs) -> UInt64
+    weights_digest(key, specs; content=0) -> UInt64
 
-Content digest over a model's identity and weight layout (name, per-tensor dtype/size/shape, and
-a format version). Two workers computing this for the same model agree on the same region key.
+Digest over a model's identity, weight layout (name, per-tensor dtype/size/shape, a format
+version), and a `content` token identifying the weight file's on-disk version (see
+[`weights_file_token`](@ref)). Two workers computing this for the same model and the same file
+agree on the same region key. Without the content token a weights-only update (same name, same
+tensor layout) would collide with the previous version's region and silently serve stale weights,
+including across server restarts (regions in `/dev/shm` outlive the process by design).
 """
-function weights_digest(key::AbstractString, specs)
+function weights_digest(key::AbstractString, specs; content::UInt64=UInt64(0))
     io = IOBuffer()
-    print(io, "rsw1|", key)
+    print(io, "rsw2|", key, "|c", string(content; base=16))
     for (T, dims) in specs
         print(io, "|", string(T), ":", sizeof(T), ":", join(dims, ","))
     end
+    return _fnv1a64(take!(io))
+end
+
+"""
+    weights_file_token(path) -> UInt64
+
+Identity token for a weights file's current on-disk version, folded into
+[`weights_digest`](@ref) via its `content` keyword. Derived from the file's size and mtime:
+cheap (no content read, so the shared store's zero-copy attach path stays zero-read) and
+identical across same-node workers stat'ing the same file. Returns 0 for an empty or missing
+path (hand-built test entries), which reproduces the layout-only digest.
+"""
+function weights_file_token(path::AbstractString)
+    isempty(path) && return UInt64(0)
+    st = stat(String(path))               # a missing path stats as all-zeros, no throw
+    st.mtime == 0 && return UInt64(0)
+    io = IOBuffer()
+    print(io, st.size, ":", st.mtime)
     return _fnv1a64(take!(io))
 end
 
@@ -162,6 +188,35 @@ function _attach_ready(name, digest::UInt64, total::Int)
         return existing
     end
     finalize(existing)                      # munmap the stale/partial mapping
+    return nothing
+end
+
+# Unlink stale sibling versions of one model's region: same sanitized model name, a different
+# digest, and no holders (a non-blocking exclusive flock on the sibling's lock file succeeds).
+# Called by a worker right after it has attached its own region, while holding that region's
+# shared lock, so the version being kept can never be swept by a peer running the same code.
+# Content-keyed digests orphan the previous version's region when a model's weights are updated;
+# live holders release it through the normal last-one-out unlink, but a crashed run would leak it
+# in /dev/shm (a RAM-backed tmpfs) forever. This reclaims exactly those, touching nothing in use.
+function _sweep_stale_versions(store::SharedWeightStore, key::AbstractString, keep_digest::UInt64)
+    san = _sanitize_name(key)
+    keep = "rsw-" * san * "-" * string(keep_digest; base=16)
+    rx = Regex("^rsw-" * san * "-[0-9a-f]+\$")
+    entries = try
+        readdir("/dev/shm")
+    catch
+        return nothing
+    end
+    for f in entries
+        (f != keep && match(rx, f) !== nothing) || continue
+        fd = _open_lock("/dev/shm/" * f * ".lock", store.mode)
+        fd < 0 && continue
+        if _flock(fd, _LOCK_EX | _LOCK_NB) == 0   # no holders: safe to unlink
+            _shm_unlink("/" * f)
+            _flock(fd, _LOCK_UN)
+        end
+        _close_fd(fd)
+    end
     return nothing
 end
 
@@ -223,6 +278,9 @@ function materialize_host_weights!(store::SharedWeightStore, key, digest::UInt64
         rethrow()
     end
     @lock store.lock store.attached[String(key)] = (; shm, fd, name, lockpath)
+    # Our region is attached (shared lock held), so reclaim any holder-free older versions of this
+    # model now: a weights update moved the digest, and only crashed runs leave the old ones behind.
+    _sweep_stale_versions(store, String(key), digest)
     return arrays
 end
 
@@ -235,6 +293,24 @@ unlinks the region and its lock file. A no-op for the private store. The caller 
 references to the arrays first.
 """
 release_host_weights!(::PrivateWeightStore, key) = nothing
+
+"""
+    rename_host_weights!(store, old, new) -> nothing
+
+Rekey a model's attached host-weight region from `old` to `new` (a model rename; the weights are
+unchanged). The region itself keeps its original content-addressed SHM name; only this worker's
+bookkeeping key moves, so a later `release_host_weights!(store, new)` detaches the same region.
+A no-op for the private store and when nothing is attached under `old`.
+"""
+rename_host_weights!(::PrivateWeightStore, old, new) = nothing
+
+function rename_host_weights!(store::SharedWeightStore, old, new)
+    @lock store.lock begin
+        ent = pop!(store.attached, String(old), nothing)
+        ent === nothing || (store.attached[String(new)] = ent)
+    end
+    return nothing
+end
 
 function release_host_weights!(store::SharedWeightStore, key)
     ent = @lock store.lock get(store.attached, String(key), nothing)

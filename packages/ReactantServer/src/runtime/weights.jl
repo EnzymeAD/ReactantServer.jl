@@ -55,17 +55,22 @@ Materialize a model's host weight floor through a [`WeightStore`](@ref). The pri
 allocates per-worker arrays (identical to `materialize_host_weights`); the shared store backs them
 with a node-shared SHM region so same-node workers share one copy. `key` is the model name.
 """
-host_materialize(::PrivateWeightStore, key, st, names::Vector{String}) =
+host_materialize(::PrivateWeightStore, key, st, names::Vector{String}; content::UInt64=UInt64(0)) =
     materialize_host_weights(st, names)
 
-function host_materialize(store::SharedWeightStore, key, st, names::Vector{String})
+# `content` identifies the weights file's on-disk version (see `weights_file_token`); it keys the
+# shared region so a weights-only update materializes a NEW region instead of reusing the stale
+# one (which persists in /dev/shm across worker restarts by design).
+function host_materialize(store::SharedWeightStore, key, st, names::Vector{String};
+                          content::UInt64=UInt64(0))
     specs = [(eltype(st[n]), size(st[n])) for n in names]
     fill! = function (arrays)
         for (i, n) in enumerate(names)
             copyto!(arrays[i], st[n])
         end
     end
-    return materialize_host_weights!(store, key, weights_digest(String(key), specs), specs, fill!)
+    return materialize_host_weights!(store, key, weights_digest(String(key), specs; content=content),
+                                     specs, fill!)
 end
 
 """
@@ -77,6 +82,14 @@ The caller must drop its references to the host arrays first.
 """
 host_release!(::PrivateWeightStore, key) = nothing
 host_release!(store::SharedWeightStore, key) = release_host_weights!(store, key)
+
+"""
+    host_rename!(store, old, new) -> nothing
+
+Rekey a model's host weight floor from `old` to `new` after a model rename (the weights are
+unchanged, so nothing is re-materialized). A no-op for the private store.
+"""
+host_rename!(store::WeightStore, old, new) = rename_host_weights!(store, old, new)
 
 """
     transfer_to_device(backend, pool, hosts) -> Vector{Any}

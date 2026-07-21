@@ -46,7 +46,9 @@ an example configuration for each.
   `lpt_packing` that concentrates each model's traffic to fill batches. → [Architecture](https://enzymead.github.io/ReactantServer.jl/dev/design/architecture/), [Multi-GPU Gateway](https://enzymead.github.io/ReactantServer.jl/dev/manual/multi_gpu_gateway/)
 - **Fast iteration.** In `dynamic` mode the server watches the model repository and hot-loads,
   unloads, and reloads bundles online — weights, MLIR, manifest, and `model.jl` alike — with no
-  restart (`static` and `explicit` control modes are also available). → [Node Configuration](https://enzymead.github.io/ReactantServer.jl/dev/manual/node_config/)
+  restart (`static` and `explicit` control modes are also available). A model is named by its
+  bundle directory, and a renamed directory (a registry promotion such as `-staging` to
+  `-production`) renames the live model in place with no recompile. → [Node Configuration](https://enzymead.github.io/ReactantServer.jl/dev/manual/node_config/)
 - **Meta models.** A `kind: meta` bundle chains several models with data-dependent Julia between
   stages: its `model.jl` registers a `run` hook that calls sub-models, runs off the GPU dispatch
   loop, and re-enters the scheduler for each sub-call. → [Meta Models](https://enzymead.github.io/ReactantServer.jl/dev/manual/meta_models/)

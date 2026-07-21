@@ -314,8 +314,11 @@ function _parse_input_shapes(d::AbstractDict, raw_inputs, specs::Vector{TensorSp
 end
 
 function parse_manifest(d::AbstractDict)
-    name = get(d, "name", nothing)
-    name isa AbstractString || throw(ManifestError("manifest missing string 'name'"))
+    # `name` is informational: a model's serving identity is its bundle directory's basename (the
+    # loader injects it before parsing). A manifest parsed outside a bundle (e.g. a client reading
+    # the YAML directly) may omit it entirely.
+    name = get(d, "name", "")
+    name isa AbstractString || throw(ManifestError("manifest field 'name' must be a string"))
     fv = get(d, "format_version", nothing)
     fv === nothing && throw(ManifestError("manifest '$name' missing 'format_version'"))
     desc = get(d, "description", "")
@@ -373,9 +376,8 @@ function validate_manifest(m::Manifest, dir::AbstractString, has_model_jl::Bool)
     m.kind in SUPPORTED_KINDS ||
         throw(ManifestError("unsupported kind '$(m.kind)'; supported: $(join(SUPPORTED_KINDS, ", "))"))
 
-    expected = basename(normpath(String(dir)))
-    m.name == expected ||
-        throw(ManifestError("manifest name '$(m.name)' does not match directory name '$expected'"))
+    # The directory basename IS the model's identity (renaming the directory renames the model);
+    # a manifest-declared `name` is informational and deliberately not checked against `dir`.
 
     if is_meta(m)
         has_model_jl ||

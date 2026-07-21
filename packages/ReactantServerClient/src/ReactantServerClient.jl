@@ -37,22 +37,28 @@ include("Inference.jl")
 include("Metadata.jl")
 
 """
-    kserve_init(; pool_bytes=DEFAULT_POOL_BYTES, n_slots=DEFAULT_POOL_SLOTS)
+    kserve_init(; pool_bytes=DEFAULT_POOL_BYTES, n_slots=DEFAULT_POOL_SLOTS, shm_reprobe_interval=60.0)
 
 Initialize the gRPC subsystem and (re)set the staging-pool parameters. `n_slots` is the number
 of fixed-size slots each pool is divided into, which bounds how many chunks can be in flight
-concurrently against a single pool.
+concurrently against a single pool. `shm_reprobe_interval` (seconds) is how often the background
+task re-probes endpoints that fell back to inline transport and restores shared memory if the
+server has recovered; set it to `0` (or negative) to disable that background recovery.
 """
 function kserve_init(; pool_bytes::Integer = DEFAULT_POOL_BYTES,
-                            n_slots::Integer = DEFAULT_POOL_SLOTS)
+                            n_slots::Integer = DEFAULT_POOL_SLOTS,
+                            shm_reprobe_interval::Real = 60.0)
     grpc_init()
+    _stop_reprobe!()   # must run outside _pools_lock (the loop takes it)
     @lock _pools_lock begin
         _teardown_shm_pool!()
         _pool_bytes[] = Int(pool_bytes)
         _pool_slots[] = Int(n_slots)
+        _reprobe_interval[] = Float64(shm_reprobe_interval)
         _inline_pool[] = nothing
         empty!(_pool_routes)
         empty!(_route_locks)
+        empty!(_latched)
     end
     nothing
 end
@@ -65,11 +71,13 @@ registered with, drop the cached pools and per-URL routes, and shut the gRPC sub
 Pair with [`kserve_init`](@ref).
 """
 function kserve_shutdown()
+    _stop_reprobe!()   # must run outside _pools_lock (the loop takes it)
     @lock _pools_lock begin
         _teardown_shm_pool!()
         _inline_pool[] = nothing
         empty!(_pool_routes)
         empty!(_route_locks)
+        empty!(_latched)
     end
     grpc_shutdown()
 end

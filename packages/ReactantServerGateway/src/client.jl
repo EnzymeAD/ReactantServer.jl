@@ -169,6 +169,10 @@ function client_status(e::gRPCClient.gRPCServiceCallException)
     st = e.grpc_status
     st == gRPCClient.GRPC_NOT_FOUND && return STATUS_NOT_FOUND
     st == gRPCClient.GRPC_RESOURCE_EXHAUSTED && return STATUS_RESOURCE_EXHAUSTED
+    # A stale shared-memory registration (region unknown after a worker restart) comes back as
+    # FAILED_PRECONDITION; forward it verbatim so the client can re-register and retry, rather than
+    # folding it into UNAVAILABLE (which the client would blindly retry against the same stale region).
+    st == gRPCClient.GRPC_FAILED_PRECONDITION && return STATUS_FAILED_PRE
     # A deadline observed at the worker (admission shed, server-enforced grpc-timeout, or a
     # local curl timeout) is a distinct outcome from a worker being down; give it its own status
     # so metrics and logs do not fold it into STATUS_UNAVAILABLE.

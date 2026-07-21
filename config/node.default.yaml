@@ -22,6 +22,15 @@ global:
     # inflating the startup weight-cache memory probe on the first, un-cached start. The trade-off is
     # losing timing-tuned kernels.
     # autotune: true
+    # numerics (default auto) sets the f32 matmul/convolution precision policy. 'auto' follows the
+    # hardware: TF32 on GPUs that support it (compute capability >= 8.0), plain f32 elsewhere, so
+    # the same bundle can produce different numerics on different GPU generations. 'f32' pins full
+    # f32 everywhere (TF32 algorithms rewritten, precision_config=HIGHEST on f32 matmuls/convs,
+    # NVIDIA_TF32_OVERRIDE=0): identical numerics across hardware, the mode for validated
+    # deployments, at the cost of tensor-core throughput on TF32-capable GPUs. 'tf32' compiles
+    # like 'auto' (TF32 permitted, kernels chosen by XLA/cuBLAS) but fails startup on hardware
+    # that cannot run TF32, so a mixed fleet cannot silently serve divergent numerics.
+    # numerics: auto
     mem_fraction: 0.9
     # Preallocate one BFC arena up front so every sub-allocation (activations, autotune/recompile
     # scratch, weight-cache reloads) is served from it and never fragments the driver memory map.

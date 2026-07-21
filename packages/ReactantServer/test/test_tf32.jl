@@ -89,3 +89,80 @@ end
         @test repr(mod) == before
     end
 end
+
+# A convolution module lowered by Reactant's NNlib path (guaranteed-valid stablehlo.convolution).
+function _conv_hlo()
+    x = Reactant.to_rarray(ones(Float32, 5, 5, 1, 1))
+    w = Reactant.to_rarray(ones(Float32, 2, 2, 1, 1))
+    return repr(@code_hlo(RS.NNlib.conv(x, w)))
+end
+
+@testset "pin_f32!: HIGHEST on an algorithm-free f32 dot_general" begin
+    _with_parsed(_dot_general_hlo()) do mod
+        # Before the pin, the invariant must reject the module (DEFAULT precision).
+        @test_throws ErrorException RS.assert_f32_pinned(mod)
+        st = RS.pin_f32!(mod)
+        @test st.algorithms_rewritten == 0
+        @test st.dots_pinned == 1
+        @test st.convs_pinned == 0
+        @test occursin("HIGHEST", repr(mod))
+        @test RS.assert_f32_pinned(mod).opaque_ops == String[]
+        st2 = RS.pin_f32!(mod)                   # idempotent
+        @test st2.dots_pinned == 0
+    end
+end
+
+@testset "pin_f32!: tf32 algorithm rewritten to f32, no precision added" begin
+    _with_parsed(_tf32_module_text()) do mod
+        st = RS.pin_f32!(mod)
+        @test st.algorithms_rewritten == 1
+        @test st.dots_pinned == 0                # algorithm and precision are mutually exclusive
+        s = repr(mod)
+        @test !occursin("tf32", s)
+        @test occursin("lhs_precision_type = f32", s)
+        @test !occursin("HIGHEST", s)
+        RS.assert_f32_pinned(mod)                # an explicit f32 algorithm is an equally hard pin
+        @test RS.pin_f32!(mod).algorithms_rewritten == 0   # idempotent
+    end
+end
+
+@testset "pin_f32!: non-f32 operands are never touched" begin
+    # A pure-text f16 retype of the algorithm-free module: HIGHEST on f16 would change semantics.
+    text16 = replace(_dot_general_hlo(), "f32" => "f16")
+    _with_parsed(text16) do mod
+        before = repr(mod)
+        st = RS.pin_f32!(mod)
+        @test st.dots_pinned == 0
+        @test repr(mod) == before
+        RS.assert_f32_pinned(mod)                # nothing f32 to pin => invariant holds vacuously
+    end
+end
+
+@testset "pin_f32!: f32 convolution pinned" begin
+    text = _conv_hlo()
+    @test occursin("stablehlo.convolution", text)
+    _with_parsed(text) do mod
+        st = RS.pin_f32!(mod)
+        @test st.convs_pinned == 1
+        @test occursin("HIGHEST", repr(mod))
+        @test RS.assert_f32_pinned(mod).opaque_ops == String[]
+        @test RS.pin_f32!(mod).convs_pinned == 0   # idempotent
+    end
+end
+
+@testset "tf32 probe on CPU: plain f32 detected, pinned leg attests exactly" begin
+    backend = RS.ReactantBackend()
+    runtime = RS.RuntimeConfig(RS.CPU_BACKEND, 0, 0.9, true, true)
+    pool = RS.resolve_client(backend, runtime)
+
+    # auto (the pool default): the DEFAULT-precision leg runs, the attestation leg is skipped.
+    res = RS.tf32_probe(backend, pool)
+    @test res.tf32_active == false               # CPU DEFAULT is plain f32
+    @test res.pinned_exact === nothing
+
+    # f32: the attestation leg compiles through the real pin path and must be bit-exact.
+    pool_f32 = RS.MemoryPool(pool.backend, pool.client, pool.device, pool.platform, pool.ctx,
+                             pool.autotune, RS.NUMERICS_F32)
+    res2 = RS.tf32_probe(backend, pool_f32)
+    @test res2.pinned_exact === true
+end

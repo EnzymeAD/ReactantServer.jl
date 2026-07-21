@@ -225,7 +225,8 @@ function set_residency_state!(cache::WeightCache, entry::ModelEntry, target::Res
     new_host = model.host_weights
     drop_host = false
     if target == PINNED_SYSTEM && model.host_weights === nothing
-        new_host = host_materialize(cache.store, entry.name, entry.weights, model.sig.weight_names)
+        new_host = host_materialize(cache.store, entry.name, entry.weights, model.sig.weight_names;
+                                    content=weights_file_token(entry.weights_path))
     elseif target == UNPINNED && model.host_weights !== nothing
         new_host = nothing        # drop the host floor
         drop_host = true
@@ -289,6 +290,23 @@ function release_all!(cache::WeightCache, entry::ModelEntry)
         model.host_weights = nothing
         host_release!(cache.store, entry.name)
     end
+    return nothing
+end
+
+"""
+    rename!(cache, old, new) -> nothing
+
+Rekey a model's residency bookkeeping from `old` to `new` after a model rename: the LRU entry
+(when the model is device-resident and non-pinned) and the host-weight store key. No device or
+host memory moves; the weights themselves are untouched. Runs on the dispatch thread (sole
+residency mutator), like every other cache mutation.
+"""
+function rename!(cache::WeightCache, old::AbstractString, new::AbstractString)
+    lock(cache.lock) do
+        i = findfirst(==(String(old)), cache.lru)
+        i === nothing || (cache.lru[i] = String(new))
+    end
+    host_rename!(cache.store, old, new)
     return nothing
 end
 

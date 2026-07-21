@@ -18,11 +18,97 @@ using Reactant
 using SafeTensors
 using YAML
 using JSON3
+using Dates
 
 const MLIR = Reactant.MLIR
 const Compiler = Reactant.Compiler
 
-export IOSpec, write_bundle, export_bundle, export_torchscript_bundle
+export IOSpec, write_bundle, export_bundle, export_torchscript_bundle, collect_provenance
+
+# ============================================================================
+# Provenance
+# ============================================================================
+
+# One git plumbing read, or `nothing`. Never throws; stderr is discarded (a non-repo dir
+# or missing git is an expected, handled case).
+function _git_field(repo_dir::AbstractString, args::Vector{String})
+    try
+        out = read(pipeline(`git -C $repo_dir $args`; stderr=devnull), String)
+        return String(strip(out))
+    catch
+        return nothing
+    end
+end
+
+"""
+    collect_provenance(repo_dir=pwd(); extra=Dict()) -> Dict{String,Any}
+
+Best-effort reproducibility provenance for a bundle. Captures the state of the model repo
+at `repo_dir` (`repo_remote`, `git_commit`, `git_tree_sha1`, `git_branch`, `git_dirty`)
+plus the export environment (`julia_version`, `reactantserverexport_version`) and an
+`exported_at` UTC timestamp. Merge the result into `export_bundle`'s `provenance`; the
+frontends separately stamp their framework versions (`reactant_version`, or
+`torch_version`/`torchax_version`).
+
+When the work tree is dirty, the uncommitted changes are captured as `git_diff`
+(`git diff --binary HEAD`), so `git_commit` plus the patch reconstructs the exact exported
+code (untracked files are not captured). [`write_bundle`](@ref) extracts `git_diff` into a
+`working_tree.patch` file in the bundle dir rather than embedding it in the manifest.
+
+Every git field is best-effort: when `git` is missing, `repo_dir` is not inside a work
+tree, or a repo has no `origin` remote, the affected fields are omitted (with a warning
+for the non-repo case) and the function never throws. `extra` entries are merged last and
+override collected fields.
+"""
+function collect_provenance(repo_dir::AbstractString=pwd(); extra=Dict{String,Any}())
+    prov = Dict{String,Any}(
+        "exported_at" => Dates.format(Dates.now(Dates.UTC), dateformat"yyyy-mm-dd\THH:MM:SS\Z"),
+        "julia_version" => string(VERSION),
+        "reactantserverexport_version" => string(pkgversion(@__MODULE__)),
+    )
+    if _git_field(repo_dir, ["rev-parse", "--is-inside-work-tree"]) == "true"
+        commit = _git_field(repo_dir, ["rev-parse", "HEAD"])
+        commit === nothing || (prov["git_commit"] = commit)
+        tree = _git_field(repo_dir, ["rev-parse", "HEAD^{tree}"])
+        tree === nothing || (prov["git_tree_sha1"] = tree)
+        branch = _git_field(repo_dir, ["rev-parse", "--abbrev-ref", "HEAD"])
+        branch === nothing || (prov["git_branch"] = branch)
+        status = _git_field(repo_dir, ["status", "--porcelain"])
+        status === nothing || (prov["git_dirty"] = !isempty(status))
+        if get(prov, "git_dirty", false) == true
+            # --binary keeps the patch applicable (`git apply --binary`) even for binary
+            # files, so tree sha1 + patch reconstructs the exported code exactly. Read raw
+            # (not via _git_field): stripping the trailing newline corrupts the patch.
+            diff = try
+                read(pipeline(`git -C $repo_dir diff --binary HEAD`; stderr=devnull), String)
+            catch
+                nothing
+            end
+            if diff !== nothing && !isempty(diff)
+                if sizeof(diff) > 20 * 1024 * 1024
+                    @warn "collect_provenance: working-tree diff is $(round(sizeof(diff) / 2^20; digits=1)) MiB; " *
+                          "omitting git_diff from provenance (commit the large changes to capture them)"
+                else
+                    prov["git_diff"] = diff
+                end
+            end
+        end
+        remote = _git_field(repo_dir, ["remote", "get-url", "origin"])
+        remote === nothing || (prov["repo_remote"] = remote)
+    else
+        @warn "collect_provenance: $repo_dir is not inside a git work tree (or git is " *
+              "unavailable); omitting the git provenance fields" maxlog = 1
+    end
+    return merge(prov, Dict{String,Any}(string(k) => v for (k, v) in extra))
+end
+
+# The fields the Reactant tracing frontend stamps on every bundle. User-passed provenance
+# wins on key collisions.
+_reactant_base_provenance() = Dict{String,Any}(
+    "source_framework" => "reactant",
+    "converter" => "ReactantServerExport.jl",
+    "reactant_version" => string(pkgversion(Reactant)),
+)
 
 # ============================================================================
 # Bundle writer (the former BundleWriter)
@@ -206,12 +292,22 @@ function write_bundle(dir::AbstractString; name::AbstractString,
     SafeTensors.serialize(joinpath(dir, "weights.safetensors"), wdata,
                           Dict("argument_order" => JSON3.write(wnames)))
 
+    # A `git_diff` provenance entry (from `collect_provenance` on a dirty tree) is
+    # materialized as a patch file in the bundle rather than embedded in the manifest;
+    # the manifest records the filename so the tree is reconstructible from
+    # git_commit + `git apply --binary working_tree.patch`.
+    prov_dict = Dict{String,Any}(string(k) => v for (k, v) in provenance)
+    if haskey(prov_dict, "git_diff")
+        write(joinpath(dir, "working_tree.patch"), pop!(prov_dict, "git_diff"))
+        prov_dict["git_diff_file"] = "working_tree.patch"
+    end
+
     manifest = Dict{String,Any}(
         "format_version" => "2.0",
         "name" => String(name),
         "executable_inputs" => [_spec_dict(s) for s in executable_inputs],
         "executable_outputs" => [_spec_dict(s) for s in executable_outputs],
-        "provenance" => Dict{String,Any}(string(k) => v for (k, v) in provenance),
+        "provenance" => prov_dict,
     )
 
     if input_shapes === nothing
@@ -345,8 +441,7 @@ function export_bundle(::Val{:lux}, model, ps, st, example_input::AbstractArray;
     out_batch_axis = ndims(y0) - 1
     inputs = [IOSpec(input_name, in_T, in_shape_julia; batch_axis=in_batch_axis)]
     outputs = [IOSpec(output_name, eltype(y0), collect(Int, size(y0)); batch_axis=out_batch_axis)]
-    prov = merge(Dict{String,Any}("source_framework" => "reactant", "converter" => "ReactantServerExport.jl"),
-                 Dict{String,Any}(provenance))
+    prov = merge(_reactant_base_provenance(), Dict{String,Any}(provenance))
 
     GC.@preserve ctxs begin
         write_bundle(dir; name=name, executable_inputs=inputs, executable_outputs=outputs,
@@ -451,8 +546,7 @@ function export_bundle(::Val{:lux}, model, ps, st, example_inputs::Tuple;
                        batch_axis = in_axes[i] === nothing ? nothing : in_axes[i] - 1) for i in 1:nin]
     out_specs = [IOSpec(outnames[i], eltype(y0[i]), collect(Int, size(y0[i]));
                         batch_axis = out_axes[i] === nothing ? nothing : out_axes[i] - 1) for i in 1:nout]
-    prov = merge(Dict{String,Any}("source_framework" => "reactant", "converter" => "ReactantServerExport.jl"),
-                 Dict{String,Any}(provenance))
+    prov = merge(_reactant_base_provenance(), Dict{String,Any}(provenance))
 
     GC.@preserve ctxs begin
         write_bundle(dir; name=name, executable_inputs=in_specs, executable_outputs=out_specs,
@@ -487,8 +581,7 @@ function export_bundle(::Val{:reactant}, f, inputs::Tuple, weights::AbstractVect
     in_specs = [IOSpec(innames[i], eltype(inputs[i]), collect(Int, size(inputs[i])))
                 for i in 1:length(inputs)]
     out_specs = [IOSpec(output_name, eltype(yarr), collect(Int, size(yarr)))]
-    prov = merge(Dict{String,Any}("source_framework" => "reactant", "converter" => "ReactantServerExport.jl"),
-                 Dict{String,Any}(provenance))
+    prov = merge(_reactant_base_provenance(), Dict{String,Any}(provenance))
 
     GC.@preserve ctx begin
         write_bundle(dir; name=name, executable_inputs=in_specs, executable_outputs=out_specs,

@@ -50,6 +50,7 @@ global:
     mem_fraction: 0.9      # fraction of device memory claimed for the pool (GPU only)
     preallocate: true      # claim the pool up front (GPU only)
     allow_cpu_fallback: false
+    numerics: auto         # f32 | auto | tf32; f32 matmul/convolution precision policy (see below)
     weight_cache_fraction: 1.0          # arena fraction for all weights (pinned + on-demand); 0 disables, GPU only
     weight_cache_wiggle_fraction: 0.1   # arena fraction kept free; drives startup peak probe + auto-sizing
   scheduler:               # -> SchedulerConfig
@@ -70,6 +71,22 @@ global:
     max_send_msg_bytes: 536870912   # 512 MiB; max outbound gRPC message
 ```
 
+`runtime.numerics` sets the f32 matmul/convolution precision policy. `auto` (the default) is
+hardware-adaptive: TF32 is used on GPUs that support it (NVIDIA compute capability 8.0 and up)
+and stripped where it would not compile, so one bundle runs everywhere but its numerics follow
+the hardware. `f32` pins full f32 on every target: TF32 `DotAlgorithm`s are rewritten to f32,
+every algorithm-free f32 `dot_general`/`convolution` gets `precision_config = HIGHEST` (a
+machine-checked invariant per compiled artifact), and `NVIDIA_TF32_OVERRIDE=0` is set as defense
+in depth. This makes numerics identical across GPU generations, which is the mode for validated
+deployments where a hardware refresh must not change model outputs; the cost is tensor-core
+throughput for f32 matmuls on TF32-capable GPUs. `tf32` compiles exactly like `auto` (TF32 is
+permitted, and XLA/cuBLAS pick the kernels; StableHLO has no way to force TF32 for convolutions)
+but turns the hardware requirement into a guarantee: startup fails on hardware that cannot run
+TF32, so a mixed fleet cannot silently serve divergent numerics. On CUDA
+workers a startup probe logs whether TF32 arithmetic is actually in use and, under `f32`, proves
+the pin bit-exactly; the per-model outcome (ops pinned, algorithms rewritten or stripped) is
+recorded in each "model loaded" log line.
+
 The `global.grpc` block is the single node-level place for gRPC message-size limits: every worker
 reads it directly, and the supervisor also mirrors it into the embedded gateway (as
 `REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES` / `_SEND_MSG_BYTES`), so one block sizes the whole node.
@@ -78,7 +95,8 @@ worker, `REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES` for the gateway, which wins o
 value).
 
 `model_control_mode` sets how the loaded model set evolves: `dynamic` (the default) watches
-the repository and loads, unloads, and reloads bundles online as files change; `static` fixes
+the repository and loads, unloads, reloads, and renames bundles online as files change (a
+renamed directory with unchanged contents renames the model in place, no recompile); `static` fixes
 the startup set; `explicit` cedes the lifecycle to an external control plane via the worker
 control RPCs. `scheduler.discipline` selects the dispatch policy: `fair` shares GPU time
 across models by weighted deficit and learned cost, while `fifo` serves the oldest queued

@@ -12,6 +12,10 @@ Base.showerror(io::IO, e::BundleError) = print(io, "BundleError: ", e.msg)
 # Include a bundle's model.jl in an isolated module so it cannot clobber server globals. Only
 # register_model, register_meta_model, and the ReactantServer module are injected. When `meta` is
 # true the bundle must call register_meta_model; otherwise it must call register_model.
+#
+# The name passed to register_model/register_meta_model is informational only: a model's serving
+# identity is its bundle directory's basename, so a directory rename renames the model with no
+# edits to model.jl (or the manifest). `expected_name` is used purely for error messages.
 function _include_model_jl(path::AbstractString, expected_name::AbstractString; meta::Bool=false)
     _CURRENT_REGISTRATION[] = nothing
     _CURRENT_META_REGISTRATION[] = nothing
@@ -27,14 +31,10 @@ function _include_model_jl(path::AbstractString, expected_name::AbstractString; 
     if meta
         mreg === nothing && throw(BundleError("model.jl for meta model '$expected_name' did not call register_meta_model"))
         reg === nothing || throw(BundleError("meta model '$expected_name' must call register_meta_model, not register_model"))
-        mreg.name == expected_name ||
-            throw(BundleError("model.jl registered meta model '$(mreg.name)' but bundle directory is '$expected_name'"))
         return mreg
     end
     reg === nothing && throw(BundleError("model.jl for '$expected_name' did not call register_model"))
     mreg === nothing || throw(BundleError("model '$expected_name' must call register_model, not register_meta_model"))
-    reg.name == expected_name ||
-        throw(BundleError("model.jl registered '$(reg.name)' but bundle directory is '$expected_name'"))
     return reg
 end
 
@@ -84,14 +84,17 @@ end
     load_bundle_entry(dir; validator=NullSignatureValidator()) -> ModelEntry
 
 Parse and validate the bundle directory `dir` into an uncompiled `ModelEntry` (its `executable`
-and `sched` slots are `nothing`). The directory name is *not* enforced to equal the manifest
-`name` here; that check is `load_bundles`'s responsibility (it filters by directory name). Used by
-both `load_bundles` and the directory watcher (see watcher.jl) to load a single bundle.
+and `sched` slots are `nothing`). The model's name is the directory's basename: renaming the
+directory renames the model. A `name` declared in the manifest is informational and ignored (the
+directory name is injected before parsing so every downstream consumer, including error messages
+and the metadata RPC, agrees on the served name). Used by both `load_bundles` and the directory
+watcher (see watcher.jl) to load a single bundle.
 """
 function load_bundle_entry(dir::AbstractString; validator::SignatureValidator=NullSignatureValidator())
     manifest_path = joinpath(dir, "manifest.yaml")
     raw = YAML.load_file(manifest_path; dicttype=Dict{String,Any})
     raw isa AbstractDict || throw(BundleError("manifest in $dir is not a mapping"))
+    raw["name"] = basename(normpath(String(dir)))   # identity comes from the directory, not the YAML
     m = parse_manifest(raw)
 
     model_jl = joinpath(dir, "model.jl")
@@ -142,9 +145,9 @@ Discover every subdirectory containing a manifest.yaml under each model dir, loa
 validate it, and register it. The runtime fills each entry's executable slot afterwards.
 
 When `include` is a non-empty collection of model names, only bundles whose directory name
-is in the set are loaded. The directory name equals the manifest `name` (enforced by
-`validate_manifest`), so filtering by directory avoids parsing skipped manifests. Names in
-`include` that are not found in any model dir produce a warning.
+is in the set are loaded. The directory name IS the model name (see `load_bundle_entry`), so
+filtering by directory avoids parsing skipped manifests. Names in `include` that are not found
+in any model dir produce a warning.
 """
 function load_bundles(model_dirs::AbstractVector{<:AbstractString};
                       validator::SignatureValidator=NullSignatureValidator(),

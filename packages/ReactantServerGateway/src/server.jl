@@ -23,6 +23,11 @@ function _server_exc(status::AbstractString, msg::AbstractString)
     # RESOURCE_EXHAUSTED (not FAILED_PRECONDITION): it is the standard signal for a client to back
     # off and retry, which ReactantServerClient does within the request's deadline budget.
     status == STATUS_RESOURCE_EXHAUSTED && return gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_RESOURCE_EXHAUSTED, msg)
+    # A stale shared-memory registration surfaces as FAILED_PRECONDITION; preserve the code so the
+    # client re-registers and retries instead of treating it as a transient UNAVAILABLE. _try_replicas
+    # returns it immediately (no failover): the client's pool registration is host-global, so every
+    # worker rejects it identically until the client re-registers through the gateway's fan-out.
+    status == STATUS_FAILED_PRE && return gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_FAILED_PRECONDITION, msg)
     status == STATUS_INTERNAL && return gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_INTERNAL, msg)
     return gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_UNAVAILABLE, msg)
 end

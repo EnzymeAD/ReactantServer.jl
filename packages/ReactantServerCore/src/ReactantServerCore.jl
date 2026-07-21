@@ -79,7 +79,8 @@ export pool_base_pointer, pool_region_name, pool_slot_bytes
 
 # ---- weight store ----
 export WeightStore, PrivateWeightStore, SharedWeightStore
-export materialize_host_weights!, release_host_weights!, weights_digest
+export materialize_host_weights!, release_host_weights!, rename_host_weights!, weights_digest,
+    weights_file_token
 
 # ---- boundary ----
 export NamedTensor, InferRequest, QueuedRequest, DeadlineExceeded
@@ -99,6 +100,7 @@ export ResidencyState, UNPINNED, PINNED_SYSTEM, PINNED_DEVICE
 export ResidencyMode, SELF_MANAGED, EXTERNALLY_MANAGED
 export ModelControlMode, STATIC, DYNAMIC, EXPLICIT
 export SchedulingDiscipline, FAIR, FIFO, EDF
+export NumericsMode, NUMERICS_F32, NUMERICS_AUTO, NUMERICS_TF32
 export RuntimeConfig, ModelSchedConfig, SchedulerConfig, EndpointsConfig, GrpcConfig, ServerConfig
 export build_config, validate_config, apply_env_overrides!, log_effective_config
 
@@ -108,7 +110,7 @@ export node_gpus, materialize_node!
 
 # ---- shared-memory registry ----
 export ShmRegion, SharedMemoryRegistry, shm_register!, shm_unregister!, shm_read, shm_write!
-export shm_regions, shm_teardown!, same_ipc_namespace
+export shm_regions, shm_teardown!, same_ipc_namespace, UnregisteredRegionError
 
 # ---- codec ----
 export OutputTarget, DecodedRequest, decode_infer_request, encode_infer_response, encode_model_metadata

@@ -131,15 +131,21 @@ function memory_report(backend::AbstractBackend, pool::MemoryPool;
 end
 
 # Consistent model summary, emitted from build_loaded_model so startup and the watcher format a
-# model identically. `source` distinguishes the trigger (:startup, :dynamic).
-function log_model_loaded(entry::ModelEntry, model::LoadedModel; source::Symbol, memory::AbstractString)
+# model identically. `source` distinguishes the trigger (:startup, :dynamic). `numerics` is the
+# effective f32/tf32 precision outcome (see format_numerics); "" when the caller has none (tests).
+function log_model_loaded(entry::ModelEntry, model::LoadedModel; source::Symbol, memory::AbstractString,
+                          numerics::AbstractString="")
     m = entry.manifest
-    @info "model loaded" name = entry.name source = source inputs = _format_specs(m.executable_inputs) outputs = _format_specs(m.executable_outputs) batch_sizes = _compiled_sizes(model) weights = Base.format_bytes(model.nbytes) residency = model.state memory = memory
+    @info "model loaded" name = entry.name source = source inputs = _format_specs(m.executable_inputs) outputs = _format_specs(m.executable_outputs) batch_sizes = _compiled_sizes(model) weights = Base.format_bytes(model.nbytes) residency = model.state numerics = numerics memory = memory
     return nothing
 end
 
 log_model_unloaded(name::AbstractString, nbytes::Integer; memory::AbstractString) =
     (@info "model unloaded" name = name freed = Base.format_bytes(nbytes) memory = memory; nothing)
+
+# A rename keeps the compiled executables and resident weights; nothing is freed or compiled.
+log_model_renamed(old::AbstractString, new::AbstractString) =
+    (@info "model renamed" from = old to = new; nothing)
 
 # Debug level: residency moves happen on the request path (on-demand weight cache churn), which
 # is far too chatty for the default log surface. Enable with JULIA_DEBUG=ReactantServer.

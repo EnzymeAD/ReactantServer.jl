@@ -4,11 +4,15 @@
 
 # torchax is capped because PyTorchExportExt depends on its internal API layout (its func closure,
 # decomposition order, and the jaten/ops_registry internals). torchax >=0.0.10 also requires
-# jax >=0.6.2, which the unpinned jax/jaxlib resolve to. torch is reinstalled as the CPU build at
+# jax >=0.6.2. torch is reinstalled as the CPU build at
 # test time (see test/runtests.jl); the CUDA wheel segfaults against Reactant/XLA on a CPU host.
+#
+# torch is capped below 2.13 because torch 2.13 removed the aten.prod.dim_Dimname overload that
+# torchax 0.0.12 registers at import time (AttributeError on `import torchax`, before any
+# tracing). jax is capped to the known-good pairing (torch 2.12.x / torchax 0.0.12 / jax 0.10.x).
 [pip.deps]
-torch = ">=2.4"
+torch = ">=2.4,<2.13"
 torchax = ">=0.0.10,<0.0.13"
-jax = ""
-jaxlib = ""
+jax = "<0.11"
+jaxlib = "<0.11"
 numpy = ""

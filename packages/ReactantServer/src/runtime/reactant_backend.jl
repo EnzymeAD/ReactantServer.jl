@@ -90,6 +90,14 @@ end
 # the safe way to trigger it without reaching into Reactant's field layout.
 free_buffer!(::ReactantBackend, buffer) = (Base.finalize(buffer); nothing)
 
+# Eager executable release, same rationale and mechanism as free_buffer!. Reactant's
+# PJRT.LoadedExecutable frees the underlying PjRtLoadedExecutable in its GC finalizer
+# (free_exec -> ExecutableFree); the executable object itself is tiny, so under low allocation
+# pressure that finalizer can be deferred indefinitely while the executable's command buffers
+# (CUDA graphs, allocated by the driver outside the BFC arena) stay resident. XLA destroys the
+# command buffers when the executable is destroyed, so finalizing now reclaims them now.
+free_executable!(::ReactantBackend, exec) = (Base.finalize(exec); nothing)
+
 function _flatten_buffers!(acc, x)
     if x isa _RXLA.AbstractBuffer
         push!(acc, x)
@@ -135,7 +143,8 @@ function device_memory_stats(::ReactantBackend, pool::MemoryPool)
 end
 
 function compile_artifact(backend::ReactantBackend, pool::MemoryPool, mlir_bytes,
-                          n_parameters::Int, n_outputs::Int)
+                          n_parameters::Int, n_outputs::Int;
+                          numerics_stats::Union{NumericsStats,Nothing}=nothing)
     ctx = pool.ctx
     _RMLIR.IR.activate(ctx)
     try
@@ -144,10 +153,24 @@ function compile_artifact(backend::ReactantBackend, pool::MemoryPool, mlir_bytes
         artifact = String(copy(Vector{UInt8}(mlir_bytes)))
         mlir_mod = _RMLIR.API.stablehloDeserializePortableArtifactNoError(artifact, ctx)
         mod = _RMLIR.IR.Module(mlir_mod)
-        # Portable artifacts may carry TF32 baked into dot_general as an explicit DotAlgorithm, which
-        # is a hard compile error on non-Ampere targets. Strip it when this device cannot run it,
-        # before XLA sees the module; on a TF32-capable GPU leave it intact.
-        tf32_supported(pool.client, pool.device) || maybe_strip_tf32!(mod)
+        # Numerics policy (runtime.numerics; see tf32.jl and NumericsMode). AUTO follows the
+        # hardware: explicit TF32 DotAlgorithms are a hard compile error on non-Ampere targets, so
+        # strip them there; elsewhere TF32 resolves through DEFAULT precision. F32 pins
+        # hardware-invariant full-f32 numerics and machine-checks the result. TF32 passes the
+        # module through untouched; its capability gate ran once at startup (_bring_up).
+        if pool.numerics == NUMERICS_F32
+            st = pin_f32!(mod)
+            inv = assert_f32_pinned(mod)
+            if numerics_stats !== nothing
+                numerics_stats.algorithms_rewritten += st.algorithms_rewritten
+                numerics_stats.dots_pinned += st.dots_pinned
+                numerics_stats.convs_pinned += st.convs_pinned
+                append!(numerics_stats.opaque_ops, inv.opaque_ops)
+            end
+        elseif pool.numerics == NUMERICS_AUTO && !tf32_supported(pool.client, pool.device)
+            n = maybe_strip_tf32!(mod)
+            numerics_stats === nothing || (numerics_stats.tf32_stripped += n)
+        end
         # When autotuning is disabled, force xla_gpu_autotune_level=0: XLA uses default gemm/conv
         # algorithm selection with no device timing trials. This removes the autotuner's run-to-run
         # non-determinism and the compile-time scratch that otherwise inflates the startup memory

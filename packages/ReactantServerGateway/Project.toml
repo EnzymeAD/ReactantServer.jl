@@ -1,6 +1,6 @@
 name = "ReactantServerGateway"
 uuid = "b92f1031-7cb7-4fde-89de-b6dd50303018"
-version = "0.1.5"
+version = "0.1.9"
 authors = ["Carroll Vance <cvance@medicalmetrics.com>"]
 
 [deps]
@@ -16,7 +16,7 @@ gRPCServer = "b7f0dee4-5e6a-42e7-93b0-9c098bad2317"
 HTTP = "^2.5.0"
 Prometheus = "1.5.1"
 ProtoBuf = "1.3.0"
-ReactantServerCore = "=0.1.5"
+ReactantServerCore = "=0.1.9"
 YAML = "0.4.16"
 gRPCClient = "1.0.3"
 gRPCServer = "0.1"

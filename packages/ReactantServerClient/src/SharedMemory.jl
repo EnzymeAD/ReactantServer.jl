@@ -34,13 +34,19 @@ mutable struct InferenceBufferPool
     pool::BufferPool
     registered_models::Vector{KServeModel}
     registered_keys::Set{Tuple{String,UInt16}}
+    # Per-endpoint registration generation, bumped every time the pool is (re-)registered with an
+    # endpoint. Used to coalesce concurrent re-registration after a server restart: the first failed
+    # request bumps it, all other in-flight requests that observed the same generation skip the
+    # re-register and just retry (see recover_registration!).
+    reg_gen::Dict{Tuple{String,UInt16},Int}
     register_lock::ReentrantLock
 end
 
 function InferenceBufferPool(n_bytes::Integer; n_slots::Integer = 8, use_shm::Bool = true,
                              name::AbstractString = "reactant_server_client_pool")
     pool = BufferPool(n_bytes; n_slots = n_slots, use_shm = use_shm, name = name)
-    return InferenceBufferPool(pool, KServeModel[], Set{Tuple{String,UInt16}}(), ReentrantLock())
+    return InferenceBufferPool(pool, KServeModel[], Set{Tuple{String,UInt16}}(),
+                               Dict{Tuple{String,UInt16},Int}(), ReentrantLock())
 end
 
 Base.sizeof(p::InferenceBufferPool) = sizeof(p.pool)
@@ -84,7 +90,32 @@ function register_pool_with_model!(p::InferenceBufferPool, model::KServeModel)
             ),
         )
         push!(p.registered_keys, key)
-        push!(p.registered_models, model)
+        # One representative model per endpoint drives the teardown fan-out; re-registration reuses
+        # the same key, so guard against pushing a duplicate on the recovery path.
+        model in p.registered_models || push!(p.registered_models, model)
+        p.reg_gen[key] = get(p.reg_gen, key, 0) + 1
+    end
+    nothing
+end
+
+# Current registration generation for an endpoint (0 if never registered). A request snapshots this
+# before it sends, then hands it to recover_registration! so exactly one re-registration happens per
+# detected restart no matter how many requests fail at once.
+registration_gen(p::InferenceBufferPool, key::Tuple{String,UInt16}) =
+    @lock p.register_lock get(p.reg_gen, key, 0)
+
+# Re-register the pool with `model`'s endpoint after a stale-registration failure, coalescing
+# concurrent callers. `observed_gen` is the generation the caller saw before its failed request:
+# if another caller has already re-registered since (current generation moved on), this is a no-op
+# and the caller simply retries; otherwise this caller performs the single re-registration. Register
+# failures propagate so the caller can escalate to the inline fallback.
+function recover_registration!(p::InferenceBufferPool, model::KServeModel, observed_gen::Integer)
+    is_shm_backed(p) || return
+    key = (model.host, model.port)
+    lock(p.register_lock) do
+        get(p.reg_gen, key, 0) == observed_gen || return   # someone already re-registered; just retry
+        delete!(p.registered_keys, key)                    # force register_pool_with_model! to act
+        register_pool_with_model!(p, model)                # re-registers and bumps reg_gen[key]
     end
     nothing
 end
@@ -120,6 +151,21 @@ const _route_locks = Dict{PoolKey,ReentrantLock}()
 const _pools_lock = ReentrantLock()
 const _pool_bytes = Ref{Int}(DEFAULT_POOL_BYTES)
 const _pool_slots = Ref{Int}(DEFAULT_POOL_SLOTS)
+
+# Endpoints (PoolKey) whose route has been latched to the inline pool because shared memory could
+# not be recovered in-band (see latch_inline!). A single background task (below) re-probes these and
+# unlatches them back to SHM if the server recovers. Guarded by _pools_lock; the value is a
+# representative model the poller re-probes with.
+const _latched = Dict{PoolKey,KServeModel}()
+const _reprobe_interval = Ref{Float64}(60.0)      # seconds; <= 0 disables the poller
+const _reprobe_task = Ref{Union{Task,Nothing}}(nothing)
+# The running loop is identified by a generation number. Bumping it (in _stop_reprobe!) invalidates
+# the current loop so it returns at its next checkpoint, WITHOUT anyone blocking on the task -- the
+# task may be parked in a gRPC probe, and waiting on that is the shutdown hang we must avoid.
+const _reprobe_gen = Ref{Int}(0)
+# Short per-probe deadline for the poller's own IsSameIPCNamespace call. A restarted-but-not-yet-ready
+# or wedged server must not pin the background task; the normal request path keeps the 10s default.
+const _REPROBE_RPC_DEADLINE = 3
 
 function _route_lock_for(key::PoolKey)
     @lock _pools_lock get!(() -> ReentrantLock(), _route_locks, key)
@@ -166,8 +212,8 @@ end
 # :unknown means the server does not implement the RPC (UNIMPLEMENTED, e.g. stock Triton). Any
 # other gRPC error propagates: a probe that fails for an unrelated reason must not be silently
 # read as "no shared memory".
-function query_same_ipc_namespace(model::KServeModel, name::AbstractString)
-    client = grpc_is_same_ipc_namespace_client(model)
+function query_same_ipc_namespace(model::KServeModel, name::AbstractString; deadline = 10)
+    client = grpc_is_same_ipc_namespace_client(model; deadline = deadline)
     try
         resp = grpc_sync_request(client, IsSameIPCNamespaceRequest(name = name))
         return resp.same ? :yes : :no
@@ -177,6 +223,118 @@ function query_same_ipc_namespace(model::KServeModel, name::AbstractString)
         end
         rethrow()
     end
+end
+
+# ---- Inline latch + background re-probe (last-resort SHM fallback) ----
+#
+# When shared memory cannot be recovered in-band (re-registration failed, or the retried request was
+# still stale), the endpoint is *latched* to the inline pool: its route is swapped so every later
+# request goes inline with no per-request SHM probing. The only thing that re-attempts SHM for a
+# latched endpoint is the background poller, which unlatches it once the server can register again.
+
+# Route `model`'s endpoint to the inline pool and record it for the re-probe poller. Idempotent.
+function latch_inline!(model::KServeModel)
+    key = (model.host, model.port, model.shared_memory)
+    already = @lock _pools_lock begin
+        was = haskey(_latched, key)
+        _pool_routes[key] = _get_inline_pool!()
+        _latched[key] = model
+        was
+    end
+    if !already
+        @warn "shared memory unrecoverable for $(model.host):$(model.port); falling back to inline " *
+              "transport (a background probe will restore SHM if the server recovers)"
+    end
+    _ensure_reprobe_running!()
+    return _get_inline_pool!()
+end
+
+# Route a recovered endpoint back to the SHM pool and drop it from the latch set.
+function unlatch_shm!(key::PoolKey)
+    recovered = @lock _pools_lock begin
+        haskey(_latched, key) || return
+        _pool_routes[key] = _get_shm_pool!()
+        delete!(_latched, key)
+        true
+    end
+    recovered && @info "shared memory recovered for $(key[1]):$(key[2]); routing back to SHM"
+    return
+end
+
+# Start the re-probe loop once (idempotent), unless the interval is non-positive (poller disabled).
+# Each loop carries the generation it was started under; _stop_reprobe! bumps the generation to
+# retire it.
+function _ensure_reprobe_running!()
+    _reprobe_interval[] > 0 || return
+    # Never spawn the background poller while generating precompile output: its `sleep` keeps a libuv
+    # timer handle open, which makes precompilation of any downstream package that exercises a latch
+    # warn ("waiting for IO to finish") or hang. Latching still routes to inline during precompile;
+    # the poller starts on the first latch at real runtime instead.
+    ccall(:jl_generating_output, Cint, ()) == 0 || return
+    @lock _pools_lock begin
+        t = _reprobe_task[]
+        (t !== nothing && !istaskdone(t)) && return
+        g = (_reprobe_gen[] += 1)
+        _reprobe_task[] = errormonitor(Threads.@spawn _shm_reprobe_loop(g))
+    end
+    return
+end
+
+# Retire the re-probe loop. Non-blocking by design: we bump the generation (so the loop returns at
+# its next checkpoint) and drop our handle to it, but we do NOT wait for the task. The task may be
+# parked in a blocking gRPC probe against a down/wedged server, and blocking shutdown on that is
+# exactly the hang this avoids; the orphaned task observes the generation change and exits on its own.
+# Safe to call with or without _pools_lock held.
+function _stop_reprobe!()
+    @lock _pools_lock begin
+        _reprobe_gen[] += 1
+        _reprobe_task[] = nothing
+    end
+    return
+end
+
+# One re-probe pass over the latched endpoints. For each, ask whether the server can see our SHM
+# object again (IsSameIPCNamespace, under a short deadline); only on :yes do we attempt a real
+# re-registration and, on success, unlatch back to SHM. A :no/:unknown answer or any error leaves the
+# endpoint latched. Failed probes log at @debug only, so a persistently-degraded endpoint does not
+# spam the log every tick.
+function _reprobe_once()
+    latched = @lock _pools_lock collect(_latched)   # snapshot of (key => model)
+    isempty(latched) && return
+    shm = _get_shm_pool!()
+    for (key, model) in latched
+        try
+            query_same_ipc_namespace(model, shmid(shm.pool.backing);
+                                     deadline = _REPROBE_RPC_DEADLINE) === :yes || continue
+            # Force an actual re-register even if the endpoint is still in registered_keys.
+            @lock shm.register_lock delete!(shm.registered_keys, (model.host, model.port))
+            register_pool_with_model!(shm, model)
+            unlatch_shm!(key)
+        catch ex
+            @debug "SHM re-probe failed; staying on inline" endpoint = "$(model.host):$(model.port)" exception = ex
+        end
+    end
+    return
+end
+
+# Background loop: re-probe every `interval` seconds until this generation is retired. Sleeps in short
+# slices so a stop (generation bump) is picked up within a slice even while idle.
+function _shm_reprobe_loop(mygen::Int)
+    while _reprobe_gen[] == mygen
+        slept = 0.0
+        while slept < _reprobe_interval[] && _reprobe_gen[] == mygen
+            dt = min(0.5, _reprobe_interval[] - slept)
+            sleep(dt)
+            slept += dt
+        end
+        _reprobe_gen[] == mygen || break
+        try
+            _reprobe_once()
+        catch ex
+            @debug "SHM re-probe pass errored" exception = ex
+        end
+    end
+    return
 end
 
 # Decide which pool a model's (host, port) routes to, per its `shared_memory` mode. See the
