@@ -61,7 +61,24 @@ end
 
 function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     _warn_unenforced_config(cfg)
+    # numerics=f32 defense in depth: NVIDIA_TF32_OVERRIDE must be in the environment before the
+    # CUDA client (and its cuBLAS/cuDNN handles) exists. It covers library-internal matmul paths
+    # the op-level precision pin cannot see; it does NOT govern XLA's Triton GEMMs, which the pin
+    # does, so the two mechanisms cover each other's gaps.
+    cfg.runtime.numerics == NUMERICS_F32 && (ENV["NVIDIA_TF32_OVERRIDE"] = "0")
     pool = resolve_client(backend, cfg.runtime)
+    # numerics=tf32 is a hard requirement, not a preference: on a target that cannot run TF32
+    # (pre-Ampere GPU, or the CPU-fallback path), failing startup loudly beats a worker whose
+    # numerics silently diverge from the rest of the fleet.
+    if cfg.runtime.numerics == NUMERICS_TF32 && !backend_tf32_capable(backend, pool)
+        throw(ErrorException("runtime.numerics 'tf32' requested but the compile target " *
+                             "('$(pool.platform)') does not support TF32 (requires NVIDIA compute " *
+                             "capability >= 8.0); use 'auto' or 'f32', or run on capable hardware"))
+    end
+    # Numerics attestation, GPU only: report whether TF32 is actually in use (auto/tf32) and, under
+    # f32, prove the precision pin bit-exactly. Runs before any model compile and before the scratch
+    # high-water probe; see tf32_probe for why its transient ~3 MB cannot perturb that measurement.
+    pool.platform == "cuda" && tf32_probe(backend, pool)
     include = isempty(cfg.models_include) ? nothing : cfg.models_include
     registry = load_bundles(cfg.model_dirs; include=include)
     isempty(registry.by_name) && @warn "no model bundles found" model_dirs = cfg.model_dirs models_include = cfg.models_include

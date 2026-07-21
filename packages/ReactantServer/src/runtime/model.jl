@@ -63,15 +63,21 @@ function build_loaded_model(backend::AbstractBackend, pool::MemoryPool, entry::M
     end
     np = num_parameters(sig)
     # One executable per (variant, batch size); all share the single weight set loaded above.
+    # The numerics accumulator aggregates what the numerics policy did across all artifacts so the
+    # model-loaded log records the model's effective precision in one line.
+    nstats = NumericsStats()
     execs = Dict{VariantKey,Dict{Int,Any}}()
     for (vkey, batchmap) in entry.mlir_bytes
         inner = Dict{Int,Any}()
         for (sz, bytes) in batchmap
-            inner[sz] = compile_artifact(backend, pool, bytes, np, n_outputs)
+            inner[sz] = compile_artifact(backend, pool, bytes, np, n_outputs; numerics_stats=nstats)
         end
         execs[vkey] = inner
     end
     model = LoadedModel(sig, execs, weights, state, nbytes, host_weights)
-    log_model_loaded(entry, model; source=source, memory=memory_report(backend, pool))
+    numerics = format_numerics(pool.numerics, nstats, backend_tf32_capable(backend, pool))
+    isempty(nstats.opaque_ops) ||
+        @warn "numerics=f32: module contains ops the precision pin cannot govern" model = entry.name ops = sort(unique(nstats.opaque_ops))
+    log_model_loaded(entry, model; source=source, memory=memory_report(backend, pool), numerics=numerics)
     return model
 end

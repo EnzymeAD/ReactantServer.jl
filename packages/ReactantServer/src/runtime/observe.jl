@@ -131,10 +131,12 @@ function memory_report(backend::AbstractBackend, pool::MemoryPool;
 end
 
 # Consistent model summary, emitted from build_loaded_model so startup and the watcher format a
-# model identically. `source` distinguishes the trigger (:startup, :dynamic).
-function log_model_loaded(entry::ModelEntry, model::LoadedModel; source::Symbol, memory::AbstractString)
+# model identically. `source` distinguishes the trigger (:startup, :dynamic). `numerics` is the
+# effective f32/tf32 precision outcome (see format_numerics); "" when the caller has none (tests).
+function log_model_loaded(entry::ModelEntry, model::LoadedModel; source::Symbol, memory::AbstractString,
+                          numerics::AbstractString="")
     m = entry.manifest
-    @info "model loaded" name = entry.name source = source inputs = _format_specs(m.executable_inputs) outputs = _format_specs(m.executable_outputs) batch_sizes = _compiled_sizes(model) weights = Base.format_bytes(model.nbytes) residency = model.state memory = memory
+    @info "model loaded" name = entry.name source = source inputs = _format_specs(m.executable_inputs) outputs = _format_specs(m.executable_outputs) batch_sizes = _compiled_sizes(model) weights = Base.format_bytes(model.nbytes) residency = model.state numerics = numerics memory = memory
     return nothing
 end
 
