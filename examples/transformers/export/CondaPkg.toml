@@ -1,0 +1,5 @@
+# torch / torchax / jax / numpy come from ReactantServerExport's CondaPkg.toml (merged into this
+# environment via the path source). transformers loads the BERT/DistilBERT checkpoints for export;
+# left unpinned so pip resolves against the pinned torch.
+[pip.deps]
+transformers = ""

@@ -1,0 +1,18 @@
+# Client environment: sends text and reads the results. ReactantServerClient carries NO Reactant
+# dependency, so this is the lean, fast-loading environment you run most often.
+
+[deps]
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+ReactantServerClient = "df172679-9d9b-4a02-a92c-27cb5f9e1c5c"
+ReactantServerCore = "387a5f05-f7b4-4d57-bca9-cd3358e52bdc"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+gRPCClient = "aaca4a50-36af-4a1d-b878-4c443f2061ad"
+
+[sources]
+HTTP = {path = "../../../lib/HTTP.jl"}
+ReactantServerClient = {path = "../../../packages/ReactantServerClient"}
+ReactantServerCore = {path = "../../../packages/ReactantServerCore"}
+gRPCClient = {path = "../../../lib/gRPCClient.jl"}
+
+[compat]
+julia = "1.12"
