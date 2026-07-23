@@ -1,0 +1,14 @@
+# Export environment: traces the transformer text models into StableHLO bundles. Only this
+# environment loads PythonCall + the torch stack, mirroring examples/object_detection/export;
+# keeping it separate from the server (Reactant) and client environments avoids dragging the
+# torch/Conda world into either of those.
+
+[deps]
+PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
+ReactantServerExport = "90fa0446-f028-4638-8833-e223884d9b4d"
+
+[sources]
+ReactantServerExport = {path = "../../../packages/ReactantServerExport"}
+
+[compat]
+julia = "1.12"
