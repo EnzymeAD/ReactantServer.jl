@@ -18,6 +18,7 @@ ReactantServerCore = {path = "../packages/ReactantServerCore"}
 ReactantServerGateway = {path = "../packages/ReactantServerGateway"}
 ReactantServerNode = {path = "../packages/ReactantServerNode"}
 gRPCServer = {path = "../lib/gRPCServer.jl"}
+gRPCClient = {url = "https://github.com/JuliaIO/gRPCClient.jl", rev = "v1.1.0-rc1"}
 
 [compat]
 Documenter = "1"
