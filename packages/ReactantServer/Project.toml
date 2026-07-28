@@ -31,7 +31,7 @@ Reactant = "0.2.264 - 0.2.270"
 ReactantServerCore = "=0.1.9"
 SafeTensors = "1.2.1"
 YAML = "0.4.16"
-gRPCClient = "1.0.3"
+gRPCClient = "1.1.0"
 gRPCServer = "0.1"
 julia = "1.12"
 

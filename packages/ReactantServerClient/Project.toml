@@ -19,7 +19,7 @@ PrecompileTools = "1"
 ProtoBuf = "1.3.0"
 ReactantServerCore = "=0.1.9"
 ResumableFunctions = "0.6, 1"
-gRPCClient = "1.0.3"
+gRPCClient = "1.1.0"
 julia = "1.12"
 
 [extras]
