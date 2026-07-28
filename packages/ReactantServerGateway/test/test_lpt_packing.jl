@@ -380,10 +380,12 @@ end
     # A server that accepts TCP but never speaks gRPC/HTTP-2: the connection establishes then stalls
     # on the HTTP/2 handshake, exactly like a worker caught in its brief silent-accept window at
     # startup. With PIPEWAIT (which the client keeps for multiplexing), libcurl pools the half-open
-    # connection and every later request reuses (and hangs forever on) it; only dropping the
-    # connection recovers. The gateway calls reset_clients! when a probe to a worker hangs, the
-    # per-worker equivalent of a process restart. (The middle assertion documents the current
-    # gRPCClient connection-reuse behavior, to be hardened separately.)
+    # connection and later requests reuse it; a handle parked waiting for that connection to become
+    # multiplexable never re-enters libcurl's state machine, so its own CURLOPT_TIMEOUT_MS never
+    # fires. gRPCClient 1.1 backstops that with a client-side deadline watchdog, so every call on a
+    # poisoned connection now fails at its deadline instead of wedging forever. The gateway still
+    # calls reset_clients! when a probe to a worker hangs (the per-worker equivalent of a process
+    # restart); this checks the handle is usable again afterwards.
     srv = Sockets.listen(Sockets.localhost, 0)
     port = Int(Sockets.getsockname(srv)[2])
     acceptor = @async try
@@ -396,21 +398,33 @@ end
     grpc = gRPCClient.gRPCCURL(; sticky = true)
     client = gRPCClient.gRPCServiceClient{Vector{UInt8},false,Vector{UInt8},false}(
         "127.0.0.1", port, "/probe.Svc/Call"; grpc = grpc, deadline = 0.5)
+    # Returns (whether the call returned within `cap`, the exception it threw).
     bounded_call(cap) = begin
+        err = Ref{Any}(nothing)
         t = @async try
             gRPCClient.grpc_sync_request(client, UInt8[0x00, 0x00, 0x00, 0x00, 0x00])
-        catch
+        catch e
+            err[] = e
         end
-        timedwait(() -> istaskdone(t), cap)
+        (timedwait(() -> istaskdone(t), cap), err[])
     end
+    expired(e) = e isa gRPCClient.gRPCServiceCallException &&
+                 e.grpc_status == gRPCClient.GRPC_DEADLINE_EXCEEDED
 
-    @test bounded_call(3.0) == :ok          # first request times out at its 0.5s deadline, returns
-    @test bounded_call(3.0) == :timed_out   # second reuses the poisoned connection and hangs
+    # Both calls end at their 0.5s deadline: the first driven by libcurl's own timeout, the second
+    # (which reuses the poisoned pooled connection) by the client's watchdog.
+    for _ in 1:2
+        status, err = bounded_call(3.0)
+        @test status == :ok
+        @test expired(err)
+    end
 
     wc = GW.WorkerClients("127.0.0.1:$port", grpc, client, client, client, client, client, client, client, client)
     GW.reset_clients!(wc)                    # close + reopen the handle: drops the poisoned connection
 
-    @test bounded_call(3.0) == :ok          # fresh connection: times out at the deadline, no hang
+    status, err = bounded_call(3.0)          # fresh connection: still bounded by the deadline
+    @test status == :ok
+    @test expired(err)
 
     gRPCClient.grpc_shutdown(grpc)
     close(srv)
