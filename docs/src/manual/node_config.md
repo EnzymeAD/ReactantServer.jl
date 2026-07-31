@@ -214,7 +214,10 @@ logging:
   level: "info"
   format: "json"
 scheduling:
-  mode: round_robin               # round_robin | lpt_packing (see Multi-GPU Gateway)
+  mode: round_robin               # round_robin | least_outstanding | lpt_packing
+  # lpt_packing only; see Multi-GPU Gateway for the full set and for the runtime control plane.
+  default_replicas: 1             # GPUs per model (a number, or "all")
+  routing_fill_mode: run          # run (default) | spread | inflight
 endpoints:                        # worker host:port addresses, across any number of nodes
   - "worker0:8080"
   - "worker1:8081"

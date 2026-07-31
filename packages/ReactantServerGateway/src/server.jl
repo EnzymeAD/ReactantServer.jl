@@ -371,5 +371,8 @@ function build_gateway_router(state::GatewayState, cfg::GatewayConfig)
     # Control plane: a single CompactMemory RPC to the gateway fans out to every worker.
     register_ControlService!(router;
         CompactMemory = (req, ctx) -> _gw_compact(req, ctx.payload))
+    # The gateway's own scheduling control plane (see control_service.jl). A distinct service, so the
+    # worker-facing ControlService above keeps its meaning.
+    register_gateway_control_service!(router, state)
     return router
 end

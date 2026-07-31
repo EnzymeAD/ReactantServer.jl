@@ -28,3 +28,27 @@ function register_ControlService!(router; ModelControlStatus=nothing, SetModelRe
     return router
 end
 export register_ControlService!
+
+# --- GatewayControlService (terminated by the GATEWAY, not by a worker) -------------------------
+# Regenerated with the messages and moved here; see CONTRIBUTING. The worker deliberately does not
+# register this service, so a worker answers UNIMPLEMENTED for these RPCs.
+GatewayControlService_GetSchedulingStatus_Method(; TRequest=GetSchedulingStatusRequest, TResponse=GetSchedulingStatusResponse) = gRPCServer.gRPCMethod{TRequest, false, TResponse, false}("/reactant_control.GatewayControlService/GetSchedulingStatus")
+export GatewayControlService_GetSchedulingStatus_Method
+
+GatewayControlService_SetSchedulingPolicy_Method(; TRequest=SetSchedulingPolicyRequest, TResponse=SetSchedulingPolicyResponse) = gRPCServer.gRPCMethod{TRequest, false, TResponse, false}("/reactant_control.GatewayControlService/SetSchedulingPolicy")
+export GatewayControlService_SetSchedulingPolicy_Method
+
+GatewayControlService_SetModelPlacement_Method(; TRequest=SetModelPlacementRequest, TResponse=SetModelPlacementResponse) = gRPCServer.gRPCMethod{TRequest, false, TResponse, false}("/reactant_control.GatewayControlService/SetModelPlacement")
+export GatewayControlService_SetModelPlacement_Method
+
+GatewayControlService_Repack_Method(; TRequest=RepackRequest, TResponse=RepackResponse) = gRPCServer.gRPCMethod{TRequest, false, TResponse, false}("/reactant_control.GatewayControlService/Repack")
+export GatewayControlService_Repack_Method
+
+function register_GatewayControlService!(router; GetSchedulingStatus=nothing, SetSchedulingPolicy=nothing, SetModelPlacement=nothing, Repack=nothing)
+    GetSchedulingStatus === nothing || gRPCServer.handle!(router, GatewayControlService_GetSchedulingStatus_Method(), GetSchedulingStatus)
+    SetSchedulingPolicy === nothing || gRPCServer.handle!(router, GatewayControlService_SetSchedulingPolicy_Method(), SetSchedulingPolicy)
+    SetModelPlacement === nothing || gRPCServer.handle!(router, GatewayControlService_SetModelPlacement_Method(), SetModelPlacement)
+    Repack === nothing || gRPCServer.handle!(router, GatewayControlService_Repack_Method(), Repack)
+    return router
+end
+export register_GatewayControlService!

@@ -59,17 +59,28 @@ mutable struct HealthProber
     wedged_rounds::Int                        # consecutive all-timeout rounds since last response
     wedge_exit_rounds::Int                    # exit(1) after this many; 0 disables
     ever_responsive::Bool                     # a worker has answered (non-timeout) at least once
+    # The scheduler forced-work sequence this task has already consumed, so an operator-forced repack
+    # wakes the prober early (see the wait in `start_prober!`) instead of waiting out `interval`.
+    # Prober-task-owned; plain.
+    last_repack_seq::Int
 end
 
 function HealthProber(pool::ClientPool, metrics::GatewayMetrics, admin::AdminServer,
                       routes::Union{DiscoveredRoutes,Nothing} = nothing;
                       scheduler::GatewayScheduler = RoundRobinScheduler(),
-                      interval::Real = HEALTH_INTERVAL_SECONDS,
+                      interval::Real = _health_interval_seconds(),
                       wedge_exit_rounds::Integer =
                           parse(Int, get(ENV, "REACTANT_GATEWAY_WEDGE_EXIT_ROUNDS",
                                          string(WEDGE_EXIT_ROUNDS))))
     return HealthProber(pool, metrics, admin, routes, scheduler, Float64(interval),
-                        Threads.Atomic{Bool}(true), nothing, 0, Int(wedge_exit_rounds), false)
+                        Threads.Atomic{Bool}(true), nothing, 0, Int(wedge_exit_rounds), false, 0)
+end
+
+# The probe interval, overridable so a test (or a deployment that wants a tighter control-plane
+# latency) does not have to wait the full default between rounds.
+function _health_interval_seconds()
+    v = tryparse(Float64, get(ENV, "REACTANT_GATEWAY_HEALTH_INTERVAL_SECONDS", ""))
+    return (v === nothing || v <= 0) ? HEALTH_INTERVAL_SECONDS : v
 end
 
 # Query every endpoint's ready models concurrently and build the model -> endpoints routing table.
@@ -160,7 +171,7 @@ function start_prober!(p::HealthProber)
             @warn "health: initial probe failed" exception = e
         end
         while p.running[]
-            sleep(p.interval)
+            _await_next_round(p)
             p.running[] || break
             try
                 _check_once(p)
@@ -170,6 +181,24 @@ function start_prober!(p::HealthProber)
         end
     end
     return p
+end
+
+# Sleep until the next round, returning early when the scheduler has forced-work pending so an
+# operator-triggered repack lands in about a poll interval rather than after the full probe interval.
+#
+# The sequence is consumed whether or not the repack can actually run: if no worker is ready the
+# scheduler's completed counter never advances, and a predicate that kept firing on the same request
+# would spin this loop at the poll rate forever. This way each request buys at most one extra round.
+function _await_next_round(p::HealthProber)
+    seq = scheduler_repack_seq(p.scheduler)
+    if seq > p.last_repack_seq
+        p.last_repack_seq = seq
+        return nothing
+    end
+    timedwait(p.interval; pollint = 0.05) do
+        !p.running[] || scheduler_repack_seq(p.scheduler) > p.last_repack_seq
+    end
+    return nothing
 end
 
 stop_prober!(p::HealthProber) = (p.running[] = false; nothing)

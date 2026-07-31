@@ -47,7 +47,9 @@ discover models dynamically via Grafana template variables (`$worker`, `$model`)
    vs limit, weight-cache load/evict churn, out-of-pool driver memory, on-demand budget utilization, resident model count.
 4. **Scheduling & Placement** — lpt_packing: models placed per worker, in-flight load balance,
    gateway-to-worker call p99, top models by utilization, the model->worker placement table, and
-   worker metrics-scrape health.
+   worker metrics-scrape health. `gateway_replica_routed_total` (cumulative requests routed per
+   replica) is the series to watch when a replicated model looks like it is only using one GPU;
+   `gateway_model_fill_quantum` and `gateway_repacks_total{trigger}` explain why.
 5. **Per-Model Drilldown** (`$model`) — one model's rate/errors, handler-latency heatmap, queue
    depth & wait, its coalescing, residency-by-worker timeline, and placement.
 6. **Coalescing & Batching** — every model's **coalescing factor** (requests merged per dispatch =

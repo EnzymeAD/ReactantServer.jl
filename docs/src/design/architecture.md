@@ -122,7 +122,10 @@ How the set of loaded models changes over a worker's lifetime is set by `model_c
   autonomous action, and model residency is driven entirely over a small gRPC control surface
   (`ModelControlStatus` to observe, `SetModelResidency` to pin and unpin, `SetModelPolicy` to
   adjust scheduling weight). A model serves only while the control plane holds it resident.
-  This is the integration seam for organizations that run their own placement logic.
+  This is the integration seam for organizations that run their own placement logic. The gateway
+  exposes a separate service for its own placement decisions (`GatewayControlService`: read the
+  scheduling state, change a model's replica count or fill mode, retune the knobs, force a repack),
+  so worker residency and gateway placement stay independently controllable.
 
 ## The scheduler
 

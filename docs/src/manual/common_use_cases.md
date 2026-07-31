@@ -153,9 +153,9 @@ See [Multi-GPU Gateway](multi_gpu_gateway.md) and [Scaling to Multiple GPUs](sca
 
 **Which scheduling mode.** All three modes work with replicas, so the choice is about what you optimize. Use `lpt_packing` when you want to maximize batch coalescing even with replicas: it concentrates a model's requests to fill one replica's batch before spilling to the next, and it places models on GPUs reactively by measured compute and memory load, including which GPUs host a replicated model. If you do not need reactive model placement (beyond the simple, request-level reactivity that `least_outstanding` itself provides) or batch coalescing, `round_robin` and `least_outstanding` are both significantly less complicated and need no measurements, no `fifo` discipline, and no startup preconditions. Both route across the replicas the workers already serve, so you replicate a model by loading it on more than one worker rather than by setting a gateway replica count: `round_robin` spreads requests blindly across those replicas, and `least_outstanding` spreads them by live occupancy, sending each request to the replica with the fewest in flight.
 
-**How to configure it.** For the batching-first path, set `scheduling.mode: lpt_packing` in `gateway.yml` and give the replicated model a replica count, either with `scheduling.default_replicas` or per model under `scheduling.models.<name>.replicas`. The gateway places each model on that many distinct GPUs and routes its requests to fill one replica's batch before moving to the next, so coalescing is preserved across replicas rather than diluted. Tune `routing_fill_factor` (raise it above 1.0 to keep the next batch queued under fast arrival) and choose a `routing_policy`: `fill_rr` (default) round-robins which replica opens each batch, and `fill_least` opens it on the least compute-loaded GPU (best when replicas share GPUs with other models). For the simpler path, set `scheduling.mode: round_robin` or `least_outstanding` and load the model on each worker that should serve it; neither mode takes a replica count or any of the `lpt_packing` knobs. See [Multi-GPU Gateway](multi_gpu_gateway.md) for the full set of knobs.
+**How to configure it.** For the batching-first path, set `scheduling.mode: lpt_packing` in `gateway.yml` and give the replicated model a replica count, either with `scheduling.default_replicas` or per model under `scheduling.models.<name>.replicas`. The gateway places each model on that many distinct GPUs and routes its requests to fill one replica's batch before moving to the next, so coalescing is preserved across replicas rather than diluted. Tune `routing_fill_factor` (the fill quantum, as a multiple of the max batch size) and choose a `routing_policy`: `fill_rr` (default) rotates which replica opens each run, and `fill_least` opens it on the least compute-loaded GPU (best when replicas share GPUs with other models). If a replicated model is latency-bound and its client concurrency sits well below its max batch, give it `fill_mode: spread` so all its GPUs serve it at once; the fleet default `run` keeps batches deep instead. Avoid `fill_mode: inflight`, which parks such a model on a single GPU (see [Multi-GPU Gateway](multi_gpu_gateway.md)). For the simpler path, set `scheduling.mode: round_robin` or `least_outstanding` and load the model on each worker that should serve it; neither mode takes a replica count or any of the `lpt_packing` knobs. See [Multi-GPU Gateway](multi_gpu_gateway.md) for the full set of knobs.
 
-Replica counts are fixed at startup; a model does not fan out automatically under load. Size the replica count for the model's expected concurrency, and rely on the per-GPU queue and batch coalescing to absorb bursts on each replica.
+A model does not fan out automatically under load, so size the replica count for the model's expected concurrency and rely on the per-GPU queue and batch coalescing to absorb bursts on each replica. You can promote a model onto more GPUs (or change how it uses them) on a running gateway with `tools/gateway_ctl.jl set-replicas`; the change applies at the next repack and lasts until the gateway restarts.
 
 **Example configuration.** The node file is the same as the distributed case (one worker per GPU,
 `discipline: fifo`). The difference is in the gateway: give the hot model a replica count so it is
@@ -184,7 +184,7 @@ scheduling:
   default_replicas: all             # every model on every GPU
 ```
 
-Replica counts are fixed at startup; size them for the model's expected concurrency.
+Size replica counts for the model's expected concurrency. They can also be changed at runtime with `tools/gateway_ctl.jl set-replicas`, in memory only, until the gateway restarts.
 
 !!! warning "Make sure you have the memory to replicate"
     Replicating a model puts its full weight footprint on every GPU it lands on. It is your
@@ -223,7 +223,9 @@ flowchart TD
 against: the KServe V2 gRPC data plane (`ModelInfer`, `RepositoryIndex`, `ServerReady`) plus the
 worker control RPCs (`ModelControlStatus`, `SetModelResidency`, `SetModelPolicy` for residency and
 policy, `CompactMemory` to defragment device memory), and an admin HTTP port serving `/healthz`,
-`/readyz`, and Prometheus `/metrics`. Your
+`/readyz`, and Prometheus `/metrics`. A node's embedded gateway additionally answers
+`GatewayControlService` for its own scheduling state (placement, knobs, repacks; see
+[Multi-GPU Gateway](multi_gpu_gateway.md)). Your
 control plane discovers which models each node serves via `RepositoryIndex` and routes `ModelInfer`
 to a node that reports the model ready.
 

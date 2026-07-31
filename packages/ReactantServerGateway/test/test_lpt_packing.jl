@@ -113,7 +113,7 @@ end
 
 @testset "verify_lpt_packing_preconditions!: gates on worker reachability" begin
     cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", ["127.0.0.1:1"], String[], String[], 1, 1, 1, "info",
-                           "json", "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr",
+                           "json", "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr", "run",
                            Dict{String,GW.GatewayModelConfig}(), 32, 64, :off, 0, false)
     pool = GW.ClientPool(cfg)
     # Default (wait_seconds = 0) fails fast when a worker is unreachable.
@@ -223,9 +223,9 @@ end
     @test cfg.compaction_interval == 1
     @test cfg.forbid_memory_oversubscription == true
     # 0 resolves to the rebalance interval (~50% decay per rebalance); a set value is honored.
-    @test GW.LptPackingState(cfg).ema_halflife_compute == cfg.rebalance_compute_seconds
+    @test GW.knobs(GW.LptPackingState(cfg)).ema_halflife_compute == cfg.rebalance_compute_seconds
     cfg2 = _load("scheduling:\n  ema_halflife_compute_seconds: 120\n  rebalance_compute_seconds: 300\n" * eps)
-    @test GW.LptPackingState(cfg2).ema_halflife_compute == 120.0
+    @test GW.knobs(GW.LptPackingState(cfg2)).ema_halflife_compute == 120.0
     @test _load("scheduling:\n  forbid_memory_oversubscription: false\n" * eps).forbid_memory_oversubscription == false
 end
 
@@ -266,7 +266,7 @@ end
 
 @testset "gateway compaction cadence: fires on the Nth repack that moves a model" begin
     mk(mode, interval) = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], String[], 60, 1, 1,
-        "info", "json", "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr",
+        "info", "json", "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr", "run",
         Dict{String,GW.GatewayModelConfig}(), 32, 64, mode, interval, false)
     cfg = mk(:eager, 2)
     s = GW.LptPackingState(cfg)
@@ -296,14 +296,17 @@ end
 # Build a packing state directly for routing unit tests. Defaults to a single two-replica model
 # "m" on w0/w1; callers can install their own placement, per-model costs, and max batches.
 function _pk_state(; routing_policy = "fill_rr", fill_factor = 1.0, max_batch = 8,
+                   fill_mode = "run",
                    assignment = Dict{String,GW.Placement}("m" => [("w0", 0.5), ("w1", 0.5)]),
                    costs = nothing)
     cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], String[], 60, 1, 1, "info", "json",
-                           "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, fill_factor, routing_policy,
+                           "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, fill_factor, routing_policy, fill_mode,
                            Dict{String,GW.GatewayModelConfig}(), 32, 64, :off, 0, false)
     s = GW.LptPackingState(cfg)
     @atomic s.assignment = assignment
-    @atomic s.max_batch = Dict(m => max_batch for m in keys(assignment))
+    mb = Dict(m => max_batch for m in keys(assignment))
+    @atomic s.max_batch = mb
+    GW._publish_fill_plan!(s, GW.knobs(s), mb)     # resolve mode + quantum, as a prober tick would
     costs === nothing || (@atomic s.cost_snapshot = costs)
     GW._swap_outstanding!(s, (@atomic s.assignment))
     return s
@@ -374,6 +377,175 @@ end
     foreach(GW._release_route!, held)
     out = @atomic s.outstanding
     @test out[("m", "w0")][] == 0 && out[("m", "w1")][] == 0
+end
+
+# Drive `route_replica` under a closed-loop client: exactly `C` requests in flight at all times, the
+# oldest released as each new one is routed. Returns the per-replica share of routed requests and the
+# mean number of replicas holding in-flight work (how many GPUs the model uses at once). This is the
+# shape of a fixed-size consumer pool or a benchmark harness, and it is the case the `inflight` basis
+# parks on.
+function _closed_loop(; C, n = 2, steps = 400, kw...)
+    ws = ["w$(i - 1)" for i in 1:n]
+    s = _pk_state(; assignment = Dict{String,GW.Placement}("m" => [(w, 1 / n) for w in ws]), kw...)
+    held = Any[]
+    counts = Dict{String,Int}()
+    conc = 0
+    for _ in 1:steps
+        length(held) >= C && GW._release_route!(popfirst!(held))
+        urls, res = GW.route_replica(s, "m")
+        counts[urls[1]] = get(counts, urls[1], 0) + 1
+        push!(held, res)
+        out = @atomic s.outstanding
+        conc += count(w -> out[("m", w)][] > 0, ws)
+    end
+    foreach(GW._release_route!, held)
+    return [get(counts, w, 0) for w in ws], conc / steps
+end
+
+@testset "fill modes: no replica starves at any concurrency" begin
+    # The regression test for the parking bug. Under the `inflight` basis every C in 2..Q sent 100% of
+    # a model's traffic to one replica forever; `run` and `spread` must give every replica a share at
+    # every concurrency, and stay within one quantum of even.
+    Q = 8
+    for mode in ("run", "spread"), policy in ("fill_rr", "fill_least"),
+        n in (2, 3, 4), C in (1, 2, 4, 7, 8, 9, 16, 24)
+
+        shares, _ = _closed_loop(; C = C, n = n, steps = 400, max_batch = Q,
+                                 fill_mode = mode, routing_policy = policy)
+        @test sum(shares) == 400
+        @test minimum(shares) > 0                                  # nobody starves
+        @test maximum(abs.(shares .- 400 / n)) <= Q                # even to within one run
+    end
+end
+
+@testset "fill modes: run counts routed requests, not in-flight" begin
+    # Two requests in flight is far below Q=8, so the `inflight` basis can never reach its threshold
+    # and parks. The `run` basis rotates after Q *routed* requests regardless of how few are in flight.
+    run_shares, run_conc = _closed_loop(; C = 2, n = 2, steps = 400, max_batch = 8, fill_mode = "run")
+    @test run_shares == [200, 200]
+    inflight_shares, _ = _closed_loop(; C = 2, n = 2, steps = 400, max_batch = 8,
+                                      fill_mode = "inflight")
+    @test inflight_shares == [400, 0]                              # legacy behavior, pinned on purpose
+
+    # `run` keeps the model on one GPU at a time (deep batches, fair over runs); `spread` uses both at
+    # once (concurrent service, shallower batches). This is the whole distinction between them.
+    _, spread_conc = _closed_loop(; C = 4, n = 2, steps = 400, max_batch = 8, fill_mode = "spread")
+    _, run_conc4 = _closed_loop(; C = 4, n = 2, steps = 400, max_batch = 8, fill_mode = "run")
+    @test spread_conc > 1.99          # both replicas busy essentially always
+    @test 1.0 < run_conc4 < 1.5       # mostly one at a time, straddling only at run boundaries
+    @test spread_conc > run_conc4
+end
+
+@testset "fill modes: run rotates every Q requests" begin
+    s = _pk_state(; max_batch = 8, fill_mode = "run")
+    # Hold everything in flight so only the routed count can end the run.
+    held = [GW.route_replica(s, "m") for _ in 1:8]
+    first_w = held[1][1][1]
+    @test all(h -> h[1][1] == first_w, held)                       # one run of Q = 8
+    ninth, c9 = GW.route_replica(s, "m")
+    @test ninth[1] != first_w                                      # the next run opens elsewhere
+    @test Set(ninth) == Set(["w0", "w1"])                          # both present as failover
+    foreach(h -> GW._release_route!(h[2]), held)
+    GW._release_route!(c9)
+end
+
+@testset "fill modes: a replica a quantum behind loses its turn" begin
+    # Backpressure: rotation alone would return to w0, but w0 is a whole quantum deeper in in-flight
+    # work, so the run stays on the draining replica instead of queueing on the slow one.
+    s = _pk_state(; max_batch = 8, fill_mode = "run")
+    run1 = [GW.route_replica(s, "m") for _ in 1:8]                 # fills w0
+    run2 = [GW.route_replica(s, "m") for _ in 1:8]                 # fills w1
+    @test run1[1][1][1] != run2[1][1][1]
+    foreach(h -> GW._release_route!(h[2]), run2)                   # only w1 drains
+    urls, c = GW.route_replica(s, "m")
+    @test urls[1] == run2[1][1][1]                                 # not the backed-up replica
+    foreach(h -> GW._release_route!(h[2]), run1)
+    GW._release_route!(c)
+end
+
+@testset "fill modes: an unknown max batch degrades to rotation" begin
+    # max_batch 0 means the worker reported no compiled batch shape, so the quantum is 1: there is no
+    # batch to protect and every request opens a new run.
+    s = _pk_state(; max_batch = 0, fill_mode = "run")
+    @test (@atomic s.fill_plan)["m"].quantum == 1
+    picks = String[]
+    for _ in 1:4
+        urls, c = GW.route_replica(s, "m")
+        push!(picks, urls[1])
+        GW._release_route!(c)
+    end
+    @test picks == ["w0", "w1", "w0", "w1"]
+end
+
+@testset "fill modes: a run ends when the placement changes under it" begin
+    # A repack can swap a model onto a different worker set mid-run. The carried run record indexes the
+    # old placement, so routing must reopen instead of indexing out of bounds.
+    s = _pk_state(; max_batch = 8, fill_mode = "run")
+    held = [GW.route_replica(s, "m") for _ in 1:3]                 # a run is open on w0
+    foreach(h -> GW._release_route!(h[2]), held)
+    next = Dict{String,GW.Placement}("m" => [("w1", 0.5), ("w2", 0.5)])
+    @atomic s.assignment = next
+    GW._swap_outstanding!(s, next)
+    shares = Dict{String,Int}()
+    for _ in 1:40
+        urls, c = GW.route_replica(s, "m")
+        shares[urls[1]] = get(shares, urls[1], 0) + 1
+        GW._release_route!(c)
+    end
+    @test sort(collect(keys(shares))) == ["w1", "w2"]               # only the new placement is used
+    @test minimum(values(shares)) > 0
+end
+
+@testset "fill modes: per-model override beats the scheduling default" begin
+    # Three-level resolution: a model's own fill_mode/fill_factor, else the `scheduling:` default, else
+    # the built-in. This is what makes a default set at the scheduling level reach models with no block.
+    cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], String[], 60, 1, 1, "info",
+        "json", "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr", "spread",
+        Dict("pinned" => GW.GatewayModelConfig(2, :inflight, 0.0),
+             "short" => GW.GatewayModelConfig(2, :inherit, 0.25)),
+        32, 64, :off, 0, false)
+    s = GW.LptPackingState(cfg)
+    mb = Dict("pinned" => 8, "short" => 8, "plain" => 8)
+    plan = GW._publish_fill_plan!(s, GW.knobs(s), mb)
+    @test plan["pinned"].mode == :inflight && plan["pinned"].quantum == 8   # mode overridden
+    @test plan["short"].mode == :spread && plan["short"].quantum == 2       # factor overridden only
+    @test plan["plain"].mode == :spread && plan["plain"].quantum == 8       # inherits both
+
+    # Clearing an override returns the model to the fleet default; setting the fleet default moves
+    # every model that has no override of its own.
+    GW.set_knobs!(s; model_overrides = Dict("short" => GW.ModelKnobs(2, :inherit, 0.0)))
+    plan = GW._publish_fill_plan!(s, GW.knobs(s), mb)
+    @test plan["short"].quantum == 8 && plan["pinned"].mode == :spread      # both back to the default
+    GW.set_knobs!(s; routing_fill_mode = "run")
+    plan = GW._publish_fill_plan!(s, GW.knobs(s), mb)
+    @test all(p -> p.mode == :run, values(plan))
+end
+
+@testset "config: routing_fill_mode and the per-model overrides" begin
+    function _load(yaml)
+        path = tempname() * ".yaml"
+        write(path, yaml)
+        try
+            return GW.load_gateway(path)
+        finally
+            rm(path; force = true)
+        end
+    end
+    eps = "endpoints:\n  - \"127.0.0.1:7001\"\n"
+    @test _load(eps).routing_fill_mode == "run"                    # default
+    @test _load("scheduling:\n  routing_fill_mode: spread\n" * eps).routing_fill_mode == "spread"
+    @test _load("scheduling:\n  routing_fill_mode: inflight\n" * eps).routing_fill_mode == "inflight"
+    @test_throws ReactantServerCore.ConfigError _load("scheduling:\n  routing_fill_mode: bogus\n" * eps)
+    @test_throws ReactantServerCore.ConfigError _load("scheduling:\n  routing_fill_mode: inherit\n" * eps)
+    withenv("REACTANT_GATEWAY_SCHEDULING_ROUTING_FILL_MODE" => "spread") do
+        @test _load(eps).routing_fill_mode == "spread"
+    end
+    mc = _load("scheduling:\n  models:\n    a:\n      replicas: 2\n      fill_mode: inherit\n" *
+               "      fill_factor: 0.5\n" * eps).models["a"]
+    @test mc.replicas == 2 && mc.fill_mode == :inherit && mc.fill_factor == 0.5
+    @test _load("scheduling:\n  models:\n    a:\n      fill_mode: spread\n" * eps).models["a"].fill_mode == :spread
+    @test_throws ReactantServerCore.ConfigError _load(
+        "scheduling:\n  models:\n    a:\n      fill_factor: 0\n" * eps)
 end
 
 @testset "reset_clients! recovers a poisoned (stalled) worker connection" begin
@@ -556,8 +728,8 @@ end
         # Compute-driven trigger: tick_packing! accumulates fleet compute and repacks only once the
         # budget is crossed. Disable the separate first-repack budget here so this block exercises the
         # steady-state threshold directly (the first-vs-steady budget is covered in the block below).
-        aff.first_rebalance_compute_seconds = 0.0
-        aff.rebalance_compute_seconds = 1.0e9      # effectively never
+        GW.set_knobs!(aff; first_rebalance_compute_seconds = 0.0,
+                      rebalance_compute_seconds = 1.0e9)   # effectively never
         before = aff.last_rebalance
         for _ in 1:10
             _aff_infer(gw_port, "alpha")
@@ -566,7 +738,7 @@ end
         @test aff.last_rebalance == before          # not enough compute -> no repack
         @test aff.compute_accum > 0                 # but the compute was accounted
 
-        aff.rebalance_compute_seconds = 1.0e-9      # any compute triggers
+        GW.set_knobs!(aff; rebalance_compute_seconds = 1.0e-9)   # any compute triggers
         for _ in 1:10
             _aff_infer(gw_port, "alpha")
         end
@@ -577,8 +749,8 @@ end
         # First-run vs steady-state budget: the first tick-driven repack uses the smaller
         # first_rebalance_compute_seconds, then repacks after need the larger steady-state budget.
         aff.did_first_tick_repack = false
-        aff.first_rebalance_compute_seconds = 1.0e-9   # tiny first budget: any compute triggers it
-        aff.rebalance_compute_seconds = 1.0e9          # large steady-state budget: effectively never
+        GW.set_knobs!(aff; first_rebalance_compute_seconds = 1.0e-9,   # any compute triggers the first
+                      rebalance_compute_seconds = 1.0e9)              # steady state: effectively never
         before2 = aff.last_rebalance
         for _ in 1:10
             _aff_infer(gw_port, "alpha")

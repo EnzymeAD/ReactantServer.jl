@@ -51,6 +51,11 @@ scheduler_tick!(::GatewayScheduler, ::ClientPool, ready_urls, metrics) = nothing
 # Record a request arrival, for schedulers that estimate arrival rate. lpt_packing overrides this.
 record_arrival!(::GatewayScheduler, model::AbstractString) = nothing
 
+# The scheduler's forced-work sequence number, polled by the prober between rounds so an
+# operator-forced repack does not have to wait out the full probe interval. 0 means "never asks for an
+# early round", which is every scheduler but lpt_packing.
+scheduler_repack_seq(::GatewayScheduler) = 0
+
 # Release a reservation returned by `select_replicas`, on every dispatch path. The default ignores
 # it (covers schedulers that reserve nothing, and the `nothing` reservation of any scheduler).
 release!(::GatewayScheduler, reservation) = nothing

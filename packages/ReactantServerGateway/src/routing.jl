@@ -41,6 +41,10 @@ end
 
 nmodels(t::RoutingTable) = length(t.routes)
 
+# Whether a model is known, without the cursor side effect `pick` has. Used by the control plane to
+# reject a typo'd model name instead of storing an override that could never take effect.
+has_model(t::RoutingTable, model::AbstractString) = haskey(t.routes, model)
+
 # Holder for the current routing table. Autodiscovery swaps a freshly built table in atomically;
 # `pick` reads the current table lock free. Starts empty until the first discovery round.
 mutable struct DiscoveredRoutes
@@ -53,3 +57,4 @@ swap_table!(d::DiscoveredRoutes, t::RoutingTable) = (@atomic d.current = t; noth
 
 pick(d::DiscoveredRoutes, model::AbstractString) = pick(current_table(d), model)
 nmodels(d::DiscoveredRoutes) = nmodels(current_table(d))
+has_model(d::DiscoveredRoutes, model::AbstractString) = has_model(current_table(d), model)

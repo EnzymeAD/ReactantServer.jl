@@ -45,6 +45,7 @@ include(ReactantServerCore.control_server_stubs_path())   # gateway terminates C
 
 include("headers.jl")
 include("config.jl")
+include("knobs.jl")      # runtime-mutable scheduling knobs; after config.jl (built from GatewayConfig)
 include("routing.jl")
 include("metrics.jl")
 include("client.jl")
@@ -52,6 +53,7 @@ include("refresh.jl")
 include("scheduler.jl")
 include("lpt_packing.jl")
 include("server.jl")
+include("control_service.jl")   # the gateway's own GatewayControlService handlers
 include("health.jl")
 
 """

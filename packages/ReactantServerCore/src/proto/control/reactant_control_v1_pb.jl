@@ -5,47 +5,183 @@ import ProtoBuf as PB
 using ProtoBuf: OneOf
 using ProtoBuf.EnumX: @enumx
 
-export SetModelPolicyResponse, ModelControlStatusRequest, SetModelPolicyRequest, Residency
-export SetModelResidencyRequest, ModelStatus, SetModelResidencyResponse
-export ModelControlStatusResponse
-export CompactMemoryRequest, CompactMemoryResponse
+export ReplicaPlacement, SetModelPlacementRequest, SetModelPlacementResponse
+export SetModelPolicyRequest, RepackStatus, RepackRequest, CompactMemoryRequest
+export SetModelPolicyResponse, ModelControlStatusRequest, SchedulingPolicy
+export GetSchedulingStatusRequest, Residency, CompactMemoryResponse, WorkerSchedulingStatus
+export ModelSchedulingStatus, RepackResponse, SetSchedulingPolicyResponse
+export SetSchedulingPolicyRequest, SetModelResidencyResponse, SetModelResidencyRequest
+export ModelStatus, GetSchedulingStatusResponse, ModelControlStatusResponse
 
 
-struct SetModelPolicyResponse end
+struct ReplicaPlacement
+    worker::String
+    weight::Float64
+    outstanding::Int64
+    routed_total::Int64
+end
+ReplicaPlacement(;worker = "", weight = zero(Float64), outstanding = zero(Int64), routed_total = zero(Int64)) = ReplicaPlacement(worker, weight, outstanding, routed_total)
+PB.default_values(::Type{ReplicaPlacement}) = (;worker = "", weight = zero(Float64), outstanding = zero(Int64), routed_total = zero(Int64))
+PB.field_numbers(::Type{ReplicaPlacement}) = (;worker = 1, weight = 2, outstanding = 3, routed_total = 4)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetModelPolicyResponse}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ReplicaPlacement}, _endpos::Int=0, _group::Bool=false)
+    worker = ""
+    weight = zero(Float64)
+    outstanding = zero(Int64)
+    routed_total = zero(Int64)
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
-        Base.skip(d, wire_type)
+        if field_number == 1
+            worker = PB.decode(d, String)
+        elseif field_number == 2
+            weight = PB.decode(d, Float64)
+        elseif field_number == 3
+            outstanding = PB.decode(d, Int64)
+        elseif field_number == 4
+            routed_total = PB.decode(d, Int64)
+        else
+            Base.skip(d, wire_type)
+        end
     end
-    return SetModelPolicyResponse()
+    return ReplicaPlacement(worker, weight, outstanding, routed_total)
 end
 
-function PB.encode(e::PB.AbstractProtoEncoder, x::SetModelPolicyResponse)
+function PB.encode(e::PB.AbstractProtoEncoder, x::ReplicaPlacement)
     initpos = position(e.io)
+    !isempty(x.worker) && PB.encode(e, 1, x.worker)
+    x.weight !== zero(Float64) && PB.encode(e, 2, x.weight)
+    x.outstanding != zero(Int64) && PB.encode(e, 3, x.outstanding)
+    x.routed_total != zero(Int64) && PB.encode(e, 4, x.routed_total)
     return position(e.io) - initpos
 end
-function PB._encoded_size(x::SetModelPolicyResponse)
+function PB._encoded_size(x::ReplicaPlacement)
     encoded_size = 0
+    !isempty(x.worker) && (encoded_size += PB._encoded_size(x.worker, 1))
+    x.weight !== zero(Float64) && (encoded_size += PB._encoded_size(x.weight, 2))
+    x.outstanding != zero(Int64) && (encoded_size += PB._encoded_size(x.outstanding, 3))
+    x.routed_total != zero(Int64) && (encoded_size += PB._encoded_size(x.routed_total, 4))
     return encoded_size
 end
 
-struct ModelControlStatusRequest end
+struct SetModelPlacementRequest
+    name::String
+    replicas::Int64
+    fill_mode::String
+    fill_factor::Float64
+    allow_unknown_model::Bool
+end
+SetModelPlacementRequest(;name = "", replicas = zero(Int64), fill_mode = "", fill_factor = zero(Float64), allow_unknown_model = false) = SetModelPlacementRequest(name, replicas, fill_mode, fill_factor, allow_unknown_model)
+PB.default_values(::Type{SetModelPlacementRequest}) = (;name = "", replicas = zero(Int64), fill_mode = "", fill_factor = zero(Float64), allow_unknown_model = false)
+PB.field_numbers(::Type{SetModelPlacementRequest}) = (;name = 1, replicas = 2, fill_mode = 3, fill_factor = 4, allow_unknown_model = 5)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelControlStatusRequest}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetModelPlacementRequest}, _endpos::Int=0, _group::Bool=false)
+    name = ""
+    replicas = zero(Int64)
+    fill_mode = ""
+    fill_factor = zero(Float64)
+    allow_unknown_model = false
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
-        Base.skip(d, wire_type)
+        if field_number == 1
+            name = PB.decode(d, String)
+        elseif field_number == 2
+            replicas = PB.decode(d, Int64)
+        elseif field_number == 3
+            fill_mode = PB.decode(d, String)
+        elseif field_number == 4
+            fill_factor = PB.decode(d, Float64)
+        elseif field_number == 5
+            allow_unknown_model = PB.decode(d, Bool)
+        else
+            Base.skip(d, wire_type)
+        end
     end
-    return ModelControlStatusRequest()
+    return SetModelPlacementRequest(name, replicas, fill_mode, fill_factor, allow_unknown_model)
 end
 
-function PB.encode(e::PB.AbstractProtoEncoder, x::ModelControlStatusRequest)
+function PB.encode(e::PB.AbstractProtoEncoder, x::SetModelPlacementRequest)
     initpos = position(e.io)
+    !isempty(x.name) && PB.encode(e, 1, x.name)
+    x.replicas != zero(Int64) && PB.encode(e, 2, x.replicas)
+    !isempty(x.fill_mode) && PB.encode(e, 3, x.fill_mode)
+    x.fill_factor !== zero(Float64) && PB.encode(e, 4, x.fill_factor)
+    x.allow_unknown_model != false && PB.encode(e, 5, x.allow_unknown_model)
     return position(e.io) - initpos
 end
-function PB._encoded_size(x::ModelControlStatusRequest)
+function PB._encoded_size(x::SetModelPlacementRequest)
     encoded_size = 0
+    !isempty(x.name) && (encoded_size += PB._encoded_size(x.name, 1))
+    x.replicas != zero(Int64) && (encoded_size += PB._encoded_size(x.replicas, 2))
+    !isempty(x.fill_mode) && (encoded_size += PB._encoded_size(x.fill_mode, 3))
+    x.fill_factor !== zero(Float64) && (encoded_size += PB._encoded_size(x.fill_factor, 4))
+    x.allow_unknown_model != false && (encoded_size += PB._encoded_size(x.allow_unknown_model, 5))
+    return encoded_size
+end
+
+struct SetModelPlacementResponse
+    name::String
+    configured_replicas::Int64
+    effective_replicas::Int64
+    fill_mode::String
+    fill_quantum::Int64
+    warnings::Vector{String}
+    persisted::Bool
+end
+SetModelPlacementResponse(;name = "", configured_replicas = zero(Int64), effective_replicas = zero(Int64), fill_mode = "", fill_quantum = zero(Int64), warnings = Vector{String}(), persisted = false) = SetModelPlacementResponse(name, configured_replicas, effective_replicas, fill_mode, fill_quantum, warnings, persisted)
+PB.default_values(::Type{SetModelPlacementResponse}) = (;name = "", configured_replicas = zero(Int64), effective_replicas = zero(Int64), fill_mode = "", fill_quantum = zero(Int64), warnings = Vector{String}(), persisted = false)
+PB.field_numbers(::Type{SetModelPlacementResponse}) = (;name = 1, configured_replicas = 2, effective_replicas = 3, fill_mode = 4, fill_quantum = 5, warnings = 6, persisted = 7)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetModelPlacementResponse}, _endpos::Int=0, _group::Bool=false)
+    name = ""
+    configured_replicas = zero(Int64)
+    effective_replicas = zero(Int64)
+    fill_mode = ""
+    fill_quantum = zero(Int64)
+    warnings = PB.BufferedVector{String}()
+    persisted = false
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            name = PB.decode(d, String)
+        elseif field_number == 2
+            configured_replicas = PB.decode(d, Int64)
+        elseif field_number == 3
+            effective_replicas = PB.decode(d, Int64)
+        elseif field_number == 4
+            fill_mode = PB.decode(d, String)
+        elseif field_number == 5
+            fill_quantum = PB.decode(d, Int64)
+        elseif field_number == 6
+            PB.decode!(d, warnings)
+        elseif field_number == 7
+            persisted = PB.decode(d, Bool)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return SetModelPlacementResponse(name, configured_replicas, effective_replicas, fill_mode, fill_quantum, warnings[], persisted)
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::SetModelPlacementResponse)
+    initpos = position(e.io)
+    !isempty(x.name) && PB.encode(e, 1, x.name)
+    x.configured_replicas != zero(Int64) && PB.encode(e, 2, x.configured_replicas)
+    x.effective_replicas != zero(Int64) && PB.encode(e, 3, x.effective_replicas)
+    !isempty(x.fill_mode) && PB.encode(e, 4, x.fill_mode)
+    x.fill_quantum != zero(Int64) && PB.encode(e, 5, x.fill_quantum)
+    !isempty(x.warnings) && PB.encode(e, 6, x.warnings)
+    x.persisted != false && PB.encode(e, 7, x.persisted)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::SetModelPlacementResponse)
+    encoded_size = 0
+    !isempty(x.name) && (encoded_size += PB._encoded_size(x.name, 1))
+    x.configured_replicas != zero(Int64) && (encoded_size += PB._encoded_size(x.configured_replicas, 2))
+    x.effective_replicas != zero(Int64) && (encoded_size += PB._encoded_size(x.effective_replicas, 3))
+    !isempty(x.fill_mode) && (encoded_size += PB._encoded_size(x.fill_mode, 4))
+    x.fill_quantum != zero(Int64) && (encoded_size += PB._encoded_size(x.fill_quantum, 5))
+    !isempty(x.warnings) && (encoded_size += PB._encoded_size(x.warnings, 6))
+    x.persisted != false && (encoded_size += PB._encoded_size(x.persisted, 7))
     return encoded_size
 end
 
@@ -92,7 +228,711 @@ function PB._encoded_size(x::SetModelPolicyRequest)
     return encoded_size
 end
 
+struct RepackStatus
+    last_repack_unix_seconds::Float64
+    last_repack_wall_elapsed_seconds::Float64
+    last_repack_compute_seconds::Float64
+    last_trigger::String
+    last_models_placed::Int64
+    last_models_moved::Int64
+    repack_count::UInt64
+    compute_accumulated_seconds::Float64
+    active_threshold_seconds::Float64
+    first_tick_repack_done::Bool
+    last_tick_unix_seconds::Float64
+    repacks_since_compaction::Int64
+    operator_repacks_requested::UInt64
+    operator_repacks_completed::UInt64
+end
+RepackStatus(;last_repack_unix_seconds = zero(Float64), last_repack_wall_elapsed_seconds = zero(Float64), last_repack_compute_seconds = zero(Float64), last_trigger = "", last_models_placed = zero(Int64), last_models_moved = zero(Int64), repack_count = zero(UInt64), compute_accumulated_seconds = zero(Float64), active_threshold_seconds = zero(Float64), first_tick_repack_done = false, last_tick_unix_seconds = zero(Float64), repacks_since_compaction = zero(Int64), operator_repacks_requested = zero(UInt64), operator_repacks_completed = zero(UInt64)) = RepackStatus(last_repack_unix_seconds, last_repack_wall_elapsed_seconds, last_repack_compute_seconds, last_trigger, last_models_placed, last_models_moved, repack_count, compute_accumulated_seconds, active_threshold_seconds, first_tick_repack_done, last_tick_unix_seconds, repacks_since_compaction, operator_repacks_requested, operator_repacks_completed)
+PB.default_values(::Type{RepackStatus}) = (;last_repack_unix_seconds = zero(Float64), last_repack_wall_elapsed_seconds = zero(Float64), last_repack_compute_seconds = zero(Float64), last_trigger = "", last_models_placed = zero(Int64), last_models_moved = zero(Int64), repack_count = zero(UInt64), compute_accumulated_seconds = zero(Float64), active_threshold_seconds = zero(Float64), first_tick_repack_done = false, last_tick_unix_seconds = zero(Float64), repacks_since_compaction = zero(Int64), operator_repacks_requested = zero(UInt64), operator_repacks_completed = zero(UInt64))
+PB.field_numbers(::Type{RepackStatus}) = (;last_repack_unix_seconds = 1, last_repack_wall_elapsed_seconds = 2, last_repack_compute_seconds = 3, last_trigger = 4, last_models_placed = 5, last_models_moved = 6, repack_count = 7, compute_accumulated_seconds = 8, active_threshold_seconds = 9, first_tick_repack_done = 10, last_tick_unix_seconds = 11, repacks_since_compaction = 12, operator_repacks_requested = 13, operator_repacks_completed = 14)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:RepackStatus}, _endpos::Int=0, _group::Bool=false)
+    last_repack_unix_seconds = zero(Float64)
+    last_repack_wall_elapsed_seconds = zero(Float64)
+    last_repack_compute_seconds = zero(Float64)
+    last_trigger = ""
+    last_models_placed = zero(Int64)
+    last_models_moved = zero(Int64)
+    repack_count = zero(UInt64)
+    compute_accumulated_seconds = zero(Float64)
+    active_threshold_seconds = zero(Float64)
+    first_tick_repack_done = false
+    last_tick_unix_seconds = zero(Float64)
+    repacks_since_compaction = zero(Int64)
+    operator_repacks_requested = zero(UInt64)
+    operator_repacks_completed = zero(UInt64)
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            last_repack_unix_seconds = PB.decode(d, Float64)
+        elseif field_number == 2
+            last_repack_wall_elapsed_seconds = PB.decode(d, Float64)
+        elseif field_number == 3
+            last_repack_compute_seconds = PB.decode(d, Float64)
+        elseif field_number == 4
+            last_trigger = PB.decode(d, String)
+        elseif field_number == 5
+            last_models_placed = PB.decode(d, Int64)
+        elseif field_number == 6
+            last_models_moved = PB.decode(d, Int64)
+        elseif field_number == 7
+            repack_count = PB.decode(d, UInt64)
+        elseif field_number == 8
+            compute_accumulated_seconds = PB.decode(d, Float64)
+        elseif field_number == 9
+            active_threshold_seconds = PB.decode(d, Float64)
+        elseif field_number == 10
+            first_tick_repack_done = PB.decode(d, Bool)
+        elseif field_number == 11
+            last_tick_unix_seconds = PB.decode(d, Float64)
+        elseif field_number == 12
+            repacks_since_compaction = PB.decode(d, Int64)
+        elseif field_number == 13
+            operator_repacks_requested = PB.decode(d, UInt64)
+        elseif field_number == 14
+            operator_repacks_completed = PB.decode(d, UInt64)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return RepackStatus(last_repack_unix_seconds, last_repack_wall_elapsed_seconds, last_repack_compute_seconds, last_trigger, last_models_placed, last_models_moved, repack_count, compute_accumulated_seconds, active_threshold_seconds, first_tick_repack_done, last_tick_unix_seconds, repacks_since_compaction, operator_repacks_requested, operator_repacks_completed)
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::RepackStatus)
+    initpos = position(e.io)
+    x.last_repack_unix_seconds !== zero(Float64) && PB.encode(e, 1, x.last_repack_unix_seconds)
+    x.last_repack_wall_elapsed_seconds !== zero(Float64) && PB.encode(e, 2, x.last_repack_wall_elapsed_seconds)
+    x.last_repack_compute_seconds !== zero(Float64) && PB.encode(e, 3, x.last_repack_compute_seconds)
+    !isempty(x.last_trigger) && PB.encode(e, 4, x.last_trigger)
+    x.last_models_placed != zero(Int64) && PB.encode(e, 5, x.last_models_placed)
+    x.last_models_moved != zero(Int64) && PB.encode(e, 6, x.last_models_moved)
+    x.repack_count != zero(UInt64) && PB.encode(e, 7, x.repack_count)
+    x.compute_accumulated_seconds !== zero(Float64) && PB.encode(e, 8, x.compute_accumulated_seconds)
+    x.active_threshold_seconds !== zero(Float64) && PB.encode(e, 9, x.active_threshold_seconds)
+    x.first_tick_repack_done != false && PB.encode(e, 10, x.first_tick_repack_done)
+    x.last_tick_unix_seconds !== zero(Float64) && PB.encode(e, 11, x.last_tick_unix_seconds)
+    x.repacks_since_compaction != zero(Int64) && PB.encode(e, 12, x.repacks_since_compaction)
+    x.operator_repacks_requested != zero(UInt64) && PB.encode(e, 13, x.operator_repacks_requested)
+    x.operator_repacks_completed != zero(UInt64) && PB.encode(e, 14, x.operator_repacks_completed)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::RepackStatus)
+    encoded_size = 0
+    x.last_repack_unix_seconds !== zero(Float64) && (encoded_size += PB._encoded_size(x.last_repack_unix_seconds, 1))
+    x.last_repack_wall_elapsed_seconds !== zero(Float64) && (encoded_size += PB._encoded_size(x.last_repack_wall_elapsed_seconds, 2))
+    x.last_repack_compute_seconds !== zero(Float64) && (encoded_size += PB._encoded_size(x.last_repack_compute_seconds, 3))
+    !isempty(x.last_trigger) && (encoded_size += PB._encoded_size(x.last_trigger, 4))
+    x.last_models_placed != zero(Int64) && (encoded_size += PB._encoded_size(x.last_models_placed, 5))
+    x.last_models_moved != zero(Int64) && (encoded_size += PB._encoded_size(x.last_models_moved, 6))
+    x.repack_count != zero(UInt64) && (encoded_size += PB._encoded_size(x.repack_count, 7))
+    x.compute_accumulated_seconds !== zero(Float64) && (encoded_size += PB._encoded_size(x.compute_accumulated_seconds, 8))
+    x.active_threshold_seconds !== zero(Float64) && (encoded_size += PB._encoded_size(x.active_threshold_seconds, 9))
+    x.first_tick_repack_done != false && (encoded_size += PB._encoded_size(x.first_tick_repack_done, 10))
+    x.last_tick_unix_seconds !== zero(Float64) && (encoded_size += PB._encoded_size(x.last_tick_unix_seconds, 11))
+    x.repacks_since_compaction != zero(Int64) && (encoded_size += PB._encoded_size(x.repacks_since_compaction, 12))
+    x.operator_repacks_requested != zero(UInt64) && (encoded_size += PB._encoded_size(x.operator_repacks_requested, 13))
+    x.operator_repacks_completed != zero(UInt64) && (encoded_size += PB._encoded_size(x.operator_repacks_completed, 14))
+    return encoded_size
+end
+
+struct RepackRequest
+    wait_seconds::Float64
+end
+RepackRequest(;wait_seconds = zero(Float64)) = RepackRequest(wait_seconds)
+PB.default_values(::Type{RepackRequest}) = (;wait_seconds = zero(Float64))
+PB.field_numbers(::Type{RepackRequest}) = (;wait_seconds = 1)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:RepackRequest}, _endpos::Int=0, _group::Bool=false)
+    wait_seconds = zero(Float64)
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            wait_seconds = PB.decode(d, Float64)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return RepackRequest(wait_seconds)
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::RepackRequest)
+    initpos = position(e.io)
+    x.wait_seconds !== zero(Float64) && PB.encode(e, 1, x.wait_seconds)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::RepackRequest)
+    encoded_size = 0
+    x.wait_seconds !== zero(Float64) && (encoded_size += PB._encoded_size(x.wait_seconds, 1))
+    return encoded_size
+end
+
+struct CompactMemoryRequest
+    reload_models::Vector{String}
+end
+CompactMemoryRequest(;reload_models = Vector{String}()) = CompactMemoryRequest(reload_models)
+PB.default_values(::Type{CompactMemoryRequest}) = (;reload_models = Vector{String}())
+PB.field_numbers(::Type{CompactMemoryRequest}) = (;reload_models = 1)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:CompactMemoryRequest}, _endpos::Int=0, _group::Bool=false)
+    reload_models = PB.BufferedVector{String}()
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            PB.decode!(d, reload_models)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return CompactMemoryRequest(reload_models[])
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::CompactMemoryRequest)
+    initpos = position(e.io)
+    !isempty(x.reload_models) && PB.encode(e, 1, x.reload_models)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::CompactMemoryRequest)
+    encoded_size = 0
+    !isempty(x.reload_models) && (encoded_size += PB._encoded_size(x.reload_models, 1))
+    return encoded_size
+end
+
+struct SetModelPolicyResponse end
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetModelPolicyResponse}, _endpos::Int=0, _group::Bool=false)
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        Base.skip(d, wire_type)
+    end
+    return SetModelPolicyResponse()
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::SetModelPolicyResponse)
+    initpos = position(e.io)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::SetModelPolicyResponse)
+    encoded_size = 0
+    return encoded_size
+end
+
+struct ModelControlStatusRequest end
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelControlStatusRequest}, _endpos::Int=0, _group::Bool=false)
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        Base.skip(d, wire_type)
+    end
+    return ModelControlStatusRequest()
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::ModelControlStatusRequest)
+    initpos = position(e.io)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::ModelControlStatusRequest)
+    encoded_size = 0
+    return encoded_size
+end
+
+struct SchedulingPolicy
+    rebalance_compute_seconds::Float64
+    first_rebalance_compute_seconds::Float64
+    hysteresis::Float64
+    ema_halflife_compute_seconds::Float64
+    default_replicas::Int64
+    routing_policy::String
+    routing_fill_factor::Float64
+    routing_fill_mode::String
+    compaction_mode::String
+    compaction_interval::Int64
+    forbid_memory_oversubscription::Bool
+    generation::UInt64
+end
+SchedulingPolicy(;rebalance_compute_seconds = zero(Float64), first_rebalance_compute_seconds = zero(Float64), hysteresis = zero(Float64), ema_halflife_compute_seconds = zero(Float64), default_replicas = zero(Int64), routing_policy = "", routing_fill_factor = zero(Float64), routing_fill_mode = "", compaction_mode = "", compaction_interval = zero(Int64), forbid_memory_oversubscription = false, generation = zero(UInt64)) = SchedulingPolicy(rebalance_compute_seconds, first_rebalance_compute_seconds, hysteresis, ema_halflife_compute_seconds, default_replicas, routing_policy, routing_fill_factor, routing_fill_mode, compaction_mode, compaction_interval, forbid_memory_oversubscription, generation)
+PB.default_values(::Type{SchedulingPolicy}) = (;rebalance_compute_seconds = zero(Float64), first_rebalance_compute_seconds = zero(Float64), hysteresis = zero(Float64), ema_halflife_compute_seconds = zero(Float64), default_replicas = zero(Int64), routing_policy = "", routing_fill_factor = zero(Float64), routing_fill_mode = "", compaction_mode = "", compaction_interval = zero(Int64), forbid_memory_oversubscription = false, generation = zero(UInt64))
+PB.field_numbers(::Type{SchedulingPolicy}) = (;rebalance_compute_seconds = 1, first_rebalance_compute_seconds = 2, hysteresis = 3, ema_halflife_compute_seconds = 4, default_replicas = 5, routing_policy = 6, routing_fill_factor = 7, routing_fill_mode = 8, compaction_mode = 9, compaction_interval = 10, forbid_memory_oversubscription = 11, generation = 12)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SchedulingPolicy}, _endpos::Int=0, _group::Bool=false)
+    rebalance_compute_seconds = zero(Float64)
+    first_rebalance_compute_seconds = zero(Float64)
+    hysteresis = zero(Float64)
+    ema_halflife_compute_seconds = zero(Float64)
+    default_replicas = zero(Int64)
+    routing_policy = ""
+    routing_fill_factor = zero(Float64)
+    routing_fill_mode = ""
+    compaction_mode = ""
+    compaction_interval = zero(Int64)
+    forbid_memory_oversubscription = false
+    generation = zero(UInt64)
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            rebalance_compute_seconds = PB.decode(d, Float64)
+        elseif field_number == 2
+            first_rebalance_compute_seconds = PB.decode(d, Float64)
+        elseif field_number == 3
+            hysteresis = PB.decode(d, Float64)
+        elseif field_number == 4
+            ema_halflife_compute_seconds = PB.decode(d, Float64)
+        elseif field_number == 5
+            default_replicas = PB.decode(d, Int64)
+        elseif field_number == 6
+            routing_policy = PB.decode(d, String)
+        elseif field_number == 7
+            routing_fill_factor = PB.decode(d, Float64)
+        elseif field_number == 8
+            routing_fill_mode = PB.decode(d, String)
+        elseif field_number == 9
+            compaction_mode = PB.decode(d, String)
+        elseif field_number == 10
+            compaction_interval = PB.decode(d, Int64)
+        elseif field_number == 11
+            forbid_memory_oversubscription = PB.decode(d, Bool)
+        elseif field_number == 12
+            generation = PB.decode(d, UInt64)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return SchedulingPolicy(rebalance_compute_seconds, first_rebalance_compute_seconds, hysteresis, ema_halflife_compute_seconds, default_replicas, routing_policy, routing_fill_factor, routing_fill_mode, compaction_mode, compaction_interval, forbid_memory_oversubscription, generation)
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::SchedulingPolicy)
+    initpos = position(e.io)
+    x.rebalance_compute_seconds !== zero(Float64) && PB.encode(e, 1, x.rebalance_compute_seconds)
+    x.first_rebalance_compute_seconds !== zero(Float64) && PB.encode(e, 2, x.first_rebalance_compute_seconds)
+    x.hysteresis !== zero(Float64) && PB.encode(e, 3, x.hysteresis)
+    x.ema_halflife_compute_seconds !== zero(Float64) && PB.encode(e, 4, x.ema_halflife_compute_seconds)
+    x.default_replicas != zero(Int64) && PB.encode(e, 5, x.default_replicas)
+    !isempty(x.routing_policy) && PB.encode(e, 6, x.routing_policy)
+    x.routing_fill_factor !== zero(Float64) && PB.encode(e, 7, x.routing_fill_factor)
+    !isempty(x.routing_fill_mode) && PB.encode(e, 8, x.routing_fill_mode)
+    !isempty(x.compaction_mode) && PB.encode(e, 9, x.compaction_mode)
+    x.compaction_interval != zero(Int64) && PB.encode(e, 10, x.compaction_interval)
+    x.forbid_memory_oversubscription != false && PB.encode(e, 11, x.forbid_memory_oversubscription)
+    x.generation != zero(UInt64) && PB.encode(e, 12, x.generation)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::SchedulingPolicy)
+    encoded_size = 0
+    x.rebalance_compute_seconds !== zero(Float64) && (encoded_size += PB._encoded_size(x.rebalance_compute_seconds, 1))
+    x.first_rebalance_compute_seconds !== zero(Float64) && (encoded_size += PB._encoded_size(x.first_rebalance_compute_seconds, 2))
+    x.hysteresis !== zero(Float64) && (encoded_size += PB._encoded_size(x.hysteresis, 3))
+    x.ema_halflife_compute_seconds !== zero(Float64) && (encoded_size += PB._encoded_size(x.ema_halflife_compute_seconds, 4))
+    x.default_replicas != zero(Int64) && (encoded_size += PB._encoded_size(x.default_replicas, 5))
+    !isempty(x.routing_policy) && (encoded_size += PB._encoded_size(x.routing_policy, 6))
+    x.routing_fill_factor !== zero(Float64) && (encoded_size += PB._encoded_size(x.routing_fill_factor, 7))
+    !isempty(x.routing_fill_mode) && (encoded_size += PB._encoded_size(x.routing_fill_mode, 8))
+    !isempty(x.compaction_mode) && (encoded_size += PB._encoded_size(x.compaction_mode, 9))
+    x.compaction_interval != zero(Int64) && (encoded_size += PB._encoded_size(x.compaction_interval, 10))
+    x.forbid_memory_oversubscription != false && (encoded_size += PB._encoded_size(x.forbid_memory_oversubscription, 11))
+    x.generation != zero(UInt64) && (encoded_size += PB._encoded_size(x.generation, 12))
+    return encoded_size
+end
+
+struct GetSchedulingStatusRequest end
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:GetSchedulingStatusRequest}, _endpos::Int=0, _group::Bool=false)
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        Base.skip(d, wire_type)
+    end
+    return GetSchedulingStatusRequest()
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::GetSchedulingStatusRequest)
+    initpos = position(e.io)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::GetSchedulingStatusRequest)
+    encoded_size = 0
+    return encoded_size
+end
+
 @enumx Residency RESIDENCY_UNSPECIFIED=0 UNPINNED=1 PINNED_SYSTEM=2 PINNED_DEVICE=3
+
+struct CompactMemoryResponse
+    reloaded_models::Int64
+    resident_bytes_after::UInt64
+end
+CompactMemoryResponse(;reloaded_models = zero(Int64), resident_bytes_after = zero(UInt64)) = CompactMemoryResponse(reloaded_models, resident_bytes_after)
+PB.default_values(::Type{CompactMemoryResponse}) = (;reloaded_models = zero(Int64), resident_bytes_after = zero(UInt64))
+PB.field_numbers(::Type{CompactMemoryResponse}) = (;reloaded_models = 1, resident_bytes_after = 2)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:CompactMemoryResponse}, _endpos::Int=0, _group::Bool=false)
+    reloaded_models = zero(Int64)
+    resident_bytes_after = zero(UInt64)
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            reloaded_models = PB.decode(d, Int64)
+        elseif field_number == 2
+            resident_bytes_after = PB.decode(d, UInt64)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return CompactMemoryResponse(reloaded_models, resident_bytes_after)
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::CompactMemoryResponse)
+    initpos = position(e.io)
+    x.reloaded_models != zero(Int64) && PB.encode(e, 1, x.reloaded_models)
+    x.resident_bytes_after != zero(UInt64) && PB.encode(e, 2, x.resident_bytes_after)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::CompactMemoryResponse)
+    encoded_size = 0
+    x.reloaded_models != zero(Int64) && (encoded_size += PB._encoded_size(x.reloaded_models, 1))
+    x.resident_bytes_after != zero(UInt64) && (encoded_size += PB._encoded_size(x.resident_bytes_after, 2))
+    return encoded_size
+end
+
+struct WorkerSchedulingStatus
+    worker::String
+    ready::Bool
+    models_placed::Int64
+    inflight_compute::Float64
+    assigned_weight_bytes::Int64
+    weight_budget_bytes::Int64
+    oversubscribed::Bool
+end
+WorkerSchedulingStatus(;worker = "", ready = false, models_placed = zero(Int64), inflight_compute = zero(Float64), assigned_weight_bytes = zero(Int64), weight_budget_bytes = zero(Int64), oversubscribed = false) = WorkerSchedulingStatus(worker, ready, models_placed, inflight_compute, assigned_weight_bytes, weight_budget_bytes, oversubscribed)
+PB.default_values(::Type{WorkerSchedulingStatus}) = (;worker = "", ready = false, models_placed = zero(Int64), inflight_compute = zero(Float64), assigned_weight_bytes = zero(Int64), weight_budget_bytes = zero(Int64), oversubscribed = false)
+PB.field_numbers(::Type{WorkerSchedulingStatus}) = (;worker = 1, ready = 2, models_placed = 3, inflight_compute = 4, assigned_weight_bytes = 5, weight_budget_bytes = 6, oversubscribed = 7)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:WorkerSchedulingStatus}, _endpos::Int=0, _group::Bool=false)
+    worker = ""
+    ready = false
+    models_placed = zero(Int64)
+    inflight_compute = zero(Float64)
+    assigned_weight_bytes = zero(Int64)
+    weight_budget_bytes = zero(Int64)
+    oversubscribed = false
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            worker = PB.decode(d, String)
+        elseif field_number == 2
+            ready = PB.decode(d, Bool)
+        elseif field_number == 3
+            models_placed = PB.decode(d, Int64)
+        elseif field_number == 4
+            inflight_compute = PB.decode(d, Float64)
+        elseif field_number == 5
+            assigned_weight_bytes = PB.decode(d, Int64)
+        elseif field_number == 6
+            weight_budget_bytes = PB.decode(d, Int64)
+        elseif field_number == 7
+            oversubscribed = PB.decode(d, Bool)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return WorkerSchedulingStatus(worker, ready, models_placed, inflight_compute, assigned_weight_bytes, weight_budget_bytes, oversubscribed)
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::WorkerSchedulingStatus)
+    initpos = position(e.io)
+    !isempty(x.worker) && PB.encode(e, 1, x.worker)
+    x.ready != false && PB.encode(e, 2, x.ready)
+    x.models_placed != zero(Int64) && PB.encode(e, 3, x.models_placed)
+    x.inflight_compute !== zero(Float64) && PB.encode(e, 4, x.inflight_compute)
+    x.assigned_weight_bytes != zero(Int64) && PB.encode(e, 5, x.assigned_weight_bytes)
+    x.weight_budget_bytes != zero(Int64) && PB.encode(e, 6, x.weight_budget_bytes)
+    x.oversubscribed != false && PB.encode(e, 7, x.oversubscribed)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::WorkerSchedulingStatus)
+    encoded_size = 0
+    !isempty(x.worker) && (encoded_size += PB._encoded_size(x.worker, 1))
+    x.ready != false && (encoded_size += PB._encoded_size(x.ready, 2))
+    x.models_placed != zero(Int64) && (encoded_size += PB._encoded_size(x.models_placed, 3))
+    x.inflight_compute !== zero(Float64) && (encoded_size += PB._encoded_size(x.inflight_compute, 4))
+    x.assigned_weight_bytes != zero(Int64) && (encoded_size += PB._encoded_size(x.assigned_weight_bytes, 5))
+    x.weight_budget_bytes != zero(Int64) && (encoded_size += PB._encoded_size(x.weight_budget_bytes, 6))
+    x.oversubscribed != false && (encoded_size += PB._encoded_size(x.oversubscribed, 7))
+    return encoded_size
+end
+
+struct ModelSchedulingStatus
+    name::String
+    configured_replicas::Int64
+    effective_replicas::Int64
+    replicas::Vector{ReplicaPlacement}
+    utilization::Float64
+    arrival_rate::Float64
+    cost_seconds::Float64
+    max_batch::Int64
+    fill_mode::String
+    fill_quantum::Int64
+    weight_nbytes::Int64
+    placed::Bool
+    drifted::Bool
+end
+ModelSchedulingStatus(;name = "", configured_replicas = zero(Int64), effective_replicas = zero(Int64), replicas = Vector{ReplicaPlacement}(), utilization = zero(Float64), arrival_rate = zero(Float64), cost_seconds = zero(Float64), max_batch = zero(Int64), fill_mode = "", fill_quantum = zero(Int64), weight_nbytes = zero(Int64), placed = false, drifted = false) = ModelSchedulingStatus(name, configured_replicas, effective_replicas, replicas, utilization, arrival_rate, cost_seconds, max_batch, fill_mode, fill_quantum, weight_nbytes, placed, drifted)
+PB.default_values(::Type{ModelSchedulingStatus}) = (;name = "", configured_replicas = zero(Int64), effective_replicas = zero(Int64), replicas = Vector{ReplicaPlacement}(), utilization = zero(Float64), arrival_rate = zero(Float64), cost_seconds = zero(Float64), max_batch = zero(Int64), fill_mode = "", fill_quantum = zero(Int64), weight_nbytes = zero(Int64), placed = false, drifted = false)
+PB.field_numbers(::Type{ModelSchedulingStatus}) = (;name = 1, configured_replicas = 2, effective_replicas = 3, replicas = 4, utilization = 5, arrival_rate = 6, cost_seconds = 7, max_batch = 8, fill_mode = 9, fill_quantum = 10, weight_nbytes = 11, placed = 12, drifted = 13)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelSchedulingStatus}, _endpos::Int=0, _group::Bool=false)
+    name = ""
+    configured_replicas = zero(Int64)
+    effective_replicas = zero(Int64)
+    replicas = PB.BufferedVector{ReplicaPlacement}()
+    utilization = zero(Float64)
+    arrival_rate = zero(Float64)
+    cost_seconds = zero(Float64)
+    max_batch = zero(Int64)
+    fill_mode = ""
+    fill_quantum = zero(Int64)
+    weight_nbytes = zero(Int64)
+    placed = false
+    drifted = false
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            name = PB.decode(d, String)
+        elseif field_number == 2
+            configured_replicas = PB.decode(d, Int64)
+        elseif field_number == 3
+            effective_replicas = PB.decode(d, Int64)
+        elseif field_number == 4
+            PB.decode!(d, replicas)
+        elseif field_number == 5
+            utilization = PB.decode(d, Float64)
+        elseif field_number == 6
+            arrival_rate = PB.decode(d, Float64)
+        elseif field_number == 7
+            cost_seconds = PB.decode(d, Float64)
+        elseif field_number == 8
+            max_batch = PB.decode(d, Int64)
+        elseif field_number == 9
+            fill_mode = PB.decode(d, String)
+        elseif field_number == 10
+            fill_quantum = PB.decode(d, Int64)
+        elseif field_number == 11
+            weight_nbytes = PB.decode(d, Int64)
+        elseif field_number == 12
+            placed = PB.decode(d, Bool)
+        elseif field_number == 13
+            drifted = PB.decode(d, Bool)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return ModelSchedulingStatus(name, configured_replicas, effective_replicas, replicas[], utilization, arrival_rate, cost_seconds, max_batch, fill_mode, fill_quantum, weight_nbytes, placed, drifted)
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::ModelSchedulingStatus)
+    initpos = position(e.io)
+    !isempty(x.name) && PB.encode(e, 1, x.name)
+    x.configured_replicas != zero(Int64) && PB.encode(e, 2, x.configured_replicas)
+    x.effective_replicas != zero(Int64) && PB.encode(e, 3, x.effective_replicas)
+    !isempty(x.replicas) && PB.encode(e, 4, x.replicas)
+    x.utilization !== zero(Float64) && PB.encode(e, 5, x.utilization)
+    x.arrival_rate !== zero(Float64) && PB.encode(e, 6, x.arrival_rate)
+    x.cost_seconds !== zero(Float64) && PB.encode(e, 7, x.cost_seconds)
+    x.max_batch != zero(Int64) && PB.encode(e, 8, x.max_batch)
+    !isempty(x.fill_mode) && PB.encode(e, 9, x.fill_mode)
+    x.fill_quantum != zero(Int64) && PB.encode(e, 10, x.fill_quantum)
+    x.weight_nbytes != zero(Int64) && PB.encode(e, 11, x.weight_nbytes)
+    x.placed != false && PB.encode(e, 12, x.placed)
+    x.drifted != false && PB.encode(e, 13, x.drifted)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::ModelSchedulingStatus)
+    encoded_size = 0
+    !isempty(x.name) && (encoded_size += PB._encoded_size(x.name, 1))
+    x.configured_replicas != zero(Int64) && (encoded_size += PB._encoded_size(x.configured_replicas, 2))
+    x.effective_replicas != zero(Int64) && (encoded_size += PB._encoded_size(x.effective_replicas, 3))
+    !isempty(x.replicas) && (encoded_size += PB._encoded_size(x.replicas, 4))
+    x.utilization !== zero(Float64) && (encoded_size += PB._encoded_size(x.utilization, 5))
+    x.arrival_rate !== zero(Float64) && (encoded_size += PB._encoded_size(x.arrival_rate, 6))
+    x.cost_seconds !== zero(Float64) && (encoded_size += PB._encoded_size(x.cost_seconds, 7))
+    x.max_batch != zero(Int64) && (encoded_size += PB._encoded_size(x.max_batch, 8))
+    !isempty(x.fill_mode) && (encoded_size += PB._encoded_size(x.fill_mode, 9))
+    x.fill_quantum != zero(Int64) && (encoded_size += PB._encoded_size(x.fill_quantum, 10))
+    x.weight_nbytes != zero(Int64) && (encoded_size += PB._encoded_size(x.weight_nbytes, 11))
+    x.placed != false && (encoded_size += PB._encoded_size(x.placed, 12))
+    x.drifted != false && (encoded_size += PB._encoded_size(x.drifted, 13))
+    return encoded_size
+end
+
+struct RepackResponse
+    sequence::UInt64
+    completed_sequence::UInt64
+    completed::Bool
+    waited_seconds::Float64
+    repack::Union{Nothing,RepackStatus}
+    warnings::Vector{String}
+end
+RepackResponse(;sequence = zero(UInt64), completed_sequence = zero(UInt64), completed = false, waited_seconds = zero(Float64), repack = nothing, warnings = Vector{String}()) = RepackResponse(sequence, completed_sequence, completed, waited_seconds, repack, warnings)
+PB.default_values(::Type{RepackResponse}) = (;sequence = zero(UInt64), completed_sequence = zero(UInt64), completed = false, waited_seconds = zero(Float64), repack = nothing, warnings = Vector{String}())
+PB.field_numbers(::Type{RepackResponse}) = (;sequence = 1, completed_sequence = 2, completed = 3, waited_seconds = 4, repack = 5, warnings = 6)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:RepackResponse}, _endpos::Int=0, _group::Bool=false)
+    sequence = zero(UInt64)
+    completed_sequence = zero(UInt64)
+    completed = false
+    waited_seconds = zero(Float64)
+    repack = Ref{Union{Nothing,RepackStatus}}(nothing)
+    warnings = PB.BufferedVector{String}()
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            sequence = PB.decode(d, UInt64)
+        elseif field_number == 2
+            completed_sequence = PB.decode(d, UInt64)
+        elseif field_number == 3
+            completed = PB.decode(d, Bool)
+        elseif field_number == 4
+            waited_seconds = PB.decode(d, Float64)
+        elseif field_number == 5
+            PB.decode!(d, repack)
+        elseif field_number == 6
+            PB.decode!(d, warnings)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return RepackResponse(sequence, completed_sequence, completed, waited_seconds, repack[], warnings[])
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::RepackResponse)
+    initpos = position(e.io)
+    x.sequence != zero(UInt64) && PB.encode(e, 1, x.sequence)
+    x.completed_sequence != zero(UInt64) && PB.encode(e, 2, x.completed_sequence)
+    x.completed != false && PB.encode(e, 3, x.completed)
+    x.waited_seconds !== zero(Float64) && PB.encode(e, 4, x.waited_seconds)
+    !isnothing(x.repack) && PB.encode(e, 5, x.repack)
+    !isempty(x.warnings) && PB.encode(e, 6, x.warnings)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::RepackResponse)
+    encoded_size = 0
+    x.sequence != zero(UInt64) && (encoded_size += PB._encoded_size(x.sequence, 1))
+    x.completed_sequence != zero(UInt64) && (encoded_size += PB._encoded_size(x.completed_sequence, 2))
+    x.completed != false && (encoded_size += PB._encoded_size(x.completed, 3))
+    x.waited_seconds !== zero(Float64) && (encoded_size += PB._encoded_size(x.waited_seconds, 4))
+    !isnothing(x.repack) && (encoded_size += PB._encoded_size(x.repack, 5))
+    !isempty(x.warnings) && (encoded_size += PB._encoded_size(x.warnings, 6))
+    return encoded_size
+end
+
+struct SetSchedulingPolicyResponse
+    applied::Union{Nothing,SchedulingPolicy}
+    warnings::Vector{String}
+    persisted::Bool
+end
+SetSchedulingPolicyResponse(;applied = nothing, warnings = Vector{String}(), persisted = false) = SetSchedulingPolicyResponse(applied, warnings, persisted)
+PB.default_values(::Type{SetSchedulingPolicyResponse}) = (;applied = nothing, warnings = Vector{String}(), persisted = false)
+PB.field_numbers(::Type{SetSchedulingPolicyResponse}) = (;applied = 1, warnings = 2, persisted = 3)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetSchedulingPolicyResponse}, _endpos::Int=0, _group::Bool=false)
+    applied = Ref{Union{Nothing,SchedulingPolicy}}(nothing)
+    warnings = PB.BufferedVector{String}()
+    persisted = false
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            PB.decode!(d, applied)
+        elseif field_number == 2
+            PB.decode!(d, warnings)
+        elseif field_number == 3
+            persisted = PB.decode(d, Bool)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return SetSchedulingPolicyResponse(applied[], warnings[], persisted)
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::SetSchedulingPolicyResponse)
+    initpos = position(e.io)
+    !isnothing(x.applied) && PB.encode(e, 1, x.applied)
+    !isempty(x.warnings) && PB.encode(e, 2, x.warnings)
+    x.persisted != false && PB.encode(e, 3, x.persisted)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::SetSchedulingPolicyResponse)
+    encoded_size = 0
+    !isnothing(x.applied) && (encoded_size += PB._encoded_size(x.applied, 1))
+    !isempty(x.warnings) && (encoded_size += PB._encoded_size(x.warnings, 2))
+    x.persisted != false && (encoded_size += PB._encoded_size(x.persisted, 3))
+    return encoded_size
+end
+
+struct SetSchedulingPolicyRequest
+    update_mask::Vector{String}
+    policy::Union{Nothing,SchedulingPolicy}
+end
+SetSchedulingPolicyRequest(;update_mask = Vector{String}(), policy = nothing) = SetSchedulingPolicyRequest(update_mask, policy)
+PB.default_values(::Type{SetSchedulingPolicyRequest}) = (;update_mask = Vector{String}(), policy = nothing)
+PB.field_numbers(::Type{SetSchedulingPolicyRequest}) = (;update_mask = 1, policy = 2)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetSchedulingPolicyRequest}, _endpos::Int=0, _group::Bool=false)
+    update_mask = PB.BufferedVector{String}()
+    policy = Ref{Union{Nothing,SchedulingPolicy}}(nothing)
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            PB.decode!(d, update_mask)
+        elseif field_number == 2
+            PB.decode!(d, policy)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return SetSchedulingPolicyRequest(update_mask[], policy[])
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::SetSchedulingPolicyRequest)
+    initpos = position(e.io)
+    !isempty(x.update_mask) && PB.encode(e, 1, x.update_mask)
+    !isnothing(x.policy) && PB.encode(e, 2, x.policy)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::SetSchedulingPolicyRequest)
+    encoded_size = 0
+    !isempty(x.update_mask) && (encoded_size += PB._encoded_size(x.update_mask, 1))
+    !isnothing(x.policy) && (encoded_size += PB._encoded_size(x.policy, 2))
+    return encoded_size
+end
+
+struct SetModelResidencyResponse
+    residency::Residency.T
+end
+SetModelResidencyResponse(;residency = Residency.RESIDENCY_UNSPECIFIED) = SetModelResidencyResponse(residency)
+PB.default_values(::Type{SetModelResidencyResponse}) = (;residency = Residency.RESIDENCY_UNSPECIFIED)
+PB.field_numbers(::Type{SetModelResidencyResponse}) = (;residency = 1)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetModelResidencyResponse}, _endpos::Int=0, _group::Bool=false)
+    residency = Residency.RESIDENCY_UNSPECIFIED
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            residency = PB.decode(d, Residency.T)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return SetModelResidencyResponse(residency)
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::SetModelResidencyResponse)
+    initpos = position(e.io)
+    x.residency != Residency.RESIDENCY_UNSPECIFIED && PB.encode(e, 1, x.residency)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::SetModelResidencyResponse)
+    encoded_size = 0
+    x.residency != Residency.RESIDENCY_UNSPECIFIED && (encoded_size += PB._encoded_size(x.residency, 1))
+    return encoded_size
+end
 
 struct SetModelResidencyRequest
     name::String
@@ -222,34 +1062,64 @@ function PB._encoded_size(x::ModelStatus)
     return encoded_size
 end
 
-struct SetModelResidencyResponse
-    residency::Residency.T
+struct GetSchedulingStatusResponse
+    mode::String
+    policy::Union{Nothing,SchedulingPolicy}
+    repack::Union{Nothing,RepackStatus}
+    models::Vector{ModelSchedulingStatus}
+    workers::Vector{WorkerSchedulingStatus}
+    warnings::Vector{String}
 end
-SetModelResidencyResponse(;residency = Residency.RESIDENCY_UNSPECIFIED) = SetModelResidencyResponse(residency)
-PB.default_values(::Type{SetModelResidencyResponse}) = (;residency = Residency.RESIDENCY_UNSPECIFIED)
-PB.field_numbers(::Type{SetModelResidencyResponse}) = (;residency = 1)
+GetSchedulingStatusResponse(;mode = "", policy = nothing, repack = nothing, models = Vector{ModelSchedulingStatus}(), workers = Vector{WorkerSchedulingStatus}(), warnings = Vector{String}()) = GetSchedulingStatusResponse(mode, policy, repack, models, workers, warnings)
+PB.default_values(::Type{GetSchedulingStatusResponse}) = (;mode = "", policy = nothing, repack = nothing, models = Vector{ModelSchedulingStatus}(), workers = Vector{WorkerSchedulingStatus}(), warnings = Vector{String}())
+PB.field_numbers(::Type{GetSchedulingStatusResponse}) = (;mode = 1, policy = 2, repack = 3, models = 4, workers = 5, warnings = 6)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetModelResidencyResponse}, _endpos::Int=0, _group::Bool=false)
-    residency = Residency.RESIDENCY_UNSPECIFIED
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:GetSchedulingStatusResponse}, _endpos::Int=0, _group::Bool=false)
+    mode = ""
+    policy = Ref{Union{Nothing,SchedulingPolicy}}(nothing)
+    repack = Ref{Union{Nothing,RepackStatus}}(nothing)
+    models = PB.BufferedVector{ModelSchedulingStatus}()
+    workers = PB.BufferedVector{WorkerSchedulingStatus}()
+    warnings = PB.BufferedVector{String}()
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         if field_number == 1
-            residency = PB.decode(d, Residency.T)
+            mode = PB.decode(d, String)
+        elseif field_number == 2
+            PB.decode!(d, policy)
+        elseif field_number == 3
+            PB.decode!(d, repack)
+        elseif field_number == 4
+            PB.decode!(d, models)
+        elseif field_number == 5
+            PB.decode!(d, workers)
+        elseif field_number == 6
+            PB.decode!(d, warnings)
         else
             Base.skip(d, wire_type)
         end
     end
-    return SetModelResidencyResponse(residency)
+    return GetSchedulingStatusResponse(mode, policy[], repack[], models[], workers[], warnings[])
 end
 
-function PB.encode(e::PB.AbstractProtoEncoder, x::SetModelResidencyResponse)
+function PB.encode(e::PB.AbstractProtoEncoder, x::GetSchedulingStatusResponse)
     initpos = position(e.io)
-    x.residency != Residency.RESIDENCY_UNSPECIFIED && PB.encode(e, 1, x.residency)
+    !isempty(x.mode) && PB.encode(e, 1, x.mode)
+    !isnothing(x.policy) && PB.encode(e, 2, x.policy)
+    !isnothing(x.repack) && PB.encode(e, 3, x.repack)
+    !isempty(x.models) && PB.encode(e, 4, x.models)
+    !isempty(x.workers) && PB.encode(e, 5, x.workers)
+    !isempty(x.warnings) && PB.encode(e, 6, x.warnings)
     return position(e.io) - initpos
 end
-function PB._encoded_size(x::SetModelResidencyResponse)
+function PB._encoded_size(x::GetSchedulingStatusResponse)
     encoded_size = 0
-    x.residency != Residency.RESIDENCY_UNSPECIFIED && (encoded_size += PB._encoded_size(x.residency, 1))
+    !isempty(x.mode) && (encoded_size += PB._encoded_size(x.mode, 1))
+    !isnothing(x.policy) && (encoded_size += PB._encoded_size(x.policy, 2))
+    !isnothing(x.repack) && (encoded_size += PB._encoded_size(x.repack, 3))
+    !isempty(x.models) && (encoded_size += PB._encoded_size(x.models, 4))
+    !isempty(x.workers) && (encoded_size += PB._encoded_size(x.workers, 5))
+    !isempty(x.warnings) && (encoded_size += PB._encoded_size(x.warnings, 6))
     return encoded_size
 end
 
@@ -301,74 +1171,3 @@ function PB._encoded_size(x::ModelControlStatusResponse)
     x.weight_cache_max_bytes != zero(UInt64) && (encoded_size += PB._encoded_size(x.weight_cache_max_bytes, 4))
     return encoded_size
 end
-
-struct CompactMemoryRequest
-    reload_models::Vector{String}
-end
-CompactMemoryRequest(;reload_models = Vector{String}()) = CompactMemoryRequest(reload_models)
-PB.default_values(::Type{CompactMemoryRequest}) = (;reload_models = Vector{String}())
-PB.field_numbers(::Type{CompactMemoryRequest}) = (;reload_models = 1)
-
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:CompactMemoryRequest}, _endpos::Int=0, _group::Bool=false)
-    reload_models = PB.BufferedVector{String}()
-    while !PB.message_done(d, _endpos, _group)
-        field_number, wire_type = PB.decode_tag(d)
-        if field_number == 1
-            PB.decode!(d, reload_models)
-        else
-            Base.skip(d, wire_type)
-        end
-    end
-    return CompactMemoryRequest(reload_models[])
-end
-
-function PB.encode(e::PB.AbstractProtoEncoder, x::CompactMemoryRequest)
-    initpos = position(e.io)
-    !isempty(x.reload_models) && PB.encode(e, 1, x.reload_models)
-    return position(e.io) - initpos
-end
-function PB._encoded_size(x::CompactMemoryRequest)
-    encoded_size = 0
-    !isempty(x.reload_models) && (encoded_size += PB._encoded_size(x.reload_models, 1))
-    return encoded_size
-end
-
-struct CompactMemoryResponse
-    reloaded_models::Int64
-    resident_bytes_after::UInt64
-end
-CompactMemoryResponse(;reloaded_models = zero(Int64), resident_bytes_after = zero(UInt64)) = CompactMemoryResponse(reloaded_models, resident_bytes_after)
-PB.default_values(::Type{CompactMemoryResponse}) = (;reloaded_models = zero(Int64), resident_bytes_after = zero(UInt64))
-PB.field_numbers(::Type{CompactMemoryResponse}) = (;reloaded_models = 1, resident_bytes_after = 2)
-
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:CompactMemoryResponse}, _endpos::Int=0, _group::Bool=false)
-    reloaded_models = zero(Int64)
-    resident_bytes_after = zero(UInt64)
-    while !PB.message_done(d, _endpos, _group)
-        field_number, wire_type = PB.decode_tag(d)
-        if field_number == 1
-            reloaded_models = PB.decode(d, Int64)
-        elseif field_number == 2
-            resident_bytes_after = PB.decode(d, UInt64)
-        else
-            Base.skip(d, wire_type)
-        end
-    end
-    return CompactMemoryResponse(reloaded_models, resident_bytes_after)
-end
-
-function PB.encode(e::PB.AbstractProtoEncoder, x::CompactMemoryResponse)
-    initpos = position(e.io)
-    x.reloaded_models != zero(Int64) && PB.encode(e, 1, x.reloaded_models)
-    x.resident_bytes_after != zero(UInt64) && PB.encode(e, 2, x.resident_bytes_after)
-    return position(e.io) - initpos
-end
-function PB._encoded_size(x::CompactMemoryResponse)
-    encoded_size = 0
-    x.reloaded_models != zero(Int64) && (encoded_size += PB._encoded_size(x.reloaded_models, 1))
-    x.resident_bytes_after != zero(UInt64) && (encoded_size += PB._encoded_size(x.resident_bytes_after, 2))
-    return encoded_size
-end
-
-# SERVICE: No codegen handlers registered
-#    ControlService
