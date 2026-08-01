@@ -61,7 +61,8 @@ function GatewayMetrics(worker_names::Dict{String,String} = Dict{String,String}(
         (:model,); registry = reg)
     replica_outstanding = Prometheus.Family{Prometheus.Gauge}(
         "gateway_replica_outstanding",
-        "In-flight requests routed to a model's replica on a worker, sampled at the last repack.",
+        "In-flight ITEMS on a model's replica: the summed batch size of the requests in flight, " *
+        "not a request count. Equals the request count for a client whose requests all carry one item.",
         (:model, :worker); registry = reg)
     model_fill_quantum = Prometheus.Family{Prometheus.Gauge}(
         "gateway_model_fill_quantum",

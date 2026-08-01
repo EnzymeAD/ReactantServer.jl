@@ -6,8 +6,49 @@
 import gRPCServer
 import gRPCClient
 import HTTP
+import ProtoBuf as TPB
 
 const GWInf = ReactantServerCore.inference
+
+@testset "peek_model_header: routing fields without decoding the payload" begin
+    enc(msg) = (io = IOBuffer(); TPB.encode(TPB.ProtoEncoder(io), msg); take!(io))
+    tensor(name, shape) = GWInf.var"ModelInferRequest.InferInputTensor"(;
+        name = name, datatype = "UINT8", shape = Int64[shape...])
+
+    # A realistic request: a batch of 32 with a megabyte of raw contents. The batch dimension must
+    # come out without the payload being decoded, and `raw_input_contents` (field 7) sits after
+    # `inputs` (field 5) on the wire, so reaching the shape never walks the data.
+    payload = rand(UInt8, 1024 * 1024)
+    body = enc(GWInf.ModelInferRequest(; model_name = "m", id = "req-1",
+                                       inputs = [tensor("x", (32, 3, 224, 224))],
+                                       raw_input_contents = [payload]))
+    @test ReactantServerGateway.peek_model_header(body) == ("m", "req-1", 32)
+
+    # Inline contents instead of raw: the shape is field 3 within the tensor and the data field 5, so
+    # it is still reached first.
+    inline = GWInf.var"ModelInferRequest.InferInputTensor"(;
+        name = "x", datatype = "FP32", shape = Int64[8, 4],
+        contents = GWInf.InferTensorContents(; fp32_contents = Float32[1:32;]))
+    @test ReactantServerGateway.peek_model_header(enc(GWInf.ModelInferRequest(; model_name = "m2",
+                                                           inputs = [inline]))) == ("m2", "", 8)
+
+    # Several inputs: the first one's leading dimension wins. Inputs that disagree are a model
+    # authoring bug, not something the gateway adjudicates.
+    multi = enc(GWInf.ModelInferRequest(; model_name = "m3",
+                                        inputs = [tensor("a", (4, 2)), tensor("b", (9, 9))]))
+    @test ReactantServerGateway.peek_model_header(multi) == ("m3", "", 4)
+
+    # Degenerate shapes: no inputs at all, and an input with an empty shape (a scalar). Both report
+    # 0, which `route_units` charges as a single unit.
+    @test ReactantServerGateway.peek_model_header(enc(GWInf.ModelInferRequest(; model_name = "m4"))) == ("m4", "", 0)
+    @test ReactantServerGateway.peek_model_header(enc(GWInf.ModelInferRequest(; model_name = "m5",
+                                                           inputs = [tensor("s", ())]))) == ("m5", "", 0)
+
+    # An unbatched-looking leading dimension is still reported verbatim; gating it is the
+    # scheduler's job (see the fill-quantum tests), not the decoder's.
+    @test ReactantServerGateway.peek_model_header(enc(GWInf.ModelInferRequest(; model_name = "m6",
+                                                           inputs = [tensor("chw", (3, 224, 224))])))[3] == 3
+end
 
 mutable struct MockWorker
     name::String

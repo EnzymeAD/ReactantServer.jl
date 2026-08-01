@@ -49,7 +49,9 @@ discover models dynamically via Grafana template variables (`$worker`, `$model`)
    gateway-to-worker call p99, top models by utilization, the model->worker placement table, and
    worker metrics-scrape health. `gateway_replica_routed_total` (cumulative requests routed per
    replica) is the series to watch when a replicated model looks like it is only using one GPU;
-   `gateway_model_fill_quantum` and `gateway_repacks_total{trigger}` explain why.
+   `gateway_model_fill_quantum` and `gateway_repacks_total{trigger}` explain why. Note the units
+   differ on purpose: `gateway_replica_outstanding` counts in-flight ITEMS (summed batch sizes) so it
+   is comparable to the quantum, while `gateway_replica_routed_total` counts routing decisions.
 5. **Per-Model Drilldown** (`$model`) — one model's rate/errors, handler-latency heatmap, queue
    depth & wait, its coalescing, residency-by-worker timeline, and placement.
 6. **Coalescing & Batching** — every model's **coalescing factor** (requests merged per dispatch =

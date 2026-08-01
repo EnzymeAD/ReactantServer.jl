@@ -16,15 +16,23 @@
 # workers receive deep same-model groupings to coalesce. `routing_fill_mode` decides what the fill
 # quantum `Q` (the worker-reported max batch scaled by `routing_fill_factor`) counts, per model:
 #
-#   :run       (default) `Q` counts requests ROUTED to the current replica. A run of Q requests goes
-#              to one replica, then the next run opens elsewhere, so the model's GPUs serve it in turn:
-#              batches stay deep and the share is even to within one run at any concurrency. A run also
-#              ends when the model has nothing in flight (no batch to protect, so it rotates per
-#              request) or when its replica falls a whole quantum behind the least-backed-up one.
-#   :spread    equalize IN-FLIGHT requests across the set, so all k GPUs serve the model at once.
-#              Lowest latency for a latency-bound model whose concurrency is well below its max batch,
-#              at the cost of coalescing depth.
-#   :inflight  the legacy basis: `Q` counts requests IN FLIGHT. A replica keeps receiving the model's
+# The quantum and every in-flight counter are denominated in ITEMS, not requests: a request's item
+# count is the leading dimension of its first input tensor, peeked out of the body without decoding
+# the payload (see headers.jl), so one request of 32 items and 32 requests of one item are the same
+# amount of work. `max_batch` is itself an item count, which is what makes `Q = factor * max_batch`
+# dimensionally honest. Models the worker does not batch (max_batch <= 1: metas, unbatched models)
+# charge one unit per request, since their leading dimension names an axis, not a count.
+#
+#   :run       (default) a run spends `Q` ITEMS on one replica, then the next run opens elsewhere, so
+#              the model's GPUs serve it in turn: batches stay deep and the share is even to within one
+#              run at any concurrency. A run also ends when the model has nothing in flight (no batch
+#              to protect, so it rotates per request) or when its replica falls a whole quantum behind
+#              the least-backed-up one.
+#   :spread    equalize in-flight ITEMS across the set, so all k GPUs serve the model at once. Lowest
+#              latency for a latency-bound model whose concurrency is well below its max batch, at the
+#              cost of coalescing depth. This is the right mode for a client that already batches to
+#              max_batch itself, where there is nothing left for the worker to coalesce.
+#   :inflight  the legacy basis: `Q` counts items IN FLIGHT. A replica keeps receiving the model's
 #              traffic until it holds a full quantum at once, which never happens below `n*(Q-1)`
 #              in-flight, so a model whose concurrency sits between 2 and Q and never drains is served
 #              by ONE replica indefinitely while the others get nothing. Retained only to reproduce
@@ -192,13 +200,13 @@ end
 # exclusively under that model's `sel_locks` entry, so plain `Int`s are correct here and one dict
 # lookup covers the whole routing decision.
 #
-# `target` is an index into the model's current placement, 0 when no run is open. `routed` counts the
-# requests this run has sent, which is what the `:run` quantum compares against. `cursor` is the
-# 0-based rotation position the next run opens from (the former `rr_cursor`).
+# `target` is an index into the model's current placement, 0 when no run is open. `units` counts the
+# ITEMS this run has sent (the sum of the requests' batch sizes), which is what the `:run` quantum
+# compares against. `cursor` is the 0-based rotation position the next run opens from.
 mutable struct FillRun
     cursor::Int
     target::Int
-    routed::Int
+    units::Int
 end
 
 FillRun() = FillRun(0, 0, 0)
@@ -235,9 +243,12 @@ mutable struct LptPackingState <: GatewayScheduler
     @atomic cost_snapshot::Dict{String,Float64}
     # the live assignment, swapped atomically; readers never lock
     @atomic assignment::Dict{String,Placement}
-    # outstanding (in-flight) request counters, swapped atomically at repack so the hot path reads a
-    # stable snapshot and increments the shared atomics inside. Per (model, worker): backpressure for
-    # every fill mode, and the quantum itself under `:spread` / `:inflight`.
+    # In-flight ITEM counters (the sum of the batch sizes of the requests in flight), swapped
+    # atomically at repack so the hot path reads a stable snapshot. Per (model, worker): backpressure
+    # for every fill mode, and the quantum itself under `:spread` / `:inflight`. Items rather than
+    # requests so the comparison against `Q` is dimensionally consistent; for a client with a fixed
+    # request size this is just a scaled request count, which is why the item denomination degrades
+    # gracefully and the reverse would not.
     @atomic outstanding::Dict{Tuple{String,String},Threads.Atomic{Int}}
     # Cumulative requests routed per (model, worker), carried across repacks like `outstanding`.
     # Exported as `gateway_replica_routed_total`, which is the only series that shows a starved
@@ -620,7 +631,9 @@ function Prometheus.collect!(metrics::Vector, c::RoutedCollector)
     # Deterministic order across scrapes; Prometheus.jl sorts family children for the same reason.
     sort!(samples; by = x -> x.label_values.label_values)
     push!(metrics, Prometheus.Metric("counter", "gateway_replica_routed_total",
-        "Cumulative requests routed to a model's replica on a worker.", samples))
+        "Cumulative REQUESTS routed to a model's replica on a worker (a count of routing " *
+        "decisions; see gateway_replica_outstanding for the item-denominated in-flight work).",
+        samples))
     return metrics
 end
 
@@ -753,14 +766,14 @@ end
 # bump the per-(model,worker) and per-worker compute-load counters, returning the reservation tuple
 # to release later. Any counter missing from the live snapshot (mid-repack drift) is skipped and
 # released as a no-op.
-function _reserve_on!(out_snap, routed_snap, wload_snap, model, w, weight)
+function _reserve_on!(out_snap, routed_snap, wload_snap, model, w, weight, units)
     mwc = get(out_snap, (model, w), nothing)
     wload = get(wload_snap, w, nothing)
     rtd = get(routed_snap, (model, w), nothing)
-    mwc === nothing || Threads.atomic_add!(mwc, 1)
+    mwc === nothing || Threads.atomic_add!(mwc, units)   # in-flight ITEMS
     wload === nothing || Threads.atomic_add!(wload, weight)
-    rtd === nothing || Threads.atomic_add!(rtd, 1)   # cumulative: never released
-    return (mwc, wload, weight)
+    rtd === nothing || Threads.atomic_add!(rtd, 1)       # cumulative REQUESTS: never released
+    return (mwc, wload, weight, units)
 end
 
 """
@@ -780,7 +793,7 @@ The model's `fill_mode` (see [`FillPlan`](@ref)) decides what the quantum `Q` co
     ends when the model has nothing in flight (no batch to protect, so it rotates per request) or when
     its replica falls a whole quantum behind the least-backed-up one (backpressure: a slow replica
     loses its turn rather than accumulating a queue).
-  - `:spread`: equalize in-flight requests across the set, so all `k` GPUs serve the model at once.
+  - `:spread`: equalize in-flight items across the set, so all `k` GPUs serve the model at once.
     Lowest latency for a latency-bound model whose concurrency is well below its max batch, at the
     cost of coalescing depth.
   - `:inflight` (legacy): `Q` counts requests **in flight**, so a replica keeps receiving the model's
@@ -801,7 +814,7 @@ Every routed request, single- or multi-replica, bumps the per-worker compute-loa
 selection lock for multi-replica models) makes concurrent selections see the choice, so requests do
 not stampede onto the same replica.
 """
-function route_replica(s::LptPackingState, model::AbstractString)
+function route_replica(s::LptPackingState, model::AbstractString, batch::Integer=0)
     placement = get(@atomic(s.assignment), model, nothing)
     placement === nothing && return nothing
     n = length(placement)
@@ -811,17 +824,19 @@ function route_replica(s::LptPackingState, model::AbstractString)
     routed_snap = @atomic s.routed
     wload_snap = @atomic s.worker_load
     weight = _route_weight(s, model)
+    # One resolved plan per request: the mode, the quantum, and the unit count must all come from the
+    # same generation. Read before the n == 1 fast path so both charge items the same way.
+    plan = get(@atomic(s.fill_plan), model, _DEFAULT_FILL_PLAN)
+    units = route_units(plan, batch)
 
     if n == 1
         w = placement[1][1]
-        return (String[w], _reserve_on!(out_snap, routed_snap, wload_snap, model, w, weight))
+        return (String[w], _reserve_on!(out_snap, routed_snap, wload_snap, model, w, weight, units))
     end
 
     workers = String[p[1] for p in placement]
     lk = get(@atomic(s.sel_locks), model, nothing)
     lk === nothing && return (workers, nothing)   # mid-repack drift: route in order, untracked
-    # One resolved plan per request: the mode and the quantum must come from the same generation.
-    plan = get(@atomic(s.fill_plan), model, _DEFAULT_FILL_PLAN)
     policy = knobs(s).routing_policy
     Q = plan.quantum
     all_runs = @atomic s.fill_runs
@@ -854,22 +869,25 @@ function route_replica(s::LptPackingState, model::AbstractString)
                      argmin(i -> (outs[i], rot(i)), 1:n)
             run.cursor = mod(chosen, n)
             run.target = chosen
-            run.routed = 1
+            run.units = units
         elseif plan.mode === :run
             # `behind` is the backpressure guard: a replica a whole quantum deeper than the
             # least-backed-up one can neither keep nor open a run.
             floor_q = minimum(fld(outs[i], Q) for i in 1:n)
             behind(i) = fld(outs[i], Q) > floor_q
-            if run.target < 1 || run.target > n || run.routed >= Q || behind(run.target) || total == 0
+            if run.target < 1 || run.target > n || run.units >= Q || behind(run.target) || total == 0
                 chosen = policy === :fill_least ?
                          argmin(i -> (behind(i), wload_of(i), rot(i)), 1:n) :
                          argmin(i -> (behind(i), rot(i)), 1:n)
                 run.cursor = mod(chosen, n)
                 run.target = chosen
-                run.routed = 1
+                run.units = units
             else
                 chosen = run.target
-                run.routed += 1
+                # A run is spent by ITEMS, so one request carrying a full batch closes it just as 32
+                # single-item requests would. This is the whole point of the item denomination: a
+                # client that pre-batches to max_batch would otherwise hold a replica for Q batches.
+                run.units += units
             end
         else   # :inflight (legacy)
             # Fill progress in whole quanta, then the deepest replica within that bucket, which is
@@ -885,10 +903,10 @@ function route_replica(s::LptPackingState, model::AbstractString)
             best = prog(chosen)
             count(i -> prog(i) == best, 1:n) > 1 && (run.cursor = mod(chosen, n))
             run.target = chosen
-            run.routed = 1
+            run.units = units
         end
 
-        Threads.atomic_add!(cobjs[chosen], 1)
+        Threads.atomic_add!(cobjs[chosen], units)
         wload = get(wload_snap, workers[chosen], nothing)
         wload === nothing || Threads.atomic_add!(wload, weight)
         rtd = get(routed_snap, (model, workers[chosen]), nothing)
@@ -901,7 +919,7 @@ function route_replica(s::LptPackingState, model::AbstractString)
     end
     res === nothing && return (workers, nothing)
     ordered, mwc, wload = res
-    return (ordered, (mwc, wload, weight))
+    return (ordered, (mwc, wload, weight, units))
 end
 
 # Release a reservation made by route_replica: decrement the per-(model,worker) request counter and
@@ -910,8 +928,10 @@ end
 # reservation time (drift), which is stored as `nothing`.
 function _release_route!(counters)
     counters === nothing && return nothing
-    mwc, wload, weight = counters
-    mwc === nothing || Threads.atomic_sub!(mwc, 1)
+    mwc, wload, weight, units = counters
+    # The captured `units` and `weight` are subtracted, not recomputed: a repack between reservation
+    # and release changes both, and recomputing would leave the counters drifting.
+    mwc === nothing || Threads.atomic_sub!(mwc, units)
     wload === nothing || Threads.atomic_sub!(wload, weight)
     return nothing
 end
@@ -959,7 +979,7 @@ end
 # last resort so a concentrated model survives its worker dying between repacks. A model without a
 # placement yet (cold, or new since the last repack) falls back to round robin over discovered routes.
 function select_replicas(s::LptPackingState, ctx::ScheduleContext)
-    routed = route_replica(s, ctx.model)
+    routed = route_replica(s, ctx.model, ctx.batch)
     if routed === nothing
         urls = pick(ctx.routes, ctx.model)
         urls === nothing && return nothing

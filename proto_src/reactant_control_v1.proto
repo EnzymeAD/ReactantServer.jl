@@ -190,8 +190,10 @@ message ReplicaPlacement
 {
   string worker = 1;
   double weight = 2;        // 1/k across the model's k replicas
-  int64 outstanding = 3;    // in-flight requests for this (model, worker) right now
-  int64 routed_total = 4;   // cumulative requests routed to it (flat on a starved replica)
+  // In-flight ITEMS right now: the summed batch size of the requests in flight, matching the fill
+  // quantum's denomination. Equals a request count when every request carries a single item.
+  int64 outstanding = 3;
+  int64 routed_total = 4;   // cumulative REQUESTS routed to it (flat on a starved replica)
 }
 
 message ModelSchedulingStatus
@@ -205,7 +207,7 @@ message ModelSchedulingStatus
   double cost_seconds = 7;         // measured per-request compute, GPU-seconds
   int64 max_batch = 8;             // worker-reported effective max batch (refreshed every tick)
   string fill_mode = 9;            // resolved: the override, else the fleet default
-  int64 fill_quantum = 10;         // resolved run length in requests
+  int64 fill_quantum = 10;         // resolved run length in ITEMS (a batch of 32 spends 32)
   int64 weight_nbytes = 11;        // footprint seen at the last repack
   bool placed = 12;                // false = no placement yet (cold; routed round robin)
   bool drifted = 13;               // not reported by every ready worker at the last repack

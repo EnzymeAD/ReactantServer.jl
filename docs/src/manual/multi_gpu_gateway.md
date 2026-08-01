@@ -36,8 +36,11 @@ gRPC-to-gRPC pass-through that never re-marshals the body.
   is ready when at least one worker reports ready.
 - **Raw passthrough:** the `ModelInfer` hot path never decodes or re-marshals the protobuf body.
   The request and response types are `Vector{UInt8}` end to end (gRPCServer.jl and gRPCClient.jl
-  support raw byte messages natively). To route, the gateway decodes a partial schema that
-  declares only `model_name` (field 1) and `id` (field 3); ProtoBuf skips the tensor payload.
+  support raw byte messages natively). To route, the gateway decodes a partial schema declaring only
+  `model_name` (field 1), `id` (field 3), and the leading dimension of the first input tensor
+  (`inputs[0].shape[0]`, how many items the request carries, used by the fill quantum). ProtoBuf
+  seeks past everything else, including every tensor payload; the shape precedes the data on the
+  wire, so reading it costs no payload decode.
 - **SHM broadcast:** `SystemSharedMemoryRegister` / `Unregister` are fanned out to every worker.
   POSIX SHM regions are host-local; every worker attaches via `shm_open` independently. Register
   succeeds only if all workers succeed (it rolls back partial success); unregister succeeds if
@@ -151,16 +154,28 @@ resumes.
 For a model with more than one replica, the gateway concentrates its requests on one replica at a time
 so the workers receive deep same-model groupings to coalesce (the coalescing itself stays at the
 worker). The **fill quantum** `Q` is the model's worker-reported max batch size scaled by
-`routing_fill_factor`, and `routing_fill_mode` decides what `Q` counts:
+`routing_fill_factor`, and it is denominated in **items**, not requests: a request's item count is the
+leading dimension of its first input tensor, which the gateway reads out of the request header without
+decoding the payload. One request carrying a batch of 32 and 32 requests carrying one item each are
+therefore the same amount of work, and both spend a quantum of 32.
 
-- **`run`** (default) counts requests **routed** to the current replica. A run of `Q` requests goes to
-  one replica, then the next run opens elsewhere, so a model's GPUs serve it in turn: batches stay
+That matters most for a client that batches on its own behalf. If your client already fills requests to
+the model's max batch size, a request-denominated quantum would hold one replica for 32 *batches* and
+your bursts would land on a single GPU; the item denomination makes one such request close the run.
+Models the worker does not batch (a meta, or a model compiled unbatched, both reporting a max batch of
+0 or 1) charge one unit per request, since their leading dimension names an axis rather than a count.
+
+`routing_fill_mode` decides what `Q` counts against:
+
+- **`run`** (default) counts items **routed** to the current replica. A run spends `Q` items on one
+  replica, then the next run opens elsewhere, so a model's GPUs serve it in turn: batches stay
   deep and every replica gets an even share (to within one run) at any concurrency. A run also ends
   when the model has nothing in flight, so a low-rate model rotates per request instead of committing
   `Q` in a row, and when a replica falls a whole quantum behind the least-backed-up one, so a slow
   replica loses its turn rather than accumulating a queue.
-- **`spread`** equalizes **in-flight** requests across the replica set, so all `k` GPUs serve the model
-  at once. This is what promotion means for a latency-bound model whose client concurrency sits well
+- **`spread`** equalizes **in-flight items** across the replica set, so all `k` GPUs serve the model
+  at once. This is the right mode when your client already batches to the max batch size, because then
+  the worker has nothing left to coalesce and concentration only idles GPUs. This is what promotion means for a latency-bound model whose client concurrency sits well
   below its max batch; the cost is coalescing depth, since each GPU now batches roughly `1/k` as many
   requests. Prefer it per model rather than fleet-wide.
 - **`inflight`** is the legacy basis: `Q` counts requests **in flight**, so a replica keeps receiving
@@ -219,8 +234,10 @@ to the remaining replicas.
 
 The placement is observable: `gateway_model_replicas` reports each model's replica count,
 `gateway_placement_weight` reports its per-worker weight, `gateway_replica_outstanding` reports the
-in-flight requests per replica, `gateway_replica_routed_total` counts the requests routed to each
-replica since start (the series that shows whether every replica is actually being used),
+in-flight **items** per replica (summed batch sizes, matching the quantum's denomination; equal to a
+request count when every request carries one item), `gateway_replica_routed_total` counts the
+**requests** routed to each replica since start (the series that shows whether every replica is
+actually being used),
 `gateway_model_fill_quantum` reports each model's effective quantum, `gateway_repacks_total` counts
 repacks by what triggered them, and `gateway_model_utilization` reports each model's estimated demand
 in GPU-seconds per second.
@@ -285,11 +302,22 @@ The supervisor configures the embedded gateway for you: it synthesizes the worke
 about model placement is configured on the gateway; it autodiscovers which models each worker
 serves via `RepositoryIndex` and refreshes its routing table periodically.
 
-To tune the gateway, provide a `gateway.yml` and point `REACTANT_GATEWAY_FILE` at it (or, for the
-embedded gateway, set the `REACTANT_GATEWAY_*` environment below); it carries the gateway's own
+To tune the gateway, provide a `gateway.yml` and point `REACTANT_GATEWAY_FILE` at it (or leave it at
+the conventional `/etc/reactantserver/gateway.yml`, which the supervisor picks up automatically; or,
+for the embedded gateway, set the `REACTANT_GATEWAY_*` environment below); it carries the gateway's own
 settings (listen addresses, message limits, logging, and the `scheduling:` block above). Settings can also be overridden by
 environment with the prefix `REACTANT_GATEWAY_` and the dotted path uppercased with underscores,
 e.g. `REACTANT_GATEWAY_LOGGING_LEVEL=debug` or `REACTANT_GATEWAY_SCHEDULING_MODE=lpt_packing`.
+
+!!! note "A mounted `gateway.yml` owns the endpoint list"
+    Per-model settings (`scheduling.models.<name>`) are the one part of the config with no
+    environment equivalent, since the overrides only reach scalar keys, so promoting a single model
+    requires a file. When the supervisor finds one it stops synthesizing the worker lists, because the
+    file is now the authority: the file must therefore carry `endpoints:` itself, plus
+    `metrics_endpoints:` and `worker_names:` if you want the aggregated `/metrics` and the
+    `worker0..N` labels the Grafana dashboards join on. The startup wait is *not* suppressed (it
+    describes the supervisor's own co-launched workers, not gateway configuration), so an
+    lpt_packing node still waits for its workers to finish compiling rather than crash-looping.
 
 ## Operational notes
 

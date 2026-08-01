@@ -21,6 +21,11 @@ abstract type GatewayScheduler end
 struct ScheduleContext{P<:ClientPool}
     model::String
     id::String
+    # Items the request carries: the leading dimension of its first input tensor, peeked out of the
+    # body without decoding the payload (see headers.jl). 0 when the request declares no shaped
+    # input. Whether it counts as work is the scheduler's call, since an unbatched model's leading
+    # dimension names an axis rather than a count (see `route_units`).
+    batch::Int
     pool::P
     routes::DiscoveredRoutes
     metrics::GatewayMetrics

@@ -108,9 +108,11 @@ function print_status(resp)
     if !isempty(resp.models)
         println("\nmodels")
         @printf("  %-28s %5s %5s %-9s %5s %9s %9s  %s\n",
-                "name", "cfg", "eff", "fill", "quant", "util", "cost", "placement (routed/in-flight)")
+                "name", "cfg", "eff", "fill", "quant", "util", "cost",
+                "placement (requests routed / items in flight)")
         for m in resp.models
-            place = join(["$(r.worker) $(r.routed_total)/$(r.outstanding)" for r in m.replicas], "  ")
+            # requests routed / items in flight: the two are deliberately different units.
+            place = join(["$(r.worker) $(r.routed_total)req/$(r.outstanding)it" for r in m.replicas], "  ")
             flags = string(m.placed ? "" : " [unplaced]", m.drifted ? " [drifted]" : "")
             @printf("  %-28s %5s %5d %-9s %5d %9.4f %9.4f  %s%s\n",
                     m.name, fmt_replicas(m.configured_replicas), m.effective_replicas,

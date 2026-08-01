@@ -436,6 +436,73 @@ end
     @test spread_conc > run_conc4
 end
 
+@testset "fill quantum counts items, not requests" begin
+    # The requirement: 32 requests of one item and one request of 32 items are the same amount of
+    # work, so both spend a quantum of 32. A client that pre-batches to max_batch would otherwise
+    # hold a replica for 32 full batches.
+    mb = Dict("m" => 32)
+    s = _pk_state(; max_batch = 32, fill_mode = "run")
+    @test (@atomic s.fill_plan)["m"].quantum == 32
+    @test (@atomic s.fill_plan)["m"].batched
+
+    # One request carrying a full batch spends the whole run: the next request rotates.
+    urls1, c1 = GW.route_replica(s, "m", 32)
+    urls2, c2 = GW.route_replica(s, "m", 32)
+    @test urls1[1] != urls2[1]
+    # ...and it is charged as 32 in flight, not 1.
+    @test (@atomic s.outstanding)[("m", urls1[1])][] == 32
+    GW._release_route!(c1)
+    GW._release_route!(c2)
+    @test all(a -> a[] == 0, values(@atomic s.outstanding))    # release subtracts the same items
+
+    # 32 single-item requests spend exactly the same run.
+    s2 = _pk_state(; max_batch = 32, fill_mode = "run")
+    held = [GW.route_replica(s2, "m", 1) for _ in 1:32]
+    @test all(h -> h[1][1] == held[1][1][1], held)             # one run
+    @test GW.route_replica(s2, "m", 1)[1][1] != held[1][1][1]  # 33rd opens the next
+    foreach(h -> GW._release_route!(h[2]), held)
+
+    # Mixed sizes add up the same way: 16 + 8 + 8 = 32 closes the run.
+    s3 = _pk_state(; max_batch = 32, fill_mode = "run")
+    mixed = [GW.route_replica(s3, "m", n) for n in (16, 8, 8)]
+    @test all(h -> h[1][1] == mixed[1][1][1], mixed)
+    @test GW.route_replica(s3, "m", 1)[1][1] != mixed[1][1][1]
+    foreach(h -> GW._release_route!(h[2]), mixed)
+end
+
+@testset "fill quantum: only a batched model's leading dimension counts as items" begin
+    # An unbatched model's leading dimension is a real axis (channels, say), not a count. Charging it
+    # would inflate its in-flight work by that factor and rotate its runs early.
+    for (maxb, batched) in ((0, false), (1, false), (2, true), (32, true))
+        s = _pk_state(; max_batch = maxb, fill_mode = "run")
+        plan = (@atomic s.fill_plan)["m"]
+        @test plan.batched == batched
+        @test GW.route_units(plan, 3) == (batched ? 3 : 1)
+        @test GW.route_units(plan, 0) == 1        # no shaped input: one unit
+    end
+
+    # End to end: an unbatched model charges one item per request whatever its shape says.
+    s = _pk_state(; max_batch = 1, fill_mode = "run")
+    _, c = GW.route_replica(s, "m", 3)
+    @test sum(a -> a[], values(@atomic s.outstanding)) == 1
+    GW._release_route!(c)
+end
+
+@testset "fill modes: spread weighs items, so one big request outranks two small ones" begin
+    # w0 holding a single 32-item request is busier than w1 holding two 1-item requests, and spread
+    # must see that. Counting requests would have picked the wrong replica.
+    s = _pk_state(; max_batch = 32, fill_mode = "spread")
+    big = GW.route_replica(s, "m", 32)
+    small1 = GW.route_replica(s, "m", 1)
+    small2 = GW.route_replica(s, "m", 1)
+    @test small1[1][1] != big[1][1]                            # the empty replica
+    @test small2[1][1] == small1[1][1]                         # still lighter than 32 items
+    out = @atomic s.outstanding
+    @test out[("m", big[1][1])][] == 32
+    @test out[("m", small1[1][1])][] == 2
+    foreach(h -> GW._release_route!(h[2]), (big, small1, small2))
+end
+
 @testset "fill modes: run rotates every Q requests" begin
     s = _pk_state(; max_batch = 8, fill_mode = "run")
     # Hold everything in flight so only the routed count can end the run.

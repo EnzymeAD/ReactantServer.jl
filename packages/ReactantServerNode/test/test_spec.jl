@@ -57,6 +57,23 @@ end
                            endpoints=["127.0.0.1:8080"])
     @test any(a -> a == "/etc/reactantserver/gateway.yml", gwf.cmd.exec)
     @test _envval(gwf.cmd, "REACTANT_GATEWAY_WORKERS") === nothing
+
+    # ...but the startup wait is still set, because it describes the supervisor's own co-launched
+    # workers (which compile before answering) rather than gateway configuration, and a file that
+    # owns the endpoint list cannot express it. Without this a mounted-file node crash-loops the
+    # gateway for the entire compile window under lpt_packing.
+    @test _envval(gw.cmd, "REACTANT_GATEWAY_STARTUP_WAIT_SECONDS") == "inf"
+    @test _envval(gwf.cmd, "REACTANT_GATEWAY_STARTUP_WAIT_SECONDS") == "inf"
+    # An explicit value still wins, in both shapes: the default is never forced over it. (What
+    # `_envval` sees differs between them and neither is a bug: `addenv` materializes the whole
+    # environment, so the endpoint shape shows the inherited "120", while the mounted-file shape adds
+    # no pairs at all and leaves `cmd.env` unset, which means the child inherits ENV as it stands.)
+    withenv("REACTANT_GATEWAY_STARTUP_WAIT_SECONDS" => "120") do
+        for c in (RSN.gateway_spec("/opt/rs"; endpoints=["127.0.0.1:8080"]).cmd,
+                  RSN.gateway_spec("/opt/rs"; gateway_path="/etc/x/gateway.yml").cmd)
+            @test _envval(c, "REACTANT_GATEWAY_STARTUP_WAIT_SECONDS") != "inf"
+        end
+    end
 end
 
 @testset "worker endpoints and gateway listen ports" begin

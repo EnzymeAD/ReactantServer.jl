@@ -13,14 +13,16 @@ function _sched_cfg(mode)
 end
 
 # Build a ScheduleContext for `model` over a routing table mapping each model to worker URLs.
-function _ctx(model, table::Dict)
+# `batch` is the request's item count (its leading input dimension); the default 0 means "no shaped
+# input", which every scheduler charges as one unit.
+function _ctx(model, table::Dict; batch::Int = 0)
     cfg = _sched_cfg("round_robin")
     pool = GW.ClientPool(cfg)
     routes = GW.DiscoveredRoutes()
     GW.swap_table!(routes, GW.RoutingTable(table))
     metrics = GW.GatewayMetrics()
     refresher = GW.RouteRefresher(pool, routes, metrics)
-    ctx = GW.ScheduleContext(model, "id", pool, routes, metrics, refresher)
+    ctx = GW.ScheduleContext(model, "id", batch, pool, routes, metrics, refresher)
     return ctx, pool
 end
 
