@@ -1,5 +1,5 @@
 # Smoke-test the four bundle model.jl hooks outside the server: stub NamedTensor + NNlib +
-# register_model, stage each model.jl next to the shared tokenizer (as the export driver does),
+# register_model, stage each model.jl next to the bundle vocab.txt (as the export driver does),
 # include it, and round-trip realistic requests through preprocess/postprocess. Pure Julia, no
 # packages:
 #
@@ -13,6 +13,10 @@ struct NamedTensor
     name::String
     data::Array
 end
+# The real shared tokenizer module, included straight from the package source (it depends on
+# nothing but Base), so the smoke test exercises what the server would actually run.
+Base.include(@__MODULE__, joinpath(dirname(dirname(dirname(@__DIR__))),
+                                  "packages", "ReactantServer", "src", "preprocess", "bert_text.jl"))
 module NNlib
 sigmoid(x) = 1 / (1 + exp(-x))
 function softmax(x::AbstractMatrix; dims::Int=1)
@@ -30,15 +34,13 @@ end
 # (here FakeRS) injected; the `using ReactantServer: NamedTensor` line is rewritten to the injected
 # binding since FakeRS is not a loadable package.
 function load_bundle(name)
-    # Stage model.jl + shared tokenizer into a temp dir, exactly like the export driver's _stage.
+    # Stage model.jl + vocab.txt into a temp dir, exactly like the export driver's _stage.
     dir = mktempdir()
     cp(joinpath(MODELS, name, "model.jl"), joinpath(dir, "model.jl"))
-    for f in ("bert_wordpiece.jl", "vocab.txt")
-        cp(joinpath(TOKENIZER, f), joinpath(dir, f))
-    end
+    cp(joinpath(TOKENIZER, "vocab.txt"), joinpath(dir, "vocab.txt"))
     # basename(@__DIR__) is the registered name, so name the temp dir after the model.
     named = joinpath(dir, name); mkpath(named)
-    for f in ("model.jl", "bert_wordpiece.jl", "vocab.txt")
+    for f in ("model.jl", "vocab.txt")
         mv(joinpath(dir, f), joinpath(named, f))
     end
     src = read(joinpath(named, "model.jl"), String)

@@ -66,6 +66,11 @@ include("watcher.jl")
 # Referenced from a bundle's model.jl as ReactantServer.DetectionGlue. No deps on the runtime above.
 include("postprocess/detection.jl")
 
+# Self-contained BERT WordPiece tokenization + wire padding for text bundles. Referenced from a
+# bundle's model.jl as ReactantServer.BertText; the vocab.txt stays in the bundle. Like the
+# detection glue, no deps on the runtime above.
+include("preprocess/bert_text.jl")
+
 # Meta-model execution (the ModelCaller abstraction + run_meta). After the scheduler (LocalCaller
 # wraps it) and before grpc.jl (InferContext holds a ModelCaller and _handle_infer dispatches meta).
 include("meta.jl")

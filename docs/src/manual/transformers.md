@@ -33,43 +33,46 @@ text-serving shapes. For the bundle/manifest/`model.jl` contract itself see
 | `sentiment` | `distilbert-base-uncased-finetuned-sst-2-english` | `AutoModelForSequenceClassification` | none (raw logits) | tokenize; add softmax + argmax |
 
 All four share the `bert-base-uncased` WordPiece vocab (30522 tokens), so one tokenizer serves
-every bundle.
+every bundle: the code in `ReactantServer.BertText`, the vocab as a per-bundle `vocab.txt`.
 
 ## Tokenization lives in the bundle
 
 Clients send raw UTF-8 bytes; the bundle's `model.jl` decodes them and tokenizes in Julia with
-`tokenizer/bert_wordpiece.jl`, a self-contained BERT WordPiece (uncased) reimplementation with no
-dependencies beyond `Base` and `Unicode` (so `model.jl` can `include` it). It matches the
-HuggingFace Rust tokenizer, including the awkward corners: unassigned codepoints stay in the word,
-ASCII symbols like `` $ + < = > ^ ` | ~ `` count as punctuation, `LongestFirst` pair truncation,
-and special-token literals in raw text. The export driver copies `bert_wordpiece.jl` and
-`vocab.txt` into every built bundle next to its `model.jl`.
+`ReactantServer.BertText`, a self-contained BERT WordPiece (uncased) reimplementation that depends
+on nothing but `Base`. It matches the HuggingFace Rust tokenizer, including the awkward corners:
+unassigned codepoints stay in the word, ASCII symbols like `` $ + < = > ^ ` | ~ `` count as
+punctuation, `LongestFirst` pair truncation, and special-token literals in raw text.
+
+`BertText` is the request-side counterpart to `ReactantServer.DetectionGlue`: shared code lives in
+the package, per-model configuration is baked into `model.jl`, and the only tokenizer asset the
+export driver copies into a bundle is the checkpoint's `vocab.txt` (loaded at serve time relative
+to `model.jl`'s directory). A bundle exported this way needs a server that has `BertText`, the same
+version coupling the detector bundles already accept for `DetectionGlue`.
 
 `preprocess` turns the wire tensors into the executable's token-id inputs. The single-sequence
-models (`splade`, `embedding`, `sentiment`) call `encode_single` and emit `input_ids` +
+models (`splade`, `embedding`, `sentiment`) call `encode_text_batch` and emit `input_ids` +
 `attention_mask`; the cross encoder is a text *pair* (one query scored against N keys) and calls
-`encode_pair`, adding `token_type_ids`:
+`encode_pair_batch`, adding `token_type_ids`. Both decode the padded UInt8 rows, encode with the
+BERT template, and pad the batch up to the smallest compiled sequence bucket that fits:
 
 ```julia
+const BT = ReactantServer.BertText
+const TOKENIZER = BT.load_tokenizer(joinpath(@__DIR__, "vocab.txt"))
+
 function preprocess(inputs::Vector{NamedTensor})
     byname = Dict(t.name => t for t in inputs)
-    texts = byname["texts"].data::Matrix{UInt8}          # (max_bytes, batch) col-major
-    lens = vec(byname["text_lens"].data)
-    B = size(texts, 2)
-    encoded = Vector{Vector{Int32}}(undef, B)
-    for b in 1:B
-        s = String(@view texts[1:Int(lens[b]), b])
-        encoded[b] = encode_single(TOKENIZER, s; max_len=MAX_LEN)
-    end
-    seq = _bucket(maximum(length, encoded))
-    input_ids = zeros(Int64, seq, B); attention_mask = zeros(Int64, seq, B)
-    for b in 1:B, (i, id) in enumerate(encoded[b])
-        input_ids[i, b] = id; attention_mask[i, b] = 1
-    end
+    input_ids, attention_mask = BT.encode_text_batch(TOKENIZER,
+        byname["texts"].data::Matrix{UInt8},             # (max_bytes, batch) col-major
+        vec(byname["text_lens"].data);
+        max_len=MAX_LEN, buckets=SEQ_BUCKETS, lens_name="text_lens")
     return NamedTensor[NamedTensor("input_ids", input_ids),
                        NamedTensor("attention_mask", attention_mask)]
 end
 ```
+
+A bundle that needs a shape these two do not cover can drop a level and compose the same pieces:
+`wire_texts` decodes the padded rows to Strings, `encode_single` / `encode_pair` encode one text,
+and `pad_batch` packs the result into `(seq, batch)` matrices at the right bucket.
 
 ## The raw-logits / classifier rule
 
