@@ -961,6 +961,11 @@ end
         @test occursin("gateway_placement_weight", body)
         @test occursin("gateway_model_utilization", body)
         @test occursin("gateway_model_replicas", body)
+        # ...and so is the per-worker load fill_least compares, labelled with the basis in force, so a
+        # routing decision can be explained after the fact rather than guessed at.
+        @test occursin("# TYPE gateway_worker_inflight_work gauge", body)
+        @test occursin("gateway_worker_inflight_work{worker=", body)
+        @test occursin("basis=\"compute\"", body)
     finally
         GW.stop!(gw)
         close(s0)

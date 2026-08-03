@@ -189,6 +189,57 @@ end
     @test_throws ArgumentError GW.LeastOutstandingScheduler(; basis = :gpu_seconds)
 end
 
+@testset "gateway_worker_inflight_work exports what the scheduler compares" begin
+    _scrape(m) = (io = IOBuffer(); GW.expose(io, m); String(take!(io)))
+
+    # least_outstanding: the per-worker load, labelled with the basis, because the unit depends on it.
+    rm = GW.RoutingMeta(30.0)
+    GW.refresh_routing_meta!(rm, _poll(Dict("m" => (4.0, 1, 8)); batch_at = Dict("m" => ("IN", 1))))
+    s = GW.LeastOutstandingScheduler(rm; basis = :compute)
+    metrics = GW.GatewayMetrics(Dict("127.0.0.1:7001" => "worker0", "127.0.0.1:7002" => "worker1"))
+    ctx, pool = _ctx("m", Dict("m" => ["127.0.0.1:7001", "127.0.0.1:7002"]); units = 4)
+    try
+        # Nothing routed yet: the family is registered but has no children, so no series is emitted
+        # (an empty family would read as "zero work" rather than "no counters").
+        GW.scheduler_start!(s, pool, metrics)
+        @test !occursin("gateway_worker_inflight_work", _scrape(metrics))
+
+        _, res = GW.select_replicas(s, ctx)                  # 4 items x 0.5 GPU-seconds per item
+        body = _scrape(metrics)
+        @test occursin("gateway_worker_inflight_work{worker=\"worker0\",basis=\"compute\"} 2\n", body)
+        # A candidate that was not chosen still reports 0, which is what distinguishes an idle worker
+        # the scheduler knows about from one it has never seen.
+        @test occursin("gateway_worker_inflight_work{worker=\"worker1\",basis=\"compute\"} 0\n", body)
+        @test occursin("# TYPE gateway_worker_inflight_work gauge", body)
+        # Read at scrape time from the live counters, so a release is visible on the next scrape with
+        # no publish step in between.
+        GW.release!(s, res)
+        @test occursin("gateway_worker_inflight_work{worker=\"worker0\",basis=\"compute\"} 0\n",
+                       _scrape(metrics))
+    finally
+        GW.close_pool!(pool)
+    end
+
+    # The basis rides along as a label, so a fleet on items reports items under its own series.
+    si = GW.LeastOutstandingScheduler(rm; basis = :items)
+    mi = GW.GatewayMetrics(Dict("127.0.0.1:7001" => "worker0"))
+    ctxi, pooli = _ctx("m", Dict("m" => ["127.0.0.1:7001"]); units = 7)
+    try
+        GW.scheduler_start!(si, pooli, mi)
+        GW.select_replicas(si, ctxi)
+        @test occursin("gateway_worker_inflight_work{worker=\"worker0\",basis=\"items\"} 7\n", _scrape(mi))
+    finally
+        GW.close_pool!(pooli)
+    end
+
+    # round_robin tracks no work, so it registers no collector rather than exporting an empty family.
+    mr = GW.GatewayMetrics()
+    rr = GW.RoundRobinScheduler()
+    @test GW.inflight_work(rr) === nothing
+    @test GW.register_worker_work!(rr, mr) === nothing
+    @test !occursin("gateway_worker_inflight_work", _scrape(mr))
+end
+
 @testset "LeastOutstandingScheduler: routes to the least in-flight replica" begin
     s = GW.LeastOutstandingScheduler(; basis = :requests)
     ctx, pool = _ctx("m", Dict("m" => ["127.0.0.1:7001", "127.0.0.1:7002"]))

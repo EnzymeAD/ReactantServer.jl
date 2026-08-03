@@ -304,6 +304,21 @@ actually being used),
 repacks by what triggered them, and `gateway_model_utilization` reports each model's estimated demand
 in GPU-seconds per second.
 
+`gateway_worker_inflight_work` reports the per-worker load the router actually compares when it picks
+a replica, so a routing decision can be explained after the fact. It is exported by both work-routing
+mechanisms (`fill_least` under `lpt_packing`, and the `least_outstanding` mode) and carries a `basis`
+label, because the unit follows `work_basis`: GPU-seconds under `compute`, items under `items`, and a
+per-request cost under `requests`. Read it live at scrape time from the scheduler's counters, so it
+never lags a prober tick, and a worker that no longer hosts anything stops being emitted rather than
+freezing at its last value. `round_robin` exports nothing here, since it tracks no load.
+
+The bundled Grafana dashboards use it: **Scheduling & Placement** plots the per-worker load, the
+spread across workers (`max - min`, which is what `fill_least` exists to shrink), and the basis in
+force as the running gateway reports it, and **Fleet Overview** carries the per-worker load alongside
+readiness and device memory. A persistently high spread usually means a model's replicas cannot absorb
+the imbalance (too few replicas, or a single-replica model pinning one GPU) rather than a
+misbehaving policy, so read it next to the placement table.
+
 ## Runtime scheduling control
 
 The gateway answers its own gRPC service, `reactant_control.GatewayControlService`, on the same port

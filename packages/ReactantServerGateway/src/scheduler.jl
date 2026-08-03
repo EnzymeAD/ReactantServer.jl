@@ -77,6 +77,59 @@ scheduler_repack_seq(::GatewayScheduler) = 0
 # it (covers schedulers that reserve nothing, and the `nothing` reservation of any scheduler).
 release!(::GatewayScheduler, reservation) = nothing
 
+# --- per-worker in-flight work ------------------------------------------------------------------
+
+# The live per-worker work counters a work-routing scheduler compares, as `(basis, url => counter)`,
+# or `nothing` for a scheduler that tracks none (round_robin). This is the number that decides which
+# replica a request goes to, so exporting it is the difference between being able to explain a routing
+# decision and guessing at it.
+inflight_work(::GatewayScheduler) = nothing
+
+# Exported at SCRAPE time from the scheduler's live counters, the same pattern as `RoutedCollector`:
+# the series never lags a prober tick, and a worker that leaves the snapshot (a repack moved every
+# model off it) simply stops being emitted instead of freezing at its last value.
+struct WorkerWorkCollector{S<:GatewayScheduler} <: Prometheus.Collector
+    scheduler::S
+    worker_names::Dict{String,String}   # worker url -> friendly label, as GatewayMetrics maps them
+end
+
+Prometheus.metric_names(::WorkerWorkCollector) = ("gateway_worker_inflight_work",)
+
+# The unit is `basis`-dependent, so it rides along as a label rather than being buried in the help
+# text: a panel legend then states what it is reading, and a basis change is visible in the series
+# rather than silently rescaling the old one.
+const _WORK_GAUGE_HELP =
+    "In-flight work on a worker, as the scheduler that routes to it counts it (see the `basis` " *
+    "label and scheduling.work_basis): GPU-seconds under basis=compute, items under basis=items, " *
+    "and under basis=requests either cost-weighted requests (lpt_packing fill_least) or a plain " *
+    "request count (least_outstanding). This is the quantity fill_least and least_outstanding " *
+    "compare when choosing a replica."
+
+function Prometheus.collect!(out::Vector, c::WorkerWorkCollector)
+    got = inflight_work(c.scheduler)
+    got === nothing && return out
+    basis, counters = got
+    isempty(counters) && return out
+    ln = Prometheus.LabelNames((:worker, :basis))
+    b = String(basis)
+    samples = Prometheus.Sample[]
+    for (w, a) in counters
+        push!(samples, Prometheus.Sample(nothing, ln,
+                                        Prometheus.LabelValues((get(c.worker_names, w, w), b)),
+                                        Float64(a[])))
+    end
+    # Deterministic order across scrapes; Prometheus.jl sorts family children for the same reason.
+    sort!(samples; by = x -> x.label_values.label_values)
+    push!(out, Prometheus.Metric("gauge", "gateway_worker_inflight_work", _WORK_GAUGE_HELP, samples))
+    return out
+end
+
+# Register the gauge for a scheduler that has one. Called from each scheduler's `scheduler_start!`,
+# so round_robin (which tracks no work) registers nothing and exports no empty family.
+register_worker_work!(s::GatewayScheduler, m::GatewayMetrics) =
+    inflight_work(s) === nothing ? nothing :
+        Prometheus.register(m.registry, WorkerWorkCollector(s, m.worker_names))
+
 """
     make_scheduler(cfg::GatewayConfig, meta::RoutingMeta = RoutingMeta(cfg)) -> GatewayScheduler
 
@@ -195,3 +248,11 @@ end
 
 release!(::LeastOutstandingScheduler, res::Tuple{Threads.Atomic{Float64},Float64}) =
     (Threads.atomic_sub!(res[1], res[2]); nothing)
+
+inflight_work(s::LeastOutstandingScheduler) = (s.basis, @atomic s.inflight)
+
+# No preconditions to verify and nothing to place; the hook exists only to export the load gauge.
+function scheduler_start!(s::LeastOutstandingScheduler, ::ClientPool, metrics)
+    metrics === nothing || register_worker_work!(s, metrics)
+    return nothing
+end

@@ -593,6 +593,11 @@ end
 register_routed!(s::LptPackingState, m::GatewayMetrics) =
     Prometheus.register(m.registry, RoutedCollector(s, m.worker_names))
 
+# The per-worker load `fill_least` compares, in whatever unit `work_basis` selects (see
+# `_route_weight`). Exported through the shared scrape-time collector in scheduler.jl, so a fleet on
+# either work-routing mode reads the same series.
+inflight_work(s::LptPackingState) = (knobs(s).work_basis, @atomic s.worker_load)
+
 # After a repack, fan a CompactMemory out to the workers whose assignment changed, on the gateway's
 # compaction cadence. Counts every repack; once `compaction_interval` repacks have elapsed, the first
 # one that actually moved a model (non-empty `changed`) fires the fan-out and resets the counter, so
@@ -945,7 +950,10 @@ function scheduler_start!(s::LptPackingState, pool::ClientPool, metrics)
     k = knobs(s)
     @info "gateway scheduling: lpt_packing" rebalance_compute_seconds = k.rebalance_compute_seconds first_rebalance_compute_seconds = k.first_rebalance_compute_seconds ema_halflife_compute = k.ema_halflife_compute default_replicas = (k.default_replicas == REPLICAS_ALL ? "all" : k.default_replicas) routing_policy = k.routing_policy routing_fill_mode = k.routing_fill_mode forbid_memory_oversubscription = k.forbid_memory_oversubscription
     _warn_inflight_fill(k)
-    metrics === nothing || register_routed!(s, metrics)
+    if metrics !== nothing
+        register_routed!(s, metrics)
+        register_worker_work!(s, metrics)
+    end
     rebalance!(s, pool, copy(pool.order), metrics)
     return nothing
 end
