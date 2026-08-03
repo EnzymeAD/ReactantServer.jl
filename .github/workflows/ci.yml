@@ -77,14 +77,16 @@ jobs:
               - 'lib/gRPCServer.jl'
               - 'lib/gRPCServer.jl/**'
             # The PyTorch round-trip is heavy (it provisions torch/jax/tensorflow via conda), so it
-            # runs only when the PyTorch-specific surface changes: the extension, its conda pins, the
-            # test runner, or the workflow files themselves. It deliberately omits the `common`
-            # anchor so an unrelated Core/Manifest change does not pay the torch cost.
+            # runs only when the PyTorch-specific surface changes: the extension, its conda pins, its
+            # own test project, the test runner, or the workflow files themselves. It deliberately
+            # omits the `common` anchor so an unrelated Core/Manifest change does not pay the torch
+            # cost.
             export_pytorch:
               - '.github/workflows/ci.yml'
               - '.github/workflows/_test.yml'
               - 'packages/ReactantServerExport/ext/PyTorchExportExt.jl'
               - 'packages/ReactantServerExport/CondaPkg.toml'
+              - 'packages/ReactantServerExport/test/pytorch/**'
               - 'packages/ReactantServerExport/test/runtests.jl'
 
   core:
@@ -127,8 +129,11 @@ jobs:
       cache-name: node
       command: "julia --color=yes --project=packages/ReactantServerNode -e 'using Pkg; Pkg.test(; julia_args=[\"--threads=auto,1\"])'"
 
-  # Lux-only round-trip: REACTANTSERVER_SKIP_PYTORCH=true keeps runtests.jl from loading PythonCall,
-  # so no conda env is provisioned and the job stays fast. The standalone test/ project is not a
+  # Lux-only round-trip. Two things keep the conda environment out of this job, and both are needed:
+  # test/Project.toml omits PythonCall and CondaPkg, so `Pkg.instantiate` has no PythonCall-triggered
+  # extension to precompile (precompiling one loads PythonCall, which provisions ~7.4 GB of
+  # torch/jax/tensorflow before runtests.jl ever runs), and REACTANTSERVER_SKIP_PYTORCH=true then
+  # keeps runtests.jl from trying to load PythonCall at all. The standalone test/ project is not a
   # Pkg.test target, so it is instantiated explicitly before the runner script.
   export-lux:
     needs: changes
@@ -139,10 +144,12 @@ jobs:
       command: "julia --color=yes --project=packages/ReactantServerExport/test -e 'using Pkg; Pkg.instantiate()' && REACTANTSERVER_SKIP_PYTORCH=true julia --color=yes --project=packages/ReactantServerExport/test packages/ReactantServerExport/test/runtests.jl"
 
   # Full round-trip including the PyTorch export path. Standalone (not the reusable workflow) so it
-  # can run the torch path with the full conda provisioning. The CondaPkg Python environment
-  # (torch/jax/tensorflow) is deliberately NOT cached: it is multi-GB and would crowd out the Julia
-  # depot caches under the repo's 10 GB cache budget, and this job runs only on the narrow
-  # export_pytorch filter, so re-provisioning it occasionally is the cheaper trade.
+  # can run the torch path with the full conda provisioning, via test/pytorch/Project.toml (the same
+  # environment as the Lux arm plus PythonCall and CondaPkg). The CondaPkg Python environment
+  # (torch/jax/tensorflow) is deliberately NOT cached: CondaPkg's pixi package cache lives in the
+  # depot's scratchspaces and measures ~7.4 GB on its own, over GitHub's 10 GB per-repo and
+  # per-cache-entry ceiling, so caching it would evict every other cache in the repo. Reactant's
+  # precompile output is still cached; only the Python side is excluded.
   export-pytorch:
     needs: changes
     if: ${{ needs.changes.outputs.export_pytorch == 'true' }}
@@ -159,10 +166,12 @@ jobs:
         with:
           version: '1.12'
       - uses: julia-actions/cache@a45e8fa8be21c18a06b7177052533149e61e9b38 # v3.1.0
+        with:
+          cache-scratchspaces: false   # see the note above: this is where the pixi cache lives
       - name: Run PyTorch export round-trip
         run: |
-          julia --color=yes --project=packages/ReactantServerExport/test -e 'using Pkg; Pkg.instantiate()'
-          julia --color=yes --project=packages/ReactantServerExport/test packages/ReactantServerExport/test/runtests.jl
+          julia --color=yes --project=packages/ReactantServerExport/test/pytorch -e 'using Pkg; Pkg.instantiate()'
+          julia --color=yes --project=packages/ReactantServerExport/test/pytorch packages/ReactantServerExport/test/runtests.jl
 
   ci-ok:
     needs: [core, client, gateway, server, node, export-lux, export-pytorch]
