@@ -63,15 +63,15 @@ The gateway routes each model's requests across its replicas according to `sched
 ```yaml
 scheduling:
   mode: lpt_packing             # round_robin (default) | least_outstanding | lpt_packing
-  least_outstanding_basis: compute # compute (default) | items | requests  (least_outstanding only:
-                                #   what "least busy" measures; see below)
+  work_basis: compute           # compute (default) | items | requests  (what "least busy" measures,
+                                #   for least_outstanding and for fill_least; see below)
   rebalance_compute_seconds: 300 # fleet GPU-seconds consumed that triggers a repack
   first_rebalance_compute_seconds: 60 # smaller budget for the first repack (0 = use rebalance_compute_seconds)
   ema_halflife_compute_seconds: 0 # demand-EMA halflife in fleet compute-seconds (0 = track rebalance_compute_seconds)
   hysteresis: 0.0               # extra improvement required before a model moves workers (0 = move on any gain)
   default_replicas: 1           # GPUs per model unless overridden below (a number, or "all")
   routing_fill_factor: 1.0      # fill quantum as a multiple of max batch size (lpt_packing only)
-  routing_policy: fill_rr       # fill_rr (default) | fill_least  (lpt_packing only)
+  routing_policy: fill_least    # fill_least (default) | fill_rr  (lpt_packing only)
   routing_fill_mode: run        # run (default) | spread | inflight  (what the quantum counts;
                                 #   `inflight` can park a model on one GPU, see the warning below)
   forbid_memory_oversubscription: true # never strand a model on-demand when it could fit resident (default on)
@@ -98,23 +98,56 @@ concentrate traffic, so it favors even spreading over batch coalescing; prefer i
 when a model's replicas have uneven or unpredictable per-request latency, so a slow replica stops
 attracting new work instead of accumulating a backlog.
 
-`least_outstanding_basis` decides what "work" means:
+`scheduling.work_basis` decides what "work" means. It is fleet-wide: the same setting denominates
+`least_outstanding`'s per-replica counter and `lpt_packing`'s `fill_least` per-worker load, so there is
+one answer to "what does this fleet call busy".
 
 - **`compute`** (the default) counts in-flight GPU-seconds: each request charges its item count times
   the model's worker-measured cost per item. This is the only basis that is comparable across models,
   where 32 items of a cheap model are not 32 items of an expensive one.
 - **`items`** counts in-flight items, so a client that pre-batches is weighed by how much it sent.
-  Correct without any cost measurement when a fleet's models cost about the same per item.
-- **`requests`** counts in-flight requests. Blind to batch size: one request carrying 32 items weighs
-  the same as one carrying a single item, so a pre-batching client defeats the balancing entirely.
-  This was the only behavior before the basis existed.
+  Correct without any cost measurement when a fleet's models cost about the same per item. Weakest
+  under `fill_least`, which compares one worker's load across *all* models, so dropping the cost
+  weighting makes a cheap model's items look as expensive as a costly model's.
+- **`requests`** is the per-request denominator each mechanism used before this knob existed: a raw
+  count for `least_outstanding`, and the model's measured cost per *request* for `fill_least` (which
+  keeps its cross-model cost weighting). Blind to batch size either way, so a pre-batching client
+  defeats the balancing. Set this to pin the pre-knob behavior exactly.
 
 `compute` and `items` need to know where each model's batch axis is and what an item costs, which the
-gateway learns from a `ModelControlStatus` poll on each health-probe round (one extra RPC per worker
-per tick; `requests` polls nothing). Both degrade gracefully rather than misreporting: a model that
-declares no batch axis (a meta, an unbatched model) charges one unit per request, and a model whose
-cost the fleet has not measured yet borrows the fleet-mean cost per item, so a cold gateway behaves
-like `requests` and converges to true work as measurements arrive.
+gateway learns from a `ModelControlStatus` poll on each health-probe round. Under `least_outstanding`
+that is one extra RPC per worker per tick (`requests` polls nothing); `lpt_packing` already polls.
+
+Under `lpt_packing` the basis is also runtime-mutable, like every other knob in the block: change it
+with `tools/gateway_ctl.jl set-policy work_basis=items` and read it back from `GetSchedulingStatus`,
+so a fleet can be switched and rolled back without a restart. Under `least_outstanding` it is fixed at
+startup, and the startup log line states which basis is in force.
+
+### Models with no batch axis, and metas
+
+Both work bases degrade to one unit per request rather than misreporting, so no model ever routes on
+zeros:
+
+- **A model that declares no batch axis** (`wire_batch_spec` finds none: an unbatched bundle, a model
+  whose inputs are all fixed-shape) counts as one item per request. Its leading dimension names an
+  axis, not a count, so there is nothing to read; under `compute` it still charges its own measured
+  cost, which for such a model is a cost per request.
+- **A model the gateway has not polled yet** counts as one item until the first successful poll, and
+  under `compute` borrows the fleet-mean cost per item, so a cold model weighs like an average one
+  instead of looking free and attracting every request.
+- **A meta** (`kind: meta`) deliberately reports no batch axis and counts one row per request, even
+  when its own `client_inputs` declare a batch axis. The two halves go together: rows equal requests,
+  so a meta's cost per item equals its cost per request, and a work-routing gateway charges a meta its
+  whole measured cost. Reporting an axis without also counting rows would charge N times the
+  per-request cost; counting rows without reporting an axis would divide the cost by N and then charge
+  one of them.
+
+A meta is also the clearest argument for `compute` over `items`. Its work is data-dependent (a
+detection meta's ROI count varies per image, and its Julia glue is not GPU time at all), so no item
+count predicts it, while under `items` the most expensive thing on the fleet would charge one unit and
+a cheap batched model would charge 32. Note that a meta's `total_compute` counts its sub-call GPU time
+only, and its sub-models are folded into it and hidden from the gateway, so that time is counted once
+rather than double counted.
 
 **`lpt_packing`** places each model on a fixed number of distinct GPUs and routes its requests
 to preserve batch fill. A model's replica count is operator-controlled: `default_replicas`
@@ -228,12 +261,13 @@ larger one commits longer to each replica for deeper batches.
 
 `routing_policy` (lpt_packing only) decides *which* replica each run opens on:
 
-- **`fill_rr`** (default) rotates the opening replica across the model's set, so successive runs of
-  the same model spread evenly over its GPUs. Deliberately load-blind.
-- **`fill_least`** opens each run on the replica whose GPU currently carries the least in-flight
-  compute load, measured across *all* models as in-flight requests weighted by each model's
-  measured per-request compute cost. Prefer this when replicas share GPUs with other models, so a
+- **`fill_least`** (default) opens each run on the replica whose GPU currently carries the least
+  in-flight work, measured across *all* models and denominated by `work_basis` (in-flight
+  GPU-seconds by default). This is what you want whenever replicas share GPUs with other models: a
   model's runs open on whichever of its GPUs is least busy rather than always the same one.
+- **`fill_rr`** rotates the opening replica across the model's set, so successive runs of the same
+  model spread evenly over its GPUs. Deliberately load-blind, which is right only when every model on
+  the fleet costs about the same and no GPU is shared with anything else.
 
 Both policies are consulted at every run boundary, and exact ties rotate rather than falling back to
 the worker name, so an idle fleet warms every replica instead of pinning to the lowest-named one.

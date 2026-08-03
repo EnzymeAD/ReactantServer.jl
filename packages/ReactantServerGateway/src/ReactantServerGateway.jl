@@ -133,11 +133,12 @@ function serve_gateway(gateway_path::Union{AbstractString,Nothing} = nothing; bl
     meta = RoutingMeta(cfg)
     scheduler = make_scheduler(cfg, meta)
     scheduler_start!(scheduler, pool, metrics)
-    # The basis is logged only where it applies, so an operator can confirm from the startup line
-    # what "least busy" means on this fleet (it is fixed at startup, unlike the lpt_packing knobs).
-    cfg.scheduling_mode == "least_outstanding" ?
-        (@info "gateway scheduling" mode = cfg.scheduling_mode basis = cfg.least_outstanding_basis) :
-        (@info "gateway scheduling" mode = cfg.scheduling_mode)
+    # The work basis is logged where it applies, so an operator can confirm from the startup line what
+    # "least busy" means on this fleet. Under lpt_packing it is also runtime-mutable and reported by
+    # GetSchedulingStatus; under least_outstanding this line is the only place it is stated.
+    cfg.scheduling_mode == "round_robin" ?
+        (@info "gateway scheduling" mode = cfg.scheduling_mode) :
+        (@info "gateway scheduling" mode = cfg.scheduling_mode work_basis = cfg.work_basis)
     state = GatewayState(pool, routes, gate, metrics, refresher, scheduler)
 
     admin = start_admin(metrics, cfg.listen_metrics; worker_metrics = cfg.worker_metrics)

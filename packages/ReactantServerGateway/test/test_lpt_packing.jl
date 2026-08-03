@@ -101,7 +101,7 @@ end
     _mode(m) = _load("scheduling:\n  mode: $m\n" * eps).scheduling_mode
     @test _pol("fill_rr") == "fill_rr"
     @test _pol("fill_least") == "fill_least"
-    @test _load(eps).routing_policy == "fill_rr"                      # default
+    @test _load(eps).routing_policy == "fill_least"                   # default
     # least_outstanding is now a top-level scheduling mode, not a routing policy.
     @test _mode("least_outstanding") == "least_outstanding"
     @test_throws ReactantServerCore.ConfigError _pol("least_outstanding")
@@ -110,9 +110,9 @@ end
     @test_throws ReactantServerCore.ConfigError _pol("bogus")
     @test_throws ReactantServerCore.ConfigError _mode("bogus")
 
-    # What least_outstanding calls "busy". Defaults to compute: in-flight GPU-seconds.
-    _basis(b) = _load("scheduling:\n  least_outstanding_basis: $b\n" * eps).least_outstanding_basis
-    @test _load(eps).least_outstanding_basis == "compute"              # default
+    # What both least_outstanding and fill_least call "busy". Defaults to compute: in-flight GPU-seconds.
+    _basis(b) = _load("scheduling:\n  work_basis: $b\n" * eps).work_basis
+    @test _load(eps).work_basis == "compute"                           # default
     @test _basis("items") == "items"
     @test _basis("requests") == "requests"
     @test _basis("COMPUTE") == "compute"                               # case-insensitive, like the rest
@@ -303,14 +303,26 @@ end
 
 # Build a packing state directly for routing unit tests. Defaults to a single two-replica model
 # "m" on w0/w1; callers can install their own placement, per-model costs, and max batches.
+#
+# `costs` are per-REQUEST costs (what the `requests` work basis charges, published through
+# `cost_snapshot`); `item_costs` are per-ITEM costs (what `compute` charges, published through the
+# shared routing-metadata cache, which the prober would normally fill from a poll).
 function _pk_state(; routing_policy = "fill_rr", fill_factor = 1.0, max_batch = 8,
-                   fill_mode = "run", batch_at = nothing,
+                   fill_mode = "run", batch_at = nothing, work_basis = "compute",
                    assignment = Dict{String,GW.Placement}("m" => [("w0", 0.5), ("w1", 0.5)]),
-                   costs = nothing)
+                   costs = nothing, item_costs = nothing)
     cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], String[], 60, 1, 1, "info", "json",
-                           "lpt_packing", "compute", 30.0, 0.0, 0.8, 0.1, 30.0, 1, fill_factor, routing_policy, fill_mode,
+                           "lpt_packing", work_basis, 30.0, 0.0, 0.8, 0.1, 30.0, 1, fill_factor, routing_policy, fill_mode,
                            Dict{String,GW.GatewayModelConfig}(), 32, 64, :off, 0, false)
-    s = GW.LptPackingState(cfg)
+    meta = GW.RoutingMeta(30.0)
+    if item_costs !== nothing
+        bi, ax = batch_at === nothing ? ("", 0) : batch_at
+        models = Dict(m => GW.ModelRoutingMeta(max_batch, bi, ax, 0.0, Float64(c))
+                      for (m, c) in item_costs)
+        @atomic meta.snapshot = GW.RoutingMetaSnapshot(models,
+            sum(Float64(c) for c in values(item_costs)) / length(item_costs))
+    end
+    s = GW.LptPackingState(cfg, meta)
     @atomic s.assignment = assignment
     mb = Dict(m => max_batch for m in keys(assignment))
     @atomic s.max_batch = mb
@@ -364,21 +376,100 @@ end
     foreach(h -> GW._release_route!(h[2]), held)
 end
 
-@testset "route_replica: fill_least opens on the least compute-loaded GPU" begin
+@testset "route_replica: fill_least opens on the least loaded GPU (requests basis)" begin
+    # The pre-basis behavior, pinned by `work_basis: requests`: the load is the model's measured cost
+    # per REQUEST, whatever the request's size.
+    #
     # m is replicated on w0/w1; an expensive single-replica model "hot" lives on w0. Routing hot
     # loads w0 (single-replica load counts), so m's next batch opens on the idle w1 even though both
     # replicas hold zero of m's own requests.
-    s = _pk_state(; routing_policy = "fill_least",
+    s = _pk_state(; routing_policy = "fill_least", work_basis = "requests",
                   assignment = Dict{String,GW.Placement}("m" => [("w0", 0.5), ("w1", 0.5)],
                                                          "hot" => [("w0", 1.0)]),
                   costs = Dict("hot" => 10.0, "m" => 1.0))
     _, hc = GW.route_replica(s, "hot")
     @test (@atomic s.worker_load)["w0"][] == 10.0             # hot's measured cost weights the load
     @test GW.route_replica(s, "m")[1][1] == "w1"             # m avoids the busy w0
+    # Blind to batch size, which is the whole reason the other bases exist: a 32-item request of m
+    # charges exactly what a 1-item request charges.
+    _, big = GW.route_replica(s, "m", 32)
+    @test (@atomic s.worker_load)["w1"][] == 2.0             # 1.0 + 1.0, not 1.0 + 32.0
 
     # With both GPUs equally loaded the choice falls back to the deterministic URL tiebreak.
-    s2 = _pk_state(; routing_policy = "fill_least")
+    s2 = _pk_state(; routing_policy = "fill_least", work_basis = "requests")
     @test GW.route_replica(s2, "m")[1][1] == "w0"
+end
+
+@testset "route_replica: fill_least weighs items by cost per item (compute basis)" begin
+    # The default basis. Same fleet, same traffic, three bases, three different answers about which
+    # GPU is busier. "dear" costs 1.0 GPU-second per item and lives alone on w0; "m" is replicated on
+    # w0/w1 and costs 0.01 per item.
+    _fleet(basis) = _pk_state(; routing_policy = "fill_least", work_basis = basis, max_batch = 32,
+                              batch_at = ("IN", 1),
+                              assignment = Dict{String,GW.Placement}("m" => [("w0", 0.5), ("w1", 0.5)],
+                                                                     "dear" => [("w0", 1.0)]),
+                              item_costs = Dict("dear" => 1.0, "m" => 0.01),
+                              costs = Dict("dear" => 8.0, "m" => 0.32))
+
+    # compute: 8 items of dear is 8 GPU-seconds; 32 items of m is 0.32. dear's GPU is busier, which
+    # is the truth, so m's next run opens on the other one.
+    s = _fleet("compute")
+    GW.route_replica(s, "dear", 8)
+    m1 = GW.route_replica(s, "m", 32)
+    @test m1[1][1] == "w1"
+    load = @atomic s.worker_load
+    @test load["w0"][] ≈ 8.0                                 # items x cost per item, not one request
+    @test load["w1"][] ≈ 0.32
+
+    # items: the same traffic says the opposite, because 32 cheap items outweigh 8 expensive ones.
+    # This is the wart of the items basis for `fill_least`, which compares across models.
+    si = _fleet("items")
+    GW.route_replica(si, "dear", 8)
+    GW.route_replica(si, "m", 32)
+    iload = @atomic si.worker_load
+    @test iload["w0"][] == 8.0
+    @test iload["w1"][] == 32.0
+
+    # requests: both charge one measured per-request cost, blind to the sizes actually sent.
+    sr = _fleet("requests")
+    GW.route_replica(sr, "dear", 8)
+    GW.route_replica(sr, "m", 32)
+    rload = @atomic sr.worker_load
+    @test rload["w0"][] ≈ 8.0
+    @test rload["w1"][] ≈ 0.32
+
+    # Releasing subtracts the captured charge exactly, so a cost the prober refolds mid-flight cannot
+    # leave the load drifting.
+    GW._release_route!(m1[2])
+    @test (@atomic s.worker_load)["w1"][] == 0.0
+
+    # A model with no measured cost of its own borrows the fleet mean rather than looking free.
+    s2 = _pk_state(; routing_policy = "fill_least", batch_at = ("IN", 1),
+                   assignment = Dict{String,GW.Placement}("m" => [("w0", 0.5), ("w1", 0.5)],
+                                                          "cold" => [("w0", 1.0)]),
+                   item_costs = Dict("m" => 2.0))
+    GW.route_replica(s2, "cold", 3)
+    @test (@atomic s2.worker_load)["w0"][] ≈ 6.0             # 3 items x the 2.0 fleet mean
+end
+
+@testset "work_basis is runtime-mutable, so a fleet can be switched without a restart" begin
+    s = _pk_state(; routing_policy = "fill_least", batch_at = ("IN", 1),
+                  item_costs = Dict("m" => 0.5), costs = Dict("m" => 4.0))
+    @test GW.knobs(s).work_basis === :compute
+    GW.route_replica(s, "m", 6)
+    w0 = (@atomic s.worker_load)["w0"]
+    @test w0[] ≈ 3.0                                         # 6 items x 0.5 GPU-seconds
+
+    # Flip the live fleet. The run already open on w0 keeps receiving m (fill_least chooses only at a
+    # run boundary), so the change is visible in what the next request CHARGES.
+    GW.set_knobs!(s; work_basis = :requests)
+    @test GW.knobs(s).work_basis === :requests
+    GW.route_replica(s, "m", 6)
+    @test w0[] ≈ 7.0                                         # +4.0, the per-request cost, size-blind
+
+    # Validated exactly as gateway.yml validates it, and rejected without disturbing the live knobs.
+    @test_throws ReactantServerCore.ConfigError GW.set_knobs!(s; work_basis = :gpu_seconds)
+    @test GW.knobs(s).work_basis === :requests
 end
 
 @testset "route_replica: release frees the counter on every path" begin

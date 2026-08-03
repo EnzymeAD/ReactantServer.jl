@@ -29,7 +29,7 @@ import gRPCClient
 const GW = ReactantServerGateway
 
 const POLICY_KEYS = ["rebalance_compute_seconds", "first_rebalance_compute_seconds", "hysteresis",
-                     "ema_halflife_compute_seconds", "default_replicas", "routing_policy",
+                     "ema_halflife_compute_seconds", "default_replicas", "routing_policy", "work_basis",
                      "routing_fill_factor", "routing_fill_mode", "compaction_mode",
                      "compaction_interval", "forbid_memory_oversubscription"]
 
@@ -90,6 +90,7 @@ function print_status(resp)
         @printf("  ema_halflife_compute_seconds     %s\n", p.ema_halflife_compute_seconds)
         @printf("  default_replicas                 %s\n", fmt_replicas(p.default_replicas))
         @printf("  routing_policy                   %s\n", p.routing_policy)
+        @printf("  work_basis                       %s\n", p.work_basis)
         @printf("  routing_fill_mode                %s\n", p.routing_fill_mode)
         @printf("  routing_fill_factor              %s\n", p.routing_fill_factor)
         @printf("  compaction                       %s every %d repack(s)\n", p.compaction_mode, p.compaction_interval)
@@ -158,7 +159,7 @@ function partition_kv(p)
 end
 
 function coerce_policy_value(k, v)
-    k in ("routing_policy", "routing_fill_mode", "compaction_mode") && return v
+    k in ("routing_policy", "work_basis", "routing_fill_mode", "compaction_mode") && return v
     k == "forbid_memory_oversubscription" && return parse(Bool, v)
     k == "default_replicas" && return parse_replicas(v)
     k == "compaction_interval" && return Int64(parse(Int, v))

@@ -180,6 +180,11 @@ message SchedulingPolicy
   // 0 while every knob still matches gateway.yml; bumped by each accepted mutation, so an operator
   // inheriting a running gateway can tell a tuned one from a fresh one.
   uint64 generation = 12;
+  // What one unit of in-flight work is, for the fill_least policy's per-worker load:
+  // "compute" (GPU-seconds: a request's item count times the model's measured cost per item),
+  // "items", or "requests" (the model's measured cost per REQUEST, the behavior before this knob
+  // existed). Only fill_least reads it; fill_rr is load-blind.
+  string work_basis = 13;
 }
 
 message GetSchedulingStatusRequest {}

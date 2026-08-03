@@ -38,9 +38,11 @@
 #              by ONE replica indefinitely while the others get nothing. Retained only to reproduce
 #              pre-:run behavior; see the warning on `GatewayConfig.routing_fill_mode`.
 #
-# `routing_policy` decides which replica each run opens on: `fill_rr` rotates (load-blind and exactly
-# even) and `fill_least` opens on the least compute-loaded GPU, so a model's runs avoid GPUs busy with
-# other models. Coalescing itself stays at the worker; the gateway only routes and tracks small
+# `routing_policy` decides which replica each run opens on: `fill_least` (the default) opens on the
+# GPU carrying the least in-flight work, so a model's runs avoid GPUs busy with other models, while
+# `fill_rr` rotates (load-blind and exactly even). `work_basis` denominates that load: in-flight
+# GPU-seconds by default (items x the model's measured cost per item), or items, or the pre-basis
+# per-request cost. Coalescing itself stays at the worker; the gateway only routes and tracks small
 # per-replica and per-worker counters. (Spreading every request with no concentration at all is the
 # separate `least_outstanding` scheduling mode, not an lpt_packing setting; see scheduler.jl.)
 #
@@ -211,6 +213,10 @@ mutable struct LptPackingState <: GatewayScheduler
     # observe a half-applied policy change. Written only by `set_knobs!` under `control_lock`.
     @atomic knobs::PackingKnobs
     control_lock::ReentrantLock              # serializes the read-modify-write of `knobs`
+    # The gateway's shared per-model routing metadata (batch axis, cost per item, cost per request),
+    # refreshed by the prober from the same poll this scheduler ticks on. `fill_least` reads the cost
+    # per item from here under the :compute and :items bases. See routing_meta.jl.
+    meta::RoutingMeta
     # arrival counting: a copy-on-write snapshot dict of per-model atomic counters. Reads (the
     # request hot path) touch only the immutable snapshot; insertion of a new model swaps in a
     # copy under the lock.
@@ -282,8 +288,8 @@ mutable struct LptPackingState <: GatewayScheduler
     @atomic repack_completed::Int
 end
 
-LptPackingState(cfg::GatewayConfig) = LptPackingState(
-    PackingKnobs(cfg), ReentrantLock(),
+LptPackingState(cfg::GatewayConfig, meta::RoutingMeta = RoutingMeta(cfg)) = LptPackingState(
+    PackingKnobs(cfg), ReentrantLock(), meta,
     Dict{String,Threads.Atomic{Int}}(), ReentrantLock(),
     Dict{String,Float64}(), Dict{String,Float64}(), Dict{String,Tuple{Float64,UInt64}}(),
     0.0, 0.0, 0.0, false,
@@ -704,12 +710,25 @@ end
 # Reserved key in the cost snapshot for the fleet-mean cost (see _repack!). Never a real model name.
 const _COST_DEFAULT_KEY = ""
 
-# The compute weight charged for one in-flight request of `model`: its measured per-request cost, or
-# the fleet-mean as a cold-start stand-in, or 1.0 before any cost is known. The value is captured at
-# reservation and the identical value released, so an intervening repack (which changes the cost)
-# never leaves the per-worker load drifting.
-function _route_weight(s::LptPackingState, model::AbstractString)
-    snap = @atomic s.cost_snapshot
+# The work charged to a worker's load for one in-flight request of `model` carrying `units` items,
+# under `basis` (see `GatewayConfig.work_basis`):
+#
+#   :compute   items x the model's measured cost per ITEM, i.e. GPU-seconds. Comparable across models
+#              and honest about batch size, which is what `fill_least` compares.
+#   :items     items, cost-blind.
+#   :requests  the model's measured cost per REQUEST, whatever the request's size. This is what
+#              `fill_least` charged before the basis existed, kept as the exact pre-knob behavior.
+#
+# Do NOT "fix" :requests by multiplying it by `units`: the per-request cost is measured from the
+# traffic the clients actually sent, so for a client that always sends 32 items it already IS the cost
+# of a 32-item request, and scaling it would overstate a normal request 32-fold.
+#
+# The value is captured at reservation and the identical value released, so a cost that changes in
+# between (every repack refolds the EWMA) never leaves the per-worker load drifting.
+function _route_weight(s::LptPackingState, model::AbstractString, units::Int, basis::Symbol)
+    basis === :items && return Float64(units)
+    basis === :compute && return units * item_cost(routing_meta(s.meta), model)
+    snap = @atomic s.cost_snapshot                       # :requests, the pre-basis behavior
     c = get(snap, model, 0.0)
     c > 0 && return c
     return get(snap, _COST_DEFAULT_KEY, 1.0)
@@ -754,16 +773,17 @@ The model's `fill_mode` (see [`FillPlan`](@ref)) decides what the quantum `Q` co
     and `Q` and never drains is served by one replica indefinitely; see the warning on
     `GatewayConfig.routing_fill_mode`.
 
-`routing_policy` applies at every run boundary, not only when replicas tie: `fill_rr` rotates
-(load-blind and exactly even), `fill_least` opens on the replica whose worker carries the least
-in-flight compute load across all models. Exact ties rotate rather than falling through to the URL,
-so an idle fleet warms every replica instead of pinning to the lowest-named one.
+`routing_policy` applies at every run boundary, not only when replicas tie: `fill_least` (the default)
+opens on the replica whose worker carries the least in-flight work across all models, denominated by
+`work_basis` (GPU-seconds by default; see [`_route_weight`](@ref)), while `fill_rr` rotates
+(load-blind and exactly even). Exact ties rotate rather than falling through to the URL, so an idle fleet
+warms every replica instead of pinning to the lowest-named one.
 
 The returned order is the chosen replica first, then the remaining replicas least-backed-up first, so
 a failover after `NotFound`/`Unavailable` lands on the emptiest alternative.
 
-Every routed request, single- or multi-replica, bumps the per-worker compute-load counter, so
-`fill_least` sees load from all models. The reservation (atomic increments under the per-model
+Every routed request, single- or multi-replica, bumps the per-worker work counter, so `fill_least`
+sees load from all models. The reservation (atomic increments under the per-model
 selection lock for multi-replica models) makes concurrent selections see the choice, so requests do
 not stampede onto the same replica.
 """
@@ -776,11 +796,14 @@ function route_replica(s::LptPackingState, model::AbstractString, units::Integer
     out_snap = @atomic s.outstanding
     routed_snap = @atomic s.routed
     wload_snap = @atomic s.worker_load
-    weight = _route_weight(s, model)
+    # One knob snapshot for the whole decision, so the work basis and the policy that consumes it
+    # cannot come from different generations.
+    k = knobs(s)
     # One resolved plan per request: the mode and the quantum must come from the same generation.
     # `units` is how many items this request carries, already resolved by `request_units`.
     plan = get(@atomic(s.fill_plan), model, _DEFAULT_FILL_PLAN)
     units = max(Int(units), 1)
+    weight = _route_weight(s, model, units, k.work_basis)
 
     if n == 1
         w = placement[1][1]
@@ -790,7 +813,7 @@ function route_replica(s::LptPackingState, model::AbstractString, units::Integer
     workers = String[p[1] for p in placement]
     lk = get(@atomic(s.sel_locks), model, nothing)
     lk === nothing && return (workers, nothing)   # mid-repack drift: route in order, untracked
-    policy = knobs(s).routing_policy
+    policy = k.routing_policy
     Q = plan.quantum
     all_runs = @atomic s.fill_runs
 

@@ -51,6 +51,10 @@ struct PackingKnobs
     model_overrides::Dict{String,ModelKnobs}
     routing_fill_factor::Float64
     routing_policy::Symbol                     # :fill_rr | :fill_least
+    # What one unit of in-flight work is, for `fill_least`'s per-worker load (and the same knob the
+    # `least_outstanding` mode reads at startup): :compute GPU-seconds, :items, or :requests, the
+    # per-request cost this policy used before the basis existed. See `GatewayConfig.work_basis`.
+    work_basis::Symbol                         # :compute | :items | :requests
     routing_fill_mode::Symbol                  # :run | :spread | :inflight
     forbid_memory_oversubscription::Bool
     compaction_mode::Symbol                    # :off | :eager | :scheduled
@@ -69,6 +73,7 @@ function PackingKnobs(cfg::GatewayConfig)
         Dict{String,ModelKnobs}(name => ModelKnobs(mc) for (name, mc) in cfg.models),
         cfg.routing_fill_factor,
         Symbol(cfg.routing_policy),
+        Symbol(cfg.work_basis),
         Symbol(cfg.routing_fill_mode),
         cfg.forbid_memory_oversubscription,
         cfg.compaction_mode,
@@ -146,6 +151,7 @@ function _validate_knob(field::Symbol, v)
     field === :default_replicas && return _parse_replicas(v, "scheduling.default_replicas")
     field === :routing_fill_factor && return _ck_positive("scheduling.routing_fill_factor", v)
     field === :routing_policy && return _parse_routing_policy(v)
+    field === :work_basis && return _parse_work_basis(v)
     field === :routing_fill_mode && return _parse_fill_mode(v)
     field === :compaction_mode && return _parse_gateway_compaction_mode(v)
     field === :compaction_interval &&

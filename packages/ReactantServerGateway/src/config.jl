@@ -42,19 +42,27 @@ struct GatewayConfig
     # LPT packing requires worker FIFO discipline and all models on all workers (checked at startup).
     # The remaining knobs apply to lpt_packing only.
     scheduling_mode::String                 # "round_robin" | "least_outstanding" | "lpt_packing"
-    # What `least_outstanding` measures when it asks which replica is least busy (that mode only).
-    #   "compute"  (default) in-flight GPU-seconds: a request charges its item count times the
-    #              model's worker-measured cost per item. The only basis that is comparable across
-    #              models of different cost, and the only one that is right when clients pre-batch.
-    #   "items"    in-flight items. No cost measurement needed; correct for a fleet of like-cost
-    #              models.
-    #   "requests" in-flight requests. Blind to batch size: one request of 32 items weighs the same
-    #              as one of a single item, so a pre-batching client defeats the balancing.
-    # `compute` and `items` need the model's batch axis and cost, which the gateway learns from a
-    # ModelControlStatus poll on each prober round (one extra RPC per worker per tick); `requests`
-    # needs no poll. All three degrade to counting requests for a model with no batch axis (a meta,
-    # an unbatched model) or before the first successful poll, so no basis ever routes on zeros.
-    least_outstanding_basis::String         # "compute" | "items" | "requests"
+    # How much in-flight work a request counts as, wherever the gateway asks which replica or worker
+    # is least busy. Two mechanisms consult it: the `least_outstanding` mode's per-worker counter, and
+    # `lpt_packing`'s `fill_least` policy (the per-worker load that decides where a fresh run opens).
+    #   "compute"  (default) GPU-seconds: a request charges its item count times the model's
+    #              worker-measured cost per item. The only basis comparable across models of
+    #              different cost, and the only one that is right when clients pre-batch.
+    #   "items"    items. No cost measurement needed; correct for a fleet of like-cost models. Note
+    #              that `fill_least` compares one worker's load across ALL models, where dropping the
+    #              cost weighting makes a cheap model's items look as expensive as a costly model's.
+    #   "requests" the per-request denominator each mechanism used before this knob existed: a raw
+    #              count for `least_outstanding`, and the model's measured cost per REQUEST for
+    #              `fill_least` (which keeps its cross-model cost weighting). Blind to batch size
+    #              either way, so a pre-batching client defeats the balancing. Set this to pin the
+    #              pre-knob behavior exactly.
+    # `compute` and `items` need each model's batch axis and cost, which the gateway learns from a
+    # ModelControlStatus poll on each prober round; under `least_outstanding` that is one extra RPC
+    # per worker per tick, while `lpt_packing` already polls. Both degrade to counting requests for a
+    # model with no batch axis (a meta, an unbatched model) or before the first successful poll, and
+    # `compute` falls back to the fleet-mean cost per item for an unmeasured model, so no basis ever
+    # routes on zeros.
+    work_basis::String                      # "compute" | "items" | "requests"
     # Repack cadence is driven by accumulated fleet compute, not wall-clock: a repack fires once the
     # fleet has consumed `rebalance_compute_seconds` GPU-seconds since the last one. The first
     # tick-driven repack can use a separate, typically smaller, budget so an early rebalance corrects
@@ -82,10 +90,12 @@ struct GatewayConfig
     # before moving on; >1 over-provisions to keep the next batch queued). `routing_policy` selects
     # where a new batch starts (both variants still concentrate to fill one replica's batch before the
     # next; they differ only in which replica a fresh batch opens on):
-    #   "fill_rr"     round-robins the starting replica across the model's set (default).
-    #   "fill_least"  starts on the replica with the least in-flight compute load (in-flight
-    #                 requests weighted by the model's measured per-request cost), so a model's
-    #                 batches open on whichever GPU is least busy across all models.
+    #   "fill_least"  (default) starts on the replica whose worker carries the least in-flight work,
+    #                 so a model's batches open on whichever GPU is least busy across all models.
+    #                 What "work" means is `work_basis` above (GPU-seconds by default).
+    #   "fill_rr"     round-robins the starting replica across the model's set: load-blind and
+    #                 exactly even, which is what you want only when every model on the fleet costs
+    #                 about the same and no worker is shared with anything else.
     # Spreading every request without concentration is the separate `least_outstanding` scheduling
     # mode (see scheduling_mode above), not a routing policy.
     routing_fill_factor::Float64
@@ -142,7 +152,7 @@ const GW_ENV_PATHS = Tuple{String,Vector{String},DataType}[
     ("LISTEN_GRPC", ["listen", "grpc"], String),
     ("LISTEN_METRICS", ["listen", "metrics"], String),
     ("SCHEDULING_MODE", ["scheduling", "mode"], String),
-    ("SCHEDULING_LEAST_OUTSTANDING_BASIS", ["scheduling", "least_outstanding_basis"], String),
+    ("SCHEDULING_WORK_BASIS", ["scheduling", "work_basis"], String),
     ("SCHEDULING_REBALANCE_COMPUTE_SECONDS", ["scheduling", "rebalance_compute_seconds"], Float64),
     ("SCHEDULING_FIRST_REBALANCE_COMPUTE_SECONDS", ["scheduling", "first_rebalance_compute_seconds"], Float64),
     ("SCHEDULING_MAX_WORKER_SHARE", ["scheduling", "max_worker_share"], Float64),
@@ -269,9 +279,8 @@ function _build_gateway_config(raw::Dict{String,Any})
     scheduling_mode = lowercase(strip(_opt(sched, "mode", String, "round_robin")))
     scheduling_mode in ("round_robin", "least_outstanding", "lpt_packing") ||
         throw(ConfigError("scheduling.mode must be 'round_robin', 'least_outstanding', or 'lpt_packing', got '$scheduling_mode'"))
-    least_outstanding_basis = String(_parse_least_outstanding_basis(
-        _opt(sched, "least_outstanding_basis", String, "compute")))
-    routing_policy = String(_parse_routing_policy(_opt(sched, "routing_policy", String, "fill_rr")))
+    work_basis = String(_parse_work_basis(_opt(sched, "work_basis", String, "compute")))
+    routing_policy = String(_parse_routing_policy(_opt(sched, "routing_policy", String, "fill_least")))
     routing_fill_mode = String(_parse_fill_mode(_opt(sched, "routing_fill_mode", String, "run")))
     compaction_mode = _parse_gateway_compaction_mode(_opt(sched, "compaction_mode", String, "eager"))
 
@@ -287,7 +296,7 @@ function _build_gateway_config(raw::Dict{String,Any})
         _opt(logging, "level", String, "info"),
         _opt(logging, "format", String, "json"),
         scheduling_mode,
-        least_outstanding_basis,
+        work_basis,
         _opt(sched, "rebalance_compute_seconds", Float64, 300.0),
         _opt(sched, "first_rebalance_compute_seconds", Float64, 60.0),
         _opt(sched, "max_worker_share", Float64, 0.8),
@@ -387,12 +396,13 @@ function _parse_routing_policy(s)
     return Symbol(ls)
 end
 
-# What `least_outstanding` counts as "busy". Returns a Symbol; `GatewayConfig` keeps the string form,
-# so the hot path compares interned symbols while the config surface stays YAML-shaped.
-function _parse_least_outstanding_basis(s)
+# What counts as one unit of in-flight work, for every mechanism that routes to the least busy target.
+# Returns a Symbol; `GatewayConfig` keeps the string form, so the hot path compares interned symbols
+# while the config surface stays YAML-shaped.
+function _parse_work_basis(s)
     ls = lowercase(strip(String(s)))
     ls in ("compute", "items", "requests") ||
-        throw(ConfigError("scheduling.least_outstanding_basis must be 'compute', 'items', or 'requests', got '$s'"))
+        throw(ConfigError("scheduling.work_basis must be 'compute', 'items', or 'requests', got '$s'"))
     return Symbol(ls)
 end
 

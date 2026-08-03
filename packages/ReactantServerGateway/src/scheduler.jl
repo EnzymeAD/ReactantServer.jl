@@ -6,7 +6,7 @@
 # The mode is chosen by `scheduling.mode` in gateway.yml and built by `make_scheduler`:
 #   - round_robin       spread each model's requests uniformly across its replicas (RoundRobinScheduler)
 #   - least_outstanding send each request to the replica with the least in-flight work, measured in
-#                       GPU-seconds, items, or requests per `scheduling.least_outstanding_basis`
+#                       GPU-seconds, items, or requests per `scheduling.work_basis`
 #                       (LeastOutstandingScheduler)
 #   - lpt_packing       concentrate each model on few GPUs to feed batch coalescing (LptPackingState, see lpt_packing.jl)
 #
@@ -85,9 +85,9 @@ routing-metadata cache (see routing_meta.jl), which a scheduler that routes by w
 request path; it defaults to a fresh cache so a test can build a scheduler standalone.
 """
 function make_scheduler(cfg::GatewayConfig, meta::RoutingMeta = RoutingMeta(cfg))
-    cfg.scheduling_mode == "lpt_packing" && return LptPackingState(cfg)
+    cfg.scheduling_mode == "lpt_packing" && return LptPackingState(cfg, meta)
     cfg.scheduling_mode == "least_outstanding" &&
-        return LeastOutstandingScheduler(meta; basis = Symbol(cfg.least_outstanding_basis))
+        return LeastOutstandingScheduler(meta; basis = Symbol(cfg.work_basis))
     return RoundRobinScheduler()
 end
 
@@ -111,7 +111,8 @@ end
 # counter, grown copy-on-write under the lock so the hot path reads an immutable snapshot lock free
 # (the same pattern as LptPackingState.arrivals).
 #
-# `basis` decides what "least" measures, per `scheduling.least_outstanding_basis`:
+# `basis` decides what "least" measures, per `scheduling.work_basis` (the same knob `lpt_packing`'s
+# `fill_least` policy reads, so one setting describes what the whole fleet calls busy):
 #
 #   :compute   (default) in-flight GPU-seconds: each request charges its item count times the model's
 #              measured cost per item. The only basis that is honest across heterogeneous models,
@@ -126,7 +127,7 @@ end
 # for a model that declares no batch axis (a meta, an unbatched model) or that the gateway has not
 # polled yet. So a cold fleet behaves exactly like `:requests` and converges to true work as
 # measurements arrive, rather than routing on zeros.
-const LEAST_OUTSTANDING_BASES = (:compute, :items, :requests)
+const WORK_BASES = (:compute, :items, :requests)
 
 mutable struct LeastOutstandingScheduler <: GatewayScheduler
     basis::Symbol
@@ -136,8 +137,8 @@ mutable struct LeastOutstandingScheduler <: GatewayScheduler
 end
 
 function LeastOutstandingScheduler(meta::RoutingMeta = RoutingMeta(); basis::Symbol = :compute)
-    basis in LEAST_OUTSTANDING_BASES ||
-        throw(ArgumentError("least_outstanding basis must be one of $(LEAST_OUTSTANDING_BASES), got :$basis"))
+    basis in WORK_BASES ||
+        throw(ArgumentError("work basis must be one of $(WORK_BASES), got :$basis"))
     return LeastOutstandingScheduler(basis, meta, Dict{String,Threads.Atomic{Float64}}(), ReentrantLock())
 end
 

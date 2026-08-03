@@ -215,7 +215,7 @@ logging:
   format: "json"
 scheduling:
   mode: round_robin               # round_robin | least_outstanding | lpt_packing
-  least_outstanding_basis: compute # least_outstanding only: compute | items | requests
+  work_basis: compute             # what "least busy" measures: compute | items | requests
   # lpt_packing only; see Multi-GPU Gateway for the full set and for the runtime control plane.
   default_replicas: 1             # GPUs per model (a number, or "all")
   routing_fill_mode: run          # run (default) | spread | inflight

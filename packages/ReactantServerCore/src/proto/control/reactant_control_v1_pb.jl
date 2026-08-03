@@ -450,10 +450,11 @@ struct SchedulingPolicy
     compaction_interval::Int64
     forbid_memory_oversubscription::Bool
     generation::UInt64
+    work_basis::String
 end
-SchedulingPolicy(;rebalance_compute_seconds = zero(Float64), first_rebalance_compute_seconds = zero(Float64), hysteresis = zero(Float64), ema_halflife_compute_seconds = zero(Float64), default_replicas = zero(Int64), routing_policy = "", routing_fill_factor = zero(Float64), routing_fill_mode = "", compaction_mode = "", compaction_interval = zero(Int64), forbid_memory_oversubscription = false, generation = zero(UInt64)) = SchedulingPolicy(rebalance_compute_seconds, first_rebalance_compute_seconds, hysteresis, ema_halflife_compute_seconds, default_replicas, routing_policy, routing_fill_factor, routing_fill_mode, compaction_mode, compaction_interval, forbid_memory_oversubscription, generation)
-PB.default_values(::Type{SchedulingPolicy}) = (;rebalance_compute_seconds = zero(Float64), first_rebalance_compute_seconds = zero(Float64), hysteresis = zero(Float64), ema_halflife_compute_seconds = zero(Float64), default_replicas = zero(Int64), routing_policy = "", routing_fill_factor = zero(Float64), routing_fill_mode = "", compaction_mode = "", compaction_interval = zero(Int64), forbid_memory_oversubscription = false, generation = zero(UInt64))
-PB.field_numbers(::Type{SchedulingPolicy}) = (;rebalance_compute_seconds = 1, first_rebalance_compute_seconds = 2, hysteresis = 3, ema_halflife_compute_seconds = 4, default_replicas = 5, routing_policy = 6, routing_fill_factor = 7, routing_fill_mode = 8, compaction_mode = 9, compaction_interval = 10, forbid_memory_oversubscription = 11, generation = 12)
+SchedulingPolicy(;rebalance_compute_seconds = zero(Float64), first_rebalance_compute_seconds = zero(Float64), hysteresis = zero(Float64), ema_halflife_compute_seconds = zero(Float64), default_replicas = zero(Int64), routing_policy = "", routing_fill_factor = zero(Float64), routing_fill_mode = "", compaction_mode = "", compaction_interval = zero(Int64), forbid_memory_oversubscription = false, generation = zero(UInt64), work_basis = "") = SchedulingPolicy(rebalance_compute_seconds, first_rebalance_compute_seconds, hysteresis, ema_halflife_compute_seconds, default_replicas, routing_policy, routing_fill_factor, routing_fill_mode, compaction_mode, compaction_interval, forbid_memory_oversubscription, generation, work_basis)
+PB.default_values(::Type{SchedulingPolicy}) = (;rebalance_compute_seconds = zero(Float64), first_rebalance_compute_seconds = zero(Float64), hysteresis = zero(Float64), ema_halflife_compute_seconds = zero(Float64), default_replicas = zero(Int64), routing_policy = "", routing_fill_factor = zero(Float64), routing_fill_mode = "", compaction_mode = "", compaction_interval = zero(Int64), forbid_memory_oversubscription = false, generation = zero(UInt64), work_basis = "")
+PB.field_numbers(::Type{SchedulingPolicy}) = (;rebalance_compute_seconds = 1, first_rebalance_compute_seconds = 2, hysteresis = 3, ema_halflife_compute_seconds = 4, default_replicas = 5, routing_policy = 6, routing_fill_factor = 7, routing_fill_mode = 8, compaction_mode = 9, compaction_interval = 10, forbid_memory_oversubscription = 11, generation = 12, work_basis = 13)
 
 function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SchedulingPolicy}, _endpos::Int=0, _group::Bool=false)
     rebalance_compute_seconds = zero(Float64)
@@ -468,6 +469,7 @@ function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SchedulingPolicy}, _endp
     compaction_interval = zero(Int64)
     forbid_memory_oversubscription = false
     generation = zero(UInt64)
+    work_basis = ""
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         if field_number == 1
@@ -494,11 +496,13 @@ function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SchedulingPolicy}, _endp
             forbid_memory_oversubscription = PB.decode(d, Bool)
         elseif field_number == 12
             generation = PB.decode(d, UInt64)
+        elseif field_number == 13
+            work_basis = PB.decode(d, String)
         else
             Base.skip(d, wire_type)
         end
     end
-    return SchedulingPolicy(rebalance_compute_seconds, first_rebalance_compute_seconds, hysteresis, ema_halflife_compute_seconds, default_replicas, routing_policy, routing_fill_factor, routing_fill_mode, compaction_mode, compaction_interval, forbid_memory_oversubscription, generation)
+    return SchedulingPolicy(rebalance_compute_seconds, first_rebalance_compute_seconds, hysteresis, ema_halflife_compute_seconds, default_replicas, routing_policy, routing_fill_factor, routing_fill_mode, compaction_mode, compaction_interval, forbid_memory_oversubscription, generation, work_basis)
 end
 
 function PB.encode(e::PB.AbstractProtoEncoder, x::SchedulingPolicy)
@@ -515,6 +519,7 @@ function PB.encode(e::PB.AbstractProtoEncoder, x::SchedulingPolicy)
     x.compaction_interval != zero(Int64) && PB.encode(e, 10, x.compaction_interval)
     x.forbid_memory_oversubscription != false && PB.encode(e, 11, x.forbid_memory_oversubscription)
     x.generation != zero(UInt64) && PB.encode(e, 12, x.generation)
+    !isempty(x.work_basis) && PB.encode(e, 13, x.work_basis)
     return position(e.io) - initpos
 end
 function PB._encoded_size(x::SchedulingPolicy)
@@ -531,6 +536,7 @@ function PB._encoded_size(x::SchedulingPolicy)
     x.compaction_interval != zero(Int64) && (encoded_size += PB._encoded_size(x.compaction_interval, 10))
     x.forbid_memory_oversubscription != false && (encoded_size += PB._encoded_size(x.forbid_memory_oversubscription, 11))
     x.generation != zero(UInt64) && (encoded_size += PB._encoded_size(x.generation, 12))
+    !isempty(x.work_basis) && (encoded_size += PB._encoded_size(x.work_basis, 13))
     return encoded_size
 end
 

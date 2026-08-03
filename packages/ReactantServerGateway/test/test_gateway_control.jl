@@ -131,11 +131,31 @@ end
             @test resp.applied.hysteresis == 0.25
             @test resp.applied.routing_policy == "fill_least"
             @test resp.applied.compaction_interval == 4
+            @test resp.applied.work_basis == "compute"         # reported even when not in the mask
             @test resp.applied.generation == before.generation + 1
             @test !resp.persisted                                # in-memory only, by contract
             k = GW.knobs(aff)
             @test k.hysteresis == 0.25 && k.routing_policy == :fill_least
             @test k.rebalance_compute_seconds == before.rebalance_compute_seconds   # untouched
+
+            # The work basis travels the same path, so an operator can change what "least busy" means
+            # on a running fleet (the whole point of it being a knob rather than a startup setting).
+            resp2 = _ctl_call(ACtl.SetSchedulingPolicyRequest, ACtl.SetSchedulingPolicyResponse,
+                "SetSchedulingPolicy", gw_port,
+                ACtl.SetSchedulingPolicyRequest(; update_mask = ["work_basis"],
+                    policy = ACtl.SchedulingPolicy(; work_basis = "items")))
+            @test resp2.applied.work_basis == "items"
+            @test GW.knobs(aff).work_basis === :items
+            @test _ctl_status(() -> _ctl_call(ACtl.SetSchedulingPolicyRequest,
+                ACtl.SetSchedulingPolicyResponse, "SetSchedulingPolicy", gw_port,
+                ACtl.SetSchedulingPolicyRequest(; update_mask = ["work_basis"],
+                    policy = ACtl.SchedulingPolicy(; work_basis = "gpu_seconds")))) ==
+                gRPCClient.GRPC_INVALID_ARGUMENT
+            @test GW.knobs(aff).work_basis === :items           # rejected, live knobs untouched
+            _ctl_call(ACtl.SetSchedulingPolicyRequest, ACtl.SetSchedulingPolicyResponse,
+                "SetSchedulingPolicy", gw_port,
+                ACtl.SetSchedulingPolicyRequest(; update_mask = ["work_basis"],
+                    policy = ACtl.SchedulingPolicy(; work_basis = "compute")))   # restore the default
 
             # A rejected value leaves every knob alone, including the valid ones in the same request.
             held = GW.knobs(aff)
