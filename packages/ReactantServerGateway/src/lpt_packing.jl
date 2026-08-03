@@ -364,6 +364,7 @@ function _poll_workers(pool::ClientPool, ready_urls::Vector{String})
     mem = Dict{String,Float64}()                 # model -> resident weight bytes
     mem_cap = Dict{String,Float64}()             # worker -> on-demand weight budget (0 = unconstrained)
     max_batch = Dict{String,Int}()               # model -> effective max batch (max across workers)
+    batch_at = Dict{String,Tuple{String,Int}}()  # model -> (wire input name, 1-based batch axis)
     polled = String[]
     lk = ReentrantLock()
     @sync for url in ready_urls
@@ -388,6 +389,10 @@ function _poll_workers(pool::ClientPool, ready_urls::Vector{String})
                     sums[ms.name] = (tc + ms.total_compute_seconds, rq + ms.requests_served)
                     mem[ms.name] = max(get(mem, ms.name, 0.0), Float64(ms.weight_nbytes))
                     max_batch[ms.name] = max(get(max_batch, ms.name, 0), Int(ms.max_batch_size))
+                    # Every worker serves the same bundle, so the first non-empty report wins; a
+                    # worker mid-reload can legitimately report nothing yet.
+                    isempty(ms.batch_input_name) || haskey(batch_at, ms.name) ||
+                        (batch_at[ms.name] = (ms.batch_input_name, Int(ms.batch_axis)))
                     push!(get!(permodel_workers, ms.name, String[]), url)
                 end
             end
@@ -397,7 +402,7 @@ function _poll_workers(pool::ClientPool, ready_urls::Vector{String})
     for (tc, _) in values(sums)
         fleet_compute += tc
     end
-    return (; sums, permodel_workers, mem, mem_cap, max_batch, polled, fleet_compute)
+    return (; sums, permodel_workers, mem, mem_cap, max_batch, batch_at, polled, fleet_compute)
 end
 
 # Rebuild the outstanding/worker-total counters and per-model selection locks to cover the new
@@ -475,7 +480,7 @@ function _repack!(s::LptPackingState, poll, metrics::Union{GatewayMetrics,Nothin
     end
 
     @atomic s.max_batch = poll.max_batch
-    _publish_fill_plan!(s, k, poll.max_batch)
+    _publish_fill_plan!(s, k, poll.max_batch, poll.batch_at)
     # Publish a fresh per-model cost snapshot for the request hot path (fill_least). A copy, so the
     # next repack's in-place EWMA fold above cannot race a concurrent reader of the snapshot. The
     # reserved `_COST_DEFAULT_KEY` entry carries the fleet-mean measured cost, used as the cold-start
@@ -698,7 +703,7 @@ function tick_packing!(s::LptPackingState, pool::ClientPool, ready_urls::Vector{
     k = knobs(s)
     poll = _poll_workers(pool, ready_urls)
     @atomic s.max_batch = poll.max_batch         # keep routing metadata fresh between repacks
-    _publish_fill_plan!(s, k, poll.max_batch)    # ...and re-resolve the fill rules against it
+    _publish_fill_plan!(s, k, poll.max_batch, poll.batch_at)   # ...and re-resolve the fill rules
     _refresh_live_gauges!(s, metrics)            # in-flight and quantum, refreshed between repacks
     if s.last_fleet_compute == 0.0
         s.last_fleet_compute = poll.fleet_compute   # first observation: baseline only
@@ -734,10 +739,12 @@ end
 # worker-reported max batches. Called wherever `max_batch` is refreshed, so both a knob change and a
 # newly reported batch shape reach the request path on the next tick, and the request path never has
 # to walk the per-model override chain. Prober task only; the swap is atomic.
-function _publish_fill_plan!(s::LptPackingState, k::PackingKnobs, max_batch::Dict{String,Int})
+function _publish_fill_plan!(s::LptPackingState, k::PackingKnobs, max_batch::Dict{String,Int},
+                             batch_at::Dict{String,Tuple{String,Int}} = Dict{String,Tuple{String,Int}}())
     plan = Dict{String,FillPlan}()
     for (m, mb) in max_batch
-        plan[m] = resolve_fill_plan(k, m, mb)
+        bi, ax = get(batch_at, m, ("", 0))
+        plan[m] = resolve_fill_plan(k, m, mb, bi, ax)
     end
     # A model with an override but no reported max batch still gets a plan, so its configured mode
     # applies from its first request rather than only after a successful poll.
@@ -814,7 +821,7 @@ Every routed request, single- or multi-replica, bumps the per-worker compute-loa
 selection lock for multi-replica models) makes concurrent selections see the choice, so requests do
 not stampede onto the same replica.
 """
-function route_replica(s::LptPackingState, model::AbstractString, batch::Integer=0)
+function route_replica(s::LptPackingState, model::AbstractString, units::Integer=1)
     placement = get(@atomic(s.assignment), model, nothing)
     placement === nothing && return nothing
     n = length(placement)
@@ -824,10 +831,10 @@ function route_replica(s::LptPackingState, model::AbstractString, batch::Integer
     routed_snap = @atomic s.routed
     wload_snap = @atomic s.worker_load
     weight = _route_weight(s, model)
-    # One resolved plan per request: the mode, the quantum, and the unit count must all come from the
-    # same generation. Read before the n == 1 fast path so both charge items the same way.
+    # One resolved plan per request: the mode and the quantum must come from the same generation.
+    # `units` is how many items this request carries, already resolved by `request_units`.
     plan = get(@atomic(s.fill_plan), model, _DEFAULT_FILL_PLAN)
-    units = route_units(plan, batch)
+    units = max(Int(units), 1)
 
     if n == 1
         w = placement[1][1]
@@ -942,6 +949,17 @@ end
 
 release!(::LptPackingState, reservation) = _release_route!(reservation)
 
+# How many items a request carries, for the item-denominated quantum and in-flight counters. The
+# worker told us where to look (see `FillPlan`); a model that declares no batch axis, or a request
+# missing that input, counts as one item. Only this scheduler pays the peek: the generic default in
+# scheduler.jl returns 1 without touching the body.
+function request_units(s::LptPackingState, model::AbstractString, body::AbstractVector{UInt8})
+    plan = get(@atomic(s.fill_plan), model, nothing)
+    (plan === nothing || plan.batch_axis < 1) && return 1
+    n = peek_batch_size(body, plan.batch_input, plan.batch_axis)
+    return n > 0 ? n : 1
+end
+
 scheduler_repack_seq(s::LptPackingState) = @atomic s.repack_requested
 
 scheduler_tick!(s::LptPackingState, pool::ClientPool, ready_urls, metrics) =
@@ -979,7 +997,7 @@ end
 # last resort so a concentrated model survives its worker dying between repacks. A model without a
 # placement yet (cold, or new since the last repack) falls back to round robin over discovered routes.
 function select_replicas(s::LptPackingState, ctx::ScheduleContext)
-    routed = route_replica(s, ctx.model, ctx.batch)
+    routed = route_replica(s, ctx.model, ctx.units)
     if routed === nothing
         urls = pick(ctx.routes, ctx.model)
         urls === nothing && return nothing

@@ -296,7 +296,7 @@ end
 # Build a packing state directly for routing unit tests. Defaults to a single two-replica model
 # "m" on w0/w1; callers can install their own placement, per-model costs, and max batches.
 function _pk_state(; routing_policy = "fill_rr", fill_factor = 1.0, max_batch = 8,
-                   fill_mode = "run",
+                   fill_mode = "run", batch_at = nothing,
                    assignment = Dict{String,GW.Placement}("m" => [("w0", 0.5), ("w1", 0.5)]),
                    costs = nothing)
     cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], String[], 60, 1, 1, "info", "json",
@@ -306,7 +306,9 @@ function _pk_state(; routing_policy = "fill_rr", fill_factor = 1.0, max_batch = 
     @atomic s.assignment = assignment
     mb = Dict(m => max_batch for m in keys(assignment))
     @atomic s.max_batch = mb
-    GW._publish_fill_plan!(s, GW.knobs(s), mb)     # resolve mode + quantum, as a prober tick would
+    at = batch_at === nothing ? Dict{String,Tuple{String,Int}}() :
+         Dict(m => batch_at for m in keys(assignment))
+    GW._publish_fill_plan!(s, GW.knobs(s), mb, at)   # resolve mode + quantum, as a prober tick would
     costs === nothing || (@atomic s.cost_snapshot = costs)
     GW._swap_outstanding!(s, (@atomic s.assignment))
     return s
@@ -443,7 +445,6 @@ end
     mb = Dict("m" => 32)
     s = _pk_state(; max_batch = 32, fill_mode = "run")
     @test (@atomic s.fill_plan)["m"].quantum == 32
-    @test (@atomic s.fill_plan)["m"].batched
 
     # One request carrying a full batch spends the whole run: the next request rotates.
     urls1, c1 = GW.route_replica(s, "m", 32)
@@ -470,22 +471,35 @@ end
     foreach(h -> GW._release_route!(h[2]), mixed)
 end
 
-@testset "fill quantum: only a batched model's leading dimension counts as items" begin
-    # An unbatched model's leading dimension is a real axis (channels, say), not a count. Charging it
-    # would inflate its in-flight work by that factor and rotate its runs early.
-    for (maxb, batched) in ((0, false), (1, false), (2, true), (32, true))
-        s = _pk_state(; max_batch = maxb, fill_mode = "run")
-        plan = (@atomic s.fill_plan)["m"]
-        @test plan.batched == batched
-        @test GW.route_units(plan, 3) == (batched ? 3 : 1)
-        @test GW.route_units(plan, 0) == 1        # no shaped input: one unit
-    end
+@testset "request_units: the worker says where the batch axis is" begin
+    import ProtoBuf as QPB
+    QInf = ReactantServerCore.inference
+    enc(msg) = (io = IOBuffer(); QPB.encode(QPB.ProtoEncoder(io), msg); take!(io))
+    body(name, shape) = enc(QInf.ModelInferRequest(; model_name = "m",
+        inputs = [QInf.var"ModelInferRequest.InferInputTensor"(;
+            name = name, datatype = "UINT8", shape = Int64[shape...])]))
 
-    # End to end: an unbatched model charges one item per request whatever its shape says.
-    s = _pk_state(; max_batch = 1, fill_mode = "run")
-    _, c = GW.route_replica(s, "m", 3)
-    @test sum(a -> a[], values(@atomic s.outstanding)) == 1
-    GW._release_route!(c)
+    # Batch last, as an image bundle declares it (`whcn`): the item count is the 4th axis, and a
+    # first-axis assumption would have charged the width.
+    s = _pk_state(; max_batch = 32, fill_mode = "run", batch_at = ("IN", 4))
+    @test GW.request_units(s, "m", body("IN", (1024, 768, 3, 5))) == 5
+
+    # Batch first, as a tokenized bundle declares it (`nc`).
+    s1 = _pk_state(; max_batch = 32, fill_mode = "run", batch_at = ("IN", 1))
+    @test GW.request_units(s1, "m", body("IN", (7, 512))) == 7
+
+    # A model that declares no batch axis charges one item per request whatever its shape says, and
+    # so does a request that omits the named input or has too short a shape.
+    s0 = _pk_state(; max_batch = 32, fill_mode = "run")          # no locator reported
+    @test GW.request_units(s0, "m", body("IN", (3, 224, 224))) == 1
+    @test GW.request_units(s1, "m", body("OTHER", (7, 512))) == 1
+    @test GW.request_units(s1, "unknown-model", body("IN", (7, 512))) == 1
+    s9 = _pk_state(; max_batch = 32, fill_mode = "run", batch_at = ("IN", 9))
+    @test GW.request_units(s9, "m", body("IN", (7, 512))) == 1
+
+    # Schedulers that route by request count never touch the body.
+    @test GW.request_units(GW.RoundRobinScheduler(), "m", UInt8[]) == 1
+    @test GW.request_units(GW.LeastOutstandingScheduler(), "m", UInt8[]) == 1
 end
 
 @testset "fill modes: spread weighs items, so one big request outranks two small ones" begin

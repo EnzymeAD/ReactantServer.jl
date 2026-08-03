@@ -37,10 +37,10 @@ gRPC-to-gRPC pass-through that never re-marshals the body.
 - **Raw passthrough:** the `ModelInfer` hot path never decodes or re-marshals the protobuf body.
   The request and response types are `Vector{UInt8}` end to end (gRPCServer.jl and gRPCClient.jl
   support raw byte messages natively). To route, the gateway decodes a partial schema declaring only
-  `model_name` (field 1), `id` (field 3), and the leading dimension of the first input tensor
-  (`inputs[0].shape[0]`, how many items the request carries, used by the fill quantum). ProtoBuf
-  seeks past everything else, including every tensor payload; the shape precedes the data on the
-  wire, so reading it costs no payload decode.
+  `model_name` (field 1) and `id` (field 3). Under `lpt_packing` a second partial decode reads one
+  named tensor's shape to size the request in items (see the fill quantum below). ProtoBuf seeks past
+  everything else, including every tensor payload; shapes precede the data on the wire, so neither
+  decode touches it.
 - **SHM broadcast:** `SystemSharedMemoryRegister` / `Unregister` are fanned out to every worker.
   POSIX SHM regions are host-local; every worker attaches via `shm_open` independently. Register
   succeeds only if all workers succeed (it rolls back partial success); unregister succeeds if
@@ -154,10 +154,18 @@ resumes.
 For a model with more than one replica, the gateway concentrates its requests on one replica at a time
 so the workers receive deep same-model groupings to coalesce (the coalescing itself stays at the
 worker). The **fill quantum** `Q` is the model's worker-reported max batch size scaled by
-`routing_fill_factor`, and it is denominated in **items**, not requests: a request's item count is the
-leading dimension of its first input tensor, which the gateway reads out of the request header without
-decoding the payload. One request carrying a batch of 32 and 32 requests carrying one item each are
-therefore the same amount of work, and both spend a quantum of 32.
+`routing_fill_factor`, and it is denominated in **items**, not requests. One request carrying a batch
+of 32 and 32 requests carrying one item each are the same amount of work, and both spend a quantum
+of 32.
+
+The gateway does not guess where a request's items are counted. Each worker reports, per model, the
+**name** of the wire-facing input carrying the batch axis and that tensor's 1-based axis, taken from
+the bundle manifest's reserved `n`/`b` shape marker. The gateway matches that name against the
+request's own name-addressed inputs and reads that one dimension, without decoding the payload. This
+has to come from the manifest: the axis is per tensor and varies between bundles (an image model's
+`whcn` puts it last, a tokenized `nc` puts it first), the first input need not carry one at all (a
+cross-encoder's `query` is unbatched while its `keys` are batched), and it has moved between exports
+of the same model. A model that declares no batch axis counts one item per request.
 
 That matters most for a client that batches on its own behalf. If your client already fills requests to
 the model's max batch size, a request-denominated quantum would hold one replica for 32 *batches* and

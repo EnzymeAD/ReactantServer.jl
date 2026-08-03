@@ -88,7 +88,7 @@ export NamedTensor, InferRequest, QueuedRequest, DeadlineExceeded
 # ---- manifest ----
 export ManifestError, DimKind, FIXED, BATCH, VARIABLE, Dim, TensorSpec, BatchingSpec, Provenance, Manifest
 export parse_shape, parse_tensor_spec, parse_tensor_list, parse_batching, parse_manifest, validate_manifest
-export load_manifest, is_meta
+export load_manifest, is_meta, wire_batch_spec
 export client_input_spec, client_output_spec
 
 # ---- signature ----

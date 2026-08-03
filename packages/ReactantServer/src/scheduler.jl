@@ -1286,6 +1286,14 @@ function scheduler_metrics(s::Scheduler)
     end
 end
 
+# The wire-facing batch axis as ("input name", 1-based axis), or ("", 0) when the model declares
+# none. Reported over the control plane so a gateway can size a request in items rather than
+# guessing at a position that genuinely varies between bundles. See `wire_batch_spec`.
+function _wire_batch(entry::ModelEntry)
+    spec = ReactantServerCore.wire_batch_spec(entry.manifest)
+    return spec === nothing ? ("", 0) : (spec[1], spec[2])
+end
+
 # The largest compiled batch shape a model can serve, limited by its configured coalescing cap;
 # 0 when no batched shape is compiled. Reported over the control plane as routing metadata.
 function _effective_max_batch(entry::ModelEntry)
@@ -1319,7 +1327,9 @@ function _meta_group_status(s::Scheduler, meta::MetaEntry)
     return (state = floor, device_resident = dev, host_resident = host, weight_nbytes = nbytes,
             weight = meta.sched.weight, queue_depth = length(meta.sched.queue),
             total_compute = meta.sched.total_compute, requests_served = meta.sched.requests_served,
-            dispatch_count = meta.sched.dispatch_count, max_batch_size = 0)
+            dispatch_count = meta.sched.dispatch_count, max_batch_size = 0,
+            # A meta is non-coalescable, so it declares no wire batch axis: one item per request.
+            batch_input_name = "", batch_axis = 0)
 end
 
 """
@@ -1352,6 +1362,11 @@ function control_status(s::Scheduler)
                 dispatch_count = entry.sched.dispatch_count,
                 # Effective max batch the worker coalesces to, capped by max_batch_size.
                 max_batch_size = _effective_max_batch(entry),
+                # How a gateway counts the items in a request without decoding it: the name of the
+                # wire-facing input carrying the batch axis and that tensor's 1-based axis. The
+                # position varies per bundle and is not guessable from the request alone.
+                batch_input_name = _wire_batch(entry)[1],
+                batch_axis = _wire_batch(entry)[2],
             )
         end
         for meta in values(s.registry.meta)

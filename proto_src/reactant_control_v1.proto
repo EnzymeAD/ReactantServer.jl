@@ -60,6 +60,18 @@ message ModelStatus
   // batch shape, further limited by the configured scheduler.models.<name>.max_batch_size cap.
   // 0 when unknown. Routing metadata a gateway uses to fill one replica's batch before the next.
   int64 max_batch_size = 11;
+  // How to count the items in a request without decoding it, for a gateway that routes by work
+  // rather than by request count. `batch_input_name` names the wire-facing input that carries the
+  // batch axis (the first one that declares one) and `batch_axis` is that tensor's 1-based axis;
+  // the reader matches the name against the request's own name-addressed inputs. An empty name with
+  // axis 0 means the model declares no batch axis, so every request counts as one item.
+  //
+  // The gateway cannot infer this. The axis position is per tensor and varies across bundles (an
+  // image detector's `whcn` puts it last, a tokenized `nc` puts it first), the first input need not
+  // carry one at all (a cross-encoder's `query` is unbatched while its `keys` are batched), and it
+  // has changed between exports of the same model.
+  string batch_input_name = 12;
+  int64 batch_axis = 13;
 }
 
 message ModelControlStatusResponse

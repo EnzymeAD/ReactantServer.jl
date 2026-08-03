@@ -85,36 +85,28 @@ the prober tick by [`resolve_fill_plan`](@ref) and read once per request, so the
 has to walk the three-level override chain or touch `max_batch`.
 """
 struct FillPlan
-    mode::Symbol      # :run | :spread | :inflight (never :inherit; resolved)
-    quantum::Int      # >= 1, in ITEMS (see `route_units`)
-    batched::Bool     # whether this model's requests carry a batch axis at all
+    mode::Symbol        # :run | :spread | :inflight (never :inherit; resolved)
+    quantum::Int        # >= 1, in ITEMS
+    # Where to read a request's item count, as reported by the worker over the control plane: the
+    # name of the wire-facing input carrying the batch axis and that tensor's 1-based axis. Axis 0
+    # means the model declares no batch axis, so every request counts as one item. The gateway does
+    # not guess this; the position varies per bundle (`whcn` last, `nc` first) and the first input
+    # need not carry one at all.
+    batch_input::String
+    batch_axis::Int
 end
 
 # The plan for a model with no entry in the published snapshot: a cold or unknown model, routed as if
 # the fleet default applied with an unknown max batch. Never installed, only returned as a fallback.
-const _DEFAULT_FILL_PLAN = FillPlan(:run, 1, false)
-
-"""
-    route_units(plan, batch) -> Int
-
-How much of the quantum one request consumes: the number of items it carries, so a single request of
-32 items and 32 requests of one item both fill a quantum of 32. `batch` is the leading dimension the
-gateway peeked out of the request (see `peek_model_header`).
-
-The gate matters. A leading dimension is only an item count for a model the worker actually batches:
-`max_batch` is 0 for a meta or a model with nothing compiled and 1 for an unbatched model, whose
-leading dimension is a real axis (channels, say) that would otherwise be charged as if it were work.
-Those models charge 1 per request, which is exactly the pre-item behavior.
-"""
-route_units(plan::FillPlan, batch::Integer) =
-    (plan.batched && batch > 0) ? Int(batch) : 1
+const _DEFAULT_FILL_PLAN = FillPlan(:run, 1, "", 0)
 
 """
     resolve_fill_plan(k::PackingKnobs, model, max_batch) -> FillPlan
 
 Collapse the three configuration levels for one model: its own override, then the `scheduling:`
 default, then the built-in. `max_batch` is the worker-reported effective max batch (0 when unknown),
-which scales into the quantum through the fill factor. The result is denominated in ITEMS, matching
+which scales into the quantum through the fill factor; `batch_input`/`batch_axis` are the worker's
+report of where a request's item count lives on the wire. The result is denominated in ITEMS, matching
 `max_batch` itself, so a client that pre-batches to the max batch size fills a quantum with one
 request while a client sending single items needs `max_batch` of them.
 
@@ -122,14 +114,13 @@ An unknown max batch yields a quantum of 1, which is the honest degradation: wit
 aim at, `run` becomes exact rotation and `spread` becomes least-in-flight, rather than pretending to
 fill something.
 """
-function resolve_fill_plan(k::PackingKnobs, model::AbstractString, max_batch::Int)
+function resolve_fill_plan(k::PackingKnobs, model::AbstractString, max_batch::Int,
+                          batch_input::AbstractString = "", batch_axis::Integer = 0)
     mk = get(k.model_overrides, model, nothing)
     mode = (mk === nothing || mk.fill_mode === :inherit) ? k.routing_fill_mode : mk.fill_mode
     factor = (mk === nothing || mk.fill_factor <= 0) ? k.routing_fill_factor : mk.fill_factor
     quantum = max_batch <= 0 ? 1 : max(1, round(Int, factor * max_batch))
-    # `max_batch > 1` is the worker's own statement that this model coalesces, and therefore that a
-    # request's leading dimension counts items rather than naming an axis of a single sample.
-    return FillPlan(mode, quantum, max_batch > 1)
+    return FillPlan(mode, quantum, String(batch_input), Int(batch_axis))
 end
 
 # The replica-count overrides in the shape `compute_assignment` wants. Only models carrying an actual

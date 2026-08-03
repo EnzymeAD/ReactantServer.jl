@@ -21,11 +21,9 @@ abstract type GatewayScheduler end
 struct ScheduleContext{P<:ClientPool}
     model::String
     id::String
-    # Items the request carries: the leading dimension of its first input tensor, peeked out of the
-    # body without decoding the payload (see headers.jl). 0 when the request declares no shaped
-    # input. Whether it counts as work is the scheduler's call, since an unbatched model's leading
-    # dimension names an axis rather than a count (see `route_units`).
-    batch::Int
+    # Items this request carries, as resolved by `request_units` (1 for a model that declares no
+    # batch axis). Schedulers that route by work rather than by request count charge this.
+    units::Int
     pool::P
     routes::DiscoveredRoutes
     metrics::GatewayMetrics
@@ -55,6 +53,11 @@ scheduler_tick!(::GatewayScheduler, ::ClientPool, ready_urls, metrics) = nothing
 
 # Record a request arrival, for schedulers that estimate arrival rate. lpt_packing overrides this.
 record_arrival!(::GatewayScheduler, model::AbstractString) = nothing
+
+# How many items a request carries, for a scheduler that routes by work rather than by request
+# count. The default never looks at the body; `lpt_packing` overrides it to peek the batch axis the
+# worker reported for that model.
+request_units(::GatewayScheduler, ::AbstractString, ::AbstractVector{UInt8}) = 1
 
 # The scheduler's forced-work sequence number, polled by the prober between rounds so an
 # operator-forced repack does not have to wait out the full probe interval. 0 means "never asks for an

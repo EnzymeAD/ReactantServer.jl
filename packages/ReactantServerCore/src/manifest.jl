@@ -240,6 +240,31 @@ function _derive_input_batch_dim(inputs::Vector{TensorSpec})
     return nothing
 end
 
+"""
+    wire_batch_spec(m::Manifest) -> Union{Nothing,Tuple{String,Int}}
+
+The name and 1-based batch axis of the first WIRE-FACING input that declares one, or `nothing` when
+the model declares no batch axis at all (every request is then one item).
+
+"Wire-facing" is `client_inputs` when the bundle has them and `executable_inputs` otherwise:
+`client_inputs` is present exactly when a `model.jl` intercepts the request (see
+`validate_manifest`), and without one the client sends the executable inputs directly.
+
+This exists so a gateway can count the items in a request it never fully decodes. It cannot infer
+the axis: the position is per tensor and genuinely varies across bundles (`whcn` puts it last, `nc`
+first), the first input need not carry one at all (a cross-encoder's `query` is unbatched while its
+`keys` are batched), and it has moved between exports of the same model. Picking the first input
+that declares an axis mirrors `_derive_input_batch_dim`, and the name lets the reader match it
+against the request's own name-addressed tensors rather than trusting their order.
+"""
+function wire_batch_spec(m::Manifest)
+    specs = m.client_inputs === nothing ? m.executable_inputs : m.client_inputs
+    for t in specs
+        t.batch_axis === nothing || return (t.name, t.batch_axis)
+    end
+    return nothing
+end
+
 # Parse the `meta` block of a meta manifest into the declared list of called sub-model names.
 function _parse_meta_calls(d::AbstractDict, name::AbstractString)
     blk = get(d, "meta", nothing)

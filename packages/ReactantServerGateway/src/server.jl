@@ -92,12 +92,15 @@ function _try_replicas(st::GatewayState, urls, model, id, body, deadline_ns::Int
     return nothing, last_status, last_exc
 end
 
-function _dispatch_infer(st::GatewayState, model, id, batch, body, deadline_ns::Int64)
+function _dispatch_infer(st::GatewayState, model, id, body, deadline_ns::Int64)
     # Ask the scheduler which replicas to try (urls[1] is its choice; the rest are failover order)
     # and for an opaque reservation to release once the request completes. `nothing` means the
     # scheduler has no route for the model: it may have just been loaded on a worker, so refresh the
     # routing table on demand (single-flight, rate-limited) and re-select before giving up.
-    ctx = ScheduleContext(model, id, Int(batch), st.pool, st.routes, st.metrics, st.refresher)
+    # How much work this request is, per the scheduler (a no-op for the modes that route by request
+    # count). Resolved once here rather than per selection attempt.
+    ctx = ScheduleContext(model, id, request_units(st.scheduler, model, body),
+                          st.pool, st.routes, st.metrics, st.refresher)
     sel = select_replicas(st.scheduler, ctx)
     if sel === nothing
         refresh_now!(st.refresher)
@@ -120,9 +123,9 @@ end
 
 function _gw_infer(body::Vector{UInt8}, st::GatewayState, deadline_ns::Integer=0)
     t0 = time()
-    local model, id, batch
+    local model, id
     try
-        model, id, batch = peek_model_header(body)
+        model, id = peek_model_name_and_id(body)
     catch e
         inc_requests!(st.metrics, "ModelInfer", "", STATUS_INVALID)
         throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_INVALID_ARGUMENT,
@@ -134,7 +137,7 @@ function _gw_infer(body::Vector{UInt8}, st::GatewayState, deadline_ns::Integer=0
             "ModelInferRequest.model_name is empty"))
     end
     record_arrival!(st.scheduler, model)
-    resp, status, exc = _dispatch_infer(st, model, id, batch, body, Int64(deadline_ns))
+    resp, status, exc = _dispatch_infer(st, model, id, body, Int64(deadline_ns))
     observe_request!(st.metrics, "ModelInfer", model, time() - t0)
     inc_requests!(st.metrics, "ModelInfer", model, status)
     exc === nothing || throw(exc)

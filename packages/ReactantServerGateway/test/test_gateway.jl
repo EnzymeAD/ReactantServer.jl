@@ -10,44 +10,52 @@ import ProtoBuf as TPB
 
 const GWInf = ReactantServerCore.inference
 
-@testset "peek_model_header: routing fields without decoding the payload" begin
+@testset "peek_batch_size: item count by input name and axis" begin
     enc(msg) = (io = IOBuffer(); TPB.encode(TPB.ProtoEncoder(io), msg); take!(io))
     tensor(name, shape) = GWInf.var"ModelInferRequest.InferInputTensor"(;
         name = name, datatype = "UINT8", shape = Int64[shape...])
+    peek = ReactantServerGateway.peek_batch_size
 
-    # A realistic request: a batch of 32 with a megabyte of raw contents. The batch dimension must
-    # come out without the payload being decoded, and `raw_input_contents` (field 7) sits after
-    # `inputs` (field 5) on the wire, so reaching the shape never walks the data.
-    payload = rand(UInt8, 1024 * 1024)
-    body = enc(GWInf.ModelInferRequest(; model_name = "m", id = "req-1",
-                                       inputs = [tensor("x", (32, 3, 224, 224))],
-                                       raw_input_contents = [payload]))
-    @test ReactantServerGateway.peek_model_header(body) == ("m", "req-1", 32)
+    # A detector-shaped request: `whcn` puts the batch LAST, so position 0 would report the image
+    # width. The worker tells the gateway the axis precisely so this cannot be guessed wrong.
+    det = enc(GWInf.ModelInferRequest(; model_name = "det", id = "r1",
+                                      inputs = [tensor("INPUT__0", (1024, 768, 3, 2))],
+                                      raw_input_contents = [rand(UInt8, 512 * 1024)]))
+    @test peek(det, "INPUT__0", 4) == 2        # the declared batch axis
+    @test peek(det, "INPUT__0", 1) == 1024     # what a first-axis assumption would have charged
 
-    # Inline contents instead of raw: the shape is field 3 within the tensor and the data field 5, so
-    # it is still reached first.
+    # A cross-encoder-shaped request: the FIRST input carries no batch axis at all, and the batch
+    # lives on the second one. Matching by name is what makes this work.
+    xenc = enc(GWInf.ModelInferRequest(; model_name = "xe",
+                                       inputs = [tensor("query", (37,)),
+                                                 tensor("keys", (12, 37)),
+                                                 tensor("key_lens", (12,))]))
+    @test peek(xenc, "keys", 1) == 12
+    @test peek(xenc, "key_lens", 1) == 12
+
+    # Inputs may arrive in any order: KServe tensors are name-addressed.
+    shuffled = enc(GWInf.ModelInferRequest(; model_name = "xe",
+                                           inputs = [tensor("key_lens", (5,)),
+                                                     tensor("keys", (5, 9)),
+                                                     tensor("query", (9,))]))
+    @test peek(shuffled, "keys", 1) == 5
+
+    # Inline contents rather than raw: the shape is field 3 and the data field 5 within the tensor,
+    # so it is still reached without decoding the payload.
     inline = GWInf.var"ModelInferRequest.InferInputTensor"(;
-        name = "x", datatype = "FP32", shape = Int64[8, 4],
+        name = "x", datatype = "FP32", shape = Int64[4, 8],
         contents = GWInf.InferTensorContents(; fp32_contents = Float32[1:32;]))
-    @test ReactantServerGateway.peek_model_header(enc(GWInf.ModelInferRequest(; model_name = "m2",
-                                                           inputs = [inline]))) == ("m2", "", 8)
+    @test peek(enc(GWInf.ModelInferRequest(; model_name = "m", inputs = [inline])), "x", 2) == 8
 
-    # Several inputs: the first one's leading dimension wins. Inputs that disagree are a model
-    # authoring bug, not something the gateway adjudicates.
-    multi = enc(GWInf.ModelInferRequest(; model_name = "m3",
-                                        inputs = [tensor("a", (4, 2)), tensor("b", (9, 9))]))
-    @test ReactantServerGateway.peek_model_header(multi) == ("m3", "", 4)
+    # Degenerate cases all report 0, which the caller charges as a single item: no such input, an
+    # axis past the end of the shape, an empty name, and a non-positive axis.
+    @test peek(det, "nope", 1) == 0
+    @test peek(det, "INPUT__0", 9) == 0
+    @test peek(det, "", 1) == 0
+    @test peek(det, "INPUT__0", 0) == 0
 
-    # Degenerate shapes: no inputs at all, and an input with an empty shape (a scalar). Both report
-    # 0, which `route_units` charges as a single unit.
-    @test ReactantServerGateway.peek_model_header(enc(GWInf.ModelInferRequest(; model_name = "m4"))) == ("m4", "", 0)
-    @test ReactantServerGateway.peek_model_header(enc(GWInf.ModelInferRequest(; model_name = "m5",
-                                                           inputs = [tensor("s", ())]))) == ("m5", "", 0)
-
-    # An unbatched-looking leading dimension is still reported verbatim; gating it is the
-    # scheduler's job (see the fill-quantum tests), not the decoder's.
-    @test ReactantServerGateway.peek_model_header(enc(GWInf.ModelInferRequest(; model_name = "m6",
-                                                           inputs = [tensor("chw", (3, 224, 224))])))[3] == 3
+    # model_name and id still come out of their own peek, untouched by any of this.
+    @test ReactantServerGateway.peek_model_name_and_id(det) == ("det", "r1")
 end
 
 mutable struct MockWorker
