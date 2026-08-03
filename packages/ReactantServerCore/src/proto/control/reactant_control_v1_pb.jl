@@ -985,10 +985,11 @@ struct ModelStatus
     max_batch_size::Int64
     batch_input_name::String
     batch_axis::Int64
+    rows_served::UInt64
 end
-ModelStatus(;name = "", residency = Residency.RESIDENCY_UNSPECIFIED, device_resident = false, host_resident = false, weight_nbytes = zero(Int64), weight = zero(Float64), queue_depth = zero(Int64), total_compute_seconds = zero(Float64), requests_served = zero(UInt64), dispatch_count = zero(UInt64), max_batch_size = zero(Int64), batch_input_name = "", batch_axis = zero(Int64)) = ModelStatus(name, residency, device_resident, host_resident, weight_nbytes, weight, queue_depth, total_compute_seconds, requests_served, dispatch_count, max_batch_size, batch_input_name, batch_axis)
-PB.default_values(::Type{ModelStatus}) = (;name = "", residency = Residency.RESIDENCY_UNSPECIFIED, device_resident = false, host_resident = false, weight_nbytes = zero(Int64), weight = zero(Float64), queue_depth = zero(Int64), total_compute_seconds = zero(Float64), requests_served = zero(UInt64), dispatch_count = zero(UInt64), max_batch_size = zero(Int64), batch_input_name = "", batch_axis = zero(Int64))
-PB.field_numbers(::Type{ModelStatus}) = (;name = 1, residency = 2, device_resident = 3, host_resident = 4, weight_nbytes = 5, weight = 6, queue_depth = 7, total_compute_seconds = 8, requests_served = 9, dispatch_count = 10, max_batch_size = 11, batch_input_name = 12, batch_axis = 13)
+ModelStatus(;name = "", residency = Residency.RESIDENCY_UNSPECIFIED, device_resident = false, host_resident = false, weight_nbytes = zero(Int64), weight = zero(Float64), queue_depth = zero(Int64), total_compute_seconds = zero(Float64), requests_served = zero(UInt64), dispatch_count = zero(UInt64), max_batch_size = zero(Int64), batch_input_name = "", batch_axis = zero(Int64), rows_served = zero(UInt64)) = ModelStatus(name, residency, device_resident, host_resident, weight_nbytes, weight, queue_depth, total_compute_seconds, requests_served, dispatch_count, max_batch_size, batch_input_name, batch_axis, rows_served)
+PB.default_values(::Type{ModelStatus}) = (;name = "", residency = Residency.RESIDENCY_UNSPECIFIED, device_resident = false, host_resident = false, weight_nbytes = zero(Int64), weight = zero(Float64), queue_depth = zero(Int64), total_compute_seconds = zero(Float64), requests_served = zero(UInt64), dispatch_count = zero(UInt64), max_batch_size = zero(Int64), batch_input_name = "", batch_axis = zero(Int64), rows_served = zero(UInt64))
+PB.field_numbers(::Type{ModelStatus}) = (;name = 1, residency = 2, device_resident = 3, host_resident = 4, weight_nbytes = 5, weight = 6, queue_depth = 7, total_compute_seconds = 8, requests_served = 9, dispatch_count = 10, max_batch_size = 11, batch_input_name = 12, batch_axis = 13, rows_served = 14)
 
 function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelStatus}, _endpos::Int=0, _group::Bool=false)
     name = ""
@@ -1004,6 +1005,7 @@ function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelStatus}, _endpos::I
     max_batch_size = zero(Int64)
     batch_input_name = ""
     batch_axis = zero(Int64)
+    rows_served = zero(UInt64)
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         if field_number == 1
@@ -1032,11 +1034,13 @@ function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelStatus}, _endpos::I
             batch_input_name = PB.decode(d, String)
         elseif field_number == 13
             batch_axis = PB.decode(d, Int64)
+        elseif field_number == 14
+            rows_served = PB.decode(d, UInt64)
         else
             Base.skip(d, wire_type)
         end
     end
-    return ModelStatus(name, residency, device_resident, host_resident, weight_nbytes, weight, queue_depth, total_compute_seconds, requests_served, dispatch_count, max_batch_size, batch_input_name, batch_axis)
+    return ModelStatus(name, residency, device_resident, host_resident, weight_nbytes, weight, queue_depth, total_compute_seconds, requests_served, dispatch_count, max_batch_size, batch_input_name, batch_axis, rows_served)
 end
 
 function PB.encode(e::PB.AbstractProtoEncoder, x::ModelStatus)
@@ -1054,6 +1058,7 @@ function PB.encode(e::PB.AbstractProtoEncoder, x::ModelStatus)
     x.max_batch_size != zero(Int64) && PB.encode(e, 11, x.max_batch_size)
     !isempty(x.batch_input_name) && PB.encode(e, 12, x.batch_input_name)
     x.batch_axis != zero(Int64) && PB.encode(e, 13, x.batch_axis)
+    x.rows_served != zero(UInt64) && PB.encode(e, 14, x.rows_served)
     return position(e.io) - initpos
 end
 function PB._encoded_size(x::ModelStatus)
@@ -1071,6 +1076,7 @@ function PB._encoded_size(x::ModelStatus)
     x.max_batch_size != zero(Int64) && (encoded_size += PB._encoded_size(x.max_batch_size, 11))
     !isempty(x.batch_input_name) && (encoded_size += PB._encoded_size(x.batch_input_name, 12))
     x.batch_axis != zero(Int64) && (encoded_size += PB._encoded_size(x.batch_axis, 13))
+    x.rows_served != zero(UInt64) && (encoded_size += PB._encoded_size(x.rows_served, 14))
     return encoded_size
 end
 

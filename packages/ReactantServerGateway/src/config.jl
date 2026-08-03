@@ -42,6 +42,19 @@ struct GatewayConfig
     # LPT packing requires worker FIFO discipline and all models on all workers (checked at startup).
     # The remaining knobs apply to lpt_packing only.
     scheduling_mode::String                 # "round_robin" | "least_outstanding" | "lpt_packing"
+    # What `least_outstanding` measures when it asks which replica is least busy (that mode only).
+    #   "compute"  (default) in-flight GPU-seconds: a request charges its item count times the
+    #              model's worker-measured cost per item. The only basis that is comparable across
+    #              models of different cost, and the only one that is right when clients pre-batch.
+    #   "items"    in-flight items. No cost measurement needed; correct for a fleet of like-cost
+    #              models.
+    #   "requests" in-flight requests. Blind to batch size: one request of 32 items weighs the same
+    #              as one of a single item, so a pre-batching client defeats the balancing.
+    # `compute` and `items` need the model's batch axis and cost, which the gateway learns from a
+    # ModelControlStatus poll on each prober round (one extra RPC per worker per tick); `requests`
+    # needs no poll. All three degrade to counting requests for a model with no batch axis (a meta,
+    # an unbatched model) or before the first successful poll, so no basis ever routes on zeros.
+    least_outstanding_basis::String         # "compute" | "items" | "requests"
     # Repack cadence is driven by accumulated fleet compute, not wall-clock: a repack fires once the
     # fleet has consumed `rebalance_compute_seconds` GPU-seconds since the last one. The first
     # tick-driven repack can use a separate, typically smaller, budget so an early rebalance corrects
@@ -129,6 +142,7 @@ const GW_ENV_PATHS = Tuple{String,Vector{String},DataType}[
     ("LISTEN_GRPC", ["listen", "grpc"], String),
     ("LISTEN_METRICS", ["listen", "metrics"], String),
     ("SCHEDULING_MODE", ["scheduling", "mode"], String),
+    ("SCHEDULING_LEAST_OUTSTANDING_BASIS", ["scheduling", "least_outstanding_basis"], String),
     ("SCHEDULING_REBALANCE_COMPUTE_SECONDS", ["scheduling", "rebalance_compute_seconds"], Float64),
     ("SCHEDULING_FIRST_REBALANCE_COMPUTE_SECONDS", ["scheduling", "first_rebalance_compute_seconds"], Float64),
     ("SCHEDULING_MAX_WORKER_SHARE", ["scheduling", "max_worker_share"], Float64),
@@ -255,6 +269,8 @@ function _build_gateway_config(raw::Dict{String,Any})
     scheduling_mode = lowercase(strip(_opt(sched, "mode", String, "round_robin")))
     scheduling_mode in ("round_robin", "least_outstanding", "lpt_packing") ||
         throw(ConfigError("scheduling.mode must be 'round_robin', 'least_outstanding', or 'lpt_packing', got '$scheduling_mode'"))
+    least_outstanding_basis = String(_parse_least_outstanding_basis(
+        _opt(sched, "least_outstanding_basis", String, "compute")))
     routing_policy = String(_parse_routing_policy(_opt(sched, "routing_policy", String, "fill_rr")))
     routing_fill_mode = String(_parse_fill_mode(_opt(sched, "routing_fill_mode", String, "run")))
     compaction_mode = _parse_gateway_compaction_mode(_opt(sched, "compaction_mode", String, "eager"))
@@ -271,6 +287,7 @@ function _build_gateway_config(raw::Dict{String,Any})
         _opt(logging, "level", String, "info"),
         _opt(logging, "format", String, "json"),
         scheduling_mode,
+        least_outstanding_basis,
         _opt(sched, "rebalance_compute_seconds", Float64, 300.0),
         _opt(sched, "first_rebalance_compute_seconds", Float64, 60.0),
         _opt(sched, "max_worker_share", Float64, 0.8),
@@ -367,6 +384,15 @@ function _parse_routing_policy(s)
         throw(ConfigError("scheduling.routing_policy no longer accepts 'least_outstanding'; it is now a top-level scheduling mode. Set scheduling.mode: least_outstanding instead."))
     ls in ("fill_rr", "fill_least") ||
         throw(ConfigError("scheduling.routing_policy must be 'fill_rr' or 'fill_least', got '$s'"))
+    return Symbol(ls)
+end
+
+# What `least_outstanding` counts as "busy". Returns a Symbol; `GatewayConfig` keeps the string form,
+# so the hot path compares interned symbols while the config surface stays YAML-shaped.
+function _parse_least_outstanding_basis(s)
+    ls = lowercase(strip(String(s)))
+    ls in ("compute", "items", "requests") ||
+        throw(ConfigError("scheduling.least_outstanding_basis must be 'compute', 'items', or 'requests', got '$s'"))
     return Symbol(ls)
 end
 

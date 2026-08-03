@@ -72,6 +72,12 @@ message ModelStatus
   // has changed between exports of the same model.
   string batch_input_name = 12;
   int64 batch_axis = 13;
+  // Cumulative batch-axis ROWS processed, counting client-prebatched rows and not just requests.
+  // Delta rows_served against delta total_compute_seconds gives cost per ITEM, which is what a
+  // gateway needs to weigh in-flight work: requests_served would give cost per request, a figure
+  // that already embeds whatever batch sizes the client happened to send and so cannot be scaled by
+  // an item count without double-counting.
+  uint64 rows_served = 14;
 }
 
 message ModelControlStatusResponse

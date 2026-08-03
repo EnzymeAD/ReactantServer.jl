@@ -53,6 +53,9 @@ mutable struct HealthProber
     admin::AdminServer
     routes::Union{DiscoveredRoutes,Nothing}
     scheduler::GatewayScheduler               # ticked each round via scheduler_tick! (no-op unless lpt_packing)
+    # Per-model routing metadata (batch axis and measured costs), refreshed from this round's
+    # control-status poll and read by whichever scheduler routes by work. See routing_meta.jl.
+    meta::RoutingMeta
     interval::Float64
     running::Threads.Atomic{Bool}
     task::Union{Task,Nothing}
@@ -68,11 +71,12 @@ end
 function HealthProber(pool::ClientPool, metrics::GatewayMetrics, admin::AdminServer,
                       routes::Union{DiscoveredRoutes,Nothing} = nothing;
                       scheduler::GatewayScheduler = RoundRobinScheduler(),
+                      meta::RoutingMeta = RoutingMeta(),
                       interval::Real = _health_interval_seconds(),
                       wedge_exit_rounds::Integer =
                           parse(Int, get(ENV, "REACTANT_GATEWAY_WEDGE_EXIT_ROUNDS",
                                          string(WEDGE_EXIT_ROUNDS))))
-    return HealthProber(pool, metrics, admin, routes, scheduler, Float64(interval),
+    return HealthProber(pool, metrics, admin, routes, scheduler, meta, Float64(interval),
                         Threads.Atomic{Bool}(true), nothing, 0, Int(wedge_exit_rounds), false, 0)
 end
 
@@ -132,14 +136,24 @@ function _check_once(p::HealthProber)
         swap_table!(p.routes, table)
         set_routing_size!(p.metrics, nmodels(table))
     end
-    # Scheduler tick: lpt_packing polls the ready workers every probe round to refresh routing
-    # metadata and accumulate consumed compute, repacking only once the fleet has consumed the
-    # configured compute budget (other schedulers are no-ops). Placement is computed over the workers
-    # that reported ready this round; a dead worker drops out until it recovers.
+    # Control-plane round, for the schedulers that route by work: ONE ModelControlStatus poll shared
+    # by the routing-metadata cache (per-model batch axis and measured costs) and the scheduler tick,
+    # so adding a consumer never adds an RPC. Skipped entirely when nothing needs it, which keeps a
+    # round_robin fleet at exactly one probe round-trip per worker as before.
+    #
+    # Scheduler tick: lpt_packing folds the poll to refresh routing metadata and accumulate consumed
+    # compute, repacking only once the fleet has consumed the configured compute budget (other
+    # schedulers are no-ops). Placement is computed over the workers that reported ready this round;
+    # a dead worker drops out until it recovers.
     ready_urls = String[wc.url for (i, wc) in enumerate(workers) if results[i]]
     if !isempty(ready_urls)
         try
-            scheduler_tick!(p.scheduler, p.pool, ready_urls, p.metrics)
+            poll = nothing
+            if needs_routing_meta(p.scheduler)
+                poll = poll_workers(p.pool, ready_urls)
+                refresh_routing_meta!(p.meta, poll)
+            end
+            scheduler_tick!(p.scheduler, p.pool, ready_urls, p.metrics, poll)
         catch e
             @warn "scheduler tick failed; keeping the previous state" exception = e
         end

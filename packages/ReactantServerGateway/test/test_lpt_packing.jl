@@ -109,11 +109,19 @@ end
     @test_throws ReactantServerCore.ConfigError _pol("fill")
     @test_throws ReactantServerCore.ConfigError _pol("bogus")
     @test_throws ReactantServerCore.ConfigError _mode("bogus")
+
+    # What least_outstanding calls "busy". Defaults to compute: in-flight GPU-seconds.
+    _basis(b) = _load("scheduling:\n  least_outstanding_basis: $b\n" * eps).least_outstanding_basis
+    @test _load(eps).least_outstanding_basis == "compute"              # default
+    @test _basis("items") == "items"
+    @test _basis("requests") == "requests"
+    @test _basis("COMPUTE") == "compute"                               # case-insensitive, like the rest
+    @test_throws ReactantServerCore.ConfigError _basis("gpu_seconds")
 end
 
 @testset "verify_lpt_packing_preconditions!: gates on worker reachability" begin
     cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", ["127.0.0.1:1"], String[], String[], 1, 1, 1, "info",
-                           "json", "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr", "run",
+                           "json", "lpt_packing", "compute", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr", "run",
                            Dict{String,GW.GatewayModelConfig}(), 32, 64, :off, 0, false)
     pool = GW.ClientPool(cfg)
     # Default (wait_seconds = 0) fails fast when a worker is unreachable.
@@ -266,7 +274,7 @@ end
 
 @testset "gateway compaction cadence: fires on the Nth repack that moves a model" begin
     mk(mode, interval) = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], String[], 60, 1, 1,
-        "info", "json", "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr", "run",
+        "info", "json", "lpt_packing", "compute", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr", "run",
         Dict{String,GW.GatewayModelConfig}(), 32, 64, mode, interval, false)
     cfg = mk(:eager, 2)
     s = GW.LptPackingState(cfg)
@@ -300,7 +308,7 @@ function _pk_state(; routing_policy = "fill_rr", fill_factor = 1.0, max_batch = 
                    assignment = Dict{String,GW.Placement}("m" => [("w0", 0.5), ("w1", 0.5)]),
                    costs = nothing)
     cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], String[], 60, 1, 1, "info", "json",
-                           "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, fill_factor, routing_policy, fill_mode,
+                           "lpt_packing", "compute", 30.0, 0.0, 0.8, 0.1, 30.0, 1, fill_factor, routing_policy, fill_mode,
                            Dict{String,GW.GatewayModelConfig}(), 32, 64, :off, 0, false)
     s = GW.LptPackingState(cfg)
     @atomic s.assignment = assignment
@@ -581,7 +589,7 @@ end
     # Three-level resolution: a model's own fill_mode/fill_factor, else the `scheduling:` default, else
     # the built-in. This is what makes a default set at the scheduling level reach models with no block.
     cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], String[], 60, 1, 1, "info",
-        "json", "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr", "spread",
+        "json", "lpt_packing", "compute", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr", "spread",
         Dict("pinned" => GW.GatewayModelConfig(2, :inflight, 0.0),
              "short" => GW.GatewayModelConfig(2, :inherit, 0.25)),
         32, 64, :off, 0, false)
@@ -691,9 +699,15 @@ mutable struct AffMockWorker
     discipline::String
     served::Dict{String,Int}
     compute::Dict{String,Float64}
+    # Rows (batch-axis items) served, tracked separately from requests so the pair can diverge the
+    # way it does in production, and the wire batch-axis locator a real worker reports.
+    rows::Dict{String,Int}
+    rows_per_request::Int
+    batch_at::Tuple{String,Int}
 end
-AffMockWorker(name, models; discipline = "fifo") =
-    AffMockWorker(name, models, discipline, Dict{String,Int}(), Dict{String,Float64}())
+AffMockWorker(name, models; discipline = "fifo", rows_per_request = 1, batch_at = ("IN", 1)) =
+    AffMockWorker(name, models, discipline, Dict{String,Int}(), Dict{String,Float64}(),
+                  Dict{String,Int}(), rows_per_request, batch_at)
 
 function _aff_router()
     router = gRPCServer.gRPCRouter()
@@ -705,6 +719,7 @@ function _aff_router()
         ModelInfer = (req, c) -> begin
             w = c.payload
             w.served[req.model_name] = get(w.served, req.model_name, 0) + 1
+            w.rows[req.model_name] = get(w.rows, req.model_name, 0) + w.rows_per_request
             w.compute[req.model_name] = get(w.compute, req.model_name, 0.0) + 0.05
             AInf.ModelInferResponse(; model_name = w.name, id = req.id)
         end,
@@ -718,8 +733,11 @@ function _aff_router()
                               weight_nbytes = Int64(256 * 1024 * 1024),
                               total_compute_seconds = get(w.compute, m, 0.0),
                               requests_served = UInt64(get(w.served, m, 0)),
+                              rows_served = UInt64(get(w.rows, m, 0)),
                               dispatch_count = UInt64(get(w.served, m, 0)),
-                              max_batch_size = Int64(8))
+                              max_batch_size = Int64(8),
+                              batch_input_name = w.batch_at[1],
+                              batch_axis = Int64(w.batch_at[2]))
                           for m in w.models],
                 weight_cache_max_bytes = UInt64(8) * 1024^3)
         end,
@@ -887,4 +905,75 @@ end
     @test_throws ErrorException GW.serve_gateway(f3; blocking = false)
 
     rm(f1; force = true); rm(f2; force = true); rm(f3; force = true)
+end
+
+# The routing metadata has to survive the whole trip (worker control_status -> ModelStatus proto ->
+# gateway poll -> cache), and every hop is a place it can be silently dropped: a handler that never
+# populates the fields leaves the gateway counting requests, which is indistinguishable from working.
+# So this checks it against live workers rather than a hand-built poll.
+@testset "routing metadata reaches the gateway over the control plane" begin
+    models = ["alpha", "beta"]
+    # Each request carries 4 rows, so cost per item is a quarter of cost per request. A mock that
+    # reported rows == requests could not tell the two apart.
+    w0 = AffMockWorker("worker0", copy(models); rows_per_request = 4, batch_at = ("IN", 2))
+    w1 = AffMockWorker("worker1", copy(models); rows_per_request = 4, batch_at = ("IN", 2))
+    p0, p1 = grpc_free_port(), grpc_free_port()
+    s0 = gRPCServer.serve!(_aff_router(), "127.0.0.1", p0; context = w0)
+    s1 = gRPCServer.serve!(_aff_router(), "127.0.0.1", p1; context = w1)
+
+    gw_port, admin_port = grpc_free_port(), grpc_free_port()
+    gatewayfile = _aff_gatewayfile(gw_port, admin_port, [p0, p1])
+    gw = GW.serve_gateway(gatewayfile; blocking = false)
+    try
+        routed = false
+        for _ in 1:40
+            try
+                _aff_infer(gw_port, "alpha")
+                routed = true
+                break
+            catch
+                sleep(0.1)
+            end
+        end
+        @test routed
+        for _ in 1:20
+            _aff_infer(gw_port, "alpha")
+        end
+
+        # The prober owns the live cache and refreshes it from the round's poll. Driven directly here
+        # rather than waiting out a probe interval, so the assertion is not a race.
+        GW._check_once(gw.prober)
+        live = GW.model_meta(GW.routing_meta(gw.prober.meta), "alpha")
+        @test live.batch_input == "IN"
+        @test live.batch_axis == 2
+
+        meta = GW.RoutingMeta(30.0)
+        snap = GW.refresh_routing_meta!(meta, GW.poll_workers(gw.pool, copy(gw.pool.order)))
+        m = GW.model_meta(snap, "alpha")
+        @test m.batch_input == "IN"                  # the locator, not a positional guess
+        @test m.batch_axis == 2
+        @test m.max_batch == 8
+        # 0.05 GPU-seconds per request and 4 rows per request, so the per-item cost is a quarter of
+        # the per-request cost. This is the number a work-weighted router multiplies an item count by.
+        @test m.cost_per_request ≈ 0.05 rtol = 1e-6
+        @test m.cost_per_item ≈ 0.0125 rtol = 1e-6
+        @test GW.item_cost(snap, "alpha") ≈ 0.0125 rtol = 1e-6
+        # A model nobody has called yet has no cost of its own and borrows the fleet mean.
+        @test GW.model_meta(snap, "beta").cost_per_item == 0.0
+        @test GW.item_cost(snap, "beta") ≈ 0.0125 rtol = 1e-6
+
+        # And a request is sized from that locator: axis 2 of IN, not its first dimension.
+        req = AInf.ModelInferRequest(; model_name = "alpha",
+            inputs = [AInf.var"ModelInferRequest.InferInputTensor"(;
+                name = "IN", datatype = "UINT8", shape = Int64[512, 6])])
+        io = IOBuffer()
+        ReactantServerGateway.PB.encode(ReactantServerGateway.PB.ProtoEncoder(io), req)
+        body = take!(io)
+        @test GW.request_items(snap, "alpha", body) == 6
+    finally
+        GW.stop!(gw)
+        close(s0)
+        close(s1)
+        rm(gatewayfile; force = true)
+    end
 end

@@ -1327,8 +1327,11 @@ function _meta_group_status(s::Scheduler, meta::MetaEntry)
     return (state = floor, device_resident = dev, host_resident = host, weight_nbytes = nbytes,
             weight = meta.sched.weight, queue_depth = length(meta.sched.queue),
             total_compute = meta.sched.total_compute, requests_served = meta.sched.requests_served,
+            rows_served = meta.sched.rows_served,
             dispatch_count = meta.sched.dispatch_count, max_batch_size = 0,
             # A meta is non-coalescable, so it declares no wire batch axis: one item per request.
+            # `rows_served` is therefore incremented once per request too, which makes a meta's cost
+            # per item equal its cost per request. That is the honest figure for it.
             batch_input_name = "", batch_axis = 0)
 end
 
@@ -1356,9 +1359,12 @@ function control_status(s::Scheduler)
                 weight = entry.sched.weight,
                 queue_depth = length(entry.sched.queue),
                 # Cumulative serving counters: a gateway derives true per-request compute cost from
-                # deltas of total_compute / requests_served between polls (lpt_packing scheduling).
+                # deltas of total_compute / requests_served between polls (lpt_packing scheduling),
+                # and cost per ITEM from deltas of total_compute / rows_served, which is the unit a
+                # gateway needs to weigh in-flight work when clients pre-batch.
                 total_compute = entry.sched.total_compute,
                 requests_served = entry.sched.requests_served,
+                rows_served = entry.sched.rows_served,
                 dispatch_count = entry.sched.dispatch_count,
                 # Effective max batch the worker coalesces to, capped by max_batch_size.
                 max_batch_size = _effective_max_batch(entry),

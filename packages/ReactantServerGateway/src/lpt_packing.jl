@@ -66,12 +66,6 @@
 # The weights are exported as metrics; request routing uses outstanding-batch counts, not weights.
 const Placement = Vector{Tuple{String,Float64}}
 
-# Watchdog ceiling for one control-status poll. The gateway's clients share one libcurl multi
-# handle with a 16-slot request semaphore (GRPC_MAX_STREAMS); if its driving stalls, in-flight
-# calls never release their slot and new calls block forever, so every poll is bounded and a worker
-# that exceeds this is treated as not-polled.
-const POLL_TIMEOUT_SECONDS = 8.0
-
 """
     compute_assignment(u, workers, prev; mem=Dict(), mem_cap=Dict(),
                        replicas=Dict(), default_replicas=1, hysteresis=0.1,
@@ -350,61 +344,6 @@ function record_arrival!(s::LptPackingState, model::AbstractString)
     return nothing
 end
 
-# EWMA fold with halflife `h` over an interval `dt`.
-_ewma(old::Float64, sample::Float64, dt::Float64, h::Float64) =
-    (alpha = 1 - 2.0^(-dt / h); (1 - alpha) * old + alpha * sample)
-
-# Poll every ready worker's ModelControlStatus concurrently and aggregate: per-model cumulative
-# (compute, requests) summed across workers, the per-model weight footprint and effective max batch,
-# each worker's weight-memory budget, the workers that answered, and the fleet's total cumulative
-# compute (the compute-trigger signal). I/O only; no state mutation.
-function _poll_workers(pool::ClientPool, ready_urls::Vector{String})
-    sums = Dict{String,Tuple{Float64,UInt64}}()
-    permodel_workers = Dict{String,Vector{String}}()
-    mem = Dict{String,Float64}()                 # model -> resident weight bytes
-    mem_cap = Dict{String,Float64}()             # worker -> on-demand weight budget (0 = unconstrained)
-    max_batch = Dict{String,Int}()               # model -> effective max batch (max across workers)
-    batch_at = Dict{String,Tuple{String,Int}}()  # model -> (wire input name, 1-based batch axis)
-    polled = String[]
-    lk = ReentrantLock()
-    @sync for url in ready_urls
-        wc = get_clients(pool, url)
-        wc === nothing && continue
-        @async begin
-            # Watchdog-bounded: a wedged client stack would otherwise hang the prober tick (and with
-            # it route discovery and /readyz). A worker that does not answer is simply skipped this
-            # round, as if not ready. A hung call (timed out, not a fast refuse) means a poisoned
-            # connection; drop it so the next poll reconnects fresh.
-            resp, to = _bounded(() -> fetch_control_status(wc), POLL_TIMEOUT_SECONDS, nothing,
-                                "ModelControlStatus poll", url)
-            if resp === nothing
-                to && reset_clients!(wc)
-                return
-            end
-            lock(lk) do
-                push!(polled, url)
-                mem_cap[url] = Float64(resp.weight_cache_max_bytes)
-                for ms in resp.models
-                    tc, rq = get(sums, ms.name, (0.0, UInt64(0)))
-                    sums[ms.name] = (tc + ms.total_compute_seconds, rq + ms.requests_served)
-                    mem[ms.name] = max(get(mem, ms.name, 0.0), Float64(ms.weight_nbytes))
-                    max_batch[ms.name] = max(get(max_batch, ms.name, 0), Int(ms.max_batch_size))
-                    # Every worker serves the same bundle, so the first non-empty report wins; a
-                    # worker mid-reload can legitimately report nothing yet.
-                    isempty(ms.batch_input_name) || haskey(batch_at, ms.name) ||
-                        (batch_at[ms.name] = (ms.batch_input_name, Int(ms.batch_axis)))
-                    push!(get!(permodel_workers, ms.name, String[]), url)
-                end
-            end
-        end
-    end
-    fleet_compute = 0.0
-    for (tc, _) in values(sums)
-        fleet_compute += tc
-    end
-    return (; sums, permodel_workers, mem, mem_cap, max_batch, batch_at, polled, fleet_compute)
-end
-
 # Rebuild the outstanding/worker-total counters and per-model selection locks to cover the new
 # assignment, carrying over the live atomics for placements that persist (so in-flight counts
 # survive a repack) and dropping the rest, then swap the snapshots in atomically. Lock objects are
@@ -471,7 +410,10 @@ function _repack!(s::LptPackingState, poll, metrics::Union{GatewayMetrics,Nothin
 
     # Worker-reported costs: delta the per-model cumulative (compute, requests) against the previous
     # repack. A negative delta means a worker restarted (counters reset); re-baseline and skip.
-    for (m, (tc, rq)) in poll.sums
+    # This is cost per REQUEST, which is what the packer's utilization needs (u = arrivals/sec x
+    # cost/request). Cost per ITEM, for weighing in-flight work, lives in the shared routing-metadata
+    # cache (routing_meta.jl); `fill_least` should migrate onto it, at which point this EWMA goes away.
+    for (m, (tc, rq, _rows)) in poll.sums
         prev_tc, prev_rq = get(s.last_cum, m, (0.0, UInt64(0)))
         dtc, drq = tc - prev_tc, Int(rq) - Int(prev_rq)
         s.last_cum[m] = (tc, rq)
@@ -679,21 +621,26 @@ path is [`tick_packing!`](@ref).
 """
 function rebalance!(s::LptPackingState, pool::ClientPool, ready_urls::Vector{String},
                     metrics::Union{GatewayMetrics,Nothing}=nothing; trigger::Symbol=:startup)
-    _repack!(s, _poll_workers(pool, ready_urls), metrics; trigger = trigger)
+    _repack!(s, poll_workers(pool, ready_urls), metrics; trigger = trigger)
     return nothing
 end
 
 """
-    tick_packing!(s, pool, ready_urls, metrics) -> nothing
+    tick_packing!(s, pool, ready_urls, metrics, poll=poll_workers(pool, ready_urls)) -> nothing
 
-One prober tick: poll the ready workers, refresh the routing metadata, accumulate the fleet's
-consumed compute, and repack only when the accumulated compute crosses the active budget. The first
-tick-driven repack uses `first_rebalance_compute_seconds` (when set); every repack after uses
-`rebalance_compute_seconds`. The cheap per-tick work is the poll and the accumulator; the EWMA fold
-and `compute_assignment` run only on a triggered repack.
+One prober tick: refresh the routing metadata from `poll`, accumulate the fleet's consumed compute,
+and repack only when the accumulated compute crosses the active budget. The first tick-driven repack
+uses `first_rebalance_compute_seconds` (when set); every repack after uses
+`rebalance_compute_seconds`. The cheap per-tick work is the accumulator; the EWMA fold and
+`compute_assignment` run only on a triggered repack.
+
+`poll` is the prober's [`poll_workers`](@ref) result for this round, shared with the gateway's
+routing-metadata cache so there is one control-status round per tick however many consumers there
+are. It defaults to polling here so a test (or a direct caller) need not thread one through.
 """
 function tick_packing!(s::LptPackingState, pool::ClientPool, ready_urls::Vector{String},
-                       metrics::Union{GatewayMetrics,Nothing}=nothing)
+                       metrics::Union{GatewayMetrics,Nothing}=nothing,
+                       poll = poll_workers(pool, ready_urls))
     # Read the forced-repack request BEFORE the knobs: the acquire pairs with the release a handler
     # did when it swapped `knobs`, so any knob or override written before a request bump is visible to
     # the repack that serves it. `SetModelPlacement` followed by `Repack` always lands together.
@@ -701,7 +648,6 @@ function tick_packing!(s::LptPackingState, pool::ClientPool, ready_urls::Vector{
     # One knob snapshot for the whole tick, so a policy change landing mid-tick cannot produce a
     # repack that mixes old and new settings.
     k = knobs(s)
-    poll = _poll_workers(pool, ready_urls)
     @atomic s.max_batch = poll.max_batch         # keep routing metadata fresh between repacks
     _publish_fill_plan!(s, k, poll.max_batch, poll.batch_at)   # ...and re-resolve the fill rules
     _refresh_live_gauges!(s, metrics)            # in-flight and quantum, refreshed between repacks
@@ -962,8 +908,12 @@ end
 
 scheduler_repack_seq(s::LptPackingState) = @atomic s.repack_requested
 
-scheduler_tick!(s::LptPackingState, pool::ClientPool, ready_urls, metrics) =
-    tick_packing!(s, pool, ready_urls, metrics)
+scheduler_tick!(s::LptPackingState, pool::ClientPool, ready_urls, metrics, poll) =
+    tick_packing!(s, pool, ready_urls, metrics, poll)
+
+# The packer needs the control plane every round: the poll drives the compute accumulator that
+# triggers repacks, not just the routing metadata.
+needs_routing_meta(::LptPackingState) = true
 
 # Hard startup preconditions (all workers reachable, FIFO discipline, identical model sets), then an
 # initial rebalance so the first requests already route by packing rather than waiting a prober tick.

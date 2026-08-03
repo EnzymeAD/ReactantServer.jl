@@ -63,6 +63,8 @@ The gateway routes each model's requests across its replicas according to `sched
 ```yaml
 scheduling:
   mode: lpt_packing             # round_robin (default) | least_outstanding | lpt_packing
+  least_outstanding_basis: compute # compute (default) | items | requests  (least_outstanding only:
+                                #   what "least busy" measures; see below)
   rebalance_compute_seconds: 300 # fleet GPU-seconds consumed that triggers a repack
   first_rebalance_compute_seconds: 60 # smaller budget for the first repack (0 = use rebalance_compute_seconds)
   ema_halflife_compute_seconds: 0 # demand-EMA halflife in fleet compute-seconds (0 = track rebalance_compute_seconds)
@@ -90,11 +92,29 @@ It is fully predictable from the config file and needs no measurements, at the c
 per-worker queues: when every model is on every worker, each worker sees a slice of every
 model's traffic, so coalesced batches rarely fill.
 
-**`least_outstanding`** sends each request to the replica with the fewest in-flight requests,
-spreading by live occupancy rather than blindly. Like `round_robin` it needs no measurements and no
-preconditions and does not concentrate traffic, so it favors even spreading over batch coalescing;
-prefer it over `round_robin` when a model's replicas have uneven or unpredictable per-request
-latency, so a slow replica stops attracting new work instead of accumulating a backlog.
+**`least_outstanding`** sends each request to the replica carrying the least in-flight work, spreading
+by live occupancy rather than blindly. Like `round_robin` it needs no preconditions and does not
+concentrate traffic, so it favors even spreading over batch coalescing; prefer it over `round_robin`
+when a model's replicas have uneven or unpredictable per-request latency, so a slow replica stops
+attracting new work instead of accumulating a backlog.
+
+`least_outstanding_basis` decides what "work" means:
+
+- **`compute`** (the default) counts in-flight GPU-seconds: each request charges its item count times
+  the model's worker-measured cost per item. This is the only basis that is comparable across models,
+  where 32 items of a cheap model are not 32 items of an expensive one.
+- **`items`** counts in-flight items, so a client that pre-batches is weighed by how much it sent.
+  Correct without any cost measurement when a fleet's models cost about the same per item.
+- **`requests`** counts in-flight requests. Blind to batch size: one request carrying 32 items weighs
+  the same as one carrying a single item, so a pre-batching client defeats the balancing entirely.
+  This was the only behavior before the basis existed.
+
+`compute` and `items` need to know where each model's batch axis is and what an item costs, which the
+gateway learns from a `ModelControlStatus` poll on each health-probe round (one extra RPC per worker
+per tick; `requests` polls nothing). Both degrade gracefully rather than misreporting: a model that
+declares no batch axis (a meta, an unbatched model) charges one unit per request, and a model whose
+cost the fleet has not measured yet borrows the fleet-mean cost per item, so a cold gateway behaves
+like `requests` and converges to true work as measurements arrive.
 
 **`lpt_packing`** places each model on a fixed number of distinct GPUs and routes its requests
 to preserve batch fill. A model's replica count is operator-controlled: `default_replicas`

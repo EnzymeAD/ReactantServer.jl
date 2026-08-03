@@ -119,6 +119,9 @@ end
     @test snap.models["scale"].requests_served == 6
     @test snap.models["scale"].dispatch_count == 6
     @test snap.models["scale"].total_compute > 0
+    # Rows too, the cost-per-ITEM denominator: one row per request for an unbatched model, so here
+    # it coincides with the request count. The two diverge as soon as a client pre-batches.
+    @test snap.models["scale"].rows_served == 6
     # Unbatched model (only the key-0 exec): no compiled batch shape, so the effective max batch is 0.
     @test snap.models["scale"].max_batch_size == 0
 end
@@ -162,6 +165,37 @@ end
     capped.registry.by_name["capped"].sched =
         ReactantServer.ModelSchedState("capped", ReactantServer.ModelSchedConfig(1.0; max_batch_size = 2), 0.0)
     @test ReactantServer.control_status(capped).models["capped"].max_batch_size == 2
+end
+
+@testset "control_status carries the routing metadata a work-routing gateway needs" begin
+    sched = _batched_scheduler("bscale", [1, 4])
+    st = ReactantServer.control_status(sched).models["bscale"]
+    # The batch axis, by NAME and 1-based position: this manifest is (features=2, n), batch last.
+    @test st.batch_input_name == "x"
+    @test st.batch_axis == 2
+    @test st.rows_served == 0                  # nothing dispatched yet
+
+    # Four single-row requests coalesced into one dispatch: one dispatch, four requests, four ROWS.
+    qrs = [let req = ReactantServer.InferRequest("bscale", ["y"], [ReactantServer.NamedTensor("x", reshape(Float32[k, k], 2, 1))])
+               ReactantServer.QueuedRequest(req, req.inputs, 0.0, Channel{Any}(1))
+           end for k in 1:4]
+    append!(sched.registry.by_name["bscale"].sched.queue, qrs)
+    ReactantServer.execute_and_record!(sched, ReactantServer.select_dispatch!(sched, 0.0))
+    st = ReactantServer.control_status(sched).models["bscale"]
+    @test st.dispatch_count == 1
+    @test st.requests_served == 4
+    @test st.rows_served == 4
+
+    # ...and all of it survives the trip through the wire message. The proto fields are the whole
+    # point: a handler that drops them leaves the gateway silently counting requests, which looks
+    # exactly like working.
+    ctx = ReactantServer.InferContext(sched, sched.registry, ReactantServer.SharedMemoryRegistry(), "mock")
+    wire = Dict(m.name => m for m in ReactantServer._handle_model_control_status(ctx).models)
+    @test wire["bscale"].batch_input_name == "x"
+    @test wire["bscale"].batch_axis == 2
+    @test wire["bscale"].rows_served == UInt64(4)
+    @test wire["bscale"].requests_served == UInt64(4)
+    @test wire["bscale"].max_batch_size == 4
 end
 
 # Drive select_dispatch! + execute_and_record! directly (no spawned loop) so coalescing is
