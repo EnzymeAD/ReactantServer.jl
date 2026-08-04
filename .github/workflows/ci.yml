@@ -76,14 +76,18 @@ jobs:
               - 'packages/ReactantServer/**'
               - 'lib/gRPCServer.jl'
               - 'lib/gRPCServer.jl/**'
-            # The PyTorch round-trip is heavy (it provisions torch/jax/tensorflow via conda), so it
-            # runs only when the PyTorch-specific surface changes: the extension, its conda pins, its
-            # own test project, the test runner, or the workflow files themselves. It deliberately
-            # omits the `common` anchor so an unrelated Core/Manifest change does not pay the torch
-            # cost.
+            # The PyTorch round-trip provisions torch/jax/tensorflow via conda, so it runs only when
+            # the PyTorch surface itself changes: the extension, its conda pins, its own test project,
+            # or the shared test runner (which carries the torch-specific CPU-wheel and triton
+            # handling). It deliberately omits both the `common` anchor and the workflow files, so
+            # neither an unrelated Core change nor a CI edit pays the torch cost. To run it without a
+            # matching change (for instance after editing the job itself), put the
+            # `ci:export-pytorch` label on the PR.
+            #
+            # Known gap from this narrowness: PyTorchExportExt overrides fallback stubs defined in
+            # ReactantServerExport/src, so a signature change there can break the extension without
+            # this job running. The Lux arm does not load the extension, so nothing else catches it.
             export_pytorch:
-              - '.github/workflows/ci.yml'
-              - '.github/workflows/_test.yml'
               - 'packages/ReactantServerExport/ext/PyTorchExportExt.jl'
               - 'packages/ReactantServerExport/CondaPkg.toml'
               - 'packages/ReactantServerExport/test/pytorch/**'
@@ -152,7 +156,9 @@ jobs:
   # precompile output is still cached; only the Python side is excluded.
   export-pytorch:
     needs: changes
-    if: ${{ needs.changes.outputs.export_pytorch == 'true' }}
+    # The label is the manual escape hatch for the narrow filter above; it is the only way to run
+    # this job on a PR that does not touch the PyTorch surface.
+    if: ${{ needs.changes.outputs.export_pytorch == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:export-pytorch') }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
