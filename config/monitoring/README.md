@@ -1,7 +1,7 @@
 # ReactantServer monitoring stack (Grafana + Prometheus)
 
 A self-contained Grafana + Prometheus stack that scrapes a running ReactantServer node and ships a
-six-dashboard suite. It runs as its own compose project with an independent lifecycle (restart the
+seven-dashboard suite. It runs as its own compose project with an independent lifecycle (restart the
 server without touching Grafana, and vice versa). The node runs natively on the host, so Prometheus
 scrapes the host's metrics port rather than a container over a shared network.
 
@@ -66,6 +66,25 @@ discover models dynamically via Grafana template variables (`$worker`, `$model`)
    effective batch size) vs its compiled **max batch**, with a **fill** column (factor / max),
    rank-ordered lowest-fill first. Surfaces models receiving traffic but not batching well, i.e.
    where raising the batch window or arrival concurrency could help. Covers meta sub-models too.
+7. **GPU Work Balance** — is the fleet's work actually spread across the devices? Built entirely on
+   `rate(worker_compute_seconds_total)` per worker, which is device-seconds per wall-second and so
+   reads directly as a utilization between 0 and 1. The headline is **work spread**, the coefficient
+   of variation of that rate across devices: 0% means every device is doing the same amount of work,
+   green under 10%, red over 25%. It is scale free (comparable across load levels) and stays finite
+   when a device idles, which busiest/idlest does not. Alongside it: each device's **share of fleet
+   work** as a bar gauge (even is 1/N), per-device utilization over time against the fleet mean, the
+   spread as a time series (a spike during a burst is normal, a flat elevated line is a standing
+   imbalance that costs headroom as utilization climbs), **planned vs actual share** (the packer's
+   intent from `gateway_placement_weight * gateway_model_utilization` against what the devices really
+   did, which separates "the plan is skewed" from "routing is not following the plan"), and two
+   tables: per-device totals with deviation from even, and the top model-on-device pairs so an
+   imbalance can be attributed to a model.
+
+   Deliberately carries no `$worker` variable: filtering out a device would distort every share on
+   the page. Note the utilization measures time inside `run_model` only, excluding queue wait and
+   host-side pre/postprocess, so it answers "what did the device do", not "what did the request cost".
+   Calibration from a real 4x T4 node: a routing policy leaving one device with 1.9x another's work
+   read 26% spread, and switching to even rotation read 2%.
 
 ## A label note (important when extending)
 
@@ -88,5 +107,5 @@ docker-compose.monitoring.yml      prometheus + grafana, joins external network 
 prometheus.yml                     single scrape job -> reactantserver:8002 (15s, 15d retention)
 grafana/provisioning/datasources/  Prometheus datasource (uid: prometheus)
 grafana/provisioning/dashboards/   file provider -> /var/lib/grafana/dashboards
-grafana/dashboards/*.json          the five dashboards (datasource referenced by uid)
+grafana/dashboards/*.json          the seven dashboards (datasource referenced by uid)
 ```

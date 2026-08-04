@@ -1,0 +1,901 @@
+{
+ "uid": "rs-gpu-work-balance",
+ "title": "ReactantServer / GPU Work Balance",
+ "tags": [
+  "reactantserver"
+ ],
+ "timezone": "browser",
+ "schemaVersion": 39,
+ "version": 1,
+ "refresh": "30s",
+ "time": {
+  "from": "now-6h",
+  "to": "now"
+ },
+ "templating": {
+  "list": []
+ },
+ "panels": [
+  {
+   "type": "stat",
+   "title": "Work spread across GPUs",
+   "description": "Coefficient of variation of per-GPU GPU-seconds/second: 0% means every GPU is doing the same amount of work, and it grows as they diverge. Scale free, so it is comparable across load levels, and it stays finite when a GPU goes idle (unlike busiest/idlest). Green under 10%.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 5,
+    "x": 0,
+    "y": 0
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "decimals": 0,
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 0.1
+       },
+       {
+        "color": "red",
+        "value": 0.25
+       }
+      ]
+     },
+     "color": {
+      "mode": "thresholds"
+     }
+    }
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "graphMode": "area",
+    "colorMode": "value",
+    "textMode": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "stddev(sum by (worker) (rate(worker_compute_seconds_total[$__rate_interval]))) / clamp_min(avg(sum by (worker) (rate(worker_compute_seconds_total[$__rate_interval]))), 1e-9)"
+    }
+   ]
+  },
+  {
+   "type": "stat",
+   "title": "Busiest / idlest GPU",
+   "description": "Ratio of the most-loaded GPU's work rate to the least-loaded one's. Intuitive but unstable when a GPU is fully idle, which is why the spread on the left is the headline. 1.0x is even.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 5,
+    "x": 5,
+    "y": 0
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "decimals": 2,
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 1.25
+       },
+       {
+        "color": "red",
+        "value": 1.75
+       }
+      ]
+     },
+     "color": {
+      "mode": "thresholds"
+     }
+    }
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "graphMode": "area",
+    "colorMode": "value",
+    "textMode": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "clamp_min(max(sum by (worker) (rate(worker_compute_seconds_total[$__rate_interval]))) / clamp_min(min(sum by (worker) (rate(worker_compute_seconds_total[$__rate_interval]))), 1e-9), 1)"
+    }
+   ]
+  },
+  {
+   "type": "stat",
+   "title": "Fleet GPU utilization",
+   "description": "Mean fraction of wall time the fleet's GPUs spent inside run_model. This is headroom, not balance: an even fleet at 90% is nearly out of capacity, an uneven fleet at 20% has plenty.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 5,
+    "x": 10,
+    "y": 0
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "decimals": 0,
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "blue"
+     }
+    }
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "graphMode": "area",
+    "colorMode": "value",
+    "textMode": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "avg(sum by (worker) (rate(worker_compute_seconds_total[$__rate_interval])))"
+    }
+   ]
+  },
+  {
+   "type": "stat",
+   "title": "Busiest GPU utilization",
+   "description": "The hottest GPU's utilization. Read with the spread: at high utilization an imbalance starts costing real throughput, because the busiest GPU saturates while another still has slack.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 5,
+    "x": 15,
+    "y": 0
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "decimals": 0,
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "orange"
+     }
+    }
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "graphMode": "area",
+    "colorMode": "value",
+    "textMode": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "max(sum by (worker) (rate(worker_compute_seconds_total[$__rate_interval])))"
+    }
+   ]
+  },
+  {
+   "type": "stat",
+   "title": "GPUs doing work",
+   "description": "How many GPUs served any work in the rate window. Fewer than the node has means a GPU is hosting only idle models, which is a placement question (replica counts, or which models share a GPU) rather than a routing one.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 20,
+    "y": 0
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "decimals": 0,
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "text"
+     }
+    }
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "graphMode": "area",
+    "colorMode": "value",
+    "textMode": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "count((sum by (worker) (rate(worker_compute_seconds_total[$__rate_interval]))) > 0) or vector(0)"
+    }
+   ]
+  },
+  {
+   "type": "bargauge",
+   "title": "Share of fleet GPU work, per GPU",
+   "description": "Each GPU's fraction of all GPU-seconds consumed in the window. With N GPUs the even share is 1/N (25% on a 4-GPU node), which is where the green band ends. This is the single clearest picture of balance: four equal bars means the work is spread.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 4
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "min": 0,
+     "max": 1,
+     "decimals": 1,
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 0.35
+       },
+       {
+        "color": "red",
+        "value": 0.5
+       }
+      ]
+     }
+    }
+   },
+   "options": {
+    "displayMode": "gradient",
+    "orientation": "horizontal",
+    "showUnfilled": true,
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (worker) (rate(worker_compute_seconds_total[$__rate_interval])) / scalar(clamp_min(sum(rate(worker_compute_seconds_total[$__rate_interval])), 1e-9))",
+     "legendFormat": "{{worker}}"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Per-GPU utilization over time",
+   "description": "GPU-seconds consumed per wall-second, per GPU, with the fleet mean as a reference. Lines tracking together means balanced; a line persistently above the mean is a GPU carrying more than its share. Not filtered by any variable on purpose, because hiding a GPU would distort every share on this page.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 16,
+    "x": 8,
+    "y": 4
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "min": 0,
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "max": 1
+    }
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "mean"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (worker) (rate(worker_compute_seconds_total[$__rate_interval]))",
+     "legendFormat": "{{worker}}"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "avg(sum by (worker) (rate(worker_compute_seconds_total[$__rate_interval])))",
+     "legendFormat": "fleet mean"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Work spread over time",
+   "description": "The spread as a time series, so you can tell a transient from a standing imbalance. A spike during a burst is normal (some GPU has to be picked first); a flat elevated line means the same GPUs are consistently doing more, which is the shape that costs headroom as utilization climbs.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 7,
+    "w": 12,
+    "x": 0,
+    "y": 12
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "min": 0,
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "decimals": 0
+    }
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "mean"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "stddev(sum by (worker) (rate(worker_compute_seconds_total[$__rate_interval]))) / clamp_min(avg(sum by (worker) (rate(worker_compute_seconds_total[$__rate_interval]))), 1e-9)",
+     "legendFormat": "spread (CoV)"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "(max(sum by (worker) (rate(worker_compute_seconds_total[$__rate_interval]))) - min(sum by (worker) (rate(worker_compute_seconds_total[$__rate_interval]))))",
+     "legendFormat": "busiest - idlest (GPU-s/s)"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Planned share vs actual share, per GPU",
+   "description": "Solid: each GPU's actual share of GPU work. Dashed: the share lpt_packing intended, from each model's estimated demand (gateway_model_utilization) charged to its placement. Divergence is the interesting case: if the plan is even and the actual is not, routing or the demand estimate is at fault; if the plan itself is skewed, a repack or a replica count is the lever.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 7,
+    "w": 12,
+    "x": 12,
+    "y": 12
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "min": 0,
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    }
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "mean"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (worker) (rate(worker_compute_seconds_total[$__rate_interval])) / scalar(clamp_min(sum(rate(worker_compute_seconds_total[$__rate_interval])), 1e-9))",
+     "legendFormat": "actual {{worker}}"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (worker) (gateway_placement_weight * on (model) group_left() gateway_model_utilization) / scalar(clamp_min(sum(gateway_model_utilization), 1e-9))",
+     "legendFormat": "planned {{worker}}"
+    }
+   ]
+  },
+  {
+   "type": "table",
+   "title": "Per-GPU work breakdown",
+   "description": "One row per GPU: what it served and how far its share sits from even. `dev from even` is share minus 1/N, so positive means this GPU is carrying more than its share.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 9,
+    "w": 12,
+    "x": 0,
+    "y": 19
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "align": "auto",
+      "filterable": true
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "GPU-s/s"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "none"
+       },
+       {
+        "id": "decimals",
+        "value": 3
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "util"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "percentunit"
+       },
+       {
+        "id": "decimals",
+        "value": 1
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-background",
+         "mode": "gradient"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "share"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "percentunit"
+       },
+       {
+        "id": "decimals",
+        "value": 1
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-background",
+         "mode": "gradient"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "dev from even"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "percentunit"
+       },
+       {
+        "id": "decimals",
+        "value": 1
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-text"
+        }
+       },
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "green",
+           "value": null
+          },
+          {
+           "color": "yellow",
+           "value": 0.05
+          },
+          {
+           "color": "red",
+           "value": 0.1
+          }
+         ]
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "req/s"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "reqps"
+       },
+       {
+        "id": "decimals",
+        "value": 1
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "items/s"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "none"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "routed/s"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "reqps"
+       },
+       {
+        "id": "decimals",
+        "value": 1
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "sortBy": [
+     {
+      "displayName": "share",
+      "desc": true
+     }
+    ]
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (worker) (rate(worker_compute_seconds_total[$__rate_interval]))",
+     "format": "table",
+     "instant": true
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (worker) (rate(worker_compute_seconds_total[$__rate_interval])) / scalar(clamp_min(sum(rate(worker_compute_seconds_total[$__rate_interval])), 1e-9))",
+     "format": "table",
+     "instant": true
+    },
+    {
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "abs((sum by (worker) (rate(worker_compute_seconds_total[$__rate_interval])) / scalar(clamp_min(sum(rate(worker_compute_seconds_total[$__rate_interval])), 1e-9))) - scalar(1 / clamp_min(count(sum by (worker) (rate(worker_compute_seconds_total[$__rate_interval]))), 1)))",
+     "format": "table",
+     "instant": true
+    },
+    {
+     "refId": "D",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (worker) (rate(worker_requests_served_total[$__rate_interval]))",
+     "format": "table",
+     "instant": true
+    },
+    {
+     "refId": "E",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (worker) (rate(worker_rows_served_total[$__rate_interval]))",
+     "format": "table",
+     "instant": true
+    },
+    {
+     "refId": "F",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (worker) (rate(gateway_replica_routed_total[$__rate_interval]))",
+     "format": "table",
+     "instant": true
+    }
+   ],
+   "transformations": [
+    {
+     "id": "merge",
+     "options": {}
+    },
+    {
+     "id": "organize",
+     "options": {
+      "excludeByName": {
+       "Time": true
+      },
+      "renameByName": {
+       "Value #A": "GPU-s/s",
+       "Value #B": "share",
+       "Value #C": "dev from even",
+       "Value #D": "req/s",
+       "Value #E": "items/s",
+       "Value #F": "routed/s"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "type": "table",
+   "title": "What each GPU is busy with (top model-on-GPU pairs)",
+   "description": "The GPU-seconds behind the imbalance, attributed to the model that consumed them. This is how you tell whether a hot GPU is hosting one expensive single-replica model or a disproportionate slice of a replicated one. A replicated model should appear on each of its GPUs with similar rates.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 9,
+    "w": 12,
+    "x": 12,
+    "y": 19
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "align": "auto",
+      "filterable": true
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "model"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 320
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "GPU-s/s"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "none"
+       },
+       {
+        "id": "decimals",
+        "value": 3
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-background",
+         "mode": "gradient"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "sortBy": [
+     {
+      "displayName": "GPU-s/s",
+      "desc": true
+     }
+    ]
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "topk(25, sum by (worker, model) (rate(worker_compute_seconds_total[$__rate_interval])) > 0)",
+     "format": "table",
+     "instant": true
+    }
+   ],
+   "transformations": [
+    {
+     "id": "merge",
+     "options": {}
+    },
+    {
+     "id": "organize",
+     "options": {
+      "excludeByName": {
+       "Time": true
+      },
+      "renameByName": {
+       "Value #A": "GPU-s/s",
+       "Value": "GPU-s/s"
+      }
+     }
+    }
+   ]
+  }
+ ]
+}
