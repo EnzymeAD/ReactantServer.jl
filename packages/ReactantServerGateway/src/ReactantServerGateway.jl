@@ -45,13 +45,16 @@ include(ReactantServerCore.control_server_stubs_path())   # gateway terminates C
 
 include("headers.jl")
 include("config.jl")
+include("knobs.jl")      # runtime-mutable scheduling knobs; after config.jl (built from GatewayConfig)
 include("routing.jl")
 include("metrics.jl")
 include("client.jl")
 include("refresh.jl")
+include("routing_meta.jl")   # shared per-model routing metadata; before scheduler.jl (which reads it)
 include("scheduler.jl")
 include("lpt_packing.jl")
 include("server.jl")
+include("control_service.jl")   # the gateway's own GatewayControlService handlers
 include("health.jl")
 
 """
@@ -125,9 +128,17 @@ function serve_gateway(gateway_path::Union{AbstractString,Nothing} = nothing; bl
     # identical model sets, raising on violation) and does an initial rebalance so the first requests
     # already route by packing; round_robin / least_outstanding are no-ops here. Run before the admin
     # server starts so a precondition failure leaves nothing running.
-    scheduler = make_scheduler(cfg)
+    # Per-model routing metadata (batch axis, measured cost per item), refreshed by the prober from
+    # one control-status poll per round and read by whichever scheduler routes by work.
+    meta = RoutingMeta(cfg)
+    scheduler = make_scheduler(cfg, meta)
     scheduler_start!(scheduler, pool, metrics)
-    @info "gateway scheduling" mode = cfg.scheduling_mode
+    # The work basis is logged where it applies, so an operator can confirm from the startup line what
+    # "least busy" means on this fleet. Under lpt_packing it is also runtime-mutable and reported by
+    # GetSchedulingStatus; under least_outstanding this line is the only place it is stated.
+    cfg.scheduling_mode == "round_robin" ?
+        (@info "gateway scheduling" mode = cfg.scheduling_mode) :
+        (@info "gateway scheduling" mode = cfg.scheduling_mode work_basis = cfg.work_basis)
     state = GatewayState(pool, routes, gate, metrics, refresher, scheduler)
 
     admin = start_admin(metrics, cfg.listen_metrics; worker_metrics = cfg.worker_metrics)
@@ -140,7 +151,7 @@ function serve_gateway(gateway_path::Union{AbstractString,Nothing} = nothing; bl
     catch e
         @warn "initial route discovery failed; the health prober will retry" exception = e
     end
-    prober = start_prober!(HealthProber(pool, metrics, admin, routes; scheduler = scheduler))
+    prober = start_prober!(HealthProber(pool, metrics, admin, routes; scheduler = scheduler, meta = meta))
     router = build_gateway_router(state, cfg)
 
     host, port = _split_hostport(cfg.listen_grpc)

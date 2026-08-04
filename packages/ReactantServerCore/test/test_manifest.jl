@@ -270,3 +270,39 @@ end
     dup["input_shapes"] = [Dict("w" => 1024, "h" => 1024), Dict("w" => 1024, "h" => 1024)]
     @test_throws ReactantServer.ManifestError ReactantServer.parse_manifest(dup)
 end
+
+@testset "wire_batch_spec: the declared batch axis, wherever it is" begin
+    mk(inputs; client = nothing) = begin
+        d = Dict{String,Any}("format_version" => "2.0", "name" => "m",
+                             "executable_inputs" => inputs,
+                             "executable_outputs" => [Dict("name" => "o", "dtype" => "f32",
+                                                           "shape" => "n", "dims" => Dict())])
+        client === nothing || (d["client_inputs"] = client)
+        parse_manifest(d)
+    end
+    tens(name, shape, dims) = Dict("name" => name, "dtype" => "u8", "shape" => shape, "dims" => dims)
+
+    # Batch last, as an image bundle declares it: the axis is 4, not 1.
+    m = mk([tens("INPUT__0", "whcn", Dict("w" => 1024, "h" => 768, "c" => 3))])
+    @test wire_batch_spec(m) == ("INPUT__0", 4)
+
+    # Batch first: the same helper, a different position.
+    @test wire_batch_spec(mk([tens("texts", "nc", Dict("c" => -1))])) == ("texts", 1)
+
+    # No batch axis anywhere: the model serves one item per request.
+    @test wire_batch_spec(mk([tens("x", "chw", Dict("c" => 3, "h" => 4, "w" => 4))])) === nothing
+
+    # client_inputs win when present, because they are what the client actually sends. Here the
+    # executable side is batch-last while the wire side is batch-first.
+    m2 = mk([tens("input_ids", "sn", Dict("s" => 512))];
+            client = [tens("texts", "nc", Dict("c" => -1))])
+    @test wire_batch_spec(m2) == ("texts", 1)
+
+    # The FIRST wire input need not carry the axis: a cross-encoder's query is unbatched and the
+    # batch lives on its keys. Reporting a position without a name would be unusable here.
+    m3 = mk([tens("input_ids", "sn", Dict("s" => 512))];
+            client = [tens("query", "c", Dict("c" => -1)),
+                      tens("keys", "cn", Dict("c" => -1)),
+                      tens("key_lens", "n", Dict())])
+    @test wire_batch_spec(m3) == ("keys", 2)
+end

@@ -11,10 +11,11 @@ over KServe V2. The four models cover the common text-serving shapes:
 | `cross_encoder` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | query/document relevance scoring |
 | `sentiment` | `distilbert-base-uncased-finetuned-sst-2-english` | binary sentiment classification |
 
-All four share the `bert-base-uncased` WordPiece vocab, so one tokenizer
-(`tokenizer/bert_wordpiece.jl` + `tokenizer/vocab.txt`) serves every bundle. Tokenization
-runs in Julia **inside** each bundle's `model.jl`, so clients send raw UTF-8 text bytes,
-never token ids.
+All four share the `bert-base-uncased` WordPiece vocab, so one tokenizer serves every bundle:
+the code comes from `ReactantServer.BertText` (the shared WordPiece tokenizer + wire padding
+that ships with the package) and only `tokenizer/vocab.txt` is copied into each bundle.
+Tokenization runs in Julia **inside** each bundle's `model.jl`, so clients send raw UTF-8 text
+bytes, never token ids.
 
 It is split into three single-purpose Julia environments so each loads only what it needs
 (and they stop invalidating each other's precompilation): **export** is the only one with

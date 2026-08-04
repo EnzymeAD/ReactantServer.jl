@@ -43,7 +43,8 @@ an example configuration for each.
   → [Architecture](https://enzymead.github.io/ReactantServer.jl/dev/design/architecture/)
 - **Scheduling modes for single and multi-GPU.** On a worker, `fair` (deficit-weighted,
   cost-aware) or `fifo`; across GPUs, the gateway offers `round_robin` or memory-aware
-  `lpt_packing` that concentrates each model's traffic to fill batches. → [Architecture](https://enzymead.github.io/ReactantServer.jl/dev/design/architecture/), [Multi-GPU Gateway](https://enzymead.github.io/ReactantServer.jl/dev/manual/multi_gpu_gateway/)
+  `lpt_packing` that concentrates each model's traffic to fill batches, with a gRPC control plane for
+  retuning placement without a restart. → [Architecture](https://enzymead.github.io/ReactantServer.jl/dev/design/architecture/), [Multi-GPU Gateway](https://enzymead.github.io/ReactantServer.jl/dev/manual/multi_gpu_gateway/)
 - **Fast iteration.** In `dynamic` mode the server watches the model repository and hot-loads,
   unloads, and reloads bundles online — weights, MLIR, manifest, and `model.jl` alike — with no
   restart (`static` and `explicit` control modes are also available). A model is named by its

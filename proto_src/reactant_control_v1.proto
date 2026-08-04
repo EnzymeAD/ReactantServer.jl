@@ -1,8 +1,13 @@
-// ReactantServer control plane (v1). A worker-side service, distinct from the KServe V2
-// GRPCInferenceService data plane, that lets a gateway/control plane drive model residency and
-// live scheduler policy. Modeled on NVIDIA Triton's model-control extension with our pinning
-// semantics. Residency RPCs are authoritative only on an externally-managed worker; a
-// self-managed worker rejects them. SetModelPolicy works in both modes.
+// ReactantServer control plane (v1). Distinct from the KServe V2 GRPCInferenceService data plane,
+// this package carries TWO services with different terminators:
+//
+//   ControlService        answered by each WORKER: model residency and live scheduler policy.
+//                         Modeled on NVIDIA Triton's model-control extension with our pinning
+//                         semantics. Residency RPCs are authoritative only on an externally-managed
+//                         worker; a self-managed worker rejects them. SetModelPolicy works in both
+//                         modes. The gateway also terminates CompactMemory and fans it out.
+//   GatewayControlService answered by the GATEWAY process itself: its live lpt_packing scheduling
+//                         state (placement, knobs, repacks). Workers do not implement it.
 
 syntax = "proto3";
 package reactant_control;
@@ -55,6 +60,24 @@ message ModelStatus
   // batch shape, further limited by the configured scheduler.models.<name>.max_batch_size cap.
   // 0 when unknown. Routing metadata a gateway uses to fill one replica's batch before the next.
   int64 max_batch_size = 11;
+  // How to count the items in a request without decoding it, for a gateway that routes by work
+  // rather than by request count. `batch_input_name` names the wire-facing input that carries the
+  // batch axis (the first one that declares one) and `batch_axis` is that tensor's 1-based axis;
+  // the reader matches the name against the request's own name-addressed inputs. An empty name with
+  // axis 0 means the model declares no batch axis, so every request counts as one item.
+  //
+  // The gateway cannot infer this. The axis position is per tensor and varies across bundles (an
+  // image detector's `whcn` puts it last, a tokenized `nc` puts it first), the first input need not
+  // carry one at all (a cross-encoder's `query` is unbatched while its `keys` are batched), and it
+  // has changed between exports of the same model.
+  string batch_input_name = 12;
+  int64 batch_axis = 13;
+  // Cumulative batch-axis ROWS processed, counting client-prebatched rows and not just requests.
+  // Delta rows_served against delta total_compute_seconds gives cost per ITEM, which is what a
+  // gateway needs to weigh in-flight work: requests_served would give cost per request, a figure
+  // that already embeds whatever batch sizes the client happened to send and so cannot be scaled by
+  // an item count without double-counting.
+  uint64 rows_served = 14;
 }
 
 message ModelControlStatusResponse
@@ -103,4 +126,194 @@ message CompactMemoryResponse
 {
   int64 reloaded_models = 1;
   uint64 resident_bytes_after = 2;
+}
+
+// ------------------------------------------------------------------------------------------------
+// The gateway's own control service. Every RPC here is answered by the gateway process, not by a
+// worker, and drives its live lpt_packing scheduling state. Nothing is persisted: a gateway restart
+// reverts every value to gateway.yml plus the environment.
+service GatewayControlService
+{
+  // Read the live scheduling state: the mode, every runtime knob, repack bookkeeping, and one row
+  // per model and per worker. Succeeds in every scheduling mode; `policy` and `repack` are unset for
+  // the modes that have no knobs.
+  rpc GetSchedulingStatus(GetSchedulingStatusRequest) returns (GetSchedulingStatusResponse) {}
+
+  // Update the global scheduling knobs. `update_mask` names the fields of `policy` to apply;
+  // everything else keeps its current value. All or nothing: one invalid value rejects the whole
+  // request and no knob changes. lpt_packing only.
+  rpc SetSchedulingPolicy(SetSchedulingPolicyRequest) returns (SetSchedulingPolicyResponse) {}
+
+  // Set, change, or clear one model's overrides (replica count and how its requests use its GPUs).
+  // Takes effect at the next repack. lpt_packing only.
+  rpc SetModelPlacement(SetModelPlacementRequest) returns (SetModelPlacementResponse) {}
+
+  // Repack now, bypassing the accumulated-compute budget, optionally waiting a bounded time for it
+  // to land. lpt_packing only.
+  rpc Repack(RepackRequest) returns (RepackResponse) {}
+}
+
+// The gateway's runtime-mutable scheduling knobs. Used both as the read-out in
+// GetSchedulingStatusResponse and as the value carrier in SetSchedulingPolicyRequest; the field
+// names here are exactly the names accepted in SetSchedulingPolicyRequest.update_mask.
+message SchedulingPolicy
+{
+  double rebalance_compute_seconds = 1;
+  double first_rebalance_compute_seconds = 2;    // 0 = no separate first-repack budget
+  double hysteresis = 3;
+  // The halflife actually in force, already resolved: a configured 0 means "track
+  // rebalance_compute_seconds" and is resolved once at startup, so this never reads 0 and never
+  // moves retroactively when rebalance_compute_seconds is changed later.
+  double ema_halflife_compute_seconds = 4;
+  // Replica counts: > 0 a fixed number of distinct GPUs, -1 every ready worker ("all" in the yaml).
+  int64 default_replicas = 5;
+  string routing_policy = 6;                     // "fill_rr" | "fill_least"
+  double routing_fill_factor = 7;
+  // "run" | "spread" | "inflight". WARNING on "inflight": it counts requests IN FLIGHT, so a model
+  // whose in-flight concurrency stays between 2 and its quantum and never drains to zero is served
+  // by ONE replica indefinitely while the others receive no traffic. Diagnose with
+  // gateway_replica_routed_total. Prefer "run", or "spread" when a model needs every GPU at once.
+  string routing_fill_mode = 8;
+  string compaction_mode = 9;                    // "off" | "eager" | "scheduled"
+  int64 compaction_interval = 10;                // repacks between compactions; 0 disables
+  bool forbid_memory_oversubscription = 11;
+  // 0 while every knob still matches gateway.yml; bumped by each accepted mutation, so an operator
+  // inheriting a running gateway can tell a tuned one from a fresh one.
+  uint64 generation = 12;
+  // What one unit of in-flight work is, for the fill_least policy's per-worker load:
+  // "compute" (GPU-seconds: a request's item count times the model's measured cost per item),
+  // "items", or "requests" (the model's measured cost per REQUEST, the behavior before this knob
+  // existed). Only fill_least reads it; fill_rr is load-blind.
+  string work_basis = 13;
+}
+
+message GetSchedulingStatusRequest {}
+
+message RepackStatus
+{
+  double last_repack_unix_seconds = 1;           // 0 = no repack yet
+  double last_repack_wall_elapsed_seconds = 2;   // wall time the last repack covered
+  double last_repack_compute_seconds = 3;        // fleet GPU-seconds the last repack consumed
+  string last_trigger = 4;                       // "startup" | "compute" | "operator"
+  int64 last_models_placed = 5;
+  int64 last_models_moved = 6;
+  uint64 repack_count = 7;                       // repacks since start, including the startup one
+  // Live compute-trigger accounting, as of the last prober tick.
+  double compute_accumulated_seconds = 8;
+  double active_threshold_seconds = 9;           // the budget the next tick compares against
+  bool first_tick_repack_done = 10;              // false = the first-repack budget is still armed
+  double last_tick_unix_seconds = 11;
+  int64 repacks_since_compaction = 12;
+  // Operator-forced repack handshake counters (see Repack).
+  uint64 operator_repacks_requested = 13;
+  uint64 operator_repacks_completed = 14;
+}
+
+message ReplicaPlacement
+{
+  string worker = 1;
+  double weight = 2;        // 1/k across the model's k replicas
+  // In-flight ITEMS right now: the summed batch size of the requests in flight, matching the fill
+  // quantum's denomination. Equals a request count when every request carries a single item.
+  int64 outstanding = 3;
+  int64 routed_total = 4;   // cumulative REQUESTS routed to it (flat on a starved replica)
+}
+
+message ModelSchedulingStatus
+{
+  string name = 1;
+  int64 configured_replicas = 2;   // > 0 a count, -1 all, 0 no override (uses default_replicas)
+  int64 effective_replicas = 3;    // the placement actually installed, after clamping
+  repeated ReplicaPlacement replicas = 4;
+  double utilization = 5;          // u_m = rate * cost, GPU-sec/wall-sec, as of the last repack
+  double arrival_rate = 6;         // requests/sec EWMA, as of the last repack
+  double cost_seconds = 7;         // measured per-request compute, GPU-seconds
+  int64 max_batch = 8;             // worker-reported effective max batch (refreshed every tick)
+  string fill_mode = 9;            // resolved: the override, else the fleet default
+  int64 fill_quantum = 10;         // resolved run length in ITEMS (a batch of 32 spends 32)
+  int64 weight_nbytes = 11;        // footprint seen at the last repack
+  bool placed = 12;                // false = no placement yet (cold; routed round robin)
+  bool drifted = 13;               // not reported by every ready worker at the last repack
+}
+
+message WorkerSchedulingStatus
+{
+  string worker = 1;
+  bool ready = 2;                  // answered the control poll at the last repack
+  int64 models_placed = 3;
+  double inflight_compute = 4;     // in-flight requests weighted by measured per-request cost
+  int64 assigned_weight_bytes = 5;
+  int64 weight_budget_bytes = 6;   // 0 = unconstrained
+  bool oversubscribed = 7;         // assigned > budget
+}
+
+message GetSchedulingStatusResponse
+{
+  string mode = 1;                             // "round_robin" | "least_outstanding" | "lpt_packing"
+  SchedulingPolicy policy = 2;                 // unset outside lpt_packing
+  RepackStatus repack = 3;                     // unset outside lpt_packing
+  repeated ModelSchedulingStatus models = 4;
+  repeated WorkerSchedulingStatus workers = 5;
+  repeated string warnings = 6;
+}
+
+message SetSchedulingPolicyRequest
+{
+  // Names of the SchedulingPolicy fields to apply. Must be non-empty; an unrecognized name, or the
+  // name of a startup-only setting, is rejected rather than ignored.
+  repeated string update_mask = 1;
+  SchedulingPolicy policy = 2;
+}
+
+message SetSchedulingPolicyResponse
+{
+  SchedulingPolicy applied = 1;    // the complete knob set now in force
+  repeated string warnings = 2;
+  bool persisted = 3;              // always false: in-memory only, reverted by a gateway restart
+}
+
+message SetModelPlacementRequest
+{
+  string name = 1;
+  // > 0 a fixed number of distinct GPUs, -1 every ready worker, 0 removes the override so the model
+  // falls back to default_replicas, and < -1 is rejected. Leave unset (0) to change only the fill
+  // fields below... note that 0 therefore CLEARS the replica override; to change nothing but the fill
+  // mode, send the model's current configured_replicas back.
+  int64 replicas = 2;
+  // "" leaves the model's fill mode unchanged, "inherit" clears it back to the scheduling default,
+  // and "run" / "spread" / "inflight" set it.
+  string fill_mode = 3;
+  // < 0 leaves the run length unchanged, 0 clears it back to the scheduling default, > 0 sets it.
+  double fill_factor = 4;
+  // By default a model no worker currently serves is rejected NOT_FOUND, which catches typos. Set
+  // this to pre-seed an override for a model that is about to be loaded.
+  bool allow_unknown_model = 5;
+}
+
+message SetModelPlacementResponse
+{
+  string name = 1;
+  int64 configured_replicas = 2;   // the override now in force (0 = none, -1 = all)
+  int64 effective_replicas = 3;    // after clamping to the ready-worker count, at the next repack
+  string fill_mode = 4;            // resolved mode that will apply
+  int64 fill_quantum = 5;
+  repeated string warnings = 6;
+  bool persisted = 7;              // always false
+}
+
+message RepackRequest
+{
+  // Bounded wait for the repack to land, in seconds. 0 returns as soon as the request is queued.
+  // Clamped to a server maximum; the caller's own gRPC deadline still wins.
+  double wait_seconds = 1;
+}
+
+message RepackResponse
+{
+  uint64 sequence = 1;             // the operator-repack sequence this request was assigned
+  uint64 completed_sequence = 2;   // the highest operator repack the gateway has served
+  bool completed = 3;              // false = queued, not observed within wait_seconds
+  double waited_seconds = 4;
+  RepackStatus repack = 5;         // bookkeeping after the wait
+  repeated string warnings = 6;
 }

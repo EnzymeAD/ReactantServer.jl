@@ -115,8 +115,19 @@ function gateway_spec(workspace_root::AbstractString;
     cmd = gateway_path === nothing ?
           `$(Base.julia_cmd()) --project=$proj -e $_GATEWAY_BOOT` :
           `$(Base.julia_cmd()) --project=$proj -e $_GATEWAY_BOOT $gateway_path`
+    pairs = Pair{String,String}[]
+    # The supervisor co-launches the workers, which compile every model before answering. Under
+    # lpt_packing the gateway must wait for all of them before its startup checks pass, so make the
+    # embedded gateway wait indefinitely by default (the worker subprocesses are this supervisor's
+    # responsibility) rather than fail fast. An explicit env value wins.
+    #
+    # This is set even with a mounted gateway.yml, unlike the endpoint synthesis below. The wait is a
+    # fact about the supervisor's own children, not a piece of gateway configuration, and a file that
+    # legitimately owns the endpoint list has no way to express it. Suppressing it here used to leave
+    # a mounted-file deployment crash-looping for the whole (potentially hours-long) compile window.
+    haskey(ENV, "REACTANT_GATEWAY_STARTUP_WAIT_SECONDS") ||
+        push!(pairs, "REACTANT_GATEWAY_STARTUP_WAIT_SECONDS" => "inf")
     if gateway_path === nothing
-        pairs = Pair{String,String}[]
         endpoints === nothing || push!(pairs, "REACTANT_GATEWAY_WORKERS" => join(endpoints, ","))
         metrics_endpoints === nothing || isempty(metrics_endpoints) ||
             push!(pairs, "REACTANT_GATEWAY_WORKER_METRICS" => join(metrics_endpoints, ","))
@@ -124,20 +135,15 @@ function gateway_spec(workspace_root::AbstractString;
         # worker series with the same `worker` names the workers self-tag (host:port disappears).
         worker_names === nothing || isempty(worker_names) ||
             push!(pairs, "REACTANT_GATEWAY_WORKER_NAMES" => join(worker_names, ","))
-        # The supervisor co-launches the workers, which compile every model before answering. Under
-        # lpt_packing the gateway must wait for all of them before its startup checks pass, so make
-        # the embedded gateway wait indefinitely by default (the worker subprocesses are this
-        # supervisor's responsibility) rather than fail fast. An explicit env value wins.
-        haskey(ENV, "REACTANT_GATEWAY_STARTUP_WAIT_SECONDS") ||
-            push!(pairs, "REACTANT_GATEWAY_STARTUP_WAIT_SECONDS" => "inf")
         # Mirror the node-level gRPC message-size limits (global.grpc) into the embedded gateway, so a
         # single node knob configures the workers and the gateway alike. An explicit env value wins.
+        # Unlike the startup wait, a mounted gateway.yml can express these itself, so it owns them.
         grpc_max_recv === nothing || haskey(ENV, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES") ||
             push!(pairs, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES" => string(grpc_max_recv))
         grpc_max_send === nothing || haskey(ENV, "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES") ||
             push!(pairs, "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES" => string(grpc_max_send))
-        isempty(pairs) || (cmd = addenv(cmd, pairs...))
     end
+    isempty(pairs) || (cmd = addenv(cmd, pairs...))
     return ChildSpec("gateway", cmd, Float64(grace_seconds))
 end
 

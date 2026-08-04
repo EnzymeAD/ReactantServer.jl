@@ -1,8 +1,13 @@
+# Lux-only round-trip environment. PythonCall and CondaPkg are deliberately absent: their mere
+# presence in the manifest makes `Pkg.instantiate` precompile the PythonCall-triggered extensions
+# (ReactantServerExport -> PyTorchExportExt and Reactant -> ReactantPythonCallExt), and precompiling
+# those loads PythonCall, which provisions the whole torch/jax/tensorflow CondaPkg environment
+# (measured at 7.4 GB in the tree plus a 7.4 GB pixi cache in the depot). All of that happens during
+# instantiate, before runtests.jl runs, so REACTANTSERVER_SKIP_PYTORCH cannot prevent it. The PyTorch
+# arm lives in test/pytorch/Project.toml, which adds the two deps back.
 [deps]
-CondaPkg = "992eb4ea-22a4-4c89-a5bb-47a3300528ab"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
-PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 ReactantServer = "faa8a0e4-1926-4c6b-a0e2-e70699715ecf"

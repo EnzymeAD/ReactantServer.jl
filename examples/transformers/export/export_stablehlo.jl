@@ -4,8 +4,9 @@
 #   julia --project=examples/transformers/export examples/transformers/export/export_stablehlo.jl
 #
 # CPU trace: no GPU, no lease. One model.b{N}.mlir per batch size; all batch variants share one
-# weights.safetensors. After each trace the staged model.jl and the shared tokenizer
-# (bert_wordpiece.jl + vocab.txt) are copied into the bundle dir. Writes ./bundles/; skips a
+# weights.safetensors. After each trace the staged model.jl and the checkpoint's vocab.txt are
+# copied into the bundle dir (the tokenizer code itself lives in ReactantServer.BertText, so it
+# is not staged). Writes ./bundles/; skips a
 # bundle that already exists (delete the bundles dir to re-export). Needs network on the first run
 # for the four checkpoint downloads.
 
@@ -36,7 +37,7 @@ end
 
 const HERE = @__DIR__
 const EXAMPLE = dirname(HERE)                            # examples/transformers
-const TOKENIZER = joinpath(EXAMPLE, "tokenizer")         # shared bert_wordpiece.jl + vocab.txt
+const TOKENIZER = joinpath(EXAMPLE, "tokenizer")         # shared vocab.txt (code: RS.BertText)
 const MODELS = joinpath(EXAMPLE, "models")               # per-bundle model.jl sources
 const OUT = joinpath(EXAMPLE, "bundles")
 const REPO_ROOT = dirname(dirname(EXAMPLE))              # ReactantServer.jl checkout
@@ -62,13 +63,12 @@ function _builders()
     return pyimport("export_model")
 end
 
-# Copy the staged serve-time files into the bundle; the frontend never writes model.jl. The
-# tokenizer must live inside the bundle because model.jl `include`s it at serve time.
+# Copy the staged serve-time files into the bundle; the frontend never writes model.jl. vocab.txt
+# must live inside the bundle (model.jl loads it at serve time relative to @__DIR__); the
+# tokenizer code does not, it comes from ReactantServer.BertText.
 function _stage(bundle_dir, model_name)
     cp(joinpath(MODELS, model_name, "model.jl"), joinpath(bundle_dir, "model.jl"); force=true)
-    for f in ("bert_wordpiece.jl", "vocab.txt")
-        cp(joinpath(TOKENIZER, f), joinpath(bundle_dir, f); force=true)
-    end
+    cp(joinpath(TOKENIZER, "vocab.txt"), joinpath(bundle_dir, "vocab.txt"); force=true)
 end
 
 _prov(extra) = merge(ReactantServerExport.collect_provenance(REPO_ROOT), Dict{String,Any}(extra...))

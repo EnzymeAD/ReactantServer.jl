@@ -97,7 +97,10 @@ function _dispatch_infer(st::GatewayState, model, id, body, deadline_ns::Int64)
     # and for an opaque reservation to release once the request completes. `nothing` means the
     # scheduler has no route for the model: it may have just been loaded on a worker, so refresh the
     # routing table on demand (single-flight, rate-limited) and re-select before giving up.
-    ctx = ScheduleContext(model, id, st.pool, st.routes, st.metrics, st.refresher)
+    # How much work this request is, per the scheduler (a no-op for the modes that route by request
+    # count). Resolved once here rather than per selection attempt.
+    ctx = ScheduleContext(model, id, request_units(st.scheduler, model, body),
+                          st.pool, st.routes, st.metrics, st.refresher)
     sel = select_replicas(st.scheduler, ctx)
     if sel === nothing
         refresh_now!(st.refresher)
@@ -371,5 +374,8 @@ function build_gateway_router(state::GatewayState, cfg::GatewayConfig)
     # Control plane: a single CompactMemory RPC to the gateway fans out to every worker.
     register_ControlService!(router;
         CompactMemory = (req, ctx) -> _gw_compact(req, ctx.payload))
+    # The gateway's own scheduling control plane (see control_service.jl). A distinct service, so the
+    # worker-facing ControlService above keeps its meaning.
+    register_gateway_control_service!(router, state)
     return router
 end

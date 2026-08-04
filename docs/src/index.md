@@ -31,10 +31,10 @@ clients connect to it directly.
   a renamed bundle directory renames the live model in place with no recompile); `static`
   fixes the startup set; `explicit` cedes lifecycle and residency to an external control plane
   over the worker control RPCs.
-- Multi-GPU scheduling in the gateway: `round_robin` or `lpt_packing`, which places each model on a
-  fixed, operator-configured number of GPUs and routes its requests to fill one replica's batch
-  before the next, preserving batch coalescing (see
-  [Multi-GPU Gateway](manual/multi_gpu_gateway.md)).
+- Multi-GPU scheduling in the gateway: `round_robin` or `lpt_packing`, which places each model on an
+  operator-configured number of GPUs and concentrates its requests a batch at a time to preserve
+  coalescing, with a gRPC control plane for retuning placement and forcing a repack without a restart
+  (see [Multi-GPU Gateway](manual/multi_gpu_gateway.md)).
 - Multiple compiled batch sizes per model and custom per-model pre/post-processing via a
   bundle's `model.jl` (see [Bundles & model.jl](manual/bundles.md)).
 - Meta models: `kind: meta` bundles whose `model.jl` chains several models with data-dependent

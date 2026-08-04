@@ -45,3 +45,59 @@ ControlService_CompactMemory_Client(
 	max_recieve_message_length=max_recieve_message_length,
 )
 export ControlService_CompactMemory_Client
+
+# --- GatewayControlService (the gateway's own scheduling control plane) -------------------------
+# These four take their deadline through `options...` rather than hardcoding one. Pass a deadline
+# above the gateway's bounded-wait cap when calling `Repack` with `wait_seconds` set, or the client
+# gives up before the gateway answers.
+GatewayControlService_GetSchedulingStatus_Client(
+    host, port;
+    TRequest=GetSchedulingStatusRequest,
+    TResponse=GetSchedulingStatusResponse,
+    grpc=gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/reactant_control.GatewayControlService/GetSchedulingStatus";
+    grpc=grpc,
+    options...
+)
+export GatewayControlService_GetSchedulingStatus_Client
+
+GatewayControlService_SetSchedulingPolicy_Client(
+    host, port;
+    TRequest=SetSchedulingPolicyRequest,
+    TResponse=SetSchedulingPolicyResponse,
+    grpc=gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/reactant_control.GatewayControlService/SetSchedulingPolicy";
+    grpc=grpc,
+    options...
+)
+export GatewayControlService_SetSchedulingPolicy_Client
+
+GatewayControlService_SetModelPlacement_Client(
+    host, port;
+    TRequest=SetModelPlacementRequest,
+    TResponse=SetModelPlacementResponse,
+    grpc=gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/reactant_control.GatewayControlService/SetModelPlacement";
+    grpc=grpc,
+    options...
+)
+export GatewayControlService_SetModelPlacement_Client
+
+GatewayControlService_Repack_Client(
+    host, port;
+    TRequest=RepackRequest,
+    TResponse=RepackResponse,
+    grpc=gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/reactant_control.GatewayControlService/Repack";
+    grpc=grpc,
+    options...
+)
+export GatewayControlService_Repack_Client

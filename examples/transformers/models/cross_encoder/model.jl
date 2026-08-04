@@ -14,48 +14,22 @@
 
 using ReactantServer: NamedTensor
 
-Base.include(@__MODULE__, joinpath(@__DIR__, "bert_wordpiece.jl"))
-using .BertWordPiece
+# Shared BERT WordPiece tokenizer + wire padding; only vocab.txt is bundle-local.
+const BT = ReactantServer.BertText
 
-const TOKENIZER = load_tokenizer(joinpath(@__DIR__, "vocab.txt"))
+const TOKENIZER = BT.load_tokenizer(joinpath(@__DIR__, "vocab.txt"))
 const MAX_LEN = 512
 # Single compiled sequence length: every request pads to 512 (bit-identical to a tight bucket
 # because all ops are attention-mask aware). Keep in sync with the export driver's SEQ_LEN.
 const SEQ_BUCKETS = (512,)
 
-_bucket(n::Int) = something(findfirst(>=(n), SEQ_BUCKETS), length(SEQ_BUCKETS)) |> i -> SEQ_BUCKETS[i]
-
 function preprocess(inputs::Vector{NamedTensor})
     byname = Dict(t.name => t for t in inputs)
-    query = String(vec(copy(byname["query"].data::Array{UInt8})))
-    keys_raw = byname["keys"].data::Matrix{UInt8}        # (max_bytes, batch) col-major
-    lens = vec(byname["key_lens"].data)
-    B = size(keys_raw, 2)
-    length(lens) == B || error("key_lens has $(length(lens)) entries for $B key rows")
-
-    encoded = Vector{Tuple{Vector{Int32},Vector{Int32}}}(undef, B)
-    maxlen = 1
-    for b in 1:B
-        n = Int(lens[b])
-        0 <= n <= size(keys_raw, 1) || error("key_lens[$b] = $n out of range")
-        key = String(@view keys_raw[1:n, b])
-        ids, type_ids = encode_pair(TOKENIZER, query, key; max_len=MAX_LEN)
-        maxlen = max(maxlen, length(ids))
-        encoded[b] = (ids, type_ids)
-    end
-
-    seq = _bucket(maxlen)
-    input_ids = zeros(Int64, seq, B)                     # 0 == [PAD]
-    attention_mask = zeros(Int64, seq, B)
-    token_type_ids = zeros(Int64, seq, B)
-    for b in 1:B
-        ids, type_ids = encoded[b]
-        for i in eachindex(ids)
-            input_ids[i, b] = ids[i]
-            attention_mask[i, b] = 1
-            token_type_ids[i, b] = type_ids[i]
-        end
-    end
+    input_ids, attention_mask, token_type_ids = BT.encode_pair_batch(TOKENIZER,
+        BT.wire_text(byname["query"].data::Array{UInt8}),
+        byname["keys"].data::Matrix{UInt8},              # (max_bytes, batch) col-major
+        vec(byname["key_lens"].data);
+        max_len=MAX_LEN, buckets=SEQ_BUCKETS, lens_name="key_lens")
     return NamedTensor[NamedTensor("input_ids", input_ids),
                        NamedTensor("attention_mask", attention_mask),
                        NamedTensor("token_type_ids", token_type_ids)]

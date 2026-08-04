@@ -246,6 +246,18 @@ end
         # The meta's serving counters are recorded for the control plane (one successful run above).
         @test sched.registry.meta["det"].sched.requests_served == 1
         @test sched.registry.meta["det"].sched.total_compute >= 0.0
+        # A meta charges ONE row per request, and reports no wire batch axis, on purpose. The two go
+        # together: a gateway sizes a meta request as one item, and rows == requests makes the meta's
+        # cost per item equal its cost per request, so a work-routing gateway charges a meta its whole
+        # measured cost. Reporting an axis without also counting rows would make it charge N times its
+        # per-request cost, and counting rows without an axis would divide the cost by N and then
+        # charge one of them. The meta is also the reason `items` is a poor basis for a fleet that has
+        # one: its work is data-dependent (a detection meta's ROI count), so no item count predicts it.
+        @test sched.registry.meta["det"].sched.rows_served == 1
+        st = _RS.control_status(sched).models["det"]
+        @test st.rows_served == st.requests_served
+        @test st.batch_input_name == "" && st.batch_axis == 0
+        @test st.max_batch_size == 0                # non-coalescable
     finally
         _RS.shutdown!(sched)
     end

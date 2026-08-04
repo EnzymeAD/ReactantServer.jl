@@ -38,7 +38,8 @@ discover models dynamically via Grafana template variables (`$worker`, `$model`)
 ## Dashboards
 
 1. **Fleet Overview** — RED top-line: request rate, error rate, in-flight/shed, latency
-   percentiles, worker-readiness state timeline, per-worker device-memory saturation. "Is it OK right now."
+   percentiles, worker-readiness state timeline, per-worker device-memory saturation, and the
+   per-worker routing load. "Is it OK right now."
 2. **Latency & Throughput** — request-latency **heatmap** (the full distribution, not just p99),
    percentile lines, throughput by gRPC status, **coalescing factor** (rows per dispatch = effective
    batch size) by worker, queue-wait by worker, top-N models by request rate.
@@ -47,7 +48,18 @@ discover models dynamically via Grafana template variables (`$worker`, `$model`)
    vs limit, weight-cache load/evict churn, out-of-pool driver memory, on-demand budget utilization, resident model count.
 4. **Scheduling & Placement** — lpt_packing: models placed per worker, in-flight load balance,
    gateway-to-worker call p99, top models by utilization, the model->worker placement table, and
-   worker metrics-scrape health.
+   worker metrics-scrape health. `gateway_replica_routed_total` (cumulative requests routed per
+   replica) is the series to watch when a replicated model looks like it is only using one GPU;
+   `gateway_model_fill_quantum` and `gateway_repacks_total{trigger}` explain why. Note the units
+   differ on purpose: `gateway_replica_outstanding` counts in-flight ITEMS (summed batch sizes) so it
+   is comparable to the quantum, while `gateway_replica_routed_total` counts routing decisions.
+   `gateway_worker_inflight_work` is the third unit and the one that decides routing: the per-worker
+   load `fill_least` (or the `least_outstanding` mode) compares, denominated by `scheduling.work_basis`
+   and labelled with it, so the dashboard states which basis is in force rather than trusting the
+   config file, which a runtime `set-policy` can have superseded. The spread panel (`max - min`) is
+   what `fill_least` exists to shrink; read a persistently high spread next to the placement table,
+   since it usually means the replicas cannot absorb the imbalance rather than that the policy is
+   failing.
 5. **Per-Model Drilldown** (`$model`) — one model's rate/errors, handler-latency heatmap, queue
    depth & wait, its coalescing, residency-by-worker timeline, and placement.
 6. **Coalescing & Batching** — every model's **coalescing factor** (requests merged per dispatch =

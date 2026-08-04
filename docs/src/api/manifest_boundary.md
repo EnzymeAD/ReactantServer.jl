@@ -17,6 +17,7 @@ Dim
 BatchingSpec
 load_manifest
 is_meta
+ReactantServerCore.wire_batch_spec
 ```
 
 ## Boundary

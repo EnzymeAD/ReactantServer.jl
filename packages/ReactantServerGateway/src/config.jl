@@ -10,11 +10,17 @@
 # worker count, which tracks the fleet as workers come and go.
 const REPLICAS_ALL = typemax(Int)
 
-# Per-model scheduling override (an entry under `scheduling.models`). Currently only the replica
-# count: how many distinct GPUs host the model under lpt_packing (default `default_replicas`).
+# Per-model scheduling override (an entry under `scheduling.models`): how many distinct GPUs host the
+# model under lpt_packing, and optionally how its requests should use them. `fill_mode` and
+# `fill_factor` carry "not set" sentinels (`:inherit`, `0.0`) so a model can override the basis, the
+# run length, or neither, and inherit the `scheduling:` default for the rest.
 struct GatewayModelConfig
     replicas::Int
+    fill_mode::Symbol      # :inherit | :run | :spread | :inflight
+    fill_factor::Float64   # 0.0 = inherit scheduling.routing_fill_factor
 end
+
+GatewayModelConfig(replicas::Int) = GatewayModelConfig(replicas, :inherit, 0.0)
 
 struct GatewayConfig
     listen_grpc::String
@@ -36,6 +42,27 @@ struct GatewayConfig
     # LPT packing requires worker FIFO discipline and all models on all workers (checked at startup).
     # The remaining knobs apply to lpt_packing only.
     scheduling_mode::String                 # "round_robin" | "least_outstanding" | "lpt_packing"
+    # How much in-flight work a request counts as, wherever the gateway asks which replica or worker
+    # is least busy. Two mechanisms consult it: the `least_outstanding` mode's per-worker counter, and
+    # `lpt_packing`'s `fill_least` policy (the per-worker load that decides where a fresh run opens).
+    #   "compute"  (default) GPU-seconds: a request charges its item count times the model's
+    #              worker-measured cost per item. The only basis comparable across models of
+    #              different cost, and the only one that is right when clients pre-batch.
+    #   "items"    items. No cost measurement needed; correct for a fleet of like-cost models. Note
+    #              that `fill_least` compares one worker's load across ALL models, where dropping the
+    #              cost weighting makes a cheap model's items look as expensive as a costly model's.
+    #   "requests" the per-request denominator each mechanism used before this knob existed: a raw
+    #              count for `least_outstanding`, and the model's measured cost per REQUEST for
+    #              `fill_least` (which keeps its cross-model cost weighting). Blind to batch size
+    #              either way, so a pre-batching client defeats the balancing. Set this to pin the
+    #              pre-knob behavior exactly.
+    # `compute` and `items` need each model's batch axis and cost, which the gateway learns from a
+    # ModelControlStatus poll on each prober round; under `least_outstanding` that is one extra RPC
+    # per worker per tick, while `lpt_packing` already polls. Both degrade to counting requests for a
+    # model with no batch axis (a meta, an unbatched model) or before the first successful poll, and
+    # `compute` falls back to the fleet-mean cost per item for an unmeasured model, so no basis ever
+    # routes on zeros.
+    work_basis::String                      # "compute" | "items" | "requests"
     # Repack cadence is driven by accumulated fleet compute, not wall-clock: a repack fires once the
     # fleet has consumed `rebalance_compute_seconds` GPU-seconds since the last one. The first
     # tick-driven repack can use a separate, typically smaller, budget so an early rebalance corrects
@@ -63,14 +90,34 @@ struct GatewayConfig
     # before moving on; >1 over-provisions to keep the next batch queued). `routing_policy` selects
     # where a new batch starts (both variants still concentrate to fill one replica's batch before the
     # next; they differ only in which replica a fresh batch opens on):
-    #   "fill_rr"     round-robins the starting replica across the model's set (default).
-    #   "fill_least"  starts on the replica with the least in-flight compute load (in-flight
-    #                 requests weighted by the model's measured per-request cost), so a model's
-    #                 batches open on whichever GPU is least busy across all models.
+    #   "fill_least"  (default) starts on the replica whose worker carries the least in-flight work,
+    #                 so a model's batches open on whichever GPU is least busy across all models.
+    #                 What "work" means is `work_basis` above (GPU-seconds by default).
+    #   "fill_rr"     round-robins the starting replica across the model's set: load-blind and
+    #                 exactly even, which is what you want only when every model on the fleet costs
+    #                 about the same and no worker is shared with anything else.
     # Spreading every request without concentration is the separate `least_outstanding` scheduling
     # mode (see scheduling_mode above), not a routing policy.
     routing_fill_factor::Float64
     routing_policy::String
+    # What the fill quantum counts, i.e. when the gateway stops sending a model's requests to the
+    # replica it is currently filling. The fleet default; `scheduling.models.<name>.fill_mode`
+    # overrides it per model.
+    #   "run"      (default) the quantum is a run length in requests ROUTED to the replica. The
+    #              model's GPUs serve it in turn: batches stay deep and every replica gets an even
+    #              share at any concurrency.
+    #   "spread"   equalize in-flight requests across the replica set, so all k GPUs serve the model
+    #              concurrently. Lowest latency for a latency-bound model whose client concurrency is
+    #              well below its max batch, at the cost of coalescing depth.
+    #   "inflight" the legacy basis: the quantum counts requests IN FLIGHT on the replica.
+    #              WARNING: a model whose in-flight concurrency stays between 2 and the quantum and
+    #              never drains to zero is served by ONE replica indefinitely and the others receive
+    #              no traffic at all (with max_batch 32 and a client holding 4 requests in flight, the
+    #              second GPU receives zero requests for the life of the process). Closed-loop clients
+    #              hit this reliably. Diagnose with `gateway_replica_routed_total`: a flat series on
+    #              one replica of a multi-replica model is the signature. Use it only to reproduce
+    #              the pre-`run` behavior.
+    routing_fill_mode::String
     models::Dict{String,GatewayModelConfig}
     # Concurrency limits. `max_concurrent_streams_per_worker` is the outbound cap: the in-flight
     # gRPC streams the gateway will multiplex over one worker's shared libcurl handle (the rest block
@@ -105,6 +152,7 @@ const GW_ENV_PATHS = Tuple{String,Vector{String},DataType}[
     ("LISTEN_GRPC", ["listen", "grpc"], String),
     ("LISTEN_METRICS", ["listen", "metrics"], String),
     ("SCHEDULING_MODE", ["scheduling", "mode"], String),
+    ("SCHEDULING_WORK_BASIS", ["scheduling", "work_basis"], String),
     ("SCHEDULING_REBALANCE_COMPUTE_SECONDS", ["scheduling", "rebalance_compute_seconds"], Float64),
     ("SCHEDULING_FIRST_REBALANCE_COMPUTE_SECONDS", ["scheduling", "first_rebalance_compute_seconds"], Float64),
     ("SCHEDULING_MAX_WORKER_SHARE", ["scheduling", "max_worker_share"], Float64),
@@ -114,6 +162,7 @@ const GW_ENV_PATHS = Tuple{String,Vector{String},DataType}[
     ("SCHEDULING_DEFAULT_REPLICAS", ["scheduling", "default_replicas"], String),
     ("SCHEDULING_ROUTING_FILL_FACTOR", ["scheduling", "routing_fill_factor"], Float64),
     ("SCHEDULING_ROUTING_POLICY", ["scheduling", "routing_policy"], String),
+    ("SCHEDULING_ROUTING_FILL_MODE", ["scheduling", "routing_fill_mode"], String),
     ("SCHEDULING_COMPACTION_MODE", ["scheduling", "compaction_mode"], String),
     ("SCHEDULING_COMPACTION_INTERVAL", ["scheduling", "compaction_interval"], Int),
     ("WORKER_CLIENT_REQUEST_TIMEOUT_SECONDS", ["worker_client", "request_timeout_seconds"], Int),
@@ -230,11 +279,9 @@ function _build_gateway_config(raw::Dict{String,Any})
     scheduling_mode = lowercase(strip(_opt(sched, "mode", String, "round_robin")))
     scheduling_mode in ("round_robin", "least_outstanding", "lpt_packing") ||
         throw(ConfigError("scheduling.mode must be 'round_robin', 'least_outstanding', or 'lpt_packing', got '$scheduling_mode'"))
-    routing_policy = lowercase(strip(_opt(sched, "routing_policy", String, "fill_rr")))
-    routing_policy == "least_outstanding" &&
-        throw(ConfigError("scheduling.routing_policy no longer accepts 'least_outstanding'; it is now a top-level scheduling mode. Set scheduling.mode: least_outstanding instead."))
-    routing_policy in ("fill_rr", "fill_least") ||
-        throw(ConfigError("scheduling.routing_policy must be 'fill_rr' or 'fill_least', got '$routing_policy'"))
+    work_basis = String(_parse_work_basis(_opt(sched, "work_basis", String, "compute")))
+    routing_policy = String(_parse_routing_policy(_opt(sched, "routing_policy", String, "fill_least")))
+    routing_fill_mode = String(_parse_fill_mode(_opt(sched, "routing_fill_mode", String, "run")))
     compaction_mode = _parse_gateway_compaction_mode(_opt(sched, "compaction_mode", String, "eager"))
 
     cfg = GatewayConfig(
@@ -249,6 +296,7 @@ function _build_gateway_config(raw::Dict{String,Any})
         _opt(logging, "level", String, "info"),
         _opt(logging, "format", String, "json"),
         scheduling_mode,
+        work_basis,
         _opt(sched, "rebalance_compute_seconds", Float64, 300.0),
         _opt(sched, "first_rebalance_compute_seconds", Float64, 60.0),
         _opt(sched, "max_worker_share", Float64, 0.8),
@@ -257,6 +305,7 @@ function _build_gateway_config(raw::Dict{String,Any})
         _parse_replicas(get(sched, "default_replicas", 1), "scheduling.default_replicas"),
         _opt(sched, "routing_fill_factor", Float64, 1.0),
         routing_policy,
+        routing_fill_mode,
         _parse_gateway_sched_models(sched),
         _opt(wc, "max_concurrent_streams", Int, 32),
         _opt(grpc, "max_concurrent_requests_per_worker", Int, 64),
@@ -271,13 +320,18 @@ function _build_gateway_config(raw::Dict{String,Any})
     cfg.max_concurrent_requests_per_worker == 0 ||
         cfg.max_concurrent_requests_per_worker > cfg.max_concurrent_streams_per_worker ||
         @warn "gateway inbound cap per worker is not above the outbound stream limit; a burst may shed before workers saturate" inbound_per_worker = cfg.max_concurrent_requests_per_worker outbound_streams = cfg.max_concurrent_streams_per_worker
-    cfg.rebalance_compute_seconds > 0 || throw(ConfigError("scheduling.rebalance_compute_seconds must be positive"))
-    cfg.first_rebalance_compute_seconds >= 0 || throw(ConfigError("scheduling.first_rebalance_compute_seconds must be non-negative (0 = use rebalance_compute_seconds)"))
+    # Scheduling bounds, through the shared checks above so the runtime control path enforces the
+    # identical range. The return values are discarded here: the fields are already built and these
+    # calls exist for their throw.
+    _ck_positive("scheduling.rebalance_compute_seconds", cfg.rebalance_compute_seconds)
+    _ck_nonneg("scheduling.first_rebalance_compute_seconds", cfg.first_rebalance_compute_seconds;
+               hint = "0 = use rebalance_compute_seconds")
     0 < cfg.max_worker_share <= 1 || throw(ConfigError("scheduling.max_worker_share must be in (0, 1]"))
-    0 <= cfg.hysteresis < 1 || throw(ConfigError("scheduling.hysteresis must be in [0, 1)"))
-    cfg.ema_halflife_compute_seconds >= 0 || throw(ConfigError("scheduling.ema_halflife_compute_seconds must be non-negative (0 = use rebalance_compute_seconds)"))
-    cfg.routing_fill_factor > 0 || throw(ConfigError("scheduling.routing_fill_factor must be positive"))
-    cfg.compaction_interval >= 0 || throw(ConfigError("scheduling.compaction_interval must be non-negative (0 = disabled)"))
+    _ck_unit("scheduling.hysteresis", cfg.hysteresis)
+    _ck_nonneg("scheduling.ema_halflife_compute_seconds", cfg.ema_halflife_compute_seconds;
+               hint = "0 = use rebalance_compute_seconds")
+    _ck_positive("scheduling.routing_fill_factor", cfg.routing_fill_factor)
+    _ck_nonneg_int("scheduling.compaction_interval", cfg.compaction_interval; hint = "0 = disabled")
 
     if !isempty(_opt(tls, "cert_file", String, "")) || !isempty(_opt(tls, "key_file", String, ""))
         @warn "gateway TLS is configured but not yet enforced; serving cleartext h2c"
@@ -288,12 +342,79 @@ function _build_gateway_config(raw::Dict{String,Any})
     return cfg
 end
 
+# Shared bound checks for the scheduling knobs. These are the single authority for what a knob
+# accepts, called both by `gateway.yml` validation below and by the runtime control path
+# (`apply_updates` in knobs.jl), so the two can never drift on a bound. Each coerces and returns the
+# value, or throws `ConfigError` naming the offending key; `hint` spells out the meaning of a
+# boundary value where one exists (e.g. "0 = use rebalance_compute_seconds").
+_ck_hint(h::AbstractString) = isempty(h) ? "" : " ($h)"
+
+function _ck_positive(key::AbstractString, v; hint::AbstractString="")
+    x = Float64(v)
+    x > 0 || throw(ConfigError("$key must be positive$(_ck_hint(hint)), got $x"))
+    return x
+end
+
+function _ck_nonneg(key::AbstractString, v; hint::AbstractString="")
+    x = Float64(v)
+    x >= 0 || throw(ConfigError("$key must be non-negative$(_ck_hint(hint)), got $x"))
+    return x
+end
+
+# Half-open [0, 1): a hysteresis of 1 would mean "never move", which is `mode: round_robin` with
+# extra steps, so it is rejected rather than silently freezing the packer.
+function _ck_unit(key::AbstractString, v; hint::AbstractString="")
+    x = Float64(v)
+    0 <= x < 1 || throw(ConfigError("$key must be in [0, 1)$(_ck_hint(hint)), got $x"))
+    return x
+end
+
+function _ck_nonneg_int(key::AbstractString, v; hint::AbstractString="")
+    x = Int(v)
+    x >= 0 || throw(ConfigError("$key must be non-negative$(_ck_hint(hint)), got $x"))
+    return x
+end
+
 function _parse_gateway_compaction_mode(s)
     ls = lowercase(strip(s))
     ls == "off" && return :off
     ls == "eager" && return :eager
     ls == "scheduled" && return :scheduled
     throw(ConfigError("scheduling.compaction_mode must be 'off', 'eager', or 'scheduled', got '$s'"))
+end
+
+# Where a fresh batch opens within a model's replica set. Returns a Symbol; `GatewayConfig` keeps the
+# string form, so the hot path compares interned symbols while the config surface stays YAML-shaped.
+function _parse_routing_policy(s)
+    ls = lowercase(strip(String(s)))
+    # `least_outstanding` was briefly a routing policy before becoming a top-level scheduling mode;
+    # name the migration rather than reporting it as an unknown value.
+    ls == "least_outstanding" &&
+        throw(ConfigError("scheduling.routing_policy no longer accepts 'least_outstanding'; it is now a top-level scheduling mode. Set scheduling.mode: least_outstanding instead."))
+    ls in ("fill_rr", "fill_least") ||
+        throw(ConfigError("scheduling.routing_policy must be 'fill_rr' or 'fill_least', got '$s'"))
+    return Symbol(ls)
+end
+
+# What counts as one unit of in-flight work, for every mechanism that routes to the least busy target.
+# Returns a Symbol; `GatewayConfig` keeps the string form, so the hot path compares interned symbols
+# while the config surface stays YAML-shaped.
+function _parse_work_basis(s)
+    ls = lowercase(strip(String(s)))
+    ls in ("compute", "items", "requests") ||
+        throw(ConfigError("scheduling.work_basis must be 'compute', 'items', or 'requests', got '$s'"))
+    return Symbol(ls)
+end
+
+# What the per-replica fill quantum counts. `run` counts requests routed to the current replica,
+# `spread` equalizes in-flight work across the replica set, and `inflight` is the legacy basis that
+# counts requests in flight. `inherit` is accepted only in a per-model override.
+function _parse_fill_mode(s; allow_inherit::Bool=false)
+    ls = lowercase(strip(String(s)))
+    allow_inherit && ls == "inherit" && return :inherit
+    ls in ("run", "spread", "inflight") ||
+        throw(ConfigError("fill mode must be 'run', 'spread', or 'inflight'$(allow_inherit ? " or 'inherit'" : ""), got '$s'"))
+    return Symbol(ls)
 end
 
 # Parse a replica count: a positive integer, or the string "all" (every ready worker, stored as
@@ -325,7 +446,11 @@ function _parse_gateway_sched_models(sched::AbstractDict)
     for (name, v) in raw
         key = "scheduling.models.$name"
         v isa AbstractDict || throw(ConfigError("$key must be a mapping"))
-        out[String(name)] = GatewayModelConfig(_parse_replicas(get(v, "replicas", 1), "$key.replicas"))
+        fm = haskey(v, "fill_mode") ?
+             _parse_fill_mode(v["fill_mode"]; allow_inherit = true) : :inherit
+        ff = haskey(v, "fill_factor") ? _ck_positive("$key.fill_factor", v["fill_factor"]) : 0.0
+        out[String(name)] = GatewayModelConfig(_parse_replicas(get(v, "replicas", 1), "$key.replicas"),
+                                               fm, ff)
     end
     return out
 end

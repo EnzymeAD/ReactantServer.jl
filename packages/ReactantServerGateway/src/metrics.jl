@@ -19,6 +19,8 @@ struct GatewayMetrics
     model_utilization::Prometheus.Family{Prometheus.Gauge}
     model_replicas::Prometheus.Family{Prometheus.Gauge}
     replica_outstanding::Prometheus.Family{Prometheus.Gauge}
+    model_fill_quantum::Prometheus.Family{Prometheus.Gauge}
+    repacks_total::Prometheus.Family{Prometheus.Counter}
     worker_metrics_up::Prometheus.Family{Prometheus.Gauge}
     # Maps a worker endpoint url (gRPC or metrics) to its friendly name (worker0..N), so every
     # worker-labelled gateway series matches the workers' own self-tagged `worker` label instead of
@@ -59,15 +61,25 @@ function GatewayMetrics(worker_names::Dict{String,String} = Dict{String,String}(
         (:model,); registry = reg)
     replica_outstanding = Prometheus.Family{Prometheus.Gauge}(
         "gateway_replica_outstanding",
-        "In-flight requests routed to a model's replica on a worker, sampled at the last repack.",
+        "In-flight ITEMS on a model's replica: the summed batch size of the requests in flight, " *
+        "not a request count. Equals the request count for a client whose requests all carry one item.",
         (:model, :worker); registry = reg)
+    model_fill_quantum = Prometheus.Family{Prometheus.Gauge}(
+        "gateway_model_fill_quantum",
+        "Effective per-replica fill quantum for a model (requests; what routing_fill_mode counts).",
+        (:model,); registry = reg)
+    repacks_total = Prometheus.Family{Prometheus.Counter}(
+        "gateway_repacks_total",
+        "LPT-packing repacks by what triggered them (startup, compute budget, or operator).",
+        (:trigger,); registry = reg)
     worker_metrics_up = Prometheus.Family{Prometheus.Gauge}(
         "gateway_worker_metrics_up",
         "1 if the worker's metrics endpoint answered the most recent aggregated scrape, else 0.",
         (:worker,); registry = reg)
     return GatewayMetrics(reg, requests_total, request_latency, worker_latency,
         routing_table_size, worker_ready, placement_weight, model_utilization,
-        model_replicas, replica_outstanding, worker_metrics_up, worker_names)
+        model_replicas, replica_outstanding, model_fill_quantum, repacks_total,
+        worker_metrics_up, worker_names)
 end
 
 # Friendly name (worker0..N) for a worker endpoint url; identity if no name was supplied for it.
@@ -98,6 +110,12 @@ set_model_replicas!(m::GatewayMetrics, model, k) =
 
 set_replica_outstanding!(m::GatewayMetrics, model, worker, n) =
     Prometheus.set(Prometheus.labels(m.replica_outstanding, (String(model), _wname(m, worker))), Float64(n))
+
+set_model_fill_quantum!(m::GatewayMetrics, model, q) =
+    Prometheus.set(Prometheus.labels(m.model_fill_quantum, (String(model),)), Float64(q))
+
+inc_repacks!(m::GatewayMetrics, trigger) =
+    Prometheus.inc(Prometheus.labels(m.repacks_total, (String(trigger),)))
 
 # Reads the gRPC server's live admission counters at scrape time: in-flight RPCs, the cumulative
 # count shed at the inbound concurrency cap, and the configured cap (0 = uncapped). Holds only

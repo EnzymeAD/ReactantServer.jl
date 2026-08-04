@@ -6,8 +6,57 @@
 import gRPCServer
 import gRPCClient
 import HTTP
+import ProtoBuf as TPB
 
 const GWInf = ReactantServerCore.inference
+
+@testset "peek_batch_size: item count by input name and axis" begin
+    enc(msg) = (io = IOBuffer(); TPB.encode(TPB.ProtoEncoder(io), msg); take!(io))
+    tensor(name, shape) = GWInf.var"ModelInferRequest.InferInputTensor"(;
+        name = name, datatype = "UINT8", shape = Int64[shape...])
+    peek = ReactantServerGateway.peek_batch_size
+
+    # A detector-shaped request: `whcn` puts the batch LAST, so position 0 would report the image
+    # width. The worker tells the gateway the axis precisely so this cannot be guessed wrong.
+    det = enc(GWInf.ModelInferRequest(; model_name = "det", id = "r1",
+                                      inputs = [tensor("INPUT__0", (1024, 768, 3, 2))],
+                                      raw_input_contents = [rand(UInt8, 512 * 1024)]))
+    @test peek(det, "INPUT__0", 4) == 2        # the declared batch axis
+    @test peek(det, "INPUT__0", 1) == 1024     # what a first-axis assumption would have charged
+
+    # A cross-encoder-shaped request: the FIRST input carries no batch axis at all, and the batch
+    # lives on the second one. Matching by name is what makes this work.
+    xenc = enc(GWInf.ModelInferRequest(; model_name = "xe",
+                                       inputs = [tensor("query", (37,)),
+                                                 tensor("keys", (12, 37)),
+                                                 tensor("key_lens", (12,))]))
+    @test peek(xenc, "keys", 1) == 12
+    @test peek(xenc, "key_lens", 1) == 12
+
+    # Inputs may arrive in any order: KServe tensors are name-addressed.
+    shuffled = enc(GWInf.ModelInferRequest(; model_name = "xe",
+                                           inputs = [tensor("key_lens", (5,)),
+                                                     tensor("keys", (5, 9)),
+                                                     tensor("query", (9,))]))
+    @test peek(shuffled, "keys", 1) == 5
+
+    # Inline contents rather than raw: the shape is field 3 and the data field 5 within the tensor,
+    # so it is still reached without decoding the payload.
+    inline = GWInf.var"ModelInferRequest.InferInputTensor"(;
+        name = "x", datatype = "FP32", shape = Int64[4, 8],
+        contents = GWInf.InferTensorContents(; fp32_contents = Float32[1:32;]))
+    @test peek(enc(GWInf.ModelInferRequest(; model_name = "m", inputs = [inline])), "x", 2) == 8
+
+    # Degenerate cases all report 0, which the caller charges as a single item: no such input, an
+    # axis past the end of the shape, an empty name, and a non-positive axis.
+    @test peek(det, "nope", 1) == 0
+    @test peek(det, "INPUT__0", 9) == 0
+    @test peek(det, "", 1) == 0
+    @test peek(det, "INPUT__0", 0) == 0
+
+    # model_name and id still come out of their own peek, untouched by any of this.
+    @test ReactantServerGateway.peek_model_name_and_id(det) == ("det", "r1")
+end
 
 mutable struct MockWorker
     name::String

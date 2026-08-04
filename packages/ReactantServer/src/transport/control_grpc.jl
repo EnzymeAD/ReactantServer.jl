@@ -40,7 +40,14 @@ function _handle_model_control_status(ctx::InferContext)
                   total_compute_seconds = m.total_compute,
                   requests_served = UInt64(m.requests_served),
                   dispatch_count = UInt64(m.dispatch_count),
-                  max_batch_size = Int64(m.max_batch_size))
+                  max_batch_size = Int64(m.max_batch_size),
+                  # Routing metadata: where the batch axis is, and the row counter that turns
+                  # total_compute_seconds into a cost per ITEM rather than per request. A gateway
+                  # that routes by work needs both; omitting either silently degrades it to
+                  # counting requests, which is indistinguishable from working.
+                  batch_input_name = String(m.batch_input_name),
+                  batch_axis = Int64(m.batch_axis),
+                  rows_served = UInt64(m.rows_served))
               for (name, m) in snap.models]
     return _CTRL.ModelControlStatusResponse(;
         residency_mode = (snap.residency_mode == SELF_MANAGED ? "self_managed" : "externally_managed"),

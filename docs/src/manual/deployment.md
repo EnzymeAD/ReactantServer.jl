@@ -152,8 +152,10 @@ following before exposing any endpoint:
 - All gRPC traffic (worker and gateway) is cleartext h2c. TLS settings are parsed by the gateway
   config but not yet enforced; a configured cert triggers a startup warning.
 - There is no authentication or authorization on the KServe data plane, the worker control-plane
-  RPCs (residency and policy), or the Prometheus metrics listener (which binds `0.0.0.0:8002` by
-  default).
+  RPCs (residency and policy), the gateway's own scheduling control plane (`GatewayControlService`,
+  which can repack the fleet and change a model's replica count and routing at runtime), or the
+  Prometheus metrics listener (which binds `0.0.0.0:8002` by default). The control plane is mutating,
+  so treat access to the gRPC ports as administrative access.
 - Model bundles are trusted input: a bundle's optional `model.jl` executes arbitrary Julia in the
   server process. Only serve bundles you built or audited.
 - POSIX shared memory is a local trust boundary. Client-registered regions and the optional

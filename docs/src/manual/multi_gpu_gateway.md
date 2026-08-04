@@ -36,8 +36,11 @@ gRPC-to-gRPC pass-through that never re-marshals the body.
   is ready when at least one worker reports ready.
 - **Raw passthrough:** the `ModelInfer` hot path never decodes or re-marshals the protobuf body.
   The request and response types are `Vector{UInt8}` end to end (gRPCServer.jl and gRPCClient.jl
-  support raw byte messages natively). To route, the gateway decodes a partial schema that
-  declares only `model_name` (field 1) and `id` (field 3); ProtoBuf skips the tensor payload.
+  support raw byte messages natively). To route, the gateway decodes a partial schema declaring only
+  `model_name` (field 1) and `id` (field 3). Under `lpt_packing` a second partial decode reads one
+  named tensor's shape to size the request in items (see the fill quantum below). ProtoBuf seeks past
+  everything else, including every tensor payload; shapes precede the data on the wire, so neither
+  decode touches it.
 - **SHM broadcast:** `SystemSharedMemoryRegister` / `Unregister` are fanned out to every worker.
   POSIX SHM regions are host-local; every worker attaches via `shm_open` independently. Register
   succeeds only if all workers succeed (it rolls back partial success); unregister succeeds if
@@ -60,40 +63,101 @@ The gateway routes each model's requests across its replicas according to `sched
 ```yaml
 scheduling:
   mode: lpt_packing             # round_robin (default) | least_outstanding | lpt_packing
+  work_basis: compute           # compute (default) | items | requests  (what "least busy" measures,
+                                #   for least_outstanding and for fill_least; see below)
   rebalance_compute_seconds: 300 # fleet GPU-seconds consumed that triggers a repack
   first_rebalance_compute_seconds: 60 # smaller budget for the first repack (0 = use rebalance_compute_seconds)
   ema_halflife_compute_seconds: 0 # demand-EMA halflife in fleet compute-seconds (0 = track rebalance_compute_seconds)
   hysteresis: 0.0               # extra improvement required before a model moves workers (0 = move on any gain)
   default_replicas: 1           # GPUs per model unless overridden below (a number, or "all")
-  routing_fill_factor: 1.0      # per-replica fill target as a multiple of max batch size (lpt_packing only)
-  routing_policy: fill_rr       # fill_rr (default) | fill_least  (lpt_packing only)
+  routing_fill_factor: 1.0      # fill quantum as a multiple of max batch size (lpt_packing only)
+  routing_policy: fill_least    # fill_least (default) | fill_rr  (lpt_packing only)
+  routing_fill_mode: run        # run (default) | spread | inflight  (what the quantum counts;
+                                #   `inflight` can park a model on one GPU, see the warning below)
   forbid_memory_oversubscription: true # never strand a model on-demand when it could fit resident (default on)
   compaction_mode: eager        # eager (default) | off | scheduled  (defragment workers after a repack)
   compaction_interval: 1        # repacks between compactions; 0 disables  (see On-demand Weights)
   models:
     big-model:
       replicas: 2               # this model is placed on 2 distinct GPUs (a number, or "all")
+      fill_mode: spread         # optional per-model override of routing_fill_mode
+      fill_factor: 0.5          # optional per-model override of routing_fill_factor
 ```
+
+Every setting in this block except `mode` can also be changed while the gateway runs, through its own
+gRPC control plane; see [Runtime scheduling control](#Runtime-scheduling-control) below.
 
 **`round_robin`** (the default) spreads each model's requests uniformly across its replicas.
 It is fully predictable from the config file and needs no measurements, at the cost of thin
 per-worker queues: when every model is on every worker, each worker sees a slice of every
 model's traffic, so coalesced batches rarely fill.
 
-**`least_outstanding`** sends each request to the replica with the fewest in-flight requests,
-spreading by live occupancy rather than blindly. Like `round_robin` it needs no measurements and no
-preconditions and does not concentrate traffic, so it favors even spreading over batch coalescing;
-prefer it over `round_robin` when a model's replicas have uneven or unpredictable per-request
-latency, so a slow replica stops attracting new work instead of accumulating a backlog.
+**`least_outstanding`** sends each request to the replica carrying the least in-flight work, spreading
+by live occupancy rather than blindly. Like `round_robin` it needs no preconditions and does not
+concentrate traffic, so it favors even spreading over batch coalescing; prefer it over `round_robin`
+when a model's replicas have uneven or unpredictable per-request latency, so a slow replica stops
+attracting new work instead of accumulating a backlog.
+
+`scheduling.work_basis` decides what "work" means. It is fleet-wide: the same setting denominates
+`least_outstanding`'s per-replica counter and `lpt_packing`'s `fill_least` per-worker load, so there is
+one answer to "what does this fleet call busy".
+
+- **`compute`** (the default) counts in-flight GPU-seconds: each request charges its item count times
+  the model's worker-measured cost per item. This is the only basis that is comparable across models,
+  where 32 items of a cheap model are not 32 items of an expensive one.
+- **`items`** counts in-flight items, so a client that pre-batches is weighed by how much it sent.
+  Correct without any cost measurement when a fleet's models cost about the same per item. Weakest
+  under `fill_least`, which compares one worker's load across *all* models, so dropping the cost
+  weighting makes a cheap model's items look as expensive as a costly model's.
+- **`requests`** is the per-request denominator each mechanism used before this knob existed: a raw
+  count for `least_outstanding`, and the model's measured cost per *request* for `fill_least` (which
+  keeps its cross-model cost weighting). Blind to batch size either way, so a pre-batching client
+  defeats the balancing. Set this to pin the pre-knob behavior exactly.
+
+`compute` and `items` need to know where each model's batch axis is and what an item costs, which the
+gateway learns from a `ModelControlStatus` poll on each health-probe round. Under `least_outstanding`
+that is one extra RPC per worker per tick (`requests` polls nothing); `lpt_packing` already polls.
+
+Under `lpt_packing` the basis is also runtime-mutable, like every other knob in the block: change it
+with `tools/gateway_ctl.jl set-policy work_basis=items` and read it back from `GetSchedulingStatus`,
+so a fleet can be switched and rolled back without a restart. Under `least_outstanding` it is fixed at
+startup, and the startup log line states which basis is in force.
+
+### Models with no batch axis, and metas
+
+Both work bases degrade to one unit per request rather than misreporting, so no model ever routes on
+zeros:
+
+- **A model that declares no batch axis** (`wire_batch_spec` finds none: an unbatched bundle, a model
+  whose inputs are all fixed-shape) counts as one item per request. Its leading dimension names an
+  axis, not a count, so there is nothing to read; under `compute` it still charges its own measured
+  cost, which for such a model is a cost per request.
+- **A model the gateway has not polled yet** counts as one item until the first successful poll, and
+  under `compute` borrows the fleet-mean cost per item, so a cold model weighs like an average one
+  instead of looking free and attracting every request.
+- **A meta** (`kind: meta`) deliberately reports no batch axis and counts one row per request, even
+  when its own `client_inputs` declare a batch axis. The two halves go together: rows equal requests,
+  so a meta's cost per item equals its cost per request, and a work-routing gateway charges a meta its
+  whole measured cost. Reporting an axis without also counting rows would charge N times the
+  per-request cost; counting rows without reporting an axis would divide the cost by N and then charge
+  one of them.
+
+A meta is also the clearest argument for `compute` over `items`. Its work is data-dependent (a
+detection meta's ROI count varies per image, and its Julia glue is not GPU time at all), so no item
+count predicts it, while under `items` the most expensive thing on the fleet would charge one unit and
+a cheap batched model would charge 32. Note that a meta's `total_compute` counts its sub-call GPU time
+only, and its sub-models are folded into it and hidden from the gateway, so that time is counted once
+rather than double counted.
 
 **`lpt_packing`** places each model on a fixed number of distinct GPUs and routes its requests
 to preserve batch fill. A model's replica count is operator-controlled: `default_replicas`
 (default 1, the single-GPU case that coalesces best), overridable per model under
 `scheduling.models.<name>.replicas`. Both accept a positive integer or `all`, which places the
 model on every ready worker (so `default_replicas: all` replicates the whole model set across all
-GPUs without listing each model, and tracks the fleet as workers come and go). The count is set at
-startup and never grows automatically under load; a hot model relies on its worker's queue and
-coalescing rather than fanning out.
+GPUs without listing each model, and tracks the fleet as workers come and go). The count never grows
+*automatically* under load, so a hot model relies on its worker's queue and coalescing rather than
+fanning out on its own; an operator can promote one at any time with `SetModelPlacement`, effective at
+the next repack.
 
 !!! warning "Replication is the operator's responsibility"
     The gateway does not check that a replica count is feasible for your hardware. Replicating a
@@ -140,27 +204,76 @@ then later repacks use the larger steady-state budget to limit memory churn (`0`
 repack uses `rebalance_compute_seconds` like the rest). An idle fleet does not repack until traffic
 resumes.
 
-For a model with more than one replica, the gateway routes to fill one replica's batch before
-moving to the next, so the workers receive favorable groupings to coalesce (the coalescing itself
-stays at the worker). It tracks the in-flight request count per replica and keeps sending a model's
-requests to the replica it is currently filling until that replica holds about `routing_fill_factor`
-times the model's max batch size, then opens a fresh batch on another replica. Set
-`routing_fill_factor` above 1.0 to keep the next batch queued so a worker does not go idle between
-dispatches.
+For a model with more than one replica, the gateway concentrates its requests on one replica at a time
+so the workers receive deep same-model groupings to coalesce (the coalescing itself stays at the
+worker). The **fill quantum** `Q` is the model's worker-reported max batch size scaled by
+`routing_fill_factor`, and it is denominated in **items**, not requests. One request carrying a batch
+of 32 and 32 requests carrying one item each are the same amount of work, and both spend a quantum
+of 32.
 
-`routing_policy` (lpt_packing only) decides only *which* replica a fresh batch opens on (both
-variants preserve the fill-one-replica-first behavior above; they differ only at the batch
-boundary):
+The gateway does not guess where a request's items are counted. Each worker reports, per model, the
+**name** of the wire-facing input carrying the batch axis and that tensor's 1-based axis, taken from
+the bundle manifest's reserved `n`/`b` shape marker. The gateway matches that name against the
+request's own name-addressed inputs and reads that one dimension, without decoding the payload. This
+has to come from the manifest: the axis is per tensor and varies between bundles (an image model's
+`whcn` puts it last, a tokenized `nc` puts it first), the first input need not carry one at all (a
+cross-encoder's `query` is unbatched while its `keys` are batched), and it has moved between exports
+of the same model. A model that declares no batch axis counts one item per request.
 
-- **`fill_rr`** (default) round-robins the opening replica across the model's set, so successive
-  batches of the same model spread evenly over its GPUs.
-- **`fill_least`** opens each batch on the replica whose GPU currently carries the least in-flight
-  compute load, measured across *all* models as in-flight requests weighted by each model's
-  measured per-request compute cost. Prefer this when replicas share GPUs with other models, so a
-  model's batches open on whichever of its GPUs is least busy rather than always the same one.
+That matters most for a client that batches on its own behalf. If your client already fills requests to
+the model's max batch size, a request-denominated quantum would hold one replica for 32 *batches* and
+your bursts would land on a single GPU; the item denomination makes one such request close the run.
+Models the worker does not batch (a meta, or a model compiled unbatched, both reporting a max batch of
+0 or 1) charge one unit per request, since their leading dimension names an axis rather than a count.
 
-Spreading every request without concentrating it is the separate `least_outstanding` scheduling
-mode above, not a routing policy.
+`routing_fill_mode` decides what `Q` counts against:
+
+- **`run`** (default) counts items **routed** to the current replica. A run spends `Q` items on one
+  replica, then the next run opens elsewhere, so a model's GPUs serve it in turn: batches stay
+  deep and every replica gets an even share (to within one run) at any concurrency. A run also ends
+  when the model has nothing in flight, so a low-rate model rotates per request instead of committing
+  `Q` in a row, and when a replica falls a whole quantum behind the least-backed-up one, so a slow
+  replica loses its turn rather than accumulating a queue.
+- **`spread`** equalizes **in-flight items** across the replica set, so all `k` GPUs serve the model
+  at once. This is the right mode when your client already batches to the max batch size, because then
+  the worker has nothing left to coalesce and concentration only idles GPUs. This is what promotion means for a latency-bound model whose client concurrency sits well
+  below its max batch; the cost is coalescing depth, since each GPU now batches roughly `1/k` as many
+  requests. Prefer it per model rather than fleet-wide.
+- **`inflight`** is the legacy basis: `Q` counts requests **in flight**, so a replica keeps receiving
+  the model's traffic until it holds a full quantum at once.
+
+!!! warning "`inflight` can park a model on one GPU indefinitely"
+    Because `inflight` compares the quantum against in-flight requests, a replica keeps winning until
+    it holds `Q` of them *simultaneously*. A model whose in-flight concurrency stays between 2 and `Q`
+    and never drains to zero is therefore served by **one** replica for the life of the process, and
+    its other replicas receive no traffic at all. This is not a warm-up transient: with
+    `max_batch = 32` and a client holding 4 requests in flight, the second GPU receives zero requests,
+    forever. Closed-loop clients (a fixed-size worker pool, a benchmark harness) hit this reliably, so
+    promoting such a model to more GPUs under `inflight` buys nothing.
+
+    Diagnose it with `gateway_replica_routed_total`: a flat series on one replica of a multi-replica
+    model is the signature (`gateway_replica_outstanding` cannot show it, because a starved replica
+    reads 0 either way). Use `inflight` only to reproduce the behavior that predated `run`.
+
+`routing_fill_factor` is the direct trade between the two concerns: a model's share is even to within
+one quantum, so a smaller factor balances more finely at the cost of splitting more batches, and a
+larger one commits longer to each replica for deeper batches.
+
+`routing_policy` (lpt_packing only) decides *which* replica each run opens on:
+
+- **`fill_least`** (default) opens each run on the replica whose GPU currently carries the least
+  in-flight work, measured across *all* models and denominated by `work_basis` (in-flight
+  GPU-seconds by default). This is what you want whenever replicas share GPUs with other models: a
+  model's runs open on whichever of its GPUs is least busy rather than always the same one.
+- **`fill_rr`** rotates the opening replica across the model's set, so successive runs of the same
+  model spread evenly over its GPUs. Deliberately load-blind, which is right only when every model on
+  the fleet costs about the same and no GPU is shared with anything else.
+
+Both policies are consulted at every run boundary, and exact ties rotate rather than falling back to
+the worker name, so an idle fleet warms every replica instead of pinning to the lowest-named one.
+
+Spreading every request without concentrating it at all is the separate `least_outstanding` scheduling
+mode above, not a fill mode.
 
 A single-replica model is the degenerate case: all its requests go to its one GPU (and still count
 toward that GPU's load for the `fill_least` decisions of models that share it).
@@ -182,17 +295,76 @@ fleet converges, and a worker that drops out is excluded from placement, its tra
 to the remaining replicas.
 
 The placement is observable: `gateway_model_replicas` reports each model's replica count,
-`gateway_placement_weight` reports its per-worker weight, `gateway_replica_outstanding` reports
-the in-flight requests per replica sampled at the last repack, and `gateway_model_utilization`
-reports its estimated demand in GPU-seconds per second.
+`gateway_placement_weight` reports its per-worker weight, `gateway_replica_outstanding` reports the
+in-flight **items** per replica (summed batch sizes, matching the quantum's denomination; equal to a
+request count when every request carries one item), `gateway_replica_routed_total` counts the
+**requests** routed to each replica since start (the series that shows whether every replica is
+actually being used),
+`gateway_model_fill_quantum` reports each model's effective quantum, `gateway_repacks_total` counts
+repacks by what triggered them, and `gateway_model_utilization` reports each model's estimated demand
+in GPU-seconds per second.
+
+`gateway_worker_inflight_work` reports the per-worker load the router actually compares when it picks
+a replica, so a routing decision can be explained after the fact. It is exported by both work-routing
+mechanisms (`fill_least` under `lpt_packing`, and the `least_outstanding` mode) and carries a `basis`
+label, because the unit follows `work_basis`: GPU-seconds under `compute`, items under `items`, and a
+per-request cost under `requests`. Read it live at scrape time from the scheduler's counters, so it
+never lags a prober tick, and a worker that no longer hosts anything stops being emitted rather than
+freezing at its last value. `round_robin` exports nothing here, since it tracks no load.
+
+The bundled Grafana dashboards use it: **Scheduling & Placement** plots the per-worker load, the
+spread across workers (`max - min`, which is what `fill_least` exists to shrink), and the basis in
+force as the running gateway reports it, and **Fleet Overview** carries the per-worker load alongside
+readiness and device memory. A persistently high spread usually means a model's replicas cannot absorb
+the imbalance (too few replicas, or a single-replica model pinning one GPU) rather than a
+misbehaving policy, so read it next to the placement table.
+
+## Runtime scheduling control
+
+The gateway answers its own gRPC service, `reactant_control.GatewayControlService`, on the same port
+it serves inference. It exposes the live scheduling state and lets an operator retune it without a
+restart:
+
+| RPC | Purpose |
+| --- | --- |
+| `GetSchedulingStatus` | The mode, every runtime knob, repack bookkeeping, and one row per model and per worker (placement, in-flight and routed counts, resolved fill mode and quantum, measured demand and cost, assigned weights against each worker's budget). Answers in every scheduling mode. |
+| `SetSchedulingPolicy` | Change any knob in the `scheduling:` block except `mode`. `update_mask` names the fields to apply; one invalid value rejects the whole request and nothing changes. |
+| `SetModelPlacement` | Set, change, or clear one model's `replicas`, `fill_mode`, and `fill_factor`. The three are independent, so one call can promote a model and change how it uses its GPUs. Effective at the next repack. |
+| `Repack` | Repack now, bypassing the accumulated-compute budget, optionally waiting a bounded time for it to land. |
+
+`tools/gateway_ctl.jl` is the operator front end:
+
+```console
+julia --project=packages/ReactantServerGateway tools/gateway_ctl.jl --gateway HOST:8001 status
+... set-replicas big-model 2 --fill-mode spread
+... repack --wait 30
+... set-policy hysteresis=0.15 routing_policy=fill_least compaction_interval=4
+```
+
+`grpcurl -plaintext -proto proto_src/reactant_control_v1.proto ...` works too, with no Julia
+installed.
+
+!!! warning "Runtime changes are not persisted, and there is no authentication"
+    Every override lives in memory only: a gateway restart reverts it to `gateway.yml` plus the
+    environment, and restart is not hypothetical (the gateway deliberately exits on a wedged client
+    stack, expecting its supervisor to bring it back). Treat these RPCs as a way to try a setting or
+    respond to an incident, and write anything you want to keep into `gateway.yml`.
+    `SchedulingPolicy.generation` reads 0 while every knob still matches the config file and is bumped
+    by each accepted change, so you can tell a tuned gateway from a fresh one, and each accepted change
+    is logged with its before and after values, which is the only durable record of it. Like the rest
+    of the control plane these RPCs are unauthenticated (see [Deployment](deployment.md)), so the
+    gateway's gRPC port must not be exposed outside the trusted network.
 
 ## What the gateway does not do
 
 - Streaming RPCs.
 - The repository / model-config / statistics / trace / log RPCs in the Triton spec, plus
-  `ServerLive`, `ServerReady`, `ModelMetadata`, and `RepositoryIndex` for clients (only
-  `ModelInfer`, the two SHM register/unregister RPCs, and `IsSameIPCNamespace` are proxied;
-  everything else returns `UNIMPLEMENTED`).
+  `ServerLive`, `ServerReady`, `ModelMetadata`, and `RepositoryIndex` for clients. Of the KServe data
+  plane only `ModelInfer`, the two SHM register/unregister RPCs, and `IsSameIPCNamespace` are
+  proxied; everything else returns `UNIMPLEMENTED`. On the control plane the gateway answers
+  `ControlService/CompactMemory` (fanned out to every worker) and all four
+  `GatewayControlService` RPCs itself (see [Runtime scheduling control](#Runtime-scheduling-control));
+  the other `ControlService` RPCs are worker-only.
 - TLS: parsed but not yet enforced; the listener and the worker back-hop are cleartext h2c.
 - CUDA shared memory.
 - Dynamic worker membership: the worker endpoint list is fixed at startup (from `gateway.yml`
@@ -207,11 +379,22 @@ The supervisor configures the embedded gateway for you: it synthesizes the worke
 about model placement is configured on the gateway; it autodiscovers which models each worker
 serves via `RepositoryIndex` and refreshes its routing table periodically.
 
-To tune the gateway, provide a `gateway.yml` and point `REACTANT_GATEWAY_FILE` at it (or, for the
-embedded gateway, set the `REACTANT_GATEWAY_*` environment below); it carries the gateway's own
+To tune the gateway, provide a `gateway.yml` and point `REACTANT_GATEWAY_FILE` at it (or leave it at
+the conventional `/etc/reactantserver/gateway.yml`, which the supervisor picks up automatically; or,
+for the embedded gateway, set the `REACTANT_GATEWAY_*` environment below); it carries the gateway's own
 settings (listen addresses, message limits, logging, and the `scheduling:` block above). Settings can also be overridden by
 environment with the prefix `REACTANT_GATEWAY_` and the dotted path uppercased with underscores,
 e.g. `REACTANT_GATEWAY_LOGGING_LEVEL=debug` or `REACTANT_GATEWAY_SCHEDULING_MODE=lpt_packing`.
+
+!!! note "A mounted `gateway.yml` owns the endpoint list"
+    Per-model settings (`scheduling.models.<name>`) are the one part of the config with no
+    environment equivalent, since the overrides only reach scalar keys, so promoting a single model
+    requires a file. When the supervisor finds one it stops synthesizing the worker lists, because the
+    file is now the authority: the file must therefore carry `endpoints:` itself, plus
+    `metrics_endpoints:` and `worker_names:` if you want the aggregated `/metrics` and the
+    `worker0..N` labels the Grafana dashboards join on. The startup wait is *not* suppressed (it
+    describes the supervisor's own co-launched workers, not gateway configuration), so an
+    lpt_packing node still waits for its workers to finish compiling rather than crash-looping.
 
 ## Operational notes
 
