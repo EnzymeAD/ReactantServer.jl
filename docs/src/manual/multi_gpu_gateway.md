@@ -315,7 +315,13 @@ freezing at its last value. `round_robin` exports nothing here, since it tracks 
 The bundled Grafana dashboards use it: **Scheduling & Placement** plots the per-worker load, the
 spread across workers (`max - min`, which is what `fill_least` exists to shrink), and the basis in
 force as the running gateway reports it, and **Fleet Overview** carries the per-worker load alongside
-readiness and device memory. A persistently high spread usually means a model's replicas cannot absorb
+readiness and device memory.
+
+For whether the routing actually produced an even result, as opposed to what the router intended, the
+**GPU Work Balance** dashboard is the one to read. It is built on `rate(worker_compute_seconds_total)`
+per worker, the device-seconds each GPU really consumed, and leads with the spread of that rate across
+devices (0% is even). Its planned-vs-actual panel is the diagnostic that separates a skewed *plan*
+(a repack or a replica count is the lever) from routing not following an even plan. A persistently high spread usually means a model's replicas cannot absorb
 the imbalance (too few replicas, or a single-replica model pinning one GPU) rather than a
 misbehaving policy, so read it next to the placement table.
 
