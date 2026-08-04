@@ -839,7 +839,10 @@ function route_replica(s::LptPackingState, model::AbstractString, units::Integer
         run === nothing && (run = FillRun())
         # Read lazily: only the fill_least paths need it, and reading per candidate avoids the
         # Vector{Float64} this function used to allocate on every multi-replica request.
-        wload_of(i) = (wa = get(wload_snap, workers[i], nothing); wa === nothing ? 0.0 : wa[])
+        # QUANTIZED, because the exact-tie rotation below depends on equal loads comparing equal, and
+        # float loads do not return to exactly 0.0: a worker's charges are added and subtracted in
+        # different orders, so an idle worker retains a couple of ulp
+        wload_of(i) = (wa = get(wload_snap, workers[i], nothing); wa === nothing ? 0 : _load_key(wa[]))
         rot(i) = mod(i - 1 - run.cursor, n)       # 0-based distance from the rotation cursor
 
         chosen = 0
@@ -913,7 +916,10 @@ function _release_route!(counters)
     # The captured `units` and `weight` are subtracted, not recomputed: a repack between reservation
     # and release changes both, and recomputing would leave the counters drifting.
     mwc === nothing || Threads.atomic_sub!(mwc, units)
-    wload === nothing || Threads.atomic_sub!(wload, weight)
+    if wload !== nothing
+        Threads.atomic_sub!(wload, weight)
+        _settle_zero!(wload)    # a drained worker reads exactly 0, not a few ulp of cancellation
+    end
     return nothing
 end
 

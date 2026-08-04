@@ -77,6 +77,44 @@ scheduler_repack_seq(::GatewayScheduler) = 0
 # it (covers schedulers that reserve nothing, and the `nothing` reservation of any scheduler).
 release!(::GatewayScheduler, reservation) = nothing
 
+# --- comparing in-flight work -------------------------------------------------------------------
+
+# One nanosecond of GPU time, as the quantum for comparing two workers' loads. Far below the smallest
+# charge that can exist (a single item of the cheapest model is microseconds) and far above the
+# floating-point residue that accumulates in a load counter.
+const _LOAD_QUANTUM_INV = 1.0e9
+
+"""
+    _load_key(load) -> Int
+
+`load` reduced to an integer number of nanoseconds, for ORDERING two workers' in-flight work.
+
+A load counter does not return to exactly 0.0 when a worker drains: its charges are added and
+subtracted in different orders, and floating-point addition is not associative, so an idle worker
+keeps a couple of ulp (netai02 sat at 4.44e-16 on two GPUs and exactly 0.0 on the other two). The
+values are numerically meaningless, but comparing them raw is not: both `fill_least` and
+`least_outstanding` are specified to treat equal loads as a TIE and let the rotation cursor (or the
+URL order) break it, so that an idle fleet warms every replica. Residue turns every tie into a strict
+inequality, the tie-break never runs, and the residue-free workers win every time. On netai02 that
+skewed a 4-replica model's work 1.9x between its GPUs.
+
+Quantizing to a nanosecond restores the tie without hiding any difference that could matter: two
+workers whose in-flight work differs by less than a nanosecond of GPU time are, for routing purposes,
+carrying the same load. Integer keys then compare exactly.
+"""
+_load_key(load::Real) = round(Int, Float64(load) * _LOAD_QUANTUM_INV)
+
+# Snap a drained counter to exactly zero. Called after a release: if the counter has come back within
+# one quantum of zero, store a true 0.0 so the residue cannot accumulate over the process's life and
+# the exported gauge reads 0 when the worker is idle (a gauge showing 4.44e-16 reads as "busy" to a
+# human and to a `> 0` alert). The compare-and-swap is what makes it safe: if a concurrent charge
+# landed in between, the swap fails and the value it wrote stands, so no charge is ever lost.
+function _settle_zero!(c::Threads.Atomic{Float64})
+    v = c[]
+    (v != 0.0 && abs(v) * _LOAD_QUANTUM_INV < 1.0) && Threads.atomic_cas!(c, v, 0.0)
+    return nothing
+end
+
 # --- per-worker in-flight work ------------------------------------------------------------------
 
 # The live per-worker work counters a work-routing scheduler compares, as `(basis, url => counter)`,
@@ -237,7 +275,10 @@ function select_replicas(s::LeastOutstandingScheduler, ctx::ScheduleContext)
     counters = [_inflight_counter!(s, u) for u in urls]
     best = 1
     for i in 2:length(urls)
-        ci, cb = counters[i][], counters[best][]
+        # Quantized, so that equally loaded replicas compare EQUAL and the URL order breaks the tie
+        # as documented; raw float loads carry residue that would make every tie a strict inequality
+        # and pin the model to whichever replica happens to hold the smaller crumb (see `_load_key`).
+        ci, cb = _load_key(counters[i][]), _load_key(counters[best][])
         (ci < cb || (ci == cb && urls[i] < urls[best])) && (best = i)
     end
     charge = _charge(s, ctx)
@@ -246,8 +287,11 @@ function select_replicas(s::LeastOutstandingScheduler, ctx::ScheduleContext)
     return (vcat(urls[best], rest), (counters[best], charge))
 end
 
-release!(::LeastOutstandingScheduler, res::Tuple{Threads.Atomic{Float64},Float64}) =
-    (Threads.atomic_sub!(res[1], res[2]); nothing)
+function release!(::LeastOutstandingScheduler, res::Tuple{Threads.Atomic{Float64},Float64})
+    Threads.atomic_sub!(res[1], res[2])
+    _settle_zero!(res[1])       # a drained worker reads exactly 0, not a few ulp of cancellation
+    return nothing
+end
 
 inflight_work(s::LeastOutstandingScheduler) = (s.basis, @atomic s.inflight)
 
