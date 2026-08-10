@@ -8,6 +8,11 @@
 # ExponentialBuckets(0.001, 2, 14); Prometheus.jl appends the +Inf bucket.
 const _LE_BUCKETS = Float64[0.001 * 2.0^k for k in 0:13]
 
+# The media type of the Prometheus text exposition format (version 0.0.4), from the Prometheus
+# exposition spec. Prometheus.jl used to export it as a constant and removed it in 1.6.0; it is
+# a protocol value, so state it here rather than reaching into the package.
+const PROMETHEUS_EXPOSITION_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+
 struct GatewayMetrics
     registry::Prometheus.CollectorRegistry
     requests_total::Prometheus.Family{Prometheus.Counter}
@@ -25,61 +30,75 @@ struct GatewayMetrics
     # Maps a worker endpoint url (gRPC or metrics) to its friendly name (worker0..N), so every
     # worker-labelled gateway series matches the workers' own self-tagged `worker` label instead of
     # showing a host:port. Empty for a standalone gateway given no names: labels fall back to the url.
-    worker_names::Dict{String,String}
+    worker_names::Dict{String, String}
 end
 
-function GatewayMetrics(worker_names::Dict{String,String} = Dict{String,String}())
+function GatewayMetrics(worker_names::Dict{String, String} = Dict{String, String}())
     reg = Prometheus.CollectorRegistry()
     requests_total = Prometheus.Family{Prometheus.Counter}(
         "gateway_requests_total",
         "Count of gateway RPCs by method, model, and gRPC status code.",
-        (:rpc, :model, :status); registry = reg)
+        (:rpc, :model, :status); registry = reg
+    )
     request_latency = Prometheus.Family{Prometheus.Histogram}(
         "gateway_request_latency_seconds", "Gateway-internal latency.",
-        (:rpc, :model); buckets = _LE_BUCKETS, registry = reg)
+        (:rpc, :model); buckets = _LE_BUCKETS, registry = reg
+    )
     worker_latency = Prometheus.Family{Prometheus.Histogram}(
         "gateway_worker_latency_seconds", "Latency of the worker gRPC call.",
-        (:rpc, :worker); buckets = _LE_BUCKETS, registry = reg)
+        (:rpc, :worker); buckets = _LE_BUCKETS, registry = reg
+    )
     routing_table_size = Prometheus.Gauge(
         "gateway_routing_table_size", "Number of known models in the routing table.";
-        registry = reg)
+        registry = reg
+    )
     worker_ready = Prometheus.Family{Prometheus.Gauge}(
         "gateway_worker_ready",
         "1 if the worker reported ServerReady on the most recent health probe, else 0.",
-        (:worker,); registry = reg)
+        (:worker,); registry = reg
+    )
     placement_weight = Prometheus.Family{Prometheus.Gauge}(
         "gateway_placement_weight",
         "LPT-packing sampling weight of a model on a worker (0 when unplaced).",
-        (:model, :worker); registry = reg)
+        (:model, :worker); registry = reg
+    )
     model_utilization = Prometheus.Family{Prometheus.Gauge}(
         "gateway_model_utilization",
         "Estimated per-model expected utilization (arrival rate x compute cost, GPU-seconds/second).",
-        (:model,); registry = reg)
+        (:model,); registry = reg
+    )
     model_replicas = Prometheus.Family{Prometheus.Gauge}(
         "gateway_model_replicas",
         "LPT-packing replica count for a model (number of distinct GPUs hosting it; 0 when unplaced).",
-        (:model,); registry = reg)
+        (:model,); registry = reg
+    )
     replica_outstanding = Prometheus.Family{Prometheus.Gauge}(
         "gateway_replica_outstanding",
         "In-flight ITEMS on a model's replica: the summed batch size of the requests in flight, " *
-        "not a request count. Equals the request count for a client whose requests all carry one item.",
-        (:model, :worker); registry = reg)
+            "not a request count. Equals the request count for a client whose requests all carry one item.",
+        (:model, :worker); registry = reg
+    )
     model_fill_quantum = Prometheus.Family{Prometheus.Gauge}(
         "gateway_model_fill_quantum",
         "Effective per-replica fill quantum for a model (requests; what routing_fill_mode counts).",
-        (:model,); registry = reg)
+        (:model,); registry = reg
+    )
     repacks_total = Prometheus.Family{Prometheus.Counter}(
         "gateway_repacks_total",
         "LPT-packing repacks by what triggered them (startup, compute budget, or operator).",
-        (:trigger,); registry = reg)
+        (:trigger,); registry = reg
+    )
     worker_metrics_up = Prometheus.Family{Prometheus.Gauge}(
         "gateway_worker_metrics_up",
         "1 if the worker's metrics endpoint answered the most recent aggregated scrape, else 0.",
-        (:worker,); registry = reg)
-    return GatewayMetrics(reg, requests_total, request_latency, worker_latency,
+        (:worker,); registry = reg
+    )
+    return GatewayMetrics(
+        reg, requests_total, request_latency, worker_latency,
         routing_table_size, worker_ready, placement_weight, model_utilization,
         model_replicas, replica_outstanding, model_fill_quantum, repacks_total,
-        worker_metrics_up, worker_names)
+        worker_metrics_up, worker_names
+    )
 end
 
 # Friendly name (worker0..N) for a worker endpoint url; identity if no name was supplied for it.
@@ -133,21 +152,30 @@ _adm_scalar(name, type, help, v) =
     Prometheus.Metric(type, name, help, Prometheus.Sample(nothing, nothing, nothing, Float64(v)))
 
 function Prometheus.collect!(metrics::Vector, c::AdmissionCollector)
-    push!(metrics,
-        _adm_scalar("gateway_inflight_requests", "gauge",
-            "RPCs currently being handled (counted only when the cap is enabled).", c.inflight[]),
-        _adm_scalar("gateway_requests_shed_total", "counter",
-            "RPCs rejected with RESOURCE_EXHAUSTED at the inbound concurrency cap.", c.shed[]),
-        _adm_scalar("gateway_max_concurrent_requests", "gauge",
-            "Configured inbound RPC cap across all workers (0 = uncapped).", c.max_concurrent),
+    push!(
+        metrics,
+        _adm_scalar(
+            "gateway_inflight_requests", "gauge",
+            "RPCs currently being handled (counted only when the cap is enabled).", c.inflight[]
+        ),
+        _adm_scalar(
+            "gateway_requests_shed_total", "counter",
+            "RPCs rejected with RESOURCE_EXHAUSTED at the inbound concurrency cap.", c.shed[]
+        ),
+        _adm_scalar(
+            "gateway_max_concurrent_requests", "gauge",
+            "Configured inbound RPC cap across all workers (0 = uncapped).", c.max_concurrent
+        ),
     )
     return metrics
 end
 
 # Register the admission collector against the gateway's metrics registry, exposing the gRPC
 # server's live in-flight / shed counters on /metrics.
-register_admission!(m::GatewayMetrics, inflight::Threads.Atomic{Int}, shed::Threads.Atomic{Int},
-                    max_concurrent::Integer) =
+register_admission!(
+    m::GatewayMetrics, inflight::Threads.Atomic{Int}, shed::Threads.Atomic{Int},
+    max_concurrent::Integer
+) =
     Prometheus.register(m.registry, AdmissionCollector(inflight, shed, Int(max_concurrent)))
 
 """
@@ -169,9 +197,9 @@ their series with `worker`/`gpu` labels, so samples never collide.
 """
 function merge_expositions(texts::Vector{String})
     order = String[]                                  # family emission order
-    help = Dict{String,String}()                      # family -> "# HELP ..." line
-    type = Dict{String,String}()                      # family -> "# TYPE ..." line
-    samples = Dict{String,Vector{String}}()           # family -> sample lines
+    help = Dict{String, String}()                      # family -> "# HELP ..." line
+    type = Dict{String, String}()                      # family -> "# TYPE ..." line
+    samples = Dict{String, Vector{String}}()           # family -> sample lines
     current = ""
     family_of(line) = begin
         # Sample lines belong to the family of the preceding header when their name extends it
@@ -186,11 +214,11 @@ function merge_expositions(texts::Vector{String})
         for line in eachline(IOBuffer(text))
             isempty(strip(line)) && continue
             if startswith(line, "# HELP ")
-                current = split(line; limit=4)[3]
+                current = split(line; limit = 4)[3]
                 ensure!(current)
                 get!(help, current, line)
             elseif startswith(line, "# TYPE ")
-                current = split(line; limit=4)[3]
+                current = split(line; limit = 4)[3]
                 ensure!(current)
                 get!(type, current, line)
             elseif startswith(line, '#')
@@ -215,14 +243,16 @@ end
 
 # Fetch every worker's /metrics concurrently (best effort, bounded by readtimeout) and record
 # per-endpoint reachability in gateway_worker_metrics_up.
-function _fetch_worker_metrics(m::GatewayMetrics, endpoints::Vector{String}; readtimeout::Int=5)
-    bodies = Vector{Union{Nothing,String}}(nothing, length(endpoints))
+function _fetch_worker_metrics(m::GatewayMetrics, endpoints::Vector{String}; readtimeout::Int = 5)
+    bodies = Vector{Union{Nothing, String}}(nothing, length(endpoints))
     @sync for (i, ep) in enumerate(endpoints)
         @async begin
             ok = false
             try
-                resp = HTTP.get("http://$ep/metrics"; retry = false, status_exception = true,
-                                connect_timeout = readtimeout, request_timeout = readtimeout)
+                resp = HTTP.get(
+                    "http://$ep/metrics"; retry = false, status_exception = true,
+                    connect_timeout = readtimeout, request_timeout = readtimeout
+                )
                 bodies[i] = String(resp.body)
                 ok = true
             catch e
@@ -248,8 +278,10 @@ end
 
 set_ready!(a::AdminServer, v::Bool) = (a.ready[] = v; nothing)
 
-function start_admin(metrics::GatewayMetrics, addr::AbstractString;
-                     worker_metrics::Vector{String}=String[])
+function start_admin(
+        metrics::GatewayMetrics, addr::AbstractString;
+        worker_metrics::Vector{String} = String[]
+    )
     host, port = _split_hostport(addr)
     ready = Threads.Atomic{Bool}(false)
     handler = function (req)
@@ -265,8 +297,10 @@ function start_admin(metrics::GatewayMetrics, addr::AbstractString;
                 expose(io, metrics)   # after the fetch, so worker_metrics_up is current
                 merge_expositions(pushfirst!(workers, String(take!(io))))
             end
-            return HTTP.Response(200, ["Content-Type" => Prometheus.CONTENT_TYPE_LATEST];
-                                 body = body)
+            return HTTP.Response(
+                200, ["Content-Type" => PROMETHEUS_EXPOSITION_CONTENT_TYPE];
+                body = body
+            )
         elseif target == "/healthz"
             return HTTP.Response(200; body = "ok")
         elseif target == "/readyz"
