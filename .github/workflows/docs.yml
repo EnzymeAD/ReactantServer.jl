@@ -25,6 +25,10 @@ jobs:
         with:
           version: '1.12'
       - uses: julia-actions/cache@v2
+      - name: Install Julia dependencies
+        # docs/Manifest.toml is gitignored, so the docs environment is resolved
+        # fresh here (ReactantServer and friends come from the [sources] paths).
+        run: julia --project=docs -e 'using Pkg; Pkg.instantiate()'
       - name: Install VitePress dependencies
         # DocumenterVitepress builds the site with its bundled Node but does not
         # run npm install when docs/package.json exists, so the dependencies are
