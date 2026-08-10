@@ -10,7 +10,7 @@
 Handle to a server started with `serve(...; blocking=false)`. It holds the resolved
 [`ServerConfig`](@ref), the model registry, the running [`Scheduler`](@ref), the device
 memory pool, the shared-memory registry, the underlying gRPC server, and the listen `port`.
-Pass it to [`stop!`](@ref) to shut the server down.
+Pass it to [`stop!`](@ref ReactantServer.stop!) to shut the server down.
 """
 struct RunningServer
     config::ServerConfig
@@ -20,7 +20,7 @@ struct RunningServer
     shm::SharedMemoryRegistry
     server::Any
     port::Int
-    watcher::Union{BundleWatcher,Nothing}
+    watcher::Union{BundleWatcher, Nothing}
     metrics_server::Any        # HTTP metrics listener, or nothing when metrics_port == 0
 end
 
@@ -71,16 +71,20 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     # (pre-Ampere GPU, or the CPU-fallback path), failing startup loudly beats a worker whose
     # numerics silently diverge from the rest of the fleet.
     if cfg.runtime.numerics == NUMERICS_TF32 && !backend_tf32_capable(backend, pool)
-        throw(ErrorException("runtime.numerics 'tf32' requested but the compile target " *
-                             "('$(pool.platform)') does not support TF32 (requires NVIDIA compute " *
-                             "capability >= 8.0); use 'auto' or 'f32', or run on capable hardware"))
+        throw(
+            ErrorException(
+                "runtime.numerics 'tf32' requested but the compile target " *
+                    "('$(pool.platform)') does not support TF32 (requires NVIDIA compute " *
+                    "capability >= 8.0); use 'auto' or 'f32', or run on capable hardware"
+            )
+        )
     end
     # Numerics attestation, GPU only: report whether TF32 is actually in use (auto/tf32) and, under
     # f32, prove the precision pin bit-exactly. Runs before any model compile and before the scratch
     # high-water probe; see tf32_probe for why its transient ~3 MB cannot perturb that measurement.
     pool.platform == "cuda" && tf32_probe(backend, pool)
     include = isempty(cfg.models_include) ? nothing : cfg.models_include
-    registry = load_bundles(cfg.model_dirs; include=include)
+    registry = load_bundles(cfg.model_dirs; include = include)
     isempty(registry.by_name) && @warn "no model bundles found" model_dirs = cfg.model_dirs models_include = cfg.models_include
     # On-demand weight residency is sized as a fraction of the BFC arena (`mem_fraction * device`),
     # resolved now that the device pool exists. The cache is GPU-only: `arena` is 0 when the device
@@ -97,7 +101,7 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     store = if cfg.runtime.shared_host_weights
         cfg.runtime.shared_host_weights_mode == 0o666 &&
             @warn "shared host-weight regions are created world-writable (mode 666); set runtime.shared_host_weights_mode: \"660\" for production / multi-user systems"
-        SharedWeightStore(mode=cfg.runtime.shared_host_weights_mode)
+        SharedWeightStore(mode = cfg.runtime.shared_host_weights_mode)
     else
         PrivateWeightStore()
     end
@@ -109,7 +113,7 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     for entry in values(registry.by_name)
         state = _resolve_residency(cfg, entry.name, on_demand)
         @info "Compiling model" name = entry.name residency = state on_demand = on_demand
-        entry.executable = build_loaded_model(backend, pool, entry; state=state, on_demand=on_demand, store=store)
+        entry.executable = build_loaded_model(backend, pool, entry; state = state, on_demand = on_demand, store = store)
     end
     sched = Scheduler(registry, backend, pool, cfg.scheduler)
     if on_demand
@@ -117,14 +121,18 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
         # this never fills the arena, then auto-sizing replaces it with pinned + scratch + wiggle aware
         # value before serving.
         provisional = floor(Int, frac * arena)
-        sched.weight_cache = WeightCache(backend, pool, registry, provisional;
-                                         mode=cfg.runtime.residency_mode, store=store)
+        sched.weight_cache = WeightCache(
+            backend, pool, registry, provisional;
+            mode = cfg.runtime.residency_mode, store = store
+        )
     end
     # On-demand enabled => probe every model at startup and size the cache so pinned weights +
     # measured scratch + the wiggle slack fit the arena.
     if on_demand
-        start!(sched; autosize_arena=arena, autosize_fraction=frac,
-               autosize_wiggle=cfg.runtime.weight_cache_wiggle_fraction)
+        start!(
+            sched; autosize_arena = arena, autosize_fraction = frac,
+            autosize_wiggle = cfg.runtime.weight_cache_wiggle_fraction
+        )
     else
         start!(sched)
     end
@@ -136,12 +144,14 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     watcher = nothing
     if cfg.model_control_mode == DYNAMIC
         include_names = isempty(cfg.models_include) ? nothing : cfg.models_include
-        watcher = BundleWatcher(sched, backend, pool, cfg;
-                                interval=cfg.model_poll_seconds, on_demand=on_demand,
-                                store=store, include=include_names)
+        watcher = BundleWatcher(
+            sched, backend, pool, cfg;
+            interval = cfg.model_poll_seconds, on_demand = on_demand,
+            store = store, include = include_names
+        )
         start_watching!(watcher)
     end
-    @info "models ready" count = length(registry.by_name) control_mode = cfg.model_control_mode memory = memory_report(backend, pool; registry=registry, weight_cache=sched.weight_cache)
+    @info "models ready" count = length(registry.by_name) control_mode = cfg.model_control_mode memory = memory_report(backend, pool; registry = registry, weight_cache = sched.weight_cache)
     return pool, registry, sched, watcher
 end
 
@@ -153,14 +163,16 @@ assigned models, and start the gRPC control plane. `worker` selects which worker
 it may be omitted when the node has exactly one worker. When `blocking` is false the server runs
 in the background and a `RunningServer` is returned (stop it with `stop!`).
 """
-function serve(node_path::AbstractString; worker::Union{AbstractString,Nothing}=nothing,
-               backend::AbstractBackend=ReactantBackend(), blocking::Bool=true)
+function serve(
+        node_path::AbstractString; worker::Union{AbstractString, Nothing} = nothing,
+        backend::AbstractBackend = ReactantBackend(), blocking::Bool = true
+    )
     node = load_node(node_path)
     cfg, applied, wname = node_server_config(node, worker)
     validate_config(cfg)
     @info "Resolved node worker" worker = wname node = node_path
     log_effective_config(cfg, applied)
-    return serve(cfg; backend=backend, blocking=blocking, worker_name=wname)
+    return serve(cfg; backend = backend, blocking = blocking, worker_name = wname)
 end
 
 """
@@ -169,7 +181,7 @@ end
 Convenience alias for [`serve`](@ref) that names the worker positionally.
 """
 serve_worker(node_path::AbstractString, worker::AbstractString; kwargs...) =
-    serve(node_path; worker=worker, kwargs...)
+    serve(node_path; worker = worker, kwargs...)
 
 # Build the worker's local meta-scratch pool (plain Memory, use_shm=false) from env, or nothing to
 # disable. Defaults: 1 GiB across 16 slots. A scratch buffer larger than one slot spans several.
@@ -177,7 +189,7 @@ function _meta_scratch_pool()
     bytes = something(tryparse(Int, strip(get(ENV, "REACTANT_FANOUT_BYTES", ""))), 1 << 30)
     slots = something(tryparse(Int, strip(get(ENV, "REACTANT_FANOUT_SLOTS", ""))), 16)
     (bytes > 0 && slots > 0) || return nothing
-    return BufferPool(bytes; n_slots=slots, use_shm=false)
+    return BufferPool(bytes; n_slots = slots, use_shm = false)
 end
 
 # How many GPU-using meta orchestrations may run at once on this worker (REACTANT_META_CONCURRENCY,
@@ -192,8 +204,10 @@ function _meta_concurrency()
     return max(1, n)
 end
 
-function serve(cfg::ServerConfig; backend::AbstractBackend=ReactantBackend(), blocking::Bool=true,
-               worker_name::AbstractString="")
+function serve(
+        cfg::ServerConfig; backend::AbstractBackend = ReactantBackend(), blocking::Bool = true,
+        worker_name::AbstractString = ""
+    )
     shm = SharedMemoryRegistry()   # client-facing SystemSharedMemory feature (decode/encode shm path)
     pool, registry, sched, watcher = _bring_up(cfg, backend)
     # Local reuse pool for meta-model intermediates: plain Memory, never shared. With one meta at a time
@@ -209,33 +223,45 @@ function serve(cfg::ServerConfig; backend::AbstractBackend=ReactantBackend(), bl
     # reads both live, so they are exported even while `serve` blocks the calling task.
     inflight = Threads.Atomic{Int}(0)
     shed = Threads.Atomic{Int}(0)
-    metrics = WorkerMetrics(sched, backend, pool, cfg; worker_name=worker_name,
-        inflight=inflight, shed=shed)
-    router = build_grpc_router(sched, registry, pool.platform, shm;
-        max_recv_msg_bytes=cfg.grpc.max_recv_msg_bytes, max_send_msg_bytes=cfg.grpc.max_send_msg_bytes)
+    metrics = WorkerMetrics(
+        sched, backend, pool, cfg; worker_name = worker_name,
+        inflight = inflight, shed = shed
+    )
+    router = build_grpc_router(
+        sched, registry, pool.platform, shm;
+        max_recv_msg_bytes = cfg.grpc.max_recv_msg_bytes, max_send_msg_bytes = cfg.grpc.max_send_msg_bytes
+    )
     ctx = InferContext(sched, registry, shm, pool.platform, metrics)
     # Optional Prometheus metrics endpoint (opt-in via endpoints.metrics_port > 0). Request counting
     # is always on (the InferContext carries `metrics`); only the HTTP listener is gated.
     metrics_server = nothing
     if cfg.endpoints.metrics_port > 0
-        ready_fn = () -> (es = values(registry.by_name);
-            (!isempty(es) || !isempty(registry.meta)) && all(e -> e.executable !== nothing, es))
-        metrics_server = start_worker_metrics(metrics, cfg.endpoints.host, cfg.endpoints.metrics_port;
-            ready_fn=ready_fn, worker_name=worker_name, gpu=_gpu_identity(cfg))
+        ready_fn = () -> (
+            es = values(registry.by_name);
+            (!isempty(es) || !isempty(registry.meta)) && all(e -> e.executable !== nothing, es)
+        )
+        metrics_server = start_worker_metrics(
+            metrics, cfg.endpoints.host, cfg.endpoints.metrics_port;
+            ready_fn = ready_fn, worker_name = worker_name, gpu = _gpu_identity(cfg)
+        )
     end
     @info "Starting gRPC control plane" host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests models = model_names(registry)
     if blocking
-        _G.serve(router, cfg.endpoints.host, cfg.endpoints.port; context=ctx,
-            max_concurrent_requests=cfg.endpoints.max_concurrent_requests,
-            inflight=inflight, shed_total=shed,
-            h2_initial_window_size=_H2_INITIAL_WINDOW_BYTES,
-            h2_connection_window_size=_H2_CONNECTION_WINDOW_BYTES)
+        _G.serve(
+            router, cfg.endpoints.host, cfg.endpoints.port; context = ctx,
+            max_concurrent_requests = cfg.endpoints.max_concurrent_requests,
+            inflight = inflight, shed_total = shed,
+            h2_initial_window_size = _H2_INITIAL_WINDOW_BYTES,
+            h2_connection_window_size = _H2_CONNECTION_WINDOW_BYTES
+        )
         return nothing
     end
-    server = _G.serve!(router, cfg.endpoints.host, cfg.endpoints.port; context=ctx,
-        max_concurrent_requests=cfg.endpoints.max_concurrent_requests,
-        inflight=inflight, shed_total=shed,
-        h2_initial_window_size=_H2_INITIAL_WINDOW_BYTES,
-        h2_connection_window_size=_H2_CONNECTION_WINDOW_BYTES)
+    server = _G.serve!(
+        router, cfg.endpoints.host, cfg.endpoints.port; context = ctx,
+        max_concurrent_requests = cfg.endpoints.max_concurrent_requests,
+        inflight = inflight, shed_total = shed,
+        h2_initial_window_size = _H2_INITIAL_WINDOW_BYTES,
+        h2_connection_window_size = _H2_CONNECTION_WINDOW_BYTES
+    )
     return RunningServer(cfg, registry, sched, pool, shm, server, cfg.endpoints.port, watcher, metrics_server)
 end

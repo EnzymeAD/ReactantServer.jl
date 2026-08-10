@@ -60,7 +60,8 @@ include("health.jl")
 """
     RunningGateway
 
-Handle to a gateway started with `serve_gateway(...; blocking=false)`. Pass it to [`stop!`](@ref)
+Handle to a gateway started with `serve_gateway(...; blocking=false)`. Pass it to
+[`stop!`](@ref ReactantServer.stop!)
 to shut the gRPC server, the readiness prober, and the admin HTTP server down.
 """
 struct RunningGateway{S}
@@ -99,22 +100,22 @@ end
 Load `gateway.yml` (listen addresses and the worker endpoint list), build the worker client pool,
 start the admin HTTP server and the readiness/discovery prober (which probes each endpoint's
 ServerReady and RepositoryIndex and swaps in the discovered routing table), and serve the KServe
-gRPC proxy. When `blocking` is false the server runs in the background and a [`RunningGateway`](@ref)
-is returned (stop it with [`stop!`](@ref)).
+gRPC proxy. When `blocking` is false the server runs in the background and a
+[`RunningGateway`](@ref) is returned (stop it with [`stop!`](@ref ReactantServer.stop!)).
 
 `gateway_path` may be omitted (or `nothing`) to configure the gateway from defaults and
 `REACTANT_GATEWAY_*` environment variables alone; the endpoint list then comes from
 `REACTANT_GATEWAY_WORKERS`. The node supervisor uses this to run an embedded gateway without a
 gateway.yml.
 """
-function serve_gateway(gateway_path::Union{AbstractString,Nothing} = nothing; blocking::Bool = true)
+function serve_gateway(gateway_path::Union{AbstractString, Nothing} = nothing; blocking::Bool = true)
     cfg = load_gateway(gateway_path)
     pool = ClientPool(cfg)
     routes = DiscoveredRoutes()
     gate = RegisterGate()
     # Map every worker endpoint url (gRPC and metrics, index-aligned to worker_names) to its friendly
     # name so gateway series read worker0..N instead of host:port and join the workers' own labels.
-    name_by_url = Dict{String,String}()
+    name_by_url = Dict{String, String}()
     for (i, u) in enumerate(cfg.workers)
         i <= length(cfg.worker_names) && (name_by_url[u] = cfg.worker_names[i])
     end
@@ -165,16 +166,20 @@ function serve_gateway(gateway_path::Union{AbstractString,Nothing} = nothing; bl
     @info "Starting reactant-gateway" grpc = cfg.listen_grpc metrics = cfg.listen_metrics endpoints = cfg.workers max_concurrent_requests = max_concurrent outbound_streams_per_worker = cfg.max_concurrent_streams_per_worker
 
     if blocking
-        gRPCServer.serve(router, host, port; context = state,
+        gRPCServer.serve(
+            router, host, port; context = state,
             max_concurrent_requests = max_concurrent, inflight = inflight, shed_total = shed,
             h2_initial_window_size = _H2_INITIAL_WINDOW_BYTES,
-            h2_connection_window_size = _H2_CONNECTION_WINDOW_BYTES)
+            h2_connection_window_size = _H2_CONNECTION_WINDOW_BYTES
+        )
         return nothing
     end
-    server = gRPCServer.serve!(router, host, port; context = state,
+    server = gRPCServer.serve!(
+        router, host, port; context = state,
         max_concurrent_requests = max_concurrent, inflight = inflight, shed_total = shed,
         h2_initial_window_size = _H2_INITIAL_WINDOW_BYTES,
-        h2_connection_window_size = _H2_CONNECTION_WINDOW_BYTES)
+        h2_connection_window_size = _H2_CONNECTION_WINDOW_BYTES
+    )
     return RunningGateway(cfg, pool, routes, gate, metrics, admin, prober, server)
 end
 
@@ -200,7 +205,7 @@ returning whether it reported ready. Used as the worker container's healthcheck 
 replacement for the former Go `reactant-healthprobe`). `worker` may be omitted when the node has a
 single worker.
 """
-function probe_worker_ready(node_path::AbstractString, worker::Union{AbstractString,Nothing} = nothing)
+function probe_worker_ready(node_path::AbstractString, worker::Union{AbstractString, Nothing} = nothing)
     node = load_node(node_path)
     names = worker_names(node)
     wname = if worker !== nothing

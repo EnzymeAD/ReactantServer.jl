@@ -1,43 +1,40 @@
-name: Documentation
+# Builds the docs on every push and PR, deploys to GitHub Pages on main and on
+# tags. `deploydocs(push_preview = true)` in docs/make.jl makes PR builds land
+# on a preview URL instead of the live site, so a PR can be reviewed with its
+# docs rendered before it merges.
+name: Docs
 
 on:
   push:
-    branches:
-      - main # update to match your development branch (master, main, dev, trunk, ...)
-    tags: '*'
+    branches: [main]
+    tags: ['*']
   pull_request:
 
 jobs:
-  build:
-    # These permissions are needed to:
-    # - Deploy the documentation: https://documenter.juliadocs.org/stable/man/hosting/#Permissions
-    # - Delete old caches: https://github.com/julia-actions/cache#usage
-    permissions:
-      actions: write
-      contents: write
-      pull-requests: read
-      statuses: write
+  docs:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
-          # docs/Project.toml path-sources the member packages and the vendored lib/* forks,
-          # so the submodules must be present before instantiate.
+          # The docs environment resolves ReactantServer's vendored gRPC
+          # backend from lib/gRPCServer.jl, a git submodule.
           submodules: recursive
       - uses: julia-actions/setup-julia@v2
         with:
-          version: '1'
+          version: '1.12'
       - uses: julia-actions/cache@v2
-      - name: Install dependencies
-        shell: julia --color=yes --project=docs {0}
-        run: |
-          # docs/Project.toml already declares the full path-source closure (the five member
-          # packages + lib/* forks); just instantiate it. Do not Pkg.develop the repo root: it
-          # is a [workspace] file with no `name`, which Pkg.develop rejects.
-          using Pkg
-          Pkg.instantiate()
+      - name: Install Julia dependencies
+        # docs/Manifest.toml is gitignored, so the docs environment is resolved
+        # fresh here (ReactantServer and friends come from the [sources] paths).
+        run: julia --project=docs -e 'using Pkg; Pkg.instantiate()'
+      - name: Install VitePress dependencies
+        # DocumenterVitepress builds the site with its bundled Node but does not
+        # run npm install when docs/package.json exists, so the dependencies are
+        # installed here, from the committed lockfile for determinism.
+        run: npm ci --prefix docs
       - name: Build and deploy
-        run: julia --color=yes --project=docs docs/make.jl
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # If authenticating with GitHub Actions token
-          DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }} # If authenticating with SSH deploy key
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: julia --project=docs docs/make.jl
