@@ -106,6 +106,17 @@ code {
   --vp-button-brand-hover-bg: var(--julia-blue);
 }
 
+/* The hero logo: VitePress's `.image-src` rules only cap the image
+   (max-width/max-height), so an SVG with small intrinsic dimensions would
+   otherwise render tiny in the hero. Give it a fixed hero size instead; the
+   aspect ratio comes from the SVG, and VitePress's own centering keeps it in
+   the hero's image slot. */
+.VPHero .image-src {
+  width: 320px;
+  max-width: 100%;
+  height: auto;
+}
+
 /* Component: Home */
 :root {
   --vp-home-hero-name-color: transparent;

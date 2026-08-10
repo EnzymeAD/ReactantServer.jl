@@ -28,8 +28,12 @@ features:
     link: /client/
   - icon: 🚀
     title: XLA under the hood
-    details: Models compile ahead of time through Reactant and XLA; pre and postprocessing stays plain Julia in a bundle's model.jl.
+    details: Models compile ahead of time through Reactant and XLA into device executables; the runtime is device agnostic, CUDA today with CPU for development.
     link: /tutorial/
+  - icon: 🧩
+    title: Julia-first
+    details: A bundle's model.jl registers pre and postprocessing in plain Julia, and every convention follows Julia's, column-major with the batch axis last.
+    link: /bundles/
   - icon: 💾
     title: On-demand weights
     details: Weights stay in host RAM and stream to the GPU under an LRU byte budget, so a card serves more models than fit in VRAM.
@@ -38,10 +42,6 @@ features:
     title: A coalescing scheduler
     details: A deficit-weighted, cost-aware scheduler merges same-model requests into one execution at a compiled batch size.
     link: /scheduling/
-  - icon: 🖥️
-    title: One process, many GPUs
-    details: A node supervisor runs one worker per visible GPU and embeds a gateway behind one endpoint.
-    link: /gateway/
   - icon: 🔁
     title: Hot reload
     details: In dynamic mode the server watches the model repository and reloads bundles online, with no restart.
