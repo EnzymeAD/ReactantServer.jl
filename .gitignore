@@ -17,3 +17,8 @@ packages/ReactantServer/test/e2e/models/bit_resnet50/
 # so a vendored-fork compat bump (e.g. HTTP requiring a newer Reseau) is picked up automatically.
 Manifest.toml
 Manifest-v*.toml
+# VitePress docs build: the theme installs npm deps into docs/node_modules
+# (large, ~230 MB) and renders the site into docs/build/.
+/docs/node_modules/
+# Subagent working artifacts.
+/.pi-subagents/

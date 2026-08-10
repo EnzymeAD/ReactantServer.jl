@@ -1,83 +1,73 @@
-# Documenter build for ReactantServer.jl.
+# The Documenter build, on the DocumenterVitepress theme (the VitePress look
+# Lux.jl's docs use). `doctest = false` on purpose: the guide pages carry
+# illustrative Julia rather than executable examples, because executing any of
+# them would compile XLA programs and turn the docs build into a GPU-hours
+# exercise. The API page reads docstrings only, which is the point of @autodocs.
 #
-# Local build (no GPU required): from the repository root, instantiate the docs environment
-# (docs/Project.toml resolves ReactantServer via [sources], which transitively pulls in the
-# vendored lib/ submodules) and run this script:
-#
-#   julia --project=docs -e 'using Pkg; Pkg.instantiate()'
-#   julia --project=docs docs/make.jl
-#
-# The output is written to docs/build/. The build only reads docstrings, so loading ReactantServer
-# on CPU is sufficient; nothing here starts a server or touches a GPU.
-
+# The landing page (docs/src/index.md) carries a VitePress home layout: the hero
+# and the emoji capability boxes are YAML frontmatter inside a @raw html block,
+# exactly as Lux.jl's index.md does.
 using Documenter
-using DocumenterMermaid
-using ReactantServerCore
+using DocumenterVitepress
 using ReactantServer
-using ReactantServerGateway
 using ReactantServerClient
+using ReactantServerCore
+using ReactantServerExport
+using ReactantServerGateway
 using ReactantServerNode
 
-for m in (ReactantServerCore, ReactantServer, ReactantServerGateway, ReactantServerClient, ReactantServerNode)
-    DocMeta.setdocmeta!(m, :DocTestSetup, :(using $(Symbol(m))); recursive=true)
-end
-
 makedocs(;
-    modules  = [ReactantServerCore, ReactantServer, ReactantServerGateway, ReactantServerClient, ReactantServerNode],
-    authors  = "Carroll Vance <cs.vance@icloud.com>",
     sitename = "ReactantServer.jl",
-    # The repository is hosted on Azure DevOps, which Documenter's automatic remote
-    # detection does not recognize. Disable remote "source"/"edit" links for the local
-    # build. Set a `Remotes.URL` here if Azure DevOps source links are wanted later.
-    remotes = nothing,
-    format = Documenter.HTML(;
-        size_threshold = 400_000,
-        # The workspace root is not a package, so Documenter cannot infer a version for the
-        # search inventory; set it explicitly to match the member packages.
+    modules = [
+        ReactantServer,
+        ReactantServerClient,
+        ReactantServerCore,
+        ReactantServerExport,
+        ReactantServerGateway,
+        ReactantServerNode,
+    ],
+    authors = "Carroll Vance <cs.vance@icloud.com>",
+    doctest = false,
+    # The API page deliberately documents the exported surface of the five
+    # documented packages plus the internal helpers their docstrings reference;
+    # the rest of each module's internal docstrings are not in the manual, which
+    # would otherwise fail the build. Unresolved @refs are errors by default in
+    # this Documenter, and there are none left by the time this is committed;
+    # the category below is the safety valve while a docstring is being edited.
+    warnonly = [:missing_docs],
+    # Only the pages listed above are built: the legacy manual/api/design pages
+    # from the pre-Vitepress docs remain in the tree but are not processed.
+    pagesonly = true,
+    format = DocumenterVitepress.MarkdownVitepress(;
+        repo = "github.com/EnzymeAD/ReactantServer.jl",
+        devbranch = "main",
+        deploy_url = "https://enzymead.github.io/ReactantServer.jl/",
+        # The workspace root (../Project.toml) is not a package, so Documenter
+        # cannot infer a version for the search inventory; set it explicitly to
+        # match the member packages.
         inventory_version = "0.1.0",
-        # Navbar link to the repository; set explicitly because remote detection is off.
-        repolink  = "https://github.com/EnzymeAD/ReactantServer.jl",
-        edit_link = "main",
-        # Pretty (directory) URLs only in CI; plain .html files build locally so the
-        # site is browseable straight from docs/build/ over file://.
-        prettyurls = get(ENV, "CI", "false") == "true",
     ),
     pages = [
         "Home" => "index.md",
-        "Manual" => [
-            "Getting Started"          => "manual/getting_started.md",
-            "Common Use Cases"         => "manual/common_use_cases.md",
-            "Scaling to Multiple GPUs" => "manual/scaling.md",
-            "Client Usage"             => "manual/client_usage.md",
-            "Node Configuration"       => "manual/node_config.md",
-            "Bundles & model.jl"       => "manual/bundles.md",
-            "Meta Models"              => "manual/meta_models.md",
-            "Object Detection"         => "manual/object_detection.md",
-            "Transformer Text Models"  => "manual/transformers.md",
-            "On-demand Weights"        => "manual/on_demand_weights.md",
-            "Multi-GPU Gateway"        => "manual/multi_gpu_gateway.md",
-            "Deployment"               => "manual/deployment.md",
-        ],
-        "Design" => [
-            "Philosophy"   => "design/philosophy.md",
-            "Architecture" => "design/architecture.md",
-        ],
-        "API Reference" => [
-            "Server & Lifecycle"  => "api/server.md",
-            "Gateway"             => "api/gateway.md",
-            "Client"              => "api/client.md",
-            "Configuration"       => "api/config.md",
-            "Scheduling"          => "api/scheduling.md",
-            "Runtime & Weights"   => "api/runtime.md",
-            "Manifest & Boundary" => "api/manifest_boundary.md",
-            "Transport"           => "api/transport.md",
-        ],
+        "Tutorial" => "tutorial.md",
+        "Bundles" => "bundles.md",
+        "Node Configuration" => "node_config.md",
+        "Scheduling" => "scheduling.md",
+        "On-demand Weights" => "on_demand_weights.md",
+        "Multi-GPU Gateway" => "gateway.md",
+        "Client Usage" => "client.md",
+        "Meta Models" => "meta_models.md",
+        "Object Detection" => "object_detection.md",
+        "Transformer Text Models" => "transformers.md",
+        "Deployment" => "deployment.md",
+        "API" => "api.md",
     ],
-    checkdocs = :exports,
-    doctest   = false,
-    # Start lenient: warn (do not fail) on internals that lack docstrings. Tighten to `[]`
-    # once docstring coverage is filled out.
-    warnonly = [:missing_docs],
 )
 
-deploydocs(; repo = "github.com/EnzymeAD/ReactantServer.jl")
+# Documenter.deploydocs is NOT compatible with DocumenterVitepress; this is the
+# theme's own deployer. `push_preview = true` lands PR builds on a preview URL.
+DocumenterVitepress.deploydocs(;
+    repo = "github.com/EnzymeAD/ReactantServer.jl.git",
+    push_preview = true,
+    devbranch = "main",
+)

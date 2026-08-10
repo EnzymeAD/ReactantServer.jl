@@ -1,86 +1,134 @@
-```@meta
-CurrentModule = ReactantServer
+```@raw html
+---
+# https://vitepress.dev/reference/default-theme-home-page
+layout: home
+
+hero:
+  name: ReactantServer.jl
+  text: Production inference for Reactant-compiled models
+  tagline: KServe V2 over gRPC from one GPU to many, with compiled XLA models, Julia-first pre and postprocessing, and the most models per card.
+  actions:
+    - theme: brand
+      text: Tutorial
+      link: /tutorial/
+    - theme: alt
+      text: API Reference
+      link: /api/
+    - theme: alt
+      text: View on GitHub
+      link: https://github.com/EnzymeAD/ReactantServer.jl
+  image:
+    src: /logo.svg
+    alt: ReactantServer.jl
+
+features:
+  - icon: ⚡
+    title: KServe V2, natively
+    details: Speaks the KServe V2 inference API over gRPC, so standard Triton and KServe clients connect unchanged.
+    link: /client/
+  - icon: 🚀
+    title: XLA under the hood
+    details: Models compile ahead of time through Reactant and XLA; pre and postprocessing stays plain Julia in a bundle's model.jl.
+    link: /tutorial/
+  - icon: 💾
+    title: On-demand weights
+    details: Weights stay in host RAM and stream to the GPU under an LRU byte budget, so a card serves more models than fit in VRAM.
+    link: /on_demand_weights/
+  - icon: 🔀
+    title: A coalescing scheduler
+    details: A deficit-weighted, cost-aware scheduler merges same-model requests into one execution at a compiled batch size.
+    link: /scheduling/
+  - icon: 🖥️
+    title: One process, many GPUs
+    details: A node supervisor runs one worker per visible GPU and embeds a gateway behind one endpoint.
+    link: /gateway/
+  - icon: 🔁
+    title: Hot reload
+    details: In dynamic mode the server watches the model repository and reloads bundles online, with no restart.
+    link: /bundles/
+---
 ```
 
-# ReactantServer.jl
+## What it is
 
-A production inference server that serves models compiled through Reactant.jl — StableHLO via
-XLA today — from a single Julia process, built on Reactant's PJRT bindings. It targets static-graph workloads (computer vision,
-scientific computing) where many models share one GPU and only one model executes at a time.
-To serve more models than fit in GPU memory at once, it keeps every model's weights resident
-in host RAM and transfers them onto the GPU on demand, evicting cold models under a memory
-budget. It speaks the KServe V2 inference API natively over gRPC, so standard Triton and KServe
-clients connect to it directly.
+ReactantServer.jl is a production inference server for XLA-accelerated models, compiled through
+[Reactant.jl](https://github.com/EnzymeAD/Reactant.jl) (StableHLO via XLA today). It speaks the
+KServe V2 inference API natively over gRPC, so standard Triton and KServe clients connect
+unchanged; it scales from a single GPU to many from one container; and it balances model **memory**
+against **compute** to squeeze the most models out of each GPU. It is Julia-first throughout:
+custom pre and postprocessing is plain Julia in a bundle's `model.jl`, and every convention
+follows Julia's, column-major with the batch axis last.
 
-## What works today
+The system is a workspace of packages, split so that talking to a server never pulls in the heavy
+Reactant/XLA stack: `ReactantServerCore` is the shared, Reactant-free substrate (dtypes,
+protobufs, the manifest parser, node config, the codec, shared memory, the staging `BufferPool`);
+`ReactantServer` is the worker, the only package that depends on Reactant; `ReactantServerGateway`
+is the multi-GPU reverse proxy; `ReactantServerClient` is a Reactant-free client;
+`ReactantServerNode` is the one-container supervisor. Offline export lives in
+`ReactantServerExport`. Every package is on the [API](api.md) page.
 
-- StableHLO bundle loading, manifest parsing and validation, and a typed YAML configuration
-  with environment-variable overrides.
-- The Reactant/PJRT runtime: deserialize a portable artifact, compile with weights bound as
-  explicit arguments, execute, and read results back. A single shared memory pool backs all
-  models.
-- On-demand GPU weight loading with a host-RAM weight cache (see
-  [On-demand Weights](manual/on_demand_weights.md)), which decouples the number of servable
-  models from GPU memory capacity.
-- A deficit-weighted, cost-aware, coalescing [`Scheduler`](@ref) that runs one
-  GPU execution at a time and batches same-model requests at compiled sizes.
-- The KServe V2 control plane over gRPC: liveness/readiness, model and server metadata,
-  inference, a `RepositoryIndex`, and the Triton-compatible system shared-memory data plane.
-- Model lifecycle control: the default `dynamic` mode watches the model repository and
-  loads/unloads/reloads/renames bundles online (weights, MLIR, and `model.jl` changes alike;
-  a renamed bundle directory renames the live model in place with no recompile); `static`
-  fixes the startup set; `explicit` cedes lifecycle and residency to an external control plane
-  over the worker control RPCs.
-- Multi-GPU scheduling in the gateway: `round_robin` or `lpt_packing`, which places each model on an
-  operator-configured number of GPUs and concentrates its requests a batch at a time to preserve
-  coalescing, with a gRPC control plane for retuning placement and forcing a repack without a restart
-  (see [Multi-GPU Gateway](manual/multi_gpu_gateway.md)).
-- Multiple compiled batch sizes per model and custom per-model pre/post-processing via a
-  bundle's `model.jl` (see [Bundles & model.jl](manual/bundles.md)).
-- Meta models: `kind: meta` bundles whose `model.jl` chains several models with data-dependent
-  Julia between stages, running off the dispatch loop and re-entering the scheduler for each
-  sub-call (see [Meta Models](manual/meta_models.md)). The
-  [Object Detection](manual/object_detection.md) guide is a worked end-to-end example, a
-  torchvision Faster R-CNN split into two StableHLO stages chained by Julia detection glue.
+## Why ReactantServer?
 
-ReactantServer.jl is a Julia workspace of five packages: **ReactantServerCore** (the shared,
-Reactant-free substrate), **ReactantServer** (the worker, the only package that loads Reactant),
-**ReactantServerGateway** (the multi-GPU reverse proxy), **ReactantServerClient** (a
-Reactant-free inference client), and **ReactantServerNode** (the node
-supervisor), plus the non-member **ReactantServerExport** (offline bundle export). See
-[Architecture](design/architecture.md) for the split.
+The target is static-graph workloads, computer vision and scientific computing, where many models
+share a GPU and one model executes at a time. That shape rewards a server that is compiled rather
+than interpreted: models are compiled ahead of time into device executables through Reactant's
+PJRT bindings, so inference is a single batched kernel launch rather than an interpreter loop, and
+the runtime is device-agnostic, CUDA today with CPU for development and fallback.
 
-## Where to go next
+The design balances two resources that pull against each other. Compute is managed by a
+deficit-weighted, cost-aware [scheduler](scheduling.md) that coalesces concurrent same-model
+requests into one execution at a compiled batch size. Memory is managed by the
+[on-demand weights](on_demand_weights.md) cache, which keeps weights in host RAM and streams them
+onto the GPU under an LRU byte budget. Both are retunable at runtime, on a worker or across GPUs,
+through a gRPC control plane, without a restart.
 
-- New here? Start with [Getting Started](manual/getting_started.md).
-- Choosing a deployment shape (single GPU, multi-GPU, multi-node) with example configs:
-  [Common Use Cases](manual/common_use_cases.md).
-- Calling a server from your code: [Client Usage](manual/client_usage.md).
-- Configuring a deployment: [Node Configuration](manual/node_config.md).
-- Scaling to multiple GPUs: [Scaling to Multiple GPUs](manual/scaling.md).
-- Packaging a model: [Bundles & model.jl](manual/bundles.md).
-- Chaining models with data-dependent Julia: [Meta Models](manual/meta_models.md), with a worked
-  [Object Detection](manual/object_detection.md) example.
-- Serving more models than fit on the GPU: [On-demand Weights](manual/on_demand_weights.md).
-- Scaling across GPUs: [Multi-GPU Gateway](manual/multi_gpu_gateway.md) and
-  [Deployment](manual/deployment.md).
-- The why and the how: [Philosophy](design/philosophy.md) and
-  [Architecture](design/architecture.md).
-- The full [API Reference](api/server.md).
+## Install
 
-## Quick start
+ReactantServer is not yet registered in the General registry, so installation is from the
+repository. The one build dependency beyond the workspace is a vendored gRPC server fork, pulled
+in as a git submodule:
+
+```
+git clone https://github.com/EnzymeAD/ReactantServer.jl
+cd ReactantServer.jl
+git submodule update --init lib/gRPCServer.jl
+REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1 julia --project=. -e 'using Pkg; Pkg.instantiate()'
+```
+
+Run the supervisor over a directory of model bundles and it scales to every visible GPU:
+
+```
+CUDA_VISIBLE_DEVICES=0,1,2,3 INFERENCE_SERVER_MODEL_DIRS=/path/to/bundles \
+REACTANT_NODE_FILE=config/node.default.yaml \
+  julia --handle-signals=no --project=packages/ReactantServerNode \
+    -e 'using ReactantServerNode; ReactantServerNode.main()'
+```
+
+Or from pure Julia:
 
 ```julia
-using ReactantServer
-ReactantServer.serve("config/node.yaml")                    # single worker: name optional
-ReactantServer.serve("config/node.yaml"; worker="worker0")  # multi-worker: name the worker
+using ReactantServerNode
+ReactantServerNode.supervise("config/node.yaml")   # one worker per GPU (+ gateway if >1)
 ```
 
-All tests run on CPU and need no GPU. Each package is tested in its own environment:
+Clients speak KServe V2 gRPC to `:8001`; health and metrics are on `:8002`. The first server
+startup is slow, because every model compiles before the gRPC plane accepts traffic. The server is
+designed for a trusted network, so read the [Deployment](deployment.md) page's security notes
+before exposing an endpoint.
 
-```
-julia --project=packages/ReactantServerCore   -e 'using Pkg; Pkg.test()'
-julia --project=packages/ReactantServer        -e 'using Pkg; Pkg.test()'
-julia --project=packages/ReactantServerGateway -e 'using Pkg; Pkg.test()'
-julia --project=packages/ReactantServerClient  -e 'using Pkg; Pkg.test()'
-```
+## Start here
+
+- The [Tutorial](tutorial.md): export a Lux model to a bundle, configure a node, serve it, and
+  query it from a client, end to end.
+- [Bundles](bundles.md): the bundle format, the manifest's named-axis notation, and the export
+  frontends.
+- [Node Configuration](node_config.md): the one typed YAML file that describes a machine.
+- [Scheduling](scheduling.md): the cost-aware worker scheduler and batch coalescing.
+- [On-demand Weights](on_demand_weights.md): host-RAM weights and the LRU byte budget.
+- [Multi-GPU Gateway](gateway.md): the reverse proxy and its scheduling modes.
+- [Client Usage](client.md): the Reactant-free client and its shared-memory transport.
+- [Meta Models](meta_models.md): chaining models with data-dependent Julia between stages.
+- The worked examples, [Object Detection](object_detection.md) and
+  [Transformer Text Models](transformers.md), end to end.
+- [Deployment](deployment.md): systemd, Docker, monitoring, and the deployment shapes.
+- The [API](api.md): every documented name, collected automatically.
