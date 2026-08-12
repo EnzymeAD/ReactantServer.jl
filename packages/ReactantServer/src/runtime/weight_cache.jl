@@ -33,8 +33,10 @@ mutable struct WeightCache
     lock::ReentrantLock
 end
 
-WeightCache(backend::AbstractBackend, pool::MemoryPool, registry::ModelRegistry, max_bytes::Integer;
-            mode::ResidencyMode=SELF_MANAGED, store::WeightStore=PrivateWeightStore()) =
+WeightCache(
+    backend::AbstractBackend, pool::MemoryPool, registry::ModelRegistry, max_bytes::Integer;
+    mode::ResidencyMode = SELF_MANAGED, store::WeightStore = PrivateWeightStore()
+) =
     WeightCache(backend, pool, registry, mode, store, Int(max_bytes), 0, String[], 0, 0, 0.0, 0, 0, 0, 0, ReentrantLock())
 
 """
@@ -53,13 +55,17 @@ Pinned models reserve their footprint off the top, so the operator never subtrac
 `pinned_over_commit` (pinned exceed the pool) flags a genuine over-commit no sizing can fix. Pure
 arithmetic, no device access, so it is unit testable.
 """
-function weight_budget(; arena::Integer, fraction::Real, wiggle::Real,
-                       max_scratch::Integer, pinned_bytes::Integer)
+function weight_budget(;
+        arena::Integer, fraction::Real, wiggle::Real,
+        max_scratch::Integer, pinned_bytes::Integer
+    )
     scratch_ceiling = floor(Int, (1 - Float64(wiggle)) * arena)
     weight_pool = max(0, min(floor(Int, Float64(fraction) * arena), scratch_ceiling - Int(max_scratch)))
     on_demand_budget = clamp(weight_pool - Int(pinned_bytes), 0, weight_pool)
-    return (on_demand_budget = on_demand_budget, weight_pool = weight_pool,
-            scratch_ceiling = scratch_ceiling, pinned_over_commit = Int(pinned_bytes) > weight_pool)
+    return (
+        on_demand_budget = on_demand_budget, weight_pool = weight_pool,
+        scratch_ceiling = scratch_ceiling, pinned_over_commit = Int(pinned_bytes) > weight_pool,
+    )
 end
 
 # Free every resident non-pinned device buffer (no reload, no logging, no counters). Used by the
@@ -200,8 +206,10 @@ function acquire!(cache::WeightCache, entry::ModelEntry)
         cache.loads += 1
         cache.load_seconds += dt
     end
-    log_residency_change(entry.name, :system, :device, model.nbytes;
-        memory=memory_report(cache.backend, cache.pool; registry=cache.registry, weight_cache=cache))
+    log_residency_change(
+        entry.name, :system, :device, model.nbytes;
+        memory = memory_report(cache.backend, cache.pool; registry = cache.registry, weight_cache = cache)
+    )
     return nothing
 end
 
@@ -225,8 +233,10 @@ function set_residency_state!(cache::WeightCache, entry::ModelEntry, target::Res
     new_host = model.host_weights
     drop_host = false
     if target == PINNED_SYSTEM && model.host_weights === nothing
-        new_host = host_materialize(cache.store, entry.name, entry.weights, model.sig.weight_names;
-                                    content=weights_file_token(entry.weights_path))
+        new_host = host_materialize(
+            cache.store, entry.name, entry.weights, model.sig.weight_names;
+            content = weights_file_token(entry.weights_path)
+        )
     elseif target == UNPINNED && model.host_weights !== nothing
         new_host = nothing        # drop the host floor
         drop_host = true
@@ -261,8 +271,10 @@ function set_residency_state!(cache::WeightCache, entry::ModelEntry, target::Res
     # The host arrays are no longer referenced (model.host_weights was set to nothing); release the
     # store entry (detach + last-one-out unlink for the shared store).
     drop_host && host_release!(cache.store, entry.name)
-    log_residency_change(entry.name, cur, target, model.nbytes;
-        memory=memory_report(cache.backend, cache.pool; registry=cache.registry, weight_cache=cache))
+    log_residency_change(
+        entry.name, cur, target, model.nbytes;
+        memory = memory_report(cache.backend, cache.pool; registry = cache.registry, weight_cache = cache)
+    )
     return target
 end
 
@@ -328,8 +340,8 @@ while it is being freed. In externally-managed mode `acquire!` will not autonomo
 `reload` list is ignored there (the control plane re-pins what it needs). Returns the number of
 models reloaded.
 """
-function compact!(cache::WeightCache, registry::ModelRegistry; reload::Vector{String}=String[])
-    before = memory_report(cache.backend, cache.pool; registry=registry, weight_cache=cache)
+function compact!(cache::WeightCache, registry::ModelRegistry; reload::Vector{String} = String[])
+    before = memory_report(cache.backend, cache.pool; registry = registry, weight_cache = cache)
 
     # Phase A: free every resident non-pinned device buffer. Reset the on-demand budget bookkeeping
     # (which counts only non-pinned residency, so this is exact); keep the host floors. The slow
@@ -365,7 +377,7 @@ function compact!(cache::WeightCache, registry::ModelRegistry; reload::Vector{St
         end
     end
 
-    after = memory_report(cache.backend, cache.pool; registry=registry, weight_cache=cache)
+    after = memory_report(cache.backend, cache.pool; registry = registry, weight_cache = cache)
     @info "memory compacted" reloaded = reloaded requested = length(reload) before = before after = after
     return reloaded
 end
@@ -376,11 +388,13 @@ end
 Snapshot the cache counters under its lock for observability.
 """
 function weight_cache_stats(cache::WeightCache)
-    lock(cache.lock) do
-        return (resident_bytes = cache.resident_bytes, max_bytes = cache.max_bytes,
-                resident_models = copy(cache.lru), loads = cache.loads, evicts = cache.evicts,
-                load_seconds = cache.load_seconds, compactions = cache.compactions,
-                pinned_bytes = cache.pinned_bytes, max_scratch = cache.max_scratch,
-                weight_pool = cache.weight_pool)
+    return lock(cache.lock) do
+        return (
+            resident_bytes = cache.resident_bytes, max_bytes = cache.max_bytes,
+            resident_models = copy(cache.lru), loads = cache.loads, evicts = cache.evicts,
+            load_seconds = cache.load_seconds, compactions = cache.compactions,
+            pinned_bytes = cache.pinned_bytes, max_scratch = cache.max_scratch,
+            weight_pool = cache.weight_pool,
+        )
     end
 end

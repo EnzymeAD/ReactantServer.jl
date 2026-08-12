@@ -15,7 +15,7 @@ struct Registration
     postprocess::Function
 end
 
-const _CURRENT_REGISTRATION = Ref{Union{Registration,Nothing}}(nothing)
+const _CURRENT_REGISTRATION = Ref{Union{Registration, Nothing}}(nothing)
 
 """
     register_model(name; preprocess=identity, postprocess=identity)
@@ -23,7 +23,7 @@ const _CURRENT_REGISTRATION = Ref{Union{Registration,Nothing}}(nothing)
 Called from a bundle's model.jl to register custom pre/post-processing. Both hooks
 receive and return a `Vector{NamedTensor}`. Omitted hooks default to identity.
 """
-function register_model(name::AbstractString; preprocess::Function=identity, postprocess::Function=identity)
+function register_model(name::AbstractString; preprocess::Function = identity, postprocess::Function = identity)
     _CURRENT_REGISTRATION[] = Registration(String(name), preprocess, postprocess)
     return nothing
 end
@@ -35,7 +35,7 @@ struct MetaRegistration
     run::Function
 end
 
-const _CURRENT_META_REGISTRATION = Ref{Union{MetaRegistration,Nothing}}(nothing)
+const _CURRENT_META_REGISTRATION = Ref{Union{MetaRegistration, Nothing}}(nothing)
 
 """
     register_meta_model(name; run)
@@ -59,11 +59,11 @@ abstract type AbstractDispatchEntry end
 mutable struct ModelEntry <: AbstractDispatchEntry
     name::String
     manifest::Manifest
-    mlir_bytes::Dict{VariantKey,Dict{Int,Vector{UInt8}}}  # variant -> (batch size -> StableHLO artifact); batch key 0 = single unbatched module
+    mlir_bytes::Dict{VariantKey, Dict{Int, Vector{UInt8}}}  # variant -> (batch size -> StableHLO artifact); batch key 0 = single unbatched module
     weights_path::String
     weights::Any                          # SafeTensors handle (mmap), kept lazy; backend-opaque
-    executable::Union{LoadedModel,Nothing}   # compiled runtime + residency; `nothing` until compiled
-    sched::Union{ModelSchedState,Nothing}    # scheduling state; `nothing` until the scheduler prepares it
+    executable::Union{LoadedModel, Nothing}   # compiled runtime + residency; `nothing` until compiled
+    sched::Union{ModelSchedState, Nothing}    # scheduling state; `nothing` until the scheduler prepares it
     preprocess::Function
     postprocess::Function
 end
@@ -71,10 +71,14 @@ end
 # Convenience constructor accepting a flat batch-size -> bytes map, wrapped as the single default
 # input-shape variant `Int[]`. Keeps hand-built entries (tests, fixtures) working while the field
 # is variant-nested; the loader passes the nested map directly.
-ModelEntry(name, manifest, mlir_bytes::Dict{Int,Vector{UInt8}}, weights_path, weights,
-           executable, sched, preprocess, postprocess) =
-    ModelEntry(name, manifest, Dict{VariantKey,Dict{Int,Vector{UInt8}}}(VariantKey() => mlir_bytes),
-               weights_path, weights, executable, sched, preprocess, postprocess)
+ModelEntry(
+    name, manifest, mlir_bytes::Dict{Int, Vector{UInt8}}, weights_path, weights,
+    executable, sched, preprocess, postprocess
+) =
+    ModelEntry(
+    name, manifest, Dict{VariantKey, Dict{Int, Vector{UInt8}}}(VariantKey() => mlir_bytes),
+    weights_path, weights, executable, sched, preprocess, postprocess
+)
 
 # A meta model: a Julia orchestration over other models. It owns no compiled executable or weights and
 # is not scheduled on the dispatch loop. Its `run` executes on the gRPC request task under a per-worker
@@ -86,16 +90,16 @@ mutable struct MetaEntry <: AbstractDispatchEntry
     manifest::Manifest
     calls::Vector{String}   # declared sub-model names (manifest meta.calls)
     run::Function
-    sched::Union{ModelSchedState,Nothing}   # scheduling state; `nothing` until the scheduler prepares it
+    sched::Union{ModelSchedState, Nothing}   # scheduling state; `nothing` until the scheduler prepares it
 end
 # Existing call sites (the loader, tests) build a MetaEntry without scheduling state.
 MetaEntry(name, manifest, calls, run) = MetaEntry(name, manifest, calls, run, nothing)
 
 struct ModelRegistry
-    by_name::Dict{String,ModelEntry}
-    meta::Dict{String,MetaEntry}   # meta models, kept separate so the compile/scheduler paths never see them
+    by_name::Dict{String, ModelEntry}
+    meta::Dict{String, MetaEntry}   # meta models, kept separate so the compile/scheduler paths never see them
 end
-ModelRegistry() = ModelRegistry(Dict{String,ModelEntry}(), Dict{String,MetaEntry}())
+ModelRegistry() = ModelRegistry(Dict{String, ModelEntry}(), Dict{String, MetaEntry}())
 
 get_model(reg::ModelRegistry, name::AbstractString) = get(reg.by_name, name, nothing)
 get_meta(reg::ModelRegistry, name::AbstractString) = get(reg.meta, name, nothing)
@@ -119,6 +123,12 @@ end
 # sub-models hidden. Used by the RepositoryIndex discovery RPC.
 function routable_model_names(reg::ModelRegistry)
     subs = internal_submodels(reg)
-    return sort!(collect(Iterators.filter(n -> !(n in subs),
-                                          union(keys(reg.by_name), keys(reg.meta)))))
+    return sort!(
+        collect(
+            Iterators.filter(
+                n -> !(n in subs),
+                union(keys(reg.by_name), keys(reg.meta))
+            )
+        )
+    )
 end

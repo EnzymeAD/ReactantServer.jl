@@ -45,9 +45,11 @@ concurrently against a single pool. `shm_reprobe_interval` (seconds) is how ofte
 task re-probes endpoints that fell back to inline transport and restores shared memory if the
 server has recovered; set it to `0` (or negative) to disable that background recovery.
 """
-function kserve_init(; pool_bytes::Integer = DEFAULT_POOL_BYTES,
-                            n_slots::Integer = DEFAULT_POOL_SLOTS,
-                            shm_reprobe_interval::Real = 60.0)
+function kserve_init(;
+        pool_bytes::Integer = DEFAULT_POOL_BYTES,
+        n_slots::Integer = DEFAULT_POOL_SLOTS,
+        shm_reprobe_interval::Real = 60.0
+    )
     grpc_init()
     _stop_reprobe!()   # must run outside _pools_lock (the loop takes it)
     @lock _pools_lock begin
@@ -60,7 +62,7 @@ function kserve_init(; pool_bytes::Integer = DEFAULT_POOL_BYTES,
         empty!(_route_locks)
         empty!(_latched)
     end
-    nothing
+    return nothing
 end
 
 """
@@ -79,7 +81,7 @@ function kserve_shutdown()
         empty!(_route_locks)
         empty!(_latched)
     end
-    grpc_shutdown()
+    return grpc_shutdown()
 end
 
 export kserve_init

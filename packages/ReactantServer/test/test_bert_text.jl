@@ -7,11 +7,13 @@
 const _BT = ReactantServer.BertText
 
 # Minimal uncased vocab: specials first (ids 0..4, as in a real vocab.txt), then pieces.
-const _BT_VOCAB = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]",
-                   "the", "cat", "sat", "un", "##able", "##s", "cafe", ".", "漢"]
+const _BT_VOCAB = [
+    "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]",
+    "the", "cat", "sat", "un", "##able", "##s", "cafe", ".", "漢",
+]
 
 function _bt_tokenizer(f)
-    mktempdir() do dir
+    return mktempdir() do dir
         path = joinpath(dir, "vocab.txt")
         write(path, join(_BT_VOCAB, "\n"))
         f(_BT.load_tokenizer(path))
@@ -21,7 +23,7 @@ end
 # (max_bytes, batch) UInt8 matrix + lens, the client wire layout for a batch of texts.
 function _bt_wire(texts::Vector{String})
     rows = [Vector{UInt8}(codeunits(t)) for t in texts]
-    mx = maximum(length, rows; init=1)
+    mx = maximum(length, rows; init = 1)
     data = zeros(UInt8, mx, length(rows))
     for (b, r) in enumerate(rows)
         data[1:length(r), b] = r
@@ -58,8 +60,8 @@ end
             @test _BT.encode_single(t, "漢漢") == Int32[2, 13, 13, 3]
 
             # right truncation keeps room for both specials
-            @test _BT.encode_single(t, "the cat sat"; max_len=4) == Int32[2, 5, 6, 3]
-            @test length(_BT.encode_single(t, repeat("the ", 50); max_len=8)) == 8
+            @test _BT.encode_single(t, "the cat sat"; max_len = 4) == Int32[2, 5, 6, 3]
+            @test length(_BT.encode_single(t, repeat("the ", 50); max_len = 8)) == 8
         end
     end
 
@@ -76,7 +78,7 @@ end
 
             # LongestFirst: the longer side is cut to the shorter one first
             long, short = repeat("the ", 20), "cat sat"
-            ids, tt = _BT.encode_pair(t, long, short; max_len=12)
+            ids, tt = _BT.encode_pair(t, long, short; max_len = 12)
             @test length(ids) == 12 && length(tt) == 12
             @test count(==(2), ids) == 1 && count(==(3), ids) == 2
             @test sum(tt) == 3                                  # cat sat [SEP] on the b side
@@ -107,28 +109,28 @@ end
     @testset "encode_text_batch: padded (seq, batch) executable inputs" begin
         _bt_tokenizer() do t
             data, lens = _bt_wire(["the cat sat", "the cat", ""])
-            ids, mask = _BT.encode_text_batch(t, data, lens; max_len=64, buckets=(64, 128))
+            ids, mask = _BT.encode_text_batch(t, data, lens; max_len = 64, buckets = (64, 128))
 
             @test size(ids) == (64, 3) && size(mask) == (64, 3)
             @test eltype(ids) === Int64 && eltype(mask) === Int64
             @test ids[1, :] == fill(t.cls_id, 3)                # every row starts with [CLS]
             @test ids[1:5, 1] == Int64[2, 5, 6, 7, 3]
             @test ids[1:2, 3] == Int64[2, 3]                    # empty row is [CLS][SEP]
-            @test vec(sum(mask; dims=1)) == Int64[5, 4, 2]
+            @test vec(sum(mask; dims = 1)) == Int64[5, 4, 2]
             @test all(iszero, ids[6:end, 1])                    # 0 == [PAD]
             @test all(iszero, mask[6:end, 1])
 
             # the bucket follows the longest row in the batch
             short, slens = _bt_wire(["the"])
-            sids, _ = _BT.encode_text_batch(t, short, slens; max_len=64, buckets=(8, 64))
+            sids, _ = _BT.encode_text_batch(t, short, slens; max_len = 64, buckets = (8, 64))
             @test size(sids) == (8, 1)
 
             # a max_len past the largest bucket fails with a clear message, not a BoundsError
-            @test_throws ErrorException _BT.encode_text_batch(t, data, lens; max_len=64, buckets=(4,))
+            @test_throws ErrorException _BT.encode_text_batch(t, data, lens; max_len = 64, buckets = (4,))
 
             # error messages name the offending client tensor
             err = try
-                _BT.encode_text_batch(t, data, lens[1:1]; lens_name="text_lens")
+                _BT.encode_text_batch(t, data, lens[1:1]; lens_name = "text_lens")
             catch e
                 e
             end
@@ -139,15 +141,17 @@ end
     @testset "encode_pair_batch: one query against N keys" begin
         _bt_tokenizer() do t
             data, lens = _bt_wire(["sat", "the cat sat", ""])
-            ids, mask, tt = _BT.encode_pair_batch(t, "the cat", data, lens;
-                                                  max_len=64, buckets=(64,))
+            ids, mask, tt = _BT.encode_pair_batch(
+                t, "the cat", data, lens;
+                max_len = 64, buckets = (64,)
+            )
 
             @test size(ids) == (64, 3) && size(mask) == (64, 3) && size(tt) == (64, 3)
             @test ids[1:6, 1] == Int64[2, 5, 6, 3, 7, 3]
             @test count(==(t.sep_id), ids[:, 1]) == 2           # pair row has two [SEP]
             @test count(==(t.sep_id), ids[:, 3]) == 1           # empty key: single encoding
             @test tt[5:6, 1] == Int64[1, 1] && all(iszero, tt[:, 3])
-            @test vec(sum(mask; dims=1)) == Int64[6, 8, 4]
+            @test vec(sum(mask; dims = 1)) == Int64[6, 8, 4]
             @test all(iszero, ids[7:end, 1])
         end
     end

@@ -13,38 +13,56 @@ const GWInf = ReactantServerCore.inference
 @testset "peek_batch_size: item count by input name and axis" begin
     enc(msg) = (io = IOBuffer(); TPB.encode(TPB.ProtoEncoder(io), msg); take!(io))
     tensor(name, shape) = GWInf.var"ModelInferRequest.InferInputTensor"(;
-        name = name, datatype = "UINT8", shape = Int64[shape...])
+        name = name, datatype = "UINT8", shape = Int64[shape...]
+    )
     peek = ReactantServerGateway.peek_batch_size
 
     # A detector-shaped request: `whcn` puts the batch LAST, so position 0 would report the image
     # width. The worker tells the gateway the axis precisely so this cannot be guessed wrong.
-    det = enc(GWInf.ModelInferRequest(; model_name = "det", id = "r1",
-                                      inputs = [tensor("INPUT__0", (1024, 768, 3, 2))],
-                                      raw_input_contents = [rand(UInt8, 512 * 1024)]))
+    det = enc(
+        GWInf.ModelInferRequest(;
+            model_name = "det", id = "r1",
+            inputs = [tensor("INPUT__0", (1024, 768, 3, 2))],
+            raw_input_contents = [rand(UInt8, 512 * 1024)]
+        )
+    )
     @test peek(det, "INPUT__0", 4) == 2        # the declared batch axis
     @test peek(det, "INPUT__0", 1) == 1024     # what a first-axis assumption would have charged
 
     # A cross-encoder-shaped request: the FIRST input carries no batch axis at all, and the batch
     # lives on the second one. Matching by name is what makes this work.
-    xenc = enc(GWInf.ModelInferRequest(; model_name = "xe",
-                                       inputs = [tensor("query", (37,)),
-                                                 tensor("keys", (12, 37)),
-                                                 tensor("key_lens", (12,))]))
+    xenc = enc(
+        GWInf.ModelInferRequest(;
+            model_name = "xe",
+            inputs = [
+                tensor("query", (37,)),
+                tensor("keys", (12, 37)),
+                tensor("key_lens", (12,)),
+            ]
+        )
+    )
     @test peek(xenc, "keys", 1) == 12
     @test peek(xenc, "key_lens", 1) == 12
 
     # Inputs may arrive in any order: KServe tensors are name-addressed.
-    shuffled = enc(GWInf.ModelInferRequest(; model_name = "xe",
-                                           inputs = [tensor("key_lens", (5,)),
-                                                     tensor("keys", (5, 9)),
-                                                     tensor("query", (9,))]))
+    shuffled = enc(
+        GWInf.ModelInferRequest(;
+            model_name = "xe",
+            inputs = [
+                tensor("key_lens", (5,)),
+                tensor("keys", (5, 9)),
+                tensor("query", (9,)),
+            ]
+        )
+    )
     @test peek(shuffled, "keys", 1) == 5
 
     # Inline contents rather than raw: the shape is field 3 and the data field 5 within the tensor,
     # so it is still reached without decoding the payload.
     inline = GWInf.var"ModelInferRequest.InferInputTensor"(;
         name = "x", datatype = "FP32", shape = Int64[4, 8],
-        contents = GWInf.InferTensorContents(; fp32_contents = Float32[1:32;]))
+        contents = GWInf.InferTensorContents(; fp32_contents = Float32[1:32;])
+    )
     @test peek(enc(GWInf.ModelInferRequest(; model_name = "m", inputs = [inline])), "x", 2) == 8
 
     # Degenerate cases all report 0, which the caller charges as a single item: no such input, an
@@ -68,11 +86,15 @@ end
 
 function _mock_router()
     router = gRPCServer.gRPCRouter()
-    ReactantServerGateway.register_GRPCInferenceService!(router;
+    ReactantServerGateway.register_GRPCInferenceService!(
+        router;
         ServerReady = (req, c) -> GWInf.ServerReadyResponse(; ready = true),
-        RepositoryIndex = (req, c) -> GWInf.RepositoryIndexResponse(; models = [
-            GWInf.var"RepositoryIndexResponse.ModelIndex"(; name = m, version = "", state = "READY", reason = "")
-            for m in c.payload.models]),
+        RepositoryIndex = (req, c) -> GWInf.RepositoryIndexResponse(;
+            models = [
+                GWInf.var"RepositoryIndexResponse.ModelIndex"(; name = m, version = "", state = "READY", reason = "")
+                    for m in c.payload.models
+            ]
+        ),
         ModelInfer = (req, c) -> begin
             w = c.payload
             w.fail_infer && throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_UNAVAILABLE, "mock $(w.name) down"))
@@ -96,8 +118,10 @@ _start_mock(worker::MockWorker, port::Integer) =
     gRPCServer.serve!(_mock_router(), "127.0.0.1", port; context = worker)
 
 # Send a typed ModelInfer through the gateway and return the response (or rethrow).
-_infer(port, model) = grpc_call(GWInf.ModelInferRequest, GWInf.ModelInferResponse, "ModelInfer",
-    port, GWInf.ModelInferRequest(; model_name = model))
+_infer(port, model) = grpc_call(
+    GWInf.ModelInferRequest, GWInf.ModelInferResponse, "ModelInfer",
+    port, GWInf.ModelInferRequest(; model_name = model)
+)
 
 function _http_get(port, path)
     try
@@ -121,14 +145,16 @@ end
     s1 = _start_mock(w1, p1)
 
     gatewayfile = tempname() * ".yaml"
-    write(gatewayfile, """
-    listen:
-      grpc: "127.0.0.1:$gw_port"
-      metrics: "127.0.0.1:$admin_port"
-    endpoints:
-      - "127.0.0.1:$p0"
-      - "127.0.0.1:$p1"
-    """)
+    write(
+        gatewayfile, """
+        listen:
+          grpc: "127.0.0.1:$gw_port"
+          metrics: "127.0.0.1:$admin_port"
+        endpoints:
+          - "127.0.0.1:$p0"
+          - "127.0.0.1:$p1"
+        """
+    )
 
     gw = ReactantServerGateway.serve_gateway(gatewayfile; blocking = false)
 
@@ -203,8 +229,10 @@ end
         end
 
         @testset "SHM register fan-out and rollback" begin
-            reg(name) = grpc_call(GWInf.SystemSharedMemoryRegisterRequest, GWInf.SystemSharedMemoryRegisterResponse,
-                "SystemSharedMemoryRegister", gw_port, GWInf.SystemSharedMemoryRegisterRequest(; name = name))
+            reg(name) = grpc_call(
+                GWInf.SystemSharedMemoryRegisterRequest, GWInf.SystemSharedMemoryRegisterResponse,
+                "SystemSharedMemoryRegister", gw_port, GWInf.SystemSharedMemoryRegisterRequest(; name = name)
+            )
             # all workers ok
             @test reg("region-ok") isa GWInf.SystemSharedMemoryRegisterResponse
             # one worker fails -> FailedPrecondition
@@ -239,7 +267,11 @@ end
 
         @testset "on-demand refresh routes a newly loaded model" begin
             # 'lazy' is unknown to every worker initially, so the gateway answers NOT_FOUND.
-            err = try; _infer(gw_port, "lazy"); nothing; catch e; e; end
+            err = try
+                _infer(gw_port, "lazy"); nothing
+            catch e
+                e
+            end
             @test err isa gRPCClient.gRPCServiceCallException
             @test err.grpc_status == gRPCClient.GRPC_NOT_FOUND
             # Load it on worker0. Past the refresher's min_interval the next request rescans on
@@ -256,7 +288,10 @@ end
             # refresh; within a couple of seconds the route is dropped from the gateway's table.
             dropped = false
             for _ in 1:40
-                try; _infer(gw_port, "only0"); catch; end
+                try
+                    _infer(gw_port, "only0")
+                catch
+                end
                 if ReactantServerGateway.pick(gw.routes, "only0") === nothing
                     dropped = true
                     break
@@ -277,8 +312,10 @@ end
     # The node supervisor starts an embedded gateway with no config file: defaults plus
     # REACTANT_GATEWAY_* environment variables, with the endpoint list synthesized into
     # REACTANT_GATEWAY_WORKERS.
-    withenv("REACTANT_GATEWAY_WORKERS" => "127.0.0.1:8080,127.0.0.1:8081",
-            "REACTANT_GATEWAY_LISTEN_GRPC" => "0.0.0.0:9001") do
+    withenv(
+        "REACTANT_GATEWAY_WORKERS" => "127.0.0.1:8080,127.0.0.1:8081",
+        "REACTANT_GATEWAY_LISTEN_GRPC" => "0.0.0.0:9001"
+    ) do
         cfg = ReactantServerGateway.load_gateway(nothing)
         @test cfg.workers == ["127.0.0.1:8080", "127.0.0.1:8081"]
         @test cfg.listen_grpc == "0.0.0.0:9001"
@@ -288,8 +325,10 @@ end
         @test cfg.max_send_msg_bytes == 512 * 1024 * 1024
     end
 
-    withenv("REACTANT_GATEWAY_WORKERS" => "127.0.0.1:8080",
-            "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES" => "4096") do
+    withenv(
+        "REACTANT_GATEWAY_WORKERS" => "127.0.0.1:8080",
+        "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES" => "4096"
+    ) do
         cfg = ReactantServerGateway.load_gateway(nothing)
         @test cfg.max_recv_msg_bytes == 4096
         @test cfg.max_send_msg_bytes == 512 * 1024 * 1024   # unset -> default
@@ -353,8 +392,10 @@ end
         dead = "127.0.0.1:$(grpc_free_port())"
         admin_port = grpc_free_port()
         metrics = ReactantServerGateway.GatewayMetrics()
-        admin = ReactantServerGateway.start_admin(metrics, "127.0.0.1:$admin_port";
-            worker_metrics = [ep0, ep1, dead])
+        admin = ReactantServerGateway.start_admin(
+            metrics, "127.0.0.1:$admin_port";
+            worker_metrics = [ep0, ep1, dead]
+        )
         try
             body = String(HTTP.get("http://127.0.0.1:$admin_port/metrics"; retry = false).body)
             @test occursin("worker_models_loaded{worker=\"worker0\",gpu=\"0\"} 1", body)
@@ -370,13 +411,17 @@ end
     end
 
     @testset "metrics endpoints config" begin
-        withenv("REACTANT_GATEWAY_WORKERS" => "127.0.0.1:8080",
-                "REACTANT_GATEWAY_WORKER_METRICS" => "127.0.0.1:9100, 127.0.0.1:9101") do
+        withenv(
+            "REACTANT_GATEWAY_WORKERS" => "127.0.0.1:8080",
+            "REACTANT_GATEWAY_WORKER_METRICS" => "127.0.0.1:9100, 127.0.0.1:9101"
+        ) do
             cfg = ReactantServerGateway.load_gateway(nothing)
             @test cfg.worker_metrics == ["127.0.0.1:9100", "127.0.0.1:9101"]
         end
-        withenv("REACTANT_GATEWAY_WORKERS" => "127.0.0.1:8080",
-                "REACTANT_GATEWAY_WORKER_METRICS" => nothing) do
+        withenv(
+            "REACTANT_GATEWAY_WORKERS" => "127.0.0.1:8080",
+            "REACTANT_GATEWAY_WORKER_METRICS" => nothing
+        ) do
             @test ReactantServerGateway.load_gateway(nothing).worker_metrics == String[]
         end
     end

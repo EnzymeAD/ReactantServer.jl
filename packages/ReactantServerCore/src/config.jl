@@ -131,7 +131,7 @@ struct RuntimeConfig
     weight_cache_fraction::Float64        # arena fraction for all weights (pinned + on-demand); 0 = cache off
     weight_cache_wiggle_fraction::Float64 # arena fraction kept free as headroom (drives startup auto-sizing)
     autotune::Bool                        # false disables the GPU compile autotuner (xla_gpu_autotune_level=0)
-    autotune_cache::Union{Bool,Nothing}   # persistent per-fusion autotune cache; nothing = inherit Reactant's LocalPreferences
+    autotune_cache::Union{Bool, Nothing}   # persistent per-fusion autotune cache; nothing = inherit Reactant's LocalPreferences
     autotune_cache_dir::String            # persistent autotune cache directory; "" = inherit Reactant's LocalPreferences
     numerics::NumericsMode                # f32 matmul/conv precision policy (see NumericsMode)
 end
@@ -139,18 +139,26 @@ end
 # Five-argument form: device/backend only; residency self-managed, private host weights, and the
 # on-demand cache off (fraction 0). Used by tests and programmatic construction; the YAML path
 # (`build_config`) supplies the 1.0 fraction default.
-RuntimeConfig(backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
-    preallocate::Bool, allow_cpu_fallback::Bool) =
-    RuntimeConfig(backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
-        SELF_MANAGED, false, 0o666, 0.0, 0.0, true, nothing, "", NUMERICS_AUTO)
+RuntimeConfig(
+    backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
+    preallocate::Bool, allow_cpu_fallback::Bool
+) =
+    RuntimeConfig(
+    backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
+    SELF_MANAGED, false, 0o666, 0.0, 0.0, true, nothing, "", NUMERICS_AUTO
+)
 
 # Seven-argument form: adds residency mode and the shared-host-weights flag (cache still off unless
 # a fraction is given). Used where a test needs to exercise externally-managed residency.
-RuntimeConfig(backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
+RuntimeConfig(
+    backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
     preallocate::Bool, allow_cpu_fallback::Bool, residency_mode::ResidencyMode,
-    shared_host_weights::Bool) =
-    RuntimeConfig(backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
-        residency_mode, shared_host_weights, 0o666, 0.0, 0.0, true, nothing, "", NUMERICS_AUTO)
+    shared_host_weights::Bool
+) =
+    RuntimeConfig(
+    backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
+    residency_mode, shared_host_weights, 0o666, 0.0, 0.0, true, nothing, "", NUMERICS_AUTO
+)
 
 """
     ModelSchedConfig
@@ -168,15 +176,19 @@ than the cap is still served (requests are never split).
 """
 struct ModelSchedConfig
     weight::Float64
-    residency::Union{ResidencyState,Nothing}   # nothing = unspecified, resolved at startup
-    max_batch_size::Union{Int,Nothing}         # nothing = uncapped
+    residency::Union{ResidencyState, Nothing}   # nothing = unspecified, resolved at startup
+    max_batch_size::Union{Int, Nothing}         # nothing = uncapped
 end
 
 # Convenience constructor; residency and the batch cap default to unspecified.
-ModelSchedConfig(weight::Real=1.0; residency::Union{ResidencyState,Nothing}=nothing,
-    max_batch_size::Union{Integer,Nothing}=nothing) =
-    ModelSchedConfig(Float64(weight), residency,
-        max_batch_size === nothing ? nothing : Int(max_batch_size))
+ModelSchedConfig(
+    weight::Real = 1.0; residency::Union{ResidencyState, Nothing} = nothing,
+    max_batch_size::Union{Integer, Nothing} = nothing
+) =
+    ModelSchedConfig(
+    Float64(weight), residency,
+    max_batch_size === nothing ? nothing : Int(max_batch_size)
+)
 
 """
     SchedulerConfig
@@ -202,18 +214,22 @@ struct SchedulerConfig
     dispatch_timeout_seconds::Float64
     discipline::SchedulingDiscipline
     compaction_interval::Int
-    models::Dict{String,ModelSchedConfig}
+    models::Dict{String, ModelSchedConfig}
 end
 
 # Convenience constructor preserving the original three-argument form. The cost-aware knobs,
 # discipline, compaction interval, and per-model overrides take their defaults unless passed as keywords.
-SchedulerConfig(ema_halflife_seconds::Real, max_queue_depth::Integer, dispatch_timeout_seconds::Real;
-    recency_penalty_cap::Real=0.25, coalescing_discount::Real=0.10, cost_ema_alpha::Real=0.2,
-    discipline::SchedulingDiscipline=FAIR, compaction_interval::Integer=0,
-    models::Dict{String,ModelSchedConfig}=Dict{String,ModelSchedConfig}()) =
-    SchedulerConfig(Float64(ema_halflife_seconds), Float64(recency_penalty_cap),
-        Float64(coalescing_discount), Float64(cost_ema_alpha), Int(max_queue_depth),
-        Float64(dispatch_timeout_seconds), discipline, Int(compaction_interval), models)
+SchedulerConfig(
+    ema_halflife_seconds::Real, max_queue_depth::Integer, dispatch_timeout_seconds::Real;
+    recency_penalty_cap::Real = 0.25, coalescing_discount::Real = 0.1, cost_ema_alpha::Real = 0.2,
+    discipline::SchedulingDiscipline = FAIR, compaction_interval::Integer = 0,
+    models::Dict{String, ModelSchedConfig} = Dict{String, ModelSchedConfig}()
+) =
+    SchedulerConfig(
+    Float64(ema_halflife_seconds), Float64(recency_penalty_cap),
+    Float64(coalescing_discount), Float64(cost_ema_alpha), Int(max_queue_depth),
+    Float64(dispatch_timeout_seconds), discipline, Int(compaction_interval), models
+)
 
 """
     EndpointsConfig
@@ -294,24 +310,32 @@ end
 
 # Preserve the positional forms. Programmatic construction defaults to STATIC (no surprise
 # background watcher for embedders/unit tests); the YAML path (`build_config`) defaults to DYNAMIC.
-ServerConfig(model_dirs, cache_dir, runtime::RuntimeConfig, scheduler::SchedulerConfig,
-    endpoints::EndpointsConfig) =
+ServerConfig(
+    model_dirs, cache_dir, runtime::RuntimeConfig, scheduler::SchedulerConfig,
+    endpoints::EndpointsConfig
+) =
     ServerConfig(model_dirs, cache_dir, runtime, scheduler, endpoints, String[], 0.0, STATIC)
 
-ServerConfig(model_dirs, cache_dir, runtime::RuntimeConfig, scheduler::SchedulerConfig,
-    endpoints::EndpointsConfig, models_include) =
+ServerConfig(
+    model_dirs, cache_dir, runtime::RuntimeConfig, scheduler::SchedulerConfig,
+    endpoints::EndpointsConfig, models_include
+) =
     ServerConfig(model_dirs, cache_dir, runtime, scheduler, endpoints, models_include, 0.0, STATIC)
 
 # Pre-grpc positional form (eight args): default the gRPC limits so existing callers keep working.
-ServerConfig(model_dirs, cache_dir, runtime::RuntimeConfig, scheduler::SchedulerConfig,
-    endpoints::EndpointsConfig, models_include, model_poll_seconds, model_control_mode::ModelControlMode) =
-    ServerConfig(model_dirs, cache_dir, runtime, scheduler, endpoints, models_include,
-        model_poll_seconds, model_control_mode, GrpcConfig())
+ServerConfig(
+    model_dirs, cache_dir, runtime::RuntimeConfig, scheduler::SchedulerConfig,
+    endpoints::EndpointsConfig, models_include, model_poll_seconds, model_control_mode::ModelControlMode
+) =
+    ServerConfig(
+    model_dirs, cache_dir, runtime, scheduler, endpoints, models_include,
+    model_poll_seconds, model_control_mode, GrpcConfig()
+)
 
 const ENV_PREFIX = "INFERENCE_SERVER_"
 
 # (env suffix, path into the raw dict, target type). Single source of truth for overrides.
-const ENV_PATHS = Tuple{String,Vector{String},DataType}[
+const ENV_PATHS = Tuple{String, Vector{String}, DataType}[
     ("CACHE_DIR", ["cache_dir"], String),
     ("MODEL_POLL_SECONDS", ["model_poll_seconds"], Float64),
     ("MODEL_CONTROL_MODE", ["model_control_mode"], String),
@@ -364,7 +388,7 @@ function _set_nested!(d::AbstractDict, path::Vector{String}, val)
     for k in path[1:(end - 1)]
         nxt = get(cur, k, nothing)
         if !(nxt isa AbstractDict)
-            nxt = Dict{String,Any}()
+            nxt = Dict{String, Any}()
             cur[k] = nxt
         end
         cur = nxt
@@ -393,7 +417,7 @@ function apply_env_overrides!(raw::AbstractDict)
         var == ENV_PREFIX * "RUNTIME_RESIDENCY_MODE" &&
             throw(ConfigError("environment override $var: " * _RESIDENCY_MODE_REMOVED_MSG))
     end
-    applied = Tuple{String,String}[]
+    applied = Tuple{String, String}[]
     for (suffix, path, T) in ENV_PATHS
         var = ENV_PREFIX * suffix
         haskey(ENV, var) || continue
@@ -402,12 +426,12 @@ function apply_env_overrides!(raw::AbstractDict)
     end
     mdvar = ENV_PREFIX * "MODEL_DIRS"
     if haskey(ENV, mdvar)
-        raw["model_dirs"] = String[String(x) for x in split(ENV[mdvar], ':'; keepempty=false)]
+        raw["model_dirs"] = String[String(x) for x in split(ENV[mdvar], ':'; keepempty = false)]
         push!(applied, (mdvar, ENV[mdvar]))
     end
     mivar = ENV_PREFIX * "MODELS_INCLUDE"
     if haskey(ENV, mivar)
-        raw["models_include"] = String[String(x) for x in split(ENV[mivar], ':'; keepempty=false)]
+        raw["models_include"] = String[String(x) for x in split(ENV[mivar], ':'; keepempty = false)]
         push!(applied, (mivar, ENV[mivar]))
     end
     return applied
@@ -422,13 +446,15 @@ _opt(d, key, ::Type{T}, default) where {T} = haskey(d, key) ? _coerce(T, d[key],
 
 function _coerce_strvec(v, key)
     v isa AbstractVector || throw(ConfigError("config '$key' must be a list"))
-    return String[x isa AbstractString ? String(x) :
-                  throw(ConfigError("config '$key' entries must be strings")) for x in v]
+    return String[
+        x isa AbstractString ? String(x) :
+            throw(ConfigError("config '$key' entries must be strings")) for x in v
+    ]
 end
 
 function _subdict(raw, key)
     v = get(raw, key, nothing)
-    v === nothing && return Dict{String,Any}()
+    v === nothing && return Dict{String, Any}()
     v isa AbstractDict || throw(ConfigError("config '$key' must be a mapping"))
     return v
 end
@@ -450,7 +476,7 @@ end
 
 # Permission bits for the shared host-weight regions, from an octal string like "666".
 function _parse_shm_mode(s)
-    m = tryparse(UInt16, s; base=8)
+    m = tryparse(UInt16, s; base = 8)
     (m !== nothing && m <= 0o777) ||
         throw(ConfigError("runtime.shared_host_weights_mode must be an octal permission string like \"666\" or \"660\", got '$s'"))
     return m
@@ -486,9 +512,9 @@ end
 # `residency: device`. Unlisted models fall back to the defaults at scheduler-build time.
 function _parse_sched_models(sc)
     raw = get(sc, "models", nothing)
-    raw === nothing && return Dict{String,ModelSchedConfig}()
+    raw === nothing && return Dict{String, ModelSchedConfig}()
     raw isa AbstractDict || throw(ConfigError("config 'scheduler.models' must be a mapping"))
-    out = Dict{String,ModelSchedConfig}()
+    out = Dict{String, ModelSchedConfig}()
     for (name, v) in raw
         key = "scheduler.models.$name"
         v isa AbstractDict || throw(ConfigError("config '$key' must be a mapping"))
@@ -501,7 +527,7 @@ function _parse_sched_models(sc)
             nothing            # unspecified: the server resolves the default at startup
         end
         max_batch_size = haskey(v, "max_batch_size") ?
-                         _coerce(Int, v["max_batch_size"], "$key.max_batch_size") : nothing
+            _coerce(Int, v["max_batch_size"], "$key.max_batch_size") : nothing
         out[String(name)] = ModelSchedConfig(weight, residency, max_batch_size)
     end
     return out
@@ -542,7 +568,7 @@ function build_config(raw::AbstractDict)
     scheduler = SchedulerConfig(
         _opt(sc, "ema_halflife_seconds", Float64, 30.0),
         _opt(sc, "recency_penalty_cap", Float64, 0.25),
-        _opt(sc, "coalescing_discount", Float64, 0.10),
+        _opt(sc, "coalescing_discount", Float64, 0.1),
         _opt(sc, "cost_ema_alpha", Float64, 0.2),
         _opt(sc, "max_queue_depth", Int, 1024),
         _opt(sc, "dispatch_timeout_seconds", Float64, 30.0),
@@ -563,7 +589,7 @@ function build_config(raw::AbstractDict)
     )
 
     models_include = haskey(raw, "models_include") ?
-                     _coerce_strvec(raw["models_include"], "models_include") : String[]
+        _coerce_strvec(raw["models_include"], "models_include") : String[]
 
     # Default to a sensible interval so `dynamic` (the default mode) watches out of the box.
     model_poll_seconds = _opt(raw, "model_poll_seconds", Float64, 15.0)
@@ -574,8 +600,10 @@ function build_config(raw::AbstractDict)
         _opt(gc, "max_send_msg_bytes", Int, DEFAULT_GRPC_MSG_BYTES),
     )
 
-    return ServerConfig(model_dirs, cache_dir, runtime, scheduler, endpoints, models_include,
-        model_poll_seconds, model_control_mode, grpc)
+    return ServerConfig(
+        model_dirs, cache_dir, runtime, scheduler, endpoints, models_include,
+        model_poll_seconds, model_control_mode, grpc
+    )
 end
 
 function validate_config(cfg::ServerConfig)
@@ -624,7 +652,7 @@ end
 # `apply_env_overrides!` is applied on top by `node_server_config`.
 
 function log_effective_config(cfg::ServerConfig, applied)
-    @info "Effective configuration" model_dirs=cfg.model_dirs models_include=cfg.models_include model_control_mode=cfg.model_control_mode model_poll_seconds=cfg.model_poll_seconds cache_dir=cfg.cache_dir backend=cfg.runtime.backend device_ordinal=cfg.runtime.device_ordinal mem_fraction=cfg.runtime.mem_fraction preallocate=cfg.runtime.preallocate allow_cpu_fallback=cfg.runtime.allow_cpu_fallback weight_cache_fraction=cfg.runtime.weight_cache_fraction weight_cache_wiggle_fraction=cfg.runtime.weight_cache_wiggle_fraction autotune=cfg.runtime.autotune autotune_cache=cfg.runtime.autotune_cache autotune_cache_dir=cfg.runtime.autotune_cache_dir numerics=cfg.runtime.numerics residency_mode=cfg.runtime.residency_mode shared_host_weights=cfg.runtime.shared_host_weights shared_host_weights_mode=string(cfg.runtime.shared_host_weights_mode; base=8) host=cfg.endpoints.host port=cfg.endpoints.port metrics_port=cfg.endpoints.metrics_port max_concurrent_requests=cfg.endpoints.max_concurrent_requests discipline=cfg.scheduler.discipline ema_halflife_seconds=cfg.scheduler.ema_halflife_seconds recency_penalty_cap=cfg.scheduler.recency_penalty_cap coalescing_discount=cfg.scheduler.coalescing_discount cost_ema_alpha=cfg.scheduler.cost_ema_alpha max_queue_depth=cfg.scheduler.max_queue_depth compaction_interval=cfg.scheduler.compaction_interval scheduler_models=collect(keys(cfg.scheduler.models))
-    isempty(applied) || @info "Configuration overridden by environment" overrides=["$k=$v" for (k, v) in applied]
+    @info "Effective configuration" model_dirs = cfg.model_dirs models_include = cfg.models_include model_control_mode = cfg.model_control_mode model_poll_seconds = cfg.model_poll_seconds cache_dir = cfg.cache_dir backend = cfg.runtime.backend device_ordinal = cfg.runtime.device_ordinal mem_fraction = cfg.runtime.mem_fraction preallocate = cfg.runtime.preallocate allow_cpu_fallback = cfg.runtime.allow_cpu_fallback weight_cache_fraction = cfg.runtime.weight_cache_fraction weight_cache_wiggle_fraction = cfg.runtime.weight_cache_wiggle_fraction autotune = cfg.runtime.autotune autotune_cache = cfg.runtime.autotune_cache autotune_cache_dir = cfg.runtime.autotune_cache_dir numerics = cfg.runtime.numerics residency_mode = cfg.runtime.residency_mode shared_host_weights = cfg.runtime.shared_host_weights shared_host_weights_mode = string(cfg.runtime.shared_host_weights_mode; base = 8) host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests discipline = cfg.scheduler.discipline ema_halflife_seconds = cfg.scheduler.ema_halflife_seconds recency_penalty_cap = cfg.scheduler.recency_penalty_cap coalescing_discount = cfg.scheduler.coalescing_discount cost_ema_alpha = cfg.scheduler.cost_ema_alpha max_queue_depth = cfg.scheduler.max_queue_depth compaction_interval = cfg.scheduler.compaction_interval scheduler_models = collect(keys(cfg.scheduler.models))
+    isempty(applied) || @info "Configuration overridden by environment" overrides = ["$k=$v" for (k, v) in applied]
     return nothing
 end

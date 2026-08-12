@@ -6,15 +6,15 @@ import InterProcessCommunication as IPC
 
 const _ShmInf = ReactantServer.inference
 
-_sp(s) = _ShmInf.InferParameter(; parameter_choice=ReactantServer.ProtoBuf.OneOf(:string_param, String(s)))
-_ip(i) = _ShmInf.InferParameter(; parameter_choice=ReactantServer.ProtoBuf.OneOf(:int64_param, Int64(i)))
+_sp(s) = _ShmInf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:string_param, String(s)))
+_ip(i) = _ShmInf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:int64_param, Int64(i)))
 
 # Create a POSIX shm region; returns (handle, key, byte-view). volatile=true so the handle
 # unlinks the object when finalized at the end of the test.
 function _make_region(nbytes::Int)
     key = "/reactantserver-test-$(getpid())-$(rand(UInt32))"
     shm = IPC.SharedMemory(key, nbytes)
-    view = unsafe_wrap(Array, convert(Ptr{UInt8}, pointer(shm)), nbytes; own=false)
+    view = unsafe_wrap(Array, convert(Ptr{UInt8}, pointer(shm)), nbytes; own = false)
     fill!(view, 0x00)
     return shm, key, view
 end
@@ -113,15 +113,19 @@ end
           }
         }
         """
-        write_bundle(root, "scale4"; manifest_yaml=manifest, mlir_text=mlir,
-            weights=Dict("w" => Float32[2, 2, 2, 2]), argument_order=["w"])
+        write_bundle(
+            root, "scale4"; manifest_yaml = manifest, mlir_text = mlir,
+            weights = Dict("w" => Float32[2, 2, 2, 2]), argument_order = ["w"]
+        )
 
         port = grpc_free_port()
-        cfg = ReactantServer.ServerConfig([root], "",
+        cfg = ReactantServer.ServerConfig(
+            [root], "",
             ReactantServer.RuntimeConfig(ReactantServer.CPU_BACKEND, 0, 0.9, true, true),
             ReactantServer.SchedulerConfig(30.0, 64, 30.0),
-            ReactantServer.EndpointsConfig("127.0.0.1", port))
-        srv = ReactantServer.serve(cfg; backend=ReactantServer.ReactantBackend(), blocking=false)
+            ReactantServer.EndpointsConfig("127.0.0.1", port)
+        )
+        srv = ReactantServer.serve(cfg; backend = ReactantServer.ReactantBackend(), blocking = false)
         sleep(0.3)
 
         rin, kin, vin = _make_region(16)               # input region
@@ -129,62 +133,92 @@ end
         try
             # --- register both regions ---
             for (rname, key, bytes) in (("rin", kin, 16), ("rio", kio, 32))
-                resp = grpc_call(_ShmInf.SystemSharedMemoryRegisterRequest, _ShmInf.SystemSharedMemoryRegisterResponse,
+                resp = grpc_call(
+                    _ShmInf.SystemSharedMemoryRegisterRequest, _ShmInf.SystemSharedMemoryRegisterResponse,
                     "SystemSharedMemoryRegister", port,
-                    _ShmInf.SystemSharedMemoryRegisterRequest(; name=rname, key=key, offset=0, byte_size=bytes))
+                    _ShmInf.SystemSharedMemoryRegisterRequest(; name = rname, key = key, offset = 0, byte_size = bytes)
+                )
                 @test resp isa _ShmInf.SystemSharedMemoryRegisterResponse
             end
 
             # status reports both regions
-            st = grpc_call(_ShmInf.SystemSharedMemoryStatusRequest, _ShmInf.SystemSharedMemoryStatusResponse,
-                "SystemSharedMemoryStatus", port, _ShmInf.SystemSharedMemoryStatusRequest(; name=""))
+            st = grpc_call(
+                _ShmInf.SystemSharedMemoryStatusRequest, _ShmInf.SystemSharedMemoryStatusResponse,
+                "SystemSharedMemoryStatus", port, _ShmInf.SystemSharedMemoryStatusRequest(; name = "")
+            )
             @test haskey(st.regions, "rin") && haskey(st.regions, "rio")
             @test st.regions["rin"].byte_size == 16
             @test st.regions["rin"].key == kin
 
             # --- A: input from shm, output inline ---
             copyto!(vin, reinterpret(UInt8, Float32[1, 2, 3, 4]))
-            inA = _ShmInf.var"ModelInferRequest.InferInputTensor"(; name="x", datatype="FP32", shape=Int64[4],
-                parameters=Dict("shared_memory_region" => _sp("rin"),
-                                "shared_memory_offset" => _ip(0),
-                                "shared_memory_byte_size" => _ip(16)))
-            mA = grpc_call(_ShmInf.ModelInferRequest, _ShmInf.ModelInferResponse, "ModelInfer", port,
-                _ShmInf.ModelInferRequest(; model_name="scale4", inputs=[inA]))
+            inA = _ShmInf.var"ModelInferRequest.InferInputTensor"(;
+                name = "x", datatype = "FP32", shape = Int64[4],
+                parameters = Dict(
+                    "shared_memory_region" => _sp("rin"),
+                    "shared_memory_offset" => _ip(0),
+                    "shared_memory_byte_size" => _ip(16)
+                )
+            )
+            mA = grpc_call(
+                _ShmInf.ModelInferRequest, _ShmInf.ModelInferResponse, "ModelInfer", port,
+                _ShmInf.ModelInferRequest(; model_name = "scale4", inputs = [inA])
+            )
             @test collect(reinterpret(Float32, mA.raw_output_contents[1])) == Float32[2, 4, 6, 8]
 
             # --- B: input from shm, output written to shm at offset 16 ---
             copyto!(view(vio, 1:16), reinterpret(UInt8, Float32[3, 4, 5, 6]))
-            inB = _ShmInf.var"ModelInferRequest.InferInputTensor"(; name="x", datatype="FP32", shape=Int64[4],
-                parameters=Dict("shared_memory_region" => _sp("rio"),
-                                "shared_memory_offset" => _ip(0),
-                                "shared_memory_byte_size" => _ip(16)))
-            outB = _ShmInf.var"ModelInferRequest.InferRequestedOutputTensor"(; name="y",
-                parameters=Dict("shared_memory_region" => _sp("rio"),
-                                "shared_memory_offset" => _ip(16),
-                                "shared_memory_byte_size" => _ip(16)))
-            mB = grpc_call(_ShmInf.ModelInferRequest, _ShmInf.ModelInferResponse, "ModelInfer", port,
-                _ShmInf.ModelInferRequest(; model_name="scale4", inputs=[inB], outputs=[outB]))
+            inB = _ShmInf.var"ModelInferRequest.InferInputTensor"(;
+                name = "x", datatype = "FP32", shape = Int64[4],
+                parameters = Dict(
+                    "shared_memory_region" => _sp("rio"),
+                    "shared_memory_offset" => _ip(0),
+                    "shared_memory_byte_size" => _ip(16)
+                )
+            )
+            outB = _ShmInf.var"ModelInferRequest.InferRequestedOutputTensor"(;
+                name = "y",
+                parameters = Dict(
+                    "shared_memory_region" => _sp("rio"),
+                    "shared_memory_offset" => _ip(16),
+                    "shared_memory_byte_size" => _ip(16)
+                )
+            )
+            mB = grpc_call(
+                _ShmInf.ModelInferRequest, _ShmInf.ModelInferResponse, "ModelInfer", port,
+                _ShmInf.ModelInferRequest(; model_name = "scale4", inputs = [inB], outputs = [outB])
+            )
             @test isempty(mB.raw_output_contents)                 # output went to shm, not inline
             @test mB.outputs[1].name == "y"
             # the server wrote the result into the region at offset 16
             @test reinterpret(Float32, view(vio, 17:32)) == Float32[6, 8, 10, 12]
 
             # --- unregister one, then confirm it is gone ---
-            ru = grpc_call(_ShmInf.SystemSharedMemoryUnregisterRequest, _ShmInf.SystemSharedMemoryUnregisterResponse,
-                "SystemSharedMemoryUnregister", port, _ShmInf.SystemSharedMemoryUnregisterRequest(; name="rin"))
+            ru = grpc_call(
+                _ShmInf.SystemSharedMemoryUnregisterRequest, _ShmInf.SystemSharedMemoryUnregisterResponse,
+                "SystemSharedMemoryUnregister", port, _ShmInf.SystemSharedMemoryUnregisterRequest(; name = "rin")
+            )
             @test ru isa _ShmInf.SystemSharedMemoryUnregisterResponse
-            st2 = grpc_call(_ShmInf.SystemSharedMemoryStatusRequest, _ShmInf.SystemSharedMemoryStatusResponse,
-                "SystemSharedMemoryStatus", port, _ShmInf.SystemSharedMemoryStatusRequest(; name=""))
+            st2 = grpc_call(
+                _ShmInf.SystemSharedMemoryStatusRequest, _ShmInf.SystemSharedMemoryStatusResponse,
+                "SystemSharedMemoryStatus", port, _ShmInf.SystemSharedMemoryStatusRequest(; name = "")
+            )
             @test !haskey(st2.regions, "rin") && haskey(st2.regions, "rio")
 
             # referencing an unregistered region is recoverable (the client re-registers), so it
             # surfaces as FAILED_PRECONDITION, distinct from a malformed-request INVALID_ARGUMENT.
-            inBad = _ShmInf.var"ModelInferRequest.InferInputTensor"(; name="x", datatype="FP32", shape=Int64[4],
-                parameters=Dict("shared_memory_region" => _sp("rin"),
-                                "shared_memory_byte_size" => _ip(16)))
+            inBad = _ShmInf.var"ModelInferRequest.InferInputTensor"(;
+                name = "x", datatype = "FP32", shape = Int64[4],
+                parameters = Dict(
+                    "shared_memory_region" => _sp("rin"),
+                    "shared_memory_byte_size" => _ip(16)
+                )
+            )
             try
-                grpc_call(_ShmInf.ModelInferRequest, _ShmInf.ModelInferResponse, "ModelInfer", port,
-                    _ShmInf.ModelInferRequest(; model_name="scale4", inputs=[inBad]))
+                grpc_call(
+                    _ShmInf.ModelInferRequest, _ShmInf.ModelInferResponse, "ModelInfer", port,
+                    _ShmInf.ModelInferRequest(; model_name = "scale4", inputs = [inBad])
+                )
                 @test false
             catch ex
                 @test ex isa gRPCClient.gRPCServiceCallException
@@ -195,13 +229,19 @@ end
             # A request against the still-registered "rio" region now fails the same recoverable way,
             # which is exactly the stale-registration signal the client keys its recovery on.
             ReactantServer.shm_teardown!(srv.shm)
-            inStale = _ShmInf.var"ModelInferRequest.InferInputTensor"(; name="x", datatype="FP32", shape=Int64[4],
-                parameters=Dict("shared_memory_region" => _sp("rio"),
-                                "shared_memory_offset" => _ip(0),
-                                "shared_memory_byte_size" => _ip(16)))
+            inStale = _ShmInf.var"ModelInferRequest.InferInputTensor"(;
+                name = "x", datatype = "FP32", shape = Int64[4],
+                parameters = Dict(
+                    "shared_memory_region" => _sp("rio"),
+                    "shared_memory_offset" => _ip(0),
+                    "shared_memory_byte_size" => _ip(16)
+                )
+            )
             try
-                grpc_call(_ShmInf.ModelInferRequest, _ShmInf.ModelInferResponse, "ModelInfer", port,
-                    _ShmInf.ModelInferRequest(; model_name="scale4", inputs=[inStale]))
+                grpc_call(
+                    _ShmInf.ModelInferRequest, _ShmInf.ModelInferResponse, "ModelInfer", port,
+                    _ShmInf.ModelInferRequest(; model_name = "scale4", inputs = [inStale])
+                )
                 @test false
             catch ex
                 @test ex isa gRPCClient.gRPCServiceCallException

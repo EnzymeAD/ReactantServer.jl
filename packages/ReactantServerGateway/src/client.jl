@@ -21,7 +21,7 @@ const STATUS_DEADLINE = "DeadlineExceeded"
 # budget and request semaphore, isolating a slow or wedged worker to its own slots. The struct is
 # parametric so every field keeps its concrete client type (the request path forwards through
 # `infer` with no dynamic dispatch); the type parameters are inferred at construction.
-struct WorkerClients{G,I,SR,SU,RD,RI,CS,CM,NS}
+struct WorkerClients{G, I, SR, SU, RD, RI, CS, CM, NS}
     url::String
     grpc::G
     infer::I
@@ -34,9 +34,9 @@ struct WorkerClients{G,I,SR,SU,RD,RI,CS,CM,NS}
     is_same_ns::NS        # GRPCInferenceService/IsSameIPCNamespace (SHM-namespace probe fan-out)
 end
 
-struct ClientPool{W<:WorkerClients}
+struct ClientPool{W <: WorkerClients}
     order::Vector{String}
-    clients::Dict{String,W}
+    clients::Dict{String, W}
 end
 
 # Build one worker's clients over a freshly-created multi handle.
@@ -49,24 +49,32 @@ function _worker_clients(cfg::GatewayConfig, url::AbstractString)
     # one running multi handle per worker; its stream semaphore caps outbound in-flight requests to
     # this worker (the rest block until a slot frees).
     grpc = gRPCClient.gRPCCURL(; sticky = true, max_streams = cfg.max_concurrent_streams_per_worker)
-    infer = GRPCInferenceService_ModelInfer_Client(host, port; grpc = grpc,
+    infer = GRPCInferenceService_ModelInfer_Client(
+        host, port; grpc = grpc,
         TRequest = Vector{UInt8}, TResponse = Vector{UInt8},
         deadline = cfg.request_timeout_seconds,
         max_send_message_length = cfg.max_send_msg_bytes,
-        max_recieve_message_length = cfg.max_recv_msg_bytes)
-    shm_reg = GRPCInferenceService_SystemSharedMemoryRegister_Client(host, port; grpc = grpc,
+        max_recieve_message_length = cfg.max_recv_msg_bytes
+    )
+    shm_reg = GRPCInferenceService_SystemSharedMemoryRegister_Client(
+        host, port; grpc = grpc,
         TRequest = Vector{UInt8}, TResponse = Vector{UInt8},
-        deadline = cfg.request_timeout_seconds)
-    shm_unreg = GRPCInferenceService_SystemSharedMemoryUnregister_Client(host, port; grpc = grpc,
+        deadline = cfg.request_timeout_seconds
+    )
+    shm_unreg = GRPCInferenceService_SystemSharedMemoryUnregister_Client(
+        host, port; grpc = grpc,
         TRequest = Vector{UInt8}, TResponse = Vector{UInt8},
-        deadline = cfg.request_timeout_seconds)
+        deadline = cfg.request_timeout_seconds
+    )
     ready = GRPCInferenceService_ServerReady_Client(host, port; grpc = grpc, deadline = 5)
     repo_index = GRPCInferenceService_RepositoryIndex_Client(host, port; grpc = grpc, deadline = 5)
     control_status = ControlService_ModelControlStatus_Client(host, port; grpc = grpc, deadline = 5)
     # Compaction frees and reloads weights (device-pinned models re-read from the mmap), so it can
     # run far longer than a status probe; give it a generous deadline rather than the 5s probe one.
-    compact = ControlService_CompactMemory_Client(host, port; grpc = grpc,
-        deadline = max(cfg.request_timeout_seconds, 300))
+    compact = ControlService_CompactMemory_Client(
+        host, port; grpc = grpc,
+        deadline = max(cfg.request_timeout_seconds, 300)
+    )
     # Typed (decoded response) so the gateway can read `.same` to aggregate across workers.
     is_same_ns = GRPCInferenceService_IsSameIPCNamespace_Client(host, port; grpc = grpc, deadline = 5)
     return WorkerClients(url, grpc, infer, shm_reg, shm_unreg, ready, repo_index, control_status, compact, is_same_ns)
@@ -118,9 +126,9 @@ end
 # `deadline` (seconds, or nothing) overrides the worker client's default per-call timeout so the
 # gateway can forward the request's REMAINING budget as grpc-timeout — decrementing it for the time
 # already spent reaching the gateway, rather than granting the worker a fresh full budget.
-function invoke_infer(wc::WorkerClients, body::Vector{UInt8}; deadline::Union{Real,Nothing}=nothing)
+function invoke_infer(wc::WorkerClients, body::Vector{UInt8}; deadline::Union{Real, Nothing} = nothing)
     deadline === nothing && return gRPCClient.grpc_sync_request(wc.infer, body)
-    req = gRPCClient.grpc_async_request(wc.infer, body; deadline=deadline)
+    req = gRPCClient.grpc_async_request(wc.infer, body; deadline = deadline)
     return gRPCClient.grpc_async_await(wc.infer, req)
 end
 invoke_shm_register(wc::WorkerClients, body::Vector{UInt8}) = gRPCClient.grpc_sync_request(wc.shm_register, body)
@@ -184,9 +192,9 @@ end
 
 struct RegisterGate
     lock::ReentrantLock
-    inflight::Dict{String,Base.Event}
+    inflight::Dict{String, Base.Event}
 end
-RegisterGate() = RegisterGate(ReentrantLock(), Dict{String,Base.Event}())
+RegisterGate() = RegisterGate(ReentrantLock(), Dict{String, Base.Event}())
 
 # Mark a SHM operation in flight against `url`; returns a function that releases the gate.
 function gate_begin!(g::RegisterGate, url::AbstractString)
@@ -198,7 +206,7 @@ function gate_begin!(g::RegisterGate, url::AbstractString)
         lock(g.lock) do
             delete!(g.inflight, String(url))
         end
-        notify(ev)
+        return notify(ev)
     end
 end
 

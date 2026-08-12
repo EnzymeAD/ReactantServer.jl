@@ -12,7 +12,7 @@
 # infer_async/infer_sync calls can never overlap.
 
 function triton_unregister_shm()
-    @lock _pools_lock begin
+    return @lock _pools_lock begin
         shm = _shm_pool[]
         shm === nothing || unregister_pool!(shm)
     end
@@ -33,20 +33,24 @@ end
 mutable struct InferenceBufferPool
     pool::BufferPool
     registered_models::Vector{KServeModel}
-    registered_keys::Set{Tuple{String,UInt16}}
+    registered_keys::Set{Tuple{String, UInt16}}
     # Per-endpoint registration generation, bumped every time the pool is (re-)registered with an
     # endpoint. Used to coalesce concurrent re-registration after a server restart: the first failed
     # request bumps it, all other in-flight requests that observed the same generation skip the
     # re-register and just retry (see recover_registration!).
-    reg_gen::Dict{Tuple{String,UInt16},Int}
+    reg_gen::Dict{Tuple{String, UInt16}, Int}
     register_lock::ReentrantLock
 end
 
-function InferenceBufferPool(n_bytes::Integer; n_slots::Integer = 8, use_shm::Bool = true,
-                             name::AbstractString = "reactant_server_client_pool")
+function InferenceBufferPool(
+        n_bytes::Integer; n_slots::Integer = 8, use_shm::Bool = true,
+        name::AbstractString = "reactant_server_client_pool"
+    )
     pool = BufferPool(n_bytes; n_slots = n_slots, use_shm = use_shm, name = name)
-    return InferenceBufferPool(pool, KServeModel[], Set{Tuple{String,UInt16}}(),
-                               Dict{Tuple{String,UInt16},Int}(), ReentrantLock())
+    return InferenceBufferPool(
+        pool, KServeModel[], Set{Tuple{String, UInt16}}(),
+        Dict{Tuple{String, UInt16}, Int}(), ReentrantLock()
+    )
 end
 
 Base.sizeof(p::InferenceBufferPool) = sizeof(p.pool)
@@ -95,13 +99,13 @@ function register_pool_with_model!(p::InferenceBufferPool, model::KServeModel)
         model in p.registered_models || push!(p.registered_models, model)
         p.reg_gen[key] = get(p.reg_gen, key, 0) + 1
     end
-    nothing
+    return nothing
 end
 
 # Current registration generation for an endpoint (0 if never registered). A request snapshots this
 # before it sends, then hands it to recover_registration! so exactly one re-registration happens per
 # detected restart no matter how many requests fail at once.
-registration_gen(p::InferenceBufferPool, key::Tuple{String,UInt16}) =
+registration_gen(p::InferenceBufferPool, key::Tuple{String, UInt16}) =
     @lock p.register_lock get(p.reg_gen, key, 0)
 
 # Re-register the pool with `model`'s endpoint after a stale-registration failure, coalescing
@@ -117,7 +121,7 @@ function recover_registration!(p::InferenceBufferPool, model::KServeModel, obser
         delete!(p.registered_keys, key)                    # force register_pool_with_model! to act
         register_pool_with_model!(p, model)                # re-registers and bumps reg_gen[key]
     end
-    nothing
+    return nothing
 end
 
 function unregister_pool!(p::InferenceBufferPool)
@@ -125,8 +129,10 @@ function unregister_pool!(p::InferenceBufferPool)
     lock(p.register_lock) do
         for m in p.registered_models
             try
-                grpc_sync_request(grpc_shm_unregister_client(m),
-                                  SystemSharedMemoryUnregisterRequest(name = pool_name(p)))
+                grpc_sync_request(
+                    grpc_shm_unregister_client(m),
+                    SystemSharedMemoryUnregisterRequest(name = pool_name(p))
+                )
             catch ex
                 @info ex
             end
@@ -134,7 +140,7 @@ function unregister_pool!(p::InferenceBufferPool)
         empty!(p.registered_keys)
         empty!(p.registered_models)
     end
-    nothing
+    return nothing
 end
 
 # ---- Pool registry (two singletons + per-URL routing) ----
@@ -143,11 +149,11 @@ end
 # the server but on the model's mode, so two models hitting the same endpoint with different modes
 # (e.g. one :off and one :on) must not share a cached route -- otherwise :on could silently inherit
 # an inline route instead of failing loudly.
-const PoolKey = Tuple{String,UInt16,Symbol}
-const _shm_pool = Ref{Union{InferenceBufferPool,Nothing}}(nothing)
-const _inline_pool = Ref{Union{InferenceBufferPool,Nothing}}(nothing)
-const _pool_routes = Dict{PoolKey,InferenceBufferPool}()
-const _route_locks = Dict{PoolKey,ReentrantLock}()
+const PoolKey = Tuple{String, UInt16, Symbol}
+const _shm_pool = Ref{Union{InferenceBufferPool, Nothing}}(nothing)
+const _inline_pool = Ref{Union{InferenceBufferPool, Nothing}}(nothing)
+const _pool_routes = Dict{PoolKey, InferenceBufferPool}()
+const _route_locks = Dict{PoolKey, ReentrantLock}()
 const _pools_lock = ReentrantLock()
 const _pool_bytes = Ref{Int}(DEFAULT_POOL_BYTES)
 const _pool_slots = Ref{Int}(DEFAULT_POOL_SLOTS)
@@ -156,9 +162,9 @@ const _pool_slots = Ref{Int}(DEFAULT_POOL_SLOTS)
 # not be recovered in-band (see latch_inline!). A single background task (below) re-probes these and
 # unlatches them back to SHM if the server recovers. Guarded by _pools_lock; the value is a
 # representative model the poller re-probes with.
-const _latched = Dict{PoolKey,KServeModel}()
+const _latched = Dict{PoolKey, KServeModel}()
 const _reprobe_interval = Ref{Float64}(60.0)      # seconds; <= 0 disables the poller
-const _reprobe_task = Ref{Union{Task,Nothing}}(nothing)
+const _reprobe_task = Ref{Union{Task, Nothing}}(nothing)
 # The running loop is identified by a generation number. Bumping it (in _stop_reprobe!) invalidates
 # the current loop so it returns at its next checkpoint, WITHOUT anyone blocking on the task -- the
 # task may be parked in a gRPC probe, and waiting on that is the shutdown hang we must avoid.
@@ -168,7 +174,7 @@ const _reprobe_gen = Ref{Int}(0)
 const _REPROBE_RPC_DEADLINE = 3
 
 function _route_lock_for(key::PoolKey)
-    @lock _pools_lock get!(() -> ReentrantLock(), _route_locks, key)
+    return @lock _pools_lock get!(() -> ReentrantLock(), _route_locks, key)
 end
 
 function _get_shm_pool!()
@@ -243,7 +249,7 @@ function latch_inline!(model::KServeModel)
     end
     if !already
         @warn "shared memory unrecoverable for $(model.host):$(model.port); falling back to inline " *
-              "transport (a background probe will restore SHM if the server recovers)"
+            "transport (a background probe will restore SHM if the server recovers)"
     end
     _ensure_reprobe_running!()
     return _get_inline_pool!()
@@ -304,8 +310,10 @@ function _reprobe_once()
     shm = _get_shm_pool!()
     for (key, model) in latched
         try
-            query_same_ipc_namespace(model, shmid(shm.pool.backing);
-                                     deadline = _REPROBE_RPC_DEADLINE) === :yes || continue
+            query_same_ipc_namespace(
+                model, shmid(shm.pool.backing);
+                deadline = _REPROBE_RPC_DEADLINE
+            ) === :yes || continue
             # Force an actual re-register even if the endpoint is still in registered_keys.
             @lock shm.register_lock delete!(shm.registered_keys, (model.host, model.port))
             register_pool_with_model!(shm, model)
@@ -352,10 +360,12 @@ function _decide_pool!(model::KServeModel)
         return shm_pool
     elseif verdict === :no
         if mode === :on
-            error("shared_memory=:on for $(model.host):$(model.port), but the server reports it is " *
-                  "not in this client's IPC namespace, so system shared memory cannot work. Use " *
-                  "shared_memory=:auto to fall back to inline transport, or run the client and " *
-                  "server in the same IPC namespace.")
+            error(
+                "shared_memory=:on for $(model.host):$(model.port), but the server reports it is " *
+                    "not in this client's IPC namespace, so system shared memory cannot work. Use " *
+                    "shared_memory=:auto to fall back to inline transport, or run the client and " *
+                    "server in the same IPC namespace."
+            )
         end
         return _get_inline_pool!()
     else  # :unknown -- the server does not implement IsSameIPCNamespace
@@ -377,7 +387,7 @@ function get_or_create_pool!(model::KServeModel)
     cached = @lock _pools_lock get(_pool_routes, key, nothing)
     cached === nothing || return cached
 
-    lock(_route_lock_for(key)) do
+    return lock(_route_lock_for(key)) do
         cached = @lock _pools_lock get(_pool_routes, key, nothing)
         cached === nothing || return cached
 

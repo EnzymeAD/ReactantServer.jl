@@ -36,6 +36,44 @@ The PyTorch portion skips gracefully when `torch`/`torchax` are unavailable.
 `packages/ReactantServer/test/spike_reactant.jl` (and the `spike_*.jl` siblings) are standalone
 scripts that exercise the Reactant runtime and export paths in isolation.
 
+## Formatting
+
+[Runic.jl](https://github.com/fredrikekre/Runic.jl) is the formatter. Runic has **no
+configuration** — the rules are fixed, so output is deterministic.
+
+Install the `runic` CLI (Julia ≥ 1.12 provides it as a Pkg app):
+
+```
+julia -e 'using Pkg; Pkg.Apps.add("Runic")'
+```
+
+Format in place (repo, directory, or single file):
+
+```
+runic --inplace .
+runic --inplace packages/ReactantServerCore/src
+runic --inplace path/to/file.jl
+```
+
+Check that files are formatted without modifying them (exits non-zero when changes are needed —
+useful for CI):
+
+```
+runic --check .
+```
+
+A pre-commit hook runs `runic --inplace packages docs examples tools docker` and re-stages the formatted
+files, so commits never ship unformatted code. `.git/hooks/` is machine-local and not versioned;
+(re)install the hook in a fresh clone with:
+
+```
+cp scripts/pre-commit-runic .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+```
+
+The generated protobuf bindings under `packages/ReactantServerCore/src/proto/` are formatted like
+any other source; after regenerating them (see below), run `runic --inplace` over the generated
+tree before committing so the diff stays clean.
+
 ## Regenerating the protobuf bindings
 
 The KServe V2 messages and gRPC service stubs in
@@ -84,12 +122,14 @@ the two stub files are hand-maintained:
 
 ## Documentation
 
-The docs are built with Documenter:
+The docs are built with Documenter (DocumenterVitepress) and published to GitHub Pages by the
+`.github/workflows/docs.yml` workflow: every push and PR builds, and pushes to `main` (or a tag)
+deploy the live site — PRs get a preview URL (`deploydocs(push_preview = true)` in
+`docs/make.jl`). To build locally:
 
 ```
 julia --project=docs -e 'using Pkg; Pkg.instantiate()'
 julia --project=docs docs/make.jl
 ```
 
-Output lands in `docs/build/`. There is no `deploydocs`; an Azure DevOps pipeline can publish
-`docs/build/` as an artifact when desired.
+Output lands in `docs/build/`.

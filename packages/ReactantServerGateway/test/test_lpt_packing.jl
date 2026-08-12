@@ -16,7 +16,7 @@ const ACtl = ReactantServerCore.control
 include(ReactantServerCore.control_server_stubs_path())
 
 const GW = ReactantServerGateway
-const NOPREV = Dict{String,GW.Placement}()
+const NOPREV = Dict{String, GW.Placement}()
 
 @testset "control proto: max_batch_size round-trips" begin
     ms = ACtl.ModelStatus(; name = "m", max_batch_size = Int64(32))
@@ -63,8 +63,10 @@ end
     @test length(GW.compute_assignment(Dict("m" => 0.9), W, NOPREV; default_replicas = 2)["m"]) == 2
 
     # default_replicas = all places every model on every worker (clamped to the worker count).
-    everywhere = GW.compute_assignment(Dict("a" => 0.5, "b" => 0.1, "c" => 0.0), W, NOPREV;
-                                       default_replicas = GW.REPLICAS_ALL)
+    everywhere = GW.compute_assignment(
+        Dict("a" => 0.5, "b" => 0.1, "c" => 0.0), W, NOPREV;
+        default_replicas = GW.REPLICAS_ALL
+    )
     @test all(m -> length(everywhere[m]) == 3, keys(everywhere))
 end
 
@@ -120,16 +122,20 @@ end
 end
 
 @testset "verify_lpt_packing_preconditions!: gates on worker reachability" begin
-    cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", ["127.0.0.1:1"], String[], String[], 1, 1, 1, "info",
-                           "json", "lpt_packing", "compute", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr", "run",
-                           Dict{String,GW.GatewayModelConfig}(), 32, 64, :off, 0, false)
+    cfg = GW.GatewayConfig(
+        "0.0.0.0:0", "0.0.0.0:0", ["127.0.0.1:1"], String[], String[], 1, 1, 1, "info",
+        "json", "lpt_packing", "compute", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr", "run",
+        Dict{String, GW.GatewayModelConfig}(), 32, 64, :off, 0, false
+    )
     pool = GW.ClientPool(cfg)
     # Default (wait_seconds = 0) fails fast when a worker is unreachable.
     @test_throws ErrorException GW.verify_lpt_packing_preconditions!(pool; wait_seconds = 0)
     # A bounded wait polls, then still errors if the worker never comes up.
     t0 = time()
-    @test_throws ErrorException GW.verify_lpt_packing_preconditions!(pool; wait_seconds = 0.3,
-                                                                     poll_interval = 0.05)
+    @test_throws ErrorException GW.verify_lpt_packing_preconditions!(
+        pool; wait_seconds = 0.3,
+        poll_interval = 0.05
+    )
     @test time() - t0 >= 0.25
 end
 
@@ -164,38 +170,44 @@ end
     @test packed["c"] == [("w0", 1.0)]
 
     # Cold models (u = 0) still occupy memory and get concentrated homes spread by footprint.
-    cold = GW.compute_assignment(Dict("c1" => 0.0, "c2" => 0.0), W, NOPREV;
-                                 mem = Dict("c1" => 6GB, "c2" => 6GB), mem_cap = caps)
+    cold = GW.compute_assignment(
+        Dict("c1" => 0.0, "c2" => 0.0), W, NOPREV;
+        mem = Dict("c1" => 6GB, "c2" => 6GB), mem_cap = caps
+    )
     @test length(cold["c1"]) == 1 && length(cold["c2"]) == 1
     @test cold["c1"][1][2] == 1.0 && cold["c2"][1][2] == 1.0
     @test cold["c1"][1][1] != cold["c2"][1][1]    # one per worker: 12 GB would overflow one budget
 
     # A worker with cap 0 (on-demand cache disabled) is memory-unconstrained.
-    free = GW.compute_assignment(u, W, NOPREV; mem = mem,
-                                 mem_cap = Dict("w0" => 0.0, "w1" => 0.0))
+    free = GW.compute_assignment(
+        u, W, NOPREV; mem = mem,
+        mem_cap = Dict("w0" => 0.0, "w1" => 0.0)
+    )
     @test free["c"] == [("w1", 1.0)]              # back to pure compute balance
 
     # Abundant memory degrades gracefully to compute-only LPT: when every model fits every
     # budget with room to spare, the max-norm is dominated by compute pressure and the placement
     # matches the no-memory packing exactly.
-    roomy = GW.compute_assignment(u, W, NOPREV; mem = mem,
-                                  mem_cap = Dict("w0" => 1000GB, "w1" => 1000GB))
+    roomy = GW.compute_assignment(
+        u, W, NOPREV; mem = mem,
+        mem_cap = Dict("w0" => 1000GB, "w1" => 1000GB)
+    )
     @test roomy == plain
 end
 
 @testset "compute_assignment: hysteresis keeps placements stable" begin
     W = ["w0", "w1"]
-    prev = Dict{String,GW.Placement}("a" => [("w1", 1.0)])
+    prev = Dict{String, GW.Placement}("a" => [("w1", 1.0)])
     # small imbalance: a stays on its previous worker even though w0 is nominally least loaded
     asn = GW.compute_assignment(Dict("a" => 0.5), W, prev; hysteresis = 0.1)
     @test asn["a"] == [("w1", 1.0)]
     # large imbalance: a model stuck behind a hot one moves
-    prev2 = Dict{String,GW.Placement}("hot" => [("w1", 1.0)], "a" => [("w1", 1.0)])
+    prev2 = Dict{String, GW.Placement}("hot" => [("w1", 1.0)], "a" => [("w1", 1.0)])
     asn2 = GW.compute_assignment(Dict("hot" => 0.7, "a" => 0.3), W, prev2; hysteresis = 0.1)
     @test asn2["hot"] == [("w1", 1.0)]               # sticky
     @test asn2["a"] == [("w0", 1.0)]                 # moved off the hot worker
     # a previous worker that no longer exists is ignored
-    prev3 = Dict{String,GW.Placement}("a" => [("gone", 1.0)])
+    prev3 = Dict{String, GW.Placement}("a" => [("gone", 1.0)])
     asn3 = GW.compute_assignment(Dict("a" => 0.5), W, prev3)
     @test asn3["a"][1][1] in W
 end
@@ -243,14 +255,18 @@ end
     caps = Dict("w0" => 10GB, "w1" => 10GB)
     # cpu1 saturates w1's compute; occ0 + m together exceed w0's budget. Hysteresis (unconstrained)
     # pins m on w0 because moving it to the compute-busy w1 barely improves its max-norm pressure.
-    prev = Dict{String,GW.Placement}("m" => [("w0", 1.0)], "occ0" => [("w0", 1.0)],
-                                     "cpu1" => [("w1", 1.0)])
+    prev = Dict{String, GW.Placement}(
+        "m" => [("w0", 1.0)], "occ0" => [("w0", 1.0)],
+        "cpu1" => [("w1", 1.0)]
+    )
     u = Dict("cpu1" => 1.0, "occ0" => 0.0, "m" => 0.0)
     mem = Dict("cpu1" => 1GB, "occ0" => 7GB, "m" => 3.5GB)
     soft = GW.compute_assignment(u, W, prev; mem = mem, mem_cap = caps, hysteresis = 0.1)
     @test soft["m"] == [("w0", 1.0)]                            # pinned: w0 now holds 10.5 GB > 10
-    hard = GW.compute_assignment(u, W, prev; mem = mem, mem_cap = caps, hysteresis = 0.1,
-                                 forbid_memory_oversubscription = true)
+    hard = GW.compute_assignment(
+        u, W, prev; mem = mem, mem_cap = caps, hysteresis = 0.1,
+        forbid_memory_oversubscription = true
+    )
     @test hard["m"] == [("w1", 1.0)]                            # forced onto the feasible worker
     for w in W                                                  # no worker exceeds its budget
         load = sum((get(mem, mm, 0.0) for (mm, pl) in hard for (ww, _) in pl if ww == w); init = 0.0)
@@ -261,21 +277,27 @@ end
     u2 = Dict("a" => 0.6, "b" => 0.5, "c" => 0.1)
     mem2 = Dict("a" => 1GB, "b" => 1GB, "c" => 1GB)
     big = Dict("w0" => 1000GB, "w1" => 1000GB)
-    @test GW.compute_assignment(u2, W, NOPREV; mem = mem2, mem_cap = big,
-                                forbid_memory_oversubscription = true) ==
-          GW.compute_assignment(u2, W, NOPREV; mem = mem2, mem_cap = big)
+    @test GW.compute_assignment(
+        u2, W, NOPREV; mem = mem2, mem_cap = big,
+        forbid_memory_oversubscription = true
+    ) ==
+        GW.compute_assignment(u2, W, NOPREV; mem = mem2, mem_cap = big)
 
     # Genuinely infeasible (a model larger than any budget) is still placed, not dropped.
-    huge = GW.compute_assignment(Dict("x" => 0.5), W, NOPREV;
-                                 mem = Dict("x" => 20GB), mem_cap = caps,
-                                 forbid_memory_oversubscription = true)
+    huge = GW.compute_assignment(
+        Dict("x" => 0.5), W, NOPREV;
+        mem = Dict("x" => 20GB), mem_cap = caps,
+        forbid_memory_oversubscription = true
+    )
     @test length(huge["x"]) == 1 && huge["x"][1][1] in W
 end
 
 @testset "gateway compaction cadence: fires on the Nth repack that moves a model" begin
-    mk(mode, interval) = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], String[], 60, 1, 1,
+    mk(mode, interval) = GW.GatewayConfig(
+        "0.0.0.0:0", "0.0.0.0:0", String[], String[], String[], 60, 1, 1,
         "info", "json", "lpt_packing", "compute", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr", "run",
-        Dict{String,GW.GatewayModelConfig}(), 32, 64, mode, interval, false)
+        Dict{String, GW.GatewayModelConfig}(), 32, 64, mode, interval, false
+    )
     cfg = mk(:eager, 2)
     s = GW.LptPackingState(cfg)
     pool = GW.ClientPool(cfg)               # no workers; the ghost URL below is skipped (no network)
@@ -307,27 +329,35 @@ end
 # `costs` are per-REQUEST costs (what the `requests` work basis charges, published through
 # `cost_snapshot`); `item_costs` are per-ITEM costs (what `compute` charges, published through the
 # shared routing-metadata cache, which the prober would normally fill from a poll).
-function _pk_state(; routing_policy = "fill_rr", fill_factor = 1.0, max_batch = 8,
-                   fill_mode = "run", batch_at = nothing, work_basis = "compute",
-                   assignment = Dict{String,GW.Placement}("m" => [("w0", 0.5), ("w1", 0.5)]),
-                   costs = nothing, item_costs = nothing)
-    cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], String[], 60, 1, 1, "info", "json",
-                           "lpt_packing", work_basis, 30.0, 0.0, 0.8, 0.1, 30.0, 1, fill_factor, routing_policy, fill_mode,
-                           Dict{String,GW.GatewayModelConfig}(), 32, 64, :off, 0, false)
+function _pk_state(;
+        routing_policy = "fill_rr", fill_factor = 1.0, max_batch = 8,
+        fill_mode = "run", batch_at = nothing, work_basis = "compute",
+        assignment = Dict{String, GW.Placement}("m" => [("w0", 0.5), ("w1", 0.5)]),
+        costs = nothing, item_costs = nothing
+    )
+    cfg = GW.GatewayConfig(
+        "0.0.0.0:0", "0.0.0.0:0", String[], String[], String[], 60, 1, 1, "info", "json",
+        "lpt_packing", work_basis, 30.0, 0.0, 0.8, 0.1, 30.0, 1, fill_factor, routing_policy, fill_mode,
+        Dict{String, GW.GatewayModelConfig}(), 32, 64, :off, 0, false
+    )
     meta = GW.RoutingMeta(30.0)
     if item_costs !== nothing
         bi, ax = batch_at === nothing ? ("", 0) : batch_at
-        models = Dict(m => GW.ModelRoutingMeta(max_batch, bi, ax, 0.0, Float64(c))
-                      for (m, c) in item_costs)
-        @atomic meta.snapshot = GW.RoutingMetaSnapshot(models,
-            sum(Float64(c) for c in values(item_costs)) / length(item_costs))
+        models = Dict(
+            m => GW.ModelRoutingMeta(max_batch, bi, ax, 0.0, Float64(c))
+                for (m, c) in item_costs
+        )
+        @atomic meta.snapshot = GW.RoutingMetaSnapshot(
+            models,
+            sum(Float64(c) for c in values(item_costs)) / length(item_costs)
+        )
     end
     s = GW.LptPackingState(cfg, meta)
     @atomic s.assignment = assignment
     mb = Dict(m => max_batch for m in keys(assignment))
     @atomic s.max_batch = mb
-    at = batch_at === nothing ? Dict{String,Tuple{String,Int}}() :
-         Dict(m => batch_at for m in keys(assignment))
+    at = batch_at === nothing ? Dict{String, Tuple{String, Int}}() :
+        Dict(m => batch_at for m in keys(assignment))
     GW._publish_fill_plan!(s, GW.knobs(s), mb, at)   # resolve mode + quantum, as a prober tick would
     costs === nothing || (@atomic s.cost_snapshot = costs)
     GW._swap_outstanding!(s, (@atomic s.assignment))
@@ -350,7 +380,7 @@ end
 
     # single-replica fast path: still reserves (so its load is visible to fill_least), but routes
     # to its sole worker. A cold/unknown model falls back to round robin (nothing).
-    s3 = _pk_state(; assignment = Dict{String,GW.Placement}("solo" => [("w0", 1.0)]))
+    s3 = _pk_state(; assignment = Dict{String, GW.Placement}("solo" => [("w0", 1.0)]))
     urls, counters = GW.route_replica(s3, "solo")
     @test urls == ["w0"] && counters !== nothing
     @test (@atomic s3.worker_load)["w0"][] > 0                # the single-replica request loads w0
@@ -383,10 +413,14 @@ end
     # m is replicated on w0/w1; an expensive single-replica model "hot" lives on w0. Routing hot
     # loads w0 (single-replica load counts), so m's next batch opens on the idle w1 even though both
     # replicas hold zero of m's own requests.
-    s = _pk_state(; routing_policy = "fill_least", work_basis = "requests",
-                  assignment = Dict{String,GW.Placement}("m" => [("w0", 0.5), ("w1", 0.5)],
-                                                         "hot" => [("w0", 1.0)]),
-                  costs = Dict("hot" => 10.0, "m" => 1.0))
+    s = _pk_state(;
+        routing_policy = "fill_least", work_basis = "requests",
+        assignment = Dict{String, GW.Placement}(
+            "m" => [("w0", 0.5), ("w1", 0.5)],
+            "hot" => [("w0", 1.0)]
+        ),
+        costs = Dict("hot" => 10.0, "m" => 1.0)
+    )
     _, hc = GW.route_replica(s, "hot")
     @test (@atomic s.worker_load)["w0"][] == 10.0             # hot's measured cost weights the load
     @test GW.route_replica(s, "m")[1][1] == "w1"             # m avoids the busy w0
@@ -404,12 +438,16 @@ end
     # The default basis. Same fleet, same traffic, three bases, three different answers about which
     # GPU is busier. "dear" costs 1.0 GPU-second per item and lives alone on w0; "m" is replicated on
     # w0/w1 and costs 0.01 per item.
-    _fleet(basis) = _pk_state(; routing_policy = "fill_least", work_basis = basis, max_batch = 32,
-                              batch_at = ("IN", 1),
-                              assignment = Dict{String,GW.Placement}("m" => [("w0", 0.5), ("w1", 0.5)],
-                                                                     "dear" => [("w0", 1.0)]),
-                              item_costs = Dict("dear" => 1.0, "m" => 0.01),
-                              costs = Dict("dear" => 8.0, "m" => 0.32))
+    _fleet(basis) = _pk_state(;
+        routing_policy = "fill_least", work_basis = basis, max_batch = 32,
+        batch_at = ("IN", 1),
+        assignment = Dict{String, GW.Placement}(
+            "m" => [("w0", 0.5), ("w1", 0.5)],
+            "dear" => [("w0", 1.0)]
+        ),
+        item_costs = Dict("dear" => 1.0, "m" => 0.01),
+        costs = Dict("dear" => 8.0, "m" => 0.32)
+    )
 
     # compute: 8 items of dear is 8 GPU-seconds; 32 items of m is 0.32. dear's GPU is busier, which
     # is the truth, so m's next run opens on the other one.
@@ -444,10 +482,14 @@ end
     @test (@atomic s.worker_load)["w1"][] == 0.0
 
     # A model with no measured cost of its own borrows the fleet mean rather than looking free.
-    s2 = _pk_state(; routing_policy = "fill_least", batch_at = ("IN", 1),
-                   assignment = Dict{String,GW.Placement}("m" => [("w0", 0.5), ("w1", 0.5)],
-                                                          "cold" => [("w0", 1.0)]),
-                   item_costs = Dict("m" => 2.0))
+    s2 = _pk_state(;
+        routing_policy = "fill_least", batch_at = ("IN", 1),
+        assignment = Dict{String, GW.Placement}(
+            "m" => [("w0", 0.5), ("w1", 0.5)],
+            "cold" => [("w0", 1.0)]
+        ),
+        item_costs = Dict("m" => 2.0)
+    )
     GW.route_replica(s2, "cold", 3)
     @test (@atomic s2.worker_load)["w0"][] ≈ 6.0             # 3 items x the 2.0 fleet mean
 end
@@ -466,10 +508,12 @@ end
     #
     # The cost and shape are netai02's: ~0.00326 GPU-seconds per item, 31-item requests, quantum 32
     # items, 8 requests in flight per burst.
-    FOUR = Dict{String,GW.Placement}("m" => [("w$i", 0.25) for i in 0:3])
-    s = _pk_state(; routing_policy = "fill_least", max_batch = 32, batch_at = ("IN", 1),
-                  assignment = FOUR, item_costs = Dict("m" => 0.00326))
-    routed = Dict{String,Int}()
+    FOUR = Dict{String, GW.Placement}("m" => [("w$i", 0.25) for i in 0:3])
+    s = _pk_state(;
+        routing_policy = "fill_least", max_batch = 32, batch_at = ("IN", 1),
+        assignment = FOUR, item_costs = Dict("m" => 0.00326)
+    )
+    routed = Dict{String, Int}()
     for _ in 1:16
         held = [GW.route_replica(s, "m", 31) for _ in 1:8]
         for h in held
@@ -488,12 +532,14 @@ end
     # And the comparison itself: loads differing by less than a nanosecond of GPU time are a tie, so
     # the rotation cursor decides rather than the crumb, while a real difference still orders.
     @test GW._load_key(0.0) == GW._load_key(4.440892098500626e-16)
-    @test GW._load_key(0.5) < GW._load_key(0.5 + 1e-6)
+    @test GW._load_key(0.5) < GW._load_key(0.5 + 1.0e-6)
 end
 
 @testset "work_basis is runtime-mutable, so a fleet can be switched without a restart" begin
-    s = _pk_state(; routing_policy = "fill_least", batch_at = ("IN", 1),
-                  item_costs = Dict("m" => 0.5), costs = Dict("m" => 4.0))
+    s = _pk_state(;
+        routing_policy = "fill_least", batch_at = ("IN", 1),
+        item_costs = Dict("m" => 0.5), costs = Dict("m" => 4.0)
+    )
     @test GW.knobs(s).work_basis === :compute
     GW.route_replica(s, "m", 6)
     w0 = (@atomic s.worker_load)["w0"]
@@ -526,9 +572,9 @@ end
 # parks on.
 function _closed_loop(; C, n = 2, steps = 400, kw...)
     ws = ["w$(i - 1)" for i in 1:n]
-    s = _pk_state(; assignment = Dict{String,GW.Placement}("m" => [(w, 1 / n) for w in ws]), kw...)
+    s = _pk_state(; assignment = Dict{String, GW.Placement}("m" => [(w, 1 / n) for w in ws]), kw...)
     held = Any[]
-    counts = Dict{String,Int}()
+    counts = Dict{String, Int}()
     conc = 0
     for _ in 1:steps
         length(held) >= C && GW._release_route!(popfirst!(held))
@@ -548,10 +594,12 @@ end
     # every concurrency, and stay within one quantum of even.
     Q = 8
     for mode in ("run", "spread"), policy in ("fill_rr", "fill_least"),
-        n in (2, 3, 4), C in (1, 2, 4, 7, 8, 9, 16, 24)
+            n in (2, 3, 4), C in (1, 2, 4, 7, 8, 9, 16, 24)
 
-        shares, _ = _closed_loop(; C = C, n = n, steps = 400, max_batch = Q,
-                                 fill_mode = mode, routing_policy = policy)
+        shares, _ = _closed_loop(;
+            C = C, n = n, steps = 400, max_batch = Q,
+            fill_mode = mode, routing_policy = policy
+        )
         @test sum(shares) == 400
         @test minimum(shares) > 0                                  # nobody starves
         @test maximum(abs.(shares .- 400 / n)) <= Q                # even to within one run
@@ -563,8 +611,10 @@ end
     # and parks. The `run` basis rotates after Q *routed* requests regardless of how few are in flight.
     run_shares, run_conc = _closed_loop(; C = 2, n = 2, steps = 400, max_batch = 8, fill_mode = "run")
     @test run_shares == [200, 200]
-    inflight_shares, _ = _closed_loop(; C = 2, n = 2, steps = 400, max_batch = 8,
-                                      fill_mode = "inflight")
+    inflight_shares, _ = _closed_loop(;
+        C = 2, n = 2, steps = 400, max_batch = 8,
+        fill_mode = "inflight"
+    )
     @test inflight_shares == [400, 0]                              # legacy behavior, pinned on purpose
 
     # `run` keeps the model on one GPU at a time (deep batches, fair over runs); `spread` uses both at
@@ -613,9 +663,16 @@ end
     import ProtoBuf as QPB
     QInf = ReactantServerCore.inference
     enc(msg) = (io = IOBuffer(); QPB.encode(QPB.ProtoEncoder(io), msg); take!(io))
-    body(name, shape) = enc(QInf.ModelInferRequest(; model_name = "m",
-        inputs = [QInf.var"ModelInferRequest.InferInputTensor"(;
-            name = name, datatype = "UINT8", shape = Int64[shape...])]))
+    body(name, shape) = enc(
+        QInf.ModelInferRequest(;
+            model_name = "m",
+            inputs = [
+                QInf.var"ModelInferRequest.InferInputTensor"(;
+                    name = name, datatype = "UINT8", shape = Int64[shape...]
+                ),
+            ]
+        )
+    )
 
     # Batch last, as an image bundle declares it (`whcn`): the item count is the 4th axis, and a
     # first-axis assumption would have charged the width.
@@ -702,10 +759,10 @@ end
     s = _pk_state(; max_batch = 8, fill_mode = "run")
     held = [GW.route_replica(s, "m") for _ in 1:3]                 # a run is open on w0
     foreach(h -> GW._release_route!(h[2]), held)
-    next = Dict{String,GW.Placement}("m" => [("w1", 0.5), ("w2", 0.5)])
+    next = Dict{String, GW.Placement}("m" => [("w1", 0.5), ("w2", 0.5)])
     @atomic s.assignment = next
     GW._swap_outstanding!(s, next)
-    shares = Dict{String,Int}()
+    shares = Dict{String, Int}()
     for _ in 1:40
         urls, c = GW.route_replica(s, "m")
         shares[urls[1]] = get(shares, urls[1], 0) + 1
@@ -718,11 +775,15 @@ end
 @testset "fill modes: per-model override beats the scheduling default" begin
     # Three-level resolution: a model's own fill_mode/fill_factor, else the `scheduling:` default, else
     # the built-in. This is what makes a default set at the scheduling level reach models with no block.
-    cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], String[], 60, 1, 1, "info",
+    cfg = GW.GatewayConfig(
+        "0.0.0.0:0", "0.0.0.0:0", String[], String[], String[], 60, 1, 1, "info",
         "json", "lpt_packing", "compute", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr", "spread",
-        Dict("pinned" => GW.GatewayModelConfig(2, :inflight, 0.0),
-             "short" => GW.GatewayModelConfig(2, :inherit, 0.25)),
-        32, 64, :off, 0, false)
+        Dict(
+            "pinned" => GW.GatewayModelConfig(2, :inflight, 0.0),
+            "short" => GW.GatewayModelConfig(2, :inherit, 0.25)
+        ),
+        32, 64, :off, 0, false
+    )
     s = GW.LptPackingState(cfg)
     mb = Dict("pinned" => 8, "short" => 8, "plain" => 8)
     plan = GW._publish_fill_plan!(s, GW.knobs(s), mb)
@@ -759,12 +820,15 @@ end
     withenv("REACTANT_GATEWAY_SCHEDULING_ROUTING_FILL_MODE" => "spread") do
         @test _load(eps).routing_fill_mode == "spread"
     end
-    mc = _load("scheduling:\n  models:\n    a:\n      replicas: 2\n      fill_mode: inherit\n" *
-               "      fill_factor: 0.5\n" * eps).models["a"]
+    mc = _load(
+        "scheduling:\n  models:\n    a:\n      replicas: 2\n      fill_mode: inherit\n" *
+            "      fill_factor: 0.5\n" * eps
+    ).models["a"]
     @test mc.replicas == 2 && mc.fill_mode == :inherit && mc.fill_factor == 0.5
     @test _load("scheduling:\n  models:\n    a:\n      fill_mode: spread\n" * eps).models["a"].fill_mode == :spread
     @test_throws ReactantServerCore.ConfigError _load(
-        "scheduling:\n  models:\n    a:\n      fill_factor: 0\n" * eps)
+        "scheduling:\n  models:\n    a:\n      fill_factor: 0\n" * eps
+    )
 end
 
 @testset "reset_clients! recovers a poisoned (stalled) worker connection" begin
@@ -787,8 +851,9 @@ end
     end
 
     grpc = gRPCClient.gRPCCURL(; sticky = true)
-    client = gRPCClient.gRPCServiceClient{Vector{UInt8},false,Vector{UInt8},false}(
-        "127.0.0.1", port, "/probe.Svc/Call"; grpc = grpc, deadline = 0.5)
+    client = gRPCClient.gRPCServiceClient{Vector{UInt8}, false, Vector{UInt8}, false}(
+        "127.0.0.1", port, "/probe.Svc/Call"; grpc = grpc, deadline = 0.5
+    )
     # Returns (whether the call returned within `cap`, the exception it threw).
     bounded_call(cap) = begin
         err = Ref{Any}(nothing)
@@ -800,7 +865,7 @@ end
         (timedwait(() -> istaskdone(t), cap), err[])
     end
     expired(e) = e isa gRPCClient.gRPCServiceCallException &&
-                 e.grpc_status == gRPCClient.GRPC_DEADLINE_EXCEEDED
+        e.grpc_status == gRPCClient.GRPC_DEADLINE_EXCEEDED
 
     # Both calls end at their 0.5s deadline: the first driven by libcurl's own timeout, the second
     # (which reuses the poisoned pooled connection) by the client's watchdog.
@@ -827,25 +892,31 @@ mutable struct AffMockWorker
     name::String
     models::Vector{String}
     discipline::String
-    served::Dict{String,Int}
-    compute::Dict{String,Float64}
+    served::Dict{String, Int}
+    compute::Dict{String, Float64}
     # Rows (batch-axis items) served, tracked separately from requests so the pair can diverge the
     # way it does in production, and the wire batch-axis locator a real worker reports.
-    rows::Dict{String,Int}
+    rows::Dict{String, Int}
     rows_per_request::Int
-    batch_at::Tuple{String,Int}
+    batch_at::Tuple{String, Int}
 end
 AffMockWorker(name, models; discipline = "fifo", rows_per_request = 1, batch_at = ("IN", 1)) =
-    AffMockWorker(name, models, discipline, Dict{String,Int}(), Dict{String,Float64}(),
-                  Dict{String,Int}(), rows_per_request, batch_at)
+    AffMockWorker(
+    name, models, discipline, Dict{String, Int}(), Dict{String, Float64}(),
+    Dict{String, Int}(), rows_per_request, batch_at
+)
 
 function _aff_router()
     router = gRPCServer.gRPCRouter()
-    GW.register_GRPCInferenceService!(router;
+    GW.register_GRPCInferenceService!(
+        router;
         ServerReady = (req, c) -> AInf.ServerReadyResponse(; ready = true),
-        RepositoryIndex = (req, c) -> AInf.RepositoryIndexResponse(; models = [
-            AInf.var"RepositoryIndexResponse.ModelIndex"(; name = m, version = "", state = "READY", reason = "")
-            for m in c.payload.models]),
+        RepositoryIndex = (req, c) -> AInf.RepositoryIndexResponse(;
+            models = [
+                AInf.var"RepositoryIndexResponse.ModelIndex"(; name = m, version = "", state = "READY", reason = "")
+                    for m in c.payload.models
+            ]
+        ),
         ModelInfer = (req, c) -> begin
             w = c.payload
             w.served[req.model_name] = get(w.served, req.model_name, 0) + 1
@@ -854,22 +925,28 @@ function _aff_router()
             AInf.ModelInferResponse(; model_name = w.name, id = req.id)
         end,
     )
-    register_ControlService!(router;
+    register_ControlService!(
+        router;
         ModelControlStatus = (req, c) -> begin
             w = c.payload
             ACtl.ModelControlStatusResponse(;
                 residency_mode = "self_managed", discipline = w.discipline,
-                models = [ACtl.ModelStatus(; name = m,
-                              weight_nbytes = Int64(256 * 1024 * 1024),
-                              total_compute_seconds = get(w.compute, m, 0.0),
-                              requests_served = UInt64(get(w.served, m, 0)),
-                              rows_served = UInt64(get(w.rows, m, 0)),
-                              dispatch_count = UInt64(get(w.served, m, 0)),
-                              max_batch_size = Int64(8),
-                              batch_input_name = w.batch_at[1],
-                              batch_axis = Int64(w.batch_at[2]))
-                          for m in w.models],
-                weight_cache_max_bytes = UInt64(8) * 1024^3)
+                models = [
+                    ACtl.ModelStatus(;
+                            name = m,
+                            weight_nbytes = Int64(256 * 1024 * 1024),
+                            total_compute_seconds = get(w.compute, m, 0.0),
+                            requests_served = UInt64(get(w.served, m, 0)),
+                            rows_served = UInt64(get(w.rows, m, 0)),
+                            dispatch_count = UInt64(get(w.served, m, 0)),
+                            max_batch_size = Int64(8),
+                            batch_input_name = w.batch_at[1],
+                            batch_axis = Int64(w.batch_at[2])
+                        )
+                        for m in w.models
+                ],
+                weight_cache_max_bytes = UInt64(8) * 1024^3
+            )
         end,
         # Eager compaction is the default now, so the gateway may fan CompactMemory out after a
         # placement-changing repack; answer it so the call never hits the generous client deadline.
@@ -878,22 +955,26 @@ function _aff_router()
     return router
 end
 
-_aff_infer(port, model) = grpc_call(AInf.ModelInferRequest, AInf.ModelInferResponse, "ModelInfer",
-    port, AInf.ModelInferRequest(; model_name = model))
+_aff_infer(port, model) = grpc_call(
+    AInf.ModelInferRequest, AInf.ModelInferResponse, "ModelInfer",
+    port, AInf.ModelInferRequest(; model_name = model)
+)
 
 function _aff_gatewayfile(gw_port, admin_port, worker_ports)
     path = tempname() * ".yaml"
     eps = join(("  - \"127.0.0.1:$p\"" for p in worker_ports), "\n")
-    write(path, """
-    listen:
-      grpc: "127.0.0.1:$gw_port"
-      metrics: "127.0.0.1:$admin_port"
-    scheduling:
-      mode: lpt_packing
-      rebalance_compute_seconds: 0.001
-    endpoints:
-    $eps
-    """)
+    write(
+        path, """
+        listen:
+          grpc: "127.0.0.1:$gw_port"
+          metrics: "127.0.0.1:$admin_port"
+        scheduling:
+          mode: lpt_packing
+          rebalance_compute_seconds: 0.001
+        endpoints:
+        $eps
+        """
+    )
     return path
 end
 
@@ -957,8 +1038,10 @@ end
         # Compute-driven trigger: tick_packing! accumulates fleet compute and repacks only once the
         # budget is crossed. Disable the separate first-repack budget here so this block exercises the
         # steady-state threshold directly (the first-vs-steady budget is covered in the block below).
-        GW.set_knobs!(aff; first_rebalance_compute_seconds = 0.0,
-                      rebalance_compute_seconds = 1.0e9)   # effectively never
+        GW.set_knobs!(
+            aff; first_rebalance_compute_seconds = 0.0,
+            rebalance_compute_seconds = 1.0e9
+        )   # effectively never
         before = aff.last_rebalance
         for _ in 1:10
             _aff_infer(gw_port, "alpha")
@@ -978,8 +1061,10 @@ end
         # First-run vs steady-state budget: the first tick-driven repack uses the smaller
         # first_rebalance_compute_seconds, then repacks after need the larger steady-state budget.
         aff.did_first_tick_repack = false
-        GW.set_knobs!(aff; first_rebalance_compute_seconds = 1.0e-9,   # any compute triggers the first
-                      rebalance_compute_seconds = 1.0e9)              # steady state: effectively never
+        GW.set_knobs!(
+            aff; first_rebalance_compute_seconds = 1.0e-9,   # any compute triggers the first
+            rebalance_compute_seconds = 1.0e9
+        )              # steady state: effectively never
         before2 = aff.last_rebalance
         for _ in 1:10
             _aff_infer(gw_port, "alpha")
@@ -1090,17 +1175,22 @@ end
         @test m.max_batch == 8
         # 0.05 GPU-seconds per request and 4 rows per request, so the per-item cost is a quarter of
         # the per-request cost. This is the number a work-weighted router multiplies an item count by.
-        @test m.cost_per_request ≈ 0.05 rtol = 1e-6
-        @test m.cost_per_item ≈ 0.0125 rtol = 1e-6
-        @test GW.item_cost(snap, "alpha") ≈ 0.0125 rtol = 1e-6
+        @test m.cost_per_request ≈ 0.05 rtol = 1.0e-6
+        @test m.cost_per_item ≈ 0.0125 rtol = 1.0e-6
+        @test GW.item_cost(snap, "alpha") ≈ 0.0125 rtol = 1.0e-6
         # A model nobody has called yet has no cost of its own and borrows the fleet mean.
         @test GW.model_meta(snap, "beta").cost_per_item == 0.0
-        @test GW.item_cost(snap, "beta") ≈ 0.0125 rtol = 1e-6
+        @test GW.item_cost(snap, "beta") ≈ 0.0125 rtol = 1.0e-6
 
         # And a request is sized from that locator: axis 2 of IN, not its first dimension.
-        req = AInf.ModelInferRequest(; model_name = "alpha",
-            inputs = [AInf.var"ModelInferRequest.InferInputTensor"(;
-                name = "IN", datatype = "UINT8", shape = Int64[512, 6])])
+        req = AInf.ModelInferRequest(;
+            model_name = "alpha",
+            inputs = [
+                AInf.var"ModelInferRequest.InferInputTensor"(;
+                    name = "IN", datatype = "UINT8", shape = Int64[512, 6]
+                ),
+            ]
+        )
         io = IOBuffer()
         ReactantServerGateway.PB.encode(ReactantServerGateway.PB.ProtoEncoder(io), req)
         body = take!(io)

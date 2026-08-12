@@ -66,7 +66,7 @@
 
 # One model's placement: worker URLs with weights (1/k across its k replicas), sorted by URL.
 # The weights are exported as metrics; request routing uses outstanding-batch counts, not weights.
-const Placement = Vector{Tuple{String,Float64}}
+const Placement = Vector{Tuple{String, Float64}}
 
 """
     compute_assignment(u, workers, prev; mem=Dict(), mem_cap=Dict(),
@@ -112,22 +112,26 @@ mutable struct RepackStats
 end
 RepackStats() = RepackStats(0, 0.0)
 
-function compute_assignment(u::Dict{String,Float64}, workers::Vector{String},
-                            prev::Dict{String,Placement};
-                            mem::Dict{String,Float64}=Dict{String,Float64}(),
-                            mem_cap::Dict{String,Float64}=Dict{String,Float64}(),
-                            replicas::Dict{String,Int}=Dict{String,Int}(),
-                            default_replicas::Int=1, hysteresis::Float64=0.1,
-                            forbid_memory_oversubscription::Bool=false,
-                            stats::Union{Nothing,RepackStats}=nothing)
-    out = Dict{String,Placement}()
+function compute_assignment(
+        u::Dict{String, Float64}, workers::Vector{String},
+        prev::Dict{String, Placement};
+        mem::Dict{String, Float64} = Dict{String, Float64}(),
+        mem_cap::Dict{String, Float64} = Dict{String, Float64}(),
+        replicas::Dict{String, Int} = Dict{String, Int}(),
+        default_replicas::Int = 1, hysteresis::Float64 = 0.1,
+        forbid_memory_oversubscription::Bool = false,
+        stats::Union{Nothing, RepackStats} = nothing
+    )
+    out = Dict{String, Placement}()
     isempty(workers) && return out
-    cload = Dict{String,Float64}(w => 0.0 for w in workers)   # compute, normalized (capacity 1.0)
-    mload = Dict{String,Float64}(w => 0.0 for w in workers)   # memory, bytes
+    cload = Dict{String, Float64}(w => 0.0 for w in workers)   # compute, normalized (capacity 1.0)
+    mload = Dict{String, Float64}(w => 0.0 for w in workers)   # memory, bytes
     capof(w) = (c = get(mem_cap, w, Inf); c <= 0 ? Inf : c)
     # Pressure of worker `w` after placing compute `uc` and memory `wm` on it.
-    score_after(w, uc, wm) = max(cload[w] + uc,
-                                 capof(w) == Inf ? 0.0 : (mload[w] + wm) / capof(w))
+    score_after(w, uc, wm) = max(
+        cload[w] + uc,
+        capof(w) == Inf ? 0.0 : (mload[w] + wm) / capof(w)
+    )
     # Whether `w` can still hold a model of footprint `wm` within its budget (unconstrained always
     # fits). Used only when `forbid_memory_oversubscription` is set.
     fits(w, wm) = (c = capof(w); c == Inf || mload[w] + wm <= c)
@@ -220,13 +224,13 @@ mutable struct LptPackingState <: GatewayScheduler
     # arrival counting: a copy-on-write snapshot dict of per-model atomic counters. Reads (the
     # request hot path) touch only the immutable snapshot; insertion of a new model swaps in a
     # copy under the lock.
-    @atomic arrivals::Dict{String,Threads.Atomic{Int}}
+    @atomic arrivals::Dict{String, Threads.Atomic{Int}}
     lock::ReentrantLock
     # EWMAs and the cumulative baselines for worker-counter deltas (model -> (compute, requests)).
     # Touched only on the prober task (poll/repack), so no locking needed.
-    rate_ewma::Dict{String,Float64}          # requests/sec
-    cost_ewma::Dict{String,Float64}          # compute seconds/request
-    last_cum::Dict{String,Tuple{Float64,UInt64}}
+    rate_ewma::Dict{String, Float64}          # requests/sec
+    cost_ewma::Dict{String, Float64}          # compute seconds/request
+    last_cum::Dict{String, Tuple{Float64, UInt64}}
     last_rebalance::Float64
     # compute-trigger accounting (prober task only): fleet GPU-seconds since the last repack and the
     # previous fleet cumulative-compute total used to derive the per-tick delta.
@@ -236,41 +240,41 @@ mutable struct LptPackingState <: GatewayScheduler
     # first tick repack sets this, after which the steady-state `rebalance_compute_seconds` applies.
     did_first_tick_repack::Bool
     # routing metadata, swapped atomically each tick; the request hot path reads the snapshot.
-    @atomic max_batch::Dict{String,Int}      # model -> effective max batch (largest compiled, capped)
+    @atomic max_batch::Dict{String, Int}      # model -> effective max batch (largest compiled, capped)
     # Per-model measured per-request compute cost (GPU-seconds/request), published from cost_ewma at
     # each repack so the request hot path can read it without racing the prober. Drives fill_least's
     # compute-weighted load.
-    @atomic cost_snapshot::Dict{String,Float64}
+    @atomic cost_snapshot::Dict{String, Float64}
     # the live assignment, swapped atomically; readers never lock
-    @atomic assignment::Dict{String,Placement}
+    @atomic assignment::Dict{String, Placement}
     # In-flight ITEM counters (the sum of the batch sizes of the requests in flight), swapped
     # atomically at repack so the hot path reads a stable snapshot. Per (model, worker): backpressure
     # for every fill mode, and the quantum itself under `:spread` / `:inflight`. Items rather than
     # requests so the comparison against `Q` is dimensionally consistent; for a client with a fixed
     # request size this is just a scaled request count, which is why the item denomination degrades
     # gracefully and the reverse would not.
-    @atomic outstanding::Dict{Tuple{String,String},Threads.Atomic{Int}}
+    @atomic outstanding::Dict{Tuple{String, String}, Threads.Atomic{Int}}
     # Cumulative requests routed per (model, worker), carried across repacks like `outstanding`.
     # Exported as `gateway_replica_routed_total`, which is the only series that shows a starved
     # replica: its in-flight gauge reads 0 whether it is idle or never chosen.
-    @atomic routed::Dict{Tuple{String,String},Threads.Atomic{Int}}
+    @atomic routed::Dict{Tuple{String, String}, Threads.Atomic{Int}}
     # Per-worker in-flight compute load: the sum over a worker's in-flight requests of each routed
     # model's cost weight (GPU-seconds). Drives fill_least's least-loaded batch-start choice. Every
     # routed request, single- or multi-replica, contributes, so the load reflects all models.
-    @atomic worker_load::Dict{String,Threads.Atomic{Float64}}
+    @atomic worker_load::Dict{String, Threads.Atomic{Float64}}
     # per-model selection lock (multi-replica models only), so a pick-and-reserve is atomic and
     # concurrent requests do not stampede onto the same replica.
-    @atomic sel_locks::Dict{String,ReentrantLock}
+    @atomic sel_locks::Dict{String, ReentrantLock}
     # per-model fill run (multi-replica models only): which replica is currently being filled, how
     # much of its quantum it has served, and the rotation cursor for opening the next one. Read and
     # written only under the model's `sel_locks` entry, so the fields are plain (see FillRun).
-    @atomic fill_runs::Dict{String,FillRun}
+    @atomic fill_runs::Dict{String, FillRun}
     # Per-model resolved routing rule (mode + quantum), republished every prober tick from the knobs
     # and the worker-reported max batch. The request path reads this instead of walking the override
     # chain. See `_publish_fill_plan!`.
-    @atomic fill_plan::Dict{String,FillPlan}
+    @atomic fill_plan::Dict{String, FillPlan}
     # label pairs / models previously exported to the gauges, zeroed when dropped
-    exported::Set{Tuple{String,String}}
+    exported::Set{Tuple{String, String}}
     replicas_exported::Set{String}
     # Repacks since the last compaction fan-out, so the first placement-changing repack at or after
     # `knobs.compaction_interval` fires it. Prober task only. See `_maybe_compact_fleet!`.
@@ -290,16 +294,17 @@ end
 
 LptPackingState(cfg::GatewayConfig, meta::RoutingMeta = RoutingMeta(cfg)) = LptPackingState(
     PackingKnobs(cfg), ReentrantLock(), meta,
-    Dict{String,Threads.Atomic{Int}}(), ReentrantLock(),
-    Dict{String,Float64}(), Dict{String,Float64}(), Dict{String,Tuple{Float64,UInt64}}(),
+    Dict{String, Threads.Atomic{Int}}(), ReentrantLock(),
+    Dict{String, Float64}(), Dict{String, Float64}(), Dict{String, Tuple{Float64, UInt64}}(),
     0.0, 0.0, 0.0, false,
-    Dict{String,Int}(), Dict{String,Float64}(), Dict{String,Placement}(),
-    Dict{Tuple{String,String},Threads.Atomic{Int}}(),
-    Dict{Tuple{String,String},Threads.Atomic{Int}}(),
-    Dict{String,Threads.Atomic{Float64}}(),
-    Dict{String,ReentrantLock}(), Dict{String,FillRun}(), Dict{String,FillPlan}(),
-    Set{Tuple{String,String}}(), Set{String}(), 0,
-    TickReport(), RepackReport(), 0, 0)
+    Dict{String, Int}(), Dict{String, Float64}(), Dict{String, Placement}(),
+    Dict{Tuple{String, String}, Threads.Atomic{Int}}(),
+    Dict{Tuple{String, String}, Threads.Atomic{Int}}(),
+    Dict{String, Threads.Atomic{Float64}}(),
+    Dict{String, ReentrantLock}(), Dict{String, FillRun}(), Dict{String, FillPlan}(),
+    Set{Tuple{String, String}}(), Set{String}(), 0,
+    TickReport(), RepackReport(), 0, 0
+)
 
 """
     knobs(s::LptPackingState) -> PackingKnobs
@@ -354,17 +359,17 @@ end
 # assignment, carrying over the live atomics for placements that persist (so in-flight counts
 # survive a repack) and dropping the rest, then swap the snapshots in atomically. Lock objects are
 # reused per model so the same object guards a model regardless of which snapshot a request read.
-function _swap_outstanding!(s::LptPackingState, next::Dict{String,Placement})
+function _swap_outstanding!(s::LptPackingState, next::Dict{String, Placement})
     prev_out = @atomic s.outstanding
     prev_routed = @atomic s.routed
     prev_wload = @atomic s.worker_load
     prev_locks = @atomic s.sel_locks
     prev_runs = @atomic s.fill_runs
-    out = Dict{Tuple{String,String},Threads.Atomic{Int}}()
-    routed = Dict{Tuple{String,String},Threads.Atomic{Int}}()
-    wload = Dict{String,Threads.Atomic{Float64}}()
-    locks = Dict{String,ReentrantLock}()
-    runs = Dict{String,FillRun}()
+    out = Dict{Tuple{String, String}, Threads.Atomic{Int}}()
+    routed = Dict{Tuple{String, String}, Threads.Atomic{Int}}()
+    wload = Dict{String, Threads.Atomic{Float64}}()
+    locks = Dict{String, ReentrantLock}()
+    runs = Dict{String, FillRun}()
     for (m, placement) in next
         if length(placement) > 1
             locks[m] = get(prev_locks, m, ReentrantLock())
@@ -393,8 +398,10 @@ end
 # swap in the assignment and outstanding counters, reset the compute accumulator, and export
 # metrics. Runs on the prober task only. A model not reported by every ready worker (runtime drift)
 # gets a uniform placement over the workers that do serve it, with a warning.
-function _repack!(s::LptPackingState, poll, metrics::Union{GatewayMetrics,Nothing};
-                  trigger::Symbol=:compute, k::PackingKnobs=knobs(s))
+function _repack!(
+        s::LptPackingState, poll, metrics::Union{GatewayMetrics, Nothing};
+        trigger::Symbol = :compute, k::PackingKnobs = knobs(s)
+    )
     now = time()
     # Elapsed since the last repack, for the repack log: wall time and the fleet GPU-seconds that
     # accumulated (the compute that triggered this repack). Captured before they are reset below.
@@ -442,8 +449,8 @@ function _repack!(s::LptPackingState, poll, metrics::Union{GatewayMetrics,Nothin
     # yet, u = 0): they still occupy weight memory, so the packer gives each a concentrated home
     # placed by the memory dimension. A model missing from some polled workers (runtime drift)
     # routes uniformly over its actual replicas until the fleet converges.
-    full = Dict{String,Float64}()
-    drifted = Dict{String,Placement}()
+    full = Dict{String, Float64}()
+    drifted = Dict{String, Placement}()
     nready = length(poll.polled)
     for (m, ws) in poll.permodel_workers
         if length(ws) == nready
@@ -458,12 +465,14 @@ function _repack!(s::LptPackingState, poll, metrics::Union{GatewayMetrics,Nothin
 
     prev = @atomic s.assignment
     stats = RepackStats()
-    next = compute_assignment(full, sort(poll.polled), prev;
-                              mem=poll.mem, mem_cap=poll.mem_cap,
-                              replicas=replica_overrides(k), default_replicas=k.default_replicas,
-                              hysteresis=k.hysteresis,
-                              forbid_memory_oversubscription=k.forbid_memory_oversubscription,
-                              stats=stats)
+    next = compute_assignment(
+        full, sort(poll.polled), prev;
+        mem = poll.mem, mem_cap = poll.mem_cap,
+        replicas = replica_overrides(k), default_replicas = k.default_replicas,
+        hysteresis = k.hysteresis,
+        forbid_memory_oversubscription = k.forbid_memory_oversubscription,
+        stats = stats
+    )
     merge!(next, drifted)
     @atomic s.assignment = next
     _swap_outstanding!(s, next)
@@ -493,7 +502,7 @@ function _repack!(s::LptPackingState, poll, metrics::Union{GatewayMetrics,Nothin
     # Memory oversubscription warning: when a worker's assigned weight footprint exceeds its
     # on-demand budget the packing is infeasible (total weights outgrew the fleet); the worker's
     # LRU cache degrades gracefully, but the operator should know.
-    assigned_mem = Dict{String,Float64}(w => 0.0 for w in poll.polled)
+    assigned_mem = Dict{String, Float64}(w => 0.0 for w in poll.polled)
     for (m, placement) in next, (w, _) in placement
         haskey(assigned_mem, w) && (assigned_mem[w] += get(poll.mem, m, 0.0))
     end
@@ -505,7 +514,7 @@ function _repack!(s::LptPackingState, poll, metrics::Union{GatewayMetrics,Nothin
 
     if metrics !== nothing
         inc_repacks!(metrics, trigger)
-        live = Set{Tuple{String,String}}()
+        live = Set{Tuple{String, String}}()
         live_models = Set{String}()
         for (m, placement) in next
             push!(live_models, m)
@@ -534,11 +543,13 @@ function _repack!(s::LptPackingState, poll, metrics::Union{GatewayMetrics,Nothin
     # for the same reason `cost_snapshot` is: the next repack folds them in place. `poll.mem` /
     # `poll.mem_cap` are freshly built by this poll and never mutated afterwards, so they can be
     # referenced directly.
-    @atomic s.report = RepackReport(now, wall_elapsed, compute_elapsed, trigger,
-                                    (@atomic s.report).count + 1, length(next), moved,
-                                    copy(full), copy(s.rate_ewma), copy(s.cost_ewma),
-                                    poll.mem, poll.mem_cap, sort(poll.polled),
-                                    Set{String}(keys(drifted)))
+    @atomic s.report = RepackReport(
+        now, wall_elapsed, compute_elapsed, trigger,
+        (@atomic s.report).count + 1, length(next), moved,
+        copy(full), copy(s.rate_ewma), copy(s.cost_ewma),
+        poll.mem, poll.mem_cap, sort(poll.polled),
+        Set{String}(keys(drifted))
+    )
     return changed_workers
 end
 
@@ -546,7 +557,7 @@ end
 # in-flight requests per replica, and each model's effective fill quantum. Zeroing of label pairs that
 # have disappeared stays at repack (see `s.exported`), so this only ever writes pairs that are in the
 # current assignment. Prober task only; a nothing `metrics` (tests) is a no-op.
-function _refresh_live_gauges!(s::LptPackingState, metrics::Union{GatewayMetrics,Nothing})
+function _refresh_live_gauges!(s::LptPackingState, metrics::Union{GatewayMetrics, Nothing})
     metrics === nothing && return nothing
     out_snap = @atomic s.outstanding
     plan = @atomic s.fill_plan
@@ -566,7 +577,7 @@ end
 # starved one: both report zero in-flight, but only the starved one has a flat routed total.
 struct RoutedCollector <: Prometheus.Collector
     state::LptPackingState
-    worker_names::Dict{String,String}   # worker url -> friendly label, as GatewayMetrics maps them
+    worker_names::Dict{String, String}   # worker url -> friendly label, as GatewayMetrics maps them
 end
 
 Prometheus.metric_names(::RoutedCollector) = ("gateway_replica_routed_total",)
@@ -577,16 +588,24 @@ function Prometheus.collect!(metrics::Vector, c::RoutedCollector)
     ln = Prometheus.LabelNames((:model, :worker))
     samples = Prometheus.Sample[]
     for ((m, w), a) in snap
-        push!(samples, Prometheus.Sample(nothing, ln,
-                                        Prometheus.LabelValues((m, get(c.worker_names, w, w))),
-                                        Float64(a[])))
+        push!(
+            samples, Prometheus.Sample(
+                nothing, ln,
+                Prometheus.LabelValues((m, get(c.worker_names, w, w))),
+                Float64(a[])
+            )
+        )
     end
     # Deterministic order across scrapes; Prometheus.jl sorts family children for the same reason.
     sort!(samples; by = x -> x.label_values.label_values)
-    push!(metrics, Prometheus.Metric("counter", "gateway_replica_routed_total",
-        "Cumulative REQUESTS routed to a model's replica on a worker (a count of routing " *
-        "decisions; see gateway_replica_outstanding for the item-denominated in-flight work).",
-        samples))
+    push!(
+        metrics, Prometheus.Metric(
+            "counter", "gateway_replica_routed_total",
+            "Cumulative REQUESTS routed to a model's replica on a worker (a count of routing " *
+                "decisions; see gateway_replica_outstanding for the item-denominated in-flight work).",
+            samples
+        )
+    )
     return metrics
 end
 
@@ -604,15 +623,17 @@ inflight_work(s::LptPackingState) = (knobs(s).work_basis, @atomic s.worker_load)
 # it can land later than exactly N. `:off` disables; `:eager` sends an empty reload list (the
 # on-demand region refills lazily as requests arrive); `:scheduled` sends each changed worker the set
 # of models this repack assigned to it, warming the new placement. Runs on the prober task.
-function _maybe_compact_fleet!(s::LptPackingState, pool::ClientPool,
-                               metrics::Union{GatewayMetrics,Nothing}, changed::Set{String};
-                               k::PackingKnobs=knobs(s))
+function _maybe_compact_fleet!(
+        s::LptPackingState, pool::ClientPool,
+        metrics::Union{GatewayMetrics, Nothing}, changed::Set{String};
+        k::PackingKnobs = knobs(s)
+    )
     (k.compaction_mode == :off || k.compaction_interval <= 0) && return nothing
     s.repacks_since_compact += 1
     (s.repacks_since_compact >= k.compaction_interval && !isempty(changed)) || return nothing
     s.repacks_since_compact = 0
 
-    perworker = Dict{String,Vector{String}}(w => String[] for w in changed)
+    perworker = Dict{String, Vector{String}}(w => String[] for w in changed)
     if k.compaction_mode == :scheduled
         for (m, placement) in @atomic(s.assignment), (w, _) in placement
             haskey(perworker, w) && push!(perworker[w], m)
@@ -630,8 +651,10 @@ Force a repack now: poll the ready workers and recompute the assignment uncondit
 startup (so the first requests already route by packing) and by tests. The periodic, compute-driven
 path is [`tick_packing!`](@ref).
 """
-function rebalance!(s::LptPackingState, pool::ClientPool, ready_urls::Vector{String},
-                    metrics::Union{GatewayMetrics,Nothing}=nothing; trigger::Symbol=:startup)
+function rebalance!(
+        s::LptPackingState, pool::ClientPool, ready_urls::Vector{String},
+        metrics::Union{GatewayMetrics, Nothing} = nothing; trigger::Symbol = :startup
+    )
     _repack!(s, poll_workers(pool, ready_urls), metrics; trigger = trigger)
     return nothing
 end
@@ -649,9 +672,11 @@ uses `first_rebalance_compute_seconds` (when set); every repack after uses
 routing-metadata cache so there is one control-status round per tick however many consumers there
 are. It defaults to polling here so a test (or a direct caller) need not thread one through.
 """
-function tick_packing!(s::LptPackingState, pool::ClientPool, ready_urls::Vector{String},
-                       metrics::Union{GatewayMetrics,Nothing}=nothing,
-                       poll = poll_workers(pool, ready_urls))
+function tick_packing!(
+        s::LptPackingState, pool::ClientPool, ready_urls::Vector{String},
+        metrics::Union{GatewayMetrics, Nothing} = nothing,
+        poll = poll_workers(pool, ready_urls)
+    )
     # Read the forced-repack request BEFORE the knobs: the acquire pairs with the release a handler
     # did when it swapped `knobs`, so any knob or override written before a request bump is visible to
     # the repack that serves it. `SetModelPlacement` followed by `Repack` always lands together.
@@ -673,7 +698,7 @@ function tick_packing!(s::LptPackingState, pool::ClientPool, ready_urls::Vector{
     # placement quickly; steady-state then uses the larger budget. The flag is flipped here, not in
     # `_repack!`, because the startup `rebalance!` also calls `_repack!` and must not consume it.
     threshold = (!s.did_first_tick_repack && k.first_rebalance_compute_seconds > 0) ?
-                k.first_rebalance_compute_seconds : k.rebalance_compute_seconds
+        k.first_rebalance_compute_seconds : k.rebalance_compute_seconds
     forced = requested > (@atomic s.repack_completed)
     if forced || s.compute_accum >= threshold
         # A forced repack does not consume the first-repack budget, for the same reason the startup
@@ -687,8 +712,10 @@ function tick_packing!(s::LptPackingState, pool::ClientPool, ready_urls::Vector{
     end
     # Published after any repack, so `compute_accum` reflects the reset and a reader never sees the
     # pre-repack accumulator paired with a post-repack assignment.
-    @atomic s.tick = TickReport(time(), sort(ready_urls), poll.fleet_compute, s.compute_accum,
-                                threshold, s.did_first_tick_repack)
+    @atomic s.tick = TickReport(
+        time(), sort(ready_urls), poll.fleet_compute, s.compute_accum,
+        threshold, s.did_first_tick_repack
+    )
     return nothing
 end
 
@@ -696,9 +723,11 @@ end
 # worker-reported max batches. Called wherever `max_batch` is refreshed, so both a knob change and a
 # newly reported batch shape reach the request path on the next tick, and the request path never has
 # to walk the per-model override chain. Prober task only; the swap is atomic.
-function _publish_fill_plan!(s::LptPackingState, k::PackingKnobs, max_batch::Dict{String,Int},
-                             batch_at::Dict{String,Tuple{String,Int}} = Dict{String,Tuple{String,Int}}())
-    plan = Dict{String,FillPlan}()
+function _publish_fill_plan!(
+        s::LptPackingState, k::PackingKnobs, max_batch::Dict{String, Int},
+        batch_at::Dict{String, Tuple{String, Int}} = Dict{String, Tuple{String, Int}}()
+    )
+    plan = Dict{String, FillPlan}()
     for (m, mb) in max_batch
         bi, ax = get(batch_at, m, ("", 0))
         plan[m] = resolve_fill_plan(k, m, mb, bi, ax)
@@ -792,7 +821,7 @@ sees load from all models. The reservation (atomic increments under the per-mode
 selection lock for multi-replica models) makes concurrent selections see the choice, so requests do
 not stampede onto the same replica.
 """
-function route_replica(s::LptPackingState, model::AbstractString, units::Integer=1)
+function route_replica(s::LptPackingState, model::AbstractString, units::Integer = 1)
     placement = get(@atomic(s.assignment), model, nothing)
     placement === nothing && return nothing
     n = length(placement)
@@ -849,8 +878,8 @@ function route_replica(s::LptPackingState, model::AbstractString, units::Integer
         if plan.mode === :spread
             # All replicas serve the model at once; ties go to the policy so an idle set still rotates.
             chosen = policy === :fill_least ?
-                     argmin(i -> (outs[i], wload_of(i), rot(i)), 1:n) :
-                     argmin(i -> (outs[i], rot(i)), 1:n)
+                argmin(i -> (outs[i], wload_of(i), rot(i)), 1:n) :
+                argmin(i -> (outs[i], rot(i)), 1:n)
             run.cursor = mod(chosen, n)
             run.target = chosen
             run.units = units
@@ -861,8 +890,8 @@ function route_replica(s::LptPackingState, model::AbstractString, units::Integer
             behind(i) = fld(outs[i], Q) > floor_q
             if run.target < 1 || run.target > n || run.units >= Q || behind(run.target) || total == 0
                 chosen = policy === :fill_least ?
-                         argmin(i -> (behind(i), wload_of(i), rot(i)), 1:n) :
-                         argmin(i -> (behind(i), rot(i)), 1:n)
+                    argmin(i -> (behind(i), wload_of(i), rot(i)), 1:n) :
+                    argmin(i -> (behind(i), rot(i)), 1:n)
                 run.cursor = mod(chosen, n)
                 run.target = chosen
                 run.units = units
@@ -1022,16 +1051,18 @@ never complete, never return their semaphore slot, and every new call blocks at 
 call exceeds the watchdog for `wedge_rounds` consecutive rounds (the wedge signature), the process
 exits so the supervisor restarts the gateway with a fresh handle (16 free slots), which recovers.
 """
-function verify_lpt_packing_preconditions!(pool::ClientPool; wait_seconds::Real=0,
-                                           poll_interval::Real=10.0, call_timeout::Real=8.0,
-                                           wedge_rounds::Integer=3)
+function verify_lpt_packing_preconditions!(
+        pool::ClientPool; wait_seconds::Real = 0,
+        poll_interval::Real = 10.0, call_timeout::Real = 8.0,
+        wedge_rounds::Integer = 3
+    )
     clients = all_clients(pool)
     forever = isinf(wait_seconds)
     deadline = (forever || wait_seconds <= 0) ? nothing : time() + Float64(wait_seconds)
-    statuses = Dict{String,Any}()
+    statuses = Dict{String, Any}()
     wedged_streak = 0
     while true
-        statuses = Dict{String,Any}()
+        statuses = Dict{String, Any}()
         pending = String[]
         timed_out = 0
         for wc in clients
@@ -1039,8 +1070,10 @@ function verify_lpt_packing_preconditions!(pool::ClientPool; wait_seconds::Real=
             # compiles before its control plane answers), not a fault. The per-worker timeout is
             # quieted to debug; the once-per-round "waiting for all workers" @info below is the
             # operator-facing progress line. The runtime prober keeps the default :warn.
-            resp, to = _bounded(() -> fetch_control_status(wc), call_timeout, nothing,
-                                "ModelControlStatus poll", wc.url; level = :debug)
+            resp, to = _bounded(
+                () -> fetch_control_status(wc), call_timeout, nothing,
+                "ModelControlStatus poll", wc.url; level = :debug
+            )
             if resp === nothing
                 push!(pending, wc.url)
                 # A hung call (not a fast refuse) means the worker was caught mid-stall and its

@@ -35,8 +35,8 @@ function _bounded(f, secs, default, what::String, url::String; level::Symbol = :
     if timedwait(() -> istaskdone(t), secs) !== :ok
         msg = "health: $what timed out; treating as unavailable"
         level === :debug ? (@debug msg worker = url timeout_s = secs) :
-        level === :info  ? (@info msg worker = url timeout_s = secs) :
-                           (@warn msg worker = url timeout_s = secs)
+            level === :info ? (@info msg worker = url timeout_s = secs) :
+            (@warn msg worker = url timeout_s = secs)
         return default, true
     end
     v = try
@@ -51,14 +51,14 @@ mutable struct HealthProber
     pool::ClientPool
     metrics::GatewayMetrics
     admin::AdminServer
-    routes::Union{DiscoveredRoutes,Nothing}
+    routes::Union{DiscoveredRoutes, Nothing}
     scheduler::GatewayScheduler               # ticked each round via scheduler_tick! (no-op unless lpt_packing)
     # Per-model routing metadata (batch axis and measured costs), refreshed from this round's
     # control-status poll and read by whichever scheduler routes by work. See routing_meta.jl.
     meta::RoutingMeta
     interval::Float64
     running::Threads.Atomic{Bool}
-    task::Union{Task,Nothing}
+    task::Union{Task, Nothing}
     wedged_rounds::Int                        # consecutive all-timeout rounds since last response
     wedge_exit_rounds::Int                    # exit(1) after this many; 0 disables
     ever_responsive::Bool                     # a worker has answered (non-timeout) at least once
@@ -68,16 +68,24 @@ mutable struct HealthProber
     last_repack_seq::Int
 end
 
-function HealthProber(pool::ClientPool, metrics::GatewayMetrics, admin::AdminServer,
-                      routes::Union{DiscoveredRoutes,Nothing} = nothing;
-                      scheduler::GatewayScheduler = RoundRobinScheduler(),
-                      meta::RoutingMeta = RoutingMeta(),
-                      interval::Real = _health_interval_seconds(),
-                      wedge_exit_rounds::Integer =
-                          parse(Int, get(ENV, "REACTANT_GATEWAY_WEDGE_EXIT_ROUNDS",
-                                         string(WEDGE_EXIT_ROUNDS))))
-    return HealthProber(pool, metrics, admin, routes, scheduler, meta, Float64(interval),
-                        Threads.Atomic{Bool}(true), nothing, 0, Int(wedge_exit_rounds), false, 0)
+function HealthProber(
+        pool::ClientPool, metrics::GatewayMetrics, admin::AdminServer,
+        routes::Union{DiscoveredRoutes, Nothing} = nothing;
+        scheduler::GatewayScheduler = RoundRobinScheduler(),
+        meta::RoutingMeta = RoutingMeta(),
+        interval::Real = _health_interval_seconds(),
+        wedge_exit_rounds::Integer =
+            parse(
+            Int, get(
+                ENV, "REACTANT_GATEWAY_WEDGE_EXIT_ROUNDS",
+                string(WEDGE_EXIT_ROUNDS)
+            )
+        )
+    )
+    return HealthProber(
+        pool, metrics, admin, routes, scheduler, meta, Float64(interval),
+        Threads.Atomic{Bool}(true), nothing, 0, Int(wedge_exit_rounds), false, 0
+    )
 end
 
 # The probe interval, overridable so a test (or a deployment that wants a tighter control-plane
@@ -91,12 +99,14 @@ end
 # An unreachable endpoint is skipped (it contributes no routes this round and is picked up later).
 function discover_routes(pool::ClientPool)
     workers = all_clients(pool)
-    found = Dict{String,Vector{String}}()
+    found = Dict{String, Vector{String}}()
     lk = ReentrantLock()
     @sync for wc in workers
         @async begin
-            names, _ = _bounded(() -> discover_models(wc), PROBE_TIMEOUT_SECONDS, nothing,
-                                "RepositoryIndex discovery", wc.url)
+            names, _ = _bounded(
+                () -> discover_models(wc), PROBE_TIMEOUT_SECONDS, nothing,
+                "RepositoryIndex discovery", wc.url
+            )
             names === nothing && return
             lock(lk) do
                 for n in names
@@ -114,8 +124,10 @@ function _check_once(p::HealthProber)
     timeouts = Vector{Bool}(undef, length(workers))
     @sync for (i, wc) in enumerate(workers)
         @async results[i], timeouts[i] =
-            _bounded(() -> probe_ready(wc), PROBE_TIMEOUT_SECONDS, false,
-                     "ServerReady probe", wc.url)
+            _bounded(
+            () -> probe_ready(wc), PROBE_TIMEOUT_SECONDS, false,
+            "ServerReady probe", wc.url
+        )
     end
     any_ready = false
     any_responsive = false

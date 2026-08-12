@@ -17,7 +17,7 @@
 # forever through fragmentation), and it preserves the FIFO order span-1 callers had under the
 # previous Channel-based free list.
 
-const PoolBacking = Union{SharedMemory,Memory{UInt8}}
+const PoolBacking = Union{SharedMemory, Memory{UInt8}}
 
 mutable struct BufferPool
     backing::PoolBacking
@@ -40,9 +40,11 @@ at construction (`n_bytes ÷ n_slots`), not recomputed per request, so the alloc
 disjoint slots to concurrent callers. A SHM-backed pool can be registered with a server; an
 inline pool (`use_shm=false`) is the fallback transport.
 """
-function BufferPool(n_bytes::Integer; n_slots::Integer = 8, use_shm::Bool = true,
-                    name::AbstractString = "reactant_server_pool",
-                    key::Union{AbstractString,Nothing} = nothing)
+function BufferPool(
+        n_bytes::Integer; n_slots::Integer = 8, use_shm::Bool = true,
+        name::AbstractString = "reactant_server_pool",
+        key::Union{AbstractString, Nothing} = nothing
+    )
     n_bytes > 0 || throw(ArgumentError("BufferPool: n_bytes must be positive (got $n_bytes)"))
     n_slots > 0 || throw(ArgumentError("BufferPool: n_slots must be positive (got $n_slots)"))
     slot_bytes = Int(n_bytes) ÷ Int(n_slots)
@@ -61,9 +63,11 @@ function BufferPool(n_bytes::Integer; n_slots::Integer = 8, use_shm::Bool = true
     end
 
     alloc_lock = ReentrantLock()
-    return BufferPool(backing, usable, region_name, slot_bytes, Int(n_slots),
-                      trues(Int(n_slots)), alloc_lock, Threads.Condition(alloc_lock),
-                      UInt64[], UInt64(0))
+    return BufferPool(
+        backing, usable, region_name, slot_bytes, Int(n_slots),
+        trues(Int(n_slots)), alloc_lock, Threads.Condition(alloc_lock),
+        UInt64[], UInt64(0)
+    )
 end
 
 Base.sizeof(pool::BufferPool) = pool.n_bytes
@@ -72,7 +76,7 @@ pool_region_name(pool::BufferPool) = pool.name
 pool_slot_bytes(pool::BufferPool) = pool.slot_bytes
 
 function _pool_base_pointer(pool::BufferPool)
-    pool.backing isa SharedMemory ? convert(Ptr{UInt8}, pointer(pool.backing)) : pointer(pool.backing)
+    return pool.backing isa SharedMemory ? convert(Ptr{UInt8}, pointer(pool.backing)) : pointer(pool.backing)
 end
 
 # Base address of the pool's backing region. Used by the meta fan-out to detect, by pointer range,
@@ -128,8 +132,10 @@ struct PoolAcquireTimeout <: Exception
     waited_ns::Int64
 end
 Base.showerror(io::IO, e::PoolAcquireTimeout) =
-    print(io, "acquire_slot!: timed out after ", round(e.waited_ns / 1e9, digits = 3),
-          "s waiting for ", e.span, " contiguous slot(s)")
+    print(
+    io, "acquire_slot!: timed out after ", round(e.waited_ns / 1.0e9, digits = 3),
+    "s waiting for ", e.span, " contiguous slot(s)"
+)
 
 """
     acquire_slot!(pool, span=1; deadline_ns=0) -> PoolSlot
@@ -149,17 +155,20 @@ budget in the park.
 function acquire_slot!(pool::BufferPool, span::Integer = 1; deadline_ns::Integer = 0)
     s = Int(span)
     s >= 1 || throw(ArgumentError("acquire_slot!: span must be >= 1 (got $s)"))
-    s <= pool.n_slots || throw(ArgumentError(
-        "acquire_slot!: span $s exceeds the pool's $(pool.n_slots) slots of " *
-        "$(pool.slot_bytes) bytes each; this request can never be satisfied. " *
-        "Increase the pool's total bytes or decrease n_slots so each slot is larger."))
+    s <= pool.n_slots || throw(
+        ArgumentError(
+            "acquire_slot!: span $s exceeds the pool's $(pool.n_slots) slots of " *
+                "$(pool.slot_bytes) bytes each; this request can never be satisfied. " *
+                "Increase the pool's total bytes or decrease n_slots so each slot is larger."
+        )
+    )
 
     dl = Int64(deadline_ns)
     t0 = Int64(time_ns())
     lock(pool.alloc_lock)
     token = UInt64(0)   # sentinel keeps the finally safe if we are interrupted pre-enqueue
     timer = nothing     # one-shot wake at the deadline; armed on first park, closed in finally
-    try
+    return try
         token = (pool.token_counter += 1)
         push!(pool.waitq, token)
         while true
@@ -172,8 +181,10 @@ function acquire_slot!(pool::BufferPool, span::Integer = 1; deadline_ns::Integer
                     for i in start:(start + s - 1)
                         pool.free[i] = false
                     end
-                    return PoolSlot(pool, start, (start - 1) * pool.slot_bytes,
-                                    s * pool.slot_bytes, s)
+                    return PoolSlot(
+                        pool, start, (start - 1) * pool.slot_bytes,
+                        s * pool.slot_bytes, s
+                    )
                 end
             end
             # Arm a single timer for the absolute deadline so the park is bounded even with no
@@ -181,9 +192,16 @@ function acquire_slot!(pool::BufferPool, span::Integer = 1; deadline_ns::Integer
             # re-check; the expired one then throws on the next loop turn. notify wakes all, so one
             # timer per waiter is enough for each to observe its own deadline.
             if dl != 0 && timer === nothing
-                rem = (dl - Int64(time_ns())) / 1e9
+                rem = (dl - Int64(time_ns())) / 1.0e9
                 rem <= 0 && throw(PoolAcquireTimeout(s, Int64(time_ns()) - t0))
-                timer = Timer(_ -> (try; @lock pool.alloc_lock notify(pool.freed); catch; end), rem)
+                timer = Timer(
+                    _ -> (
+                        try
+                            @lock pool.alloc_lock notify(pool.freed)
+                        catch
+                        end
+                    ), rem
+                )
             end
             wait(pool.freed)   # releases alloc_lock while parked, reacquires on wake
         end
@@ -213,8 +231,11 @@ function release_slot!(slot::PoolSlot)
     pool = slot.pool
     @lock pool.alloc_lock begin
         for i in slot.index:(slot.index + slot.span - 1)
-            pool.free[i] && throw(ArgumentError(
-                "release_slot!: slot index $i is already free (double release?)"))
+            pool.free[i] && throw(
+                ArgumentError(
+                    "release_slot!: slot index $i is already free (double release?)"
+                )
+            )
             pool.free[i] = true
         end
         notify(pool.freed)
@@ -229,8 +250,12 @@ function subslot(parent::PoolSlot, n_bytes::Integer)
     n = Int(n_bytes)
     n >= 0 || throw(ArgumentError("subslot byte count must be non-negative (got $n)"))
     parent.cursor + n <= parent.capacity ||
-        throw(ArgumentError("subslot of $n bytes exceeds parent slot capacity " *
-                            "($(parent.capacity - parent.cursor) bytes remaining)"))
+        throw(
+        ArgumentError(
+            "subslot of $n bytes exceeds parent slot capacity " *
+                "($(parent.capacity - parent.cursor) bytes remaining)"
+        )
+    )
     child = PoolSlot(parent.pool, 0, parent.offset + parent.cursor, n, 0, 0)
     parent.cursor += n
     return child
@@ -242,7 +267,7 @@ reset_slot!(slot::PoolSlot) = (slot.cursor = 0; slot)
 # A Julia array view of the slot's bytes typed as T. The pool owns the memory; the view is
 # ephemeral.
 function pool_view(slot::PoolSlot, ::Type{T}, dims::Integer...) where {T}
-    n_bytes = Base.checked_mul(Int(sizeof(T)), reduce(Base.checked_mul, Int.(dims); init=1))
+    n_bytes = Base.checked_mul(Int(sizeof(T)), reduce(Base.checked_mul, Int.(dims); init = 1))
     n_bytes <= slot.capacity ||
         throw(ArgumentError("pool_view ($n_bytes bytes) exceeds slot capacity ($(slot.capacity) bytes)"))
     ptr = Ptr{T}(_pool_base_pointer(slot.pool) + slot.offset)
@@ -252,7 +277,7 @@ end
 # Pinned pool references keyed by the aliased Memory's objectid. Same rationale as
 # _SHM_KEEPALIVE: a closure-only finalizer is not reliable, and keying by Memory itself would
 # hold it strongly and prevent its finalizer from ever running.
-const _POOL_KEEPALIVE = Dict{UInt,BufferPool}()
+const _POOL_KEEPALIVE = Dict{UInt, BufferPool}()
 const _POOL_KEEPALIVE_LOCK = ReentrantLock()
 
 # A Memory{T} aliasing the slot's bytes (zero-copy, own=false). The pool is pinned in
@@ -275,10 +300,10 @@ function pool_memory(slot::PoolSlot, ::Type{T}, n_elem::Integer) where {T}
 end
 
 # FixedSizeArray view over a pool slot, backed by the slot's Memory{T} alias.
-pool_fsa(slot::PoolSlot, ::Type{T}, dims::NTuple{N,<:Integer}) where {T,N} =
+pool_fsa(slot::PoolSlot, ::Type{T}, dims::NTuple{N, <:Integer}) where {T, N} =
     fsa_from_memory(pool_memory(slot, T, prod(dims)), dims)
 
-pool_fsa(slot::PoolSlot, ::Type{T}, dims::Vararg{Integer,N}) where {T,N} = pool_fsa(slot, T, dims)
+pool_fsa(slot::PoolSlot, ::Type{T}, dims::Vararg{Integer, N}) where {T, N} = pool_fsa(slot, T, dims)
 
 """
     scratch(slot, dims, T) -> Array{T}

@@ -11,7 +11,7 @@ function _to_core_residency(r)
     r == _CTRL.Residency.UNPINNED && return UNPINNED
     r == _CTRL.Residency.PINNED_SYSTEM && return PINNED_SYSTEM
     r == _CTRL.Residency.PINNED_DEVICE && return PINNED_DEVICE
-    _invalid("residency target must be UNPINNED, PINNED_SYSTEM, or PINNED_DEVICE")
+    return _invalid("residency target must be UNPINNED, PINNED_SYSTEM, or PINNED_DEVICE")
 end
 
 _from_core_residency(s::ResidencyState) =
@@ -33,27 +33,32 @@ end
 
 function _handle_model_control_status(ctx::InferContext)
     snap = control_status(ctx.sched)
-    models = [_CTRL.ModelStatus(; name = String(name),
-                  residency = _from_core_residency(m.state),
-                  device_resident = m.device_resident, host_resident = m.host_resident,
-                  weight_nbytes = m.weight_nbytes, weight = m.weight, queue_depth = m.queue_depth,
-                  total_compute_seconds = m.total_compute,
-                  requests_served = UInt64(m.requests_served),
-                  dispatch_count = UInt64(m.dispatch_count),
-                  max_batch_size = Int64(m.max_batch_size),
-                  # Routing metadata: where the batch axis is, and the row counter that turns
-                  # total_compute_seconds into a cost per ITEM rather than per request. A gateway
-                  # that routes by work needs both; omitting either silently degrades it to
-                  # counting requests, which is indistinguishable from working.
-                  batch_input_name = String(m.batch_input_name),
-                  batch_axis = Int64(m.batch_axis),
-                  rows_served = UInt64(m.rows_served))
-              for (name, m) in snap.models]
+    models = [
+        _CTRL.ModelStatus(;
+                name = String(name),
+                residency = _from_core_residency(m.state),
+                device_resident = m.device_resident, host_resident = m.host_resident,
+                weight_nbytes = m.weight_nbytes, weight = m.weight, queue_depth = m.queue_depth,
+                total_compute_seconds = m.total_compute,
+                requests_served = UInt64(m.requests_served),
+                dispatch_count = UInt64(m.dispatch_count),
+                max_batch_size = Int64(m.max_batch_size),
+                # Routing metadata: where the batch axis is, and the row counter that turns
+                # total_compute_seconds into a cost per ITEM rather than per request. A gateway
+                # that routes by work needs both; omitting either silently degrades it to
+                # counting requests, which is indistinguishable from working.
+                batch_input_name = String(m.batch_input_name),
+                batch_axis = Int64(m.batch_axis),
+                rows_served = UInt64(m.rows_served)
+            )
+            for (name, m) in snap.models
+    ]
     return _CTRL.ModelControlStatusResponse(;
         residency_mode = (snap.residency_mode == SELF_MANAGED ? "self_managed" : "externally_managed"),
         discipline = lowercase(string(snap.discipline)),
         models = models,
-        weight_cache_max_bytes = UInt64(snap.weight_cache_max_bytes))
+        weight_cache_max_bytes = UInt64(snap.weight_cache_max_bytes)
+    )
 end
 
 function _handle_set_model_residency(ctx::InferContext, req)
@@ -80,11 +85,12 @@ end
 # Register the ControlService handlers on an existing router (the inference router), reusing the
 # InferContext payload so both services share the scheduler.
 function register_control_service!(router)
-    register_ControlService!(router;
+    register_ControlService!(
+        router;
         ModelControlStatus = (req, ctx) -> _handle_model_control_status(ctx.payload),
-        SetModelResidency  = (req, ctx) -> _handle_set_model_residency(ctx.payload, req),
-        SetModelPolicy     = (req, ctx) -> _handle_set_model_policy(ctx.payload, req),
-        CompactMemory      = (req, ctx) -> _handle_compact_memory(ctx.payload, req),
+        SetModelResidency = (req, ctx) -> _handle_set_model_residency(ctx.payload, req),
+        SetModelPolicy = (req, ctx) -> _handle_set_model_policy(ctx.payload, req),
+        CompactMemory = (req, ctx) -> _handle_compact_memory(ctx.payload, req),
     )
     return router
 end

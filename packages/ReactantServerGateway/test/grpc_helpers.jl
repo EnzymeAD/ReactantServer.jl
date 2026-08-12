@@ -13,9 +13,13 @@ grpc_free_port() = (s = Sockets.listen(Sockets.localhost, 0); p = Int(Sockets.ge
 # Send `request` to `rpc` on the local server at `port`, returning the decoded response. `service`
 # defaults to the inference data plane; pass it to reach another service on the same router (the
 # gateway also terminates the two control services).
-function grpc_call(::Type{Req}, ::Type{Resp}, rpc::AbstractString, port::Integer, request;
-                   service::AbstractString = _GRPC_SERVICE, deadline = 10) where {Req,Resp}
-    client = gRPCClient.gRPCServiceClient{Req,false,Resp,false}("127.0.0.1", port, "$service/$rpc";
-                                                                deadline = deadline)
+function grpc_call(
+        ::Type{Req}, ::Type{Resp}, rpc::AbstractString, port::Integer, request;
+        service::AbstractString = _GRPC_SERVICE, deadline = 10
+    ) where {Req, Resp}
+    client = gRPCClient.gRPCServiceClient{Req, false, Resp, false}(
+        "127.0.0.1", port, "$service/$rpc";
+        deadline = deadline
+    )
     return gRPCClient.grpc_sync_request(client, request)
 end

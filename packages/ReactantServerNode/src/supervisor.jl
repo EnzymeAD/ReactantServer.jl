@@ -5,7 +5,7 @@
 
 mutable struct Child
     spec::ChildSpec
-    proc::Union{Base.Process,Nothing}
+    proc::Union{Base.Process, Nothing}
     restarts::Int          # consecutive restarts without a stable run
     started_at::Float64
 end
@@ -22,11 +22,15 @@ struct Supervisor
     stable_seconds::Float64            # uptime that resets the restart counter
 end
 
-function Supervisor(specs::Vector{ChildSpec}; sink::IO=stdout, max_restarts::Int=0,
-                    backoff_cap::Real=30.0, stable_seconds::Real=60.0)
-    return Supervisor(Child[Child(s) for s in specs], sink, ReentrantLock(),
-                      Threads.Atomic{Bool}(false), Channel{Int}(8), max_restarts,
-                      Float64(backoff_cap), Float64(stable_seconds))
+function Supervisor(
+        specs::Vector{ChildSpec}; sink::IO = stdout, max_restarts::Int = 0,
+        backoff_cap::Real = 30.0, stable_seconds::Real = 60.0
+    )
+    return Supervisor(
+        Child[Child(s) for s in specs], sink, ReentrantLock(),
+        Threads.Atomic{Bool}(false), Channel{Int}(8), max_restarts,
+        Float64(backoff_cap), Float64(stable_seconds)
+    )
 end
 
 function _emit(sup::Supervisor, name::AbstractString, line::AbstractString)
@@ -52,7 +56,7 @@ end
 function _start!(sup::Supervisor, c::Child)
     out = Pipe()
     err = Pipe()
-    proc = run(pipeline(c.spec.cmd; stdout=out, stderr=err); wait=false)
+    proc = run(pipeline(c.spec.cmd; stdout = out, stderr = err); wait = false)
     close(out.in)
     close(err.in)
     c.proc = proc
@@ -68,7 +72,7 @@ end
 Ask the supervisor to shut the node down (idempotent; the first requested exit code wins). The
 signal bridge calls this on SIGTERM/SIGINT; tests and the crash-loop guard call it directly.
 """
-function request_shutdown!(sup::Supervisor, code::Integer=0)
+function request_shutdown!(sup::Supervisor, code::Integer = 0)
     isready(sup.exit_signal) && return nothing
     try
         put!(sup.exit_signal, Int(code))
@@ -108,12 +112,12 @@ function _supervise!(sup::Supervisor, c::Child)
         wait(t2)
         uptime = time() - c.started_at
         sup.shutting_down[] && break
-        _slog(sup, "$(c.spec.name) exited (code=$(proc.exitcode), signal=$(proc.termsignal), uptime=$(round(uptime; digits=1))s)")
+        _slog(sup, "$(c.spec.name) exited (code=$(proc.exitcode), signal=$(proc.termsignal), uptime=$(round(uptime; digits = 1))s)")
         uptime >= sup.stable_seconds && (c.restarts = 0)
         c.restarts += 1
         _check_restart_budget!(sup, c) || break
         delay = min(2.0^(c.restarts - 1), sup.backoff_cap)
-        _slog(sup, "restarting $(c.spec.name) in $(round(delay; digits=1))s")
+        _slog(sup, "restarting $(c.spec.name) in $(round(delay; digits = 1))s")
         _sleep_interruptible(sup, delay)
     end
     return nothing
@@ -156,7 +160,7 @@ Run every child's supervision loop and block until shutdown is requested (SIGTER
 crash-loop budget breach, or `request_shutdown!`). Children are terminated gracefully before it
 returns the exit code.
 """
-function run_supervisor!(sup::Supervisor; install_signal_handlers::Bool=true)
+function run_supervisor!(sup::Supervisor; install_signal_handlers::Bool = true)
     cond = Base.AsyncCondition()
     if install_signal_handlers
         install_term_handlers!(cond)

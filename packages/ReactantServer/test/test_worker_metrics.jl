@@ -19,15 +19,19 @@ function _wm_sched()
     sig = ModelSignature(["x"], DataType[Float32], ["w"], 1, ["y"], DataType[Float32], 1)
     inx = TensorSpec("x", F32, Dim[Dim(FIXED, 2), Dim(BATCH)], 2)
     outy = TensorSpec("y", F32, Dim[Dim(FIXED, 2), Dim(BATCH)], 2)
-    man = Manifest("2.0", "m", "", TensorSpec[inx], TensorSpec[outy], nothing, nothing,
-        BatchingSpec(Int[]), Provenance(Dict{String,Any}()), 1)
+    man = Manifest(
+        "2.0", "m", "", TensorSpec[inx], TensorSpec[outy], nothing, nothing,
+        BatchingSpec(Int[]), Provenance(Dict{String, Any}()), 1
+    )
     # weights set (Any[1]) ⇒ device-resident; execs values are unused by the metrics collector.
-    model = LoadedModel(sig, Dict{Int,Any}(1 => nothing, 4 => nothing), Any[1], UNPINNED, 4096, nothing)
-    reg.by_name["m"] = ModelEntry("m", man, Dict{Int,Vector{UInt8}}(), "", nothing, model, nothing, identity, identity)
+    model = LoadedModel(sig, Dict{Int, Any}(1 => nothing, 4 => nothing), Any[1], UNPINNED, 4096, nothing)
+    reg.by_name["m"] = ModelEntry("m", man, Dict{Int, Vector{UInt8}}(), "", nothing, model, nothing, identity, identity)
     sched = Scheduler(reg, backend, pool, SchedulerConfig(30.0, 64, 30.0))
     reg.by_name["m"].sched = ModelSchedState("m", ModelSchedConfig(1.0), 0.0)
-    cfg = ServerConfig(["."], "", RuntimeConfig(CPU_BACKEND, 0, 0.9, true, true), sched.cfg,
-        EndpointsConfig("127.0.0.1", 0))
+    cfg = ServerConfig(
+        ["."], "", RuntimeConfig(CPU_BACKEND, 0, 0.9, true, true), sched.cfg,
+        EndpointsConfig("127.0.0.1", 0)
+    )
     return sched, backend, pool, cfg
 end
 
@@ -35,7 +39,7 @@ _expose(wm) = (io = IOBuffer(); Prometheus.expose(io, wm.registry); String(take!
 
 @testset "worker metrics: pull collector series" begin
     sched, backend, pool, cfg = _wm_sched()
-    wm = WorkerMetrics(sched, backend, pool, cfg; worker_name="worker0")
+    wm = WorkerMetrics(sched, backend, pool, cfg; worker_name = "worker0")
     s = _expose(wm)
     @test occursin("worker_dispatch_total{model=\"m\"}", s)
     @test occursin("worker_queue_depth{model=\"m\"}", s)
@@ -83,15 +87,15 @@ end
 
 @testset "worker metrics: HTTP endpoint" begin
     sched, backend, pool, cfg = _wm_sched()
-    wm = WorkerMetrics(sched, backend, pool, cfg; worker_name="worker0")
+    wm = WorkerMetrics(sched, backend, pool, cfg; worker_name = "worker0")
     port = grpc_free_port()
     server = start_worker_metrics(wm, "127.0.0.1", port; ready_fn = () -> true)
     try
-        resp = HTTP.get("http://127.0.0.1:$port/metrics"; retry=false, readtimeout=5)
+        resp = HTTP.get("http://127.0.0.1:$port/metrics"; retry = false, readtimeout = 5)
         @test resp.status == 200
         @test occursin("worker_info", String(resp.body))
-        @test HTTP.get("http://127.0.0.1:$port/healthz"; retry=false, readtimeout=5).status == 200
-        @test HTTP.get("http://127.0.0.1:$port/readyz"; retry=false, readtimeout=5).status == 200
+        @test HTTP.get("http://127.0.0.1:$port/healthz"; retry = false, readtimeout = 5).status == 200
+        @test HTTP.get("http://127.0.0.1:$port/readyz"; retry = false, readtimeout = 5).status == 200
     finally
         close(server)
     end
@@ -115,16 +119,18 @@ end
     @test occursin("worker_info{gpu=\"1\",worker=\"worker0\",device_ordinal=\"0\"} 1", out)
     # Comment lines pass through untouched.
     @test occursin("# HELP worker_dispatch_total Total dispatches per model.", out)
-    @test inject_metric_labels(text, Pair{String,String}[]) == text
+    @test inject_metric_labels(text, Pair{String, String}[]) == text
 
     # The HTTP endpoint applies the labels to the real exposition.
     sched, backend, pool, cfg = _wm_sched()
-    wm = WorkerMetrics(sched, backend, pool, cfg; worker_name="worker0")
+    wm = WorkerMetrics(sched, backend, pool, cfg; worker_name = "worker0")
     port = grpc_free_port()
-    server = start_worker_metrics(wm, "127.0.0.1", port; ready_fn = () -> true,
-                                  worker_name="worker0", gpu="2")
+    server = start_worker_metrics(
+        wm, "127.0.0.1", port; ready_fn = () -> true,
+        worker_name = "worker0", gpu = "2"
+    )
     try
-        body = String(HTTP.get("http://127.0.0.1:$port/metrics"; retry=false, readtimeout=5).body)
+        body = String(HTTP.get("http://127.0.0.1:$port/metrics"; retry = false, readtimeout = 5).body)
         @test occursin("worker_dispatch_total{worker=\"worker0\",gpu=\"2\",model=\"m\"}", body)
         @test occursin("worker_models_loaded{worker=\"worker0\",gpu=\"2\"}", body)
     finally
@@ -133,8 +139,10 @@ end
 end
 
 @testset "worker metrics: gpu identity" begin
-    cuda_cfg(ord) = ServerConfig(["."], "", RuntimeConfig(CUDA_BACKEND, ord, 0.9, true, true),
-        SchedulerConfig(30.0, 64, 30.0), EndpointsConfig("127.0.0.1", 0))
+    cuda_cfg(ord) = ServerConfig(
+        ["."], "", RuntimeConfig(CUDA_BACKEND, ord, 0.9, true, true),
+        SchedulerConfig(30.0, 64, 30.0), EndpointsConfig("127.0.0.1", 0)
+    )
 
     # The supervisor / per-GPU-container case: a single selector is the physical identity.
     @test _gpu_identity(cuda_cfg(0), Dict("CUDA_VISIBLE_DEVICES" => "3")) == "3"
@@ -142,9 +150,11 @@ end
     # Bare metal, several visible devices: the addressed ordinal's token.
     @test _gpu_identity(cuda_cfg(1), Dict("CUDA_VISIBLE_DEVICES" => "4,5")) == "5"
     # No CUDA_VISIBLE_DEVICES: the device ordinal is the best available identity.
-    @test _gpu_identity(cuda_cfg(2), Dict{String,String}()) == "2"
+    @test _gpu_identity(cuda_cfg(2), Dict{String, String}()) == "2"
     # CPU backend: no gpu label.
-    cpu = ServerConfig(["."], "", RuntimeConfig(CPU_BACKEND, 0, 0.9, true, true),
-        SchedulerConfig(30.0, 64, 30.0), EndpointsConfig("127.0.0.1", 0))
+    cpu = ServerConfig(
+        ["."], "", RuntimeConfig(CPU_BACKEND, 0, 0.9, true, true),
+        SchedulerConfig(30.0, 64, 30.0), EndpointsConfig("127.0.0.1", 0)
+    )
     @test _gpu_identity(cpu, Dict("CUDA_VISIBLE_DEVICES" => "3")) == ""
 end

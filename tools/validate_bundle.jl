@@ -44,19 +44,27 @@ using ReactantServer
 const RSE = ReactantServerExport
 
 function parse_args(args)
-    rtol, atol, report, maxn, refonly, device = 1e-3, 1e-4, "", typemax(Int), false, "cpu"
+    rtol, atol, report, maxn, refonly, device = 1.0e-3, 1.0e-4, "", typemax(Int), false, "cpu"
     pos = String[]
     i = 1
     while i <= length(args)
         a = args[i]
-        if a == "--rtol";            rtol = parse(Float64, args[i+1]); i += 2
-        elseif a == "--atol";        atol = parse(Float64, args[i+1]); i += 2
-        elseif a == "--report";      report = args[i+1]; i += 2
-        elseif a == "--max";         maxn = parse(Int, args[i+1]); i += 2
-        elseif a == "--device";      device = args[i+1] == "cuda" ? "cuda:0" : args[i+1]; i += 2
-        elseif a == "--reference-only"; refonly = true; i += 1
-        elseif startswith(a, "--");  error("unknown argument: $a")
-        else;                        push!(pos, a); i += 1
+        if a == "--rtol"
+            rtol = parse(Float64, args[i + 1]); i += 2
+        elseif a == "--atol"
+            atol = parse(Float64, args[i + 1]); i += 2
+        elseif a == "--report"
+            report = args[i + 1]; i += 2
+        elseif a == "--max"
+            maxn = parse(Int, args[i + 1]); i += 2
+        elseif a == "--device"
+            device = args[i + 1] == "cuda" ? "cuda:0" : args[i + 1]; i += 2
+        elseif a == "--reference-only"
+            refonly = true; i += 1
+        elseif startswith(a, "--")
+            error("unknown argument: $a")
+        else
+            push!(pos, a); i += 1
         end
     end
     if refonly
@@ -72,111 +80,113 @@ end
 const opts = parse_args(ARGS)
 
 # --- Python side: parse config inputs, load samples, run the reference model ---
-pyexec("""
-import os, re, glob
-import numpy as np
-import torch
+pyexec(
+    """
+    import os, re, glob
+    import numpy as np
+    import torch
 
-def _extract_block(text, keyword):
-    m = re.search(keyword + r'\\s*\\[', text)
-    if not m: return None
-    i, depth = m.end() - 1, 0
-    for j in range(i, len(text)):
-        if text[j] == '[': depth += 1
-        elif text[j] == ']':
-            depth -= 1
-            if depth == 0: return text[i+1:j]
-    return None
-
-def input_specs(model_dir):
-    # Returns (names, ranks) where rank is the config dims length (without the batch axis).
-    cfg = os.path.join(model_dir, 'config.pbtxt')
-    text = open(cfg).read() if os.path.exists(cfg) else ''
-    block = _extract_block(text, 'input')
-    names, ranks = [], []
-    if block:
-        depth, start = 0, None
-        for j, c in enumerate(block):
-            if c == '{':
-                if depth == 0: start = j + 1
-                depth += 1
-            elif c == '}':
+    def _extract_block(text, keyword):
+        m = re.search(keyword + r'\\s*\\[', text)
+        if not m: return None
+        i, depth = m.end() - 1, 0
+        for j in range(i, len(text)):
+            if text[j] == '[': depth += 1
+            elif text[j] == ']':
                 depth -= 1
-                if depth == 0:
-                    obj = block[start:j]
-                    nm = re.search(r'name\\s*:\\s*"([^"]+)"', obj)
-                    dims = re.search(r'dims\\s*:\\s*\\[([^\\]]*)\\]', obj)
-                    nd = len(re.findall(r'-?\\d+', dims.group(1))) if dims else 0
-                    names.append(nm.group(1) if nm else f'INPUT__{len(names)}')
-                    ranks.append(nd)
-    return names, ranks
+                if depth == 0: return text[i+1:j]
+        return None
 
-def _ensure_batch(arr, rank_no_batch):
-    # The executable was compiled with a leading batch axis. Add batch=1 if the sample omits it.
-    if arr.ndim == rank_no_batch:
-        return arr[None, ...]
-    return arr
+    def input_specs(model_dir):
+        # Returns (names, ranks) where rank is the config dims length (without the batch axis).
+        cfg = os.path.join(model_dir, 'config.pbtxt')
+        text = open(cfg).read() if os.path.exists(cfg) else ''
+        block = _extract_block(text, 'input')
+        names, ranks = [], []
+        if block:
+            depth, start = 0, None
+            for j, c in enumerate(block):
+                if c == '{':
+                    if depth == 0: start = j + 1
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        obj = block[start:j]
+                        nm = re.search(r'name\\s*:\\s*"([^"]+)"', obj)
+                        dims = re.search(r'dims\\s*:\\s*\\[([^\\]]*)\\]', obj)
+                        nd = len(re.findall(r'-?\\d+', dims.group(1))) if dims else 0
+                        names.append(nm.group(1) if nm else f'INPUT__{len(names)}')
+                        ranks.append(nd)
+        return names, ranks
 
-def list_samples(samples_dir, names, ranks):
-    # Returns a list of (sample_id, {name: ndarray}), batch axis ensured. Flat .npy files =>
-    # single-input samples; subdirs => one sample each with per-input <name>.npy.
-    rank_of = {n: r for n, r in zip(names, ranks)}
-    subdirs = sorted([d for d in glob.glob(os.path.join(samples_dir, '*')) if os.path.isdir(d)])
-    samples = []
-    if subdirs:
-        for d in subdirs:
-            inp = {}
-            for n in names:
-                p = os.path.join(d, n + '.npy')
-                if not os.path.exists(p):
-                    raise FileNotFoundError(f'sample {d} missing input {n}.npy')
-                inp[n] = _ensure_batch(np.load(p), rank_of[n])
-            samples.append((os.path.basename(d), inp))
-    else:
-        files = sorted(glob.glob(os.path.join(samples_dir, '*.npy')))
-        if len(names) != 1 and files:
-            raise ValueError(f'model has {len(names)} inputs; use per-sample subdirs, not flat .npy')
-        for p in files:
-            samples.append((os.path.basename(p), {names[0]: _ensure_batch(np.load(p), rank_of[names[0]])}))
-    return samples
+    def _ensure_batch(arr, rank_no_batch):
+        # The executable was compiled with a leading batch axis. Add batch=1 if the sample omits it.
+        if arr.ndim == rank_no_batch:
+            return arr[None, ...]
+        return arr
 
-_MODEL = {}
-def load_reference(pt_path, device):
-    # device is 'cpu' or 'cuda:0' (with CUDA_VISIBLE_DEVICES selecting the physical GPU). Some
-    # scripted models bake device='cuda:0' into ops (e.g. an RNN's zero-initialized hidden state),
-    # so they must load and run on CUDA. TF32 is disabled so the GPU reference stays full float32,
-    # matching the CPU-lowered bundle.
-    m = torch.jit.load(pt_path, map_location=device)
-    # Some scripted models bake training=False as a constant, so .eval() raises "Can't set constant
-    # training". They are already in eval mode; ignore that.
-    try:
-        m.eval()
-    except RuntimeError:
-        pass
-    if device.startswith('cuda'):
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
-    _MODEL['m'] = m
-    _MODEL['device'] = device
-    return True
+    def list_samples(samples_dir, names, ranks):
+        # Returns a list of (sample_id, {name: ndarray}), batch axis ensured. Flat .npy files =>
+        # single-input samples; subdirs => one sample each with per-input <name>.npy.
+        rank_of = {n: r for n, r in zip(names, ranks)}
+        subdirs = sorted([d for d in glob.glob(os.path.join(samples_dir, '*')) if os.path.isdir(d)])
+        samples = []
+        if subdirs:
+            for d in subdirs:
+                inp = {}
+                for n in names:
+                    p = os.path.join(d, n + '.npy')
+                    if not os.path.exists(p):
+                        raise FileNotFoundError(f'sample {d} missing input {n}.npy')
+                    inp[n] = _ensure_batch(np.load(p), rank_of[n])
+                samples.append((os.path.basename(d), inp))
+        else:
+            files = sorted(glob.glob(os.path.join(samples_dir, '*.npy')))
+            if len(names) != 1 and files:
+                raise ValueError(f'model has {len(names)} inputs; use per-sample subdirs, not flat .npy')
+            for p in files:
+                samples.append((os.path.basename(p), {names[0]: _ensure_batch(np.load(p), rank_of[names[0]])}))
+        return samples
 
-def run_reference(name_arrays, names):
-    m = _MODEL['m']; device = _MODEL['device']
-    args = []
-    for n in names:
-        a = name_arrays[n]
-        t = torch.from_numpy(np.ascontiguousarray(a)).to(device)
-        args.append(t)
-    with torch.no_grad():
-        out = m(*args)
-    outs = [out] if isinstance(out, torch.Tensor) else list(out)
-    # Return list of (numpy_array, dtype_name) for each output tensor.
-    res = []
-    for o in outs:
-        a = o.detach().cpu().numpy()
-        res.append((a, str(a.dtype)))
-    return res
-""", @__MODULE__)
+    _MODEL = {}
+    def load_reference(pt_path, device):
+        # device is 'cpu' or 'cuda:0' (with CUDA_VISIBLE_DEVICES selecting the physical GPU). Some
+        # scripted models bake device='cuda:0' into ops (e.g. an RNN's zero-initialized hidden state),
+        # so they must load and run on CUDA. TF32 is disabled so the GPU reference stays full float32,
+        # matching the CPU-lowered bundle.
+        m = torch.jit.load(pt_path, map_location=device)
+        # Some scripted models bake training=False as a constant, so .eval() raises "Can't set constant
+        # training". They are already in eval mode; ignore that.
+        try:
+            m.eval()
+        except RuntimeError:
+            pass
+        if device.startswith('cuda'):
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+        _MODEL['m'] = m
+        _MODEL['device'] = device
+        return True
+
+    def run_reference(name_arrays, names):
+        m = _MODEL['m']; device = _MODEL['device']
+        args = []
+        for n in names:
+            a = name_arrays[n]
+            t = torch.from_numpy(np.ascontiguousarray(a)).to(device)
+            args.append(t)
+        with torch.no_grad():
+            out = m(*args)
+        outs = [out] if isinstance(out, torch.Tensor) else list(out)
+        # Return list of (numpy_array, dtype_name) for each output tensor.
+        res = []
+        for o in outs:
+            a = o.detach().cpu().numpy()
+            res.append((a, str(a.dtype)))
+        return res
+    """, @__MODULE__
+)
 
 # numpy ndarray (Python) -> Julia Array with reversed (column-major) shape, same dtype. Standalone
 # (does not use RSE's _numpy[] Ref, which only the export path initializes). _numpy_dtype_to_julia
@@ -201,10 +211,10 @@ function compare_output(ref::AbstractArray, cand::AbstractArray; rtol, atol)
         return (nbad == 0, nbad == 0 ? "exact int match" : "$nbad/$(length(ref)) integer elements differ")
     end
     rf = Float64.(ref); cf = Float64.(cand)
-    if isapprox(rf, cf; rtol=rtol, atol=atol)
-        return (true, "within tol (max|Δ|=$(round(maximum(abs.(rf .- cf)); sigdigits=3)))")
+    if isapprox(rf, cf; rtol = rtol, atol = atol)
+        return (true, "within tol (max|Δ|=$(round(maximum(abs.(rf .- cf)); sigdigits = 3)))")
     end
-    return (false, "max|Δ|=$(round(maximum(abs.(rf .- cf)); sigdigits=3)) exceeds rtol=$rtol atol=$atol")
+    return (false, "max|Δ|=$(round(maximum(abs.(rf .- cf)); sigdigits = 3)) exceeds rtol=$rtol atol=$atol")
 end
 
 function main()
@@ -221,8 +231,10 @@ function main()
     # dtypes, and ranges. Used to confirm sample wiring and to learn the real (variable-count)
     # output structure before a converted bundle exists.
     if opts.refonly
-        lines = String["# Reference-only run: $(basename(normpath(opts.model_dir)))",
-                       "model_dir: `$(opts.model_dir)`  samples=$nsamp  inputs=$(join(names, ", "))", ""]
+        lines = String[
+            "# Reference-only run: $(basename(normpath(opts.model_dir)))",
+            "model_dir: `$(opts.model_dir)`  samples=$nsamp  inputs=$(join(names, ", "))", "",
+        ]
         nrun = min(nsamp, opts.maxn)
         for si in 0:(nrun - 1)
             sid = pyconvert(String, samples[si][0])
@@ -233,7 +245,7 @@ function main()
                 a = np_to_julia(ref_py[k][0])
                 dt = pyconvert(String, ref_py[k][1])
                 rng = (eltype(a) <: AbstractFloat && !isempty(a)) ?
-                    " range[$(round(minimum(a); sigdigits=4)),$(round(maximum(a); sigdigits=4))]" : ""
+                    " range[$(round(minimum(a); sigdigits = 4)),$(round(maximum(a); sigdigits = 4))]" : ""
                 push!(parts, "out$k: $dt $(size(a))$rng")
             end
             push!(lines, "- `$sid`: " * join(parts, "; "))
@@ -246,17 +258,21 @@ function main()
 
     # Candidate: load the converted bundle on the CPU backend.
     backend = ReactantServer.ReactantBackend()
-    pool = ReactantServer.resolve_client(backend,
-        ReactantServer.RuntimeConfig(ReactantServer.CPU_BACKEND, 0, 0.9, true, true))
+    pool = ReactantServer.resolve_client(
+        backend,
+        ReactantServer.RuntimeConfig(ReactantServer.CPU_BACKEND, 0, 0.9, true, true)
+    )
     parent = dirname(normpath(opts.bundle_dir))
     bname = basename(normpath(opts.bundle_dir))
-    reg = ReactantServer.load_bundles([parent]; include=[bname])
+    reg = ReactantServer.load_bundles([parent]; include = [bname])
     entry = ReactantServer.get_model(reg, bname)
     entry.executable = ReactantServer.build_loaded_model(backend, pool, entry)
 
-    lines = String["# Parity report: $(bname)", "",
-                   "model_dir: `$(opts.model_dir)`  bundle: `$(opts.bundle_dir)`",
-                   "rtol=$(opts.rtol) atol=$(opts.atol)  samples=$nsamp", ""]
+    lines = String[
+        "# Parity report: $(bname)", "",
+        "model_dir: `$(opts.model_dir)`  bundle: `$(opts.bundle_dir)`",
+        "rtol=$(opts.rtol) atol=$(opts.atol)  samples=$nsamp", "",
+    ]
     npass = 0
     nrun = min(nsamp, opts.maxn)
     for si in 0:(nrun - 1)
@@ -298,9 +314,9 @@ function main()
         sample_ok = true
         detparts = String[]
         for k in 1:length(ref_outs)
-            ok, det = compare_output(ref_outs[k], cand_outs[k]; rtol=opts.rtol, atol=opts.atol)
+            ok, det = compare_output(ref_outs[k], cand_outs[k]; rtol = opts.rtol, atol = opts.atol)
             sample_ok &= ok
-            push!(detparts, "out$(k-1): $(ok ? "✓" : "✗") $det")
+            push!(detparts, "out$(k - 1): $(ok ? "✓" : "✗") $det")
         end
         npass += sample_ok ? 1 : 0
         push!(lines, "- $(sample_ok ? "✅" : "❌") `$sid`: " * join(detparts, "; "))
@@ -314,7 +330,7 @@ function main()
         write(opts.report, report_text)
         println("\nreport written to: $(opts.report)")
     end
-    exit(npass == nrun ? 0 : 1)
+    return exit(npass == nrun ? 0 : 1)
 end
 
 main()

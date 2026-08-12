@@ -18,7 +18,7 @@ The monorepo root containing `packages/`. `REACTANT_WORKSPACE_ROOT` wins; otherw
 derived from the active project, which for the supervisor is
 `<root>/packages/ReactantServerNode/Project.toml`.
 """
-function default_workspace_root(env::AbstractDict=ENV)
+function default_workspace_root(env::AbstractDict = ENV)
     haskey(env, "REACTANT_WORKSPACE_ROOT") && return String(env["REACTANT_WORKSPACE_ROOT"])
     proj = Base.active_project()
     proj === nothing && throw(ConfigError("no active project; set REACTANT_WORKSPACE_ROOT"))
@@ -33,10 +33,10 @@ Sys.islinux() && ccall(:prctl, Cint, (Cint, Culong, Culong, Culong, Culong), 1, 
 """
 
 const _WORKER_BOOT = _PDEATHSIG_BOOT * """
-using ReactantServer
-w = get(ENV, "REACTANT_WORKER_NAME", "")
-ReactantServer.serve(ARGS[1]; worker = isempty(w) ? nothing : w)
-"""
+    using ReactantServer
+    w = get(ENV, "REACTANT_WORKER_NAME", "")
+    ReactantServer.serve(ARGS[1]; worker = isempty(w) ? nothing : w)
+    """
 
 # The default per-worker compute-thread cap. `--threads=auto` would size each worker's pool to the
 # whole host; with N workers per node that is an N-way oversubscription (each worker, plus its GC
@@ -46,15 +46,17 @@ ReactantServer.serve(ARGS[1]; worker = isempty(w) ? nothing : w)
 const _MAX_WORKER_THREADS = 16
 
 # Per-worker compute-thread count: the host's share among the workers, at least 1, capped.
-_worker_thread_count(cpu_threads::Integer, nworkers::Integer; cap::Integer=_MAX_WORKER_THREADS) =
+_worker_thread_count(cpu_threads::Integer, nworkers::Integer; cap::Integer = _MAX_WORKER_THREADS) =
     clamp(cpu_threads ÷ max(1, nworkers), 1, cap)
 
-function worker_spec(name::AbstractString, node_file::AbstractString,
-                     device::Union{AbstractString,Nothing}, workspace_root::AbstractString;
-                     compute_threads::Integer=_worker_thread_count(Sys.CPU_THREADS, 1),
-                     grpc_port::Union{Integer,Nothing}=nothing,
-                     metrics_port::Union{Integer,Nothing}=nothing,
-                     grace_seconds::Real=15.0)
+function worker_spec(
+        name::AbstractString, node_file::AbstractString,
+        device::Union{AbstractString, Nothing}, workspace_root::AbstractString;
+        compute_threads::Integer = _worker_thread_count(Sys.CPU_THREADS, 1),
+        grpc_port::Union{Integer, Nothing} = nothing,
+        metrics_port::Union{Integer, Nothing} = nothing,
+        grace_seconds::Real = 15.0
+    )
     proj = joinpath(workspace_root, "packages", "ReactantServer")
     # `--threads=<compute_threads>,1`: a default pool sized to this worker's share of the host for
     # the per-request preprocess/postprocess tasks, plus one interactive thread the scheduler pins
@@ -63,7 +65,7 @@ function worker_spec(name::AbstractString, node_file::AbstractString,
     # workers run on one node. (Base.julia_cmd() carries no thread setting, so this is the sole
     # source.)
     cmd = `$(Base.julia_cmd()) --threads=$(compute_threads),1 --project=$proj -e $_WORKER_BOOT $node_file`
-    pairs = Pair{String,String}["REACTANT_WORKER_NAME" => String(name)]
+    pairs = Pair{String, String}["REACTANT_WORKER_NAME" => String(name)]
     # Always set device visibility explicitly: the assigned selector, or empty for a CPU worker,
     # so a container-level CUDA_VISIBLE_DEVICES is never inherited by accident.
     push!(pairs, "CUDA_VISIBLE_DEVICES" => (device === nothing ? "" : String(device)))
@@ -79,19 +81,21 @@ end
 # The node's public gRPC and metrics ports (where clients and Prometheus connect): the gateway's
 # listen ports, default 8001/8002, overridable via REACTANT_GATEWAY_LISTEN_* so a single worker
 # bound directly to them stays consistent with the gateway it replaces.
-function public_ports(env::AbstractDict=ENV)
+function public_ports(env::AbstractDict = ENV)
     _port(addr, default) = begin
         i = findlast(==(':'), String(addr))
         i === nothing ? default : something(tryparse(Int, String(addr)[(i + 1):end]), default)
     end
-    return (_port(get(env, "REACTANT_GATEWAY_LISTEN_GRPC", "0.0.0.0:8001"), 8001),
-            _port(get(env, "REACTANT_GATEWAY_LISTEN_METRICS", "0.0.0.0:8002"), 8002))
+    return (
+        _port(get(env, "REACTANT_GATEWAY_LISTEN_GRPC", "0.0.0.0:8001"), 8001),
+        _port(get(env, "REACTANT_GATEWAY_LISTEN_METRICS", "0.0.0.0:8002"), 8002),
+    )
 end
 
 const _GATEWAY_BOOT = _PDEATHSIG_BOOT * """
-using ReactantServerGateway
-ReactantServerGateway.serve_gateway(isempty(ARGS) ? nothing : ARGS[1])
-"""
+    using ReactantServerGateway
+    ReactantServerGateway.serve_gateway(isempty(ARGS) ? nothing : ARGS[1])
+    """
 
 """
     gateway_spec(workspace_root; gateway_path=nothing, endpoints=nothing,
@@ -103,19 +107,21 @@ synthesized into `REACTANT_GATEWAY_WORKERS`, and `metrics_endpoints` (the worker
 addresses) into `REACTANT_GATEWAY_WORKER_METRICS`, so the gateway's /metrics aggregates every
 worker's export. A mounted gateway.yml wins: it is passed through and no endpoint env is set.
 """
-function gateway_spec(workspace_root::AbstractString;
-                      gateway_path::Union{AbstractString,Nothing}=nothing,
-                      endpoints::Union{Vector{String},Nothing}=nothing,
-                      metrics_endpoints::Union{Vector{String},Nothing}=nothing,
-                      worker_names::Union{Vector{String},Nothing}=nothing,
-                      grpc_max_recv::Union{Integer,Nothing}=nothing,
-                      grpc_max_send::Union{Integer,Nothing}=nothing,
-                      grace_seconds::Real=10.0)
+function gateway_spec(
+        workspace_root::AbstractString;
+        gateway_path::Union{AbstractString, Nothing} = nothing,
+        endpoints::Union{Vector{String}, Nothing} = nothing,
+        metrics_endpoints::Union{Vector{String}, Nothing} = nothing,
+        worker_names::Union{Vector{String}, Nothing} = nothing,
+        grpc_max_recv::Union{Integer, Nothing} = nothing,
+        grpc_max_send::Union{Integer, Nothing} = nothing,
+        grace_seconds::Real = 10.0
+    )
     proj = joinpath(workspace_root, "packages", "ReactantServerGateway")
     cmd = gateway_path === nothing ?
-          `$(Base.julia_cmd()) --project=$proj -e $_GATEWAY_BOOT` :
-          `$(Base.julia_cmd()) --project=$proj -e $_GATEWAY_BOOT $gateway_path`
-    pairs = Pair{String,String}[]
+        `$(Base.julia_cmd()) --project=$proj -e $_GATEWAY_BOOT` :
+        `$(Base.julia_cmd()) --project=$proj -e $_GATEWAY_BOOT $gateway_path`
+    pairs = Pair{String, String}[]
     # The supervisor co-launches the workers, which compile every model before answering. Under
     # lpt_packing the gateway must wait for all of them before its startup checks pass, so make the
     # embedded gateway wait indefinitely by default (the worker subprocesses are this supervisor's
@@ -153,7 +159,7 @@ end
 The node's worker gRPC addresses (`host:port` per worker, ports via the node's base_port math),
 as fed to the embedded gateway.
 """
-function worker_endpoints(node::AbstractDict; host::AbstractString="127.0.0.1")
+function worker_endpoints(node::AbstractDict; host::AbstractString = "127.0.0.1")
     ws = _node_workers(node)
     return String["$host:$(_worker_port(node, w, i - 1))" for (i, w) in enumerate(ws)]
 end
@@ -164,7 +170,7 @@ end
 The node's worker metrics addresses (`metrics_base_port + i` per worker); empty when the node
 has no `metrics_base_port`.
 """
-function worker_metrics_endpoints(node::AbstractDict; host::AbstractString="127.0.0.1")
+function worker_metrics_endpoints(node::AbstractDict; host::AbstractString = "127.0.0.1")
     mbp = get(node, "metrics_base_port", nothing)
     mbp isa Integer || return String[]
     return String["$host:$(Int(mbp) + i - 1)" for i in 1:length(_node_workers(node))]
@@ -172,11 +178,11 @@ end
 
 # The gateway's listen ports (for the worker-port collision warning): defaults 8001/8002,
 # overridden by a mounted gateway.yml's listen block, overridden by REACTANT_GATEWAY_LISTEN_*.
-function _gateway_listen_ports(gateway_path::Union{AbstractString,Nothing}, env::AbstractDict)
-    listen = Dict{String,Any}()
+function _gateway_listen_ports(gateway_path::Union{AbstractString, Nothing}, env::AbstractDict)
+    listen = Dict{String, Any}()
     if gateway_path !== nothing && isfile(gateway_path)
         raw = try
-            YAML.load_file(gateway_path; dicttype=Dict{String,Any})
+            YAML.load_file(gateway_path; dicttype = Dict{String, Any})
         catch
             nothing
         end

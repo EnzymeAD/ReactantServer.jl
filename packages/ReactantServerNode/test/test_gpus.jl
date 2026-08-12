@@ -31,20 +31,20 @@ end
 end
 
 @testset "detect_gpus precedence" begin
-    node_list = Dict{String,Any}("gpus" => [0, 1])
+    node_list = Dict{String, Any}("gpus" => [0, 1])
 
     # REACTANT_GPUS beats everything, including the node file and CUDA_VISIBLE_DEVICES.
     env = Dict("REACTANT_GPUS" => "1", "CUDA_VISIBLE_DEVICES" => "0,1,2")
-    @test RSN.detect_gpus(env; node=node_list) == ["0"]
-    @test RSN.detect_gpus(Dict("REACTANT_GPUS" => "0"); node=node_list) == String[]
+    @test RSN.detect_gpus(env; node = node_list) == ["0"]
+    @test RSN.detect_gpus(Dict("REACTANT_GPUS" => "0"); node = node_list) == String[]
 
     # The node file's gpus key beats CUDA_VISIBLE_DEVICES.
     env = Dict("CUDA_VISIBLE_DEVICES" => "5")
-    @test RSN.detect_gpus(env; node=node_list) == ["0", "1"]
-    @test RSN.detect_gpus(env; node=Dict{String,Any}("gpus" => 3)) == ["0", "1", "2"]
+    @test RSN.detect_gpus(env; node = node_list) == ["0", "1"]
+    @test RSN.detect_gpus(env; node = Dict{String, Any}("gpus" => 3)) == ["0", "1", "2"]
 
     # gpus: auto falls through to CUDA_VISIBLE_DEVICES.
-    @test RSN.detect_gpus(env; node=Dict{String,Any}("gpus" => "auto")) == ["5"]
+    @test RSN.detect_gpus(env; node = Dict{String, Any}("gpus" => "auto")) == ["5"]
     @test RSN.detect_gpus(Dict("CUDA_VISIBLE_DEVICES" => "GPU-aaaa")) == ["GPU-aaaa"]
     @test RSN.detect_gpus(Dict("CUDA_VISIBLE_DEVICES" => "")) == String[]
 end

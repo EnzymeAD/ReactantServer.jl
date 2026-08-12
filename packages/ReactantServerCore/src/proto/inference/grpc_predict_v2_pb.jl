@@ -25,11 +25,11 @@ struct ModelMetadataRequest
     name::String
     version::String
 end
-ModelMetadataRequest(;name = "", version = "") = ModelMetadataRequest(name, version)
-PB.default_values(::Type{ModelMetadataRequest}) = (;name = "", version = "")
-PB.field_numbers(::Type{ModelMetadataRequest}) = (;name = 1, version = 2)
+ModelMetadataRequest(; name = "", version = "") = ModelMetadataRequest(name, version)
+PB.default_values(::Type{ModelMetadataRequest}) = (; name = "", version = "")
+PB.field_numbers(::Type{ModelMetadataRequest}) = (; name = 1, version = 2)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelMetadataRequest}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelMetadataRequest}, _endpos::Int = 0, _group::Bool = false)
     name = ""
     version = ""
     while !PB.message_done(d, _endpos, _group)
@@ -64,11 +64,11 @@ struct SystemSharedMemoryRegisterRequest
     offset::UInt64
     byte_size::UInt64
 end
-SystemSharedMemoryRegisterRequest(;name = "", key = "", offset = zero(UInt64), byte_size = zero(UInt64)) = SystemSharedMemoryRegisterRequest(name, key, offset, byte_size)
-PB.default_values(::Type{SystemSharedMemoryRegisterRequest}) = (;name = "", key = "", offset = zero(UInt64), byte_size = zero(UInt64))
-PB.field_numbers(::Type{SystemSharedMemoryRegisterRequest}) = (;name = 1, key = 2, offset = 3, byte_size = 4)
+SystemSharedMemoryRegisterRequest(; name = "", key = "", offset = zero(UInt64), byte_size = zero(UInt64)) = SystemSharedMemoryRegisterRequest(name, key, offset, byte_size)
+PB.default_values(::Type{SystemSharedMemoryRegisterRequest}) = (; name = "", key = "", offset = zero(UInt64), byte_size = zero(UInt64))
+PB.field_numbers(::Type{SystemSharedMemoryRegisterRequest}) = (; name = 1, key = 2, offset = 3, byte_size = 4)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SystemSharedMemoryRegisterRequest}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SystemSharedMemoryRegisterRequest}, _endpos::Int = 0, _group::Bool = false)
     name = ""
     key = ""
     offset = zero(UInt64)
@@ -109,7 +109,7 @@ end
 
 struct ServerReadyRequest end
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ServerReadyRequest}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ServerReadyRequest}, _endpos::Int = 0, _group::Bool = false)
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         Base.skip(d, wire_type)
@@ -129,11 +129,11 @@ end
 struct SystemSharedMemoryStatusRequest
     name::String
 end
-SystemSharedMemoryStatusRequest(;name = "") = SystemSharedMemoryStatusRequest(name)
-PB.default_values(::Type{SystemSharedMemoryStatusRequest}) = (;name = "")
-PB.field_numbers(::Type{SystemSharedMemoryStatusRequest}) = (;name = 1)
+SystemSharedMemoryStatusRequest(; name = "") = SystemSharedMemoryStatusRequest(name)
+PB.default_values(::Type{SystemSharedMemoryStatusRequest}) = (; name = "")
+PB.field_numbers(::Type{SystemSharedMemoryStatusRequest}) = (; name = 1)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SystemSharedMemoryStatusRequest}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SystemSharedMemoryStatusRequest}, _endpos::Int = 0, _group::Bool = false)
     name = ""
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
@@ -160,11 +160,11 @@ end
 struct SystemSharedMemoryUnregisterRequest
     name::String
 end
-SystemSharedMemoryUnregisterRequest(;name = "") = SystemSharedMemoryUnregisterRequest(name)
-PB.default_values(::Type{SystemSharedMemoryUnregisterRequest}) = (;name = "")
-PB.field_numbers(::Type{SystemSharedMemoryUnregisterRequest}) = (;name = 1)
+SystemSharedMemoryUnregisterRequest(; name = "") = SystemSharedMemoryUnregisterRequest(name)
+PB.default_values(::Type{SystemSharedMemoryUnregisterRequest}) = (; name = "")
+PB.field_numbers(::Type{SystemSharedMemoryUnregisterRequest}) = (; name = 1)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SystemSharedMemoryUnregisterRequest}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SystemSharedMemoryUnregisterRequest}, _endpos::Int = 0, _group::Bool = false)
     name = ""
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
@@ -190,7 +190,7 @@ end
 
 struct SystemSharedMemoryUnregisterResponse end
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SystemSharedMemoryUnregisterResponse}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SystemSharedMemoryUnregisterResponse}, _endpos::Int = 0, _group::Bool = false)
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         Base.skip(d, wire_type)
@@ -210,11 +210,11 @@ end
 struct IsSameIPCNamespaceRequest
     name::String
 end
-IsSameIPCNamespaceRequest(;name = "") = IsSameIPCNamespaceRequest(name)
-PB.default_values(::Type{IsSameIPCNamespaceRequest}) = (;name = "")
-PB.field_numbers(::Type{IsSameIPCNamespaceRequest}) = (;name = 1)
+IsSameIPCNamespaceRequest(; name = "") = IsSameIPCNamespaceRequest(name)
+PB.default_values(::Type{IsSameIPCNamespaceRequest}) = (; name = "")
+PB.field_numbers(::Type{IsSameIPCNamespaceRequest}) = (; name = 1)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:IsSameIPCNamespaceRequest}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:IsSameIPCNamespaceRequest}, _endpos::Int = 0, _group::Bool = false)
     name = ""
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
@@ -241,11 +241,11 @@ end
 struct IsSameIPCNamespaceResponse
     same::Bool
 end
-IsSameIPCNamespaceResponse(;same = false) = IsSameIPCNamespaceResponse(same)
-PB.default_values(::Type{IsSameIPCNamespaceResponse}) = (;same = false)
-PB.field_numbers(::Type{IsSameIPCNamespaceResponse}) = (;same = 1)
+IsSameIPCNamespaceResponse(; same = false) = IsSameIPCNamespaceResponse(same)
+PB.default_values(::Type{IsSameIPCNamespaceResponse}) = (; same = false)
+PB.field_numbers(::Type{IsSameIPCNamespaceResponse}) = (; same = 1)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:IsSameIPCNamespaceResponse}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:IsSameIPCNamespaceResponse}, _endpos::Int = 0, _group::Bool = false)
     same = false
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
@@ -273,11 +273,11 @@ struct RepositoryIndexRequest
     repository_name::String
     ready::Bool
 end
-RepositoryIndexRequest(;repository_name = "", ready = false) = RepositoryIndexRequest(repository_name, ready)
-PB.default_values(::Type{RepositoryIndexRequest}) = (;repository_name = "", ready = false)
-PB.field_numbers(::Type{RepositoryIndexRequest}) = (;repository_name = 1, ready = 2)
+RepositoryIndexRequest(; repository_name = "", ready = false) = RepositoryIndexRequest(repository_name, ready)
+PB.default_values(::Type{RepositoryIndexRequest}) = (; repository_name = "", ready = false)
+PB.field_numbers(::Type{RepositoryIndexRequest}) = (; repository_name = 1, ready = 2)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:RepositoryIndexRequest}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:RepositoryIndexRequest}, _endpos::Int = 0, _group::Bool = false)
     repository_name = ""
     ready = false
     while !PB.message_done(d, _endpos, _group)
@@ -311,11 +311,11 @@ struct var"ModelMetadataResponse.TensorMetadata"
     datatype::String
     shape::Vector{Int64}
 end
-var"ModelMetadataResponse.TensorMetadata"(;name = "", datatype = "", shape = Vector{Int64}()) = var"ModelMetadataResponse.TensorMetadata"(name, datatype, shape)
-PB.default_values(::Type{var"ModelMetadataResponse.TensorMetadata"}) = (;name = "", datatype = "", shape = Vector{Int64}())
-PB.field_numbers(::Type{var"ModelMetadataResponse.TensorMetadata"}) = (;name = 1, datatype = 2, shape = 3)
+var"ModelMetadataResponse.TensorMetadata"(; name = "", datatype = "", shape = Vector{Int64}()) = var"ModelMetadataResponse.TensorMetadata"(name, datatype, shape)
+PB.default_values(::Type{var"ModelMetadataResponse.TensorMetadata"}) = (; name = "", datatype = "", shape = Vector{Int64}())
+PB.field_numbers(::Type{var"ModelMetadataResponse.TensorMetadata"}) = (; name = 1, datatype = 2, shape = 3)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:var"ModelMetadataResponse.TensorMetadata"}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:var"ModelMetadataResponse.TensorMetadata"}, _endpos::Int = 0, _group::Bool = false)
     name = ""
     datatype = ""
     shape = PB.BufferedVector{Int64}()
@@ -350,16 +350,16 @@ function PB._encoded_size(x::var"ModelMetadataResponse.TensorMetadata")
 end
 
 struct InferParameter
-    parameter_choice::Union{Nothing,OneOf{<:Union{Bool,Int64,String}}}
+    parameter_choice::Union{Nothing, OneOf{<:Union{Bool, Int64, String}}}
 end
-InferParameter(;parameter_choice = nothing) = InferParameter(parameter_choice)
+InferParameter(; parameter_choice = nothing) = InferParameter(parameter_choice)
 PB.oneof_field_types(::Type{InferParameter}) = (;
-    parameter_choice = (;bool_param=Bool, int64_param=Int64, string_param=String),
+    parameter_choice = (; bool_param = Bool, int64_param = Int64, string_param = String),
 )
-PB.default_values(::Type{InferParameter}) = (;bool_param = false, int64_param = zero(Int64), string_param = "")
-PB.field_numbers(::Type{InferParameter}) = (;bool_param = 1, int64_param = 2, string_param = 3)
+PB.default_values(::Type{InferParameter}) = (; bool_param = false, int64_param = zero(Int64), string_param = "")
+PB.field_numbers(::Type{InferParameter}) = (; bool_param = 1, int64_param = 2, string_param = 3)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:InferParameter}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:InferParameter}, _endpos::Int = 0, _group::Bool = false)
     parameter_choice = nothing
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
@@ -378,7 +378,7 @@ end
 
 function PB.encode(e::PB.AbstractProtoEncoder, x::InferParameter)
     initpos = position(e.io)
-    if isnothing(x.parameter_choice);
+    if isnothing(x.parameter_choice)
     elseif x.parameter_choice.name === :bool_param
         PB.encode(e, 1, x.parameter_choice[]::Bool)
     elseif x.parameter_choice.name === :int64_param
@@ -390,7 +390,7 @@ function PB.encode(e::PB.AbstractProtoEncoder, x::InferParameter)
 end
 function PB._encoded_size(x::InferParameter)
     encoded_size = 0
-    if isnothing(x.parameter_choice);
+    if isnothing(x.parameter_choice)
     elseif x.parameter_choice.name === :bool_param
         encoded_size += PB._encoded_size(x.parameter_choice[]::Bool, 1)
     elseif x.parameter_choice.name === :int64_param
@@ -404,11 +404,11 @@ end
 struct ServerLiveResponse
     live::Bool
 end
-ServerLiveResponse(;live = false) = ServerLiveResponse(live)
-PB.default_values(::Type{ServerLiveResponse}) = (;live = false)
-PB.field_numbers(::Type{ServerLiveResponse}) = (;live = 1)
+ServerLiveResponse(; live = false) = ServerLiveResponse(live)
+PB.default_values(::Type{ServerLiveResponse}) = (; live = false)
+PB.field_numbers(::Type{ServerLiveResponse}) = (; live = 1)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ServerLiveResponse}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ServerLiveResponse}, _endpos::Int = 0, _group::Bool = false)
     live = false
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
@@ -435,11 +435,11 @@ end
 struct ModelReadyResponse
     ready::Bool
 end
-ModelReadyResponse(;ready = false) = ModelReadyResponse(ready)
-PB.default_values(::Type{ModelReadyResponse}) = (;ready = false)
-PB.field_numbers(::Type{ModelReadyResponse}) = (;ready = 1)
+ModelReadyResponse(; ready = false) = ModelReadyResponse(ready)
+PB.default_values(::Type{ModelReadyResponse}) = (; ready = false)
+PB.field_numbers(::Type{ModelReadyResponse}) = (; ready = 1)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelReadyResponse}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelReadyResponse}, _endpos::Int = 0, _group::Bool = false)
     ready = false
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
@@ -473,11 +473,11 @@ struct InferTensorContents
     fp64_contents::Vector{Float64}
     bytes_contents::Vector{Vector{UInt8}}
 end
-InferTensorContents(;bool_contents = Vector{Bool}(), int_contents = Vector{Int32}(), int64_contents = Vector{Int64}(), uint_contents = Vector{UInt32}(), uint64_contents = Vector{UInt64}(), fp32_contents = Vector{Float32}(), fp64_contents = Vector{Float64}(), bytes_contents = Vector{Vector{UInt8}}()) = InferTensorContents(bool_contents, int_contents, int64_contents, uint_contents, uint64_contents, fp32_contents, fp64_contents, bytes_contents)
-PB.default_values(::Type{InferTensorContents}) = (;bool_contents = Vector{Bool}(), int_contents = Vector{Int32}(), int64_contents = Vector{Int64}(), uint_contents = Vector{UInt32}(), uint64_contents = Vector{UInt64}(), fp32_contents = Vector{Float32}(), fp64_contents = Vector{Float64}(), bytes_contents = Vector{Vector{UInt8}}())
-PB.field_numbers(::Type{InferTensorContents}) = (;bool_contents = 1, int_contents = 2, int64_contents = 3, uint_contents = 4, uint64_contents = 5, fp32_contents = 6, fp64_contents = 7, bytes_contents = 8)
+InferTensorContents(; bool_contents = Vector{Bool}(), int_contents = Vector{Int32}(), int64_contents = Vector{Int64}(), uint_contents = Vector{UInt32}(), uint64_contents = Vector{UInt64}(), fp32_contents = Vector{Float32}(), fp64_contents = Vector{Float64}(), bytes_contents = Vector{Vector{UInt8}}()) = InferTensorContents(bool_contents, int_contents, int64_contents, uint_contents, uint64_contents, fp32_contents, fp64_contents, bytes_contents)
+PB.default_values(::Type{InferTensorContents}) = (; bool_contents = Vector{Bool}(), int_contents = Vector{Int32}(), int64_contents = Vector{Int64}(), uint_contents = Vector{UInt32}(), uint64_contents = Vector{UInt64}(), fp32_contents = Vector{Float32}(), fp64_contents = Vector{Float64}(), bytes_contents = Vector{Vector{UInt8}}())
+PB.field_numbers(::Type{InferTensorContents}) = (; bool_contents = 1, int_contents = 2, int64_contents = 3, uint_contents = 4, uint64_contents = 5, fp32_contents = 6, fp64_contents = 7, bytes_contents = 8)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:InferTensorContents}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:InferTensorContents}, _endpos::Int = 0, _group::Bool = false)
     bool_contents = PB.BufferedVector{Bool}()
     int_contents = PB.BufferedVector{Int32}()
     int64_contents = PB.BufferedVector{Int64}()
@@ -542,11 +542,11 @@ struct var"SystemSharedMemoryStatusResponse.RegionStatus"
     offset::UInt64
     byte_size::UInt64
 end
-var"SystemSharedMemoryStatusResponse.RegionStatus"(;name = "", key = "", offset = zero(UInt64), byte_size = zero(UInt64)) = var"SystemSharedMemoryStatusResponse.RegionStatus"(name, key, offset, byte_size)
-PB.default_values(::Type{var"SystemSharedMemoryStatusResponse.RegionStatus"}) = (;name = "", key = "", offset = zero(UInt64), byte_size = zero(UInt64))
-PB.field_numbers(::Type{var"SystemSharedMemoryStatusResponse.RegionStatus"}) = (;name = 1, key = 2, offset = 3, byte_size = 4)
+var"SystemSharedMemoryStatusResponse.RegionStatus"(; name = "", key = "", offset = zero(UInt64), byte_size = zero(UInt64)) = var"SystemSharedMemoryStatusResponse.RegionStatus"(name, key, offset, byte_size)
+PB.default_values(::Type{var"SystemSharedMemoryStatusResponse.RegionStatus"}) = (; name = "", key = "", offset = zero(UInt64), byte_size = zero(UInt64))
+PB.field_numbers(::Type{var"SystemSharedMemoryStatusResponse.RegionStatus"}) = (; name = 1, key = 2, offset = 3, byte_size = 4)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:var"SystemSharedMemoryStatusResponse.RegionStatus"}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:var"SystemSharedMemoryStatusResponse.RegionStatus"}, _endpos::Int = 0, _group::Bool = false)
     name = ""
     key = ""
     offset = zero(UInt64)
@@ -591,11 +591,11 @@ struct var"RepositoryIndexResponse.ModelIndex"
     state::String
     reason::String
 end
-var"RepositoryIndexResponse.ModelIndex"(;name = "", version = "", state = "", reason = "") = var"RepositoryIndexResponse.ModelIndex"(name, version, state, reason)
-PB.default_values(::Type{var"RepositoryIndexResponse.ModelIndex"}) = (;name = "", version = "", state = "", reason = "")
-PB.field_numbers(::Type{var"RepositoryIndexResponse.ModelIndex"}) = (;name = 1, version = 2, state = 3, reason = 4)
+var"RepositoryIndexResponse.ModelIndex"(; name = "", version = "", state = "", reason = "") = var"RepositoryIndexResponse.ModelIndex"(name, version, state, reason)
+PB.default_values(::Type{var"RepositoryIndexResponse.ModelIndex"}) = (; name = "", version = "", state = "", reason = "")
+PB.field_numbers(::Type{var"RepositoryIndexResponse.ModelIndex"}) = (; name = 1, version = 2, state = 3, reason = 4)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:var"RepositoryIndexResponse.ModelIndex"}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:var"RepositoryIndexResponse.ModelIndex"}, _endpos::Int = 0, _group::Bool = false)
     name = ""
     version = ""
     state = ""
@@ -636,7 +636,7 @@ end
 
 struct ServerLiveRequest end
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ServerLiveRequest}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ServerLiveRequest}, _endpos::Int = 0, _group::Bool = false)
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         Base.skip(d, wire_type)
@@ -656,11 +656,11 @@ end
 struct ServerReadyResponse
     ready::Bool
 end
-ServerReadyResponse(;ready = false) = ServerReadyResponse(ready)
-PB.default_values(::Type{ServerReadyResponse}) = (;ready = false)
-PB.field_numbers(::Type{ServerReadyResponse}) = (;ready = 1)
+ServerReadyResponse(; ready = false) = ServerReadyResponse(ready)
+PB.default_values(::Type{ServerReadyResponse}) = (; ready = false)
+PB.field_numbers(::Type{ServerReadyResponse}) = (; ready = 1)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ServerReadyResponse}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ServerReadyResponse}, _endpos::Int = 0, _group::Bool = false)
     ready = false
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
@@ -686,7 +686,7 @@ end
 
 struct ServerMetadataRequest end
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ServerMetadataRequest}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ServerMetadataRequest}, _endpos::Int = 0, _group::Bool = false)
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         Base.skip(d, wire_type)
@@ -705,7 +705,7 @@ end
 
 struct SystemSharedMemoryRegisterResponse end
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SystemSharedMemoryRegisterResponse}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SystemSharedMemoryRegisterResponse}, _endpos::Int = 0, _group::Bool = false)
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         Base.skip(d, wire_type)
@@ -727,11 +727,11 @@ struct ServerMetadataResponse
     version::String
     extensions::Vector{String}
 end
-ServerMetadataResponse(;name = "", version = "", extensions = Vector{String}()) = ServerMetadataResponse(name, version, extensions)
-PB.default_values(::Type{ServerMetadataResponse}) = (;name = "", version = "", extensions = Vector{String}())
-PB.field_numbers(::Type{ServerMetadataResponse}) = (;name = 1, version = 2, extensions = 3)
+ServerMetadataResponse(; name = "", version = "", extensions = Vector{String}()) = ServerMetadataResponse(name, version, extensions)
+PB.default_values(::Type{ServerMetadataResponse}) = (; name = "", version = "", extensions = Vector{String}())
+PB.field_numbers(::Type{ServerMetadataResponse}) = (; name = 1, version = 2, extensions = 3)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ServerMetadataResponse}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ServerMetadataResponse}, _endpos::Int = 0, _group::Bool = false)
     name = ""
     version = ""
     extensions = PB.BufferedVector{String}()
@@ -769,11 +769,11 @@ struct ModelReadyRequest
     name::String
     version::String
 end
-ModelReadyRequest(;name = "", version = "") = ModelReadyRequest(name, version)
-PB.default_values(::Type{ModelReadyRequest}) = (;name = "", version = "")
-PB.field_numbers(::Type{ModelReadyRequest}) = (;name = 1, version = 2)
+ModelReadyRequest(; name = "", version = "") = ModelReadyRequest(name, version)
+PB.default_values(::Type{ModelReadyRequest}) = (; name = "", version = "")
+PB.field_numbers(::Type{ModelReadyRequest}) = (; name = 1, version = 2)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelReadyRequest}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelReadyRequest}, _endpos::Int = 0, _group::Bool = false)
     name = ""
     version = ""
     while !PB.message_done(d, _endpos, _group)
@@ -809,11 +809,11 @@ struct ModelMetadataResponse
     inputs::Vector{var"ModelMetadataResponse.TensorMetadata"}
     outputs::Vector{var"ModelMetadataResponse.TensorMetadata"}
 end
-ModelMetadataResponse(;name = "", versions = Vector{String}(), platform = "", inputs = Vector{var"ModelMetadataResponse.TensorMetadata"}(), outputs = Vector{var"ModelMetadataResponse.TensorMetadata"}()) = ModelMetadataResponse(name, versions, platform, inputs, outputs)
-PB.default_values(::Type{ModelMetadataResponse}) = (;name = "", versions = Vector{String}(), platform = "", inputs = Vector{var"ModelMetadataResponse.TensorMetadata"}(), outputs = Vector{var"ModelMetadataResponse.TensorMetadata"}())
-PB.field_numbers(::Type{ModelMetadataResponse}) = (;name = 1, versions = 2, platform = 3, inputs = 4, outputs = 5)
+ModelMetadataResponse(; name = "", versions = Vector{String}(), platform = "", inputs = Vector{var"ModelMetadataResponse.TensorMetadata"}(), outputs = Vector{var"ModelMetadataResponse.TensorMetadata"}()) = ModelMetadataResponse(name, versions, platform, inputs, outputs)
+PB.default_values(::Type{ModelMetadataResponse}) = (; name = "", versions = Vector{String}(), platform = "", inputs = Vector{var"ModelMetadataResponse.TensorMetadata"}(), outputs = Vector{var"ModelMetadataResponse.TensorMetadata"}())
+PB.field_numbers(::Type{ModelMetadataResponse}) = (; name = 1, versions = 2, platform = 3, inputs = 4, outputs = 5)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelMetadataResponse}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelMetadataResponse}, _endpos::Int = 0, _group::Bool = false)
     name = ""
     versions = PB.BufferedVector{String}()
     platform = ""
@@ -859,15 +859,15 @@ end
 
 struct var"ModelInferRequest.InferRequestedOutputTensor"
     name::String
-    parameters::Dict{String,InferParameter}
+    parameters::Dict{String, InferParameter}
 end
-var"ModelInferRequest.InferRequestedOutputTensor"(;name = "", parameters = Dict{String,InferParameter}()) = var"ModelInferRequest.InferRequestedOutputTensor"(name, parameters)
-PB.default_values(::Type{var"ModelInferRequest.InferRequestedOutputTensor"}) = (;name = "", parameters = Dict{String,InferParameter}())
-PB.field_numbers(::Type{var"ModelInferRequest.InferRequestedOutputTensor"}) = (;name = 1, parameters = 2)
+var"ModelInferRequest.InferRequestedOutputTensor"(; name = "", parameters = Dict{String, InferParameter}()) = var"ModelInferRequest.InferRequestedOutputTensor"(name, parameters)
+PB.default_values(::Type{var"ModelInferRequest.InferRequestedOutputTensor"}) = (; name = "", parameters = Dict{String, InferParameter}())
+PB.field_numbers(::Type{var"ModelInferRequest.InferRequestedOutputTensor"}) = (; name = 1, parameters = 2)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:var"ModelInferRequest.InferRequestedOutputTensor"}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:var"ModelInferRequest.InferRequestedOutputTensor"}, _endpos::Int = 0, _group::Bool = false)
     name = ""
-    parameters = Dict{String,InferParameter}()
+    parameters = Dict{String, InferParameter}()
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         if field_number == 1
@@ -898,19 +898,19 @@ struct var"ModelInferRequest.InferInputTensor"
     name::String
     datatype::String
     shape::Vector{Int64}
-    parameters::Dict{String,InferParameter}
-    contents::Union{Nothing,InferTensorContents}
+    parameters::Dict{String, InferParameter}
+    contents::Union{Nothing, InferTensorContents}
 end
-var"ModelInferRequest.InferInputTensor"(;name = "", datatype = "", shape = Vector{Int64}(), parameters = Dict{String,InferParameter}(), contents = nothing) = var"ModelInferRequest.InferInputTensor"(name, datatype, shape, parameters, contents)
-PB.default_values(::Type{var"ModelInferRequest.InferInputTensor"}) = (;name = "", datatype = "", shape = Vector{Int64}(), parameters = Dict{String,InferParameter}(), contents = nothing)
-PB.field_numbers(::Type{var"ModelInferRequest.InferInputTensor"}) = (;name = 1, datatype = 2, shape = 3, parameters = 4, contents = 5)
+var"ModelInferRequest.InferInputTensor"(; name = "", datatype = "", shape = Vector{Int64}(), parameters = Dict{String, InferParameter}(), contents = nothing) = var"ModelInferRequest.InferInputTensor"(name, datatype, shape, parameters, contents)
+PB.default_values(::Type{var"ModelInferRequest.InferInputTensor"}) = (; name = "", datatype = "", shape = Vector{Int64}(), parameters = Dict{String, InferParameter}(), contents = nothing)
+PB.field_numbers(::Type{var"ModelInferRequest.InferInputTensor"}) = (; name = 1, datatype = 2, shape = 3, parameters = 4, contents = 5)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:var"ModelInferRequest.InferInputTensor"}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:var"ModelInferRequest.InferInputTensor"}, _endpos::Int = 0, _group::Bool = false)
     name = ""
     datatype = ""
     shape = PB.BufferedVector{Int64}()
-    parameters = Dict{String,InferParameter}()
-    contents = Ref{Union{Nothing,InferTensorContents}}(nothing)
+    parameters = Dict{String, InferParameter}()
+    contents = Ref{Union{Nothing, InferTensorContents}}(nothing)
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         if field_number == 1
@@ -953,19 +953,19 @@ struct var"ModelInferResponse.InferOutputTensor"
     name::String
     datatype::String
     shape::Vector{Int64}
-    parameters::Dict{String,InferParameter}
-    contents::Union{Nothing,InferTensorContents}
+    parameters::Dict{String, InferParameter}
+    contents::Union{Nothing, InferTensorContents}
 end
-var"ModelInferResponse.InferOutputTensor"(;name = "", datatype = "", shape = Vector{Int64}(), parameters = Dict{String,InferParameter}(), contents = nothing) = var"ModelInferResponse.InferOutputTensor"(name, datatype, shape, parameters, contents)
-PB.default_values(::Type{var"ModelInferResponse.InferOutputTensor"}) = (;name = "", datatype = "", shape = Vector{Int64}(), parameters = Dict{String,InferParameter}(), contents = nothing)
-PB.field_numbers(::Type{var"ModelInferResponse.InferOutputTensor"}) = (;name = 1, datatype = 2, shape = 3, parameters = 4, contents = 5)
+var"ModelInferResponse.InferOutputTensor"(; name = "", datatype = "", shape = Vector{Int64}(), parameters = Dict{String, InferParameter}(), contents = nothing) = var"ModelInferResponse.InferOutputTensor"(name, datatype, shape, parameters, contents)
+PB.default_values(::Type{var"ModelInferResponse.InferOutputTensor"}) = (; name = "", datatype = "", shape = Vector{Int64}(), parameters = Dict{String, InferParameter}(), contents = nothing)
+PB.field_numbers(::Type{var"ModelInferResponse.InferOutputTensor"}) = (; name = 1, datatype = 2, shape = 3, parameters = 4, contents = 5)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:var"ModelInferResponse.InferOutputTensor"}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:var"ModelInferResponse.InferOutputTensor"}, _endpos::Int = 0, _group::Bool = false)
     name = ""
     datatype = ""
     shape = PB.BufferedVector{Int64}()
-    parameters = Dict{String,InferParameter}()
-    contents = Ref{Union{Nothing,InferTensorContents}}(nothing)
+    parameters = Dict{String, InferParameter}()
+    contents = Ref{Union{Nothing, InferTensorContents}}(nothing)
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         if field_number == 1
@@ -1005,14 +1005,14 @@ function PB._encoded_size(x::var"ModelInferResponse.InferOutputTensor")
 end
 
 struct SystemSharedMemoryStatusResponse
-    regions::Dict{String,var"SystemSharedMemoryStatusResponse.RegionStatus"}
+    regions::Dict{String, var"SystemSharedMemoryStatusResponse.RegionStatus"}
 end
-SystemSharedMemoryStatusResponse(;regions = Dict{String,var"SystemSharedMemoryStatusResponse.RegionStatus"}()) = SystemSharedMemoryStatusResponse(regions)
-PB.default_values(::Type{SystemSharedMemoryStatusResponse}) = (;regions = Dict{String,var"SystemSharedMemoryStatusResponse.RegionStatus"}())
-PB.field_numbers(::Type{SystemSharedMemoryStatusResponse}) = (;regions = 1)
+SystemSharedMemoryStatusResponse(; regions = Dict{String, var"SystemSharedMemoryStatusResponse.RegionStatus"}()) = SystemSharedMemoryStatusResponse(regions)
+PB.default_values(::Type{SystemSharedMemoryStatusResponse}) = (; regions = Dict{String, var"SystemSharedMemoryStatusResponse.RegionStatus"}())
+PB.field_numbers(::Type{SystemSharedMemoryStatusResponse}) = (; regions = 1)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SystemSharedMemoryStatusResponse}, _endpos::Int=0, _group::Bool=false)
-    regions = Dict{String,var"SystemSharedMemoryStatusResponse.RegionStatus"}()
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SystemSharedMemoryStatusResponse}, _endpos::Int = 0, _group::Bool = false)
+    regions = Dict{String, var"SystemSharedMemoryStatusResponse.RegionStatus"}()
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         if field_number == 1
@@ -1038,11 +1038,11 @@ end
 struct RepositoryIndexResponse
     models::Vector{var"RepositoryIndexResponse.ModelIndex"}
 end
-RepositoryIndexResponse(;models = Vector{var"RepositoryIndexResponse.ModelIndex"}()) = RepositoryIndexResponse(models)
-PB.default_values(::Type{RepositoryIndexResponse}) = (;models = Vector{var"RepositoryIndexResponse.ModelIndex"}())
-PB.field_numbers(::Type{RepositoryIndexResponse}) = (;models = 1)
+RepositoryIndexResponse(; models = Vector{var"RepositoryIndexResponse.ModelIndex"}()) = RepositoryIndexResponse(models)
+PB.default_values(::Type{RepositoryIndexResponse}) = (; models = Vector{var"RepositoryIndexResponse.ModelIndex"}())
+PB.field_numbers(::Type{RepositoryIndexResponse}) = (; models = 1)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:RepositoryIndexResponse}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:RepositoryIndexResponse}, _endpos::Int = 0, _group::Bool = false)
     models = PB.BufferedVector{var"RepositoryIndexResponse.ModelIndex"}()
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
@@ -1070,20 +1070,20 @@ struct ModelInferRequest
     model_name::String
     model_version::String
     id::String
-    parameters::Dict{String,InferParameter}
+    parameters::Dict{String, InferParameter}
     inputs::Vector{var"ModelInferRequest.InferInputTensor"}
     outputs::Vector{var"ModelInferRequest.InferRequestedOutputTensor"}
     raw_input_contents::Vector{Vector{UInt8}}
 end
-ModelInferRequest(;model_name = "", model_version = "", id = "", parameters = Dict{String,InferParameter}(), inputs = Vector{var"ModelInferRequest.InferInputTensor"}(), outputs = Vector{var"ModelInferRequest.InferRequestedOutputTensor"}(), raw_input_contents = Vector{Vector{UInt8}}()) = ModelInferRequest(model_name, model_version, id, parameters, inputs, outputs, raw_input_contents)
-PB.default_values(::Type{ModelInferRequest}) = (;model_name = "", model_version = "", id = "", parameters = Dict{String,InferParameter}(), inputs = Vector{var"ModelInferRequest.InferInputTensor"}(), outputs = Vector{var"ModelInferRequest.InferRequestedOutputTensor"}(), raw_input_contents = Vector{Vector{UInt8}}())
-PB.field_numbers(::Type{ModelInferRequest}) = (;model_name = 1, model_version = 2, id = 3, parameters = 4, inputs = 5, outputs = 6, raw_input_contents = 7)
+ModelInferRequest(; model_name = "", model_version = "", id = "", parameters = Dict{String, InferParameter}(), inputs = Vector{var"ModelInferRequest.InferInputTensor"}(), outputs = Vector{var"ModelInferRequest.InferRequestedOutputTensor"}(), raw_input_contents = Vector{Vector{UInt8}}()) = ModelInferRequest(model_name, model_version, id, parameters, inputs, outputs, raw_input_contents)
+PB.default_values(::Type{ModelInferRequest}) = (; model_name = "", model_version = "", id = "", parameters = Dict{String, InferParameter}(), inputs = Vector{var"ModelInferRequest.InferInputTensor"}(), outputs = Vector{var"ModelInferRequest.InferRequestedOutputTensor"}(), raw_input_contents = Vector{Vector{UInt8}}())
+PB.field_numbers(::Type{ModelInferRequest}) = (; model_name = 1, model_version = 2, id = 3, parameters = 4, inputs = 5, outputs = 6, raw_input_contents = 7)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelInferRequest}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelInferRequest}, _endpos::Int = 0, _group::Bool = false)
     model_name = ""
     model_version = ""
     id = ""
-    parameters = Dict{String,InferParameter}()
+    parameters = Dict{String, InferParameter}()
     inputs = PB.BufferedVector{var"ModelInferRequest.InferInputTensor"}()
     outputs = PB.BufferedVector{var"ModelInferRequest.InferRequestedOutputTensor"}()
     raw_input_contents = PB.BufferedVector{Vector{UInt8}}()
@@ -1137,19 +1137,19 @@ struct ModelInferResponse
     model_name::String
     model_version::String
     id::String
-    parameters::Dict{String,InferParameter}
+    parameters::Dict{String, InferParameter}
     outputs::Vector{var"ModelInferResponse.InferOutputTensor"}
     raw_output_contents::Vector{Vector{UInt8}}
 end
-ModelInferResponse(;model_name = "", model_version = "", id = "", parameters = Dict{String,InferParameter}(), outputs = Vector{var"ModelInferResponse.InferOutputTensor"}(), raw_output_contents = Vector{Vector{UInt8}}()) = ModelInferResponse(model_name, model_version, id, parameters, outputs, raw_output_contents)
-PB.default_values(::Type{ModelInferResponse}) = (;model_name = "", model_version = "", id = "", parameters = Dict{String,InferParameter}(), outputs = Vector{var"ModelInferResponse.InferOutputTensor"}(), raw_output_contents = Vector{Vector{UInt8}}())
-PB.field_numbers(::Type{ModelInferResponse}) = (;model_name = 1, model_version = 2, id = 3, parameters = 4, outputs = 5, raw_output_contents = 6)
+ModelInferResponse(; model_name = "", model_version = "", id = "", parameters = Dict{String, InferParameter}(), outputs = Vector{var"ModelInferResponse.InferOutputTensor"}(), raw_output_contents = Vector{Vector{UInt8}}()) = ModelInferResponse(model_name, model_version, id, parameters, outputs, raw_output_contents)
+PB.default_values(::Type{ModelInferResponse}) = (; model_name = "", model_version = "", id = "", parameters = Dict{String, InferParameter}(), outputs = Vector{var"ModelInferResponse.InferOutputTensor"}(), raw_output_contents = Vector{Vector{UInt8}}())
+PB.field_numbers(::Type{ModelInferResponse}) = (; model_name = 1, model_version = 2, id = 3, parameters = 4, outputs = 5, raw_output_contents = 6)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelInferResponse}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelInferResponse}, _endpos::Int = 0, _group::Bool = false)
     model_name = ""
     model_version = ""
     id = ""
-    parameters = Dict{String,InferParameter}()
+    parameters = Dict{String, InferParameter}()
     outputs = PB.BufferedVector{var"ModelInferResponse.InferOutputTensor"}()
     raw_output_contents = PB.BufferedVector{Vector{UInt8}}()
     while !PB.message_done(d, _endpos, _group)
@@ -1193,4 +1193,3 @@ function PB._encoded_size(x::ModelInferResponse)
     !isempty(x.raw_output_contents) && (encoded_size += PB._encoded_size(x.raw_output_contents, 6))
     return encoded_size
 end
-

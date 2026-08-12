@@ -29,7 +29,9 @@ else
       }
     }
     """
-    write_bundle(MODELS_DIR, "scale4"; manifest_yaml = manifest, mlir_text = mlir,
-        weights = Dict("w" => Float32[2, 2, 2, 2]), argument_order = ["w"])
+    write_bundle(
+        MODELS_DIR, "scale4"; manifest_yaml = manifest, mlir_text = mlir,
+        weights = Dict("w" => Float32[2, 2, 2, 2]), argument_order = ["w"]
+    )
     @info "wrote scale4 bundle" dir = BUNDLE
 end

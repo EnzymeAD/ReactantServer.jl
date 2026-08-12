@@ -37,21 +37,21 @@ end
 # `shape` is the Julia column-major shape of the chunk's input (batch axis last). It is reversed
 # to the network's row-major order only when the wire tensor is materialized.
 function InferInput(
-    name::String,
-    sub::PoolSlot,
-    shape::AbstractVector{<:Integer},
-    ::Type{T},
-) where {T<:TritonType}
-    PoolInferInput(name, sub, Int.(shape), T)
+        name::String,
+        sub::PoolSlot,
+        shape::AbstractVector{<:Integer},
+        ::Type{T},
+    ) where {T <: TritonType}
+    return PoolInferInput(name, sub, Int.(shape), T)
 end
 
 # Convenience: derive dtype and the Julia column-major shape from a pool view.
 function InferInput(
-    name::String,
-    sub::PoolSlot,
-    view::AbstractArray{T},
-) where {T<:TritonType}
-    PoolInferInput(name, sub, collect(Int, size(view)), T)
+        name::String,
+        sub::PoolSlot,
+        view::AbstractArray{T},
+    ) where {T <: TritonType}
+    return PoolInferInput(name, sub, collect(Int, size(view)), T)
 end
 
 # Per-IO total bytes per item across every input.
@@ -108,12 +108,12 @@ item_output_bytes(io::AbstractInferenceIO) =
 # ---- Materialize PoolInferInput descriptors against a model + pool. ----
 
 function materialize_input(
-    d::PoolInferInput,
-    model::AbstractInferenceModel,
-    pool::InferenceBufferPool,
-)
+        d::PoolInferInput,
+        model::AbstractInferenceModel,
+        pool::InferenceBufferPool,
+    )
     n_bytes = sizeof(d.dtype) * prod(d.shape)
-    if is_shm_backed(pool)
+    return if is_shm_backed(pool)
         var"ModelInferRequest.InferInputTensor"(
             name = d.name,
             datatype = KSERVE_OUTPUT_DTYPE_TABLE_REVERSE[d.dtype],
@@ -137,7 +137,7 @@ function materialize_input(
 end
 
 function _materialize_inputs(inputs, model, pool::InferenceBufferPool)
-    [materialize_input(d, model, pool) for d in inputs]
+    return [materialize_input(d, model, pool) for d in inputs]
 end
 
 # `infer_encode_chunk!` may return a single `PoolInferInput` (e.g. straight from the scalar
@@ -217,8 +217,8 @@ function _chunk_geometry(io::AbstractInferenceIO, m::AbstractInferenceModel, poo
     span = cld(per_item, slot_bytes(pool))
     span <= n_slots(pool) || error(
         "one item needs $per_item bytes ($ipb input + $opb output), i.e. $span slots of " *
-        "$(slot_bytes(pool)) bytes, but the pool has only $(n_slots(pool)) slots " *
-        "($(sizeof(pool)) bytes total); increase pool_bytes on kserve_init",
+            "$(slot_bytes(pool)) bytes, but the pool has only $(n_slots(pool)) slots " *
+            "($(sizeof(pool)) bytes total); increase pool_bytes on kserve_init",
     )
     chunk = min(max_batch_size(m), (span * slot_bytes(pool)) ÷ per_item)
     return chunk, span
@@ -238,7 +238,7 @@ disjoint slot, so this is safe to call from multiple threads against one model. 
 delivered through `io`'s `infer_decode_chunk!`. Use [`infer_sync`](@ref) for serial dispatch.
 """
 function infer_async(m::AbstractInferenceModel, io::AbstractInferenceIO)
-    _infer_pool_driven(m, io; force_serial = false)
+    return _infer_pool_driven(m, io; force_serial = false)
 end
 
 # Request-level KV params carrying this model's per-request budget as a RELATIVE remaining timeout.
@@ -249,11 +249,11 @@ end
 # in-body KV param is what survives the hop. Models without a deadline send an empty map (no change).
 _request_deadline_params(::AbstractInferenceModel) = deadline_params(0)
 _request_deadline_params(m::KServeModel) =
-    deadline_params(deadline(m) > 0 ? round(Int64, deadline(m) * 1e9) : 0)
+    deadline_params(deadline(m) > 0 ? round(Int64, deadline(m) * 1.0e9) : 0)
 # Per-attempt variant: carry an explicit remaining budget (seconds) rather than the model's full
 # deadline, so each retry admits against what is actually left of the original budget.
 _request_deadline_params(budget_s::Real) =
-    deadline_params(budget_s > 0 ? round(Int64, budget_s * 1e9) : 0)
+    deadline_params(budget_s > 0 ? round(Int64, budget_s * 1.0e9) : 0)
 
 # A stale shared-memory registration: the server no longer knows the region our request references,
 # because it restarted (or otherwise dropped its registry) since we registered. The worker maps it to
@@ -337,6 +337,7 @@ function _infer_with_retry(attempt, m::AbstractInferenceModel)
             backoff *= p.factor
         end
     end
+    return
 end
 
 """
@@ -349,14 +350,14 @@ tensors built with [`InferInput`](@ref), sent inline in a single `ModelInferRequ
 decoded `ModelInferResponse` is returned for reading with [`InferOutput`](@ref).
 """
 function infer_sync(m::AbstractInferenceModel, io::AbstractInferenceIO)
-    _infer_pool_driven(m, io; force_serial = true)
+    return _infer_pool_driven(m, io; force_serial = true)
 end
 
 function _infer_pool_driven(
-    m::AbstractInferenceModel,
-    io::AbstractInferenceIO;
-    force_serial::Bool,
-)
+        m::AbstractInferenceModel,
+        io::AbstractInferenceIO;
+        force_serial::Bool,
+    )
     # Transport is decided up front by get_or_create_pool! (an IsSameIPCNamespace probe for a
     # KServeModel). A stale shared-memory registration self-heals in _send_with_shm_recovery (one
     # re-register + retry, keeping SHM). Only if that fails does the batch surface a
@@ -373,7 +374,7 @@ function _infer_pool_driven(
         # fails the batch wholesale anyway.
         _drive_pool_inference(m, io, inline; force_serial = force_serial)
     end
-    nothing
+    return nothing
 end
 
 # Read the int64 `shared_memory_byte_size` parameter the server stamps on an SHM-backed output
@@ -399,7 +400,7 @@ end
 # inline pools). The slot's cursor is driver-local, so this runs outside `fill_lock`.
 function _build_requested_outputs(specs, slot, r, pool)
     requested = var"ModelInferRequest.InferRequestedOutputTensor"[]
-    subslots = Dict{String,PoolSlot}()
+    subslots = Dict{String, PoolSlot}()
     isempty(specs) && return requested, subslots
 
     n = length(r)
@@ -478,11 +479,13 @@ end
 # request, handle the response, and always return the slot to the pool. `infer_encode_chunk!` is
 # serialized by `fill_lock` because concrete IOs commonly read from shared source state.
 function _run_chunk(m, io, pool, fill_lock, r, slot)
-    try
+    return try
         reset_slot!(slot)
-        inputs = _encoded_inputs(lock(fill_lock) do
-            infer_encode_chunk!(io, r, slot)
-        end)
+        inputs = _encoded_inputs(
+            lock(fill_lock) do
+                infer_encode_chunk!(io, r, slot)
+            end
+        )
         # Output subslots are carved from the same slot, after the inputs, so a request can stage
         # both through one registered region. Outputs are read back before the slot is released.
         requested, out_subslots = _build_requested_outputs(output_specs(io), slot, r, pool)
@@ -509,11 +512,11 @@ function _run_chunk(m, io, pool, fill_lock, r, slot)
 end
 
 function _drive_pool_inference(
-    m::AbstractInferenceModel,
-    io::AbstractInferenceIO,
-    pool::InferenceBufferPool;
-    force_serial::Bool,
-)
+        m::AbstractInferenceModel,
+        io::AbstractInferenceIO,
+        pool::InferenceBufferPool;
+        force_serial::Bool,
+    )
     chunk, span = _chunk_geometry(io, m, pool)
     fill_lock = ReentrantLock()
 
@@ -555,11 +558,11 @@ function _drive_pool_inference(
 
     foreach(wait, tasks)
     err[] === nothing || throw(err[])
-    nothing
+    return nothing
 end
 
 function infer_sync(m::AbstractInferenceModel, network_inputs)
-    _infer_with_retry(m) do budget_s
+    return _infer_with_retry(m) do budget_s
         grpc_sync_request(
             grpc_infer_client(m, budget_s),
             ModelInferRequest(
@@ -573,7 +576,7 @@ end
 
 
 function InferInput(name::String, shape, contents::AbstractVector{UInt8})
-    var"ModelInferRequest.InferInputTensor"(
+    return var"ModelInferRequest.InferInputTensor"(
         name = name,
         datatype = "UINT8",
         shape = reverse(shape),
@@ -582,7 +585,7 @@ function InferInput(name::String, shape, contents::AbstractVector{UInt8})
 end
 
 function InferInput(name::String, shape, contents::AbstractVector{UInt16})
-    var"ModelInferRequest.InferInputTensor"(
+    return var"ModelInferRequest.InferInputTensor"(
         name = name,
         datatype = "UINT16",
         shape = reverse(shape),
@@ -591,7 +594,7 @@ function InferInput(name::String, shape, contents::AbstractVector{UInt16})
 end
 
 function InferInput(name::String, shape, contents::AbstractVector{UInt32})
-    var"ModelInferRequest.InferInputTensor"(
+    return var"ModelInferRequest.InferInputTensor"(
         name = name,
         datatype = "UINT32",
         shape = reverse(shape),
@@ -600,7 +603,7 @@ function InferInput(name::String, shape, contents::AbstractVector{UInt32})
 end
 
 function InferInput(name::String, shape, contents::AbstractVector{UInt64})
-    var"ModelInferRequest.InferInputTensor"(
+    return var"ModelInferRequest.InferInputTensor"(
         name = name,
         datatype = "UINT64",
         shape = reverse(shape),
@@ -609,7 +612,7 @@ function InferInput(name::String, shape, contents::AbstractVector{UInt64})
 end
 
 function InferInput(name::String, shape, contents::AbstractVector{Int8})
-    var"ModelInferRequest.InferInputTensor"(
+    return var"ModelInferRequest.InferInputTensor"(
         name = name,
         datatype = "INT8",
         shape = reverse(shape),
@@ -618,7 +621,7 @@ function InferInput(name::String, shape, contents::AbstractVector{Int8})
 end
 
 function InferInput(name::String, shape, contents::AbstractVector{Int16})
-    var"ModelInferRequest.InferInputTensor"(
+    return var"ModelInferRequest.InferInputTensor"(
         name = name,
         datatype = "INT16",
         shape = reverse(shape),
@@ -627,7 +630,7 @@ function InferInput(name::String, shape, contents::AbstractVector{Int16})
 end
 
 function InferInput(name::String, shape, contents::AbstractVector{Int32})
-    var"ModelInferRequest.InferInputTensor"(
+    return var"ModelInferRequest.InferInputTensor"(
         name = name,
         datatype = "INT32",
         shape = reverse(shape),
@@ -636,7 +639,7 @@ function InferInput(name::String, shape, contents::AbstractVector{Int32})
 end
 
 function InferInput(name::String, shape, contents::AbstractVector{Int64})
-    var"ModelInferRequest.InferInputTensor"(
+    return var"ModelInferRequest.InferInputTensor"(
         name = name,
         datatype = "INT64",
         shape = reverse(shape),
@@ -646,7 +649,7 @@ end
 
 
 function InferInput(name::String, shape, contents::AbstractVector{Float32})
-    var"ModelInferRequest.InferInputTensor"(
+    return var"ModelInferRequest.InferInputTensor"(
         name = name,
         datatype = "FP32",
         shape = reverse(shape),
@@ -655,7 +658,7 @@ function InferInput(name::String, shape, contents::AbstractVector{Float32})
 end
 
 function InferInput(name::String, shape, contents::AbstractVector{Float64})
-    var"ModelInferRequest.InferInputTensor"(
+    return var"ModelInferRequest.InferInputTensor"(
         name = name,
         datatype = "FP64",
         shape = reverse(shape),
@@ -664,7 +667,7 @@ function InferInput(name::String, shape, contents::AbstractVector{Float64})
 end
 
 function InferInput(name::String, shape, contents::AbstractVector{Bool})
-    var"ModelInferRequest.InferInputTensor"(
+    return var"ModelInferRequest.InferInputTensor"(
         name = name,
         datatype = "BOOL",
         shape = reverse(shape),
@@ -681,8 +684,8 @@ network's row-major `(N, …, H, W)` internally (the bytes are unchanged). Pass 
 the one-shot [`infer_sync`](@ref)`(model, inputs)`. Variants taking an explicit Julia column-major
 `shape` and a typed `contents` vector are also provided.
 """
-function InferInput(name::String, inp::AbstractArray{T}) where {T<:TritonType}
-    InferInput(name, collect(size(inp)), vec(inp))
+function InferInput(name::String, inp::AbstractArray{T}) where {T <: TritonType}
+    return InferInput(name, collect(size(inp)), vec(inp))
 end
 
 """
@@ -695,10 +698,10 @@ element type as `dtype` for a type-stable result; the two-argument form reads th
 response metadata.
 """
 function InferOutput(
-    name::String,
-    response::ModelInferResponse,
-    dtype::Type{T},
-) where {T<:TritonType}
+        name::String,
+        response::ModelInferResponse,
+        dtype::Type{T},
+    ) where {T <: TritonType}
     # type stable version
     for (i, output) in enumerate(response.outputs)
         output.name == name || continue

@@ -27,11 +27,13 @@ function stablehlo_artifact(text::AbstractString)
 end
 
 # Write a complete bundle directory and return its path.
-function write_bundle(root::AbstractString, name::AbstractString;
-                      manifest_yaml::AbstractString,
-                      mlir_text::AbstractString,
-                      weights::AbstractDict{String,<:AbstractArray}=Dict{String,Array}(),
-                      argument_order::Vector{String}=String[])
+function write_bundle(
+        root::AbstractString, name::AbstractString;
+        manifest_yaml::AbstractString,
+        mlir_text::AbstractString,
+        weights::AbstractDict{String, <:AbstractArray} = Dict{String, Array}(),
+        argument_order::Vector{String} = String[]
+    )
     dir = joinpath(root, name)
     mkpath(dir)
     write(joinpath(dir, "manifest.yaml"), manifest_yaml)

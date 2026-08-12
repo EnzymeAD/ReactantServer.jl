@@ -48,11 +48,11 @@ ModelRoutingMeta() = ModelRoutingMeta(0, "", 0, 0.0, 0.0)
 # for a model with no measurement yet so a cold model weighs like an average one rather than
 # vanishing (weight 0, attracting every request) or dominating.
 struct RoutingMetaSnapshot
-    models::Dict{String,ModelRoutingMeta}
+    models::Dict{String, ModelRoutingMeta}
     mean_cost_per_item::Float64
 end
 
-RoutingMetaSnapshot() = RoutingMetaSnapshot(Dict{String,ModelRoutingMeta}(), 0.0)
+RoutingMetaSnapshot() = RoutingMetaSnapshot(Dict{String, ModelRoutingMeta}(), 0.0)
 
 """
     RoutingMeta(halflife_compute_seconds)
@@ -71,21 +71,25 @@ mutable struct RoutingMeta
     halflife::Float64                                    # in fleet GPU-seconds
     # Prober-task-owned: EWMA state and the cumulative baselines the per-tick deltas are taken
     # against. Never touched from a request task, so plain fields are correct.
-    cost_req::Dict{String,Float64}
-    cost_item::Dict{String,Float64}
-    last_cum::Dict{String,Tuple{Float64,UInt64,UInt64}}  # model -> (compute, requests, rows)
+    cost_req::Dict{String, Float64}
+    cost_item::Dict{String, Float64}
+    last_cum::Dict{String, Tuple{Float64, UInt64, UInt64}}  # model -> (compute, requests, rows)
     last_fleet_compute::Float64
 end
 
 RoutingMeta(halflife::Real = 30.0) =
-    RoutingMeta(RoutingMetaSnapshot(), Float64(halflife), Dict{String,Float64}(),
-                Dict{String,Float64}(), Dict{String,Tuple{Float64,UInt64,UInt64}}(), 0.0)
+    RoutingMeta(
+    RoutingMetaSnapshot(), Float64(halflife), Dict{String, Float64}(),
+    Dict{String, Float64}(), Dict{String, Tuple{Float64, UInt64, UInt64}}(), 0.0
+)
 
 # The cache sized from gateway.yml. The halflife mirrors `PackingKnobs`: `ema_halflife_compute_seconds`
 # when set, else the rebalance budget, so the two age their cost estimates at the same rate.
 RoutingMeta(cfg::GatewayConfig) =
-    RoutingMeta(cfg.ema_halflife_compute_seconds > 0 ? cfg.ema_halflife_compute_seconds :
-                (cfg.rebalance_compute_seconds > 0 ? cfg.rebalance_compute_seconds : 30.0))
+    RoutingMeta(
+    cfg.ema_halflife_compute_seconds > 0 ? cfg.ema_halflife_compute_seconds :
+        (cfg.rebalance_compute_seconds > 0 ? cfg.rebalance_compute_seconds : 30.0)
+)
 
 """
     routing_meta(rm::RoutingMeta) -> RoutingMetaSnapshot
@@ -138,12 +142,12 @@ end
 # fleet's total cumulative compute (the compute-trigger signal). I/O only; no state mutation, so
 # both this cache and lpt_packing's repack can be driven from one call.
 function poll_workers(pool::ClientPool, ready_urls::Vector{String})
-    sums = Dict{String,Tuple{Float64,UInt64,UInt64}}()   # model -> (compute, requests, rows)
-    permodel_workers = Dict{String,Vector{String}}()
-    mem = Dict{String,Float64}()                 # model -> resident weight bytes
-    mem_cap = Dict{String,Float64}()             # worker -> on-demand weight budget (0 = unconstrained)
-    max_batch = Dict{String,Int}()               # model -> effective max batch (max across workers)
-    batch_at = Dict{String,Tuple{String,Int}}()  # model -> (wire input name, 1-based batch axis)
+    sums = Dict{String, Tuple{Float64, UInt64, UInt64}}()   # model -> (compute, requests, rows)
+    permodel_workers = Dict{String, Vector{String}}()
+    mem = Dict{String, Float64}()                 # model -> resident weight bytes
+    mem_cap = Dict{String, Float64}()             # worker -> on-demand weight budget (0 = unconstrained)
+    max_batch = Dict{String, Int}()               # model -> effective max batch (max across workers)
+    batch_at = Dict{String, Tuple{String, Int}}()  # model -> (wire input name, 1-based batch axis)
     polled = String[]
     lk = ReentrantLock()
     @sync for url in ready_urls
@@ -154,8 +158,10 @@ function poll_workers(pool::ClientPool, ready_urls::Vector{String})
             # it route discovery and /readyz). A worker that does not answer is simply skipped this
             # round, as if not ready. A hung call (timed out, not a fast refuse) means a poisoned
             # connection; drop it so the next poll reconnects fresh.
-            resp, to = _bounded(() -> fetch_control_status(wc), POLL_TIMEOUT_SECONDS, nothing,
-                                "ModelControlStatus poll", url)
+            resp, to = _bounded(
+                () -> fetch_control_status(wc), POLL_TIMEOUT_SECONDS, nothing,
+                "ModelControlStatus poll", url
+            )
             if resp === nothing
                 to && reset_clients!(wc)
                 return
@@ -165,8 +171,10 @@ function poll_workers(pool::ClientPool, ready_urls::Vector{String})
                 mem_cap[url] = Float64(resp.weight_cache_max_bytes)
                 for ms in resp.models
                     tc, rq, rw = get(sums, ms.name, (0.0, UInt64(0), UInt64(0)))
-                    sums[ms.name] = (tc + ms.total_compute_seconds, rq + ms.requests_served,
-                                     rw + ms.rows_served)
+                    sums[ms.name] = (
+                        tc + ms.total_compute_seconds, rq + ms.requests_served,
+                        rw + ms.rows_served,
+                    )
                     mem[ms.name] = max(get(mem, ms.name, 0.0), Float64(ms.weight_nbytes))
                     max_batch[ms.name] = max(get(max_batch, ms.name, 0), Int(ms.max_batch_size))
                     # Every worker serves the same bundle, so the first non-empty report wins; a
@@ -221,7 +229,7 @@ function refresh_routing_meta!(rm::RoutingMeta, poll)
     # Publish. Models come from this poll's `max_batch` (every model any worker reported) unioned with
     # the models we hold a cost for, so a model missing from one round keeps its metadata rather than
     # blinking out of the cache mid-flight.
-    models = Dict{String,ModelRoutingMeta}()
+    models = Dict{String, ModelRoutingMeta}()
     names = union(keys(poll.max_batch), keys(rm.cost_item), keys(rm.cost_req))
     for m in names
         bi, ax = get(poll.batch_at, m, ("", 0))
@@ -232,8 +240,10 @@ function refresh_routing_meta!(rm::RoutingMeta, poll)
             bi = prev.batch_input
             ax = prev.batch_axis
         end
-        models[m] = ModelRoutingMeta(get(poll.max_batch, m, prev.max_batch), bi, ax,
-                                     get(rm.cost_req, m, 0.0), get(rm.cost_item, m, 0.0))
+        models[m] = ModelRoutingMeta(
+            get(poll.max_batch, m, prev.max_batch), bi, ax,
+            get(rm.cost_req, m, 0.0), get(rm.cost_item, m, 0.0)
+        )
     end
     measured = Float64[c for c in (m.cost_per_item for m in values(models)) if c > 0]
     mean_item = isempty(measured) ? 0.0 : sum(measured) / length(measured)

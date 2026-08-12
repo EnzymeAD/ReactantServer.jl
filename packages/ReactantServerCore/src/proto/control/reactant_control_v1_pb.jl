@@ -20,11 +20,11 @@ struct ReplicaPlacement
     outstanding::Int64
     routed_total::Int64
 end
-ReplicaPlacement(;worker = "", weight = zero(Float64), outstanding = zero(Int64), routed_total = zero(Int64)) = ReplicaPlacement(worker, weight, outstanding, routed_total)
-PB.default_values(::Type{ReplicaPlacement}) = (;worker = "", weight = zero(Float64), outstanding = zero(Int64), routed_total = zero(Int64))
-PB.field_numbers(::Type{ReplicaPlacement}) = (;worker = 1, weight = 2, outstanding = 3, routed_total = 4)
+ReplicaPlacement(; worker = "", weight = zero(Float64), outstanding = zero(Int64), routed_total = zero(Int64)) = ReplicaPlacement(worker, weight, outstanding, routed_total)
+PB.default_values(::Type{ReplicaPlacement}) = (; worker = "", weight = zero(Float64), outstanding = zero(Int64), routed_total = zero(Int64))
+PB.field_numbers(::Type{ReplicaPlacement}) = (; worker = 1, weight = 2, outstanding = 3, routed_total = 4)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ReplicaPlacement}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ReplicaPlacement}, _endpos::Int = 0, _group::Bool = false)
     worker = ""
     weight = zero(Float64)
     outstanding = zero(Int64)
@@ -70,11 +70,11 @@ struct SetModelPlacementRequest
     fill_factor::Float64
     allow_unknown_model::Bool
 end
-SetModelPlacementRequest(;name = "", replicas = zero(Int64), fill_mode = "", fill_factor = zero(Float64), allow_unknown_model = false) = SetModelPlacementRequest(name, replicas, fill_mode, fill_factor, allow_unknown_model)
-PB.default_values(::Type{SetModelPlacementRequest}) = (;name = "", replicas = zero(Int64), fill_mode = "", fill_factor = zero(Float64), allow_unknown_model = false)
-PB.field_numbers(::Type{SetModelPlacementRequest}) = (;name = 1, replicas = 2, fill_mode = 3, fill_factor = 4, allow_unknown_model = 5)
+SetModelPlacementRequest(; name = "", replicas = zero(Int64), fill_mode = "", fill_factor = zero(Float64), allow_unknown_model = false) = SetModelPlacementRequest(name, replicas, fill_mode, fill_factor, allow_unknown_model)
+PB.default_values(::Type{SetModelPlacementRequest}) = (; name = "", replicas = zero(Int64), fill_mode = "", fill_factor = zero(Float64), allow_unknown_model = false)
+PB.field_numbers(::Type{SetModelPlacementRequest}) = (; name = 1, replicas = 2, fill_mode = 3, fill_factor = 4, allow_unknown_model = 5)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetModelPlacementRequest}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetModelPlacementRequest}, _endpos::Int = 0, _group::Bool = false)
     name = ""
     replicas = zero(Int64)
     fill_mode = ""
@@ -127,11 +127,11 @@ struct SetModelPlacementResponse
     warnings::Vector{String}
     persisted::Bool
 end
-SetModelPlacementResponse(;name = "", configured_replicas = zero(Int64), effective_replicas = zero(Int64), fill_mode = "", fill_quantum = zero(Int64), warnings = Vector{String}(), persisted = false) = SetModelPlacementResponse(name, configured_replicas, effective_replicas, fill_mode, fill_quantum, warnings, persisted)
-PB.default_values(::Type{SetModelPlacementResponse}) = (;name = "", configured_replicas = zero(Int64), effective_replicas = zero(Int64), fill_mode = "", fill_quantum = zero(Int64), warnings = Vector{String}(), persisted = false)
-PB.field_numbers(::Type{SetModelPlacementResponse}) = (;name = 1, configured_replicas = 2, effective_replicas = 3, fill_mode = 4, fill_quantum = 5, warnings = 6, persisted = 7)
+SetModelPlacementResponse(; name = "", configured_replicas = zero(Int64), effective_replicas = zero(Int64), fill_mode = "", fill_quantum = zero(Int64), warnings = Vector{String}(), persisted = false) = SetModelPlacementResponse(name, configured_replicas, effective_replicas, fill_mode, fill_quantum, warnings, persisted)
+PB.default_values(::Type{SetModelPlacementResponse}) = (; name = "", configured_replicas = zero(Int64), effective_replicas = zero(Int64), fill_mode = "", fill_quantum = zero(Int64), warnings = Vector{String}(), persisted = false)
+PB.field_numbers(::Type{SetModelPlacementResponse}) = (; name = 1, configured_replicas = 2, effective_replicas = 3, fill_mode = 4, fill_quantum = 5, warnings = 6, persisted = 7)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetModelPlacementResponse}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetModelPlacementResponse}, _endpos::Int = 0, _group::Bool = false)
     name = ""
     configured_replicas = zero(Int64)
     effective_replicas = zero(Int64)
@@ -190,11 +190,11 @@ struct SetModelPolicyRequest
     has_weight::Bool
     weight::Float64
 end
-SetModelPolicyRequest(;name = "", has_weight = false, weight = zero(Float64)) = SetModelPolicyRequest(name, has_weight, weight)
-PB.default_values(::Type{SetModelPolicyRequest}) = (;name = "", has_weight = false, weight = zero(Float64))
-PB.field_numbers(::Type{SetModelPolicyRequest}) = (;name = 1, has_weight = 2, weight = 3)
+SetModelPolicyRequest(; name = "", has_weight = false, weight = zero(Float64)) = SetModelPolicyRequest(name, has_weight, weight)
+PB.default_values(::Type{SetModelPolicyRequest}) = (; name = "", has_weight = false, weight = zero(Float64))
+PB.field_numbers(::Type{SetModelPolicyRequest}) = (; name = 1, has_weight = 2, weight = 3)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetModelPolicyRequest}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetModelPolicyRequest}, _endpos::Int = 0, _group::Bool = false)
     name = ""
     has_weight = false
     weight = zero(Float64)
@@ -244,11 +244,11 @@ struct RepackStatus
     operator_repacks_requested::UInt64
     operator_repacks_completed::UInt64
 end
-RepackStatus(;last_repack_unix_seconds = zero(Float64), last_repack_wall_elapsed_seconds = zero(Float64), last_repack_compute_seconds = zero(Float64), last_trigger = "", last_models_placed = zero(Int64), last_models_moved = zero(Int64), repack_count = zero(UInt64), compute_accumulated_seconds = zero(Float64), active_threshold_seconds = zero(Float64), first_tick_repack_done = false, last_tick_unix_seconds = zero(Float64), repacks_since_compaction = zero(Int64), operator_repacks_requested = zero(UInt64), operator_repacks_completed = zero(UInt64)) = RepackStatus(last_repack_unix_seconds, last_repack_wall_elapsed_seconds, last_repack_compute_seconds, last_trigger, last_models_placed, last_models_moved, repack_count, compute_accumulated_seconds, active_threshold_seconds, first_tick_repack_done, last_tick_unix_seconds, repacks_since_compaction, operator_repacks_requested, operator_repacks_completed)
-PB.default_values(::Type{RepackStatus}) = (;last_repack_unix_seconds = zero(Float64), last_repack_wall_elapsed_seconds = zero(Float64), last_repack_compute_seconds = zero(Float64), last_trigger = "", last_models_placed = zero(Int64), last_models_moved = zero(Int64), repack_count = zero(UInt64), compute_accumulated_seconds = zero(Float64), active_threshold_seconds = zero(Float64), first_tick_repack_done = false, last_tick_unix_seconds = zero(Float64), repacks_since_compaction = zero(Int64), operator_repacks_requested = zero(UInt64), operator_repacks_completed = zero(UInt64))
-PB.field_numbers(::Type{RepackStatus}) = (;last_repack_unix_seconds = 1, last_repack_wall_elapsed_seconds = 2, last_repack_compute_seconds = 3, last_trigger = 4, last_models_placed = 5, last_models_moved = 6, repack_count = 7, compute_accumulated_seconds = 8, active_threshold_seconds = 9, first_tick_repack_done = 10, last_tick_unix_seconds = 11, repacks_since_compaction = 12, operator_repacks_requested = 13, operator_repacks_completed = 14)
+RepackStatus(; last_repack_unix_seconds = zero(Float64), last_repack_wall_elapsed_seconds = zero(Float64), last_repack_compute_seconds = zero(Float64), last_trigger = "", last_models_placed = zero(Int64), last_models_moved = zero(Int64), repack_count = zero(UInt64), compute_accumulated_seconds = zero(Float64), active_threshold_seconds = zero(Float64), first_tick_repack_done = false, last_tick_unix_seconds = zero(Float64), repacks_since_compaction = zero(Int64), operator_repacks_requested = zero(UInt64), operator_repacks_completed = zero(UInt64)) = RepackStatus(last_repack_unix_seconds, last_repack_wall_elapsed_seconds, last_repack_compute_seconds, last_trigger, last_models_placed, last_models_moved, repack_count, compute_accumulated_seconds, active_threshold_seconds, first_tick_repack_done, last_tick_unix_seconds, repacks_since_compaction, operator_repacks_requested, operator_repacks_completed)
+PB.default_values(::Type{RepackStatus}) = (; last_repack_unix_seconds = zero(Float64), last_repack_wall_elapsed_seconds = zero(Float64), last_repack_compute_seconds = zero(Float64), last_trigger = "", last_models_placed = zero(Int64), last_models_moved = zero(Int64), repack_count = zero(UInt64), compute_accumulated_seconds = zero(Float64), active_threshold_seconds = zero(Float64), first_tick_repack_done = false, last_tick_unix_seconds = zero(Float64), repacks_since_compaction = zero(Int64), operator_repacks_requested = zero(UInt64), operator_repacks_completed = zero(UInt64))
+PB.field_numbers(::Type{RepackStatus}) = (; last_repack_unix_seconds = 1, last_repack_wall_elapsed_seconds = 2, last_repack_compute_seconds = 3, last_trigger = 4, last_models_placed = 5, last_models_moved = 6, repack_count = 7, compute_accumulated_seconds = 8, active_threshold_seconds = 9, first_tick_repack_done = 10, last_tick_unix_seconds = 11, repacks_since_compaction = 12, operator_repacks_requested = 13, operator_repacks_completed = 14)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:RepackStatus}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:RepackStatus}, _endpos::Int = 0, _group::Bool = false)
     last_repack_unix_seconds = zero(Float64)
     last_repack_wall_elapsed_seconds = zero(Float64)
     last_repack_compute_seconds = zero(Float64)
@@ -340,11 +340,11 @@ end
 struct RepackRequest
     wait_seconds::Float64
 end
-RepackRequest(;wait_seconds = zero(Float64)) = RepackRequest(wait_seconds)
-PB.default_values(::Type{RepackRequest}) = (;wait_seconds = zero(Float64))
-PB.field_numbers(::Type{RepackRequest}) = (;wait_seconds = 1)
+RepackRequest(; wait_seconds = zero(Float64)) = RepackRequest(wait_seconds)
+PB.default_values(::Type{RepackRequest}) = (; wait_seconds = zero(Float64))
+PB.field_numbers(::Type{RepackRequest}) = (; wait_seconds = 1)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:RepackRequest}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:RepackRequest}, _endpos::Int = 0, _group::Bool = false)
     wait_seconds = zero(Float64)
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
@@ -371,11 +371,11 @@ end
 struct CompactMemoryRequest
     reload_models::Vector{String}
 end
-CompactMemoryRequest(;reload_models = Vector{String}()) = CompactMemoryRequest(reload_models)
-PB.default_values(::Type{CompactMemoryRequest}) = (;reload_models = Vector{String}())
-PB.field_numbers(::Type{CompactMemoryRequest}) = (;reload_models = 1)
+CompactMemoryRequest(; reload_models = Vector{String}()) = CompactMemoryRequest(reload_models)
+PB.default_values(::Type{CompactMemoryRequest}) = (; reload_models = Vector{String}())
+PB.field_numbers(::Type{CompactMemoryRequest}) = (; reload_models = 1)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:CompactMemoryRequest}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:CompactMemoryRequest}, _endpos::Int = 0, _group::Bool = false)
     reload_models = PB.BufferedVector{String}()
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
@@ -401,7 +401,7 @@ end
 
 struct SetModelPolicyResponse end
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetModelPolicyResponse}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetModelPolicyResponse}, _endpos::Int = 0, _group::Bool = false)
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         Base.skip(d, wire_type)
@@ -420,7 +420,7 @@ end
 
 struct ModelControlStatusRequest end
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelControlStatusRequest}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelControlStatusRequest}, _endpos::Int = 0, _group::Bool = false)
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         Base.skip(d, wire_type)
@@ -452,11 +452,11 @@ struct SchedulingPolicy
     generation::UInt64
     work_basis::String
 end
-SchedulingPolicy(;rebalance_compute_seconds = zero(Float64), first_rebalance_compute_seconds = zero(Float64), hysteresis = zero(Float64), ema_halflife_compute_seconds = zero(Float64), default_replicas = zero(Int64), routing_policy = "", routing_fill_factor = zero(Float64), routing_fill_mode = "", compaction_mode = "", compaction_interval = zero(Int64), forbid_memory_oversubscription = false, generation = zero(UInt64), work_basis = "") = SchedulingPolicy(rebalance_compute_seconds, first_rebalance_compute_seconds, hysteresis, ema_halflife_compute_seconds, default_replicas, routing_policy, routing_fill_factor, routing_fill_mode, compaction_mode, compaction_interval, forbid_memory_oversubscription, generation, work_basis)
-PB.default_values(::Type{SchedulingPolicy}) = (;rebalance_compute_seconds = zero(Float64), first_rebalance_compute_seconds = zero(Float64), hysteresis = zero(Float64), ema_halflife_compute_seconds = zero(Float64), default_replicas = zero(Int64), routing_policy = "", routing_fill_factor = zero(Float64), routing_fill_mode = "", compaction_mode = "", compaction_interval = zero(Int64), forbid_memory_oversubscription = false, generation = zero(UInt64), work_basis = "")
-PB.field_numbers(::Type{SchedulingPolicy}) = (;rebalance_compute_seconds = 1, first_rebalance_compute_seconds = 2, hysteresis = 3, ema_halflife_compute_seconds = 4, default_replicas = 5, routing_policy = 6, routing_fill_factor = 7, routing_fill_mode = 8, compaction_mode = 9, compaction_interval = 10, forbid_memory_oversubscription = 11, generation = 12, work_basis = 13)
+SchedulingPolicy(; rebalance_compute_seconds = zero(Float64), first_rebalance_compute_seconds = zero(Float64), hysteresis = zero(Float64), ema_halflife_compute_seconds = zero(Float64), default_replicas = zero(Int64), routing_policy = "", routing_fill_factor = zero(Float64), routing_fill_mode = "", compaction_mode = "", compaction_interval = zero(Int64), forbid_memory_oversubscription = false, generation = zero(UInt64), work_basis = "") = SchedulingPolicy(rebalance_compute_seconds, first_rebalance_compute_seconds, hysteresis, ema_halflife_compute_seconds, default_replicas, routing_policy, routing_fill_factor, routing_fill_mode, compaction_mode, compaction_interval, forbid_memory_oversubscription, generation, work_basis)
+PB.default_values(::Type{SchedulingPolicy}) = (; rebalance_compute_seconds = zero(Float64), first_rebalance_compute_seconds = zero(Float64), hysteresis = zero(Float64), ema_halflife_compute_seconds = zero(Float64), default_replicas = zero(Int64), routing_policy = "", routing_fill_factor = zero(Float64), routing_fill_mode = "", compaction_mode = "", compaction_interval = zero(Int64), forbid_memory_oversubscription = false, generation = zero(UInt64), work_basis = "")
+PB.field_numbers(::Type{SchedulingPolicy}) = (; rebalance_compute_seconds = 1, first_rebalance_compute_seconds = 2, hysteresis = 3, ema_halflife_compute_seconds = 4, default_replicas = 5, routing_policy = 6, routing_fill_factor = 7, routing_fill_mode = 8, compaction_mode = 9, compaction_interval = 10, forbid_memory_oversubscription = 11, generation = 12, work_basis = 13)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SchedulingPolicy}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SchedulingPolicy}, _endpos::Int = 0, _group::Bool = false)
     rebalance_compute_seconds = zero(Float64)
     first_rebalance_compute_seconds = zero(Float64)
     hysteresis = zero(Float64)
@@ -542,7 +542,7 @@ end
 
 struct GetSchedulingStatusRequest end
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:GetSchedulingStatusRequest}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:GetSchedulingStatusRequest}, _endpos::Int = 0, _group::Bool = false)
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         Base.skip(d, wire_type)
@@ -559,17 +559,17 @@ function PB._encoded_size(x::GetSchedulingStatusRequest)
     return encoded_size
 end
 
-@enumx Residency RESIDENCY_UNSPECIFIED=0 UNPINNED=1 PINNED_SYSTEM=2 PINNED_DEVICE=3
+@enumx Residency RESIDENCY_UNSPECIFIED = 0 UNPINNED = 1 PINNED_SYSTEM = 2 PINNED_DEVICE = 3
 
 struct CompactMemoryResponse
     reloaded_models::Int64
     resident_bytes_after::UInt64
 end
-CompactMemoryResponse(;reloaded_models = zero(Int64), resident_bytes_after = zero(UInt64)) = CompactMemoryResponse(reloaded_models, resident_bytes_after)
-PB.default_values(::Type{CompactMemoryResponse}) = (;reloaded_models = zero(Int64), resident_bytes_after = zero(UInt64))
-PB.field_numbers(::Type{CompactMemoryResponse}) = (;reloaded_models = 1, resident_bytes_after = 2)
+CompactMemoryResponse(; reloaded_models = zero(Int64), resident_bytes_after = zero(UInt64)) = CompactMemoryResponse(reloaded_models, resident_bytes_after)
+PB.default_values(::Type{CompactMemoryResponse}) = (; reloaded_models = zero(Int64), resident_bytes_after = zero(UInt64))
+PB.field_numbers(::Type{CompactMemoryResponse}) = (; reloaded_models = 1, resident_bytes_after = 2)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:CompactMemoryResponse}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:CompactMemoryResponse}, _endpos::Int = 0, _group::Bool = false)
     reloaded_models = zero(Int64)
     resident_bytes_after = zero(UInt64)
     while !PB.message_done(d, _endpos, _group)
@@ -607,11 +607,11 @@ struct WorkerSchedulingStatus
     weight_budget_bytes::Int64
     oversubscribed::Bool
 end
-WorkerSchedulingStatus(;worker = "", ready = false, models_placed = zero(Int64), inflight_compute = zero(Float64), assigned_weight_bytes = zero(Int64), weight_budget_bytes = zero(Int64), oversubscribed = false) = WorkerSchedulingStatus(worker, ready, models_placed, inflight_compute, assigned_weight_bytes, weight_budget_bytes, oversubscribed)
-PB.default_values(::Type{WorkerSchedulingStatus}) = (;worker = "", ready = false, models_placed = zero(Int64), inflight_compute = zero(Float64), assigned_weight_bytes = zero(Int64), weight_budget_bytes = zero(Int64), oversubscribed = false)
-PB.field_numbers(::Type{WorkerSchedulingStatus}) = (;worker = 1, ready = 2, models_placed = 3, inflight_compute = 4, assigned_weight_bytes = 5, weight_budget_bytes = 6, oversubscribed = 7)
+WorkerSchedulingStatus(; worker = "", ready = false, models_placed = zero(Int64), inflight_compute = zero(Float64), assigned_weight_bytes = zero(Int64), weight_budget_bytes = zero(Int64), oversubscribed = false) = WorkerSchedulingStatus(worker, ready, models_placed, inflight_compute, assigned_weight_bytes, weight_budget_bytes, oversubscribed)
+PB.default_values(::Type{WorkerSchedulingStatus}) = (; worker = "", ready = false, models_placed = zero(Int64), inflight_compute = zero(Float64), assigned_weight_bytes = zero(Int64), weight_budget_bytes = zero(Int64), oversubscribed = false)
+PB.field_numbers(::Type{WorkerSchedulingStatus}) = (; worker = 1, ready = 2, models_placed = 3, inflight_compute = 4, assigned_weight_bytes = 5, weight_budget_bytes = 6, oversubscribed = 7)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:WorkerSchedulingStatus}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:WorkerSchedulingStatus}, _endpos::Int = 0, _group::Bool = false)
     worker = ""
     ready = false
     models_placed = zero(Int64)
@@ -680,11 +680,11 @@ struct ModelSchedulingStatus
     placed::Bool
     drifted::Bool
 end
-ModelSchedulingStatus(;name = "", configured_replicas = zero(Int64), effective_replicas = zero(Int64), replicas = Vector{ReplicaPlacement}(), utilization = zero(Float64), arrival_rate = zero(Float64), cost_seconds = zero(Float64), max_batch = zero(Int64), fill_mode = "", fill_quantum = zero(Int64), weight_nbytes = zero(Int64), placed = false, drifted = false) = ModelSchedulingStatus(name, configured_replicas, effective_replicas, replicas, utilization, arrival_rate, cost_seconds, max_batch, fill_mode, fill_quantum, weight_nbytes, placed, drifted)
-PB.default_values(::Type{ModelSchedulingStatus}) = (;name = "", configured_replicas = zero(Int64), effective_replicas = zero(Int64), replicas = Vector{ReplicaPlacement}(), utilization = zero(Float64), arrival_rate = zero(Float64), cost_seconds = zero(Float64), max_batch = zero(Int64), fill_mode = "", fill_quantum = zero(Int64), weight_nbytes = zero(Int64), placed = false, drifted = false)
-PB.field_numbers(::Type{ModelSchedulingStatus}) = (;name = 1, configured_replicas = 2, effective_replicas = 3, replicas = 4, utilization = 5, arrival_rate = 6, cost_seconds = 7, max_batch = 8, fill_mode = 9, fill_quantum = 10, weight_nbytes = 11, placed = 12, drifted = 13)
+ModelSchedulingStatus(; name = "", configured_replicas = zero(Int64), effective_replicas = zero(Int64), replicas = Vector{ReplicaPlacement}(), utilization = zero(Float64), arrival_rate = zero(Float64), cost_seconds = zero(Float64), max_batch = zero(Int64), fill_mode = "", fill_quantum = zero(Int64), weight_nbytes = zero(Int64), placed = false, drifted = false) = ModelSchedulingStatus(name, configured_replicas, effective_replicas, replicas, utilization, arrival_rate, cost_seconds, max_batch, fill_mode, fill_quantum, weight_nbytes, placed, drifted)
+PB.default_values(::Type{ModelSchedulingStatus}) = (; name = "", configured_replicas = zero(Int64), effective_replicas = zero(Int64), replicas = Vector{ReplicaPlacement}(), utilization = zero(Float64), arrival_rate = zero(Float64), cost_seconds = zero(Float64), max_batch = zero(Int64), fill_mode = "", fill_quantum = zero(Int64), weight_nbytes = zero(Int64), placed = false, drifted = false)
+PB.field_numbers(::Type{ModelSchedulingStatus}) = (; name = 1, configured_replicas = 2, effective_replicas = 3, replicas = 4, utilization = 5, arrival_rate = 6, cost_seconds = 7, max_batch = 8, fill_mode = 9, fill_quantum = 10, weight_nbytes = 11, placed = 12, drifted = 13)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelSchedulingStatus}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelSchedulingStatus}, _endpos::Int = 0, _group::Bool = false)
     name = ""
     configured_replicas = zero(Int64)
     effective_replicas = zero(Int64)
@@ -773,19 +773,19 @@ struct RepackResponse
     completed_sequence::UInt64
     completed::Bool
     waited_seconds::Float64
-    repack::Union{Nothing,RepackStatus}
+    repack::Union{Nothing, RepackStatus}
     warnings::Vector{String}
 end
-RepackResponse(;sequence = zero(UInt64), completed_sequence = zero(UInt64), completed = false, waited_seconds = zero(Float64), repack = nothing, warnings = Vector{String}()) = RepackResponse(sequence, completed_sequence, completed, waited_seconds, repack, warnings)
-PB.default_values(::Type{RepackResponse}) = (;sequence = zero(UInt64), completed_sequence = zero(UInt64), completed = false, waited_seconds = zero(Float64), repack = nothing, warnings = Vector{String}())
-PB.field_numbers(::Type{RepackResponse}) = (;sequence = 1, completed_sequence = 2, completed = 3, waited_seconds = 4, repack = 5, warnings = 6)
+RepackResponse(; sequence = zero(UInt64), completed_sequence = zero(UInt64), completed = false, waited_seconds = zero(Float64), repack = nothing, warnings = Vector{String}()) = RepackResponse(sequence, completed_sequence, completed, waited_seconds, repack, warnings)
+PB.default_values(::Type{RepackResponse}) = (; sequence = zero(UInt64), completed_sequence = zero(UInt64), completed = false, waited_seconds = zero(Float64), repack = nothing, warnings = Vector{String}())
+PB.field_numbers(::Type{RepackResponse}) = (; sequence = 1, completed_sequence = 2, completed = 3, waited_seconds = 4, repack = 5, warnings = 6)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:RepackResponse}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:RepackResponse}, _endpos::Int = 0, _group::Bool = false)
     sequence = zero(UInt64)
     completed_sequence = zero(UInt64)
     completed = false
     waited_seconds = zero(Float64)
-    repack = Ref{Union{Nothing,RepackStatus}}(nothing)
+    repack = Ref{Union{Nothing, RepackStatus}}(nothing)
     warnings = PB.BufferedVector{String}()
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
@@ -830,16 +830,16 @@ function PB._encoded_size(x::RepackResponse)
 end
 
 struct SetSchedulingPolicyResponse
-    applied::Union{Nothing,SchedulingPolicy}
+    applied::Union{Nothing, SchedulingPolicy}
     warnings::Vector{String}
     persisted::Bool
 end
-SetSchedulingPolicyResponse(;applied = nothing, warnings = Vector{String}(), persisted = false) = SetSchedulingPolicyResponse(applied, warnings, persisted)
-PB.default_values(::Type{SetSchedulingPolicyResponse}) = (;applied = nothing, warnings = Vector{String}(), persisted = false)
-PB.field_numbers(::Type{SetSchedulingPolicyResponse}) = (;applied = 1, warnings = 2, persisted = 3)
+SetSchedulingPolicyResponse(; applied = nothing, warnings = Vector{String}(), persisted = false) = SetSchedulingPolicyResponse(applied, warnings, persisted)
+PB.default_values(::Type{SetSchedulingPolicyResponse}) = (; applied = nothing, warnings = Vector{String}(), persisted = false)
+PB.field_numbers(::Type{SetSchedulingPolicyResponse}) = (; applied = 1, warnings = 2, persisted = 3)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetSchedulingPolicyResponse}, _endpos::Int=0, _group::Bool=false)
-    applied = Ref{Union{Nothing,SchedulingPolicy}}(nothing)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetSchedulingPolicyResponse}, _endpos::Int = 0, _group::Bool = false)
+    applied = Ref{Union{Nothing, SchedulingPolicy}}(nothing)
     warnings = PB.BufferedVector{String}()
     persisted = false
     while !PB.message_done(d, _endpos, _group)
@@ -874,15 +874,15 @@ end
 
 struct SetSchedulingPolicyRequest
     update_mask::Vector{String}
-    policy::Union{Nothing,SchedulingPolicy}
+    policy::Union{Nothing, SchedulingPolicy}
 end
-SetSchedulingPolicyRequest(;update_mask = Vector{String}(), policy = nothing) = SetSchedulingPolicyRequest(update_mask, policy)
-PB.default_values(::Type{SetSchedulingPolicyRequest}) = (;update_mask = Vector{String}(), policy = nothing)
-PB.field_numbers(::Type{SetSchedulingPolicyRequest}) = (;update_mask = 1, policy = 2)
+SetSchedulingPolicyRequest(; update_mask = Vector{String}(), policy = nothing) = SetSchedulingPolicyRequest(update_mask, policy)
+PB.default_values(::Type{SetSchedulingPolicyRequest}) = (; update_mask = Vector{String}(), policy = nothing)
+PB.field_numbers(::Type{SetSchedulingPolicyRequest}) = (; update_mask = 1, policy = 2)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetSchedulingPolicyRequest}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetSchedulingPolicyRequest}, _endpos::Int = 0, _group::Bool = false)
     update_mask = PB.BufferedVector{String}()
-    policy = Ref{Union{Nothing,SchedulingPolicy}}(nothing)
+    policy = Ref{Union{Nothing, SchedulingPolicy}}(nothing)
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         if field_number == 1
@@ -912,11 +912,11 @@ end
 struct SetModelResidencyResponse
     residency::Residency.T
 end
-SetModelResidencyResponse(;residency = Residency.RESIDENCY_UNSPECIFIED) = SetModelResidencyResponse(residency)
-PB.default_values(::Type{SetModelResidencyResponse}) = (;residency = Residency.RESIDENCY_UNSPECIFIED)
-PB.field_numbers(::Type{SetModelResidencyResponse}) = (;residency = 1)
+SetModelResidencyResponse(; residency = Residency.RESIDENCY_UNSPECIFIED) = SetModelResidencyResponse(residency)
+PB.default_values(::Type{SetModelResidencyResponse}) = (; residency = Residency.RESIDENCY_UNSPECIFIED)
+PB.field_numbers(::Type{SetModelResidencyResponse}) = (; residency = 1)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetModelResidencyResponse}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetModelResidencyResponse}, _endpos::Int = 0, _group::Bool = false)
     residency = Residency.RESIDENCY_UNSPECIFIED
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
@@ -944,11 +944,11 @@ struct SetModelResidencyRequest
     name::String
     target::Residency.T
 end
-SetModelResidencyRequest(;name = "", target = Residency.RESIDENCY_UNSPECIFIED) = SetModelResidencyRequest(name, target)
-PB.default_values(::Type{SetModelResidencyRequest}) = (;name = "", target = Residency.RESIDENCY_UNSPECIFIED)
-PB.field_numbers(::Type{SetModelResidencyRequest}) = (;name = 1, target = 2)
+SetModelResidencyRequest(; name = "", target = Residency.RESIDENCY_UNSPECIFIED) = SetModelResidencyRequest(name, target)
+PB.default_values(::Type{SetModelResidencyRequest}) = (; name = "", target = Residency.RESIDENCY_UNSPECIFIED)
+PB.field_numbers(::Type{SetModelResidencyRequest}) = (; name = 1, target = 2)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetModelResidencyRequest}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetModelResidencyRequest}, _endpos::Int = 0, _group::Bool = false)
     name = ""
     target = Residency.RESIDENCY_UNSPECIFIED
     while !PB.message_done(d, _endpos, _group)
@@ -993,11 +993,11 @@ struct ModelStatus
     batch_axis::Int64
     rows_served::UInt64
 end
-ModelStatus(;name = "", residency = Residency.RESIDENCY_UNSPECIFIED, device_resident = false, host_resident = false, weight_nbytes = zero(Int64), weight = zero(Float64), queue_depth = zero(Int64), total_compute_seconds = zero(Float64), requests_served = zero(UInt64), dispatch_count = zero(UInt64), max_batch_size = zero(Int64), batch_input_name = "", batch_axis = zero(Int64), rows_served = zero(UInt64)) = ModelStatus(name, residency, device_resident, host_resident, weight_nbytes, weight, queue_depth, total_compute_seconds, requests_served, dispatch_count, max_batch_size, batch_input_name, batch_axis, rows_served)
-PB.default_values(::Type{ModelStatus}) = (;name = "", residency = Residency.RESIDENCY_UNSPECIFIED, device_resident = false, host_resident = false, weight_nbytes = zero(Int64), weight = zero(Float64), queue_depth = zero(Int64), total_compute_seconds = zero(Float64), requests_served = zero(UInt64), dispatch_count = zero(UInt64), max_batch_size = zero(Int64), batch_input_name = "", batch_axis = zero(Int64), rows_served = zero(UInt64))
-PB.field_numbers(::Type{ModelStatus}) = (;name = 1, residency = 2, device_resident = 3, host_resident = 4, weight_nbytes = 5, weight = 6, queue_depth = 7, total_compute_seconds = 8, requests_served = 9, dispatch_count = 10, max_batch_size = 11, batch_input_name = 12, batch_axis = 13, rows_served = 14)
+ModelStatus(; name = "", residency = Residency.RESIDENCY_UNSPECIFIED, device_resident = false, host_resident = false, weight_nbytes = zero(Int64), weight = zero(Float64), queue_depth = zero(Int64), total_compute_seconds = zero(Float64), requests_served = zero(UInt64), dispatch_count = zero(UInt64), max_batch_size = zero(Int64), batch_input_name = "", batch_axis = zero(Int64), rows_served = zero(UInt64)) = ModelStatus(name, residency, device_resident, host_resident, weight_nbytes, weight, queue_depth, total_compute_seconds, requests_served, dispatch_count, max_batch_size, batch_input_name, batch_axis, rows_served)
+PB.default_values(::Type{ModelStatus}) = (; name = "", residency = Residency.RESIDENCY_UNSPECIFIED, device_resident = false, host_resident = false, weight_nbytes = zero(Int64), weight = zero(Float64), queue_depth = zero(Int64), total_compute_seconds = zero(Float64), requests_served = zero(UInt64), dispatch_count = zero(UInt64), max_batch_size = zero(Int64), batch_input_name = "", batch_axis = zero(Int64), rows_served = zero(UInt64))
+PB.field_numbers(::Type{ModelStatus}) = (; name = 1, residency = 2, device_resident = 3, host_resident = 4, weight_nbytes = 5, weight = 6, queue_depth = 7, total_compute_seconds = 8, requests_served = 9, dispatch_count = 10, max_batch_size = 11, batch_input_name = 12, batch_axis = 13, rows_served = 14)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelStatus}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelStatus}, _endpos::Int = 0, _group::Bool = false)
     name = ""
     residency = Residency.RESIDENCY_UNSPECIFIED
     device_resident = false
@@ -1088,20 +1088,20 @@ end
 
 struct GetSchedulingStatusResponse
     mode::String
-    policy::Union{Nothing,SchedulingPolicy}
-    repack::Union{Nothing,RepackStatus}
+    policy::Union{Nothing, SchedulingPolicy}
+    repack::Union{Nothing, RepackStatus}
     models::Vector{ModelSchedulingStatus}
     workers::Vector{WorkerSchedulingStatus}
     warnings::Vector{String}
 end
-GetSchedulingStatusResponse(;mode = "", policy = nothing, repack = nothing, models = Vector{ModelSchedulingStatus}(), workers = Vector{WorkerSchedulingStatus}(), warnings = Vector{String}()) = GetSchedulingStatusResponse(mode, policy, repack, models, workers, warnings)
-PB.default_values(::Type{GetSchedulingStatusResponse}) = (;mode = "", policy = nothing, repack = nothing, models = Vector{ModelSchedulingStatus}(), workers = Vector{WorkerSchedulingStatus}(), warnings = Vector{String}())
-PB.field_numbers(::Type{GetSchedulingStatusResponse}) = (;mode = 1, policy = 2, repack = 3, models = 4, workers = 5, warnings = 6)
+GetSchedulingStatusResponse(; mode = "", policy = nothing, repack = nothing, models = Vector{ModelSchedulingStatus}(), workers = Vector{WorkerSchedulingStatus}(), warnings = Vector{String}()) = GetSchedulingStatusResponse(mode, policy, repack, models, workers, warnings)
+PB.default_values(::Type{GetSchedulingStatusResponse}) = (; mode = "", policy = nothing, repack = nothing, models = Vector{ModelSchedulingStatus}(), workers = Vector{WorkerSchedulingStatus}(), warnings = Vector{String}())
+PB.field_numbers(::Type{GetSchedulingStatusResponse}) = (; mode = 1, policy = 2, repack = 3, models = 4, workers = 5, warnings = 6)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:GetSchedulingStatusResponse}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:GetSchedulingStatusResponse}, _endpos::Int = 0, _group::Bool = false)
     mode = ""
-    policy = Ref{Union{Nothing,SchedulingPolicy}}(nothing)
-    repack = Ref{Union{Nothing,RepackStatus}}(nothing)
+    policy = Ref{Union{Nothing, SchedulingPolicy}}(nothing)
+    repack = Ref{Union{Nothing, RepackStatus}}(nothing)
     models = PB.BufferedVector{ModelSchedulingStatus}()
     workers = PB.BufferedVector{WorkerSchedulingStatus}()
     warnings = PB.BufferedVector{String}()
@@ -1153,11 +1153,11 @@ struct ModelControlStatusResponse
     models::Vector{ModelStatus}
     weight_cache_max_bytes::UInt64
 end
-ModelControlStatusResponse(;residency_mode = "", discipline = "", models = Vector{ModelStatus}(), weight_cache_max_bytes = zero(UInt64)) = ModelControlStatusResponse(residency_mode, discipline, models, weight_cache_max_bytes)
-PB.default_values(::Type{ModelControlStatusResponse}) = (;residency_mode = "", discipline = "", models = Vector{ModelStatus}(), weight_cache_max_bytes = zero(UInt64))
-PB.field_numbers(::Type{ModelControlStatusResponse}) = (;residency_mode = 1, discipline = 2, models = 3, weight_cache_max_bytes = 4)
+ModelControlStatusResponse(; residency_mode = "", discipline = "", models = Vector{ModelStatus}(), weight_cache_max_bytes = zero(UInt64)) = ModelControlStatusResponse(residency_mode, discipline, models, weight_cache_max_bytes)
+PB.default_values(::Type{ModelControlStatusResponse}) = (; residency_mode = "", discipline = "", models = Vector{ModelStatus}(), weight_cache_max_bytes = zero(UInt64))
+PB.field_numbers(::Type{ModelControlStatusResponse}) = (; residency_mode = 1, discipline = 2, models = 3, weight_cache_max_bytes = 4)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelControlStatusResponse}, _endpos::Int=0, _group::Bool=false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelControlStatusResponse}, _endpos::Int = 0, _group::Bool = false)
     residency_mode = ""
     discipline = ""
     models = PB.BufferedVector{ModelStatus}()

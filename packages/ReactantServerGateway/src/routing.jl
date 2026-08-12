@@ -10,11 +10,11 @@ mutable struct RouteEntry
 end
 
 struct RoutingTable
-    routes::Dict{String,RouteEntry}
+    routes::Dict{String, RouteEntry}
 end
 
 function RoutingTable(routes::AbstractDict)
-    d = Dict{String,RouteEntry}()
+    d = Dict{String, RouteEntry}()
     for (model, urls) in routes
         cp = sort(String[String(u) for u in urls])
         d[String(model)] = RouteEntry(cp, Threads.Atomic{UInt64}(0))
@@ -50,7 +50,7 @@ has_model(t::RoutingTable, model::AbstractString) = haskey(t.routes, model)
 mutable struct DiscoveredRoutes
     @atomic current::RoutingTable
 end
-DiscoveredRoutes() = DiscoveredRoutes(RoutingTable(Dict{String,Vector{String}}()))
+DiscoveredRoutes() = DiscoveredRoutes(RoutingTable(Dict{String, Vector{String}}()))
 
 current_table(d::DiscoveredRoutes) = @atomic d.current
 swap_table!(d::DiscoveredRoutes, t::RoutingTable) = (@atomic d.current = t; nothing)

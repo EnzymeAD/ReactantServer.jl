@@ -6,19 +6,27 @@ const _RS = ReactantServer
 
 # A model whose input "img" has shape "whn" (w=axis 1 and h=axis 2 variable, n=axis 3 batch) and a
 # matching output "y". variant_spec = [("img",1),("img",2)] so the variant key is [w, h].
-_ms_sig() = _RS.ModelSignature(["img"], DataType[Float32], String[], 1, ["y"], DataType[Float32],
-    2, [("img", 1), ("img", 2)])
+_ms_sig() = _RS.ModelSignature(
+    ["img"], DataType[Float32], String[], 1, ["y"], DataType[Float32],
+    2, [("img", 1), ("img", 2)]
+)
 
 function _ms_manifest(name)
-    whn(letters_var) = _RS.TensorSpec(letters_var[1], _RS.F32,
-        _RS.Dim[_RS.Dim(_RS.VARIABLE), _RS.Dim(_RS.VARIABLE), _RS.Dim(_RS.BATCH)], 3)
+    whn(letters_var) = _RS.TensorSpec(
+        letters_var[1], _RS.F32,
+        _RS.Dim[_RS.Dim(_RS.VARIABLE), _RS.Dim(_RS.VARIABLE), _RS.Dim(_RS.BATCH)], 3
+    )
     inimg = whn(["img"])
-    outy = _RS.TensorSpec("y", _RS.F32,
-        _RS.Dim[_RS.Dim(_RS.VARIABLE), _RS.Dim(_RS.VARIABLE), _RS.Dim(_RS.BATCH)], 3)
+    outy = _RS.TensorSpec(
+        "y", _RS.F32,
+        _RS.Dim[_RS.Dim(_RS.VARIABLE), _RS.Dim(_RS.VARIABLE), _RS.Dim(_RS.BATCH)], 3
+    )
     # input_batch_dim 2 (0-based axis of n), two declared variants.
-    return _RS.Manifest("2.0", name, "", _RS.TensorSpec[inimg], _RS.TensorSpec[outy],
-        nothing, nothing, _RS.BatchingSpec(Int[1]), _RS.Provenance(Dict{String,Any}()),
-        2, "model", String[], [[2, 3], [4, 2]])
+    return _RS.Manifest(
+        "2.0", name, "", _RS.TensorSpec[inimg], _RS.TensorSpec[outy],
+        nothing, nothing, _RS.BatchingSpec(Int[1]), _RS.Provenance(Dict{String, Any}()),
+        2, "model", String[], [[2, 3], [4, 2]]
+    )
 end
 
 function _ms_named(w, h, b)
@@ -30,9 +38,10 @@ end
     execA = _RS.MockExecutable(args -> [args[1]], 1)
     execA2 = _RS.MockExecutable(args -> [args[1]], 1)
     execB = _RS.MockExecutable(args -> [args[1]], 1)
-    execs = Dict{_RS.VariantKey,Dict{Int,Any}}(
-        [2, 3] => Dict{Int,Any}(1 => execA, 2 => execA2),
-        [4, 2] => Dict{Int,Any}(1 => execB))
+    execs = Dict{_RS.VariantKey, Dict{Int, Any}}(
+        [2, 3] => Dict{Int, Any}(1 => execA, 2 => execA2),
+        [4, 2] => Dict{Int, Any}(1 => execB)
+    )
     model = _RS.LoadedModel(_ms_sig(), execs, Any[])
 
     @test _RS._select_exec(model, _ms_named(2, 3, 1)) === execA          # variant [2,3], batch 1
@@ -60,18 +69,19 @@ end
     # which program ran; both receive the same `shared` weight buffer as their trailing argument.
     execA = _RS.MockExecutable(args -> [fill(Float32(args[2][1]) + 1, size(args[1]))], 1)
     execB = _RS.MockExecutable(args -> [fill(Float32(args[2][1]) + 2, size(args[1]))], 1)
-    execs = Dict{_RS.VariantKey,Dict{Int,Any}}(
-        [2, 3] => Dict{Int,Any}(1 => execA),
-        [4, 2] => Dict{Int,Any}(1 => execB))
+    execs = Dict{_RS.VariantKey, Dict{Int, Any}}(
+        [2, 3] => Dict{Int, Any}(1 => execA),
+        [4, 2] => Dict{Int, Any}(1 => execB)
+    )
     model = _RS.LoadedModel(_ms_sig(), execs, shared)
 
     outA = _RS.run_model(backend, pool, model, [_RS.NamedTensor("img", zeros(Float32, 2, 3, 1))])
     @test size(outA[1].data) == (2, 3, 1)
-    @test all(==(8f0), outA[1].data)                         # 7 (shared weight) + 1 (variant A)
+    @test all(==(8.0f0), outA[1].data)                         # 7 (shared weight) + 1 (variant A)
 
     outB = _RS.run_model(backend, pool, model, [_RS.NamedTensor("img", zeros(Float32, 4, 2, 1))])
     @test size(outB[1].data) == (4, 2, 1)
-    @test all(==(9f0), outB[1].data)                         # 7 (same shared weight) + 2 (variant B)
+    @test all(==(9.0f0), outB[1].data)                         # 7 (same shared weight) + 2 (variant B)
 end
 
 @testset "multishape _discover_modules finds per-variant files" begin
@@ -94,13 +104,16 @@ end
     backend = _RS.MockBackend()
     pool = _RS.MemoryPool(backend, _RS.MockClient(), _RS.MockDevice(0), "mock", nothing)
     echo = _RS.MockExecutable(args -> [args[1]], 1)
-    execs = Dict{_RS.VariantKey,Dict{Int,Any}}(
-        [2, 3] => Dict{Int,Any}(1 => echo, 2 => echo),       # variant A compiled for batch 1 and 2
-        [4, 2] => Dict{Int,Any}(1 => echo))                  # variant B compiled for batch 1
+    execs = Dict{_RS.VariantKey, Dict{Int, Any}}(
+        [2, 3] => Dict{Int, Any}(1 => echo, 2 => echo),       # variant A compiled for batch 1 and 2
+        [4, 2] => Dict{Int, Any}(1 => echo)
+    )                  # variant B compiled for batch 1
     model = _RS.LoadedModel(_ms_sig(), execs, Any[])
     st = _RS.ModelSchedState("ms", _RS.ModelSchedConfig(1.0), 0.0)
-    entry = _RS.ModelEntry("ms", _ms_manifest("ms"), Dict{Int,Vector{UInt8}}(),
-        "", nothing, model, st, identity, identity)
+    entry = _RS.ModelEntry(
+        "ms", _ms_manifest("ms"), Dict{Int, Vector{UInt8}}(),
+        "", nothing, model, st, identity, identity
+    )
 
     mk(w, h) = let req = _RS.InferRequest("ms", ["y"], [_RS.NamedTensor("img", zeros(Float32, w, h, 1))])
         _RS.QueuedRequest(req, req.inputs, 0.0, Channel{Any}(1))
@@ -130,35 +143,48 @@ end
 #   img: "whn" (w,h variable, batch 'n' at Julia axis 3)   -> drives the variant key [w, h]
 #   vec: "dn"  (d fixed = 2, batch 'n' at Julia axis 2)     -> batch axis at a DIFFERENT position
 #   y:   "dn"  (d fixed = 2, batch 'n' at Julia axis 2)
-_pi_sig() = _RS.ModelSignature(["img", "vec"], DataType[Float32, Float32], String[], 1,
-    ["y"], DataType[Float32], 2, [("img", 1), ("img", 2)])
+_pi_sig() = _RS.ModelSignature(
+    ["img", "vec"], DataType[Float32, Float32], String[], 1,
+    ["y"], DataType[Float32], 2, [("img", 1), ("img", 2)]
+)
 
 function _pi_manifest(name)
-    inimg = _RS.TensorSpec("img", _RS.F32,
-        _RS.Dim[_RS.Dim(_RS.VARIABLE), _RS.Dim(_RS.VARIABLE), _RS.Dim(_RS.BATCH)], 3)
+    inimg = _RS.TensorSpec(
+        "img", _RS.F32,
+        _RS.Dim[_RS.Dim(_RS.VARIABLE), _RS.Dim(_RS.VARIABLE), _RS.Dim(_RS.BATCH)], 3
+    )
     invec = _RS.TensorSpec("vec", _RS.F32, _RS.Dim[_RS.Dim(_RS.FIXED, 2), _RS.Dim(_RS.BATCH)], 2)
     outy = _RS.TensorSpec("y", _RS.F32, _RS.Dim[_RS.Dim(_RS.FIXED, 2), _RS.Dim(_RS.BATCH)], 2)
     # input_batch_dim 2 (0-based; img's 'n' at Julia axis 3), two declared variants.
-    return _RS.Manifest("2.0", name, "", _RS.TensorSpec[inimg, invec], _RS.TensorSpec[outy],
-        nothing, nothing, _RS.BatchingSpec(Int[1, 2]), _RS.Provenance(Dict{String,Any}()),
-        2, "model", String[], [[2, 3], [4, 2]])
+    return _RS.Manifest(
+        "2.0", name, "", _RS.TensorSpec[inimg, invec], _RS.TensorSpec[outy],
+        nothing, nothing, _RS.BatchingSpec(Int[1, 2]), _RS.Provenance(Dict{String, Any}()),
+        2, "model", String[], [[2, 3], [4, 2]]
+    )
 end
 
 @testset "per-input batch axis: coalesce within a variant, split at the boundary" begin
     echo = _RS.MockExecutable(args -> [args[1]], 1)
-    execs = Dict{_RS.VariantKey,Dict{Int,Any}}(
-        [2, 3] => Dict{Int,Any}(1 => echo, 2 => echo),       # variant A: batch 1 and 2
-        [4, 2] => Dict{Int,Any}(1 => echo))                  # variant B: batch 1
+    execs = Dict{_RS.VariantKey, Dict{Int, Any}}(
+        [2, 3] => Dict{Int, Any}(1 => echo, 2 => echo),       # variant A: batch 1 and 2
+        [4, 2] => Dict{Int, Any}(1 => echo)
+    )                  # variant B: batch 1
     model = _RS.LoadedModel(_pi_sig(), execs, Any[])
     st = _RS.ModelSchedState("pi", _RS.ModelSchedConfig(1.0), 0.0)
-    entry = _RS.ModelEntry("pi", _pi_manifest("pi"), Dict{Int,Vector{UInt8}}(),
-        "", nothing, model, st, identity, identity)
+    entry = _RS.ModelEntry(
+        "pi", _pi_manifest("pi"), Dict{Int, Vector{UInt8}}(),
+        "", nothing, model, st, identity, identity
+    )
 
     @test _RS._coalescable(entry)                            # both inputs and the output are batched
 
-    mk(w, h) = let req = _RS.InferRequest("pi", ["y"],
-            [_RS.NamedTensor("img", zeros(Float32, w, h, 1)),
-             _RS.NamedTensor("vec", zeros(Float32, 2, 1))])
+    mk(w, h) = let req = _RS.InferRequest(
+            "pi", ["y"],
+            [
+                _RS.NamedTensor("img", zeros(Float32, w, h, 1)),
+                _RS.NamedTensor("vec", zeros(Float32, 2, 1)),
+            ]
+        )
         _RS.QueuedRequest(req, req.inputs, 0.0, Channel{Any}(1))
     end
     # Queue A, A, B: only the leading same-variant run (the two A's) coalesces; B stops the window.

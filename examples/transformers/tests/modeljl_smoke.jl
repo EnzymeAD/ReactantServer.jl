@@ -9,25 +9,29 @@ const MODELS = joinpath(EXAMPLE, "models")
 const TOKENIZER = joinpath(EXAMPLE, "tokenizer")
 
 module FakeRS
-struct NamedTensor
-    name::String
-    data::Array
-end
-# The real shared tokenizer module, included straight from the package source (it depends on
-# nothing but Base), so the smoke test exercises what the server would actually run.
-Base.include(@__MODULE__, joinpath(dirname(dirname(dirname(@__DIR__))),
-                                  "packages", "ReactantServer", "src", "preprocess", "bert_text.jl"))
-module NNlib
-sigmoid(x) = 1 / (1 + exp(-x))
-function softmax(x::AbstractMatrix; dims::Int=1)
-    m = maximum(x; dims=dims)
-    e = exp.(x .- m)
-    return e ./ sum(e; dims=dims)
-end
-end
-const REGISTERED = Dict{String,Any}()
-register_model(name; preprocess=identity, postprocess=identity) =
-    (REGISTERED[name] = (; preprocess, postprocess); nothing)
+    struct NamedTensor
+        name::String
+        data::Array
+    end
+    # The real shared tokenizer module, included straight from the package source (it depends on
+    # nothing but Base), so the smoke test exercises what the server would actually run.
+    Base.include(
+        @__MODULE__, joinpath(
+            dirname(dirname(dirname(@__DIR__))),
+            "packages", "ReactantServer", "src", "preprocess", "bert_text.jl"
+        )
+    )
+    module NNlib
+        sigmoid(x) = 1 / (1 + exp(-x))
+        function softmax(x::AbstractMatrix; dims::Int = 1)
+            m = maximum(x; dims = dims)
+            e = exp.(x .- m)
+            return e ./ sum(e; dims = dims)
+        end
+    end
+    const REGISTERED = Dict{String, Any}()
+    register_model(name; preprocess = identity, postprocess = identity) =
+        (REGISTERED[name] = (; preprocess, postprocess); nothing)
 end
 
 # Mirror the server's model.jl sandbox: an isolated module with register_model and ReactantServer
@@ -53,7 +57,7 @@ function load_bundle(name)
 end
 
 pad_rows(rows::Vector{Vector{UInt8}}) = begin
-    mx = maximum(length, rows; init=1)
+    mx = maximum(length, rows; init = 1)
     out = zeros(UInt8, mx, length(rows))
     for (i, r) in enumerate(rows)
         out[1:length(r), i] = r
@@ -80,7 +84,7 @@ post = sp.postprocess(FakeRS.NamedTensor[NT("scores", scores)])
 d = Dict(t.name => t.data for t in post)
 @assert d["indices"] == Int32[4, 99] && d["values"] == Float32[1.4, 0.3]
 @assert d["row_offsets"] == Int64[0, 1, 2, 2]
-println("splade ok: seq bucket $(size(ids,1)), CSR ", d)
+println("splade ok: seq bucket $(size(ids, 1)), CSR ", d)
 
 # --- embedding ---
 load_bundle("embedding")
@@ -97,11 +101,13 @@ load_bundle("cross_encoder")
 ce = FakeRS.REGISTERED["cross_encoder"]
 keys = ["Rest and fluids help with a cold.", "unrelated documentation", ""]
 krows = [Vector{UInt8}(codeunits(k)) for k in keys]
-prep = ce.preprocess(FakeRS.NamedTensor[
-    NT("query", Vector{UInt8}(codeunits("how to treat a cold"))),
-    NT("keys", pad_rows(krows)),
-    NT("key_lens", Int32[length(r) for r in krows]),
-])
+prep = ce.preprocess(
+    FakeRS.NamedTensor[
+        NT("query", Vector{UInt8}(codeunits("how to treat a cold"))),
+        NT("keys", pad_rows(krows)),
+        NT("key_lens", Int32[length(r) for r in krows]),
+    ]
+)
 cids = prep[1].data; tt = prep[3].data
 @assert size(cids) == (512, 3)
 @assert count(==(102), cids[:, 1]) == 2 "pair row has two [SEP]"
@@ -110,7 +116,7 @@ cids = prep[1].data; tt = prep[3].data
 post = ce.postprocess(FakeRS.NamedTensor[NT("logits", Float32[2.0, -2.0, 0.0])])
 pd = Dict(t.name => t.data for t in post)
 @assert pd["logits"] == Float32[2.0, -2.0, 0.0]
-@assert isapprox(pd["prob"], 1 ./ (1 .+ exp.(-Float32[2.0, -2.0, 0.0])); atol=1e-6)
+@assert isapprox(pd["prob"], 1 ./ (1 .+ exp.(-Float32[2.0, -2.0, 0.0])); atol = 1.0e-6)
 println("cross_encoder ok: prob = ", pd["prob"])
 
 # --- sentiment ---
@@ -123,7 +129,7 @@ post = se.postprocess(FakeRS.NamedTensor[NT("logits", logits)])
 sd = Dict(t.name => t.data for t in post)
 @assert sd["label_id"] == Int32[1, 0, 1] "argmax label ids"
 @assert size(sd["probs"]) == (2, 3)
-@assert all(isapprox.(sum(sd["probs"]; dims=1), 1.0f0; atol=1e-6)) "softmax columns sum to 1"
+@assert all(isapprox.(sum(sd["probs"]; dims = 1), 1.0f0; atol = 1.0e-6)) "softmax columns sum to 1"
 println("sentiment ok: label_id = ", sd["label_id"], ", probs col1 = ", sd["probs"][:, 1])
 
 println("\nsmoke test passed")

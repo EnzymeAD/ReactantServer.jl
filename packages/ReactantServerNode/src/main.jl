@@ -1,8 +1,10 @@
 # Top-level assembly: resolve the role, detect devices, materialize the node file, build the
 # child specs, and run the supervisor. `main()` is the container entrypoint.
 
-function _resolve_role(role::Union{Symbol,AbstractString,Nothing}, env::AbstractDict,
-                       node::Union{AbstractDict,Nothing})
+function _resolve_role(
+        role::Union{Symbol, AbstractString, Nothing}, env::AbstractDict,
+        node::Union{AbstractDict, Nothing}
+    )
     r = if role !== nothing
         Symbol(lowercase(String(role)))
     elseif haskey(env, "REACTANT_ROLE")
@@ -19,9 +21,9 @@ function _resolve_role(role::Union{Symbol,AbstractString,Nothing}, env::Abstract
 end
 
 function _node_backend(node::AbstractDict)
-    g = get(node, "global", Dict{String,Any}())
+    g = get(node, "global", Dict{String, Any}())
     g isa AbstractDict || return "cpu"
-    rt = get(g, "runtime", Dict{String,Any}())
+    rt = get(g, "runtime", Dict{String, Any}())
     rt isa AbstractDict || return "cpu"
     return lowercase(String(get(rt, "backend", "cpu")))   # build_config's default backend is cpu
 end
@@ -31,9 +33,9 @@ end
 # below, without parsing the typed ServerConfig the workers build for themselves.
 function _node_runtime(node::AbstractDict)
     g = get(node, "global", nothing)
-    g isa AbstractDict || return Dict{String,Any}()
+    g isa AbstractDict || return Dict{String, Any}()
     rt = get(g, "runtime", nothing)
-    return rt isa AbstractDict ? rt : Dict{String,Any}()
+    return rt isa AbstractDict ? rt : Dict{String, Any}()
 end
 
 # The node's global.grpc dict, or an empty dict when absent/malformed. Workers pick this block up
@@ -42,9 +44,9 @@ end
 # node-level `global.grpc` block configures the workers and the gateway alike.
 function _node_grpc(node::AbstractDict)
     g = get(node, "global", nothing)
-    g isa AbstractDict || return Dict{String,Any}()
+    g isa AbstractDict || return Dict{String, Any}()
     gc = get(g, "grpc", nothing)
-    return gc isa AbstractDict ? gc : Dict{String,Any}()
+    return gc isa AbstractDict ? gc : Dict{String, Any}()
 end
 
 # A node-level grpc message-size value as an Int, or nothing when absent (so the gateway falls back
@@ -59,7 +61,7 @@ end
 
 # Write the materialized (workers synthesized, devices assigned) node file where children and
 # the healthcheck can read it. /run/reactantserver in the container; a temp dir elsewhere.
-function _write_materialized(node::AbstractDict, runtime_dir::Union{AbstractString,Nothing})
+function _write_materialized(node::AbstractDict, runtime_dir::Union{AbstractString, Nothing})
     if runtime_dir !== nothing
         mkpath(runtime_dir)
         path = joinpath(runtime_dir, "node.yaml")
@@ -80,7 +82,7 @@ end
 
 # An explicitly configured gateway file must exist; the conventional mount point is picked up
 # opportunistically. `nothing` means env-only gateway config (endpoints synthesized by us).
-function _resolve_gateway_path(gateway_path::Union{AbstractString,Nothing}, env::AbstractDict)
+function _resolve_gateway_path(gateway_path::Union{AbstractString, Nothing}, env::AbstractDict)
     gateway_path !== nothing && return String(gateway_path)
     if haskey(env, "REACTANT_GATEWAY_FILE")
         p = String(env["REACTANT_GATEWAY_FILE"])
@@ -112,13 +114,15 @@ Assemble the node's children without running them. Role precedence: keyword, `RE
 env, `role:` in the node file, then `all`. Tests and the in-process e2e use this directly
 (`run_supervisor!` + `request_shutdown!`); `supervise` is the blocking wrapper.
 """
-function build_supervisor(node_path::AbstractString;
-                          role::Union{Symbol,AbstractString,Nothing}=nothing,
-                          gateway_path::Union{AbstractString,Nothing}=nothing,
-                          sink::IO=stdout, env::AbstractDict=ENV,
-                          workspace_root::Union{AbstractString,Nothing}=nothing,
-                          runtime_dir::Union{AbstractString,Nothing}=nothing,
-                          max_restarts::Union{Integer,Nothing}=nothing)
+function build_supervisor(
+        node_path::AbstractString;
+        role::Union{Symbol, AbstractString, Nothing} = nothing,
+        gateway_path::Union{AbstractString, Nothing} = nothing,
+        sink::IO = stdout, env::AbstractDict = ENV,
+        workspace_root::Union{AbstractString, Nothing} = nothing,
+        runtime_dir::Union{AbstractString, Nothing} = nothing,
+        max_restarts::Union{Integer, Nothing} = nothing
+    )
     root = workspace_root !== nothing ? String(workspace_root) : default_workspace_root(env)
     node = isfile(node_path) ? load_node_raw(node_path) : nothing
     r = _resolve_role(role, env, node)
@@ -126,21 +130,21 @@ function build_supervisor(node_path::AbstractString;
         throw(ConfigError("node config file not found: $node_path"))
 
     mr = max_restarts !== nothing ? Int(max_restarts) :
-         parse(Int, get(env, "REACTANT_SUPERVISOR_MAX_RESTARTS", "0"))
+        parse(Int, get(env, "REACTANT_SUPERVISOR_MAX_RESTARTS", "0"))
 
     specs = ChildSpec[]
     notes = String[]
     gw_path = _resolve_gateway_path(gateway_path, env)
 
     if r === :gateway
-        push!(specs, gateway_spec(root; gateway_path=gw_path))
+        push!(specs, gateway_spec(root; gateway_path = gw_path))
     else
-        devices = detect_gpus(env; node=node)
+        devices = detect_gpus(env; node = node)
         if isempty(devices) && _node_backend(node) != "cpu"
             throw(ConfigError("no GPUs detected for a CUDA node; run the container with --gpus all, set REACTANT_GPUS, or set global.runtime.backend: cpu"))
         end
         cpu_workers = parse(Int, get(env, "REACTANT_CPU_WORKERS", "1"))
-        selectors = materialize_node!(node, devices; cpu_workers=cpu_workers)
+        selectors = materialize_node!(node, devices; cpu_workers = cpu_workers)
         validate_node(node)
         length(devices) > length(selectors) &&
             push!(notes, "node file defines $(length(selectors)) worker(s); $(length(devices) - length(selectors)) visible device(s) left unused")
@@ -163,11 +167,13 @@ function build_supervisor(node_path::AbstractString;
             gpu = lowercase(string(get(rt, "backend", "cpu"))) in ("cuda", "gpu")
             on_demand = gpu && frac isa Real && frac > 0
             shared = get(rt, "shared_host_weights", false) === true
-            on_demand && !shared && push!(notes,
+            on_demand && !shared && push!(
+                notes,
                 "WARNING: $(length(ws)) workers with the on-demand weight cache but " *
-                "global.runtime.shared_host_weights is off; each worker holds a private host copy " *
-                "of every model's weights ($(length(ws))x host RAM). Set shared_host_weights: true " *
-                "(and shared_host_weights_mode: \"660\") to share one copy across the workers.")
+                    "global.runtime.shared_host_weights is off; each worker holds a private host copy " *
+                    "of every model's weights ($(length(ws))x host RAM). Set shared_host_weights: true " *
+                    "(and shared_host_weights_mode: \"660\") to share one copy across the workers."
+            )
         end
 
         # A single worker needs no gateway: it serves the full KServe V2 API on its own. In the
@@ -181,18 +187,24 @@ function build_supervisor(node_path::AbstractString;
         # overrides the computed value verbatim (bypassing the share split and the cap).
         worker_threads = let v = strip(get(env, "REACTANT_WORKER_THREADS", ""))
             isempty(v) ? _worker_thread_count(Sys.CPU_THREADS, length(ws)) :
-                         max(1, parse(Int, v))
+                max(1, parse(Int, v))
         end
         push!(notes, "worker compute threads: $worker_threads (host $(Sys.CPU_THREADS) / $(length(ws)) worker(s))")
         # Meta sub-calls run in-process on each worker now (no loopback, no shared-memory mesh), so a
         # worker needs neither a gateway endpoint nor a fan-out region injected. Each worker keeps its
         # own local meta-scratch pool (sized by REACTANT_FANOUT_BYTES/_SLOTS, read in serve()).
         for (i, w) in enumerate(ws)
-            push!(specs, sole_public ?
-                worker_spec(_worker_name(w), node_file, selectors[i], root;
-                            compute_threads=worker_threads, grpc_port=gpub, metrics_port=mpub) :
-                worker_spec(_worker_name(w), node_file, selectors[i], root;
-                            compute_threads=worker_threads))
+            push!(
+                specs, sole_public ?
+                    worker_spec(
+                        _worker_name(w), node_file, selectors[i], root;
+                        compute_threads = worker_threads, grpc_port = gpub, metrics_port = mpub
+                    ) :
+                    worker_spec(
+                        _worker_name(w), node_file, selectors[i], root;
+                        compute_threads = worker_threads
+                    )
+            )
         end
         if sole_public
             push!(notes, "single worker: serving directly on $gpub (gRPC) / $mpub (metrics); no gateway")
@@ -200,16 +212,20 @@ function build_supervisor(node_path::AbstractString;
             overlap = intersect(Set(_worker_ports(node)), _gateway_listen_ports(gw_path, env))
             isempty(overlap) ||
                 push!(notes, "WARNING: worker port(s) $(sort!(collect(overlap))) collide with the gateway listen ports; adjust base_port / metrics_base_port")
-            push!(specs, gateway_spec(root; gateway_path=gw_path,
-                                      endpoints=gw_path === nothing ? worker_endpoints(node) : nothing,
-                                      metrics_endpoints=gw_path === nothing ? worker_metrics_endpoints(node) : nothing,
-                                      worker_names=gw_path === nothing ? String[_worker_name(w) for w in ws] : nothing,
-                                      grpc_max_recv=gw_path === nothing ? _node_grpc_bytes(node, "max_recv_msg_bytes") : nothing,
-                                      grpc_max_send=gw_path === nothing ? _node_grpc_bytes(node, "max_send_msg_bytes") : nothing))
+            push!(
+                specs, gateway_spec(
+                    root; gateway_path = gw_path,
+                    endpoints = gw_path === nothing ? worker_endpoints(node) : nothing,
+                    metrics_endpoints = gw_path === nothing ? worker_metrics_endpoints(node) : nothing,
+                    worker_names = gw_path === nothing ? String[_worker_name(w) for w in ws] : nothing,
+                    grpc_max_recv = gw_path === nothing ? _node_grpc_bytes(node, "max_recv_msg_bytes") : nothing,
+                    grpc_max_send = gw_path === nothing ? _node_grpc_bytes(node, "max_send_msg_bytes") : nothing
+                )
+            )
         end
     end
 
-    sup = Supervisor(specs; sink=sink, max_restarts=mr)
+    sup = Supervisor(specs; sink = sink, max_restarts = mr)
     foreach(n -> _slog(sup, n), notes)
     _slog(sup, "role=$r children=$(join([s.name for s in specs], ", "))")
     return sup
@@ -224,10 +240,12 @@ default all-in-one role), multiplex their output onto `sink` with `[name]` line 
 restart children that die, and block until SIGTERM/SIGINT (or a crash-loop budget breach).
 Returns the process exit code.
 """
-function supervise(node_path::AbstractString; sink::IO=stdout, env::AbstractDict=ENV,
-                   install_signal_handlers::Bool=true, kwargs...)
-    sup = build_supervisor(node_path; sink=sink, env=env, kwargs...)
-    return run_supervisor!(sup; install_signal_handlers=install_signal_handlers)
+function supervise(
+        node_path::AbstractString; sink::IO = stdout, env::AbstractDict = ENV,
+        install_signal_handlers::Bool = true, kwargs...
+    )
+    sup = build_supervisor(node_path; sink = sink, env = env, kwargs...)
+    return run_supervisor!(sup; install_signal_handlers = install_signal_handlers)
 end
 
 """

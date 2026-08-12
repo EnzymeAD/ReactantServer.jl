@@ -46,7 +46,7 @@ function _devfs_gpus(dir::AbstractString)
         m === nothing || push!(devs, String(m.captures[1]))
     end
     isempty(devs) && return nothing
-    return sort!(devs; by=x -> parse(Int, x))
+    return sort!(devs; by = x -> parse(Int, x))
 end
 
 """
@@ -58,8 +58,10 @@ count in the node file, a `CUDA_VISIBLE_DEVICES` already set on the container (s
 worker per token), `nvidia-smi` enumeration, and finally `/dev/nvidiaN`. An empty result means
 no GPUs; the caller decides whether that is a CPU node or an error.
 """
-function detect_gpus(env::AbstractDict=ENV; node::AbstractDict=Dict{String,Any}(),
-                     devdir::AbstractString="/dev")
+function detect_gpus(
+        env::AbstractDict = ENV; node::AbstractDict = Dict{String, Any}(),
+        devdir::AbstractString = "/dev"
+    )
     haskey(env, "REACTANT_GPUS") && return _parse_reactant_gpus(env["REACTANT_GPUS"])
     g = node_gpus(node)
     g isa Int && return _expand_count(g)

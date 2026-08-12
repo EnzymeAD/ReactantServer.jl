@@ -17,8 +17,12 @@ end
 # Render a tensor list as e.g. "x: f32[3,224,224,n], mask: f32[n]".
 function _format_specs(specs::Vector{TensorSpec})
     isempty(specs) && return "(none)"
-    return join(("$(s.name): $(dtype_token(s.dtype))[$(join((_format_dim(d) for d in s.shape), ","))]"
-                 for s in specs), ", ")
+    return join(
+        (
+            "$(s.name): $(dtype_token(s.dtype))[$(join((_format_dim(d) for d in s.shape), ","))]"
+                for s in specs
+        ), ", "
+    )
 end
 
 # The compiled batch sizes of a built model; the sole key 0 means a single unbatched module. With
@@ -106,9 +110,11 @@ live device allocator (or `device n/a` when unsupported, e.g. CPU), the server's
 accounting (when a `registry` is given), and the on-demand weight-cache budget (when a
 `weight_cache` is given).
 """
-function memory_report(backend::AbstractBackend, pool::MemoryPool;
-                       registry::Union{ModelRegistry,Nothing}=nothing,
-                       weight_cache=nothing)
+function memory_report(
+        backend::AbstractBackend, pool::MemoryPool;
+        registry::Union{ModelRegistry, Nothing} = nothing,
+        weight_cache = nothing
+    )
     parts = String[]
     stats = device_memory_stats(backend, pool)
     if stats === nothing
@@ -133,8 +139,10 @@ end
 # Consistent model summary, emitted from build_loaded_model so startup and the watcher format a
 # model identically. `source` distinguishes the trigger (:startup, :dynamic). `numerics` is the
 # effective f32/tf32 precision outcome (see format_numerics); "" when the caller has none (tests).
-function log_model_loaded(entry::ModelEntry, model::LoadedModel; source::Symbol, memory::AbstractString,
-                          numerics::AbstractString="")
+function log_model_loaded(
+        entry::ModelEntry, model::LoadedModel; source::Symbol, memory::AbstractString,
+        numerics::AbstractString = ""
+    )
     m = entry.manifest
     @info "model loaded" name = entry.name source = source inputs = _format_specs(m.executable_inputs) outputs = _format_specs(m.executable_outputs) batch_sizes = _compiled_sizes(model) weights = Base.format_bytes(model.nbytes) residency = model.state numerics = numerics memory = memory
     return nothing

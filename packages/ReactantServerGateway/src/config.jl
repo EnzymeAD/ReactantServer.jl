@@ -118,7 +118,7 @@ struct GatewayConfig
     #              one replica of a multi-replica model is the signature. Use it only to reproduce
     #              the pre-`run` behavior.
     routing_fill_mode::String
-    models::Dict{String,GatewayModelConfig}
+    models::Dict{String, GatewayModelConfig}
     # Concurrency limits. `max_concurrent_streams_per_worker` is the outbound cap: the in-flight
     # gRPC streams the gateway will multiplex over one worker's shared libcurl handle (the rest block
     # until a slot frees). `max_concurrent_requests_per_worker` sizes the inbound cap: the gateway
@@ -148,7 +148,7 @@ struct GatewayConfig
 end
 
 const GW_ENV_PREFIX = "REACTANT_GATEWAY_"
-const GW_ENV_PATHS = Tuple{String,Vector{String},DataType}[
+const GW_ENV_PATHS = Tuple{String, Vector{String}, DataType}[
     ("LISTEN_GRPC", ["listen", "grpc"], String),
     ("LISTEN_METRICS", ["listen", "metrics"], String),
     ("SCHEDULING_MODE", ["scheduling", "mode"], String),
@@ -178,7 +178,7 @@ const GW_ENV_PATHS = Tuple{String,Vector{String},DataType}[
 ]
 
 function _apply_gateway_env!(raw::AbstractDict)
-    applied = Tuple{String,String}[]
+    applied = Tuple{String, String}[]
     for (suffix, path, T) in GW_ENV_PATHS
         var = GW_ENV_PREFIX * suffix
         haskey(ENV, var) || continue
@@ -190,7 +190,7 @@ end
 
 # Parse an endpoint list (`endpoints:` / `metrics_endpoints:`) into a deduplicated,
 # order-preserving vector of host:port strings.
-function _gateway_endpoints(raw::AbstractDict, key::String="endpoints")
+function _gateway_endpoints(raw::AbstractDict, key::String = "endpoints")
     eps = get(raw, key, nothing)
     eps === nothing && return String[]
     eps isa AbstractVector || throw(ConfigError("gateway config '$key' must be a list of host:port strings"))
@@ -231,14 +231,14 @@ which is how the node supervisor launches an embedded gateway (it synthesizes
 """
 function load_gateway(gateway_path::AbstractString)
     isfile(gateway_path) || throw(ConfigError("gateway config file not found: $gateway_path"))
-    parsed = YAML.load_file(gateway_path; dicttype=Dict{String,Any})
+    parsed = YAML.load_file(gateway_path; dicttype = Dict{String, Any})
     parsed isa AbstractDict || throw(ConfigError("gateway config root must be a mapping"))
-    return _build_gateway_config(Dict{String,Any}(parsed))
+    return _build_gateway_config(Dict{String, Any}(parsed))
 end
 
-load_gateway(::Nothing) = _build_gateway_config(Dict{String,Any}())
+load_gateway(::Nothing) = _build_gateway_config(Dict{String, Any}())
 
-function _build_gateway_config(raw::Dict{String,Any})
+function _build_gateway_config(raw::Dict{String, Any})
     applied = _apply_gateway_env!(raw)
 
     listen = _subdict(raw, "listen")
@@ -324,12 +324,16 @@ function _build_gateway_config(raw::Dict{String,Any})
     # identical range. The return values are discarded here: the fields are already built and these
     # calls exist for their throw.
     _ck_positive("scheduling.rebalance_compute_seconds", cfg.rebalance_compute_seconds)
-    _ck_nonneg("scheduling.first_rebalance_compute_seconds", cfg.first_rebalance_compute_seconds;
-               hint = "0 = use rebalance_compute_seconds")
+    _ck_nonneg(
+        "scheduling.first_rebalance_compute_seconds", cfg.first_rebalance_compute_seconds;
+        hint = "0 = use rebalance_compute_seconds"
+    )
     0 < cfg.max_worker_share <= 1 || throw(ConfigError("scheduling.max_worker_share must be in (0, 1]"))
     _ck_unit("scheduling.hysteresis", cfg.hysteresis)
-    _ck_nonneg("scheduling.ema_halflife_compute_seconds", cfg.ema_halflife_compute_seconds;
-               hint = "0 = use rebalance_compute_seconds")
+    _ck_nonneg(
+        "scheduling.ema_halflife_compute_seconds", cfg.ema_halflife_compute_seconds;
+        hint = "0 = use rebalance_compute_seconds"
+    )
     _ck_positive("scheduling.routing_fill_factor", cfg.routing_fill_factor)
     _ck_nonneg_int("scheduling.compaction_interval", cfg.compaction_interval; hint = "0 = disabled")
 
@@ -349,13 +353,13 @@ end
 # boundary value where one exists (e.g. "0 = use rebalance_compute_seconds").
 _ck_hint(h::AbstractString) = isempty(h) ? "" : " ($h)"
 
-function _ck_positive(key::AbstractString, v; hint::AbstractString="")
+function _ck_positive(key::AbstractString, v; hint::AbstractString = "")
     x = Float64(v)
     x > 0 || throw(ConfigError("$key must be positive$(_ck_hint(hint)), got $x"))
     return x
 end
 
-function _ck_nonneg(key::AbstractString, v; hint::AbstractString="")
+function _ck_nonneg(key::AbstractString, v; hint::AbstractString = "")
     x = Float64(v)
     x >= 0 || throw(ConfigError("$key must be non-negative$(_ck_hint(hint)), got $x"))
     return x
@@ -363,13 +367,13 @@ end
 
 # Half-open [0, 1): a hysteresis of 1 would mean "never move", which is `mode: round_robin` with
 # extra steps, so it is rejected rather than silently freezing the packer.
-function _ck_unit(key::AbstractString, v; hint::AbstractString="")
+function _ck_unit(key::AbstractString, v; hint::AbstractString = "")
     x = Float64(v)
     0 <= x < 1 || throw(ConfigError("$key must be in [0, 1)$(_ck_hint(hint)), got $x"))
     return x
 end
 
-function _ck_nonneg_int(key::AbstractString, v; hint::AbstractString="")
+function _ck_nonneg_int(key::AbstractString, v; hint::AbstractString = "")
     x = Int(v)
     x >= 0 || throw(ConfigError("$key must be non-negative$(_ck_hint(hint)), got $x"))
     return x
@@ -409,7 +413,7 @@ end
 # What the per-replica fill quantum counts. `run` counts requests routed to the current replica,
 # `spread` equalizes in-flight work across the replica set, and `inflight` is the legacy basis that
 # counts requests in flight. `inherit` is accepted only in a per-model override.
-function _parse_fill_mode(s; allow_inherit::Bool=false)
+function _parse_fill_mode(s; allow_inherit::Bool = false)
     ls = lowercase(strip(String(s)))
     allow_inherit && ls == "inherit" && return :inherit
     ls in ("run", "spread", "inflight") ||
@@ -440,17 +444,19 @@ end
 # Unlisted models use `default_replicas`.
 function _parse_gateway_sched_models(sched::AbstractDict)
     raw = get(sched, "models", nothing)
-    raw === nothing && return Dict{String,GatewayModelConfig}()
+    raw === nothing && return Dict{String, GatewayModelConfig}()
     raw isa AbstractDict || throw(ConfigError("scheduling.models must be a mapping"))
-    out = Dict{String,GatewayModelConfig}()
+    out = Dict{String, GatewayModelConfig}()
     for (name, v) in raw
         key = "scheduling.models.$name"
         v isa AbstractDict || throw(ConfigError("$key must be a mapping"))
         fm = haskey(v, "fill_mode") ?
-             _parse_fill_mode(v["fill_mode"]; allow_inherit = true) : :inherit
+            _parse_fill_mode(v["fill_mode"]; allow_inherit = true) : :inherit
         ff = haskey(v, "fill_factor") ? _ck_positive("$key.fill_factor", v["fill_factor"]) : 0.0
-        out[String(name)] = GatewayModelConfig(_parse_replicas(get(v, "replicas", 1), "$key.replicas"),
-                                               fm, ff)
+        out[String(name)] = GatewayModelConfig(
+            _parse_replicas(get(v, "replicas", 1), "$key.replicas"),
+            fm, ff
+        )
     end
     return out
 end

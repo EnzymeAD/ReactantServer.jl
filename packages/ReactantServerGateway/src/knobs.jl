@@ -48,7 +48,7 @@ struct PackingKnobs
     rebalance_compute_seconds::Float64
     first_rebalance_compute_seconds::Float64   # 0 = no separate first-repack budget
     default_replicas::Int
-    model_overrides::Dict{String,ModelKnobs}
+    model_overrides::Dict{String, ModelKnobs}
     routing_fill_factor::Float64
     routing_policy::Symbol                     # :fill_rr | :fill_least
     # What one unit of in-flight work is, for `fill_least`'s per-worker load (and the same knob the
@@ -70,7 +70,7 @@ function PackingKnobs(cfg::GatewayConfig)
         cfg.rebalance_compute_seconds,
         cfg.first_rebalance_compute_seconds,
         cfg.default_replicas,
-        Dict{String,ModelKnobs}(name => ModelKnobs(mc) for (name, mc) in cfg.models),
+        Dict{String, ModelKnobs}(name => ModelKnobs(mc) for (name, mc) in cfg.models),
         cfg.routing_fill_factor,
         Symbol(cfg.routing_policy),
         Symbol(cfg.work_basis),
@@ -119,8 +119,10 @@ An unknown max batch yields a quantum of 1, which is the honest degradation: wit
 aim at, `run` becomes exact rotation and `spread` becomes least-in-flight, rather than pretending to
 fill something.
 """
-function resolve_fill_plan(k::PackingKnobs, model::AbstractString, max_batch::Int,
-                          batch_input::AbstractString = "", batch_axis::Integer = 0)
+function resolve_fill_plan(
+        k::PackingKnobs, model::AbstractString, max_batch::Int,
+        batch_input::AbstractString = "", batch_axis::Integer = 0
+    )
     mk = get(k.model_overrides, model, nothing)
     mode = (mk === nothing || mk.fill_mode === :inherit) ? k.routing_fill_mode : mk.fill_mode
     factor = (mk === nothing || mk.fill_factor <= 0) ? k.routing_fill_factor : mk.fill_factor
@@ -133,7 +135,7 @@ end
 # `default_replicas` through `compute_assignment`'s own `get`. Rebuilt per repack; repacks are rare
 # and the request path never touches this.
 replica_overrides(k::PackingKnobs) =
-    Dict{String,Int}(m => mk.replicas for (m, mk) in k.model_overrides if mk.replicas > 0)
+    Dict{String, Int}(m => mk.replicas for (m, mk) in k.model_overrides if mk.replicas > 0)
 
 # Validate and coerce one knob by field name, through the same checks `gateway.yml` uses (config.jl),
 # so the config path and the control plane cannot disagree about what a knob accepts. Unknown names
@@ -146,8 +148,10 @@ function _validate_knob(field::Symbol, v)
     field === :rebalance_compute_seconds &&
         return _ck_positive("scheduling.rebalance_compute_seconds", v)
     field === :first_rebalance_compute_seconds &&
-        return _ck_nonneg("scheduling.first_rebalance_compute_seconds", v;
-                          hint = "0 = use rebalance_compute_seconds")
+        return _ck_nonneg(
+        "scheduling.first_rebalance_compute_seconds", v;
+        hint = "0 = use rebalance_compute_seconds"
+    )
     field === :default_replicas && return _parse_replicas(v, "scheduling.default_replicas")
     field === :routing_fill_factor && return _ck_positive("scheduling.routing_fill_factor", v)
     field === :routing_policy && return _parse_routing_policy(v)
@@ -157,7 +161,7 @@ function _validate_knob(field::Symbol, v)
     field === :compaction_interval &&
         return _ck_nonneg_int("scheduling.compaction_interval", v; hint = "0 = disabled")
     field === :forbid_memory_oversubscription && return Bool(v)
-    field === :model_overrides && return v::Dict{String,ModelKnobs}
+    field === :model_overrides && return v::Dict{String, ModelKnobs}
     field === :generation && return Int(v)
     throw(ConfigError("unknown scheduling knob '$field'"))
 end
@@ -225,16 +229,18 @@ struct RepackReport
     count::Int                    # repacks since start, including the startup placement
     models_placed::Int
     models_moved::Int
-    utilization::Dict{String,Float64}
-    rate::Dict{String,Float64}
-    cost::Dict{String,Float64}
-    mem::Dict{String,Float64}     # per-model weight footprint seen by this repack
-    mem_cap::Dict{String,Float64} # per-worker weight budget (0 = unconstrained)
+    utilization::Dict{String, Float64}
+    rate::Dict{String, Float64}
+    cost::Dict{String, Float64}
+    mem::Dict{String, Float64}     # per-model weight footprint seen by this repack
+    mem_cap::Dict{String, Float64} # per-worker weight budget (0 = unconstrained)
     polled::Vector{String}
     drifted::Set{String}          # models not reported by every ready worker
 end
 
-RepackReport() = RepackReport(0.0, 0.0, 0.0, :none, 0, 0, 0,
-                              Dict{String,Float64}(), Dict{String,Float64}(),
-                              Dict{String,Float64}(), Dict{String,Float64}(),
-                              Dict{String,Float64}(), String[], Set{String}())
+RepackReport() = RepackReport(
+    0.0, 0.0, 0.0, :none, 0, 0, 0,
+    Dict{String, Float64}(), Dict{String, Float64}(),
+    Dict{String, Float64}(), Dict{String, Float64}(),
+    Dict{String, Float64}(), String[], Set{String}()
+)

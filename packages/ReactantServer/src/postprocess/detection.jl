@@ -28,7 +28,7 @@ Greedy IoU suppression on xyxy `boxes` [N,4] by `scores` [N]. Returns kept row i
 descending-score order, matching torchvision.ops.nms.
 """
 function nms(boxes::AbstractMatrix, scores::AbstractVector, thresh::Real)
-    order = sortperm(scores; rev=true)
+    order = sortperm(scores; rev = true)
     kept = Int[]
     suppressed = falses(length(order))
     @inbounds for ii in eachindex(order)
@@ -71,7 +71,7 @@ const SCALE_CLAMP = log(1000.0 / 16.0)
 `deltas` [M,B] (B a multiple of 4, class-specific groups), `boxes` [M,4] anchors/proposals, `weights`
 (wx,wy,ww,wh). Output xyxy per group, layout [x1,y1,x2,y2] interleaved per class.
 """
-function decode_boxes(deltas::AbstractMatrix, boxes::AbstractMatrix, weights::NTuple{4,<:Real})
+function decode_boxes(deltas::AbstractMatrix, boxes::AbstractMatrix, weights::NTuple{4, <:Real})
     M, B = size(deltas); nc = B ÷ 4
     out = Matrix{Float64}(undef, M, B)
     wx, wy, ww, wh = weights
@@ -123,9 +123,11 @@ end
 # loading a fresh line per channel, as a per-channel bilinear call did). The per-channel arithmetic
 # and the per-channel accumulation order over samples match the previous per-channel formulation
 # exactly, so the result is bit-for-bit unchanged. `acc` is reset here for this bin.
-function _roi_bin_accum!(acc::AbstractVector{Float64}, feat::AbstractArray{<:Real,3},
-                         C::Int, H::Int, W::Int, sh::Float64, sw::Float64, bh::Float64, bw::Float64,
-                         ph::Int, pw::Int, gh::Int, gw::Int)
+function _roi_bin_accum!(
+        acc::AbstractVector{Float64}, feat::AbstractArray{<:Real, 3},
+        C::Int, H::Int, W::Int, sh::Float64, sw::Float64, bh::Float64, bw::Float64,
+        ph::Int, pw::Int, gh::Int, gw::Int
+    )
     @inbounds for c in 1:C
         acc[c] = 0.0
     end
@@ -155,7 +157,7 @@ function _roi_bin_accum!(acc::AbstractVector{Float64}, feat::AbstractArray{<:Rea
             r0 = yl + 1; r1 = yh + 1; q0 = xl + 1; q1 = xh + 1
             for c in 1:C
                 acc[c] += w00 * feat[c, r0, q0] + w01 * feat[c, r0, q1] +
-                          w10 * feat[c, r1, q0] + w11 * feat[c, r1, q1]
+                    w10 * feat[c, r1, q0] + w11 * feat[c, r1, q1]
             end
         end
     end
@@ -172,8 +174,10 @@ sampling by a half pixel (`box*scale - 0.5`); `false` (the torchvision detection
 default) uses no offset and clamps each ROI's width/height to at least one pixel (the legacy
 malformed-ROI guard).
 """
-function roi_align!(out::AbstractArray{<:Real,4}, feat::AbstractArray{<:Real,3},
-                    boxes::AbstractMatrix, scale::Real; pooled::Int=7, ratio::Int=0, aligned::Bool=true)
+function roi_align!(
+        out::AbstractArray{<:Real, 4}, feat::AbstractArray{<:Real, 3},
+        boxes::AbstractMatrix, scale::Real; pooled::Int = 7, ratio::Int = 0, aligned::Bool = true
+    )
     C, H, W = size(feat)
     K = size(boxes, 1)
     off = aligned ? 0.5 : 0.0
@@ -207,8 +211,10 @@ Lets a meta stage ROI features straight into a shared-memory scratch slot. Same 
 is bit-identical to the old `Float64` roi_align + final `Float32` convert. See `roi_align!` for the
 `aligned` convention (half-pixel offset `true` vs torchvision detection `false`).
 """
-function roi_align_wire!(out::AbstractArray{<:Real,4}, feat::AbstractArray{<:Real,3},
-                         boxes::AbstractMatrix, scale::Real; pooled::Int=7, ratio::Int=0, aligned::Bool=true)
+function roi_align_wire!(
+        out::AbstractArray{<:Real, 4}, feat::AbstractArray{<:Real, 3},
+        boxes::AbstractMatrix, scale::Real; pooled::Int = 7, ratio::Int = 0, aligned::Bool = true
+    )
     C, H, W = size(feat)
     K = size(boxes, 1)
     off = aligned ? 0.5 : 0.0
@@ -240,12 +246,14 @@ end
 find_top_rpn_proposals: per-level top-`pre` by objectness, clip to image, drop empty, level-aware
 NMS, then top-`post`. `boxes_levels[i]`/`scores_levels[i]` are the decoded boxes/objectness for level i.
 """
-function select_rpn_proposals(boxes_levels::Vector{<:AbstractMatrix}, scores_levels::Vector{<:AbstractVector},
-                              imgH::Real, imgW::Real; pre::Int=1000, post::Int=1000, nms_thresh::Real=0.7)
+function select_rpn_proposals(
+        boxes_levels::Vector{<:AbstractMatrix}, scores_levels::Vector{<:AbstractVector},
+        imgH::Real, imgW::Real; pre::Int = 1000, post::Int = 1000, nms_thresh::Real = 0.7
+    )
     bs = Matrix{Float64}[]; ss = Vector{Float64}[]; lv = Vector{Int}[]
     for (lid, (b, s)) in enumerate(zip(boxes_levels, scores_levels))
         n = min(length(s), pre)
-        idx = partialsortperm(s, 1:n; rev=true)
+        idx = partialsortperm(s, 1:n; rev = true)
         push!(bs, b[idx, :]); push!(ss, Float64.(s[idx])); push!(lv, fill(lid, n))
     end
     boxes = reduce(vcat, bs); scores = reduce(vcat, ss); lvl = reduce(vcat, lv)
@@ -276,10 +284,12 @@ column `c` is `c-1` (0-based), and the emitted class id is `c-1`.
 `min_size` drops decoded boxes whose width or height is below it before the final NMS (torchvision's
 `postprocess_detections` uses `1e-2`); the default `0.0` keeps every box.
 """
-function fast_rcnn_inference(cls::AbstractMatrix, deltas::AbstractMatrix, proposals::AbstractMatrix,
-                             imgH::Real, imgW::Real; score_thresh::Real, nms_thresh::Real,
-                             topk::Int, weights::NTuple{4,<:Real}=(10.0, 10.0, 5.0, 5.0),
-                             bg_first::Bool=false, min_size::Real=0.0)
+function fast_rcnn_inference(
+        cls::AbstractMatrix, deltas::AbstractMatrix, proposals::AbstractMatrix,
+        imgH::Real, imgW::Real; score_thresh::Real, nms_thresh::Real,
+        topk::Int, weights::NTuple{4, <:Real} = (10.0, 10.0, 5.0, 5.0),
+        bg_first::Bool = false, min_size::Real = 0.0
+    )
     K = size(cls, 1); nrc = size(deltas, 2) ÷ 4
     dec = decode_boxes(deltas, proposals, weights)            # [K, nrc*4]
     @inbounds for m in 1:K, c in 0:(nrc - 1)
@@ -300,8 +310,10 @@ function fast_rcnn_inference(cls::AbstractMatrix, deltas::AbstractMatrix, propos
     isempty(cs) && return (Matrix{Float64}(undef, 0, 4), Float64[], Int[])
     boxes = reduce(vcat, (b' for b in cb))
     if min_size > 0
-        ks = findall(i -> (boxes[i, 3] - boxes[i, 1]) >= min_size && (boxes[i, 4] - boxes[i, 2]) >= min_size,
-                     1:size(boxes, 1))
+        ks = findall(
+            i -> (boxes[i, 3] - boxes[i, 1]) >= min_size && (boxes[i, 4] - boxes[i, 2]) >= min_size,
+            1:size(boxes, 1)
+        )
         isempty(ks) && return (Matrix{Float64}(undef, 0, 4), Float64[], Int[])
         boxes, cs, cc = boxes[ks, :], cs[ks], cc[ks]
     end
@@ -345,13 +357,15 @@ function deltas_matrix(D::AbstractArray)
 end
 
 "feature map (W,H,C,1) -> [C,H,W] for roi_align!"
-feature_chw(F::AbstractArray) = permutedims(dropdims(F; dims=4), (3, 2, 1))
+feature_chw(F::AbstractArray) = permutedims(dropdims(F; dims = 4), (3, 2, 1))
 
 "FPN ROIPooler level for a box (FPN paper Eqn.1): clamp(floor(log2(sqrt(area)/canon_size+1e-8)+canon_level),min,max)-min"
-function assign_level(box::AbstractVector; canon_level::Int=4, canon_size::Real=224,
-                      min_level::Int=2, max_level::Int=5)
+function assign_level(
+        box::AbstractVector; canon_level::Int = 4, canon_size::Real = 224,
+        min_level::Int = 2, max_level::Int = 5
+    )
     area = max(0.0, (box[3] - box[1]) * (box[4] - box[2]))
-    return Int(clamp(floor(log2(sqrt(area) / canon_size + 1e-8) + canon_level), min_level, max_level)) - min_level
+    return Int(clamp(floor(log2(sqrt(area) / canon_size + 1.0e-8) + canon_level), min_level, max_level)) - min_level
 end
 
 end # module DetectionGlue

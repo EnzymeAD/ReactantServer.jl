@@ -37,26 +37,34 @@ model(name) = KServeModel(URL, name; max_batch_size = 8)
 
 function demo_embedding()
     println("\n== dense embedding (all-MiniLM-L6-v2) ==")
-    texts = ["A dog runs across the park.",
-             "A puppy sprints through the field.",
-             "The quarterly earnings report was released today."]
+    texts = [
+        "A dog runs across the park.",
+        "A puppy sprints through the field.",
+        "The quarterly earnings report was released today.",
+    ]
     mat, lens = pack_texts(texts)
-    resp = infer_sync(model("embedding"),
-                      [InferInput("texts", mat), InferInput("text_lens", lens)])
+    resp = infer_sync(
+        model("embedding"),
+        [InferInput("texts", mat), InferInput("text_lens", lens)]
+    )
     emb = InferOutput("embedding", resp, Float32)      # (dim, batch)
     cos(a, b) = sum(emb[:, a] .* emb[:, b])            # unit-norm rows -> dot product is cosine
-    println("  embedding dim = $(size(emb, 1)), row norms ≈ ",
-            round.([sqrt(sum(abs2, emb[:, b])) for b in 1:size(emb, 2)]; digits = 4))
+    println(
+        "  embedding dim = $(size(emb, 1)), row norms ≈ ",
+        round.([sqrt(sum(abs2, emb[:, b])) for b in 1:size(emb, 2)]; digits = 4)
+    )
     println("  cosine(1, 2) = $(round(cos(1, 2); digits = 4))  (near-paraphrase)")
-    println("  cosine(1, 3) = $(round(cos(1, 3); digits = 4))  (unrelated)")
+    return println("  cosine(1, 3) = $(round(cos(1, 3); digits = 4))  (unrelated)")
 end
 
 function demo_splade(; topk = 8)
     println("\n== SPLADE (naver/splade-cocondenser-ensembledistil) ==")
     text = "The central bank raised interest rates to curb inflation."
     mat, lens = pack_texts([text])
-    resp = infer_sync(model("splade"),
-                      [InferInput("texts", mat), InferInput("text_lens", lens)])
+    resp = infer_sync(
+        model("splade"),
+        [InferInput("texts", mat), InferInput("text_lens", lens)]
+    )
     indices = InferOutput("indices", resp, Int32)
     values = InferOutput("values", resp, Float32)
     offsets = InferOutput("row_offsets", resp, Int64)  # 0-based, length batch+1
@@ -68,44 +76,57 @@ function demo_splade(; topk = 8)
         id = indices[span[j]]
         println("    $(rpad(token_for(id), 16)) $(round(values[span[j]]; digits = 3))")
     end
+    return
 end
 
 function demo_cross()
     println("\n== cross encoder (cross-encoder/ms-marco-MiniLM-L-6-v2) ==")
     query = "How do I treat a cold?"
-    candidates = ["Rest, fluids, and over-the-counter medicine help with a cold.",
-                  "The GDP grew by two percent last quarter.",
-                  "Drinking warm tea can soothe a sore throat from a cold."]
+    candidates = [
+        "Rest, fluids, and over-the-counter medicine help with a cold.",
+        "The GDP grew by two percent last quarter.",
+        "Drinking warm tea can soothe a sore throat from a cold.",
+    ]
     keys, key_lens = pack_texts(candidates)
-    resp = infer_sync(model("cross_encoder"),
-                      [InferInput("query", Vector{UInt8}(codeunits(query))),
-                       InferInput("keys", keys), InferInput("key_lens", key_lens)])
+    resp = infer_sync(
+        model("cross_encoder"),
+        [
+            InferInput("query", Vector{UInt8}(codeunits(query))),
+            InferInput("keys", keys), InferInput("key_lens", key_lens),
+        ]
+    )
     prob = InferOutput("prob", resp, Float32)          # (batch,)
     println("  query: ", query)
     for i in sortperm(prob; rev = true)
         println("    $(round(prob[i]; digits = 4))  $(candidates[i])")
     end
+    return
 end
 
 function demo_sentiment()
     println("\n== sentiment (distilbert-base-uncased-finetuned-sst-2-english) ==")
-    texts = ["I absolutely loved this movie, it was fantastic!",
-             "The plot was dull and the acting was terrible.",
-             "It was fine, nothing special."]
+    texts = [
+        "I absolutely loved this movie, it was fantastic!",
+        "The plot was dull and the acting was terrible.",
+        "It was fine, nothing special.",
+    ]
     mat, lens = pack_texts(texts)
-    resp = infer_sync(model("sentiment"),
-                      [InferInput("texts", mat), InferInput("text_lens", lens)])
+    resp = infer_sync(
+        model("sentiment"),
+        [InferInput("texts", mat), InferInput("text_lens", lens)]
+    )
     probs = InferOutput("probs", resp, Float32)        # (2, batch)
     label_id = InferOutput("label_id", resp, Int32)    # (batch,)
     for b in eachindex(label_id)
         label = SENTIMENT_LABELS[label_id[b] + 1]
         println("    $(rpad(label, 8)) $(round(probs[label_id[b] + 1, b]; digits = 4))  \"$(texts[b])\"")
     end
+    return
 end
 
 function main()
     kserve_init()
-    try
+    return try
         @info "Querying transformer bundles" server = "$HOST:$PORT"
         demo_embedding()
         demo_splade()

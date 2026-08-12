@@ -48,7 +48,7 @@ end
 ```
 """
 macro infer_inbounds(ex)
-    quote
+    return quote
         if $(_FORCE_BOUNDS)[]
             $(esc(ex))
         else
@@ -64,8 +64,8 @@ struct TensorMeta
 end
 
 struct ModelIOSpec
-    inputs::Dict{String,TensorMeta}
-    outputs::Dict{String,TensorMeta}
+    inputs::Dict{String, TensorMeta}
+    outputs::Dict{String, TensorMeta}
     input_order::Vector{String}
     output_order::Vector{String}
 end
@@ -75,8 +75,8 @@ end
 _tensor_meta(t) = TensorMeta(t.name, t.datatype, reverse(Int[Int(s) for s in t.shape]))
 
 function _parse_io_spec(resp::ModelMetadataResponse)
-    inputs = Dict{String,TensorMeta}()
-    outputs = Dict{String,TensorMeta}()
+    inputs = Dict{String, TensorMeta}()
+    outputs = Dict{String, TensorMeta}()
     in_order = String[]
     out_order = String[]
     for t in resp.inputs
@@ -143,7 +143,7 @@ end
 # trailing batch axis from the model shape (the batch axis is last in column-major order).
 function _alignable(user_shape, meta_shape, user_has_batch)
     user_has_batch && return _shapes_match(user_shape, meta_shape)
-    if length(meta_shape) == length(user_shape) + 1 && _shapes_match(user_shape, @view meta_shape[1:end-1])
+    if length(meta_shape) == length(user_shape) + 1 && _shapes_match(user_shape, @view meta_shape[1:(end - 1)])
         return true
     end
     return _shapes_match(user_shape, meta_shape)
@@ -154,8 +154,10 @@ function _check_shape(name, kind, user_shape, meta_shape; user_has_batch::Bool)
     hint = _alignable(reverse(user_shape), meta_shape, user_has_batch) ?
         " The declared shape matches the model only when reversed; check the axis order (shapes " *
         "here are Julia column-major, with the batch axis last)." : ""
-    error("$kind '$name' shape $(collect(user_shape)) is incompatible with the model shape " *
-          "$(meta_shape); -1 is a wildcard for batch or dynamic dims.$hint")
+    error(
+        "$kind '$name' shape $(collect(user_shape)) is incompatible with the model shape " *
+            "$(meta_shape); -1 is a wildcard for batch or dynamic dims.$hint"
+    )
 end
 
 # ---- descriptor / spec validation ----
@@ -171,6 +173,7 @@ function _validate_input_descriptors(spec::ModelIOSpec, descriptors)
             error("input '$(d.name)' declares dtype $(want) but the model expects $(meta.datatype)")
         _check_shape(d.name, "input", d.shape, meta.shape; user_has_batch = true)
     end
+    return
 end
 
 function _validate_output_specs(spec::ModelIOSpec, specs::Vector{OutputSpec})
@@ -185,6 +188,7 @@ function _validate_output_specs(spec::ModelIOSpec, specs::Vector{OutputSpec})
         # per_item_dims and the model shape are both Julia column-major; compare directly.
         _check_shape(s.name, "output", s.per_item_dims, meta.shape; user_has_batch = false)
     end
+    return
 end
 
 # ---- synthetic response ----
@@ -194,7 +198,7 @@ end
 # Julia column-major, so reverse it to wire order first: a leading -1 (batch, by KServe convention)
 # becomes `batch`; remaining -1 dims are filled from a declared OutputSpec's per-item dims when
 # available, else 1.
-function _resolve_wire_shape(meta::TensorMeta, batch::Int, declared::Union{OutputSpec,Nothing})
+function _resolve_wire_shape(meta::TensorMeta, batch::Int, declared::Union{OutputSpec, Nothing})
     shape = reverse(meta.shape)
     isempty(shape) && return shape
     shape[1] == -1 && (shape[1] = batch)
@@ -226,8 +230,11 @@ function _synth_response(spec::ModelIOSpec, io, r)
         end
         wire = _resolve_wire_shape(meta, batch, get(declared, name, nothing))
         nbytes = sizeof(dt) * (isempty(wire) ? 1 : prod(wire))
-        push!(outs, var"ModelInferResponse.InferOutputTensor"(
-            name = name, datatype = meta.datatype, shape = Int64[wire...]))
+        push!(
+            outs, var"ModelInferResponse.InferOutputTensor"(
+                name = name, datatype = meta.datatype, shape = Int64[wire...]
+            )
+        )
         push!(raw, zeros(UInt8, nbytes))
     end
     return ModelInferResponse(model_name = "validate_io", outputs = outs, raw_output_contents = raw)
@@ -277,8 +284,10 @@ function validate_io(spec::ModelIOSpec, io::AbstractInferenceIO; items::Integer 
                 infer_encode_chunk!(io, r, slot)
             end
         catch ex
-            error("infer_encode_chunk!($(typeof(io)), $r) failed during validate_io: " *
-                  "$(sprint(showerror, ex))")
+            error(
+                "infer_encode_chunk!($(typeof(io)), $r) failed during validate_io: " *
+                    "$(sprint(showerror, ex))"
+            )
         end
         _validate_input_descriptors(spec, _encoded_inputs(inputs))
 
@@ -288,9 +297,11 @@ function validate_io(spec::ModelIOSpec, io::AbstractInferenceIO; items::Integer 
                 infer_decode_chunk!(io, r, response)
             end
         catch ex
-            error("infer_decode_chunk!($(typeof(io)), $r) failed against a synthetic response shaped " *
-                  "from the model spec; this usually means the result handling assumes a different " *
-                  "output shape or index than the model produces: $(sprint(showerror, ex))")
+            error(
+                "infer_decode_chunk!($(typeof(io)), $r) failed against a synthetic response shaped " *
+                    "from the model spec; this usually means the result handling assumes a different " *
+                    "output shape or index than the model produces: $(sprint(showerror, ex))"
+            )
         end
     finally
         release_slot!(slot)

@@ -55,13 +55,14 @@ lets workers running as unrelated UIDs (for example different containers) share 
 but is world-writable; `0o660` is recommended for production and multi-user systems.
 """
 mutable struct SharedWeightStore <: WeightStore
-    attached::Dict{String,NamedTuple{(:shm, :fd, :name, :lockpath),Tuple{SharedMemory,Cint,String,String}}}
+    attached::Dict{String, NamedTuple{(:shm, :fd, :name, :lockpath), Tuple{SharedMemory, Cint, String, String}}}
     lock::ReentrantLock
     mode::UInt16                  # POSIX permission bits for the regions and lock files
 end
-SharedWeightStore(; mode::Integer=0o666) = SharedWeightStore(
-    Dict{String,NamedTuple{(:shm, :fd, :name, :lockpath),Tuple{SharedMemory,Cint,String,String}}}(),
-    ReentrantLock(), UInt16(mode))
+SharedWeightStore(; mode::Integer = 0o666) = SharedWeightStore(
+    Dict{String, NamedTuple{(:shm, :fd, :name, :lockpath), Tuple{SharedMemory, Cint, String, String}}}(),
+    ReentrantLock(), UInt16(mode)
+)
 
 const _RSW_MAGIC = 0x52535701      # 'RSW' + format version 1
 const _RSW_DATA_OFFSET = 64        # header occupies the first bytes; tensor data starts here
@@ -77,14 +78,14 @@ const _O_CREAT = Cint(0o100)
 const _MS_SYNC = Cint(4)
 
 _flock(fd::Cint, op::Cint) = ccall(:flock, Cint, (Cint, Cint), fd, op)
-_open_lock(path::AbstractString, mode::Integer=0o666) =
+_open_lock(path::AbstractString, mode::Integer = 0o666) =
     ccall(:open, Cint, (Cstring, Cint, Cint), path, _O_RDWR | _O_CREAT, Cint(mode))
 _close_fd(fd::Cint) = ccall(:close, Cint, (Cint,), fd)
 _shm_unlink(name::AbstractString) = ccall(:shm_unlink, Cint, (Cstring,), name)
 _msync(shm::SharedMemory) =
     ccall(:msync, Cint, (Ptr{Cvoid}, Csize_t, Cint), pointer(shm), Csize_t(sizeof(shm)), _MS_SYNC)
 
-_align(n::Integer, a::Integer=_RSW_ALIGN) = ((Int(n) + a - 1) ÷ a) * a
+_align(n::Integer, a::Integer = _RSW_ALIGN) = ((Int(n) + a - 1) ÷ a) * a
 
 # A 64-bit FNV-1a over a byte string. Used for the content digest because it is stable across
 # processes and Julia versions (unlike `hash`, which can fold object identities).
@@ -108,9 +109,9 @@ agree on the same region key. Without the content token a weights-only update (s
 tensor layout) would collide with the previous version's region and silently serve stale weights,
 including across server restarts (regions in `/dev/shm` outlive the process by design).
 """
-function weights_digest(key::AbstractString, specs; content::UInt64=UInt64(0))
+function weights_digest(key::AbstractString, specs; content::UInt64 = UInt64(0))
     io = IOBuffer()
-    print(io, "rsw2|", key, "|c", string(content; base=16))
+    print(io, "rsw2|", key, "|c", string(content; base = 16))
     for (T, dims) in specs
         print(io, "|", string(T), ":", sizeof(T), ":", join(dims, ","))
     end
@@ -152,7 +153,7 @@ function _build_arrays(shm::SharedMemory, specs, offs)
     base = convert(Ptr{UInt8}, pointer(shm))
     arrays = Any[]
     for ((T, dims), o) in zip(specs, offs)
-        push!(arrays, unsafe_wrap(Array, convert(Ptr{T}, base + o), Tuple(dims); own=false))
+        push!(arrays, unsafe_wrap(Array, convert(Ptr{T}, base + o), Tuple(dims); own = false))
     end
     return arrays
 end
@@ -200,7 +201,7 @@ end
 # in /dev/shm (a RAM-backed tmpfs) forever. This reclaims exactly those, touching nothing in use.
 function _sweep_stale_versions(store::SharedWeightStore, key::AbstractString, keep_digest::UInt64)
     san = _sanitize_name(key)
-    keep = "rsw-" * san * "-" * string(keep_digest; base=16)
+    keep = "rsw-" * san * "-" * string(keep_digest; base = 16)
     rx = Regex("^rsw-" * san * "-[0-9a-f]+\$")
     entries = try
         readdir("/dev/shm")
@@ -222,7 +223,7 @@ end
 
 function materialize_host_weights!(store::SharedWeightStore, key, digest::UInt64, specs, fill!)
     offs, total = _layout(specs)
-    tag = _sanitize_name(key) * "-" * string(digest; base=16)
+    tag = _sanitize_name(key) * "-" * string(digest; base = 16)
     name = "/rsw-" * tag
     lockpath = "/dev/shm/rsw-" * tag * ".lock"
 
@@ -251,12 +252,16 @@ function materialize_host_weights!(store::SharedWeightStore, key, digest::UInt64
                     break
                 end
                 # Remove any non-ready remnant, then create exclusively and populate.
-                stale = try SharedMemory(name) catch; nothing end
+                stale = try
+                    SharedMemory(name)
+                catch
+                    nothing
+                end
                 if stale !== nothing
                     finalize(stale)
                     _shm_unlink(name)
                 end
-                shm = SharedMemory(name, total; perms=store.mode, volatile=false)
+                shm = SharedMemory(name, total; perms = store.mode, volatile = false)
                 p = convert(Ptr{UInt8}, pointer(shm))
                 _hdr_write!(p, _RSW_MAGIC, 0)
                 _hdr_write!(p, UInt32(0), 4)        # ready = 0 until the data is durable

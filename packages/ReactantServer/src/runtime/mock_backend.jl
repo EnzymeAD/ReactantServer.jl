@@ -39,8 +39,10 @@ to_host!(::MockBackend, b::MockBuffer, dest::Array) = (copyto!(dest, b.data); de
 free_buffer!(::MockBackend, b::MockBuffer) = (b.freed = true; nothing)
 free_executable!(::MockBackend, e::MockExecutable) = (e.freed = true; nothing)
 
-function execute_single_device(::MockBackend, exec::MockExecutable, ::MockDevice,
-                               buffers::AbstractVector, donated::AbstractVector{Bool}, num_outputs::Int)
+function execute_single_device(
+        ::MockBackend, exec::MockExecutable, ::MockDevice,
+        buffers::AbstractVector, donated::AbstractVector{Bool}, num_outputs::Int
+    )
     args = [b.data for b in buffers]
     outs = exec.fn(args)
     length(outs) == num_outputs ||

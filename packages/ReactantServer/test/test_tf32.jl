@@ -9,13 +9,13 @@ const RS = ReactantServer
 
 # Lower `x * y` (a dot_general) to StableHLO and return the module text. With `algorithm` set, bake
 # that explicit DotAlgorithm; without it, the op relies on precision_config (no algorithm attr).
-function _dot_general_hlo(; algorithm=nothing)
+function _dot_general_hlo(; algorithm = nothing)
     x = Reactant.to_rarray(ones(Float32, 4, 4))
     y = Reactant.to_rarray(ones(Float32, 4, 4))
     mod = if algorithm === nothing
         @code_hlo(*(x, y))
     else
-        with_config(; dot_general_algorithm=algorithm) do
+        with_config(; dot_general_algorithm = algorithm) do
             @code_hlo(*(x, y))
         end
     end
@@ -28,7 +28,7 @@ end
 # tensor element types stay f32). Parsing this is pure IR construction, so tf32's runtime
 # (un)supportedness is irrelevant to the test.
 _tf32_module_text() = replace(
-    _dot_general_hlo(; algorithm=DotGeneralAlgorithmPreset.F32_F32_F32),
+    _dot_general_hlo(; algorithm = DotGeneralAlgorithmPreset.F32_F32_F32),
     "lhs_precision_type = f32" => "lhs_precision_type = tf32",
     "rhs_precision_type = f32" => "rhs_precision_type = tf32",
 )
@@ -70,7 +70,7 @@ end
 @testset "tf32 force_rewrite yields an all-f32 algorithm" begin
     text = _tf32_module_text()
     _with_parsed(text) do mod
-        n = RS.maybe_strip_tf32!(mod; force_rewrite=true)
+        n = RS.maybe_strip_tf32!(mod; force_rewrite = true)
         @test n == 1
         s = repr(mod)
         @test !occursin("tf32", s)
@@ -161,8 +161,10 @@ end
     @test res.pinned_exact === nothing
 
     # f32: the attestation leg compiles through the real pin path and must be bit-exact.
-    pool_f32 = RS.MemoryPool(pool.backend, pool.client, pool.device, pool.platform, pool.ctx,
-                             pool.autotune, RS.NUMERICS_F32)
+    pool_f32 = RS.MemoryPool(
+        pool.backend, pool.client, pool.device, pool.platform, pool.ctx,
+        pool.autotune, RS.NUMERICS_F32
+    )
     res2 = RS.tf32_probe(backend, pool_f32)
     @test res2.pinned_exact === true
 end

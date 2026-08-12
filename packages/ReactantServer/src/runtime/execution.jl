@@ -32,8 +32,10 @@ function _select_exec(model::LoadedModel, byname)
     return inner[batch]
 end
 
-function run_model(backend::AbstractBackend, pool::MemoryPool, model::LoadedModel,
-                   inputs::AbstractVector{NamedTensor})
+function run_model(
+        backend::AbstractBackend, pool::MemoryPool, model::LoadedModel,
+        inputs::AbstractVector{NamedTensor}
+    )
     sig = model.sig
     byname = Dict(t.name => t for t in inputs)
 

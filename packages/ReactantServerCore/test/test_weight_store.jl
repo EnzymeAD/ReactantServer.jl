@@ -6,8 +6,10 @@
 @testset "PrivateWeightStore materializes fresh per-call arrays" begin
     specs = [(Float32, (4,)), (Float64, (2, 2))]
     dg = weights_digest("m", specs)
-    arrs = materialize_host_weights!(PrivateWeightStore(), "m", dg, specs,
-        a -> (a[1] .= Float32[1, 2, 3, 4]; a[2] .= 9.0))
+    arrs = materialize_host_weights!(
+        PrivateWeightStore(), "m", dg, specs,
+        a -> (a[1] .= Float32[1, 2, 3, 4]; a[2] .= 9.0)
+    )
     @test arrs[1] == Float32[1, 2, 3, 4]
     @test size(arrs[2]) == (2, 2) && all(==(9.0), arrs[2])
     @test eltype(arrs[1]) == Float32 && eltype(arrs[2]) == Float64
@@ -21,10 +23,10 @@ end
     @test weights_digest("m", [(Float32, (4,))]) != weights_digest("m", [(Float64, (4,))])
     # A weights-only update (same name, same layout) must move the digest, or a stale region in
     # /dev/shm would be reused and serve the old weights, even across restarts.
-    @test weights_digest("m", [(Float32, (4,))]; content=UInt64(1)) !=
-          weights_digest("m", [(Float32, (4,))])
-    @test weights_digest("m", [(Float32, (4,))]; content=UInt64(1)) !=
-          weights_digest("m", [(Float32, (4,))]; content=UInt64(2))
+    @test weights_digest("m", [(Float32, (4,))]; content = UInt64(1)) !=
+        weights_digest("m", [(Float32, (4,))])
+    @test weights_digest("m", [(Float32, (4,))]; content = UInt64(1)) !=
+        weights_digest("m", [(Float32, (4,))]; content = UInt64(2))
 end
 
 @testset "weights_file_token tracks the on-disk file version" begin
@@ -39,7 +41,7 @@ end
     @test weights_file_token(p) != t1
     @test weights_file_token("") == 0                 # hand-built entries with no file
     @test weights_file_token(joinpath(dir, "missing")) == 0
-    rm(dir; recursive=true, force=true)
+    rm(dir; recursive = true, force = true)
 end
 
 @testset "SharedWeightStore: single-process create, reuse, and unlink" begin
@@ -49,7 +51,7 @@ end
         key = "wsone_" * string(getpid())
         specs = [(Float32, (4,))]
         dg = weights_digest(key, specs)
-        region = "/dev/shm/rsw-" * key * "-" * string(dg; base=16)
+        region = "/dev/shm/rsw-" * key * "-" * string(dg; base = 16)
 
         store = SharedWeightStore()
         arrs = materialize_host_weights!(store, key, dg, specs, a -> (a[1] .= Float32[10, 20, 30, 40]))
@@ -79,9 +81,9 @@ end
         # renaming away and dropping the store (the region stays because we fake the crash by
         # keeping it: populate v1 and abandon the store object after closing its lock).
         store1 = SharedWeightStore()
-        dg1 = weights_digest(key, specs; content=UInt64(1))
+        dg1 = weights_digest(key, specs; content = UInt64(1))
         materialize_host_weights!(store1, key, dg1, specs, a -> (a[1] .= 1.0f0))
-        region1 = "/dev/shm/rsw-" * key * "-" * string(dg1; base=16)
+        region1 = "/dev/shm/rsw-" * key * "-" * string(dg1; base = 16)
         @test isfile(region1)
         # Drop the holder's lock the way a crashed process would (kernel releases flocks on exit)
         # but leave the region in place: close the fd directly without the release path's unlink.
@@ -94,17 +96,17 @@ end
 
         # A new version (different content token) attaches under a new region and sweeps the leak.
         store2 = SharedWeightStore()
-        dg2 = weights_digest(key, specs; content=UInt64(2))
+        dg2 = weights_digest(key, specs; content = UInt64(2))
         arrs = materialize_host_weights!(store2, key, dg2, specs, a -> (a[1] .= 2.0f0))
-        region2 = "/dev/shm/rsw-" * key * "-" * string(dg2; base=16)
+        region2 = "/dev/shm/rsw-" * key * "-" * string(dg2; base = 16)
         @test arrs[1] == Float32[2, 2, 2, 2]               # freshly filled, not the stale content
         @test isfile(region2)
         @test !isfile(region1)                             # stale version swept
         release_host_weights!(store2, key)
         @test !isfile(region2)
         # Sweep leaves lock files behind by design; clean them for a tidy /dev/shm.
-        for f in readdir("/dev/shm"; join=true)
-            occursin("rsw-" * key, f) && endswith(f, ".lock") && rm(f; force=true)
+        for f in readdir("/dev/shm"; join = true)
+            occursin("rsw-" * key, f) && endswith(f, ".lock") && rm(f; force = true)
         end
     end
 end
@@ -116,28 +118,32 @@ end
         key = "wsx_" * string(getpid())
         specs = [(Float32, (4,))]
         dg = weights_digest(key, specs)
-        region = "/dev/shm/rsw-" * key * "-" * string(dg; base=16)
+        region = "/dev/shm/rsw-" * key * "-" * string(dg; base = 16)
 
         dir = mktempdir()
         readyf = joinpath(dir, "ready")
         stopf = joinpath(dir, "stop")
         script = joinpath(dir, "holder.jl")
-        write(script, """
-        using ReactantServerCore
-        key, readyf, stopf = ARGS[1], ARGS[2], ARGS[3]
-        specs = [(Float32, (4,))]
-        store = SharedWeightStore()
-        materialize_host_weights!(store, key, weights_digest(key, specs), specs,
-            a -> (a[1] .= Float32[10, 20, 30, 40]))
-        write(readyf, "ok")
-        t0 = time(); while !isfile(stopf) && time() - t0 < 30; sleep(0.05); end
-        release_host_weights!(store, key)
-        """)
+        write(
+            script, """
+            using ReactantServerCore
+            key, readyf, stopf = ARGS[1], ARGS[2], ARGS[3]
+            specs = [(Float32, (4,))]
+            store = SharedWeightStore()
+            materialize_host_weights!(store, key, weights_digest(key, specs), specs,
+                a -> (a[1] .= Float32[10, 20, 30, 40]))
+            write(readyf, "ok")
+            t0 = time(); while !isfile(stopf) && time() - t0 < 30; sleep(0.05); end
+            release_host_weights!(store, key)
+            """
+        )
 
-        proc = run(`$(Base.julia_cmd()) --project=$(Base.active_project()) $script $key $readyf $stopf`; wait=false)
+        proc = run(`$(Base.julia_cmd()) --project=$(Base.active_project()) $script $key $readyf $stopf`; wait = false)
         try
             t0 = time()
-            while !isfile(readyf) && time() - t0 < 90; sleep(0.1); end
+            while !isfile(readyf) && time() - t0 < 90
+                sleep(0.1)
+            end
             @test isfile(readyf)          # holder populated the region
             @test isfile(region)
 
@@ -155,6 +161,6 @@ end
             wait(proc)
         end
         @test !isfile(region)             # last holder out: region unlinked
-        rm(dir; recursive=true, force=true)
+        rm(dir; recursive = true, force = true)
     end
 end

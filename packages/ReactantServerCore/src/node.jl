@@ -69,7 +69,7 @@ function _model_assignments(node::AbstractDict)
     models = get(node, "models", nothing)
     models === nothing && return nothing
     models isa AbstractDict || throw(ConfigError("node config 'models' must be a mapping of model name to worker list"))
-    out = Dict{String,Vector{String}}()
+    out = Dict{String, Vector{String}}()
     for (m, targets) in models
         targets isa AbstractVector ||
             throw(ConfigError("node config 'models.$m' must be a list of worker names"))
@@ -99,7 +99,7 @@ function validate_node(node::AbstractDict)
 
     workers = _node_workers(node)
     names = String[]
-    ports = Dict{Int,String}()
+    ports = Dict{Int, String}()
     for (i, w) in enumerate(workers)
         name = _worker_name(w)
         name in names && throw(ConfigError("duplicate node worker name '$name'"))
@@ -153,9 +153,9 @@ to synthesize the `workers:` list (see [`materialize_node!`](@ref)) before valid
 """
 function load_node_raw(path::AbstractString)
     isfile(path) || throw(ConfigError("node config file not found: $path"))
-    raw = YAML.load_file(path; dicttype=Dict{String,Any})
+    raw = YAML.load_file(path; dicttype = Dict{String, Any})
     raw isa AbstractDict || throw(ConfigError("node config root must be a mapping"))
-    return Dict{String,Any}(raw)
+    return Dict{String, Any}(raw)
 end
 
 """
@@ -189,8 +189,8 @@ function node_gpus(node::AbstractDict)
         out = String[]
         for d in g
             d isa Integer ? push!(out, string(Int(d))) :
-            d isa AbstractString ? push!(out, String(strip(d))) :
-            throw(ConfigError("node config 'gpus' entries must be device ordinals or UUID strings"))
+                d isa AbstractString ? push!(out, String(strip(d))) :
+                throw(ConfigError("node config 'gpus' entries must be device ordinals or UUID strings"))
         end
         isempty(out) && throw(ConfigError("node config 'gpus' list must not be empty"))
         return out
@@ -213,20 +213,22 @@ device through `CUDA_VISIBLE_DEVICES`, resolves device ordinal 0. Assigning one 
 workers, or having more workers than devices, is a `ConfigError`. Call `validate_node` on the
 result before use.
 """
-function materialize_node!(node::AbstractDict, devices::AbstractVector{<:AbstractString};
-                           cpu_workers::Int=1)
+function materialize_node!(
+        node::AbstractDict, devices::AbstractVector{<:AbstractString};
+        cpu_workers::Int = 1
+    )
     devs = String[String(d) for d in devices]
     if !haskey(node, "workers")
         n = isempty(devs) ? cpu_workers : length(devs)
         n >= 1 || throw(ConfigError("cannot materialize a node with no devices and cpu_workers < 1"))
-        node["workers"] = Any[Dict{String,Any}("name" => "worker$(i)") for i in 0:(n - 1)]
-        return isempty(devs) ? Union{String,Nothing}[nothing for _ in 1:n] :
-               Union{String,Nothing}[d for d in devs]
+        node["workers"] = Any[Dict{String, Any}("name" => "worker$(i)") for i in 0:(n - 1)]
+        return isempty(devs) ? Union{String, Nothing}[nothing for _ in 1:n] :
+            Union{String, Nothing}[d for d in devs]
     end
 
     workers = _node_workers(node)
-    selectors = Union{String,Nothing}[]
-    assigned = Dict{String,String}()   # device selector -> worker name
+    selectors = Union{String, Nothing}[]
+    assigned = Dict{String, String}()   # device selector -> worker name
     for (i, w) in enumerate(workers)
         name = _worker_name(w)
         if isempty(devs)
@@ -272,17 +274,17 @@ function worker_raw_config(node::AbstractDict, name::AbstractString)
         throw(ConfigError("worker '$name' not defined in node (have: $(join(worker_names(node), ", ")))"))
     w = workers[index]
 
-    g = get(node, "global", Dict{String,Any}())
+    g = get(node, "global", Dict{String, Any}())
     g isa AbstractDict || throw(ConfigError("node config 'global' must be a mapping"))
-    raw = deepcopy(Dict{String,Any}(g))
+    raw = deepcopy(Dict{String, Any}(g))
 
     # Worker override blocks (any non-structural key) deep-merge over global.
-    overrides = Dict{String,Any}(k => v for (k, v) in w if !(k in _NODE_WORKER_RESERVED))
+    overrides = Dict{String, Any}(k => v for (k, v) in w if !(k in _NODE_WORKER_RESERVED))
     _deep_merge!(raw, overrides)
 
     raw["model_dirs"] = String[String(node["model_repo"])]
 
-    ep = get!(raw, "endpoints", Dict{String,Any}())
+    ep = get!(raw, "endpoints", Dict{String, Any}())
     ep isa AbstractDict || throw(ConfigError("node 'global.endpoints' must be a mapping"))
     ep["port"] = _worker_port(node, w, index - 1)
     # Optional Prometheus metrics port, derived per-worker from the node-level metrics_base_port
@@ -293,7 +295,7 @@ function worker_raw_config(node::AbstractDict, name::AbstractString)
         ep["metrics_port"] = Int(mbp) + (index - 1)
     end
 
-    rt = get!(raw, "runtime", Dict{String,Any}())
+    rt = get!(raw, "runtime", Dict{String, Any}())
     rt isa AbstractDict || throw(ConfigError("node 'global.runtime' must be a mapping"))
     # Each worker is expected to see a single GPU at index 0 (the default working assumption);
     # physical-GPU selection is a deployment concern (e.g. CUDA_VISIBLE_DEVICES). `gpu` is
@@ -314,13 +316,13 @@ function worker_raw_config(node::AbstractDict, name::AbstractString)
     # no longer restricts which models load; with no `models_include` set, every worker loads all.
     assignments = _model_assignments(node)
     if assignments !== nothing
-        sc = get!(raw, "scheduler", Dict{String,Any}())
+        sc = get!(raw, "scheduler", Dict{String, Any}())
         sc isa AbstractDict || throw(ConfigError("node 'global.scheduler' must be a mapping"))
-        sm = get!(sc, "models", Dict{String,Any}())
+        sm = get!(sc, "models", Dict{String, Any}())
         sm isa AbstractDict || throw(ConfigError("node 'global.scheduler.models' must be a mapping"))
         for (m, targets) in assignments
             String(name) in targets || continue
-            mc = get!(sm, m, Dict{String,Any}())
+            mc = get!(sm, m, Dict{String, Any}())
             mc isa AbstractDict || throw(ConfigError("node 'scheduler.models.$m' must be a mapping"))
             haskey(mc, "residency") || (mc["residency"] = "device")
         end
@@ -337,7 +339,7 @@ exactly one worker (it defaults to that sole entry); otherwise it must name a de
 Environment overrides (`INFERENCE_SERVER_*`) are applied on top, as for any server config. Does
 not validate; call `validate_config` on the result.
 """
-function node_server_config(node::AbstractDict, worker::Union{AbstractString,Nothing})
+function node_server_config(node::AbstractDict, worker::Union{AbstractString, Nothing})
     names = worker_names(node)
     wname = if worker !== nothing
         String(worker) in names ||
