@@ -8,6 +8,7 @@
 # and the emoji capability boxes are YAML frontmatter inside a @raw html block,
 # exactly as Lux.jl's index.md does.
 using Documenter
+using DocumenterCodeBlocks
 using DocumenterVitepress
 using ReactantServer
 using ReactantServerClient
@@ -28,6 +29,12 @@ makedocs(;
     ],
     authors = "Carroll Vance <cs.vance@icloud.com>",
     doctest = false,
+    # DocumenterCodeBlocks enhances code blocks (reference links, hover tooltips,
+    # line numbers, JuliaSyntax highlighting), but its post-processing targets the
+    # standard Documenter HTML writer only. Under MarkdownVitepress the plugin runs
+    # and no-ops, so these features activate if the docs ever move to Documenter's
+    # own HTML backend.
+    plugins = [CodeBlocks()],
     # The API page deliberately documents the exported surface of the five
     # documented packages plus the internal helpers their docstrings reference;
     # the rest of each module's internal docstrings are not in the manual, which
