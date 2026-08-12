@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Runic pre-commit hook: format staged .jl files in place and re-stage them.
+# Runic pre-commit hook: format the source tree with Runic and re-stage the result.
+#
+# Runs `runic --inplace packages docs examples tools` — everything tracked except
+# `lib/`, which holds only the gRPCServer.jl submodule (formatted in its own repo).
 #
 # Requires the `runic` CLI (Julia >= 1.12 Pkg app):
 #     julia -e 'using Pkg; Pkg.Apps.add("Runic")'
@@ -15,30 +18,13 @@ if ! command -v runic >/dev/null 2>&1; then
     exit 0
 fi
 
-# Collect staged .jl files (added/copied/modified; deleted and renamed-without-change excluded).
-files=()
-while IFS= read -r f; do
-    files+=("$f")
-done < <(git diff --cached --name-only --diff-filter=ACM -- '*.jl')
-
-if [ "${#files[@]}" -eq 0 ]; then
-    exit 0
-fi
-
-# Only format files that still exist in the working tree.
-existing=()
-for f in "${files[@]}"; do
-    [ -f "$f" ] && existing+=("$f")
-done
-if [ "${#existing[@]}" -eq 0 ]; then
-    exit 0
-fi
-
-echo "pre-commit: formatting ${#existing[@]} staged Julia file(s) with Runic..." >&2
-runic --inplace --diff "${existing[@]}"
+echo "pre-commit: formatting packages/docs/examples/tools with Runic..." >&2
+runic --inplace --diff packages docs examples tools
 status=$?
 
-# Re-stage whatever the formatter touched so the commit includes the formatted code.
-git add -- "${existing[@]}"
+# Re-stage the .jl files the formatter touched so the commit includes the formatted code.
+# (git ls-files never errors on empty matches, unlike `git add -u` with an unmatched
+# pathspec, so a dir with no .jl files can't silently skip the re-stage.)
+git ls-files -m -z -- packages docs examples tools | grep -z '\.jl$' | xargs -0 -r git add --
 
 exit $status
