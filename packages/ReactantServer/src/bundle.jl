@@ -16,7 +16,7 @@ Base.showerror(io::IO, e::BundleError) = print(io, "BundleError: ", e.msg)
 # The name passed to register_model/register_meta_model is informational only: a model's serving
 # identity is its bundle directory's basename, so a directory rename renames the model with no
 # edits to model.jl (or the manifest). `expected_name` is used purely for error messages.
-function _include_model_jl(path::AbstractString, expected_name::AbstractString; meta::Bool=false)
+function _include_model_jl(path::AbstractString, expected_name::AbstractString; meta::Bool = false)
     _CURRENT_REGISTRATION[] = nothing
     _CURRENT_META_REGISTRATION[] = nothing
     sandbox = Module(gensym(:bundle))
@@ -43,7 +43,7 @@ end
 # either per-batch-size files `<prefix>.b{N}.mlir` (keyed by N) or a single `<prefix>.mlir`
 # (keyed by 0, used for any batch size).
 function _discover_batch_modules(dir::AbstractString, m::Manifest, prefix::AbstractString)
-    modules = Dict{Int,Vector{UInt8}}()
+    modules = Dict{Int, Vector{UInt8}}()
     rx = Regex("^" * replace(prefix, "." => "\\.") * "\\.b(\\d+)\\.mlir\$")
     for f in readdir(dir)
         mt = match(rx, f)
@@ -71,9 +71,9 @@ end
 # and the runtime derives from a request, so dispatch lines up with what was compiled.
 function _discover_modules(dir::AbstractString, m::Manifest)
     if isempty(m.input_shapes)
-        return Dict{VariantKey,Dict{Int,Vector{UInt8}}}(VariantKey() => _discover_batch_modules(dir, m, "model"))
+        return Dict{VariantKey, Dict{Int, Vector{UInt8}}}(VariantKey() => _discover_batch_modules(dir, m, "model"))
     end
-    out = Dict{VariantKey,Dict{Int,Vector{UInt8}}}()
+    out = Dict{VariantKey, Dict{Int, Vector{UInt8}}}()
     for (i, vkey) in enumerate(m.input_shapes)
         out[vkey] = _discover_batch_modules(dir, m, "model.v$(i - 1)")
     end
@@ -90,9 +90,9 @@ directory name is injected before parsing so every downstream consumer, includin
 and the metadata RPC, agrees on the served name). Used by both `load_bundles` and the directory
 watcher (see watcher.jl) to load a single bundle.
 """
-function load_bundle_entry(dir::AbstractString; validator::SignatureValidator=NullSignatureValidator())
+function load_bundle_entry(dir::AbstractString; validator::SignatureValidator = NullSignatureValidator())
     manifest_path = joinpath(dir, "manifest.yaml")
-    raw = YAML.load_file(manifest_path; dicttype=Dict{String,Any})
+    raw = YAML.load_file(manifest_path; dicttype = Dict{String, Any})
     raw isa AbstractDict || throw(BundleError("manifest in $dir is not a mapping"))
     raw["name"] = basename(normpath(String(dir)))   # identity comes from the directory, not the YAML
     m = parse_manifest(raw)
@@ -104,7 +104,7 @@ function load_bundle_entry(dir::AbstractString; validator::SignatureValidator=Nu
     # A meta bundle has no StableHLO module or weights: it is just a manifest + model.jl
     # orchestration. validate_manifest already enforced model.jl presence and the meta block.
     if is_meta(m)
-        mreg = _include_model_jl(model_jl, m.name; meta=true)
+        mreg = _include_model_jl(model_jl, m.name; meta = true)
         return MetaEntry(m.name, m, m.meta_calls, mreg.run)
     end
 
@@ -112,7 +112,7 @@ function load_bundle_entry(dir::AbstractString; validator::SignatureValidator=Nu
 
     weights_path = joinpath(dir, "weights.safetensors")
     isfile(weights_path) || throw(BundleError("bundle '$(m.name)' missing weights.safetensors"))
-    weights = SafeTensors.deserialize(weights_path; mmap=true)
+    weights = SafeTensors.deserialize(weights_path; mmap = true)
 
     # Every variant/batch module shares one signature; validate against any one of them.
     validate_against_signature(validator, m, first(values(first(values(mlir_bytes)))))
@@ -127,7 +127,7 @@ function load_bundle_entry(dir::AbstractString; validator::SignatureValidator=Nu
 end
 
 function _load_one_bundle!(reg::ModelRegistry, dir::AbstractString, validator::SignatureValidator)
-    entry = load_bundle_entry(dir; validator=validator)
+    entry = load_bundle_entry(dir; validator = validator)
     (haskey(reg.by_name, entry.name) || haskey(reg.meta, entry.name)) &&
         throw(BundleError("duplicate model name '$(entry.name)'"))
     if entry isa MetaEntry
@@ -149,15 +149,17 @@ is in the set are loaded. The directory name IS the model name (see `load_bundle
 filtering by directory avoids parsing skipped manifests. Names in `include` that are not found
 in any model dir produce a warning.
 """
-function load_bundles(model_dirs::AbstractVector{<:AbstractString};
-                      validator::SignatureValidator=NullSignatureValidator(),
-                      include=nothing)
+function load_bundles(
+        model_dirs::AbstractVector{<:AbstractString};
+        validator::SignatureValidator = NullSignatureValidator(),
+        include = nothing
+    )
     want = include === nothing ? nothing : Set{String}(String(x) for x in include)
     reg = ModelRegistry()
     found = Set{String}()
     for root in model_dirs
         isdir(root) || throw(BundleError("model dir does not exist: $root"))
-        for child in readdir(root; join=true)
+        for child in readdir(root; join = true)
             isdir(child) || continue
             isfile(joinpath(child, "manifest.yaml")) || continue
             name = basename(normpath(child))
@@ -185,8 +187,12 @@ function _validate_meta_calls(reg::ModelRegistry)
     for entry in values(reg.meta)
         for callee in entry.calls
             haskey(reg.meta, callee) &&
-                throw(BundleError("meta model '$(entry.name)' calls '$callee', which is also a meta model; " *
-                                  "meta models may not call other meta models"))
+                throw(
+                BundleError(
+                    "meta model '$(entry.name)' calls '$callee', which is also a meta model; " *
+                        "meta models may not call other meta models"
+                )
+            )
             haskey(reg.by_name, callee) ||
                 @info "meta model declares a call to a model not loaded on this worker (expected in multi-worker deployments)" meta = entry.name callee = callee
         end

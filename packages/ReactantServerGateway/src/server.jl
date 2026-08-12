@@ -7,7 +7,7 @@
 # Per-request state threaded through gRPCServer's context payload. Parametric on the pool and
 # scheduler types so the request hot path (`st.pool` -> `get_clients` -> `wc.infer`, and the
 # `select_replicas` dispatch) stays type-stable.
-struct GatewayState{P<:ClientPool,S<:GatewayScheduler}
+struct GatewayState{P <: ClientPool, S <: GatewayScheduler}
     pool::P
     routes::DiscoveredRoutes
     gate::RegisterGate
@@ -52,8 +52,10 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64)
         rem = deadline_ns - Int64(time_ns())
         if rem <= 0
             return nothing, STATUS_DEADLINE,
-                gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_DEADLINE_EXCEEDED,
-                    "deadline exceeded at gateway for model \"$model\"")
+                gRPCServer.gRPCServiceCallException(
+                    gRPCServer.GRPC_DEADLINE_EXCEEDED,
+                    "deadline exceeded at gateway for model \"$model\""
+                )
         end
         # Forward as WHOLE SECONDS: grpc_timeout_header_val only encodes integer seconds without
         # falling back to a >8-digit nanosecond value the worker rejects; ceil so a sub-second budget
@@ -62,7 +64,7 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64)
     end
     t0 = time()
     try
-        resp = invoke_infer(wc, body; deadline=deadline_s)
+        resp = invoke_infer(wc, body; deadline = deadline_s)
         observe_worker!(st.metrics, "ModelInfer", url, time() - t0)
         return resp, STATUS_OK, nothing
     catch e
@@ -99,8 +101,10 @@ function _dispatch_infer(st::GatewayState, model, id, body, deadline_ns::Int64)
     # routing table on demand (single-flight, rate-limited) and re-select before giving up.
     # How much work this request is, per the scheduler (a no-op for the modes that route by request
     # count). Resolved once here rather than per selection attempt.
-    ctx = ScheduleContext(model, id, request_units(st.scheduler, model, body),
-                          st.pool, st.routes, st.metrics, st.refresher)
+    ctx = ScheduleContext(
+        model, id, request_units(st.scheduler, model, body),
+        st.pool, st.routes, st.metrics, st.refresher
+    )
     sel = select_replicas(st.scheduler, ctx)
     if sel === nothing
         refresh_now!(st.refresher)
@@ -121,20 +125,28 @@ function _dispatch_infer(st::GatewayState, model, id, body, deadline_ns::Int64)
     end
 end
 
-function _gw_infer(body::Vector{UInt8}, st::GatewayState, deadline_ns::Integer=0)
+function _gw_infer(body::Vector{UInt8}, st::GatewayState, deadline_ns::Integer = 0)
     t0 = time()
     local model, id
     try
         model, id = peek_model_name_and_id(body)
     catch e
         inc_requests!(st.metrics, "ModelInfer", "", STATUS_INVALID)
-        throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_INVALID_ARGUMENT,
-            "malformed ModelInferRequest: $(sprint(showerror, e))"))
+        throw(
+            gRPCServer.gRPCServiceCallException(
+                gRPCServer.GRPC_INVALID_ARGUMENT,
+                "malformed ModelInferRequest: $(sprint(showerror, e))"
+            )
+        )
     end
     if isempty(model)
         inc_requests!(st.metrics, "ModelInfer", "", STATUS_INVALID)
-        throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_INVALID_ARGUMENT,
-            "ModelInferRequest.model_name is empty"))
+        throw(
+            gRPCServer.gRPCServiceCallException(
+                gRPCServer.GRPC_INVALID_ARGUMENT,
+                "ModelInferRequest.model_name is empty"
+            )
+        )
     end
     record_arrival!(st.scheduler, model)
     resp, status, exc = _dispatch_infer(st, model, id, body, Int64(deadline_ns))
@@ -159,7 +171,7 @@ function _broadcast_shm(st::GatewayState, op, region, rpc_label)
     workers = all_clients(st.pool)
     succeeded = String[]
     failed = String[]
-    first_body = Ref{Union{Nothing,Vector{UInt8}}}(nothing)
+    first_body = Ref{Union{Nothing, Vector{UInt8}}}(nothing)
     lk = ReentrantLock()
     @sync for wc in workers
         @async begin
@@ -206,13 +218,21 @@ function _gw_shm_register(body::Vector{UInt8}, st::GatewayState)
         region = peek_shm_name(body)
     catch e
         inc_requests!(st.metrics, "SystemSharedMemoryRegister", "", STATUS_INVALID)
-        throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_INVALID_ARGUMENT,
-            "malformed SystemSharedMemoryRegisterRequest: $(sprint(showerror, e))"))
+        throw(
+            gRPCServer.gRPCServiceCallException(
+                gRPCServer.GRPC_INVALID_ARGUMENT,
+                "malformed SystemSharedMemoryRegisterRequest: $(sprint(showerror, e))"
+            )
+        )
     end
     if isempty(region)
         inc_requests!(st.metrics, "SystemSharedMemoryRegister", "", STATUS_INVALID)
-        throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_INVALID_ARGUMENT,
-            "SystemSharedMemoryRegisterRequest.name is empty"))
+        throw(
+            gRPCServer.gRPCServiceCallException(
+                gRPCServer.GRPC_INVALID_ARGUMENT,
+                "SystemSharedMemoryRegisterRequest.name is empty"
+            )
+        )
     end
 
     resp, succeeded, failed = _broadcast_shm(st, wc -> invoke_shm_register(wc, body), region, "SystemSharedMemory")
@@ -229,8 +249,12 @@ function _gw_shm_register(body::Vector{UInt8}, st::GatewayState)
         _fanout_unregister(st, succeeded, _encode_unregister(region))
     end
     inc_requests!(st.metrics, "SystemSharedMemoryRegister", region, STATUS_FAILED_PRE)
-    throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_FAILED_PRECONDITION,
-        "SHM register failed on workers: $(failed)"))
+    throw(
+        gRPCServer.gRPCServiceCallException(
+            gRPCServer.GRPC_FAILED_PRECONDITION,
+            "SHM register failed on workers: $(failed)"
+        )
+    )
 end
 
 function _gw_shm_unregister(body::Vector{UInt8}, st::GatewayState)
@@ -240,8 +264,12 @@ function _gw_shm_unregister(body::Vector{UInt8}, st::GatewayState)
         region = peek_shm_name(body)
     catch e
         inc_requests!(st.metrics, "SystemSharedMemoryUnregister", "", STATUS_INVALID)
-        throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_INVALID_ARGUMENT,
-            "malformed SystemSharedMemoryUnregisterRequest: $(sprint(showerror, e))"))
+        throw(
+            gRPCServer.gRPCServiceCallException(
+                gRPCServer.GRPC_INVALID_ARGUMENT,
+                "malformed SystemSharedMemoryUnregisterRequest: $(sprint(showerror, e))"
+            )
+        )
     end
 
     resp, succeeded, failed = _broadcast_shm(st, wc -> invoke_shm_unregister(wc, body), region, "SystemSharedMemory")
@@ -250,8 +278,12 @@ function _gw_shm_unregister(body::Vector{UInt8}, st::GatewayState)
     if isempty(succeeded) && !isempty(failed)
         @warn "shm.unregister: every worker failed" region failed_workers = failed
         inc_requests!(st.metrics, "SystemSharedMemoryUnregister", region, STATUS_UNAVAILABLE)
-        throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_UNAVAILABLE,
-            "SHM unregister failed on all workers: $(failed)"))
+        throw(
+            gRPCServer.gRPCServiceCallException(
+                gRPCServer.GRPC_UNAVAILABLE,
+                "SHM unregister failed on all workers: $(failed)"
+            )
+        )
     end
     if !isempty(failed)
         @warn "shm.unregister: partial failures" region ok_workers = succeeded failed_workers = failed
@@ -300,7 +332,7 @@ end
 # succeeded_urls, failed_urls). One slow or failing worker is isolated to its own @async branch and
 # never aborts the others. Shared by the operator RPC (`_gw_compact`, all workers, one list) and the
 # placement-driven path (lpt_packing's `_maybe_compact_fleet!`, changed workers, per-worker lists).
-function _compact_workers(pool::ClientPool, metrics::Union{GatewayMetrics,Nothing}, perworker::AbstractDict)
+function _compact_workers(pool::ClientPool, metrics::Union{GatewayMetrics, Nothing}, perworker::AbstractDict)
     succeeded = String[]
     failed = String[]
     total = Ref(0)
@@ -339,8 +371,12 @@ function _gw_compact(req::CompactMemoryRequest, st::GatewayState)
     if isempty(succeeded) && !isempty(failed)
         inc_requests!(st.metrics, "CompactMemory", "", STATUS_UNAVAILABLE)
         @warn "compact: every worker failed" failed_workers = failed
-        throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_UNAVAILABLE,
-            "compaction failed on all workers: $(failed)"))
+        throw(
+            gRPCServer.gRPCServiceCallException(
+                gRPCServer.GRPC_UNAVAILABLE,
+                "compaction failed on all workers: $(failed)"
+            )
+        )
     end
     isempty(failed) ? (@info "compact: ok" workers = succeeded reloaded = total) :
         (@warn "compact: partial failures" ok_workers = succeeded failed_workers = failed reloaded = total)
@@ -359,21 +395,33 @@ gateway aggregates each worker's answer rather than forwarding one. Every other
 GRPCInferenceService RPC is left unimplemented (clients get UNIMPLEMENTED).
 """
 function build_gateway_router(state::GatewayState, cfg::GatewayConfig)
-    router = gRPCServer.gRPCRouter(; max_receive_message_length = cfg.max_recv_msg_bytes,
-        max_send_message_length = cfg.max_send_msg_bytes)
+    router = gRPCServer.gRPCRouter(;
+        max_receive_message_length = cfg.max_recv_msg_bytes,
+        max_send_message_length = cfg.max_send_msg_bytes
+    )
     raw(rpc) = rpc(; TRequest = Vector{UInt8}, TResponse = Vector{UInt8})
-    gRPCServer.handle!(router, raw(GRPCInferenceService_ModelInfer_Method),
-        (req, ctx) -> _gw_infer(req, ctx.payload, ctx.deadline_ns))
-    gRPCServer.handle!(router, raw(GRPCInferenceService_SystemSharedMemoryRegister_Method),
-        (req, ctx) -> _gw_shm_register(req, ctx.payload))
-    gRPCServer.handle!(router, raw(GRPCInferenceService_SystemSharedMemoryUnregister_Method),
-        (req, ctx) -> _gw_shm_unregister(req, ctx.payload))
+    gRPCServer.handle!(
+        router, raw(GRPCInferenceService_ModelInfer_Method),
+        (req, ctx) -> _gw_infer(req, ctx.payload, ctx.deadline_ns)
+    )
+    gRPCServer.handle!(
+        router, raw(GRPCInferenceService_SystemSharedMemoryRegister_Method),
+        (req, ctx) -> _gw_shm_register(req, ctx.payload)
+    )
+    gRPCServer.handle!(
+        router, raw(GRPCInferenceService_SystemSharedMemoryUnregister_Method),
+        (req, ctx) -> _gw_shm_unregister(req, ctx.payload)
+    )
     # Typed (decoded) so the handler can read each worker's `.same` and aggregate; not forwarded raw.
-    gRPCServer.handle!(router, GRPCInferenceService_IsSameIPCNamespace_Method(),
-        (req, ctx) -> _gw_is_same_ipc_namespace(req, ctx.payload))
+    gRPCServer.handle!(
+        router, GRPCInferenceService_IsSameIPCNamespace_Method(),
+        (req, ctx) -> _gw_is_same_ipc_namespace(req, ctx.payload)
+    )
     # Control plane: a single CompactMemory RPC to the gateway fans out to every worker.
-    register_ControlService!(router;
-        CompactMemory = (req, ctx) -> _gw_compact(req, ctx.payload))
+    register_ControlService!(
+        router;
+        CompactMemory = (req, ctx) -> _gw_compact(req, ctx.payload)
+    )
     # The gateway's own scheduling control plane (see control_service.jl). A distinct service, so the
     # worker-facing ControlService above keeps its meaning.
     register_gateway_control_service!(router, state)

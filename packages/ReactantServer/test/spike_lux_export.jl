@@ -28,8 +28,10 @@ end
 function serialize_module(mod)
     vbytes, _ = capture_bytes((cb, ref) -> MLIR.API.stablehloGetCurrentVersion(cb, ref))
     ver = String(vbytes)
-    bytes, sres = capture_bytes((cb, ref) ->
-        MLIR.API.stablehloSerializePortableArtifactFromModule(mod, ver, cb, ref, true))
+    bytes, sres = capture_bytes(
+        (cb, ref) ->
+        MLIR.API.stablehloSerializePortableArtifactFromModule(mod, ver, cb, ref, true)
+    )
     MLIR.IR.isfailure(MLIR.IR.LogicalResult(sres)) && error("serialize failed")
     return bytes
 end
@@ -41,7 +43,7 @@ function trace_and_serialize(batch::Int, W, b)
     x = Reactant.to_rarray(reshape(collect(Float32, 1:(3 * batch)), 3, batch))  # (in=3, batch)
     Wr = Reactant.to_rarray(W)
     br = Reactant.to_rarray(b)
-    mod, _ = Compiler.compile_mlir(ctx, g, (x, Wr, br); drop_unsupported_attributes=true)
+    mod, _ = Compiler.compile_mlir(ctx, g, (x, Wr, br); drop_unsupported_attributes = true)
     text = string(mod)
     bytes = serialize_module(mod)
     return text, bytes
@@ -61,21 +63,25 @@ function main()
     println("batch=1 artifact: $(length(bytes1)) bytes; batch=4 artifact: $(length(bytes4)) bytes")
 
     # Round-trip the batch=1 module through the CURRENT (single-module) server runtime.
-    mktempdir() do root
+    return mktempdir() do root
         dir = joinpath(root, "dense_spike")
         mkpath(dir)
         write(joinpath(dir, "model.mlir"), bytes1)
-        SafeTensors.serialize(joinpath(dir, "weights.safetensors"),
-            Dict("W" => W, "b" => b), Dict("argument_order" => JSON3.write(["W", "b"])))
-        write(joinpath(dir, "manifest.yaml"), """
-        format_version: "2.0"
-        name: dense_spike
-        executable_inputs:
-          - {name: x, dtype: f32, shape: nc, dims: {c: 3}}
-        executable_outputs:
-          - {name: y, dtype: f32, shape: nc, dims: {c: 2}}
-        batching: {compiled_batch_sizes: [1]}
-        """)
+        SafeTensors.serialize(
+            joinpath(dir, "weights.safetensors"),
+            Dict("W" => W, "b" => b), Dict("argument_order" => JSON3.write(["W", "b"]))
+        )
+        write(
+            joinpath(dir, "manifest.yaml"), """
+            format_version: "2.0"
+            name: dense_spike
+            executable_inputs:
+              - {name: x, dtype: f32, shape: nc, dims: {c: 3}}
+            executable_outputs:
+              - {name: y, dtype: f32, shape: nc, dims: {c: 2}}
+            batching: {compiled_batch_sizes: [1]}
+            """
+        )
 
         backend = ReactantServer.ReactantBackend()
         pool = ReactantServer.resolve_client(backend, ReactantServer.RuntimeConfig(ReactantServer.CPU_BACKEND, 0, 0.9, true, true))
@@ -88,7 +94,7 @@ function main()
         got = vec(out[1].data)
         ref = vec(W * xin .+ b)
         println("server output: $got   reference: $ref")
-        @assert isapprox(got, ref; rtol=1e-5) "round-trip mismatch: $got vs $ref"
+        @assert isapprox(got, ref; rtol = 1.0e-5) "round-trip mismatch: $got vs $ref"
         println("\nSPIKE PASSED: compile_mlir output serializes and loads/runs in the server")
     end
 end

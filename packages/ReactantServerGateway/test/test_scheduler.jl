@@ -7,9 +7,11 @@ const GW = ReactantServerGateway
 # A GatewayConfig with the given scheduling mode and two dummy endpoints (no servers are contacted;
 # the lightweight-scheduler select_replicas paths read only the routing table).
 function _sched_cfg(mode; basis = "compute")
-    return GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", ["127.0.0.1:7001", "127.0.0.1:7002"],
-                            String[], String[], 60, 1, 1, "info", "json", mode, basis, 30.0, 0.0, 0.8, 0.1, 30.0,
-                            1, 1.0, "fill_rr", "run", Dict{String,GW.GatewayModelConfig}(), 32, 64, :off, 0, false)
+    return GW.GatewayConfig(
+        "0.0.0.0:0", "0.0.0.0:0", ["127.0.0.1:7001", "127.0.0.1:7002"],
+        String[], String[], 60, 1, 1, "info", "json", mode, basis, 30.0, 0.0, 0.8, 0.1, 30.0,
+        1, 1.0, "fill_rr", "run", Dict{String, GW.GatewayModelConfig}(), 32, 64, :off, 0, false
+    )
 end
 
 # Build a ScheduleContext for `model` over a routing table mapping each model to worker URLs.
@@ -52,25 +54,33 @@ end
 # A poll result shaped like `poll_workers`, carrying per-model cumulative (compute, requests, rows).
 # `cum` maps model -> (compute_seconds, requests, rows); `batch_at` maps model -> (input, axis).
 function _poll(cum::Dict; batch_at::Dict = Dict(), max_batch::Dict = Dict(), workers = ["w0"])
-    sums = Dict{String,Tuple{Float64,UInt64,UInt64}}(
-        m => (Float64(c), UInt64(r), UInt64(w)) for (m, (c, r, w)) in cum)
-    mb = Dict{String,Int}(m => Int(get(max_batch, m, 8)) for m in keys(cum))
-    ba = Dict{String,Tuple{String,Int}}(m => v for (m, v) in batch_at)
-    return (; sums,
-            permodel_workers = Dict{String,Vector{String}}(m => copy(workers) for m in keys(cum)),
-            mem = Dict{String,Float64}(m => 0.0 for m in keys(cum)),
-            mem_cap = Dict{String,Float64}(w => 0.0 for w in workers),
-            max_batch = mb, batch_at = ba, polled = collect(workers),
-            fleet_compute = sum(Float64(c) for (c, _, _) in values(cum); init = 0.0))
+    sums = Dict{String, Tuple{Float64, UInt64, UInt64}}(
+        m => (Float64(c), UInt64(r), UInt64(w)) for (m, (c, r, w)) in cum
+    )
+    mb = Dict{String, Int}(m => Int(get(max_batch, m, 8)) for m in keys(cum))
+    ba = Dict{String, Tuple{String, Int}}(m => v for (m, v) in batch_at)
+    return (;
+        sums,
+        permodel_workers = Dict{String, Vector{String}}(m => copy(workers) for m in keys(cum)),
+        mem = Dict{String, Float64}(m => 0.0 for m in keys(cum)),
+        mem_cap = Dict{String, Float64}(w => 0.0 for w in workers),
+        max_batch = mb, batch_at = ba, polled = collect(workers),
+        fleet_compute = sum(Float64(c) for (c, _, _) in values(cum); init = 0.0),
+    )
 end
 
 # A ModelInferRequest body carrying one named input with the given shape, encoded as the wire sees it.
 function _body(model, name, shape)
     QPB = ReactantServerGateway.PB
     QInf = ReactantServerCore.inference
-    msg = QInf.ModelInferRequest(; model_name = model,
-        inputs = [QInf.var"ModelInferRequest.InferInputTensor"(;
-            name = name, datatype = "UINT8", shape = Int64[shape...])])
+    msg = QInf.ModelInferRequest(;
+        model_name = model,
+        inputs = [
+            QInf.var"ModelInferRequest.InferInputTensor"(;
+                name = name, datatype = "UINT8", shape = Int64[shape...]
+            ),
+        ]
+    )
     io = IOBuffer()
     QPB.encode(QPB.ProtoEncoder(io), msg)
     return take!(io)
@@ -160,10 +170,18 @@ end
     # :compute weighs items by the model's measured cost per item, the only basis that is comparable
     # across models: 8 items of a model costing 1.0s/item outweigh 32 items of one costing 0.01s/item.
     rm2 = GW.RoutingMeta(30.0)
-    GW.refresh_routing_meta!(rm2, _poll(Dict("dear" => (0.0, 0, 0), "cheap" => (0.0, 0, 0));
-                                       batch_at = Dict("dear" => ("IN", 1), "cheap" => ("IN", 1))))
-    GW.refresh_routing_meta!(rm2, _poll(Dict("dear" => (10.0, 1, 10), "cheap" => (0.1, 1, 10));
-                                       batch_at = Dict("dear" => ("IN", 1), "cheap" => ("IN", 1))))
+    GW.refresh_routing_meta!(
+        rm2, _poll(
+            Dict("dear" => (0.0, 0, 0), "cheap" => (0.0, 0, 0));
+            batch_at = Dict("dear" => ("IN", 1), "cheap" => ("IN", 1))
+        )
+    )
+    GW.refresh_routing_meta!(
+        rm2, _poll(
+            Dict("dear" => (10.0, 1, 10), "cheap" => (0.1, 1, 10));
+            batch_at = Dict("dear" => ("IN", 1), "cheap" => ("IN", 1))
+        )
+    )
     sc = GW.LeastOutstandingScheduler(rm2; basis = :compute)
     snap = GW.routing_meta(rm2)
     @test GW.item_cost(snap, "dear") ≈ 1.0
@@ -181,7 +199,7 @@ end
         foreach(r -> GW.release!(sc, r), (rdear, rcheap))
         # The captured charge is what is released, so the counters return to baseline (to within the
         # float rounding of summing and unsumming fractional GPU-seconds).
-        @test all(c -> isapprox(c[], 0.0; atol = 1e-9), values(@atomic sc.inflight))
+        @test all(c -> isapprox(c[], 0.0; atol = 1.0e-9), values(@atomic sc.inflight))
     finally
         GW.close_pool!(pool2)
     end
@@ -214,8 +232,10 @@ end
         # Read at scrape time from the live counters, so a release is visible on the next scrape with
         # no publish step in between.
         GW.release!(s, res)
-        @test occursin("gateway_worker_inflight_work{worker=\"worker0\",basis=\"compute\"} 0\n",
-                       _scrape(metrics))
+        @test occursin(
+            "gateway_worker_inflight_work{worker=\"worker0\",basis=\"compute\"} 0\n",
+            _scrape(metrics)
+        )
     finally
         GW.close_pool!(pool)
     end

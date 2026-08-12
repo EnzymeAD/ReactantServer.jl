@@ -17,12 +17,12 @@
 
 # A bundle's on-disk fingerprint: (filename, mtime, size) for each file that defines it. Two equal
 # signatures mean the bundle is unchanged.
-const BundleSig = Vector{Tuple{String,Float64,Int}}
+const BundleSig = Vector{Tuple{String, Float64, Int}}
 
 # A bundle directory's filesystem identity (device, inode). rename(2) preserves it (and every file
 # mtime inside), so a removed name and an added name with the same DirId and an equal BundleSig
 # are one atomic directory rename, servable without recompiling.
-const DirId = Tuple{UInt64,UInt64}
+const DirId = Tuple{UInt64, UInt64}
 _dir_id(dir::AbstractString) = (st = stat(dir); (UInt64(st.device), UInt64(st.inode)))
 
 # The files that actually define a bundle (and thus affect compilation/serving). Other files in the
@@ -32,8 +32,8 @@ _is_bundle_file(f::AbstractString) =
     occursin(r"^model(\.b\d+)?\.mlir$", f)
 
 function bundle_signature(dir::AbstractString)::BundleSig
-    sig = Tuple{String,Float64,Int}[]
-    for f in readdir(dir; sort=true)
+    sig = Tuple{String, Float64, Int}[]
+    for f in readdir(dir; sort = true)
         _is_bundle_file(f) || continue
         p = joinpath(dir, f)
         isfile(p) || continue
@@ -52,11 +52,11 @@ directory's basename) and honors the `include` allowlist (`nothing` = load all).
 `load_bundles`, a missing root is skipped rather than raising, since the watcher must keep running
 across a transiently absent mount.
 """
-function scan_repository(model_dirs, include::Union{Set{String},Nothing})
-    out = Dict{String,Tuple{String,BundleSig,DirId}}()
+function scan_repository(model_dirs, include::Union{Set{String}, Nothing})
+    out = Dict{String, Tuple{String, BundleSig, DirId}}()
     for root in model_dirs
         isdir(root) || continue
-        for child in readdir(root; join=true)
+        for child in readdir(root; join = true)
             isdir(child) || continue
             isfile(joinpath(child, "manifest.yaml")) || continue
             name = basename(normpath(child))
@@ -81,37 +81,43 @@ mutable struct BundleWatcher
     pool::MemoryPool
     cfg::ServerConfig
     model_dirs::Vector{String}
-    include::Union{Set{String},Nothing}
+    include::Union{Set{String}, Nothing}
     on_demand::Bool
     store::WeightStore
     interval::Float64
-    seen::Dict{String,BundleSig}                       # last-applied signatures (loaded models)
-    dir_ids::Dict{String,DirId}                        # last-applied directory identities (rename detection)
-    pending::Dict{String,Union{BundleSig,Nothing}}     # candidate change awaiting a stable second poll
+    seen::Dict{String, BundleSig}                       # last-applied signatures (loaded models)
+    dir_ids::Dict{String, DirId}                        # last-applied directory identities (rename detection)
+    pending::Dict{String, Union{BundleSig, Nothing}}     # candidate change awaiting a stable second poll
     running::Bool
-    task::Union{Task,Nothing}
+    task::Union{Task, Nothing}
 end
 
-function BundleWatcher(sched::Scheduler, backend::AbstractBackend, pool::MemoryPool,
-                       cfg::ServerConfig; interval::Real, on_demand::Bool,
-                       store::WeightStore=PrivateWeightStore(),
-                       include::Union{Nothing,AbstractVector}=nothing)
+function BundleWatcher(
+        sched::Scheduler, backend::AbstractBackend, pool::MemoryPool,
+        cfg::ServerConfig; interval::Real, on_demand::Bool,
+        store::WeightStore = PrivateWeightStore(),
+        include::Union{Nothing, AbstractVector} = nothing
+    )
     inc = include === nothing ? nothing : Set{String}(String(x) for x in include)
     # Seed `seen` from what is on disk now: it matches what `_bring_up` just loaded, so the first
     # poll is a no-op for the startup models and only later changes are acted on.
     initial = scan_repository(cfg.model_dirs, inc)
-    seen = Dict{String,BundleSig}(name => cs[2] for (name, cs) in initial)
-    dir_ids = Dict{String,DirId}(name => cs[3] for (name, cs) in initial)
-    return BundleWatcher(sched, backend, pool, cfg, copy(cfg.model_dirs), inc, on_demand, store,
-                         Float64(interval), seen, dir_ids,
-                         Dict{String,Union{BundleSig,Nothing}}(), false, nothing)
+    seen = Dict{String, BundleSig}(name => cs[2] for (name, cs) in initial)
+    dir_ids = Dict{String, DirId}(name => cs[3] for (name, cs) in initial)
+    return BundleWatcher(
+        sched, backend, pool, cfg, copy(cfg.model_dirs), inc, on_demand, store,
+        Float64(interval), seen, dir_ids,
+        Dict{String, Union{BundleSig, Nothing}}(), false, nothing
+    )
 end
 
 # Apply a single confirmed change. `desired === nothing` means the bundle is gone (unload); a
 # BundleSig means load or reload from `dir`. Failures are logged and not propagated: `seen` is left
 # untouched on a load failure so the next poll retries.
-function _apply_change!(w::BundleWatcher, name::AbstractString,
-                        desired::Union{BundleSig,Nothing}, dir::Union{String,Nothing})
+function _apply_change!(
+        w::BundleWatcher, name::AbstractString,
+        desired::Union{BundleSig, Nothing}, dir::Union{String, Nothing}
+    )
     # The detected change and the plan of action; the resulting "model loaded"/"model unloaded"
     # summaries carry the per-model detail.
     action = desired === nothing ? :unload : (haskey(w.seen, name) ? :reload : :load)
@@ -131,8 +137,10 @@ function _apply_change!(w::BundleWatcher, name::AbstractString,
                 put_meta!(w.scheduler, entry)
             else
                 state = _resolve_residency(w.cfg, name, w.on_demand)
-                load_model!(w.scheduler, w.backend, w.pool, entry;
-                            state=state, on_demand=w.on_demand, store=w.store)
+                load_model!(
+                    w.scheduler, w.backend, w.pool, entry;
+                    state = state, on_demand = w.on_demand, store = w.store
+                )
             end
             w.seen[name] = desired
             w.dir_ids[name] = _dir_id(dir)
@@ -148,12 +156,16 @@ end
 # or compiled; only the residency floor is re-resolved for the new name (operator config is keyed
 # by model name). Returns true when applied; false means the caller should fall back to the
 # generic unload + load path.
-function _apply_rename!(w::BundleWatcher, old::AbstractString, new::AbstractString,
-                        sig::BundleSig, id::DirId)
+function _apply_rename!(
+        w::BundleWatcher, old::AbstractString, new::AbstractString,
+        sig::BundleSig, id::DirId
+    )
     @info "watcher: change detected" name = String(new) action = :rename from = String(old)
     try
-        rename_model!(w.scheduler, old, new;
-                      residency=_resolve_residency(w.cfg, new, w.on_demand))
+        rename_model!(
+            w.scheduler, old, new;
+            residency = _resolve_residency(w.cfg, new, w.on_demand)
+        )
         delete!(w.seen, old)
         delete!(w.dir_ids, old)
         w.seen[new] = sig
@@ -169,9 +181,9 @@ end
 # has been stable for two consecutive polls.
 function _watch_once!(w::BundleWatcher)
     current = scan_repository(w.model_dirs, w.include)
-    desired = Dict{String,BundleSig}(name => cs[2] for (name, cs) in current)
-    next_pending = Dict{String,Union{BundleSig,Nothing}}()
-    confirmed = Tuple{String,Union{BundleSig,Nothing}}[]
+    desired = Dict{String, BundleSig}(name => cs[2] for (name, cs) in current)
+    next_pending = Dict{String, Union{BundleSig, Nothing}}()
+    confirmed = Tuple{String, Union{BundleSig, Nothing}}[]
     for name in union(keys(desired), keys(w.seen))
         d = get(desired, name, nothing)   # nothing => should be unloaded
         s = get(w.seen, name, nothing)    # nothing => not currently loaded
@@ -192,9 +204,9 @@ function _watch_once!(w::BundleWatcher)
     # occupied until the first is applied, so renames are applied in collision order below. A
     # moved directory whose contents also changed matches nothing here and falls through to the
     # generic unload + load, which must compile anyway.
-    adds = Dict{String,BundleSig}(name => d for (name, d) in confirmed if d !== nothing)
+    adds = Dict{String, BundleSig}(name => d for (name, d) in confirmed if d !== nothing)
     removes = Set{String}(name for (name, d) in confirmed if d === nothing)
-    renames = Pair{String,String}[]                            # old name => new name
+    renames = Pair{String, String}[]                            # old name => new name
     claimed = Set{String}()                                    # rename sources already matched
     for (new, d) in adds
         haskey(current, new) || continue

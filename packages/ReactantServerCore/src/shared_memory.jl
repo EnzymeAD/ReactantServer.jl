@@ -37,10 +37,10 @@ ShmRegion(name, key, offset, byte_size, shm) =
     ShmRegion(name, key, offset, byte_size, shm, ReentrantLock(), true)
 
 struct SharedMemoryRegistry
-    regions::Dict{String,ShmRegion}
+    regions::Dict{String, ShmRegion}
     lock::ReentrantLock
 end
-SharedMemoryRegistry() = SharedMemoryRegistry(Dict{String,ShmRegion}(), ReentrantLock())
+SharedMemoryRegistry() = SharedMemoryRegistry(Dict{String, ShmRegion}(), ReentrantLock())
 
 # Detach our mapping of a region. Must be called holding `r.lock`; flips `attached` so any
 # reader blocked on the same lock bails instead of touching the munmap'd page. This munmaps
@@ -60,8 +60,10 @@ end
 Attach the existing POSIX shared-memory object `key` read-write and register it under
 `name`. Re-registering a name replaces (and detaches) the previous mapping.
 """
-function shm_register!(reg::SharedMemoryRegistry, name::AbstractString, key::AbstractString,
-                       offset::Integer, byte_size::Integer)
+function shm_register!(
+        reg::SharedMemoryRegistry, name::AbstractString, key::AbstractString,
+        offset::Integer, byte_size::Integer
+    )
     isempty(name) && throw(ArgumentError("shared memory region name must not be empty"))
     isempty(key) && throw(ArgumentError("shared memory key must not be empty"))
     # Validate and narrow the untrusted sizes before any mapping exists, so an out-of-range
@@ -73,13 +75,17 @@ function shm_register!(reg::SharedMemoryRegistry, name::AbstractString, key::Abs
     off = Int(offset)
     bs = Int(byte_size)
 
-    shm = IPC.SharedMemory(String(key); readonly=false)
+    shm = IPC.SharedMemory(String(key); readonly = false)
     total = sizeof(shm)
     # Subtraction form: `off + bs` could wrap for large values.
     if bs > total || off > total - bs
         finalize(shm)
-        throw(ArgumentError("region '$name' offset+byte_size exceeds " *
-                            "shared memory object '$key' size ($total)"))
+        throw(
+            ArgumentError(
+                "region '$name' offset+byte_size exceeds " *
+                    "shared memory object '$key' size ($total)"
+            )
+        )
     end
 
     old = @lock reg.lock begin
@@ -135,7 +141,7 @@ permission error, malformed name) is reported as `false`.
 function same_ipc_namespace(name::AbstractString)
     isempty(name) && return false
     shm = try
-        IPC.SharedMemory(String(name); readonly=true)
+        IPC.SharedMemory(String(name); readonly = true)
     catch
         return false
     end
@@ -161,13 +167,21 @@ function _region_base(r::ShmRegion, offset::Integer, byte_size::Integer)
     # Range-check the untrusted values before narrowing, and use the subtraction form for the
     # bounds check: `off + bs` could wrap for hostile int64 parameters.
     (0 <= offset <= typemax(Int) && 0 <= byte_size <= typemax(Int)) ||
-        throw(ArgumentError("shared memory access (offset $offset, byte_size $byte_size) is out " *
-                            "of bounds for region '$(r.name)' of $(r.byte_size) bytes"))
+        throw(
+        ArgumentError(
+            "shared memory access (offset $offset, byte_size $byte_size) is out " *
+                "of bounds for region '$(r.name)' of $(r.byte_size) bytes"
+        )
+    )
     off = Int(offset)
     bs = Int(byte_size)
     (bs <= r.byte_size && off <= r.byte_size - bs) ||
-        throw(ArgumentError("shared memory access [$off, $off + $bs) is out of bounds for region " *
-                            "'$(r.name)' of $(r.byte_size) bytes"))
+        throw(
+        ArgumentError(
+            "shared memory access [$off, $off + $bs) is out of bounds for region " *
+                "'$(r.name)' of $(r.byte_size) bytes"
+        )
+    )
     return convert(Ptr{UInt8}, pointer(r.shm)) + r.offset + off, bs
 end
 
@@ -196,8 +210,10 @@ Copy `bytes` into `[offset, offset+length(bytes))` of the named region. The copy
 the region's lock is held, so a concurrent `shm_unregister!` of the same region cannot detach
 the mapping underneath the write.
 """
-function shm_write!(reg::SharedMemoryRegistry, name::AbstractString, offset::Integer,
-                    bytes::Vector{UInt8})
+function shm_write!(
+        reg::SharedMemoryRegistry, name::AbstractString, offset::Integer,
+        bytes::Vector{UInt8}
+    )
     r = _lookup_region(reg, name)
     @lock r.lock begin
         r.attached || throw(UnregisteredRegionError(String(name)))

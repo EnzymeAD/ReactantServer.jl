@@ -9,24 +9,26 @@ function _envval(cmd::Cmd, key::String)
     return nothing
 end
 
-_node_yaml(dir; extra="") = begin
+_node_yaml(dir; extra = "") = begin
     path = joinpath(dir, "node.yaml")
-    write(path, """
-    model_repo: /repo
-    base_port: 8080
-    metrics_base_port: 9100
-    global:
-      runtime:
-        backend: cuda
-    $extra
-    """)
+    write(
+        path, """
+        model_repo: /repo
+        base_port: 8080
+        metrics_base_port: 9100
+        global:
+          runtime:
+            backend: cuda
+        $extra
+        """
+    )
     path
 end
 
 @testset "workspace root and child specs" begin
     @test RSN.default_workspace_root(Dict("REACTANT_WORKSPACE_ROOT" => "/opt/rs")) == "/opt/rs"
 
-    spec = RSN.worker_spec("worker1", "/run/node.yaml", "1", "/opt/rs"; compute_threads=8)
+    spec = RSN.worker_spec("worker1", "/run/node.yaml", "1", "/opt/rs"; compute_threads = 8)
     @test spec.name == "worker1"
     @test _envval(spec.cmd, "REACTANT_WORKER_NAME") == "worker1"
     @test _envval(spec.cmd, "CUDA_VISIBLE_DEVICES") == "1"
@@ -48,13 +50,15 @@ end
     spec = RSN.worker_spec("worker0", "/run/node.yaml", nothing, "/opt/rs")
     @test _envval(spec.cmd, "CUDA_VISIBLE_DEVICES") == ""
 
-    gw = RSN.gateway_spec("/opt/rs"; endpoints=["127.0.0.1:8080", "127.0.0.1:8081"])
+    gw = RSN.gateway_spec("/opt/rs"; endpoints = ["127.0.0.1:8080", "127.0.0.1:8081"])
     @test gw.name == "gateway"
     @test _envval(gw.cmd, "REACTANT_GATEWAY_WORKERS") == "127.0.0.1:8080,127.0.0.1:8081"
 
     # A mounted gateway.yml wins: passed as an argument, no endpoint synthesis.
-    gwf = RSN.gateway_spec("/opt/rs"; gateway_path="/etc/reactantserver/gateway.yml",
-                           endpoints=["127.0.0.1:8080"])
+    gwf = RSN.gateway_spec(
+        "/opt/rs"; gateway_path = "/etc/reactantserver/gateway.yml",
+        endpoints = ["127.0.0.1:8080"]
+    )
     @test any(a -> a == "/etc/reactantserver/gateway.yml", gwf.cmd.exec)
     @test _envval(gwf.cmd, "REACTANT_GATEWAY_WORKERS") === nothing
 
@@ -69,26 +73,34 @@ end
     # environment, so the endpoint shape shows the inherited "120", while the mounted-file shape adds
     # no pairs at all and leaves `cmd.env` unset, which means the child inherits ENV as it stands.)
     withenv("REACTANT_GATEWAY_STARTUP_WAIT_SECONDS" => "120") do
-        for c in (RSN.gateway_spec("/opt/rs"; endpoints=["127.0.0.1:8080"]).cmd,
-                  RSN.gateway_spec("/opt/rs"; gateway_path="/etc/x/gateway.yml").cmd)
+        for c in (
+                RSN.gateway_spec("/opt/rs"; endpoints = ["127.0.0.1:8080"]).cmd,
+                RSN.gateway_spec("/opt/rs"; gateway_path = "/etc/x/gateway.yml").cmd,
+            )
             @test _envval(c, "REACTANT_GATEWAY_STARTUP_WAIT_SECONDS") != "inf"
         end
     end
 end
 
 @testset "worker endpoints and gateway listen ports" begin
-    node = Dict{String,Any}("model_repo" => "/repo", "base_port" => 8080,
-                            "workers" => Any[Dict{String,Any}("name" => "a"),
-                                             Dict{String,Any}("name" => "b")])
+    node = Dict{String, Any}(
+        "model_repo" => "/repo", "base_port" => 8080,
+        "workers" => Any[
+            Dict{String, Any}("name" => "a"),
+            Dict{String, Any}("name" => "b"),
+        ]
+    )
     @test RSN.worker_endpoints(node) == ["127.0.0.1:8080", "127.0.0.1:8081"]
 
-    @test RSN._gateway_listen_ports(nothing, Dict{String,String}()) == Set([8001, 8002])
-    @test RSN._gateway_listen_ports(nothing,
-        Dict("REACTANT_GATEWAY_LISTEN_GRPC" => "0.0.0.0:7001")) == Set([7001, 8002])
+    @test RSN._gateway_listen_ports(nothing, Dict{String, String}()) == Set([8001, 8002])
+    @test RSN._gateway_listen_ports(
+        nothing,
+        Dict("REACTANT_GATEWAY_LISTEN_GRPC" => "0.0.0.0:7001")
+    ) == Set([7001, 8002])
     mktempdir() do dir
         gwy = joinpath(dir, "gateway.yml")
         write(gwy, "listen:\n  grpc: \"0.0.0.0:6001\"\n  metrics: \"0.0.0.0:6002\"\n")
-        @test RSN._gateway_listen_ports(gwy, Dict{String,String}()) == Set([6001, 6002])
+        @test RSN._gateway_listen_ports(gwy, Dict{String, String}()) == Set([6001, 6002])
     end
 end
 
@@ -96,15 +108,17 @@ end
     mktempdir() do dir
         path = _node_yaml(dir)
         sink = IOBuffer()
-        sup = RSN.build_supervisor(path; env=Dict("REACTANT_GPUS" => "2"), sink=sink,
-                                   workspace_root="/opt/rs", runtime_dir=joinpath(dir, "run"))
+        sup = RSN.build_supervisor(
+            path; env = Dict("REACTANT_GPUS" => "2"), sink = sink,
+            workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "run")
+        )
         names = [c.spec.name for c in sup.children]
         @test names == ["worker0", "worker1", "gateway"]
 
         # The materialized node file has the synthesized workers and is what children read.
         mat = joinpath(dir, "run", "node.yaml")
         @test isfile(mat)
-        node = YAML.load_file(mat; dicttype=Dict{String,Any})
+        node = YAML.load_file(mat; dicttype = Dict{String, Any})
         @test [w["name"] for w in node["workers"]] == ["worker0", "worker1"]
         for c in sup.children[1:2]
             @test any(a -> a == mat, c.spec.cmd.exec)
@@ -115,10 +129,10 @@ end
         # (no public-port override) and the gateway fronts them.
         @test _envval(sup.children[1].spec.cmd, "INFERENCE_SERVER_ENDPOINTS_PORT") === nothing
         @test _envval(sup.children[3].spec.cmd, "REACTANT_GATEWAY_WORKERS") ==
-              "127.0.0.1:8080,127.0.0.1:8081"
+            "127.0.0.1:8080,127.0.0.1:8081"
         # Worker metrics endpoints feed the gateway's aggregated /metrics.
         @test _envval(sup.children[3].spec.cmd, "REACTANT_GATEWAY_WORKER_METRICS") ==
-              "127.0.0.1:9100,127.0.0.1:9101"
+            "127.0.0.1:9100,127.0.0.1:9101"
         @test occursin("role=all", String(take!(sink)))
     end
 end
@@ -127,8 +141,10 @@ end
     mktempdir() do dir
         path = _node_yaml(dir)
         sink = IOBuffer()
-        sup = RSN.build_supervisor(path; env=Dict("REACTANT_GPUS" => "1"), sink=sink,
-                                   workspace_root="/opt/rs", runtime_dir=joinpath(dir, "run"))
+        sup = RSN.build_supervisor(
+            path; env = Dict("REACTANT_GPUS" => "1"), sink = sink,
+            workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "run")
+        )
         # No gateway child: the sole worker is the node's public endpoint.
         @test [c.spec.name for c in sup.children] == ["worker0"]
         w = sup.children[1].spec.cmd
@@ -138,10 +154,14 @@ end
         @test occursin("no gateway", String(take!(sink)))
 
         # The public ports honor the gateway listen overrides.
-        sup = RSN.build_supervisor(path;
-            env=Dict("REACTANT_GPUS" => "1", "REACTANT_GATEWAY_LISTEN_GRPC" => "0.0.0.0:7001",
-                     "REACTANT_GATEWAY_LISTEN_METRICS" => "0.0.0.0:7002"),
-            sink=IOBuffer(), workspace_root="/opt/rs", runtime_dir=joinpath(dir, "run2"))
+        sup = RSN.build_supervisor(
+            path;
+            env = Dict(
+                "REACTANT_GPUS" => "1", "REACTANT_GATEWAY_LISTEN_GRPC" => "0.0.0.0:7001",
+                "REACTANT_GATEWAY_LISTEN_METRICS" => "0.0.0.0:7002"
+            ),
+            sink = IOBuffer(), workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "run2")
+        )
         @test _envval(sup.children[1].spec.cmd, "INFERENCE_SERVER_ENDPOINTS_PORT") == "7001"
         @test _envval(sup.children[1].spec.cmd, "INFERENCE_SERVER_ENDPOINTS_METRICS_PORT") == "7002"
     end
@@ -152,30 +172,40 @@ end
         path = _node_yaml(dir)
 
         # workers role (via env): no gateway child.
-        sup = RSN.build_supervisor(path;
-            env=Dict("REACTANT_GPUS" => "1", "REACTANT_ROLE" => "workers"),
-            sink=IOBuffer(), workspace_root="/opt/rs", runtime_dir=joinpath(dir, "runw"))
+        sup = RSN.build_supervisor(
+            path;
+            env = Dict("REACTANT_GPUS" => "1", "REACTANT_ROLE" => "workers"),
+            sink = IOBuffer(), workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "runw")
+        )
         @test [c.spec.name for c in sup.children] == ["worker0"]
 
         # gateway role: just the gateway, no node materialization (works without GPUs).
-        sup = RSN.build_supervisor(path; role=:gateway, env=Dict{String,String}(),
-                                   sink=IOBuffer(), workspace_root="/opt/rs")
+        sup = RSN.build_supervisor(
+            path; role = :gateway, env = Dict{String, String}(),
+            sink = IOBuffer(), workspace_root = "/opt/rs"
+        )
         @test [c.spec.name for c in sup.children] == ["gateway"]
 
         # CUDA node with zero devices is a hard error with guidance.
-        @test_throws ReactantServerCore.ConfigError RSN.build_supervisor(path;
-            env=Dict("REACTANT_GPUS" => "0"), sink=IOBuffer(), workspace_root="/opt/rs",
-            runtime_dir=joinpath(dir, "rune"))
+        @test_throws ReactantServerCore.ConfigError RSN.build_supervisor(
+            path;
+            env = Dict("REACTANT_GPUS" => "0"), sink = IOBuffer(), workspace_root = "/opt/rs",
+            runtime_dir = joinpath(dir, "rune")
+        )
 
         # Bad role rejected.
-        @test_throws ReactantServerCore.ConfigError RSN.build_supervisor(path;
-            role=:everything, env=Dict{String,String}(), sink=IOBuffer(),
-            workspace_root="/opt/rs")
+        @test_throws ReactantServerCore.ConfigError RSN.build_supervisor(
+            path;
+            role = :everything, env = Dict{String, String}(), sink = IOBuffer(),
+            workspace_root = "/opt/rs"
+        )
 
         # max_restarts from the environment.
-        sup = RSN.build_supervisor(path;
-            env=Dict("REACTANT_GPUS" => "1", "REACTANT_SUPERVISOR_MAX_RESTARTS" => "4"),
-            sink=IOBuffer(), workspace_root="/opt/rs", runtime_dir=joinpath(dir, "runm"))
+        sup = RSN.build_supervisor(
+            path;
+            env = Dict("REACTANT_GPUS" => "1", "REACTANT_SUPERVISOR_MAX_RESTARTS" => "4"),
+            sink = IOBuffer(), workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "runm")
+        )
         @test sup.max_restarts == 4
     end
 end
@@ -183,16 +213,20 @@ end
 @testset "build_supervisor: port collision warning" begin
     mktempdir() do dir
         path = joinpath(dir, "node.yaml")
-        write(path, """
-        model_repo: /repo
-        base_port: 8001
-        global:
-          runtime:
-            backend: cuda
-        """)
+        write(
+            path, """
+            model_repo: /repo
+            base_port: 8001
+            global:
+              runtime:
+                backend: cuda
+            """
+        )
         sink = IOBuffer()
-        RSN.build_supervisor(path; env=Dict("REACTANT_GPUS" => "2"), sink=sink,
-                             workspace_root="/opt/rs", runtime_dir=joinpath(dir, "run"))
+        RSN.build_supervisor(
+            path; env = Dict("REACTANT_GPUS" => "2"), sink = sink,
+            workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "run")
+        )
         out = String(take!(sink))
         @test occursin("WARNING", out)
         @test occursin("8001", out)
@@ -203,24 +237,28 @@ end
     # Multiple workers + on-demand cache + private host floor: warn about the Nx host-RAM copies.
     ondemand_node(dir; shared) = begin
         path = joinpath(dir, "node.yaml")
-        write(path, """
-        model_repo: /repo
-        base_port: 8080
-        metrics_base_port: 9100
-        global:
-          runtime:
-            backend: cuda
-            weight_cache_fraction: 0.6
-            shared_host_weights: $shared
-        """)
+        write(
+            path, """
+            model_repo: /repo
+            base_port: 8080
+            metrics_base_port: 9100
+            global:
+              runtime:
+                backend: cuda
+                weight_cache_fraction: 0.6
+                shared_host_weights: $shared
+            """
+        )
         path
     end
 
     # Two workers, on-demand cache, shared store off: the warning fires.
     mktempdir() do dir
         sink = IOBuffer()
-        RSN.build_supervisor(ondemand_node(dir; shared=false); env=Dict("REACTANT_GPUS" => "2"),
-                             sink=sink, workspace_root="/opt/rs", runtime_dir=joinpath(dir, "run"))
+        RSN.build_supervisor(
+            ondemand_node(dir; shared = false); env = Dict("REACTANT_GPUS" => "2"),
+            sink = sink, workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "run")
+        )
         out = String(take!(sink))
         @test occursin("shared_host_weights", out)
         @test occursin("private host copy", out)
@@ -229,16 +267,20 @@ end
     # Same, but the shared store is on: no warning.
     mktempdir() do dir
         sink = IOBuffer()
-        RSN.build_supervisor(ondemand_node(dir; shared=true); env=Dict("REACTANT_GPUS" => "2"),
-                             sink=sink, workspace_root="/opt/rs", runtime_dir=joinpath(dir, "run"))
+        RSN.build_supervisor(
+            ondemand_node(dir; shared = true); env = Dict("REACTANT_GPUS" => "2"),
+            sink = sink, workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "run")
+        )
         @test !occursin("private host copy", String(take!(sink)))
     end
 
     # A single worker materializes one floor regardless, so the warning is gated on >1 worker.
     mktempdir() do dir
         sink = IOBuffer()
-        RSN.build_supervisor(ondemand_node(dir; shared=false); env=Dict("REACTANT_GPUS" => "1"),
-                             sink=sink, workspace_root="/opt/rs", runtime_dir=joinpath(dir, "run"))
+        RSN.build_supervisor(
+            ondemand_node(dir; shared = false); env = Dict("REACTANT_GPUS" => "1"),
+            sink = sink, workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "run")
+        )
         @test !occursin("private host copy", String(take!(sink)))
     end
 end
@@ -246,42 +288,50 @@ end
 @testset "build_supervisor: cpu node" begin
     mktempdir() do dir
         path = joinpath(dir, "node.yaml")
-        write(path, """
-        model_repo: /repo
-        base_port: 8080
-        global:
-          runtime:
-            backend: cpu
-        """)
-        sup = RSN.build_supervisor(path;
-            env=Dict("REACTANT_GPUS" => "0", "REACTANT_CPU_WORKERS" => "2"),
-            sink=IOBuffer(), workspace_root="/opt/rs", runtime_dir=joinpath(dir, "run"))
+        write(
+            path, """
+            model_repo: /repo
+            base_port: 8080
+            global:
+              runtime:
+                backend: cpu
+            """
+        )
+        sup = RSN.build_supervisor(
+            path;
+            env = Dict("REACTANT_GPUS" => "0", "REACTANT_CPU_WORKERS" => "2"),
+            sink = IOBuffer(), workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "run")
+        )
         @test [c.spec.name for c in sup.children] == ["worker0", "worker1", "gateway"]
         @test _envval(sup.children[1].spec.cmd, "CUDA_VISIBLE_DEVICES") == ""
     end
 end
 
 @testset "gateway_spec: grpc message-size env synthesis" begin
-    withenv("REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES" => nothing,
-            "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES" => nothing) do
+    withenv(
+        "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES" => nothing,
+        "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES" => nothing
+    ) do
         # Provided sizes are synthesized into the gateway's env.
-        gw = RSN.gateway_spec("/opt/rs"; endpoints=["127.0.0.1:8080"],
-                              grpc_max_recv=111, grpc_max_send=222)
+        gw = RSN.gateway_spec(
+            "/opt/rs"; endpoints = ["127.0.0.1:8080"],
+            grpc_max_recv = 111, grpc_max_send = 222
+        )
         @test _envval(gw.cmd, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES") == "111"
         @test _envval(gw.cmd, "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES") == "222"
 
         # Omitted -> not synthesized (the gateway uses its own default).
-        gw0 = RSN.gateway_spec("/opt/rs"; endpoints=["127.0.0.1:8080"])
+        gw0 = RSN.gateway_spec("/opt/rs"; endpoints = ["127.0.0.1:8080"])
         @test _envval(gw0.cmd, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES") === nothing
 
         # A mounted gateway.yml suppresses synthesis (the gateway reads its own file).
-        gwf = RSN.gateway_spec("/opt/rs"; gateway_path="/etc/x/gateway.yml", grpc_max_recv=111)
+        gwf = RSN.gateway_spec("/opt/rs"; gateway_path = "/etc/x/gateway.yml", grpc_max_recv = 111)
         @test _envval(gwf.cmd, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES") === nothing
     end
 
     # An explicit process env wins over the synthesized value.
     withenv("REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES" => "999") do
-        gwe = RSN.gateway_spec("/opt/rs"; endpoints=["127.0.0.1:8080"], grpc_max_recv=111)
+        gwe = RSN.gateway_spec("/opt/rs"; endpoints = ["127.0.0.1:8080"], grpc_max_recv = 111)
         @test _envval(gwe.cmd, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES") == "999"
     end
 end
@@ -289,21 +339,27 @@ end
 @testset "build_supervisor: node global.grpc reaches the embedded gateway" begin
     mktempdir() do dir
         path = joinpath(dir, "node.yaml")
-        write(path, """
-        model_repo: /repo
-        base_port: 8080
-        metrics_base_port: 9100
-        global:
-          runtime:
-            backend: cuda
-          grpc:
-            max_recv_msg_bytes: 111
-            max_send_msg_bytes: 222
-        """)
-        withenv("REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES" => nothing,
-                "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES" => nothing) do
-            sup = RSN.build_supervisor(path; env=Dict("REACTANT_GPUS" => "2"),
-                sink=IOBuffer(), workspace_root="/opt/rs", runtime_dir=joinpath(dir, "run"))
+        write(
+            path, """
+            model_repo: /repo
+            base_port: 8080
+            metrics_base_port: 9100
+            global:
+              runtime:
+                backend: cuda
+              grpc:
+                max_recv_msg_bytes: 111
+                max_send_msg_bytes: 222
+            """
+        )
+        withenv(
+            "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES" => nothing,
+            "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES" => nothing
+        ) do
+            sup = RSN.build_supervisor(
+                path; env = Dict("REACTANT_GPUS" => "2"),
+                sink = IOBuffer(), workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "run")
+            )
             gw = sup.children[end].spec.cmd   # the gateway is the last child
             @test _envval(gw, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES") == "111"
             @test _envval(gw, "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES") == "222"

@@ -72,8 +72,10 @@ using Lux
 # Load a bundle and run it through the ReactantServer runtime (CPU backend).
 function run_bundle(root, name, inputs::Vector{<:Pair})
     backend = ReactantServer.ReactantBackend()
-    pool = ReactantServer.resolve_client(backend,
-        ReactantServer.RuntimeConfig(ReactantServer.CPU_BACKEND, 0, 0.9, true, true))
+    pool = ReactantServer.resolve_client(
+        backend,
+        ReactantServer.RuntimeConfig(ReactantServer.CPU_BACKEND, 0, 0.9, true, true)
+    )
     reg = ReactantServer.load_bundles([root])
     entry = ReactantServer.get_model(reg, name)
     entry.executable = ReactantServer.build_loaded_model(backend, pool, entry)
@@ -82,7 +84,8 @@ function run_bundle(root, name, inputs::Vector{<:Pair})
 end
 
 _load_manifest(dir) = ReactantServer.parse_manifest(
-    ReactantServer.YAML.load_file(joinpath(dir, "manifest.yaml"); dicttype = Dict{String,Any}))
+    ReactantServer.YAML.load_file(joinpath(dir, "manifest.yaml"); dicttype = Dict{String, Any})
+)
 
 @testset "ReactantServerExport" begin
     @testset "collect_provenance" begin
@@ -93,8 +96,10 @@ _load_manifest(dir) = ReactantServer.parse_manifest(
             run(`git -C $repo add f.txt`)
             run(`git -C $repo -c user.name=t -c user.email=t@t commit -qm init`)
             prov = collect_provenance(repo; extra = Dict("model" => "M"))
-            for k in ("exported_at", "julia_version", "reactantserverexport_version",
-                      "git_commit", "git_tree_sha1", "git_branch", "git_dirty")
+            for k in (
+                    "exported_at", "julia_version", "reactantserverexport_version",
+                    "git_commit", "git_tree_sha1", "git_branch", "git_dirty",
+                )
                 @test haskey(prov, k)
             end
             @test prov["model"] == "M"
@@ -127,9 +132,11 @@ _load_manifest(dir) = ReactantServer.parse_manifest(
 
         mktempdir() do root
             example = randn(Float32, 4, 1)            # (features, batch); batch is the last Julia axis
-            export_bundle(:lux, model, ps, st, example;
+            export_bundle(
+                :lux, model, ps, st, example;
                 dir = joinpath(root, "mlp"), name = "mlp", batch_sizes = [1, 4],
-                provenance = Dict{String,Any}("git_diff" => "--- fake patch\n"))
+                provenance = Dict{String, Any}("git_diff" => "--- fake patch\n")
+            )
 
             # write_bundle extracts git_diff into a patch file instead of the manifest.
             @test read(joinpath(root, "mlp", "working_tree.patch"), String) == "--- fake patch\n"
@@ -154,7 +161,7 @@ _load_manifest(dir) = ReactantServer.parse_manifest(
                 yref = first(model(x, ps, st))        # (3, b) Julia
                 out = run_bundle(root, "mlp", ["input" => x])
                 @test length(out) == 1
-                @test isapprox(out[1].data, yref; rtol = 1e-4, atol = 1e-5)
+                @test isapprox(out[1].data, yref; rtol = 1.0e-4, atol = 1.0e-5)
             end
         end
     end
@@ -165,13 +172,15 @@ _load_manifest(dir) = ReactantServer.parse_manifest(
         bvec = Float32[10, 20]
         mktempdir() do root
             x0 = reshape(collect(Float32, 1:3), 3, 1)
-            export_bundle(:reactant, g, (x0,), ["W" => W, "b" => bvec];
-                dir = joinpath(root, "affine"), name = "affine", input_names = ["x"])
+            export_bundle(
+                :reactant, g, (x0,), ["W" => W, "b" => bvec];
+                dir = joinpath(root, "affine"), name = "affine", input_names = ["x"]
+            )
             @test isfile(joinpath(root, "affine", "model.mlir"))
 
             x = reshape(Float32[2, 3, 4], 3, 1)
             out = run_bundle(root, "affine", ["x" => x])
-            @test isapprox(vec(out[1].data), vec(W * x .+ bvec); rtol = 1e-5)
+            @test isapprox(vec(out[1].data), vec(W * x .+ bvec); rtol = 1.0e-5)
         end
     end
 
@@ -186,35 +195,37 @@ _load_manifest(dir) = ReactantServer.parse_manifest(
             return ReactantServerExport._numpy_to_julia(np_arr, T)
         end
 
-        pyexec("""
-import torch
+        pyexec(
+            """
+            import torch
 
-class TinyMLP(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.fc1 = torch.nn.Linear(4, 8)
-        self.fc2 = torch.nn.Linear(8, 3)
-    def forward(self, x):
-        return self.fc2(torch.tanh(self.fc1(x)))
+            class TinyMLP(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.fc1 = torch.nn.Linear(4, 8)
+                    self.fc2 = torch.nn.Linear(8, 3)
+                def forward(self, x):
+                    return self.fc2(torch.tanh(self.fc1(x)))
 
-class UInt8In(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.fc = torch.nn.Linear(4, 2)
-    def forward(self, x):
-        xf = x.to(torch.float32) / 255.0 - 0.5
-        return self.fc(xf)
+            class UInt8In(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.fc = torch.nn.Linear(4, 2)
+                def forward(self, x):
+                    xf = x.to(torch.float32) / 255.0 - 0.5
+                    return self.fc(xf)
 
-# TinyConv exercises the aten._convolution.default delegation patch in the TorchScript path.
-class TinyConv(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv = torch.nn.Conv2d(3, 4, kernel_size=3, padding=1)
-        self.fc = torch.nn.Linear(4 * 4 * 4, 2)
-    def forward(self, x):
-        h = torch.relu(self.conv(x))
-        return self.fc(h.flatten(1))
-""", @__MODULE__)
+            # TinyConv exercises the aten._convolution.default delegation patch in the TorchScript path.
+            class TinyConv(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.conv = torch.nn.Conv2d(3, 4, kernel_size=3, padding=1)
+                    self.fc = torch.nn.Linear(4 * 4 * 4, 2)
+                def forward(self, x):
+                    h = torch.relu(self.conv(x))
+                    return self.fc(h.flatten(1))
+            """, @__MODULE__
+        )
 
         @testset "PyTorch nn.Module -> bundle -> server (Float32, multi-batch)" begin
             torch.manual_seed(0)
@@ -222,9 +233,11 @@ class TinyConv(torch.nn.Module):
 
             mktempdir() do root
                 example = randn(Float32, 4, 1)   # (features, batch) Julia = (batch, features) PyTorch
-                export_bundle(:pytorch, model, (example,);
+                export_bundle(
+                    :pytorch, model, (example,);
                     dir = joinpath(root, "mlp"), name = "mlp",
-                    input_names = ["input"], batch_sizes = [1, 4])
+                    input_names = ["input"], batch_sizes = [1, 4]
+                )
 
                 @test isfile(joinpath(root, "mlp", "model.b1.mlir"))
                 @test isfile(joinpath(root, "mlp", "model.b4.mlir"))
@@ -237,14 +250,16 @@ class TinyConv(torch.nn.Module):
 
                 for b in (1, 4)
                     x = randn(Float32, 4, b)
-                    py_x = torch.from_numpy(np.frombuffer(
-                        pybytes(Vector{UInt8}(reinterpret(UInt8, vec(x)))), dtype = "float32"
-                    ).reshape(reverse(size(x))...).copy())
+                    py_x = torch.from_numpy(
+                        np.frombuffer(
+                            pybytes(Vector{UInt8}(reinterpret(UInt8, vec(x)))), dtype = "float32"
+                        ).reshape(reverse(size(x))...).copy()
+                    )
                     yref = torch_to_julia(model(py_x))
 
                     out = run_bundle(root, "mlp", ["input" => x])
                     @test length(out) == 1
-                    @test isapprox(out[1].data, yref; rtol = 1e-4, atol = 1e-5)
+                    @test isapprox(out[1].data, yref; rtol = 1.0e-4, atol = 1.0e-5)
                 end
             end
         end
@@ -257,9 +272,11 @@ class TinyConv(torch.nn.Module):
 
             mktempdir() do root
                 example = randn(Float64, 4, 1)
-                export_bundle(:pytorch, model, (example,);
+                export_bundle(
+                    :pytorch, model, (example,);
                     dir = joinpath(root, "mlp64"), name = "mlp64",
-                    input_names = ["input"], batch_sizes = [1, 4])
+                    input_names = ["input"], batch_sizes = [1, 4]
+                )
 
                 man = _load_manifest(joinpath(root, "mlp64"))
                 @test man.executable_inputs[1].dtype == ReactantServer.F64
@@ -267,15 +284,17 @@ class TinyConv(torch.nn.Module):
 
                 for b in (1, 4)
                     x = randn(Float64, 4, b)
-                    py_x = torch.from_numpy(np.frombuffer(
-                        pybytes(Vector{UInt8}(reinterpret(UInt8, vec(x)))), dtype = "float64"
-                    ).reshape(reverse(size(x))...).copy())
+                    py_x = torch.from_numpy(
+                        np.frombuffer(
+                            pybytes(Vector{UInt8}(reinterpret(UInt8, vec(x)))), dtype = "float64"
+                        ).reshape(reverse(size(x))...).copy()
+                    )
                     yref = torch_to_julia(model(py_x))
 
                     out = run_bundle(root, "mlp64", ["input" => x])
                     @test length(out) == 1
                     @test eltype(out[1].data) == Float64
-                    @test isapprox(out[1].data, yref; rtol = 1e-12, atol = 1e-12)
+                    @test isapprox(out[1].data, yref; rtol = 1.0e-12, atol = 1.0e-12)
                 end
             end
         end
@@ -286,9 +305,11 @@ class TinyConv(torch.nn.Module):
 
             mktempdir() do root
                 example = zeros(UInt8, 4, 1)
-                export_bundle(:pytorch, model, (example,);
+                export_bundle(
+                    :pytorch, model, (example,);
                     dir = joinpath(root, "u8m"), name = "u8m",
-                    input_names = ["input"], batch_sizes = [1, 2])
+                    input_names = ["input"], batch_sizes = [1, 2]
+                )
 
                 man = _load_manifest(joinpath(root, "u8m"))
                 @test man.executable_inputs[1].dtype == ReactantServer.U8
@@ -297,14 +318,16 @@ class TinyConv(torch.nn.Module):
 
                 for b in (1, 2)
                     x = rand(UInt8, 4, b)
-                    py_x = torch.from_numpy(np.frombuffer(
-                        pybytes(Vector{UInt8}(vec(x))), dtype = "uint8"
-                    ).reshape(reverse(size(x))...).copy())
+                    py_x = torch.from_numpy(
+                        np.frombuffer(
+                            pybytes(Vector{UInt8}(vec(x))), dtype = "uint8"
+                        ).reshape(reverse(size(x))...).copy()
+                    )
                     yref = torch_to_julia(model(py_x))
 
                     out = run_bundle(root, "u8m", ["input" => x])
                     @test length(out) == 1
-                    @test isapprox(out[1].data, yref; rtol = 1e-4, atol = 1e-5)
+                    @test isapprox(out[1].data, yref; rtol = 1.0e-4, atol = 1.0e-5)
                 end
             end
         end
@@ -323,9 +346,11 @@ class TinyConv(torch.nn.Module):
                 jit_model.eval()
 
                 example = zeros(Float32, 4, 4, 3, 1)   # (W, H, C, batch) Julia = (batch, C, H, W) PyTorch
-                export_torchscript_bundle(pt_path, (example,);
+                export_torchscript_bundle(
+                    pt_path, (example,);
                     dir = joinpath(root, "tinyconv"), name = "tinyconv",
-                    input_names = ["input"], batch_sizes = [1, 2])
+                    input_names = ["input"], batch_sizes = [1, 2]
+                )
 
                 @test isfile(joinpath(root, "tinyconv", "model.b1.mlir"))
                 @test isfile(joinpath(root, "tinyconv", "model.b2.mlir"))
@@ -336,14 +361,16 @@ class TinyConv(torch.nn.Module):
 
                 for b in (1, 2)
                     x = randn(Float32, 4, 4, 3, b)
-                    py_x = torch.from_numpy(np.frombuffer(
-                        pybytes(Vector{UInt8}(reinterpret(UInt8, vec(x)))), dtype = "float32"
-                    ).reshape(reverse(size(x))...).copy())
+                    py_x = torch.from_numpy(
+                        np.frombuffer(
+                            pybytes(Vector{UInt8}(reinterpret(UInt8, vec(x)))), dtype = "float32"
+                        ).reshape(reverse(size(x))...).copy()
+                    )
                     yref = torch_to_julia(jit_model(py_x))
 
                     out = run_bundle(root, "tinyconv", ["input" => x])
                     @test length(out) == 1
-                    @test isapprox(out[1].data, yref; rtol = 1e-4, atol = 1e-5)
+                    @test isapprox(out[1].data, yref; rtol = 1.0e-4, atol = 1.0e-5)
                 end
             end
         end

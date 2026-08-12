@@ -25,23 +25,29 @@ const SEQ_BUCKETS = (512,)
 
 function preprocess(inputs::Vector{NamedTensor})
     byname = Dict(t.name => t for t in inputs)
-    input_ids, attention_mask, token_type_ids = BT.encode_pair_batch(TOKENIZER,
+    input_ids, attention_mask, token_type_ids = BT.encode_pair_batch(
+        TOKENIZER,
         BT.wire_text(byname["query"].data::Array{UInt8}),
         byname["keys"].data::Matrix{UInt8},              # (max_bytes, batch) col-major
         vec(byname["key_lens"].data);
-        max_len=MAX_LEN, buckets=SEQ_BUCKETS, lens_name="key_lens")
-    return NamedTensor[NamedTensor("input_ids", input_ids),
-                       NamedTensor("attention_mask", attention_mask),
-                       NamedTensor("token_type_ids", token_type_ids)]
+        max_len = MAX_LEN, buckets = SEQ_BUCKETS, lens_name = "key_lens"
+    )
+    return NamedTensor[
+        NamedTensor("input_ids", input_ids),
+        NamedTensor("attention_mask", attention_mask),
+        NamedTensor("token_type_ids", token_type_ids),
+    ]
 end
 
 function postprocess(out::Vector{NamedTensor})
     logits = vec(out[1].data::Array{Float32})            # (batch,)
     prob = ReactantServer.NNlib.sigmoid.(logits)
-    return NamedTensor[NamedTensor("logits", logits),
-                       NamedTensor("prob", prob)]
+    return NamedTensor[
+        NamedTensor("logits", logits),
+        NamedTensor("prob", prob),
+    ]
 end
 
 # The serving identity is the bundle directory's basename; register under it so the dated
 # bundle name lives in exactly one place.
-register_model(basename(@__DIR__); preprocess=preprocess, postprocess=postprocess)
+register_model(basename(@__DIR__); preprocess = preprocess, postprocess = postprocess)

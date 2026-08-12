@@ -8,7 +8,7 @@
 
 # Minimal safetensors double: name -> host array.
 struct FakeWeights
-    tensors::Dict{String,Array}
+    tensors::Dict{String, Array}
 end
 Base.haskey(f::FakeWeights, k) = haskey(f.tensors, k)
 Base.getindex(f::FakeWeights, k) = f.tensors[k]
@@ -25,20 +25,24 @@ Base.getindex(::PoisonWeights, k) = error("safetensors mmap accessed; weights sh
 # A batched scale model whose weights may start resident (pinned) or evicted (on-demand). When
 # host_pinned, the materialized host array is kept resident and the mmap handle is poisoned so a
 # load that reaches for the mmap would fail the test.
-function _od_entry(name; pinned::Bool, nbytes::Int, host_pinned::Bool=false)
+function _od_entry(name; pinned::Bool, nbytes::Int, host_pinned::Bool = false)
     sig = ReactantServer.ModelSignature(["x"], DataType[Float32], ["w"], 1, ["y"], DataType[Float32], 1)
     exec = ReactantServer.MockExecutable(args -> [args[1] .* args[2]], 1)
     weights = pinned ? Any[ReactantServer.MockBuffer(copy(_W))] : nothing
     host_weights = host_pinned ? Any[copy(_W)] : nothing
-    lm = ReactantServer.LoadedModel(sig, Dict{Int,Any}(1 => exec), weights, pinned, nbytes, host_weights)
-    st = host_pinned ? PoisonWeights() : FakeWeights(Dict{String,Array}("w" => copy(_W)))
-    return ReactantServer.ModelEntry(name, _batched_manifest(name), Dict{Int,Vector{UInt8}}(),
-        "", st, lm, nothing, identity, identity)
+    lm = ReactantServer.LoadedModel(sig, Dict{Int, Any}(1 => exec), weights, pinned, nbytes, host_weights)
+    st = host_pinned ? PoisonWeights() : FakeWeights(Dict{String, Array}("w" => copy(_W)))
+    return ReactantServer.ModelEntry(
+        name, _batched_manifest(name), Dict{Int, Vector{UInt8}}(),
+        "", st, lm, nothing, identity, identity
+    )
 end
 
-function _od_scheduler(entries::ReactantServer.ModelEntry...; budget::Int,
-                      mode::ReactantServer.ResidencyMode=ReactantServer.SELF_MANAGED,
-                      store::ReactantServer.WeightStore=ReactantServer.PrivateWeightStore())
+function _od_scheduler(
+        entries::ReactantServer.ModelEntry...; budget::Int,
+        mode::ReactantServer.ResidencyMode = ReactantServer.SELF_MANAGED,
+        store::ReactantServer.WeightStore = ReactantServer.PrivateWeightStore()
+    )
     backend = ReactantServer.MockBackend()
     pool = ReactantServer.MemoryPool(backend, ReactantServer.MockClient(), ReactantServer.MockDevice(0), "mock", nothing)
     reg = ReactantServer.ModelRegistry()
@@ -49,13 +53,13 @@ function _od_scheduler(entries::ReactantServer.ModelEntry...; budget::Int,
     for e in entries
         e.sched = ReactantServer.ModelSchedState(e.name, ReactantServer.ModelSchedConfig(1.0), 0.0)
     end
-    sched.weight_cache = ReactantServer.WeightCache(backend, pool, reg, budget; mode=mode, store=store)
+    sched.weight_cache = ReactantServer.WeightCache(backend, pool, reg, budget; mode = mode, store = store)
     ReactantServer.preload_pinned!(sched.weight_cache, reg)
     return sched
 end
 
 # Dispatch a single one-row request to `name` and return the per-caller result.
-function _dispatch1!(sched, name; val::Float32=1.0f0)
+function _dispatch1!(sched, name; val::Float32 = 1.0f0)
     wreq = ReactantServer.InferRequest(name, ["y"], [ReactantServer.NamedTensor("x", reshape(Float32[val, val], 2, 1))])
     qr = ReactantServer.QueuedRequest(wreq, wreq.inputs, 0.0, Channel{Any}(1))
     push!(sched.registry.by_name[name].sched.queue, qr)
@@ -65,11 +69,11 @@ function _dispatch1!(sched, name; val::Float32=1.0f0)
 end
 
 @testset "on-demand weights load on first dispatch and survive reuse" begin
-    sched = _od_scheduler(_od_entry("A"; pinned=false, nbytes=_WBYTES); budget=_WBYTES)
+    sched = _od_scheduler(_od_entry("A"; pinned = false, nbytes = _WBYTES); budget = _WBYTES)
     A = sched.registry.by_name["A"].executable
     @test A.weights === nothing                      # evicted at startup
 
-    res = _dispatch1!(sched, "A"; val=1.0f0)
+    res = _dispatch1!(sched, "A"; val = 1.0f0)
     @test res[1].data == reshape(Float32[10, 100], 2, 1)
     @test A.weights !== nothing                      # loaded on demand
     @test sched.weight_cache.loads == 1
@@ -77,14 +81,16 @@ end
 
     # A second dispatch to the same model reuses the resident weights (no reload). This is what
     # keeps back-to-back requests coalescible.
-    _dispatch1!(sched, "A"; val=2.0f0)
+    _dispatch1!(sched, "A"; val = 2.0f0)
     @test sched.weight_cache.loads == 1
     @test sched.weight_cache.evicts == 0
 end
 
 @testset "LRU eviction under budget pressure" begin
-    sched = _od_scheduler(_od_entry("A"; pinned=false, nbytes=_WBYTES),
-                          _od_entry("B"; pinned=false, nbytes=_WBYTES); budget=_WBYTES)  # holds one model
+    sched = _od_scheduler(
+        _od_entry("A"; pinned = false, nbytes = _WBYTES),
+        _od_entry("B"; pinned = false, nbytes = _WBYTES); budget = _WBYTES
+    )  # holds one model
     _dispatch1!(sched, "A")
     a_bufs = sched.registry.by_name["A"].executable.weights
     @test a_bufs !== nothing
@@ -99,8 +105,10 @@ end
 end
 
 @testset "pinned weights are preloaded and never evicted" begin
-    sched = _od_scheduler(_od_entry("P"; pinned=true, nbytes=_WBYTES),
-                          _od_entry("Q"; pinned=false, nbytes=_WBYTES); budget=_WBYTES)
+    sched = _od_scheduler(
+        _od_entry("P"; pinned = true, nbytes = _WBYTES),
+        _od_entry("Q"; pinned = false, nbytes = _WBYTES); budget = _WBYTES
+    )
     p_bufs = sched.registry.by_name["P"].executable.weights
     @test p_bufs !== nothing                          # pinned: resident from the start
 
@@ -114,15 +122,15 @@ end
 end
 
 @testset "a model larger than the whole budget still loads" begin
-    sched = _od_scheduler(_od_entry("Big"; pinned=false, nbytes=_WBYTES * 100); budget=_WBYTES)
-    res = (@test_logs (:warn,) match_mode=:any _dispatch1!(sched, "Big"))
+    sched = _od_scheduler(_od_entry("Big"; pinned = false, nbytes = _WBYTES * 100); budget = _WBYTES)
+    res = (@test_logs (:warn,) match_mode = :any _dispatch1!(sched, "Big"))
     @test res[1].data == reshape(Float32[10, 100], 2, 1)
     @test sched.registry.by_name["Big"].executable.weights !== nothing
     @test sched.weight_cache.loads == 1
 end
 
 @testset "on-demand load transfers from RAM-pinned host weights without touching the mmap" begin
-    sched = _od_scheduler(_od_entry("H"; pinned=false, nbytes=_WBYTES, host_pinned=true); budget=_WBYTES)
+    sched = _od_scheduler(_od_entry("H"; pinned = false, nbytes = _WBYTES, host_pinned = true); budget = _WBYTES)
     H = sched.registry.by_name["H"].executable
     @test H.weights === nothing          # not on the GPU yet
     @test H.host_weights !== nothing     # but resident in host RAM
@@ -135,8 +143,10 @@ end
 end
 
 @testset "externally-managed: acquire! rejects a non-resident model, residency moves it" begin
-    sched = _od_scheduler(_od_entry("E"; pinned=false, nbytes=_WBYTES); budget=_WBYTES * 10,
-                          mode=ReactantServer.EXTERNALLY_MANAGED)
+    sched = _od_scheduler(
+        _od_entry("E"; pinned = false, nbytes = _WBYTES); budget = _WBYTES * 10,
+        mode = ReactantServer.EXTERNALLY_MANAGED
+    )
     entry = sched.registry.by_name["E"]
     @test entry.executable.weights === nothing
     @test entry.executable.state == ReactantServer.UNPINNED
@@ -146,7 +156,7 @@ end
 
     # The control plane pins it to the device; it is then resident, exempt, and serveable.
     @test ReactantServer.set_residency_state!(sched.weight_cache, entry, ReactantServer.PINNED_DEVICE) ==
-          ReactantServer.PINNED_DEVICE
+        ReactantServer.PINNED_DEVICE
     @test entry.executable.weights !== nothing
     @test ReactantServer.is_device_pinned(entry.executable)
     @test !("E" in sched.weight_cache.lru)            # device-pinned is off-budget
@@ -155,7 +165,7 @@ end
     dev = entry.executable.weights
     # Demote to system: host floor materialized, device copy released (no evictor to reclaim it).
     @test ReactantServer.set_residency_state!(sched.weight_cache, entry, ReactantServer.PINNED_SYSTEM) ==
-          ReactantServer.PINNED_SYSTEM
+        ReactantServer.PINNED_SYSTEM
     @test entry.executable.host_weights !== nothing
     @test entry.executable.weights === nothing
     @test all(b -> b.freed, dev)
@@ -167,9 +177,11 @@ end
 end
 
 @testset "control_status reports mode, discipline, and per-model residency" begin
-    sched = _od_scheduler(_od_entry("P"; pinned=true, nbytes=_WBYTES),
-                          _od_entry("U"; pinned=false, nbytes=_WBYTES); budget=_WBYTES * 4,
-                          mode=ReactantServer.EXTERNALLY_MANAGED)
+    sched = _od_scheduler(
+        _od_entry("P"; pinned = true, nbytes = _WBYTES),
+        _od_entry("U"; pinned = false, nbytes = _WBYTES); budget = _WBYTES * 4,
+        mode = ReactantServer.EXTERNALLY_MANAGED
+    )
     st = ReactantServer.control_status(sched)
     @test st.residency_mode == ReactantServer.EXTERNALLY_MANAGED
     @test st.discipline == ReactantServer.FAIR
@@ -179,15 +191,17 @@ end
     @test st.models["U"].device_resident == false
 
     # set_policy! updates the live fair-discipline weight.
-    ReactantServer.set_policy!(sched, "U"; weight=3.5)
+    ReactantServer.set_policy!(sched, "U"; weight = 3.5)
     @test sched.registry.by_name["U"].sched.weight == 3.5
-    @test_throws Exception ReactantServer.set_policy!(sched, "ghost"; weight=1.0)
+    @test_throws Exception ReactantServer.set_policy!(sched, "ghost"; weight = 1.0)
 end
 
 @testset "ControlService handlers map residency/policy and drive the dispatch loop" begin
-    sched = _od_scheduler(_od_entry("P"; pinned=true, nbytes=_WBYTES),
-                          _od_entry("U"; pinned=false, nbytes=_WBYTES); budget=_WBYTES * 4,
-                          mode=ReactantServer.EXTERNALLY_MANAGED)
+    sched = _od_scheduler(
+        _od_entry("P"; pinned = true, nbytes = _WBYTES),
+        _od_entry("U"; pinned = false, nbytes = _WBYTES); budget = _WBYTES * 4,
+        mode = ReactantServer.EXTERNALLY_MANAGED
+    )
     ctx = ReactantServer.InferContext(sched, sched.registry, ReactantServer.SharedMemoryRegistry(), "mock")
     _Ctl = ReactantServer.control
 
@@ -201,28 +215,34 @@ end
     @test bymodel["U"].residency == _Ctl.Residency.UNPINNED
 
     # SetModelPolicy applies without the loop (it locks scheduler state directly).
-    ReactantServer._handle_set_model_policy(ctx, _Ctl.SetModelPolicyRequest(; name="U", has_weight=true, weight=2.0))
+    ReactantServer._handle_set_model_policy(ctx, _Ctl.SetModelPolicyRequest(; name = "U", has_weight = true, weight = 2.0))
     @test sched.registry.by_name["U"].sched.weight == 2.0
 
     # SetModelResidency routes through the control-command queue, so run the dispatch loop.
     ReactantServer.start!(sched)
     try
-        resp = ReactantServer._handle_set_model_residency(ctx,
-            _Ctl.SetModelResidencyRequest(; name="U", target=_Ctl.Residency.PINNED_DEVICE))
+        resp = ReactantServer._handle_set_model_residency(
+            ctx,
+            _Ctl.SetModelResidencyRequest(; name = "U", target = _Ctl.Residency.PINNED_DEVICE)
+        )
         @test resp.residency == _Ctl.Residency.PINNED_DEVICE
         @test ReactantServer.is_device_pinned(sched.registry.by_name["U"].executable)
 
         # An unspecified target is rejected as INVALID_ARGUMENT.
-        @test_throws Exception ReactantServer._handle_set_model_residency(ctx,
-            _Ctl.SetModelResidencyRequest(; name="U", target=_Ctl.Residency.RESIDENCY_UNSPECIFIED))
+        @test_throws Exception ReactantServer._handle_set_model_residency(
+            ctx,
+            _Ctl.SetModelResidencyRequest(; name = "U", target = _Ctl.Residency.RESIDENCY_UNSPECIFIED)
+        )
     finally
         ReactantServer.shutdown!(sched)
     end
 end
 
 @testset "compaction frees on-demand weights and leaves pinned in place (eager)" begin
-    sched = _od_scheduler(_od_entry("P"; pinned=true, nbytes=_WBYTES),
-                          _od_entry("A"; pinned=false, nbytes=_WBYTES); budget=_WBYTES * 4)
+    sched = _od_scheduler(
+        _od_entry("P"; pinned = true, nbytes = _WBYTES),
+        _od_entry("A"; pinned = false, nbytes = _WBYTES); budget = _WBYTES * 4
+    )
     _dispatch1!(sched, "A")                              # load A on demand
     A = sched.registry.by_name["A"].executable
     P = sched.registry.by_name["P"].executable
@@ -245,14 +265,16 @@ end
 end
 
 @testset "compaction reloads the requested non-pinned models eagerly" begin
-    sched = _od_scheduler(_od_entry("A"; pinned=false, nbytes=_WBYTES),
-                          _od_entry("B"; pinned=false, nbytes=_WBYTES); budget=_WBYTES * 4)
+    sched = _od_scheduler(
+        _od_entry("A"; pinned = false, nbytes = _WBYTES),
+        _od_entry("B"; pinned = false, nbytes = _WBYTES); budget = _WBYTES * 4
+    )
     _dispatch1!(sched, "A"); _dispatch1!(sched, "B")
     A = sched.registry.by_name["A"].executable
     B = sched.registry.by_name["B"].executable
     @test A.weights !== nothing && B.weights !== nothing
 
-    n = ReactantServer.compact!(sched.weight_cache, sched.registry; reload=["A"])
+    n = ReactantServer.compact!(sched.weight_cache, sched.registry; reload = ["A"])
     @test n == 1
     @test A.weights !== nothing                          # listed: reloaded eagerly
     @test B.weights === nothing                          # unlisted: left for lazy reload
@@ -261,7 +283,7 @@ end
 end
 
 @testset "compaction is a no-op without the on-demand weight cache" begin
-    sched = _od_scheduler(_od_entry("A"; pinned=false, nbytes=_WBYTES); budget=_WBYTES)
+    sched = _od_scheduler(_od_entry("A"; pinned = false, nbytes = _WBYTES); budget = _WBYTES)
     A = sched.registry.by_name["A"].executable
     A.weights = Any[ReactantServer.MockBuffer(copy(_W))]   # always-resident (no on-demand cache to churn)
     sched.weight_cache = nothing
@@ -272,9 +294,11 @@ end
 end
 
 @testset "worker auto-compaction fires once on-demand loads advance by the interval" begin
-    sched = _od_scheduler(_od_entry("A"; pinned=false, nbytes=_WBYTES),
-                          _od_entry("B"; pinned=false, nbytes=_WBYTES); budget=_WBYTES * 8)
-    sched.cfg = ReactantServer.SchedulerConfig(30.0, 1024, 30.0; compaction_interval=2)
+    sched = _od_scheduler(
+        _od_entry("A"; pinned = false, nbytes = _WBYTES),
+        _od_entry("B"; pinned = false, nbytes = _WBYTES); budget = _WBYTES * 8
+    )
+    sched.cfg = ReactantServer.SchedulerConfig(30.0, 1024, 30.0; compaction_interval = 2)
 
     _dispatch1!(sched, "A")                              # loads = 1
     ReactantServer._maybe_compact!(sched)
@@ -290,14 +314,20 @@ end
 end
 
 @testset "CompactMemory handler runs compaction through the dispatch loop" begin
-    sched = _od_scheduler(_od_entry("P"; pinned=true, nbytes=_WBYTES),
-                          _od_entry("A"; pinned=false, nbytes=_WBYTES); budget=_WBYTES * 4)
+    sched = _od_scheduler(
+        _od_entry("P"; pinned = true, nbytes = _WBYTES),
+        _od_entry("A"; pinned = false, nbytes = _WBYTES); budget = _WBYTES * 4
+    )
     ctx = ReactantServer.InferContext(sched, sched.registry, ReactantServer.SharedMemoryRegistry(), "mock")
     _Ctl = ReactantServer.control
     ReactantServer.start!(sched)
     try
-        ReactantServer.infer(sched, ReactantServer.InferRequest("A", ["y"],
-            [ReactantServer.NamedTensor("x", reshape(Float32[1, 1], 2, 1))]))
+        ReactantServer.infer(
+            sched, ReactantServer.InferRequest(
+                "A", ["y"],
+                [ReactantServer.NamedTensor("x", reshape(Float32[1, 1], 2, 1))]
+            )
+        )
         @test sched.registry.by_name["A"].executable.weights !== nothing
 
         p_bufs = sched.registry.by_name["P"].executable.weights
@@ -313,25 +343,25 @@ end
 @testset "weight_budget reserves pinned + scratch + wiggle from the arena" begin
     wb(; kw...) = ReactantServer.weight_budget(; kw...)
     # No pinned, no scratch: on-demand gets fraction*arena, capped by (1-wiggle)*arena.
-    b = wb(arena=1000, fraction=1.0, wiggle=0.1, max_scratch=0, pinned_bytes=0)
+    b = wb(arena = 1000, fraction = 1.0, wiggle = 0.1, max_scratch = 0, pinned_bytes = 0)
     @test b.scratch_ceiling == 900 && b.weight_pool == 900 && b.on_demand_budget == 900
     # Fraction caps below the scratch ceiling.
-    b = wb(arena=1000, fraction=0.5, wiggle=0.1, max_scratch=0, pinned_bytes=0)
+    b = wb(arena = 1000, fraction = 0.5, wiggle = 0.1, max_scratch = 0, pinned_bytes = 0)
     @test b.weight_pool == 500 && b.on_demand_budget == 500
     # Scratch eats into the pool.
-    b = wb(arena=1000, fraction=1.0, wiggle=0.1, max_scratch=300, pinned_bytes=0)
+    b = wb(arena = 1000, fraction = 1.0, wiggle = 0.1, max_scratch = 300, pinned_bytes = 0)
     @test b.weight_pool == 600 && b.on_demand_budget == 600
     # Pinned reserves its portion off the top.
-    b = wb(arena=1000, fraction=1.0, wiggle=0.1, max_scratch=300, pinned_bytes=200)
+    b = wb(arena = 1000, fraction = 1.0, wiggle = 0.1, max_scratch = 300, pinned_bytes = 200)
     @test b.weight_pool == 600 && b.on_demand_budget == 400 && !b.pinned_over_commit
     # Pinned over-commit: pinned exceed the pool -> on-demand 0, flagged.
-    b = wb(arena=1000, fraction=1.0, wiggle=0.1, max_scratch=300, pinned_bytes=700)
+    b = wb(arena = 1000, fraction = 1.0, wiggle = 0.1, max_scratch = 300, pinned_bytes = 700)
     @test b.on_demand_budget == 0 && b.pinned_over_commit
     # Scratch alone exceeds the ceiling -> empty pool.
-    b = wb(arena=1000, fraction=1.0, wiggle=0.1, max_scratch=950, pinned_bytes=0)
+    b = wb(arena = 1000, fraction = 1.0, wiggle = 0.1, max_scratch = 950, pinned_bytes = 0)
     @test b.weight_pool == 0 && b.on_demand_budget == 0
     # Arena 0 (CPU/mock): everything zero.
-    b = wb(arena=0, fraction=1.0, wiggle=0.1, max_scratch=0, pinned_bytes=0)
+    b = wb(arena = 0, fraction = 1.0, wiggle = 0.1, max_scratch = 0, pinned_bytes = 0)
     @test b.weight_pool == 0 && b.on_demand_budget == 0
 end
 
@@ -340,11 +370,13 @@ end
         @test_skip "shared weight store requires Linux /dev/shm"
     else
         store = ReactantServer.SharedWeightStore()
-        sched = _od_scheduler(_od_entry("S"; pinned=false, nbytes=_WBYTES); budget=_WBYTES * 4,
-                              mode=ReactantServer.EXTERNALLY_MANAGED, store=store)
+        sched = _od_scheduler(
+            _od_entry("S"; pinned = false, nbytes = _WBYTES); budget = _WBYTES * 4,
+            mode = ReactantServer.EXTERNALLY_MANAGED, store = store
+        )
         entry = sched.registry.by_name["S"]
         dg = ReactantServer.weights_digest("S", [(Float32, (2,))])
-        region = "/dev/shm/rsw-S-" * string(dg; base=16)
+        region = "/dev/shm/rsw-S-" * string(dg; base = 16)
 
         ReactantServer.set_residency_state!(sched.weight_cache, entry, ReactantServer.PINNED_SYSTEM)
         @test entry.executable.host_weights !== nothing
@@ -358,12 +390,12 @@ end
 end
 
 @testset "admit! and evict! add and remove a model at runtime" begin
-    sched = _od_scheduler(_od_entry("A"; pinned=false, nbytes=_WBYTES); budget=_WBYTES * 8)
+    sched = _od_scheduler(_od_entry("A"; pinned = false, nbytes = _WBYTES); budget = _WBYTES * 8)
     ReactantServer.start!(sched)
     req(name) = ReactantServer.InferRequest(name, ["y"], [ReactantServer.NamedTensor("x", reshape(Float32[1, 1], 2, 1))])
     try
         # A freshly compiled entry is admitted into the running system and immediately serveable.
-        ReactantServer.admit!(sched, _od_entry("B"; pinned=false, nbytes=_WBYTES))
+        ReactantServer.admit!(sched, _od_entry("B"; pinned = false, nbytes = _WBYTES))
         @test haskey(sched.registry.by_name, "B")
         @test ReactantServer.infer(sched, req("B"))[1].data == reshape(Float32[10, 100], 2, 1)
 
@@ -383,14 +415,14 @@ end
         # name errors.
         @test_throws Exception ReactantServer.infer(sched, req("B"))
         @test ReactantServer.evict!(sched, "B") === nothing
-        @test_throws Exception ReactantServer.admit!(sched, _od_entry("A"; pinned=false, nbytes=_WBYTES))
+        @test_throws Exception ReactantServer.admit!(sched, _od_entry("A"; pinned = false, nbytes = _WBYTES))
     finally
         ReactantServer.shutdown!(sched)
     end
 end
 
 @testset "rename_model! renames in place: no reload, no recompile, residency rekeyed" begin
-    sched = _od_scheduler(_od_entry("A"; pinned=false, nbytes=_WBYTES); budget=_WBYTES * 8)
+    sched = _od_scheduler(_od_entry("A"; pinned = false, nbytes = _WBYTES); budget = _WBYTES * 8)
     ReactantServer.start!(sched)
     req(name) = ReactantServer.InferRequest(name, ["y"], [ReactantServer.NamedTensor("x", reshape(Float32[1, 1], 2, 1))])
     try
@@ -413,13 +445,13 @@ end
 
         # The residency floor resolved for the new name is applied when it differs (the config is
         # keyed by model name, e.g. a `-production` name may be pinned where `-staging` was not).
-        ReactantServer.rename_model!(sched, "B", "C"; residency=ReactantServer.PINNED_DEVICE)
+        ReactantServer.rename_model!(sched, "B", "C"; residency = ReactantServer.PINNED_DEVICE)
         @test sched.registry.by_name["C"].executable.state == ReactantServer.PINNED_DEVICE
         @test !("C" in sched.weight_cache.lru)          # device-pinned models leave the LRU budget
 
         # An unknown old name and a colliding new name are rejected.
         @test_throws Exception ReactantServer.rename_model!(sched, "missing", "X")
-        ReactantServer.admit!(sched, _od_entry("D"; pinned=false, nbytes=_WBYTES))
+        ReactantServer.admit!(sched, _od_entry("D"; pinned = false, nbytes = _WBYTES))
         @test_throws Exception ReactantServer.rename_model!(sched, "D", "C")
     finally
         ReactantServer.shutdown!(sched)

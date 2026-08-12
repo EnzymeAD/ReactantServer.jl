@@ -273,13 +273,13 @@ end
 
 # Julia dtype <-> numpy dtype name. The set is exactly what ReactantServerExport.DTYPE_TOKENS
 # covers today; extend both together when adding bf16/f8/etc.
-const JULIA_TO_NUMPY = Dict{DataType,String}(
+const JULIA_TO_NUMPY = Dict{DataType, String}(
     Float16 => "float16", Float32 => "float32", Float64 => "float64",
     Int8 => "int8", Int16 => "int16", Int32 => "int32", Int64 => "int64",
     UInt8 => "uint8", UInt16 => "uint16", UInt32 => "uint32", UInt64 => "uint64",
     Bool => "bool",
 )
-const NUMPY_TO_JULIA = Dict{String,DataType}(v => k for (k, v) in JULIA_TO_NUMPY)
+const NUMPY_TO_JULIA = Dict{String, DataType}(v => k for (k, v) in JULIA_TO_NUMPY)
 
 function _julia_to_numpy_dtype(::Type{T}) where {T}
     haskey(JULIA_TO_NUMPY, T) || error("PyTorchExport: no numpy dtype mapping for $T")
@@ -289,7 +289,8 @@ end
 function _numpy_dtype_to_julia(np_dtype_name::AbstractString)
     haskey(NUMPY_TO_JULIA, np_dtype_name) || error(
         "PyTorchExport: numpy dtype '$np_dtype_name' has no Julia mapping " *
-        "(not in ReactantServerExport.DTYPE_TOKENS). Extend ReactantServerExport and PyTorchExport together to add it.")
+            "(not in ReactantServerExport.DTYPE_TOKENS). Extend ReactantServerExport and PyTorchExport together to add it."
+    )
     return NUMPY_TO_JULIA[np_dtype_name]
 end
 
@@ -301,7 +302,7 @@ function _julia_to_torch(arr::AbstractArray{T}) where {T}
     torch = _torch[]
     flat = Vector{UInt8}(reinterpret(UInt8, vec(collect(arr))))
     py_bytes = pybytes(flat)
-    np_arr = np.frombuffer(py_bytes, dtype=_julia_to_numpy_dtype(T)).reshape(collect(reverse(size(arr))))
+    np_arr = np.frombuffer(py_bytes, dtype = _julia_to_numpy_dtype(T)).reshape(collect(reverse(size(arr))))
     return torch.from_numpy(np_arr.copy())
 end
 
@@ -384,17 +385,19 @@ function _variant_key(inputs_tuple::Tuple, var_axes::Vector{Vector{Int}})
     return key
 end
 
-function export_bundle(::Val{:pytorch}, model, example_inputs::Tuple;
-                       dir::AbstractString, name::AbstractString,
-                       input_names=nothing, output_name::AbstractString="output",
-                       output_names=nothing,
-                       batch_sizes::AbstractVector{<:Integer}=[1],
-                       shape_variants::Union{Nothing,AbstractVector}=nothing,
-                       strict::Bool=false,
-                       matmul_precision::Union{Nothing,AbstractString}=nothing,
-                       client_inputs=nothing, client_outputs=nothing,
-                       axis_letters::Union{Nothing,AbstractDict}=nothing,
-                       provenance=Dict{String,Any}())
+function export_bundle(
+        ::Val{:pytorch}, model, example_inputs::Tuple;
+        dir::AbstractString, name::AbstractString,
+        input_names = nothing, output_name::AbstractString = "output",
+        output_names = nothing,
+        batch_sizes::AbstractVector{<:Integer} = [1],
+        shape_variants::Union{Nothing, AbstractVector} = nothing,
+        strict::Bool = false,
+        matmul_precision::Union{Nothing, AbstractString} = nothing,
+        client_inputs = nothing, client_outputs = nothing,
+        axis_letters::Union{Nothing, AbstractDict} = nothing,
+        provenance = Dict{String, Any}()
+    )
     isempty(example_inputs) && error("PyTorchExport: at least one example input is required")
     isempty(batch_sizes) && error("PyTorchExport: batch_sizes cannot be empty")
 
@@ -402,7 +405,7 @@ function export_bundle(::Val{:pytorch}, model, example_inputs::Tuple;
     # single-shape path); otherwise each variant is a full example-input tuple at a distinct shape,
     # all sharing one weight set. `example_inputs` is the first variant.
     variants = shape_variants === nothing ? Tuple[Tuple(example_inputs)] :
-               Tuple[Tuple(v) for v in shape_variants]
+        Tuple[Tuple(v) for v in shape_variants]
     multishape = shape_variants !== nothing
     n_in = length(example_inputs)
     for (vi, v) in enumerate(variants)
@@ -411,7 +414,8 @@ function export_bundle(::Val{:pytorch}, model, example_inputs::Tuple;
         for (i, x) in enumerate(v)
             haskey(ReactantServerExport.DTYPE_TOKENS, eltype(x)) || error(
                 "PyTorchExport: variant $vi input $i has element type $(eltype(x)), " *
-                "which is not registered in ReactantServerExport.DTYPE_TOKENS")
+                    "which is not registered in ReactantServerExport.DTYPE_TOKENS"
+            )
             eltype(x) === eltype(variants[1][i]) ||
                 error("PyTorchExport: variant $vi input $i dtype differs from variant 1")
             ndims(x) === ndims(variants[1][i]) ||
@@ -429,7 +433,7 @@ function export_bundle(::Val{:pytorch}, model, example_inputs::Tuple;
     _report_matmul_precision(jax, matmul_precision)
 
     innames = input_names === nothing ?
-              ["input_$(i - 1)" for i in 1:n_in] : collect(String, input_names)
+        ["input_$(i - 1)" for i in 1:n_in] : collect(String, input_names)
     length(innames) == n_in || error("PyTorchExport: input_names length mismatch ($n_in inputs, $(length(innames)) names)")
 
     model.eval()
@@ -437,21 +441,21 @@ function export_bundle(::Val{:pytorch}, model, example_inputs::Tuple;
     # The variable input axes (those that differ across variants); empty in the single-shape case.
     var_axes = Vector{Int}[_variant_axes_of_input(variants, i) for i in 1:n_in]
 
-    modules_by_variant = Dict{Vector{Int},Dict{Int,String}}()
-    out_specs_by_variant = Dict{Vector{Int},Vector{ReactantServerExport.IOSpec}}()
+    modules_by_variant = Dict{Vector{Int}, Dict{Int, String}}()
+    out_specs_by_variant = Dict{Vector{Int}, Vector{ReactantServerExport.IOSpec}}()
     kept_names = String[]
     kept_weights = Any[]
     captured = false
 
     for v in variants
         vkey = _variant_key(v, var_axes)
-        modules = Dict{Int,String}()
+        modules = Dict{Int, String}()
         for s in batch_sizes
             julia_inputs = Tuple(_with_batch(x, s) for x in v)
             py_input_tuple = Tuple(_julia_to_torch(x) for x in julia_inputs)
             py_args = pytuple(py_input_tuple)
 
-            exported = torchexport.export(model, py_args; strict=strict)
+            exported = torchexport.export(model, py_args; strict = strict)
             result = _to_stablehlo_inputs_first[](exported)
             weights_py = result[0]
             stablehlo = result[1]
@@ -503,8 +507,12 @@ function export_bundle(::Val{:pytorch}, model, example_inputs::Tuple;
             o_np = t.detach().cpu().numpy()
             o_dtype = _numpy_dtype_to_julia(pyconvert(String, o_np.dtype.name))
             o_shape_julia = collect(Int, reverse(pyconvert(Vector{Int}, t.shape)))
-            push!(specs, ReactantServerExport.IOSpec(onames[j], o_dtype, o_shape_julia;
-                                                 batch_axis=ndims_from_len(length(o_shape_julia))))
+            push!(
+                specs, ReactantServerExport.IOSpec(
+                    onames[j], o_dtype, o_shape_julia;
+                    batch_axis = ndims_from_len(length(o_shape_julia))
+                )
+            )
         end
         modules_by_variant[vkey] = modules
         out_specs_by_variant[vkey] = specs
@@ -522,7 +530,7 @@ function export_bundle(::Val{:pytorch}, model, example_inputs::Tuple;
         end
         bax = ndims(x_at_s) - 1
         lets = axis_letters === nothing ? nothing : get(axis_letters, innames[i], nothing)
-        push!(inputs, ReactantServerExport.IOSpec(innames[i], eltype(x_at_s), shp; batch_axis=bax, letters=lets))
+        push!(inputs, ReactantServerExport.IOSpec(innames[i], eltype(x_at_s), shp; batch_axis = bax, letters = lets))
     end
 
     # executable_outputs: each output axis that varies across variants is marked -1 (the FPN
@@ -536,40 +544,46 @@ function export_bundle(::Val{:pytorch}, model, example_inputs::Tuple;
             any(vk -> out_specs_by_variant[vk][j].shape[ax] != shp[ax], variant_keys) && (shp[ax] = -1)
         end
         lets = axis_letters === nothing ? nothing : get(axis_letters, base.name, nothing)
-        push!(outputs, ReactantServerExport.IOSpec(base.name, base.dtype, shp; batch_axis=base.batch_axis, letters=lets))
+        push!(outputs, ReactantServerExport.IOSpec(base.name, base.dtype, shp; batch_axis = base.batch_axis, letters = lets))
     end
 
     torch_v = _try_version(torch)
     torchax_v = _try_version_of("torchax")
 
-    prov = merge(Dict{String,Any}(
-        "source_framework" => "pytorch",
-        "converter" => "PyTorchExport.jl",
-        "torch_version" => torch_v,
-        "torchax_version" => torchax_v,
-        "batch_sizes" => collect(Int, batch_sizes),
-    ), Dict{String,Any}(provenance))
+    prov = merge(
+        Dict{String, Any}(
+            "source_framework" => "pytorch",
+            "converter" => "PyTorchExport.jl",
+            "torch_version" => torch_v,
+            "torchax_version" => torchax_v,
+            "batch_sizes" => collect(Int, batch_sizes),
+        ), Dict{String, Any}(provenance)
+    )
     multishape && (prov["input_shapes"] = variant_keys)
 
     if multishape
-        ReactantServerExport.write_bundle(dir;
-            name=name,
-            executable_inputs=inputs,
-            executable_outputs=outputs,
-            modules=modules_by_variant,
-            input_shapes=variant_keys,
-            weights=[kept_names[i] => kept_weights[i] for i in eachindex(kept_names)],
-            client_inputs=client_inputs, client_outputs=client_outputs,
-            provenance=prov)
+        ReactantServerExport.write_bundle(
+            dir;
+            name = name,
+            executable_inputs = inputs,
+            executable_outputs = outputs,
+            modules = modules_by_variant,
+            input_shapes = variant_keys,
+            weights = [kept_names[i] => kept_weights[i] for i in eachindex(kept_names)],
+            client_inputs = client_inputs, client_outputs = client_outputs,
+            provenance = prov
+        )
     else
-        ReactantServerExport.write_bundle(dir;
-            name=name,
-            executable_inputs=inputs,
-            executable_outputs=outputs,
-            modules=modules_by_variant[variant_keys[1]],
-            weights=[kept_names[i] => kept_weights[i] for i in eachindex(kept_names)],
-            client_inputs=client_inputs, client_outputs=client_outputs,
-            provenance=prov)
+        ReactantServerExport.write_bundle(
+            dir;
+            name = name,
+            executable_inputs = inputs,
+            executable_outputs = outputs,
+            modules = modules_by_variant[variant_keys[1]],
+            weights = [kept_names[i] => kept_weights[i] for i in eachindex(kept_names)],
+            client_inputs = client_inputs, client_outputs = client_outputs,
+            provenance = prov
+        )
     end
     return dir
 end
@@ -679,46 +693,54 @@ handler) are applied to `jit_module` before `wrap` is called.
 dense executable outputs into different client outputs (e.g. a variable detection count, encoded
 with `-1` for that axis). When you pass these you must also copy a `model.jl` into `dir`.
 """
-function export_torchscript_bundle(pt_path::AbstractString,
-                                   example_inputs::Tuple;
-                                   dir::AbstractString,
-                                   name::AbstractString,
-                                   input_names=nothing,
-                                   output_name::AbstractString="output",
-                                   output_names=nothing,
-                                   batch_sizes::AbstractVector{<:Integer}=[1],
-                                   shape_variants::Union{Nothing,AbstractVector}=nothing,
-                                   matmul_precision::Union{Nothing,AbstractString}=nothing,
-                                   client_inputs=nothing, client_outputs=nothing,
-                                   axis_letters::Union{Nothing,AbstractDict}=nothing,
-                                   provenance=Dict{String,Any}(),
-                                   map_location="cpu",
-                                   wrap=nothing)
+function export_torchscript_bundle(
+        pt_path::AbstractString,
+        example_inputs::Tuple;
+        dir::AbstractString,
+        name::AbstractString,
+        input_names = nothing,
+        output_name::AbstractString = "output",
+        output_names = nothing,
+        batch_sizes::AbstractVector{<:Integer} = [1],
+        shape_variants::Union{Nothing, AbstractVector} = nothing,
+        matmul_precision::Union{Nothing, AbstractString} = nothing,
+        client_inputs = nothing, client_outputs = nothing,
+        axis_letters::Union{Nothing, AbstractDict} = nothing,
+        provenance = Dict{String, Any}(),
+        map_location = "cpu",
+        wrap = nothing
+    )
     _pyimports()
-    jit_mod = _torch[].jit.load(pt_path, map_location=map_location)
-    prov = merge(Dict{String,Any}("torchscript_path" => String(pt_path)),
-                 Dict{String,Any}(provenance))
-    return export_torchscript_bundle(jit_mod, example_inputs;
-        dir=dir, name=name, input_names=input_names,
-        output_name=output_name, output_names=output_names,
-        batch_sizes=batch_sizes, shape_variants=shape_variants, matmul_precision=matmul_precision,
-        client_inputs=client_inputs, client_outputs=client_outputs, axis_letters=axis_letters,
-        provenance=prov, wrap=wrap)
+    jit_mod = _torch[].jit.load(pt_path, map_location = map_location)
+    prov = merge(
+        Dict{String, Any}("torchscript_path" => String(pt_path)),
+        Dict{String, Any}(provenance)
+    )
+    return export_torchscript_bundle(
+        jit_mod, example_inputs;
+        dir = dir, name = name, input_names = input_names,
+        output_name = output_name, output_names = output_names,
+        batch_sizes = batch_sizes, shape_variants = shape_variants, matmul_precision = matmul_precision,
+        client_inputs = client_inputs, client_outputs = client_outputs, axis_letters = axis_letters,
+        provenance = prov, wrap = wrap
+    )
 end
 
-function export_torchscript_bundle(jit_module::Py, example_inputs::Tuple;
-                                   dir::AbstractString,
-                                   name::AbstractString,
-                                   input_names=nothing,
-                                   output_name::AbstractString="output",
-                                   output_names=nothing,
-                                   batch_sizes::AbstractVector{<:Integer}=[1],
-                                   shape_variants::Union{Nothing,AbstractVector}=nothing,
-                                   matmul_precision::Union{Nothing,AbstractString}=nothing,
-                                   client_inputs=nothing, client_outputs=nothing,
-                                   axis_letters::Union{Nothing,AbstractDict}=nothing,
-                                   provenance=Dict{String,Any}(),
-                                   wrap=nothing)
+function export_torchscript_bundle(
+        jit_module::Py, example_inputs::Tuple;
+        dir::AbstractString,
+        name::AbstractString,
+        input_names = nothing,
+        output_name::AbstractString = "output",
+        output_names = nothing,
+        batch_sizes::AbstractVector{<:Integer} = [1],
+        shape_variants::Union{Nothing, AbstractVector} = nothing,
+        matmul_precision::Union{Nothing, AbstractString} = nothing,
+        client_inputs = nothing, client_outputs = nothing,
+        axis_letters::Union{Nothing, AbstractDict} = nothing,
+        provenance = Dict{String, Any}(),
+        wrap = nothing
+    )
     _pyimports()
     _pyimports_torchscript()
     # Most scripted modules want eval mode, but some bake training=False as a constant and raise
@@ -731,16 +753,20 @@ function export_torchscript_bundle(jit_module::Py, example_inputs::Tuple;
     end
     pyeval("_fix_jit_parameters", @__MODULE__)(jit_module)
     wrapper = wrap === nothing ? pyeval("_JitWrapper", @__MODULE__)(jit_module) : wrap(jit_module)
-    prov = merge(Dict{String,Any}("source_subframework" => "torchscript"),
-                 Dict{String,Any}(provenance))
-    return export_bundle(Val(:pytorch), wrapper, example_inputs;
-        dir=dir, name=name, input_names=input_names,
-        output_name=output_name, output_names=output_names,
-        batch_sizes=batch_sizes, shape_variants=shape_variants,
-        strict=false,
-        matmul_precision=matmul_precision,
-        client_inputs=client_inputs, client_outputs=client_outputs, axis_letters=axis_letters,
-        provenance=prov)
+    prov = merge(
+        Dict{String, Any}("source_subframework" => "torchscript"),
+        Dict{String, Any}(provenance)
+    )
+    return export_bundle(
+        Val(:pytorch), wrapper, example_inputs;
+        dir = dir, name = name, input_names = input_names,
+        output_name = output_name, output_names = output_names,
+        batch_sizes = batch_sizes, shape_variants = shape_variants,
+        strict = false,
+        matmul_precision = matmul_precision,
+        client_inputs = client_inputs, client_outputs = client_outputs, axis_letters = axis_letters,
+        provenance = prov
+    )
 end
 
 end # module PyTorchExportExt

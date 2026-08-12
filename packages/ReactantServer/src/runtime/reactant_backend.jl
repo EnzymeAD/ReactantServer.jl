@@ -18,7 +18,7 @@ struct ReactantBackend <: AbstractBackend end
 # compile by get_debug_options, so assigning them here (after `import Reactant`, before the first
 # GPU compile) takes effect. They are unexported internals, so we guard with isdefined and no-op
 # with a warning if a future Reactant renames them. `nothing` / "" mean "inherit LocalPreferences".
-function _apply_compile_cache_prefs(autotune_cache::Union{Bool,Nothing}, autotune_cache_dir::AbstractString)
+function _apply_compile_cache_prefs(autotune_cache::Union{Bool, Nothing}, autotune_cache_dir::AbstractString)
     (autotune_cache === nothing && isempty(autotune_cache_dir)) && return nothing
     if !isdefined(Reactant, :PersistentCompileCache)
         @warn "runtime.autotune_cache* set but Reactant.PersistentCompileCache not found; ignoring"
@@ -42,9 +42,11 @@ function _apply_compile_cache_prefs(autotune_cache::Union{Bool,Nothing}, autotun
     return nothing
 end
 
-function make_client(::ReactantBackend, platform::String; mem_fraction::Float64=0.9,
-                     preallocate::Bool=true, autotune_cache::Union{Bool,Nothing}=nothing,
-                     autotune_cache_dir::AbstractString="", kwargs...)
+function make_client(
+        ::ReactantBackend, platform::String; mem_fraction::Float64 = 0.9,
+        preallocate::Bool = true, autotune_cache::Union{Bool, Nothing} = nothing,
+        autotune_cache_dir::AbstractString = "", kwargs...
+    )
     if platform == "cuda" || platform == "gpu"
         # These BFC allocator knobs must be set before the GPU client is first created.
         _RXLA.XLA_REACTANT_GPU_MEM_FRACTION[] = mem_fraction
@@ -109,10 +111,12 @@ function _flatten_buffers!(acc, x)
     return acc
 end
 
-function execute_single_device(::ReactantBackend, exec, device, buffers::AbstractVector,
-                               donated::AbstractVector{Bool}, num_outputs::Int)
+function execute_single_device(
+        ::ReactantBackend, exec, device, buffers::AbstractVector,
+        donated::AbstractVector{Bool}, num_outputs::Int
+    )
     in_ptrs = (Ptr{Cvoid}[b.buffer for b in buffers]...,)
-    don = (UInt8[d ? 0x1 : 0x0 for d in donated]...,)
+    don = (UInt8[d ? 0x01 : 0x00 for d in donated]...,)
     outs = _RXLA.execute_sharded(exec, device, in_ptrs, don, Val(num_outputs))
     async = Any[]
     _flatten_buffers!(async, outs)
@@ -134,17 +138,21 @@ function device_memory_stats(::ReactantBackend, pool::MemoryPool)
         # `peak_in_use` is the allocator's session high-water mark (the empirical scratch + resident
         # ceiling). The GPU BFC allocator does not populate `largest_free_block_bytes` (it is left 0),
         # so we do not surface it; fragmentation is not directly observable from this allocator.
-        return (in_use = in_use, limit = limit, free = max(limit - in_use, 0),
-                peak_in_use = Int(stats.peak_bytes_in_use),
-                pool_bytes = _orz(stats.pool_bytes), peak_pool_bytes = _orz(stats.peak_pool_bytes))
+        return (
+            in_use = in_use, limit = limit, free = max(limit - in_use, 0),
+            peak_in_use = Int(stats.peak_bytes_in_use),
+            pool_bytes = _orz(stats.pool_bytes), peak_pool_bytes = _orz(stats.peak_pool_bytes),
+        )
     catch
         return nothing
     end
 end
 
-function compile_artifact(backend::ReactantBackend, pool::MemoryPool, mlir_bytes,
-                          n_parameters::Int, n_outputs::Int;
-                          numerics_stats::Union{NumericsStats,Nothing}=nothing)
+function compile_artifact(
+        backend::ReactantBackend, pool::MemoryPool, mlir_bytes,
+        n_parameters::Int, n_outputs::Int;
+        numerics_stats::Union{NumericsStats, Nothing} = nothing
+    )
     ctx = pool.ctx
     _RMLIR.IR.activate(ctx)
     try
@@ -177,16 +185,19 @@ function compile_artifact(backend::ReactantBackend, pool::MemoryPool, mlir_bytes
         # probe on the first (un-cached) start. When enabled, pass no override so the compile is
         # byte-identical to the previous behavior (XLA's default autotune level).
         opts = pool.autotune ?
-            _RXLA.make_compile_options(; device_id=Int64(device_ordinal(backend, pool.device))) :
-            _RXLA.make_compile_options(; device_id=Int64(device_ordinal(backend, pool.device)),
-                xla_debug_options=(; xla_gpu_autotune_level=Int32(0)))
-        return _RXLA.compile(pool.client, mod;
-            compile_options=opts,
-            num_parameters=Int64(n_parameters),
-            num_outputs=Int64(n_outputs),
-            is_sharded=false,
-            num_replicas=Int64(1),
-            num_partitions=Int64(1),
+            _RXLA.make_compile_options(; device_id = Int64(device_ordinal(backend, pool.device))) :
+            _RXLA.make_compile_options(;
+                device_id = Int64(device_ordinal(backend, pool.device)),
+                xla_debug_options = (; xla_gpu_autotune_level = Int32(0))
+            )
+        return _RXLA.compile(
+            pool.client, mod;
+            compile_options = opts,
+            num_parameters = Int64(n_parameters),
+            num_outputs = Int64(n_outputs),
+            is_sharded = false,
+            num_replicas = Int64(1),
+            num_partitions = Int64(1),
         )
     finally
         _RMLIR.IR.deactivate(ctx)

@@ -45,8 +45,10 @@ function resolve_image()
     arg = findfirst(a -> !startswith(a, "--"), ARGS)
     arg === nothing || return ARGS[arg]
     dest = joinpath(ASSETS, "test_image.jpg")
-    isfile(dest) || (@info "Downloading test image" url = DEFAULT_IMAGE_URL;
-                     Downloads.download(DEFAULT_IMAGE_URL, dest))
+    isfile(dest) || (
+        @info "Downloading test image" url = DEFAULT_IMAGE_URL;
+        Downloads.download(DEFAULT_IMAGE_URL, dest)
+    )
     return dest
 end
 
@@ -68,9 +70,13 @@ end
 function parse_detections(out)
     ndims(out) == 2 || (out = reshape(out, length(out) ÷ 6, 6))
     dets = size(out, 1) == 6 ? out : permutedims(out)
-    [(; x1 = Float64(dets[1, j]), y1 = Float64(dets[2, j]), x2 = Float64(dets[3, j]),
-       y2 = Float64(dets[4, j]), score = Float64(dets[5, j]), class = round(Int, dets[6, j]))
-     for j in 1:size(dets, 2)]
+    return [
+        (;
+                x1 = Float64(dets[1, j]), y1 = Float64(dets[2, j]), x2 = Float64(dets[3, j]),
+                y2 = Float64(dets[4, j]), score = Float64(dets[5, j]), class = round(Int, dets[6, j]),
+            )
+            for j in 1:size(dets, 2)
+    ]
 end
 
 function draw(display_img, dets, outfile)
@@ -82,10 +88,14 @@ function draw(display_img, dets, outfile)
     for d in dets
         d.score >= DISPLAY_THRESH || continue
         shown += 1
-        lines!(ax, [d.x1, d.x2, d.x2, d.x1, d.x1], [d.y1, d.y1, d.y2, d.y2, d.y1];
-               color = RGBf(0, 1, 0), linewidth = 2)
-        text!(ax, d.x1 + 2, d.y1 + 2; text = "$(label_for(d.class)) $(round(d.score; digits = 2))",
-              color = :yellow, fontsize = 14, align = (:left, :top))
+        lines!(
+            ax, [d.x1, d.x2, d.x2, d.x1, d.x1], [d.y1, d.y1, d.y2, d.y2, d.y1];
+            color = RGBf(0, 1, 0), linewidth = 2
+        )
+        text!(
+            ax, d.x1 + 2, d.y1 + 2; text = "$(label_for(d.class)) $(round(d.score; digits = 2))",
+            color = :yellow, fontsize = 14, align = (:left, :top)
+        )
     end
     # CairoMakie's save() only writes Cairo formats; render to a buffer and write the jpeg via FileIO.
     if lowercase(splitext(outfile)[2]) in (".png", ".svg", ".pdf", ".eps")
@@ -102,7 +112,7 @@ function main()
     input, display_img = load_image(image_path)
 
     kserve_init()
-    try
+    return try
         model = KServeModel("grpc://$HOST:$PORT", MODEL; max_batch_size = 1)
         @info "Running inference" server = "$HOST:$PORT"
         resp = infer_sync(model, [InferInput("INPUT__0", input)])
@@ -114,8 +124,10 @@ function main()
         @info "Done" total_detections = length(dets) drawn = shown output = outfile
         for d in sort(dets; by = x -> -x.score)
             d.score >= DISPLAY_THRESH || continue
-            println("  $(label_for(d.class))  score=$(round(d.score; digits=3))  " *
-                    "box=($(round(d.x1)), $(round(d.y1)), $(round(d.x2)), $(round(d.y2)))")
+            println(
+                "  $(label_for(d.class))  score=$(round(d.score; digits = 3))  " *
+                    "box=($(round(d.x1)), $(round(d.y1)), $(round(d.x2)), $(round(d.y2)))"
+            )
         end
     finally
         kserve_shutdown()

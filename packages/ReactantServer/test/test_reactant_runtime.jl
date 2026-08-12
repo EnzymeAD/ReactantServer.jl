@@ -36,9 +36,11 @@
           }
         }
         """
-        write_bundle(root, "scale4";
-            manifest_yaml=manifest, mlir_text=mlir,
-            weights=Dict("w" => Float32[2, 2, 2, 2]), argument_order=["w"])
+        write_bundle(
+            root, "scale4";
+            manifest_yaml = manifest, mlir_text = mlir,
+            weights = Dict("w" => Float32[2, 2, 2, 2]), argument_order = ["w"]
+        )
 
         reg = ReactantServer.load_bundles([root])
         entry = ReactantServer.get_model(reg, "scale4")
@@ -48,8 +50,10 @@
         @test entry.executable.sig.weight_names == ["w"]
         @test ReactantServer.num_parameters(entry.executable.sig) == 2
 
-        out = ReactantServer.run_model(backend, pool, entry.executable,
-            [ReactantServer.NamedTensor("x", Float32[1, 2, 3, 4])])
+        out = ReactantServer.run_model(
+            backend, pool, entry.executable,
+            [ReactantServer.NamedTensor("x", Float32[1, 2, 3, 4])]
+        )
         @test length(out) == 1
         @test out[1].name == "y"
         @test out[1].data == Float32[2, 4, 6, 8]

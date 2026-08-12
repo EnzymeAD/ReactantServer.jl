@@ -51,7 +51,7 @@ using YAML
 function usage_error(msg)
     println(stderr, "ERROR: $msg")
     println(stderr, "Usage: julia tools/convert_to_stablehlo.jl <config.yaml> [--only a,b] [--force] [--dry-run]")
-    exit(2)
+    return exit(2)
 end
 
 function parse_cli(args)
@@ -64,7 +64,7 @@ function parse_cli(args)
         a = args[i]
         if a == "--only"
             i == length(args) && usage_error("--only requires a comma-separated model list")
-            append!(only, split(args[i+1], ','; keepempty=false))
+            append!(only, split(args[i + 1], ','; keepempty = false))
             i += 2
         elseif a == "--force"
             force = true
@@ -83,7 +83,7 @@ function parse_cli(args)
     end
     config_path === nothing && usage_error("missing <config.yaml>")
     force && isempty(only) && usage_error("--force requires --only (a full forced rebuild must not happen by accident)")
-    return (config_path=abspath(config_path), only=only, force=force, dry_run=dry_run)
+    return (config_path = abspath(config_path), only = only, force = force, dry_run = dry_run)
 end
 
 config_error(msg) = (println(stderr, "config error: $msg"); exit(2))
@@ -94,7 +94,7 @@ resolve_path(p::AbstractString, base::AbstractString) =
 # Handler options are opaque to the converter except for one convention: any
 # option whose key ends in _dir or _path is resolved against the config dir.
 function resolve_options(opts::AbstractDict, base::AbstractString)
-    out = Dict{String,Any}(String(k) => v for (k, v) in opts)
+    out = Dict{String, Any}(String(k) => v for (k, v) in opts)
     for (k, v) in out
         if (endswith(k, "_dir") || endswith(k, "_path")) && v isa AbstractString
             out[k] = resolve_path(v, base)
@@ -105,7 +105,7 @@ end
 
 function load_config(path::AbstractString)
     isfile(path) || config_error("config not found: $path")
-    raw = YAML.load_file(path; dicttype=Dict{String,Any})
+    raw = YAML.load_file(path; dicttype = Dict{String, Any})
     raw isa AbstractDict || config_error("config root must be a mapping")
     base = dirname(abspath(path))
 
@@ -119,21 +119,21 @@ function load_config(path::AbstractString)
     rep = get(raw, "report_path", nothing)
     rep isa AbstractString || config_error("'report_path' must be a string")
 
-    raw_ex = get(raw, "exclude", Dict{String,Any}())
+    raw_ex = get(raw, "exclude", Dict{String, Any}())
     raw_ex isa AbstractDict || config_error("'exclude' must be a mapping of model name to {reason, remove_existing}")
-    exclude = Dict{String,NamedTuple{(:reason, :remove_existing),Tuple{String,Bool}}}()
+    exclude = Dict{String, NamedTuple{(:reason, :remove_existing), Tuple{String, Bool}}}()
     for (m, v) in raw_ex
         v isa AbstractDict || config_error("exclude entry '$m' must be a mapping")
         reason = get(v, "reason", nothing)
         reason isa AbstractString || config_error("exclude entry '$m' needs a string 'reason'")
         rmex = get(v, "remove_existing", false)
         rmex isa Bool || config_error("exclude entry '$m': 'remove_existing' must be a boolean")
-        exclude[String(m)] = (reason=String(reason), remove_existing=rmex)
+        exclude[String(m)] = (reason = String(reason), remove_existing = rmex)
     end
 
     raw_h = get(raw, "handlers", Any[])
     raw_h isa AbstractVector || config_error("'handlers' must be a list")
-    handlers = NamedTuple{(:file, :models, :options),Tuple{String,Vector{String},Dict{String,Any}}}[]
+    handlers = NamedTuple{(:file, :models, :options), Tuple{String, Vector{String}, Dict{String, Any}}}[]
     handled = Set{String}()
     for (i, h) in enumerate(raw_h)
         h isa AbstractDict || config_error("handlers[$i] must be a mapping")
@@ -144,7 +144,7 @@ function load_config(path::AbstractString)
         ms = get(h, "models", nothing)
         (ms isa AbstractVector && !isempty(ms) && all(x -> x isa AbstractString, ms)) ||
             config_error("handlers[$i] needs a non-empty 'models' list of strings")
-        opts = get(h, "options", Dict{String,Any}())
+        opts = get(h, "options", Dict{String, Any}())
         opts isa AbstractDict || config_error("handlers[$i]: 'options' must be a mapping")
         models = String.(ms)
         for m in models
@@ -152,16 +152,18 @@ function load_config(path::AbstractString)
             haskey(exclude, m) && config_error("model '$m' is in both 'exclude' and 'handlers'")
             push!(handled, m)
         end
-        push!(handlers, (file=file, models=models, options=resolve_options(opts, base)))
+        push!(handlers, (file = file, models = models, options = resolve_options(opts, base)))
     end
 
     (isempty(srcs) && isempty(handlers)) &&
         config_error("config has neither 'source_dirs' nor 'handlers'; nothing to convert")
 
-    return (source_dirs=[resolve_path(String(s), base) for s in srcs],
-            output_root=resolve_path(String(out), base),
-            report_path=resolve_path(String(rep), base),
-            exclude=exclude, handlers=handlers)
+    return (
+        source_dirs = [resolve_path(String(s), base) for s in srcs],
+        output_root = resolve_path(String(out), base),
+        report_path = resolve_path(String(rep), base),
+        exclude = exclude, handlers = handlers,
+    )
 end
 
 # ---------------------------------------------------------------------------
@@ -179,7 +181,7 @@ end
 
 # Scan source dirs, disambiguating cross-directory name collisions.
 function build_worklist(cfg)
-    worklist = Tuple{String,String,String}[]   # (source, model, bundle_name)
+    worklist = Tuple{String, String, String}[]   # (source, model, bundle_name)
     used_names = Set{String}()
     for source in cfg.source_dirs
         isdir(source) || (println("WARN: source dir missing: $source"); continue)
@@ -216,7 +218,7 @@ function apply_only(worklist, only::Vector{String})
     return keep
 end
 
-handler_file_map(cfg) = Dict{String,String}(m => basename(h.file) for h in cfg.handlers for m in h.models)
+handler_file_map(cfg) = Dict{String, String}(m => basename(h.file) for h in cfg.handlers for m in h.models)
 
 const CLI = parse_cli(ARGS)
 const CFG = load_config(CLI.config_path)
@@ -227,7 +229,7 @@ if CLI.dry_run
     println("Dry run: $(length(worklist)) models -> $(CFG.output_root)")
     for (idx, (source, model, bundle_name)) in enumerate(worklist)
         dispo = haskey(CFG.exclude, model) ? "EXCLUDED: $(CFG.exclude[model].reason)" :
-                haskey(hfile, model) ? "handler $(hfile[model])" : "generic"
+            haskey(hfile, model) ? "handler $(hfile[model])" : "generic"
         present = bundle_present(joinpath(CFG.output_root, bundle_name)) ? "present" : "absent "
         @printf("[%3d/%3d] %-55s %s  %s\n", idx, length(worklist), bundle_name, present, dispo)
     end
@@ -262,7 +264,7 @@ using ReactantServerExport
 # ---------------------------------------------------------------------------
 # Triton dtype -> Julia type. Restricted to what ReactantServerExport can serialize.
 # ---------------------------------------------------------------------------
-const TRITON_DTYPE = Dict{String,DataType}(
+const TRITON_DTYPE = Dict{String, DataType}(
     "TYPE_UINT8" => UInt8, "TYPE_UINT16" => UInt16, "TYPE_UINT32" => UInt32, "TYPE_UINT64" => UInt64,
     "TYPE_INT8" => Int8, "TYPE_INT16" => Int16, "TYPE_INT32" => Int32, "TYPE_INT64" => Int64,
     "TYPE_FP16" => Float16, "TYPE_FP32" => Float32, "TYPE_FP64" => Float64,
@@ -387,8 +389,10 @@ struct Record
     detail::String
 end
 
-function convert_model(source::AbstractString, model::AbstractString, bundle_name::AbstractString,
-                       output_root::AbstractString)
+function convert_model(
+        source::AbstractString, model::AbstractString, bundle_name::AbstractString,
+        output_root::AbstractString
+    )
     cfg_path = joinpath(source, model, "config.pbtxt")
     pt_path = joinpath(source, model, "1", "model.pt")
     isfile(cfg_path) || return Record(source, model, bundle_name, :failed, Int[], "config.pbtxt not found")
@@ -404,8 +408,10 @@ function convert_model(source::AbstractString, model::AbstractString, bundle_nam
         haskey(TRITON_DTYPE, e.dtype_token) ||
             return Record(source, model, bundle_name, :failed, Int[], "unsupported input dtype $(e.dtype_token)")
         any(d -> d < 0, e.dims) &&
-            return Record(source, model, bundle_name, :skipped, Int[],
-                          "dynamic input shape, no concrete size available (dims=$(e.dims))")
+            return Record(
+            source, model, bundle_name, :skipped, Int[],
+            "dynamic input shape, no concrete size available (dims=$(e.dims))"
+        )
     end
 
     ladder = batch_ladder(parse_max_batch_size(text))
@@ -414,15 +420,17 @@ function convert_model(source::AbstractString, model::AbstractString, bundle_nam
     ex = Tuple(example_input(e) for e in inputs)
     out_dir = joinpath(output_root, bundle_name)
 
-    do_export(sizes) = ReactantServerExport.export_torchscript_bundle(pt_path, ex;
-        dir=out_dir, name=bundle_name,
-        input_names=in_names,
-        output_names=isempty(out_names) ? nothing : out_names,
-        batch_sizes=sizes)
+    do_export(sizes) = ReactantServerExport.export_torchscript_bundle(
+        pt_path, ex;
+        dir = out_dir, name = bundle_name,
+        input_names = in_names,
+        output_names = isempty(out_names) ? nothing : out_names,
+        batch_sizes = sizes
+    )
 
     # Try the full ladder; if that throws and the ladder has more than just b1,
     # fall back to b1 alone so a usable bundle is still written.
-    isdir(out_dir) && rm(out_dir; recursive=true)
+    isdir(out_dir) && rm(out_dir; recursive = true)
     try
         do_export(ladder)
         return Record(source, model, bundle_name, :success, ladder, "")
@@ -431,12 +439,14 @@ function convert_model(source::AbstractString, model::AbstractString, bundle_nam
         if ladder == [1]
             return Record(source, model, bundle_name, :failed, Int[], full_err)
         end
-        isdir(out_dir) && rm(out_dir; recursive=true)
+        isdir(out_dir) && rm(out_dir; recursive = true)
         try
             do_export([1])
             dropped = filter(!=(1), ladder)
-            return Record(source, model, bundle_name, :partial, [1],
-                          "batch sizes $dropped failed to re-trace: $full_err")
+            return Record(
+                source, model, bundle_name, :partial, [1],
+                "batch sizes $dropped failed to re-trace: $full_err"
+            )
         catch e1
             return Record(source, model, bundle_name, :failed, Int[], short_error(e1))
         end
@@ -455,7 +465,7 @@ struct HandlerContext
     inputs::Vector{IOEntry}
     outputs::Vector{IOEntry}
     ladder::Vector{Int}         # batch ladder from this model's max_batch_size
-    options::Dict{String,Any}   # this handler's options (_dir/_path values pre-resolved)
+    options::Dict{String, Any}   # this handler's options (_dir/_path values pre-resolved)
     utils::NamedTuple           # shared helpers, see run_handler
 end
 
@@ -470,9 +480,11 @@ function load_handler(path::AbstractString, idx::Int)
     return fn
 end
 
-function run_handler(fn::Function, options::Dict{String,Any}, hname::AbstractString,
-                     source::AbstractString, model::AbstractString, bundle_name::AbstractString,
-                     output_root::AbstractString)
+function run_handler(
+        fn::Function, options::Dict{String, Any}, hname::AbstractString,
+        source::AbstractString, model::AbstractString, bundle_name::AbstractString,
+        output_root::AbstractString
+    )
     cfg_path = joinpath(source, model, "config.pbtxt")
     if isfile(cfg_path)
         text = read(cfg_path, String)
@@ -487,9 +499,11 @@ function run_handler(fn::Function, options::Dict{String,Any}, hname::AbstractStr
         outputs = IOEntry[]
         ladder = Int[1]
     end
-    ctx = HandlerContext(source, model, bundle_name, joinpath(output_root, bundle_name),
-                         text, inputs, outputs, ladder, options,
-                         (; batch_ladder, parse_max_batch_size, example_input, short_error))
+    ctx = HandlerContext(
+        source, model, bundle_name, joinpath(output_root, bundle_name),
+        text, inputs, outputs, ladder, options,
+        (; batch_ladder, parse_max_batch_size, example_input, short_error)
+    )
     try
         # invokelatest: the handler function was defined by `Base.include` in a newer world age
         # than this call site; Julia 1.12's strict world-age semantics otherwise reject it.
@@ -508,7 +522,7 @@ function main(cfg, only::Vector{String}, force::Bool)
     worklist = apply_only(build_worklist(cfg), only)
 
     # model -> (handler function, options, file basename)
-    handler_for = Dict{String,Tuple{Function,Dict{String,Any},String}}()
+    handler_for = Dict{String, Tuple{Function, Dict{String, Any}, String}}()
     for (idx, h) in enumerate(cfg.handlers)
         fn = load_handler(h.file, idx)
         for m in h.models
@@ -526,13 +540,13 @@ function main(cfg, only::Vector{String}, force::Bool)
         out_dir = joinpath(cfg.output_root, bundle_name)
         if haskey(cfg.exclude, model)
             ex = cfg.exclude[model]
-            ex.remove_existing && isdir(out_dir) && rm(out_dir; recursive=true)
+            ex.remove_existing && isdir(out_dir) && rm(out_dir; recursive = true)
             println("$prefix EXCLUDED")
             flush(stdout)
             push!(records, Record(source, model, bundle_name, :skipped, Int[], ex.reason))
             continue
         end
-        force && isdir(out_dir) && rm(out_dir; recursive=true)
+        force && isdir(out_dir) && rm(out_dir; recursive = true)
         if bundle_present(out_dir)
             println("$prefix SKIP (already present)")
             flush(stdout)
@@ -553,8 +567,8 @@ function main(cfg, only::Vector{String}, force::Bool)
         push!(records, rec)
 
         tag = rec.outcome == :success ? "OK     b=$(rec.sizes)" :
-              rec.outcome == :partial ? "PARTIAL b=$(rec.sizes)" :
-              rec.outcome == :skipped ? "SKIPPED" : "FAILED"
+            rec.outcome == :partial ? "PARTIAL b=$(rec.sizes)" :
+            rec.outcome == :skipped ? "SKIPPED" : "FAILED"
         println("$prefix $tag")
         rec.outcome in (:failed, :skipped, :partial) && !isempty(rec.detail) && println("          → $(rec.detail)")
         flush(stdout)
@@ -618,7 +632,7 @@ function write_report(records, report_path::AbstractString, output_root::Abstrac
             end
         end
     end
-    println("\nReport written to $report_path")
+    return println("\nReport written to $report_path")
 end
 
 function print_summary(records)
@@ -633,6 +647,7 @@ function print_summary(records)
             println("  $(r.bundle_name): $(r.detail)")
         end
     end
+    return
 end
 
 main(CFG, CLI.only, CLI.force)

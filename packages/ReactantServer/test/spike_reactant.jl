@@ -29,7 +29,9 @@ function collect_buffers(x)
     x isa XLA.AbstractBuffer && return XLA.AbstractBuffer[x]
     if x isa Tuple || x isa AbstractArray
         out = XLA.AbstractBuffer[]
-        for e in x; append!(out, collect_buffers(e)); end
+        for e in x
+            append!(out, collect_buffers(e))
+        end
         return out
     end
     return XLA.AbstractBuffer[]
@@ -56,10 +58,13 @@ function run_spike()
         m = parse(MLIR.IR.Module, ADD_MLIR)
         ver = current_stablehlo_version()
         @info "StableHLO current version" ver
-        bytes, sres = capture_bytes((cb, ref) -> MLIR.API.stablehloSerializePortableArtifactFromModule(
-            m, ver, cb, ref, true))
+        bytes, sres = capture_bytes(
+            (cb, ref) -> MLIR.API.stablehloSerializePortableArtifactFromModule(
+                m, ver, cb, ref, true
+            )
+        )
         MLIR.IR.isfailure(MLIR.IR.LogicalResult(sres)) && error("failed to serialize module")
-        @info "Serialized portable artifact" nbytes=length(bytes)
+        @info "Serialized portable artifact" nbytes = length(bytes)
 
         # deserialize bytes -> module  (the path the server takes on every bundle load).
         # The C wrapper has a cconvert for String/AbstractString but not Vector{UInt8},
@@ -70,7 +75,8 @@ function run_spike()
         cl = XLA.client("cpu")
         d = first(XLA.addressable_devices(cl))
         opts = XLA.make_compile_options(; device_id = Int64(XLA.device_ordinal(d)))
-        ex = XLA.compile(cl, m2;
+        ex = XLA.compile(
+            cl, m2;
             compile_options = opts,
             num_parameters = Int64(2),
             num_outputs = Int64(1),
@@ -88,12 +94,12 @@ function run_spike()
     bb = XLA.PJRT.Buffer(client, b, dev)
 
     outs = XLA.execute_sharded(exec, dev, (ba.buffer, bb.buffer), (UInt8(0), UInt8(0)), Val(1))
-    @info "execute_sharded returned" typeof=typeof(outs)
+    @info "execute_sharded returned" typeof = typeof(outs)
 
     bufs = collect_buffers(outs)
     @assert length(bufs) == 1 "expected 1 output buffer, got $(length(bufs))"
     ob = bufs[1]
-    @info "output buffer" eltype=eltype(ob) size=size(ob)
+    @info "output buffer" eltype = eltype(ob) size = size(ob)
 
     host = Array{Float32}(undef, 4)
     XLA.to_host(ob, host, Reactant.Sharding.NoSharding())

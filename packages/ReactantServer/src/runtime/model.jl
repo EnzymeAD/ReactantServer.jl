@@ -13,9 +13,11 @@ enabled the initial residency follows `state`: `PINNED_DEVICE` loads to the devi
 holds no floor and starts fully evicted (the weight cache loads it from the mmap on first
 dispatch). Called once per model at startup.
 """
-function build_loaded_model(backend::AbstractBackend, pool::MemoryPool, entry::ModelEntry;
-                            state::ResidencyState=UNPINNED, on_demand::Bool=false,
-                            store::WeightStore=PrivateWeightStore(), source::Symbol=:startup)
+function build_loaded_model(
+        backend::AbstractBackend, pool::MemoryPool, entry::ModelEntry;
+        state::ResidencyState = UNPINNED, on_demand::Bool = false,
+        store::WeightStore = PrivateWeightStore(), source::Symbol = :startup
+    )
     m = entry.manifest
     input_names = String[t.name for t in m.executable_inputs]
     input_eltypes = DataType[julia_type(t.dtype) for t in m.executable_inputs]
@@ -30,7 +32,7 @@ function build_loaded_model(backend::AbstractBackend, pool::MemoryPool, entry::M
     input_batch_dim = m.input_batch_dim === nothing ? 0 : m.input_batch_dim
     # The variable input axes, in (input, axis) order, line up with the manifest's input_shapes and
     # so with the variant keys of entry.mlir_bytes; _select_exec reads the same axes from a request.
-    variant_spec = Tuple{String,Int}[]
+    variant_spec = Tuple{String, Int}[]
     for t in m.executable_inputs
         for (ax, dm) in enumerate(t.shape)
             dm.kind == VARIABLE && push!(variant_spec, (t.name, ax))
@@ -40,8 +42,10 @@ function build_loaded_model(backend::AbstractBackend, pool::MemoryPool, entry::M
     if any(inner -> length(inner) > 1, values(entry.mlir_bytes)) && m.input_batch_dim === nothing
         error("manifest '$(m.name)' has multiple compiled batch sizes but no input with a batch axis ('n'/'b')")
     end
-    sig = ModelSignature(input_names, input_eltypes, wnames, n_outputs, output_names, output_eltypes,
-                         input_batch_dim, variant_spec)
+    sig = ModelSignature(
+        input_names, input_eltypes, wnames, n_outputs, output_names, output_eltypes,
+        input_batch_dim, variant_spec
+    )
 
     # Weights do not vary with batch size, so they are loaded once and shared.
     nbytes = weights_nbytes(entry.weights, wnames)
@@ -58,19 +62,21 @@ function build_loaded_model(backend::AbstractBackend, pool::MemoryPool, entry::M
         weights = transfer_to_device(backend, pool, host_weights)
         host_weights = nothing                       # device-pinned never evicts; no host floor needed
     elseif state == PINNED_SYSTEM
-        host_weights = host_materialize(store, entry.name, entry.weights, wnames;
-                                        content=weights_file_token(entry.weights_path))
+        host_weights = host_materialize(
+            store, entry.name, entry.weights, wnames;
+            content = weights_file_token(entry.weights_path)
+        )
     end
     np = num_parameters(sig)
     # One executable per (variant, batch size); all share the single weight set loaded above.
     # The numerics accumulator aggregates what the numerics policy did across all artifacts so the
     # model-loaded log records the model's effective precision in one line.
     nstats = NumericsStats()
-    execs = Dict{VariantKey,Dict{Int,Any}}()
+    execs = Dict{VariantKey, Dict{Int, Any}}()
     for (vkey, batchmap) in entry.mlir_bytes
-        inner = Dict{Int,Any}()
+        inner = Dict{Int, Any}()
         for (sz, bytes) in batchmap
-            inner[sz] = compile_artifact(backend, pool, bytes, np, n_outputs; numerics_stats=nstats)
+            inner[sz] = compile_artifact(backend, pool, bytes, np, n_outputs; numerics_stats = nstats)
         end
         execs[vkey] = inner
     end
@@ -78,6 +84,6 @@ function build_loaded_model(backend::AbstractBackend, pool::MemoryPool, entry::M
     numerics = format_numerics(pool.numerics, nstats, backend_tf32_capable(backend, pool))
     isempty(nstats.opaque_ops) ||
         @warn "numerics=f32: module contains ops the precision pin cannot govern" model = entry.name ops = sort(unique(nstats.opaque_ops))
-    log_model_loaded(entry, model; source=source, memory=memory_report(backend, pool), numerics=numerics)
+    log_model_loaded(entry, model; source = source, memory = memory_report(backend, pool), numerics = numerics)
     return model
 end

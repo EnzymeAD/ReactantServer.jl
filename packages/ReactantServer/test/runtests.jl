@@ -7,14 +7,18 @@ using Test
 # ReactantServer prepend an override that disables the persistent cache for this test process.
 # Test compiles are tiny; skipping the cache also keeps them deterministic.
 let prefdir = mktempdir()
-    write(joinpath(prefdir, "Project.toml"), """
-    [extras]
-    Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
-    """)
-    write(joinpath(prefdir, "LocalPreferences.toml"), """
-    [Reactant]
-    persistent_cache_enabled = false
-    """)
+    write(
+        joinpath(prefdir, "Project.toml"), """
+        [extras]
+        Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+        """
+    )
+    write(
+        joinpath(prefdir, "LocalPreferences.toml"), """
+        [Reactant]
+        persistent_cache_enabled = false
+        """
+    )
     pushfirst!(LOAD_PATH, prefdir)
 end
 

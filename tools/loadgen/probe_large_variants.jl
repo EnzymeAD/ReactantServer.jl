@@ -23,8 +23,8 @@ using ReactantServerClient
 import gRPCClient
 
 env(k, d) = get(ENV, k, d)
-const GATEWAY  = env("PROBE_GATEWAY", "grpc://localhost:8001")
-const MODEL    = env("PROBE_MODEL", "text_fuse_net_gpu")
+const GATEWAY = env("PROBE_GATEWAY", "grpc://localhost:8001")
+const MODEL = env("PROBE_MODEL", "text_fuse_net_gpu")
 const DEADLINE = parse(Float64, env("PROBE_DEADLINE", "300"))
 
 # The compiled (W, H) variants, kept in sync with input_shapes in private/convert.yaml. Probed
@@ -49,16 +49,16 @@ function main()
             resp = infer_sync(m, [InferInput("INPUT__0", img)])
             dt = round(time() - t0, digits = 2)
             wire = isempty(resp.outputs) ? Int[] : collect(resp.outputs[1].shape)
-            println("  OK   $(w)x$(h)  ($(w*h) px)  $(dt)s  out_wire_shape=$wire")
+            println("  OK   $(w)x$(h)  ($(w * h) px)  $(dt)s  out_wire_shape=$wire")
         catch err
             nfail += 1
-            println("  FAIL $(w)x$(h)  ($(w*h) px)  ", sprint(showerror, err))
+            println("  FAIL $(w)x$(h)  ($(w * h) px)  ", sprint(showerror, err))
         end
         flush(stdout)
     end
     println("== done: $(length(order) - nfail)/$(length(order)) variants ran ==")
     kserve_shutdown()
-    exit(nfail == 0 ? 0 : 1)
+    return exit(nfail == 0 ? 0 : 1)
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__

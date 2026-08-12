@@ -37,20 +37,25 @@ mutable struct MockState
     infer_calls::Threads.Atomic{Int}
     lock::ReentrantLock
 end
-MockState() = MockState(Set{String}(), true, false, 0.0, Threads.Atomic{Int}(0),
-                        Threads.Atomic{Int}(0), ReentrantLock())
+MockState() = MockState(
+    Set{String}(), true, false, 0.0, Threads.Atomic{Int}(0),
+    Threads.Atomic{Int}(0), ReentrantLock()
+)
 
 # Extract a tensor's shared_memory_region string parameter, or nothing when the tensor is inline.
 function _region_of(t)
     p = get(t.parameters, "shared_memory_region", nothing)
     (p === nothing || p.parameter_choice === nothing) && return nothing
-    p.parameter_choice.name === :string_param ? String(p.parameter_choice[]) : nothing
+    return p.parameter_choice.name === :string_param ? String(p.parameter_choice[]) : nothing
 end
 
 function _mk_router(st::MockState)
-    router = gRPCServer.gRPCRouter(; max_receive_message_length = 64 * 1024 * 1024,
-                                   max_send_message_length = 64 * 1024 * 1024)
-    register_GRPCInferenceService!(router;
+    router = gRPCServer.gRPCRouter(;
+        max_receive_message_length = 64 * 1024 * 1024,
+        max_send_message_length = 64 * 1024 * 1024
+    )
+    register_GRPCInferenceService!(
+        router;
         IsSameIPCNamespace = (req, ctx) -> begin
             st.probe_sleep > 0 && sleep(st.probe_sleep)   # simulate a restarted-but-unresponsive server
             inf.IsSameIPCNamespaceResponse(; same = st.same_ns)
@@ -71,12 +76,17 @@ function _mk_router(st::MockState)
             for t in req.inputs
                 name = _region_of(t)
                 name === nothing && continue           # inline input: nothing to check
-                @lock st.lock (name in st.regions) || throw(gRPCServer.gRPCServiceCallException(
-                    gRPCServer.GRPC_FAILED_PRECONDITION, "unregistered shared memory region: $name"))
+                @lock st.lock (name in st.regions) || throw(
+                    gRPCServer.gRPCServiceCallException(
+                        gRPCServer.GRPC_FAILED_PRECONDITION, "unregistered shared memory region: $name"
+                    )
+                )
             end
-            inf.ModelInferResponse(; model_name = req.model_name,
+            inf.ModelInferResponse(;
+                model_name = req.model_name,
                 outputs = inf.var"ModelInferResponse.InferOutputTensor"[],
-                raw_output_contents = Vector{UInt8}[])
+                raw_output_contents = Vector{UInt8}[]
+            )
         end,
     )
     return router
@@ -98,11 +108,15 @@ ReactantServerClient.infer_decode_chunk!(io::RecoveryIO, r, response) =
 _noretry() = RSC.RetryPolicy(enabled = false)
 
 @testset "stale-registration classification" begin
-    stale_fp = RSC.gRPCClient.gRPCServiceCallException(RSC.gRPCClient.GRPC_FAILED_PRECONDITION,
-                                                       "unregistered shared memory region: pool")
+    stale_fp = RSC.gRPCClient.gRPCServiceCallException(
+        RSC.gRPCClient.GRPC_FAILED_PRECONDITION,
+        "unregistered shared memory region: pool"
+    )
     # Message-only signal (status rewritten to UNAVAILABLE in transit) is still recognized.
-    stale_msg = RSC.gRPCClient.gRPCServiceCallException(RSC.gRPCClient.GRPC_UNAVAILABLE,
-                                                        "worker x: unregistered shared memory region: pool")
+    stale_msg = RSC.gRPCClient.gRPCServiceCallException(
+        RSC.gRPCClient.GRPC_UNAVAILABLE,
+        "worker x: unregistered shared memory region: pool"
+    )
     other = RSC.gRPCClient.gRPCServiceCallException(RSC.gRPCClient.GRPC_INVALID_ARGUMENT, "bad shape")
     @test RSC._is_stale_registration(stale_fp)
     @test RSC._is_stale_registration(stale_msg)
@@ -120,8 +134,10 @@ end
     server = gRPCServer.serve!(_mk_router(st), "127.0.0.1", port)
     try
         kserve_init(; pool_bytes = 1 << 20, n_slots = 8, shm_reprobe_interval = 0.0)
-        m = KServeModel("127.0.0.1", port, "m"; shared_memory = :on, max_batch_size = 1,
-                        deadline = 10.0, retry = _noretry())
+        m = KServeModel(
+            "127.0.0.1", port, "m"; shared_memory = :on, max_batch_size = 1,
+            deadline = 10.0, retry = _noretry()
+        )
         key = (m.host, m.port, m.shared_memory)
 
         # Tier 1a: initial registration + a working SHM inference.

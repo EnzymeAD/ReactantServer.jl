@@ -163,8 +163,10 @@
 
         # A deadline a release beats is satisfied normally (no spurious timeout).
         got = Channel{Any}(1)
-        t = Threads.@spawn put!(got,
-            ReactantServerCore.acquire_slot!(p; deadline_ns = Int64(time_ns()) + 5_000_000_000))
+        t = Threads.@spawn put!(
+            got,
+            ReactantServerCore.acquire_slot!(p; deadline_ns = Int64(time_ns()) + 5_000_000_000)
+        )
         @test timedwait(() -> (@lock p.alloc_lock !isempty(p.waitq)), 5.0) == :ok
         ReactantServerCore.release_slot!(singles[1])
         @test timedwait(() -> isready(got), 5.0) == :ok

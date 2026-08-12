@@ -28,27 +28,31 @@ import gRPCClient
 
 const GW = ReactantServerGateway
 
-const POLICY_KEYS = ["rebalance_compute_seconds", "first_rebalance_compute_seconds", "hysteresis",
-                     "ema_halflife_compute_seconds", "default_replicas", "routing_policy", "work_basis",
-                     "routing_fill_factor", "routing_fill_mode", "compaction_mode",
-                     "compaction_interval", "forbid_memory_oversubscription"]
+const POLICY_KEYS = [
+    "rebalance_compute_seconds", "first_rebalance_compute_seconds", "hysteresis",
+    "ema_halflife_compute_seconds", "default_replicas", "routing_policy", "work_basis",
+    "routing_fill_factor", "routing_fill_mode", "compaction_mode",
+    "compaction_interval", "forbid_memory_oversubscription",
+]
 
-usage() = print("""
-Usage: gateway_ctl.jl [--gateway HOST:PORT] COMMAND
+usage() = print(
+    """
+    Usage: gateway_ctl.jl [--gateway HOST:PORT] COMMAND
 
-Commands:
-  status
-  repack [--wait SECONDS]
-  set-replicas MODEL <n|all|default> [--fill-mode MODE] [--fill-factor F] [--allow-unknown]
-  set-policy KEY=VALUE ...
+    Commands:
+      status
+      repack [--wait SECONDS]
+      set-replicas MODEL <n|all|default> [--fill-mode MODE] [--fill-factor F] [--allow-unknown]
+      set-policy KEY=VALUE ...
 
-set-policy keys:
-  $(join(POLICY_KEYS, "\n  "))
+    set-policy keys:
+      $(join(POLICY_KEYS, "\n  "))
 
-Replica counts: a positive integer, "all" (every ready worker), or "default" (clear the override).
-Fill modes: run (default), spread, inflight (parks a model on one replica: see the docs), or
-            inherit (clear a per-model override).
-""")
+    Replica counts: a positive integer, "all" (every ready worker), or "default" (clear the override).
+    Fill modes: run (default), spread, inflight (parks a model on one replica: see the docs), or
+                inherit (clear a per-model override).
+    """
+)
 
 # --- transport ---------------------------------------------------------------------------------
 
@@ -75,6 +79,7 @@ function print_warnings(ws; prefix = "warning")
     for w in ws
         println("  $prefix: $w")
     end
+    return
 end
 
 function print_status(resp)
@@ -98,40 +103,54 @@ function print_status(resp)
     end
     r = resp.repack
     if r !== nothing
-        println("\nrepacks: $(r.repack_count) total, last trigger '$(r.last_trigger)' " *
-                "($(round(r.last_models_placed)) models, $(r.last_models_moved) moved)")
-        @printf("  compute since last repack        %.1f of %.1f GPU-seconds\n",
-                r.compute_accumulated_seconds, r.active_threshold_seconds)
+        println(
+            "\nrepacks: $(r.repack_count) total, last trigger '$(r.last_trigger)' " *
+                "($(round(r.last_models_placed)) models, $(r.last_models_moved) moved)"
+        )
+        @printf(
+            "  compute since last repack        %.1f of %.1f GPU-seconds\n",
+            r.compute_accumulated_seconds, r.active_threshold_seconds
+        )
         @printf("  first-repack budget armed        %s\n", !r.first_tick_repack_done)
-        @printf("  operator repacks                 %d requested, %d served\n",
-                r.operator_repacks_requested, r.operator_repacks_completed)
+        @printf(
+            "  operator repacks                 %d requested, %d served\n",
+            r.operator_repacks_requested, r.operator_repacks_completed
+        )
     end
     if !isempty(resp.models)
         println("\nmodels")
-        @printf("  %-28s %5s %5s %-9s %5s %9s %9s  %s\n",
-                "name", "cfg", "eff", "fill", "quant", "util", "cost",
-                "placement (requests routed / items in flight)")
+        @printf(
+            "  %-28s %5s %5s %-9s %5s %9s %9s  %s\n",
+            "name", "cfg", "eff", "fill", "quant", "util", "cost",
+            "placement (requests routed / items in flight)"
+        )
         for m in resp.models
             # requests routed / items in flight: the two are deliberately different units.
             place = join(["$(r.worker) $(r.routed_total)req/$(r.outstanding)it" for r in m.replicas], "  ")
             flags = string(m.placed ? "" : " [unplaced]", m.drifted ? " [drifted]" : "")
-            @printf("  %-28s %5s %5d %-9s %5d %9.4f %9.4f  %s%s\n",
-                    m.name, fmt_replicas(m.configured_replicas), m.effective_replicas,
-                    m.fill_mode, m.fill_quantum, m.utilization, m.cost_seconds, place, flags)
+            @printf(
+                "  %-28s %5s %5d %-9s %5d %9.4f %9.4f  %s%s\n",
+                m.name, fmt_replicas(m.configured_replicas), m.effective_replicas,
+                m.fill_mode, m.fill_quantum, m.utilization, m.cost_seconds, place, flags
+            )
         end
     end
     if !isempty(resp.workers)
         println("\nworkers")
-        @printf("  %-24s %6s %7s %11s %11s %11s\n",
-                "worker", "ready", "models", "in-flight", "weights", "budget")
+        @printf(
+            "  %-24s %6s %7s %11s %11s %11s\n",
+            "worker", "ready", "models", "in-flight", "weights", "budget"
+        )
         for w in resp.workers
-            @printf("  %-24s %6s %7d %11.3f %11s %11s%s\n",
-                    w.worker, w.ready, w.models_placed, w.inflight_compute,
-                    fmt_bytes(w.assigned_weight_bytes), fmt_bytes(w.weight_budget_bytes),
-                    w.oversubscribed ? "  OVERSUBSCRIBED" : "")
+            @printf(
+                "  %-24s %6s %7d %11.3f %11s %11s%s\n",
+                w.worker, w.ready, w.models_placed, w.inflight_compute,
+                fmt_bytes(w.assigned_weight_bytes), fmt_bytes(w.weight_budget_bytes),
+                w.oversubscribed ? "  OVERSUBSCRIBED" : ""
+            )
         end
     end
-    isempty(resp.warnings) || (println(); print_warnings(resp.warnings))
+    return isempty(resp.warnings) || (println(); print_warnings(resp.warnings))
 end
 
 # --- commands ----------------------------------------------------------------------------------
@@ -142,7 +161,7 @@ parse_replicas(v) = v == "all" ? Int64(-1) : (v in ("default", "-") ? Int64(0) :
 # script needs no knowledge of which knobs exist beyond their value types.
 function build_policy(pairs)
     mask = String[]
-    kw = Dict{Symbol,Any}()
+    kw = Dict{Symbol, Any}()
     for p in pairs
         k, _, v = partition_kv(p)
         k in POLICY_KEYS || error("unknown policy key '$k'; accepted: $(join(POLICY_KEYS, ", "))")
@@ -198,17 +217,25 @@ end
 
 function dispatch(cmd, rest, host, port)
     if cmd == "status"
-        print_status(call(GatewayControlService_GetSchedulingStatus_Client, host, port,
-                          GetSchedulingStatusRequest()))
+        print_status(
+            call(
+                GatewayControlService_GetSchedulingStatus_Client, host, port,
+                GetSchedulingStatusRequest()
+            )
+        )
     elseif cmd == "repack"
         wait = 30.0
         j = findfirst(==("--wait"), rest)
         j === nothing || (wait = parse(Float64, rest[j + 1]))
-        resp = call(GatewayControlService_Repack_Client, host, port,
-                    RepackRequest(; wait_seconds = wait); deadline = ceil(Int, wait) + 30)
-        println(resp.completed ?
+        resp = call(
+            GatewayControlService_Repack_Client, host, port,
+            RepackRequest(; wait_seconds = wait); deadline = ceil(Int, wait) + 30
+        )
+        println(
+            resp.completed ?
                 "repack $(resp.sequence) completed in $(round(resp.waited_seconds; digits = 2))s" :
-                "repack $(resp.sequence) queued (not observed within $(round(resp.waited_seconds; digits = 2))s)")
+                "repack $(resp.sequence) queued (not observed within $(round(resp.waited_seconds; digits = 2))s)"
+        )
         r = resp.repack
         r === nothing || println("  now $(r.repack_count) repack(s) total, last trigger '$(r.last_trigger)', $(r.last_models_moved) model(s) moved")
         print_warnings(resp.warnings)
@@ -226,18 +253,26 @@ function dispatch(cmd, rest, host, port)
             a == "--allow-unknown" && (allow_unknown = true; continue)
             error("unexpected argument '$a'")
         end
-        resp = call(GatewayControlService_SetModelPlacement_Client, host, port,
-                    SetModelPlacementRequest(; name = model, replicas = replicas,
-                                             fill_mode = fill_mode, fill_factor = fill_factor,
-                                             allow_unknown_model = allow_unknown))
-        println("$(resp.name): replicas $(fmt_replicas(resp.configured_replicas)) " *
-                "(effective $(resp.effective_replicas)), fill $(resp.fill_mode) quantum $(resp.fill_quantum)")
+        resp = call(
+            GatewayControlService_SetModelPlacement_Client, host, port,
+            SetModelPlacementRequest(;
+                name = model, replicas = replicas,
+                fill_mode = fill_mode, fill_factor = fill_factor,
+                allow_unknown_model = allow_unknown
+            )
+        )
+        println(
+            "$(resp.name): replicas $(fmt_replicas(resp.configured_replicas)) " *
+                "(effective $(resp.effective_replicas)), fill $(resp.fill_mode) quantum $(resp.fill_quantum)"
+        )
         print_warnings(resp.warnings)
     elseif cmd == "set-policy"
         isempty(rest) && (usage(); return 2)
         mask, policy = build_policy(rest)
-        resp = call(GatewayControlService_SetSchedulingPolicy_Client, host, port,
-                    SetSchedulingPolicyRequest(; update_mask = mask, policy = policy))
+        resp = call(
+            GatewayControlService_SetSchedulingPolicy_Client, host, port,
+            SetSchedulingPolicyRequest(; update_mask = mask, policy = policy)
+        )
         println("applied $(join(mask, ", ")) (generation $(resp.applied.generation))")
         print_warnings(resp.warnings)
     else

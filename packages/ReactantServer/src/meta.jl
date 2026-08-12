@@ -17,7 +17,7 @@ abstract type ModelCaller end
 # itself carries the backend/pool/weight-cache, so the sub-call needs only a handle to it.
 struct QueueingCaller <: ModelCaller
     sched::Scheduler
-    scratch::Union{BufferPool,Nothing}
+    scratch::Union{BufferPool, Nothing}
 end
 
 # The local reuse pool a meta's `call.scratch` allocates from (or nothing -> plain heap arrays).
@@ -27,15 +27,19 @@ caller_pool(c::QueueingCaller) = c.scratch
 # this worker's clock, so the deadline is passed straight through to the sub-request; the scheduler
 # drops it at admission only if it has already expired (committed requests skip the laxity drop). The
 # sub-model's own preprocess/postprocess run inside `infer` on this task.
-call_model(c::QueueingCaller, name::AbstractString, inputs::Vector{NamedTensor};
-           requested_outputs::Vector{String}=String[], deadline_ns::Integer=0) =
-    infer(c.sched, InferRequest(String(name), requested_outputs, inputs, Int64(deadline_ns));
-          committed=true)
+call_model(
+    c::QueueingCaller, name::AbstractString, inputs::Vector{NamedTensor};
+    requested_outputs::Vector{String} = String[], deadline_ns::Integer = 0
+) =
+    infer(
+    c.sched, InferRequest(String(name), requested_outputs, inputs, Int64(deadline_ns));
+    committed = true
+)
 
 # The injected `call` handed to a meta model's `run(inputs, call)`. Callable to dispatch a sub-call
 # (`call(name, inputs)`), and exposes `call.scratch(...)` to request reuse buffers. Tracks the pool
 # slots acquired this request so `run_meta` releases them when the orchestration returns.
-mutable struct MetaCall{C<:ModelCaller}
+mutable struct MetaCall{C <: ModelCaller}
     caller::C
     name::String
     declared::Set{String}
@@ -43,16 +47,18 @@ mutable struct MetaCall{C<:ModelCaller}
     scratched::Bool          # call.scratch may be used at most once per request (see _scratch)
     deadline_ns::Int64       # absolute local time_ns() deadline for the whole orchestration (0 = none)
     call_ns::Int64           # nanoseconds spent inside sub-calls this request; the Julia glue between
-                             # calls is deliberately NOT counted (see `run_meta` / `_run_meta_request`)
+    # calls is deliberately NOT counted (see `run_meta` / `_run_meta_request`)
 end
-MetaCall(caller::ModelCaller, name::AbstractString, declared; deadline_ns::Integer=0) =
+MetaCall(caller::ModelCaller, name::AbstractString, declared; deadline_ns::Integer = 0) =
     MetaCall(caller, String(name), Set{String}(declared), PoolSlot[], false, Int64(deadline_ns), Int64(0))
 
 # `call(name, inputs)` — dispatch a sub-call, rejecting undeclared callees. Bail before issuing if
 # the orchestration's deadline has passed (no point starting more GPU work the caller has abandoned),
 # and pass the deadline down so the in-process sub-call short-circuits too.
-function (mc::MetaCall)(name::AbstractString, inputs::Vector{NamedTensor};
-                        requested_outputs::Vector{String}=String[])
+function (mc::MetaCall)(
+        name::AbstractString, inputs::Vector{NamedTensor};
+        requested_outputs::Vector{String} = String[]
+    )
     String(name) in getfield(mc, :declared) ||
         error("meta model '$(getfield(mc, :name))' called undeclared model '$name'; add it to meta.calls")
     dl = getfield(mc, :deadline_ns)
@@ -60,8 +66,10 @@ function (mc::MetaCall)(name::AbstractString, inputs::Vector{NamedTensor};
     # Time only the sub-call itself: this is the meta's GPU/model-call cost. The data-dependent Julia
     # glue between calls runs outside this window and is intentionally excluded from the meta's compute.
     t0 = time_ns()
-    result = call_model(getfield(mc, :caller), name, inputs;
-                        requested_outputs=requested_outputs, deadline_ns=dl)
+    result = call_model(
+        getfield(mc, :caller), name, inputs;
+        requested_outputs = requested_outputs, deadline_ns = dl
+    )
     setfield!(mc, :call_ns, getfield(mc, :call_ns) + Int64(time_ns() - t0))
     return result
 end
@@ -94,7 +102,8 @@ _scratch(mc::MetaCall, dims, ::Type{T}) where {T} =
 function _scratch(mc::MetaCall, reqs::AbstractVector)
     getfield(mc, :scratched) && error(
         "meta model '$(getfield(mc, :name))': call.scratch may be called only once per request; " *
-        "request all buffers up front in a single call, e.g. call.scratch([dims1 => T1, dims2 => T2]).")
+            "request all buffers up front in a single call, e.g. call.scratch([dims1 => T1, dims2 => T2])."
+    )
     setfield!(mc, :scratched, true)
     specs = [(Tuple(first(r)), last(r)) for r in reqs]   # dims => T pairs
     pool = caller_pool(getfield(mc, :caller))
@@ -129,9 +138,11 @@ work. Any pool slots acquired via `scratch` are released here when it returns (r
 `call_ns_out` is given, the total nanoseconds spent inside sub-calls (the meta's GPU/model-call cost,
 excluding the Julia glue between calls) is written to it, even when the orchestration throws.
 """
-function run_meta(entry::MetaEntry, caller::ModelCaller, inputs::Vector{NamedTensor};
-                  deadline_ns::Integer=0, call_ns_out::Union{Base.RefValue{Int64},Nothing}=nothing)
-    mc = MetaCall(caller, entry.name, entry.calls; deadline_ns=deadline_ns)
+function run_meta(
+        entry::MetaEntry, caller::ModelCaller, inputs::Vector{NamedTensor};
+        deadline_ns::Integer = 0, call_ns_out::Union{Base.RefValue{Int64}, Nothing} = nothing
+    )
+    mc = MetaCall(caller, entry.name, entry.calls; deadline_ns = deadline_ns)
     try
         # The orchestration is defined in a sandboxed model.jl (a newer world age), so cross it with
         # invokelatest, exactly as infer() does for pre/post hooks.

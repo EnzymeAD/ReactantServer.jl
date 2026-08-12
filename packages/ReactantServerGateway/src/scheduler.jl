@@ -20,7 +20,7 @@ abstract type GatewayScheduler end
 # Everything a scheduler may consult to route one request. Parametric on the pool type so the
 # request hot path stays type-stable (mirrors GatewayState). Extend this struct as future
 # schedulers need more (e.g. the raw request body for content-based routing).
-struct ScheduleContext{P<:ClientPool}
+struct ScheduleContext{P <: ClientPool}
     model::String
     id::String
     # Items this request carries, as resolved by `request_units` (1 for a model that declares no
@@ -126,9 +126,9 @@ inflight_work(::GatewayScheduler) = nothing
 # Exported at SCRAPE time from the scheduler's live counters, the same pattern as `RoutedCollector`:
 # the series never lags a prober tick, and a worker that leaves the snapshot (a repack moved every
 # model off it) simply stops being emitted instead of freezing at its last value.
-struct WorkerWorkCollector{S<:GatewayScheduler} <: Prometheus.Collector
+struct WorkerWorkCollector{S <: GatewayScheduler} <: Prometheus.Collector
     scheduler::S
-    worker_names::Dict{String,String}   # worker url -> friendly label, as GatewayMetrics maps them
+    worker_names::Dict{String, String}   # worker url -> friendly label, as GatewayMetrics maps them
 end
 
 Prometheus.metric_names(::WorkerWorkCollector) = ("gateway_worker_inflight_work",)
@@ -152,9 +152,13 @@ function Prometheus.collect!(out::Vector, c::WorkerWorkCollector)
     b = String(basis)
     samples = Prometheus.Sample[]
     for (w, a) in counters
-        push!(samples, Prometheus.Sample(nothing, ln,
-                                        Prometheus.LabelValues((get(c.worker_names, w, w), b)),
-                                        Float64(a[])))
+        push!(
+            samples, Prometheus.Sample(
+                nothing, ln,
+                Prometheus.LabelValues((get(c.worker_names, w, w), b)),
+                Float64(a[])
+            )
+        )
     end
     # Deterministic order across scrapes; Prometheus.jl sorts family children for the same reason.
     sort!(samples; by = x -> x.label_values.label_values)
@@ -166,7 +170,7 @@ end
 # so round_robin (which tracks no work) registers nothing and exports no empty family.
 register_worker_work!(s::GatewayScheduler, m::GatewayMetrics) =
     inflight_work(s) === nothing ? nothing :
-        Prometheus.register(m.registry, WorkerWorkCollector(s, m.worker_names))
+    Prometheus.register(m.registry, WorkerWorkCollector(s, m.worker_names))
 
 """
     make_scheduler(cfg::GatewayConfig, meta::RoutingMeta = RoutingMeta(cfg)) -> GatewayScheduler
@@ -223,14 +227,14 @@ const WORK_BASES = (:compute, :items, :requests)
 mutable struct LeastOutstandingScheduler <: GatewayScheduler
     basis::Symbol
     meta::RoutingMeta                                    # shared routing metadata (batch axis + cost)
-    @atomic inflight::Dict{String,Threads.Atomic{Float64}}
+    @atomic inflight::Dict{String, Threads.Atomic{Float64}}
     lock::ReentrantLock
 end
 
 function LeastOutstandingScheduler(meta::RoutingMeta = RoutingMeta(); basis::Symbol = :compute)
     basis in WORK_BASES ||
         throw(ArgumentError("work basis must be one of $(WORK_BASES), got :$basis"))
-    return LeastOutstandingScheduler(basis, meta, Dict{String,Threads.Atomic{Float64}}(), ReentrantLock())
+    return LeastOutstandingScheduler(basis, meta, Dict{String, Threads.Atomic{Float64}}(), ReentrantLock())
 end
 
 # Only the work bases need the control plane; `:requests` counts what it can see in the request itself.
@@ -287,7 +291,7 @@ function select_replicas(s::LeastOutstandingScheduler, ctx::ScheduleContext)
     return (vcat(urls[best], rest), (counters[best], charge))
 end
 
-function release!(::LeastOutstandingScheduler, res::Tuple{Threads.Atomic{Float64},Float64})
+function release!(::LeastOutstandingScheduler, res::Tuple{Threads.Atomic{Float64}, Float64})
     Threads.atomic_sub!(res[1], res[2])
     _settle_zero!(res[1])       # a drained worker reads exactly 0, not a few ulp of cancellation
     return nothing

@@ -16,10 +16,12 @@ use_cpu = "--cpu" in ARGS
 port = parse(Int, get(ENV, "OD_PORT", "8080"))
 backend = use_cpu ? ReactantServer.CPU_BACKEND : ReactantServer.CUDA_BACKEND
 
-cfg = ReactantServer.ServerConfig([BUNDLES], "",
+cfg = ReactantServer.ServerConfig(
+    [BUNDLES], "",
     ReactantServer.RuntimeConfig(backend, 0, 0.9, true, true),
     ReactantServer.SchedulerConfig(30.0, 64, 30.0),
-    ReactantServer.EndpointsConfig("127.0.0.1", port))
+    ReactantServer.EndpointsConfig("127.0.0.1", port)
+)
 
 @info "Compiling and serving object_detector (Ctrl-C to stop)" port backend bundles = BUNDLES
 ReactantServer.serve(cfg; backend = ReactantServer.ReactantBackend())  # blocking

@@ -30,8 +30,12 @@ function _as_gateway_control(f)
         e isa ReactantServerCore.ConfigError &&
             throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_INVALID_ARGUMENT, e.msg))
         @error "gateway control: handler failed" exception = (e, catch_backtrace())
-        throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_INTERNAL,
-            "gateway control call failed: $(sprint(showerror, e))"))
+        throw(
+            gRPCServer.gRPCServiceCallException(
+                gRPCServer.GRPC_INTERNAL,
+                "gateway control call failed: $(sprint(showerror, e))"
+            )
+        )
     end
 end
 
@@ -48,8 +52,12 @@ _mode_name(::LptPackingState) = "lpt_packing"
 # The mutators need the packing scheduler; the read is answered in every mode. Dispatched on the type
 # rather than a string compare on the config.
 _require_packing(s::GatewayScheduler) =
-    throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_FAILED_PRECONDITION,
-        "gateway scheduling mode is '$(_mode_name(s))'; the scheduler control RPCs require lpt_packing"))
+    throw(
+    gRPCServer.gRPCServiceCallException(
+        gRPCServer.GRPC_FAILED_PRECONDITION,
+        "gateway scheduling mode is '$(_mode_name(s))'; the scheduler control RPCs require lpt_packing"
+    )
+)
 _require_packing(s::LptPackingState) = s
 
 # --- the forced-repack handshake --------------------------------------------------------------
@@ -89,8 +97,11 @@ _replicas_to_wire(n::Integer) = n == REPLICAS_ALL ? Int64(-1) : Int64(n)
 function _replicas_from_wire(v::Integer, key::AbstractString)
     v == 0 && return 0                       # clear the override
     v == -1 && return REPLICAS_ALL
-    v < -1 && throw(ReactantServerCore.ConfigError(
-        "$key must be a positive count, -1 for all ready workers, or 0 to clear the override, got $v"))
+    v < -1 && throw(
+        ReactantServerCore.ConfigError(
+            "$key must be a positive count, -1 for all ready workers, or 0 to clear the override, got $v"
+        )
+    )
     return Int(v)
 end
 
@@ -107,11 +118,12 @@ _policy_to_wire(k::PackingKnobs) = _CTRL_GW.SchedulingPolicy(;
     compaction_mode = String(k.compaction_mode),
     compaction_interval = Int64(k.compaction_interval),
     forbid_memory_oversubscription = k.forbid_memory_oversubscription,
-    generation = UInt64(k.generation))
+    generation = UInt64(k.generation)
+)
 
 # `update_mask` entry -> the `PackingKnobs` field it writes and the value read off the wire message.
 # Startup-only settings are absent on purpose: naming one is an error, not a silent no-op.
-const _POLICY_WIRE_FIELDS = Dict{String,Symbol}(
+const _POLICY_WIRE_FIELDS = Dict{String, Symbol}(
     "rebalance_compute_seconds" => :rebalance_compute_seconds,
     "first_rebalance_compute_seconds" => :first_rebalance_compute_seconds,
     "hysteresis" => :hysteresis,
@@ -128,7 +140,7 @@ const _POLICY_WIRE_FIELDS = Dict{String,Symbol}(
 
 # Settings that exist but cannot change without a restart, named so the error can say why rather than
 # reporting them as unknown.
-const _STARTUP_ONLY_FIELDS = Dict{String,String}(
+const _STARTUP_ONLY_FIELDS = Dict{String, String}(
     "mode" => "the scheduler is a distinct type chosen at startup, and lpt_packing has hard startup preconditions",
     "scheduling_mode" => "the scheduler is a distinct type chosen at startup, and lpt_packing has hard startup preconditions",
     "max_worker_share" => "advisory only; no code reads it",
@@ -139,7 +151,7 @@ const _STARTUP_ONLY_FIELDS = Dict{String,String}(
 function _updates_from_mask(mask, policy)
     isempty(mask) && _invalid_arg("update_mask is empty; name at least one SchedulingPolicy field to apply")
     policy === nothing && _invalid_arg("policy is unset but update_mask names $(length(mask)) field(s) to apply")
-    updates = Dict{Symbol,Any}()
+    updates = Dict{Symbol, Any}()
     for name in mask
         n = String(name)
         haskey(_STARTUP_ONLY_FIELDS, n) &&
@@ -150,7 +162,7 @@ function _updates_from_mask(mask, policy)
         raw = getfield(policy, Symbol(n))
         # `default_replicas` needs the wire sentinel decoded before the shared validator sees it.
         updates[field] = field === :default_replicas ?
-                         _replicas_from_wire(raw, "default_replicas") : raw
+            _replicas_from_wire(raw, "default_replicas") : raw
     end
     return updates
 end
@@ -159,7 +171,7 @@ end
 # resolved once at startup. Honor the same spelling over the wire (the stored knob is the resolved
 # value and must stay positive), resolving against the rebalance budget this same request installs
 # when it sets both.
-function _resolve_halflife!(updates::Dict{Symbol,Any}, cur::PackingKnobs)
+function _resolve_halflife!(updates::Dict{Symbol, Any}, cur::PackingKnobs)
     haskey(updates, :ema_halflife_compute) || return updates
     updates[:ema_halflife_compute] == 0 || return updates
     updates[:ema_halflife_compute] =
@@ -185,27 +197,34 @@ function _model_rows(s::LptPackingState, k::PackingKnobs, rep::RepackReport)
             for (w, weight) in placement
                 a = get(out_snap, (m, w), nothing)
                 r = get(routed_snap, (m, w), nothing)
-                push!(reps, _CTRL_GW.ReplicaPlacement(; worker = w, weight = weight,
-                                                      outstanding = Int64(a === nothing ? 0 : a[]),
-                                                      routed_total = Int64(r === nothing ? 0 : r[])))
+                push!(
+                    reps, _CTRL_GW.ReplicaPlacement(;
+                        worker = w, weight = weight,
+                        outstanding = Int64(a === nothing ? 0 : a[]),
+                        routed_total = Int64(r === nothing ? 0 : r[])
+                    )
+                )
             end
         end
         mk = get(k.model_overrides, m, nothing)
         p = get(plan, m, nothing)
-        push!(rows, _CTRL_GW.ModelSchedulingStatus(;
-            name = m,
-            configured_replicas = _replicas_to_wire(mk === nothing ? 0 : mk.replicas),
-            effective_replicas = Int64(placement === nothing ? 0 : length(placement)),
-            replicas = reps,
-            utilization = get(rep.utilization, m, 0.0),
-            arrival_rate = get(rep.rate, m, 0.0),
-            cost_seconds = get(rep.cost, m, 0.0),
-            max_batch = Int64(get(max_batch, m, 0)),
-            fill_mode = String(p === nothing ? :unknown : p.mode),
-            fill_quantum = Int64(p === nothing ? 0 : p.quantum),
-            weight_nbytes = Int64(round(get(rep.mem, m, 0.0))),
-            placed = placement !== nothing,
-            drifted = m in rep.drifted))
+        push!(
+            rows, _CTRL_GW.ModelSchedulingStatus(;
+                name = m,
+                configured_replicas = _replicas_to_wire(mk === nothing ? 0 : mk.replicas),
+                effective_replicas = Int64(placement === nothing ? 0 : length(placement)),
+                replicas = reps,
+                utilization = get(rep.utilization, m, 0.0),
+                arrival_rate = get(rep.rate, m, 0.0),
+                cost_seconds = get(rep.cost, m, 0.0),
+                max_batch = Int64(get(max_batch, m, 0)),
+                fill_mode = String(p === nothing ? :unknown : p.mode),
+                fill_quantum = Int64(p === nothing ? 0 : p.quantum),
+                weight_nbytes = Int64(round(get(rep.mem, m, 0.0))),
+                placed = placement !== nothing,
+                drifted = m in rep.drifted
+            )
+        )
     end
     return rows
 end
@@ -217,8 +236,8 @@ function _worker_rows(s::LptPackingState, rep::RepackReport, tick::TickReport)
     # the startup placement and the first tick, the workers that answered the startup poll. Otherwise
     # a status call right after startup would report an entire healthy fleet as not ready.
     ready = Set(tick.unix_seconds > 0 ? tick.ready_workers : rep.polled)
-    assigned = Dict{String,Float64}()
-    placed = Dict{String,Int}()
+    assigned = Dict{String, Float64}()
+    placed = Dict{String, Int}()
     for (m, placement) in assignment, (w, _) in placement
         assigned[w] = get(assigned, w, 0.0) + get(rep.mem, m, 0.0)
         placed[w] = get(placed, w, 0) + 1
@@ -228,12 +247,15 @@ function _worker_rows(s::LptPackingState, rep::RepackReport, tick::TickReport)
         cap = get(rep.mem_cap, w, 0.0)
         bytes = get(assigned, w, 0.0)
         a = get(wload, w, nothing)
-        push!(rows, _CTRL_GW.WorkerSchedulingStatus(;
-            worker = w, ready = w in ready, models_placed = Int64(get(placed, w, 0)),
-            inflight_compute = a === nothing ? 0.0 : a[],
-            assigned_weight_bytes = Int64(round(bytes)),
-            weight_budget_bytes = Int64(round(cap)),
-            oversubscribed = cap > 0 && bytes > cap))
+        push!(
+            rows, _CTRL_GW.WorkerSchedulingStatus(;
+                worker = w, ready = w in ready, models_placed = Int64(get(placed, w, 0)),
+                inflight_compute = a === nothing ? 0.0 : a[],
+                assigned_weight_bytes = Int64(round(bytes)),
+                weight_budget_bytes = Int64(round(cap)),
+                oversubscribed = cap > 0 && bytes > cap
+            )
+        )
     end
     return rows
 end
@@ -255,7 +277,8 @@ _repack_status(s::LptPackingState) = begin
         last_tick_unix_seconds = tick.unix_seconds,
         repacks_since_compaction = Int64(s.repacks_since_compact),
         operator_repacks_requested = UInt64(@atomic s.repack_requested),
-        operator_repacks_completed = UInt64(@atomic s.repack_completed))
+        operator_repacks_completed = UInt64(@atomic s.repack_completed)
+    )
 end
 
 # GetSchedulingStatus answers in every mode: an operator's first call is usually a probe of what is
@@ -274,9 +297,11 @@ function _gw_scheduling_status(::_CTRL_GW.GetSchedulingStatusRequest, st::Gatewa
             mk.fill_mode === :inflight && push!(warnings, "model '$m': $(_INFLIGHT_PARKING_WARNING)")
         end
         rep.count == 0 && push!(warnings, "no repack has run yet; per-model demand figures are unset")
-        _CTRL_GW.GetSchedulingStatusResponse(; mode = "lpt_packing", policy = _policy_to_wire(k),
+        _CTRL_GW.GetSchedulingStatusResponse(;
+            mode = "lpt_packing", policy = _policy_to_wire(k),
             repack = _repack_status(sched), models = _model_rows(sched, k, rep),
-            workers = _worker_rows(sched, rep, tick), warnings = sort!(warnings))
+            workers = _worker_rows(sched, rep, tick), warnings = sort!(warnings)
+        )
     end
 end
 
@@ -287,7 +312,7 @@ function _policy_warnings(s::LptPackingState, before::PackingKnobs, after::Packi
     w = String[]
     tick = @atomic s.tick
     if after.rebalance_compute_seconds != before.rebalance_compute_seconds &&
-       tick.compute_accum >= after.rebalance_compute_seconds
+            tick.compute_accum >= after.rebalance_compute_seconds
         push!(w, "the fleet has already accumulated $(round(tick.compute_accum; digits = 1)) GPU-seconds, at or above the new $(after.rebalance_compute_seconds) second budget; a repack will fire on the next prober tick")
     end
     after.ema_halflife_compute != before.ema_halflife_compute &&
@@ -308,8 +333,10 @@ function _gw_set_scheduling_policy(req::_CTRL_GW.SetSchedulingPolicyRequest, st:
         after = set_knobs!(s; updates...)
         warnings = _policy_warnings(s, before, after)
         @info "gateway control: scheduling policy updated" fields = sort!(String[String(f) for f in keys(updates)]) generation = after.generation before = _knob_digest(before) after = _knob_digest(after)
-        _CTRL_GW.SetSchedulingPolicyResponse(; applied = _policy_to_wire(after),
-                                            warnings = warnings, persisted = false)
+        _CTRL_GW.SetSchedulingPolicyResponse(;
+            applied = _policy_to_wire(after),
+            warnings = warnings, persisted = false
+        )
     end
 end
 
@@ -327,7 +354,7 @@ function _placement_warnings(s::LptPackingState, model::AbstractString, k::Int)
     footprint = get(rep.mem, String(model), 0.0)
     (footprint <= 0 || isempty(rep.mem_cap)) && return String[]
     assignment = @atomic s.assignment
-    assigned = Dict{String,Float64}(w => 0.0 for w in keys(rep.mem_cap))
+    assigned = Dict{String, Float64}(w => 0.0 for w in keys(rep.mem_cap))
     for (m, placement) in assignment, (w, _) in placement
         m == String(model) && continue                 # its current homes are re-chosen by the repack
         haskey(assigned, w) && (assigned[w] += get(rep.mem, m, 0.0))
@@ -339,8 +366,10 @@ function _placement_warnings(s::LptPackingState, model::AbstractString, k::Int)
         cap = get(rep.mem_cap, w, 0.0)
         cap > 0 || continue
         total = assigned[w] + footprint
-        total > cap && push!(out,
-            "estimated: placing '$model' on $k worker(s) would raise $w to $(Base.format_bytes(round(Int, total))) of weights against a $(Base.format_bytes(round(Int, cap))) budget, so the packer will oversubscribe and that worker's LRU will churn (the exact workers depend on the next poll)")
+        total > cap && push!(
+            out,
+            "estimated: placing '$model' on $k worker(s) would raise $w to $(Base.format_bytes(round(Int, total))) of weights against a $(Base.format_bytes(round(Int, cap))) budget, so the packer will oversubscribe and that worker's LRU will churn (the exact workers depend on the next poll)"
+        )
     end
     return out
 end
@@ -351,18 +380,24 @@ function _gw_set_model_placement(req::_CTRL_GW.SetModelPlacementRequest, st::Gat
         name = String(req.name)
         isempty(name) && _invalid_arg("name is empty")
         if !req.allow_unknown_model && !has_model(st.routes, name)
-            throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_NOT_FOUND,
-                "no worker currently serves model '$name'; set allow_unknown_model to pre-seed an override for a model that is about to be loaded"))
+            throw(
+                gRPCServer.gRPCServiceCallException(
+                    gRPCServer.GRPC_NOT_FOUND,
+                    "no worker currently serves model '$name'; set allow_unknown_model to pre-seed an override for a model that is about to be loaded"
+                )
+            )
         end
         replicas = _replicas_from_wire(req.replicas, "replicas")
         cur = get(knobs(s).model_overrides, name, ModelKnobs())
         # Independent fields: "" / negative mean "leave unchanged", so one call can change the replica
         # count, the fill mode, the run length, or any combination.
         fill_mode = isempty(req.fill_mode) ? cur.fill_mode :
-                    _parse_fill_mode(req.fill_mode; allow_inherit = true)
+            _parse_fill_mode(req.fill_mode; allow_inherit = true)
         fill_factor = req.fill_factor < 0 ? cur.fill_factor :
-                      (req.fill_factor == 0 ? 0.0 :
-                       _ck_positive("fill_factor", req.fill_factor))
+            (
+                req.fill_factor == 0 ? 0.0 :
+                _ck_positive("fill_factor", req.fill_factor)
+            )
         next = ModelKnobs(replicas, fill_mode, fill_factor)
         overrides = copy(knobs(s).model_overrides)      # copy-on-write: never mutate the live dict
         if next == ModelKnobs()
@@ -389,11 +424,13 @@ function _gw_set_model_placement(req::_CTRL_GW.SetModelPlacementRequest, st::Gat
         push!(warnings, "takes effect at the next repack; call Repack to apply it now")
 
         @info "gateway control: model placement updated" model = name replicas = (replicas == 0 ? "cleared" : (replicas == REPLICAS_ALL ? "all" : replicas)) fill_mode = fill_mode fill_factor = fill_factor generation = after.generation
-        _CTRL_GW.SetModelPlacementResponse(; name = name,
+        _CTRL_GW.SetModelPlacementResponse(;
+            name = name,
             configured_replicas = _replicas_to_wire(replicas),
             effective_replicas = Int64(effective == REPLICAS_ALL ? max(nready, 1) : effective),
             fill_mode = String(p.mode), fill_quantum = Int64(p.quantum),
-            warnings = warnings, persisted = false)
+            warnings = warnings, persisted = false
+        )
     end
 end
 
@@ -410,24 +447,32 @@ function _gw_repack(req::_CTRL_GW.RepackRequest, st::GatewayState)
         # A repack runs on the prober, which only ticks over workers that reported ready. Waiting on a
         # fleet with none would burn the whole budget to no purpose, so say so instead.
         if budget > 0 && isempty((@atomic s.tick).ready_workers)
-            throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_UNAVAILABLE,
-                "no worker was ready at the last prober tick, so a repack cannot run; retry once a worker is ready (or pass wait_seconds=0 to queue it)"))
+            throw(
+                gRPCServer.gRPCServiceCallException(
+                    gRPCServer.GRPC_UNAVAILABLE,
+                    "no worker was ready at the last prober tick, so a repack cannot run; retry once a worker is ready (or pass wait_seconds=0 to queue it)"
+                )
+            )
         end
         seq = request_repack!(s)
         completed, waited = await_repack(s, seq, budget)
         completed || push!(warnings, "repack queued but not observed within $(round(waited; digits = 2))s; it will run on the next prober round")
         @info "gateway control: repack requested" sequence = seq completed = completed waited_seconds = round(waited; digits = 2)
-        _CTRL_GW.RepackResponse(; sequence = UInt64(seq),
+        _CTRL_GW.RepackResponse(;
+            sequence = UInt64(seq),
             completed_sequence = UInt64(@atomic s.repack_completed),
             completed = completed, waited_seconds = waited,
-            repack = _repack_status(s), warnings = warnings)
+            repack = _repack_status(s), warnings = warnings
+        )
     end
 end
 
 # Register the four handlers on the gateway's router (see build_gateway_router).
 register_gateway_control_service!(router, state::GatewayState) =
-    register_GatewayControlService!(router;
-        GetSchedulingStatus = (req, ctx) -> _gw_scheduling_status(req, ctx.payload),
-        SetSchedulingPolicy = (req, ctx) -> _gw_set_scheduling_policy(req, ctx.payload),
-        SetModelPlacement = (req, ctx) -> _gw_set_model_placement(req, ctx.payload),
-        Repack = (req, ctx) -> _gw_repack(req, ctx.payload))
+    register_GatewayControlService!(
+    router;
+    GetSchedulingStatus = (req, ctx) -> _gw_scheduling_status(req, ctx.payload),
+    SetSchedulingPolicy = (req, ctx) -> _gw_set_scheduling_policy(req, ctx.payload),
+    SetModelPlacement = (req, ctx) -> _gw_set_model_placement(req, ctx.payload),
+    Repack = (req, ctx) -> _gw_repack(req, ctx.payload)
+)

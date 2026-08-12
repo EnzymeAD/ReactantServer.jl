@@ -1,16 +1,18 @@
 # run_model and the scheduler against the Reactant-free MockBackend.
 
 function _trivial_manifest(name)
-    ReactantServer.Manifest("2.0", name, "",
+    return ReactantServer.Manifest(
+        "2.0", name, "",
         ReactantServer.TensorSpec[], ReactantServer.TensorSpec[], nothing, nothing,
-        ReactantServer.BatchingSpec(Int[]), ReactantServer.Provenance(Dict{String,Any}()), nothing)
+        ReactantServer.BatchingSpec(Int[]), ReactantServer.Provenance(Dict{String, Any}()), nothing
+    )
 end
 
 function _scale_model()
     sig = ReactantServer.ModelSignature(["x"], DataType[Float32], ["w"], 1, ["y"], DataType[Float32], 0)
     weights = Any[ReactantServer.MockBuffer(Float32[2, 2, 2, 2])]
     exec = ReactantServer.MockExecutable(args -> [args[1] .* args[2]], 1)   # x .* w
-    return ReactantServer.LoadedModel(sig, Dict{Int,Any}(0 => exec), weights)
+    return ReactantServer.LoadedModel(sig, Dict{Int, Any}(0 => exec), weights)
 end
 
 @testset "mock run_model" begin
@@ -23,8 +25,10 @@ end
     @test out[1].data == Float32[2, 4, 6, 8]
 
     # missing input is an error
-    @test_throws ErrorException ReactantServer.run_model(backend, pool, model,
-        [ReactantServer.NamedTensor("wrong", Float32[1, 2, 3, 4])])
+    @test_throws ErrorException ReactantServer.run_model(
+        backend, pool, model,
+        [ReactantServer.NamedTensor("wrong", Float32[1, 2, 3, 4])]
+    )
 end
 
 @testset "scheduler: pre/post hooks compose, and preprocess gates device execution" begin
@@ -37,15 +41,17 @@ end
     sig = ReactantServer.ModelSignature(["x"], DataType[Float32], ["w"], 1, ["y"], DataType[Float32], 0)
     weights = Any[ReactantServer.MockBuffer(Float32[2, 2, 2, 2])]
     exec = ReactantServer.MockExecutable(args -> (Threads.atomic_add!(ran, 1); [args[1] .* args[2]]), 1)
-    model = ReactantServer.LoadedModel(sig, Dict{Int,Any}(0 => exec), weights)
+    model = ReactantServer.LoadedModel(sig, Dict{Int, Any}(0 => exec), weights)
 
     # preprocess waits on a gate so the test can prove the request is not executed until preprocess
     # returns; it adds 1 to each input. postprocess scales the output by 10.
     gate = Base.Event()
     pre(inputs) = (wait(gate); [ReactantServer.NamedTensor("x", inputs[1].data .+ 1)])
     post(outputs) = [ReactantServer.NamedTensor("y", outputs[1].data .* 10)]
-    reg.by_name["h"] = ReactantServer.ModelEntry("h", _trivial_manifest("h"), Dict{Int,Vector{UInt8}}(),
-        "", nothing, model, nothing, pre, post)
+    reg.by_name["h"] = ReactantServer.ModelEntry(
+        "h", _trivial_manifest("h"), Dict{Int, Vector{UInt8}}(),
+        "", nothing, model, nothing, pre, post
+    )
 
     sched = ReactantServer.Scheduler(reg, backend, pool, ReactantServer.SchedulerConfig(30.0, 64, 30.0))
     ReactantServer.start!(sched)
@@ -71,8 +77,10 @@ end
     reg = ReactantServer.ModelRegistry()
     S = 0.1
     slow_pre(inputs) = (sleep(S); inputs)   # stands in for real per-request CPU work
-    reg.by_name["scale"] = ReactantServer.ModelEntry("scale", _trivial_manifest("scale"),
-        Dict{Int,Vector{UInt8}}(), "", nothing, _scale_model(), nothing, slow_pre, identity)
+    reg.by_name["scale"] = ReactantServer.ModelEntry(
+        "scale", _trivial_manifest("scale"),
+        Dict{Int, Vector{UInt8}}(), "", nothing, _scale_model(), nothing, slow_pre, identity
+    )
     sched = ReactantServer.Scheduler(reg, backend, pool, ReactantServer.SchedulerConfig(30.0, 64, 30.0))
     ReactantServer.start!(sched)
 
@@ -93,8 +101,10 @@ end
     backend = ReactantServer.MockBackend()
     pool = ReactantServer.MemoryPool(backend, ReactantServer.MockClient(), ReactantServer.MockDevice(0), "mock", nothing)
     reg = ReactantServer.ModelRegistry()
-    entry = ReactantServer.ModelEntry("scale", _trivial_manifest("scale"), Dict{Int,Vector{UInt8}}(), "", nothing,
-                                 _scale_model(), nothing, identity, identity)
+    entry = ReactantServer.ModelEntry(
+        "scale", _trivial_manifest("scale"), Dict{Int, Vector{UInt8}}(), "", nothing,
+        _scale_model(), nothing, identity, identity
+    )
     reg.by_name["scale"] = entry
 
     sched = ReactantServer.Scheduler(reg, backend, pool, ReactantServer.SchedulerConfig(30.0, 64, 30.0))
@@ -132,24 +142,32 @@ function _batched_scale_model(sizes::Vector{Int})
     sig = ReactantServer.ModelSignature(["x"], DataType[Float32], ["w"], 1, ["y"], DataType[Float32], 1)
     weights = Any[ReactantServer.MockBuffer(Float32[10, 100])]
     exec = ReactantServer.MockExecutable(args -> [args[1] .* args[2]], 1)
-    return ReactantServer.LoadedModel(sig, Dict{Int,Any}(sz => exec for sz in sizes), weights)
+    return ReactantServer.LoadedModel(sig, Dict{Int, Any}(sz => exec for sz in sizes), weights)
 end
 
 function _batched_manifest(name)
-    inx = ReactantServer.TensorSpec("x", ReactantServer.F32,
-        ReactantServer.Dim[ReactantServer.Dim(ReactantServer.FIXED, 2), ReactantServer.Dim(ReactantServer.BATCH)], 2)
-    outy = ReactantServer.TensorSpec("y", ReactantServer.F32,
-        ReactantServer.Dim[ReactantServer.Dim(ReactantServer.FIXED, 2), ReactantServer.Dim(ReactantServer.BATCH)], 2)
-    return ReactantServer.Manifest("2.0", name, "", ReactantServer.TensorSpec[inx], ReactantServer.TensorSpec[outy],
-        nothing, nothing, ReactantServer.BatchingSpec(Int[]), ReactantServer.Provenance(Dict{String,Any}()), 1)
+    inx = ReactantServer.TensorSpec(
+        "x", ReactantServer.F32,
+        ReactantServer.Dim[ReactantServer.Dim(ReactantServer.FIXED, 2), ReactantServer.Dim(ReactantServer.BATCH)], 2
+    )
+    outy = ReactantServer.TensorSpec(
+        "y", ReactantServer.F32,
+        ReactantServer.Dim[ReactantServer.Dim(ReactantServer.FIXED, 2), ReactantServer.Dim(ReactantServer.BATCH)], 2
+    )
+    return ReactantServer.Manifest(
+        "2.0", name, "", ReactantServer.TensorSpec[inx], ReactantServer.TensorSpec[outy],
+        nothing, nothing, ReactantServer.BatchingSpec(Int[]), ReactantServer.Provenance(Dict{String, Any}()), 1
+    )
 end
 
 function _batched_scheduler(name, sizes)
     backend = ReactantServer.MockBackend()
     pool = ReactantServer.MemoryPool(backend, ReactantServer.MockClient(), ReactantServer.MockDevice(0), "mock", nothing)
     reg = ReactantServer.ModelRegistry()
-    reg.by_name[name] = ReactantServer.ModelEntry(name, _batched_manifest(name), Dict{Int,Vector{UInt8}}(),
-        "", nothing, _batched_scale_model(sizes), nothing, identity, identity)
+    reg.by_name[name] = ReactantServer.ModelEntry(
+        name, _batched_manifest(name), Dict{Int, Vector{UInt8}}(),
+        "", nothing, _batched_scale_model(sizes), nothing, identity, identity
+    )
     sched = ReactantServer.Scheduler(reg, backend, pool, ReactantServer.SchedulerConfig(30.0, 1024, 30.0))
     reg.by_name[name].sched = ReactantServer.ModelSchedState(name, ReactantServer.ModelSchedConfig(1.0), 0.0)
     return sched
@@ -176,9 +194,11 @@ end
     @test st.rows_served == 0                  # nothing dispatched yet
 
     # Four single-row requests coalesced into one dispatch: one dispatch, four requests, four ROWS.
-    qrs = [let req = ReactantServer.InferRequest("bscale", ["y"], [ReactantServer.NamedTensor("x", reshape(Float32[k, k], 2, 1))])
-               ReactantServer.QueuedRequest(req, req.inputs, 0.0, Channel{Any}(1))
-           end for k in 1:4]
+    qrs = [
+        let req = ReactantServer.InferRequest("bscale", ["y"], [ReactantServer.NamedTensor("x", reshape(Float32[k, k], 2, 1))])
+                ReactantServer.QueuedRequest(req, req.inputs, 0.0, Channel{Any}(1))
+        end for k in 1:4
+    ]
     append!(sched.registry.by_name["bscale"].sched.queue, qrs)
     ReactantServer.execute_and_record!(sched, ReactantServer.select_dispatch!(sched, 0.0))
     st = ReactantServer.control_status(sched).models["bscale"]
@@ -202,9 +222,11 @@ end
 # deterministic rather than dependent on arrival timing.
 @testset "mock scheduler coalesces queued requests into one dispatch" begin
     sched = _batched_scheduler("bscale", [1, 4])
-    qrs = [let req = ReactantServer.InferRequest("bscale", ["y"], [ReactantServer.NamedTensor("x", reshape(Float32[k, k], 2, 1))])
-               ReactantServer.QueuedRequest(req, req.inputs, 0.0, Channel{Any}(1))
-           end for k in 1:4]
+    qrs = [
+        let req = ReactantServer.InferRequest("bscale", ["y"], [ReactantServer.NamedTensor("x", reshape(Float32[k, k], 2, 1))])
+                ReactantServer.QueuedRequest(req, req.inputs, 0.0, Channel{Any}(1))
+        end for k in 1:4
+    ]
     for qr in qrs
         push!(sched.registry.by_name["bscale"].sched.queue, qr)
     end
@@ -240,8 +262,10 @@ end
 end
 
 @testset "_validate_inputs rejects malformed requests before dispatch" begin
-    entry = ReactantServer.ModelEntry("v", _batched_manifest("v"), Dict{Int,Vector{UInt8}}(),
-        "", nothing, _batched_scale_model([1, 4]), nothing, identity, identity)
+    entry = ReactantServer.ModelEntry(
+        "v", _batched_manifest("v"), Dict{Int, Vector{UInt8}}(),
+        "", nothing, _batched_scale_model([1, 4]), nothing, identity, identity
+    )
     _req(tensors) = ReactantServer.InferRequest("v", ["y"], tensors)
     _ok(rows) = ReactantServer.NamedTensor("x", zeros(Float32, 2, rows))
     GE = ReactantServer.gRPCServer.gRPCServiceCallException
@@ -251,17 +275,25 @@ end
     @test ReactantServer._validate_inputs(entry, _req([_ok(7)])) === nothing
 
     # Undeclared input name.
-    @test_throws GE ReactantServer._validate_inputs(entry,
-        _req([ReactantServer.NamedTensor("bogus", zeros(Float32, 2, 1))]))
+    @test_throws GE ReactantServer._validate_inputs(
+        entry,
+        _req([ReactantServer.NamedTensor("bogus", zeros(Float32, 2, 1))])
+    )
     # Wrong dtype.
-    @test_throws GE ReactantServer._validate_inputs(entry,
-        _req([ReactantServer.NamedTensor("x", zeros(Float64, 2, 1))]))
+    @test_throws GE ReactantServer._validate_inputs(
+        entry,
+        _req([ReactantServer.NamedTensor("x", zeros(Float64, 2, 1))])
+    )
     # Wrong rank.
-    @test_throws GE ReactantServer._validate_inputs(entry,
-        _req([ReactantServer.NamedTensor("x", zeros(Float32, 2))]))
+    @test_throws GE ReactantServer._validate_inputs(
+        entry,
+        _req([ReactantServer.NamedTensor("x", zeros(Float32, 2))])
+    )
     # Wrong fixed-axis extent.
-    @test_throws GE ReactantServer._validate_inputs(entry,
-        _req([ReactantServer.NamedTensor("x", zeros(Float32, 3, 1))]))
+    @test_throws GE ReactantServer._validate_inputs(
+        entry,
+        _req([ReactantServer.NamedTensor("x", zeros(Float32, 3, 1))])
+    )
     # Missing required input.
     @test_throws GE ReactantServer._validate_inputs(entry, _req(ReactantServer.NamedTensor[]))
 end

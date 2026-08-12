@@ -46,21 +46,21 @@ using Base.Threads
 # ---- config ----------------------------------------------------------------------------------
 
 env(k, d) = get(ENV, k, d)
-const GATEWAY     = env("LOADGEN_GATEWAY", "grpc://gateway:8001")
+const GATEWAY = env("LOADGEN_GATEWAY", "grpc://gateway:8001")
 const METRICS_URL = env("LOADGEN_METRICS", "http://gateway:8002/metrics")
-const MODEL_REPO  = env("LOADGEN_MODEL_REPO", "/var/lib/reactantserver/models")
+const MODEL_REPO = env("LOADGEN_MODEL_REPO", "/var/lib/reactantserver/models")
 const CONCURRENCY = parse(Int, env("LOADGEN_CONCURRENCY", "32"))
-const DURATION    = parse(Float64, env("LOADGEN_DURATION_SECONDS", "3600"))
-const TRANSPORT   = Symbol(env("LOADGEN_TRANSPORT", "tcp"))   # :tcp | :shm | :mixed
+const DURATION = parse(Float64, env("LOADGEN_DURATION_SECONDS", "3600"))
+const TRANSPORT = Symbol(env("LOADGEN_TRANSPORT", "tcp"))   # :tcp | :shm | :mixed
 const SHM_OUTPUTS = lowercase(env("LOADGEN_SHM_OUTPUTS", "true")) in ("1", "true", "yes", "on")
-const REPORT_SEC  = parse(Float64, env("LOADGEN_REPORT_SECONDS", "30"))
+const REPORT_SEC = parse(Float64, env("LOADGEN_REPORT_SECONDS", "30"))
 # Serial warmup before the concurrent soak: one request per model with a long deadline. The first
 # request to a model triggers Reactant compilation (often >10s); firing 32 concurrent cold requests
 # instead stampedes the gRPCClient libcurl multi-handle into a wedge, so the soak never makes
 # progress until manually restarted against warm models. A serial pass (no stampede) + a long
 # deadline (tolerates compilation) compiles every model — and warming a meta fans out to compile its
 # sub-models — so the soak then hits only warm models. Set LOADGEN_WARMUP=false to skip.
-const WARMUP          = lowercase(env("LOADGEN_WARMUP", "true")) != "false"
+const WARMUP = lowercase(env("LOADGEN_WARMUP", "true")) != "false"
 const WARMUP_DEADLINE = parse(Float64, env("LOADGEN_WARMUP_DEADLINE", "300"))
 
 # Coverage: every discovered model must complete at least this many soak requests, or the run
@@ -68,7 +68,7 @@ const WARMUP_DEADLINE = parse(Float64, env("LOADGEN_WARMUP_DEADLINE", "300"))
 # of duration: every SWEEP_EVERY-th request (globally) comes from a round-robin cursor instead of
 # the uniform-random draw. 0 disables the sweep (bitwise-identical pick behavior to the old tool).
 const MIN_OK_PER_MODEL = parse(Int, env("LOADGEN_MIN_OK_PER_MODEL", "1"))
-const SWEEP_EVERY      = parse(Int, env("LOADGEN_SWEEP_EVERY", "4"))
+const SWEEP_EVERY = parse(Int, env("LOADGEN_SWEEP_EVERY", "4"))
 
 # Batch mode. :rows sends multi-row requests sized from each manifest's compiled batch ladder
 # (client-side prebatching, exercising the multi-row execution path). :burst aims BURST_K
@@ -78,26 +78,26 @@ const SWEEP_EVERY      = parse(Int, env("LOADGEN_SWEEP_EVERY", "4"))
 const BATCH_MODE = Symbol(env("LOADGEN_BATCH_MODE", "off"))
 BATCH_MODE in (:off, :rows, :burst, :both) ||
     error("LOADGEN_BATCH_MODE must be off|rows|burst|both, got $(BATCH_MODE)")
-const BATCH_ROWS  = BATCH_MODE in (:rows, :both)
+const BATCH_ROWS = BATCH_MODE in (:rows, :both)
 const BATCH_BURST = BATCH_MODE in (:burst, :both)
-const BURST_K     = parse(Int, env("LOADGEN_BURST_K", "8"))
+const BURST_K = parse(Int, env("LOADGEN_BURST_K", "8"))
 
 # Deadline pressure: when set (>0), soak requests carry this per-request deadline (sent as the
 # reactant_timeout_ns request parameter, so it survives the gateway hop and drives the worker's
 # EDF admission drop). DEADLINE_EXCEEDED responses are then expected: counted separately and
 # excluded from the failure exit code. Warmup always uses WARMUP_DEADLINE.
-const DEADLINE_SEC  = parse(Float64, env("LOADGEN_DEADLINE_SECONDS", "0"))
+const DEADLINE_SEC = parse(Float64, env("LOADGEN_DEADLINE_SECONDS", "0"))
 const DEADLINE_MODE = DEADLINE_SEC > 0
 
 # Shed-ceiling ramp: effective concurrency starts at RAMP_START and multiplies by RAMP_FACTOR
 # every RAMP_STEP seconds until sheds appear (gateway/worker shed counters or client-observed
 # RESOURCE_EXHAUSTED), then records the shed point. The gRPC handle, shm
 # pool, and task count are sized once at RAMP_MAX; a per-task gate enforces the current limit.
-const RAMP_STEP         = parse(Float64, env("LOADGEN_RAMP_STEP_SECONDS", "0"))
-const RAMP_MODE         = RAMP_STEP > 0
-const RAMP_START        = parse(Int, env("LOADGEN_RAMP_START", "4"))
-const RAMP_FACTOR       = parse(Int, env("LOADGEN_RAMP_FACTOR", "2"))
-const RAMP_MAX          = parse(Int, env("LOADGEN_RAMP_MAX", "512"))
+const RAMP_STEP = parse(Float64, env("LOADGEN_RAMP_STEP_SECONDS", "0"))
+const RAMP_MODE = RAMP_STEP > 0
+const RAMP_START = parse(Int, env("LOADGEN_RAMP_START", "4"))
+const RAMP_FACTOR = parse(Int, env("LOADGEN_RAMP_FACTOR", "2"))
+const RAMP_MAX = parse(Int, env("LOADGEN_RAMP_MAX", "512"))
 
 # Stall watchdog: a wedged gRPC channel (a request whose completion is never notified, e.g. the
 # multi-handle poisoned during a connection-reset storm) blocks every firing task forever while
@@ -141,8 +141,10 @@ struct ModelStats
     lat_ns::Atomic{Int}     # cumulative success latency, for the per-model mean
     warm_ok::Atomic{Bool}   # set by the serial warmup pass
 end
-ModelStats() = ModelStats(Atomic{Int}(0), Atomic{Int}(0), Atomic{Int}(0), Atomic{Int}(0),
-                          Atomic{Int}(0), Atomic{Int}(0), Atomic{Bool}(false))
+ModelStats() = ModelStats(
+    Atomic{Int}(0), Atomic{Int}(0), Atomic{Int}(0), Atomic{Int}(0),
+    Atomic{Int}(0), Atomic{Int}(0), Atomic{Bool}(false)
+)
 
 # One model's everything needed to fire a request: its gateway handle, ALL of its input specs, the
 # prebuilt inline InferInputs for the TCP path (immutable, reused across requests, one entry per
@@ -154,7 +156,7 @@ struct ModelSpec
     inputs::Vector{InputSpec}
     out_specs::Vector{OutputSpec}   # shm read-back declarations; empty = outputs stay inline
     batch_sizes::Vector{Int}        # sorted compiled ladder; [1] when ineligible or mode off
-    tcp_inputs_by_n::Dict{Int,Vector{Any}}   # inline inputs per row count (n=1 always present)
+    tcp_inputs_by_n::Dict{Int, Vector{Any}}   # inline inputs per row count (n=1 always present)
     stats::ModelStats
 end
 
@@ -208,7 +210,7 @@ end
 
 # Every model the discovery pass dropped, with the reason — reported prominently at startup and in
 # the final summary so a silent coverage hole is impossible.
-const SKIPPED = Vector{Tuple{String,String}}()
+const SKIPPED = Vector{Tuple{String, String}}()
 _skip!(name, reason) = (push!(SKIPPED, (name, reason)); @warn "skip: $reason" model = name)
 
 function discover_models(grpc)
@@ -250,8 +252,12 @@ function discover_models(grpc)
                 tm = io.inputs[tname]
                 haskey(DTYPE, tm.datatype) || (unmapped = tm.datatype; break)
                 # batch axis shows up as -1 in the metadata shape; absent => unbatched input
-                push!(inputs, InputSpec(tname, DTYPE[tm.datatype],
-                                        per_item_dims(tm.shape), any(==(-1), tm.shape)))
+                push!(
+                    inputs, InputSpec(
+                        tname, DTYPE[tm.datatype],
+                        per_item_dims(tm.shape), any(==(-1), tm.shape)
+                    )
+                )
             end
             isempty(unmapped) || (_skip!(name, "unmapped dtype $unmapped"); continue)
             # Multi-row eligibility: a compiled batch size > 1 AND every input has a batch axis.
@@ -262,14 +268,19 @@ function discover_models(grpc)
             # Retries off: this is a measurement tool. The client's default retry-on-shed policy
             # (#57) would silently absorb sheds and EDF drops, hiding exactly what ramp and
             # deadline modes exist to observe.
-            model = KServeModel(GATEWAY, name; max_batch_size = maximum(batch_sizes),
-                                deadline = DEADLINE_MODE ? DEADLINE_SEC : 10.0, grpc = grpc,
-                                retry = ReactantServerClient.RetryPolicy(enabled = false))
-            by_n = Dict{Int,Vector{Any}}(
+            model = KServeModel(
+                GATEWAY, name; max_batch_size = maximum(batch_sizes),
+                deadline = DEADLINE_MODE ? DEADLINE_SEC : 10.0, grpc = grpc,
+                retry = ReactantServerClient.RetryPolicy(enabled = false)
+            )
+            by_n = Dict{Int, Vector{Any}}(
                 n => Any[InferInput(inp.name, zeros(inp.dtype, _wire_dims(inp, n)...)) for inp in inputs]
-                for n in union(1, batch_sizes))
-            spec = ModelSpec(name, model, inputs, output_shm_specs(io),
-                             batch_sizes, by_n, ModelStats())
+                    for n in union(1, batch_sizes)
+            )
+            spec = ModelSpec(
+                name, model, inputs, output_shm_specs(io),
+                batch_sizes, by_n, ModelStats()
+            )
         catch ex
             _skip!(name, "manifest_io_spec failed: $(sprint(showerror, ex))")
             continue
@@ -280,7 +291,7 @@ function discover_models(grpc)
 end
 
 function print_skipped()
-    if isempty(SKIPPED)
+    return if isempty(SKIPPED)
         println("== no models skipped ==")
     else
         println("== skipped models ($(length(SKIPPED))) ==")
@@ -294,15 +305,20 @@ end
 # Shared by the end-of-run summary and the stall watchdog's abort report.
 function print_model_table(specs)
     println("\n== per-model results ==")
-    println(rpad("model", 52), lpad("warm", 5), lpad("ok", 9), lpad("err", 6),
-            lpad("dead", 7), lpad("shed", 7), lpad("rows", 10), lpad("mean_ms", 9))
+    println(
+        rpad("model", 52), lpad("warm", 5), lpad("ok", 9), lpad("err", 6),
+        lpad("dead", 7), lpad("shed", 7), lpad("rows", 10), lpad("mean_ms", 9)
+    )
     for spec in specs
         s = spec.stats
-        mean_ms = s.ok[] > 0 ? round(s.lat_ns[] / s.ok[] / 1e6, digits = 1) : 0.0
-        println(rpad(spec.name, 52), lpad(s.warm_ok[] ? "y" : "n", 5), lpad(string(s.ok[]), 9),
-                lpad(string(s.err[]), 6), lpad(string(s.deadline[]), 7), lpad(string(s.shed[]), 7),
-                lpad(string(s.rows[]), 10), lpad(string(mean_ms), 9))
+        mean_ms = s.ok[] > 0 ? round(s.lat_ns[] / s.ok[] / 1.0e6, digits = 1) : 0.0
+        println(
+            rpad(spec.name, 52), lpad(s.warm_ok[] ? "y" : "n", 5), lpad(string(s.ok[]), 9),
+            lpad(string(s.err[]), 6), lpad(string(s.deadline[]), 7), lpad(string(s.shed[]), 7),
+            lpad(string(s.rows[]), 10), lpad(string(mean_ms), 9)
+        )
     end
+    return
 end
 
 # Minimal IO for the shared-memory path: `n` zero-filled items of every one of a model's inputs.
@@ -335,12 +351,12 @@ ReactantServerClient.output_specs(io::DummyIO) = io.spec.out_specs
 
 # ---- counters ---------------------------------------------------------------------------------
 
-const N_OK       = Atomic{Int}(0)
-const N_ERR      = Atomic{Int}(0)    # unexpected failures only (never deadline/shed)
+const N_OK = Atomic{Int}(0)
+const N_ERR = Atomic{Int}(0)    # unexpected failures only (never deadline/shed)
 const N_DEADLINE = Atomic{Int}(0)    # DEADLINE_EXCEEDED responses (expected under deadline mode)
-const N_SHED     = Atomic{Int}(0)    # RESOURCE_EXHAUSTED (expected in ramp)
-const N_CONN     = Atomic{Int}(0)    # subset of N_ERR: connection-teardown INTERNAL errors
-const INFLIGHT   = Atomic{Int}(0)    # requests currently inside fire() (stall-watchdog signal)
+const N_SHED = Atomic{Int}(0)    # RESOURCE_EXHAUSTED (expected in ramp)
+const N_CONN = Atomic{Int}(0)    # subset of N_ERR: connection-teardown INTERNAL errors
+const INFLIGHT = Atomic{Int}(0)    # requests currently inside fire() (stall-watchdog signal)
 const LAT_NS = Atomic{Int}(0)        # cumulative successful-request latency, ns (overall summary)
 const LAT_SAMPLES = Int[]            # per-window latency samples, ns; drained each report
 const LAT_LOCK = ReentrantLock()     # guards LAT_SAMPLES
@@ -410,7 +426,7 @@ function record_result(spec::ModelSpec, ex)
         atomic_add!(spec.stats.err, 1)
     end
     key = (cls === :deadline || cls === :shed) ? cls : :error
-    @lock ERR_LOCK begin
+    return @lock ERR_LOCK begin
         buf = SAMPLES[key]
         length(buf) < (key === :error ? 20 : 5) && push!(buf, sprint(showerror, ex))
     end
@@ -472,9 +488,11 @@ function warmup(specs::Vector{ModelSpec})
     println("warmup: priming $(length(specs)) models / $nreq requests serially (deadline $(WARMUP_DEADLINE)s) ...")
     t0 = time(); nok = 0
     for spec in specs
-        m = KServeModel(GATEWAY, spec.name; max_batch_size = maximum(spec.batch_sizes),
-                        deadline = WARMUP_DEADLINE, grpc = spec.model.grpc,
-                        retry = ReactantServerClient.RetryPolicy(enabled = false))
+        m = KServeModel(
+            GATEWAY, spec.name; max_batch_size = maximum(spec.batch_sizes),
+            deadline = WARMUP_DEADLINE, grpc = spec.model.grpc,
+            retry = ReactantServerClient.RetryPolicy(enabled = false)
+        )
         allok = true
         for n in spec.batch_sizes
             try
@@ -489,7 +507,7 @@ function warmup(specs::Vector{ModelSpec})
             nok += 1
         end
     end
-    println("warmup: $nok/$(length(specs)) models primed in $(round(time() - t0, digits = 1))s")
+    return println("warmup: $nok/$(length(specs)) models primed in $(round(time() - t0, digits = 1))s")
 end
 
 # ---- metrics scrape (via curl; no extra Julia deps) -------------------------------------------
@@ -515,10 +533,12 @@ end
 function scrape_counters()
     try
         txt = read(`curl -fsS --max-time 3 $METRICS_URL`, String)
-        return (loads = round(Int, _sum_counter(txt, "worker_weight_loads_total")),
-                evicts = round(Int, _sum_counter(txt, "worker_weight_evicts_total")),
-                gw_shed = round(Int, _sum_counter(txt, "gateway_requests_shed_total")),
-                worker_shed = round(Int, _sum_counter(txt, "worker_requests_shed_total")))
+        return (
+            loads = round(Int, _sum_counter(txt, "worker_weight_loads_total")),
+            evicts = round(Int, _sum_counter(txt, "worker_weight_evicts_total")),
+            gw_shed = round(Int, _sum_counter(txt, "gateway_requests_shed_total")),
+            worker_shed = round(Int, _sum_counter(txt, "worker_requests_shed_total")),
+        )
     catch ex
         return nothing
     end
@@ -527,9 +547,11 @@ end
 # ---- run --------------------------------------------------------------------------------------
 
 function main()
-    println("== loadgen: gateway=$GATEWAY transport=$TRANSPORT concurrency=$CONCURRENCY duration=$(DURATION)s ",
-            "batch_mode=$BATCH_MODE deadline=$(DEADLINE_MODE ? "$(DEADLINE_SEC)s" : "off") ",
-            "ramp=$(RAMP_MODE ? "$(RAMP_START)..$(RAMP_MAX) x$(RAMP_FACTOR)/$(RAMP_STEP)s" : "off") ==")
+    println(
+        "== loadgen: gateway=$GATEWAY transport=$TRANSPORT concurrency=$CONCURRENCY duration=$(DURATION)s ",
+        "batch_mode=$BATCH_MODE deadline=$(DEADLINE_MODE ? "$(DEADLINE_SEC)s" : "off") ",
+        "ramp=$(RAMP_MODE ? "$(RAMP_START)..$(RAMP_MAX) x$(RAMP_FACTOR)/$(RAMP_STEP)s" : "off") =="
+    )
     # Ramp mode sizes everything at the ceiling once (the handle cannot be resized mid-run); a
     # per-task gate enforces the current limit.
     effective_max = RAMP_MODE ? RAMP_MAX : CONCURRENCY
@@ -547,9 +569,11 @@ function main()
     # requested concurrency is.
     grpc = gRPCClient.gRPCCURL(; sticky = false, max_streams = effective_max)
     # Echo the single knob and everything it derived, so a glance at the logs confirms it propagated.
-    println("== loadgen config: effective_max=$effective_max -> firing_tasks=$effective_max, ",
-            "shm_pool_slots=$(max(effective_max, ReactantServerClient.DEFAULT_POOL_SLOTS)), ",
-            "grpc_max_streams=$effective_max, julia_threads=$(Threads.nthreads()) ==")
+    println(
+        "== loadgen config: effective_max=$effective_max -> firing_tasks=$effective_max, ",
+        "shm_pool_slots=$(max(effective_max, ReactantServerClient.DEFAULT_POOL_SLOTS)), ",
+        "grpc_max_streams=$effective_max, julia_threads=$(Threads.nthreads()) =="
+    )
     specs = discover_models(grpc)
     print_skipped()
     isempty(specs) && (println("ERROR: no usable models discovered under $MODEL_REPO"); exit(2))
@@ -600,7 +624,7 @@ function main()
     # classification or the gateway/worker shed counters rising above the post-warmup baseline),
     # then records the shed point and stops the run. Runs on the interactive pool for the same
     # reason as the reporter below.
-    shed_point = Ref{Union{Nothing,NamedTuple}}(nothing)
+    shed_point = Ref{Union{Nothing, NamedTuple}}(nothing)
     ramp = nothing
     if RAMP_MODE
         base = scrape_counters()
@@ -613,15 +637,17 @@ function main()
                 sleep(min(RAMP_STEP, max(deadline - time(), 0.01)))
                 time() < deadline || break
                 now_r = time()
-                rps_r = (N_OK[] - last_ok_r) / max(now_r - last_t_r, 1e-6)
+                rps_r = (N_OK[] - last_ok_r) / max(now_r - last_t_r, 1.0e-6)
                 last_ok_r = N_OK[]; last_t_r = now_r
                 c = scrape_counters()
                 gw = c === nothing ? base_gw : c.gw_shed
                 wk = c === nothing ? base_wk : c.worker_shed
                 if (N_SHED[] > 0 || gw > base_gw || wk > base_wk) && shed_point[] === nothing
                     shed_point[] = (concurrency = cur_limit[], rps = rps_r)
-                    println(">>> ramp: first sheds at concurrency=$(cur_limit[]) rps=$(round(rps_r, digits = 1)) ",
-                            "(client_shed=$(N_SHED[]) gw_shed=+$(gw - base_gw) wk_shed=+$(wk - base_wk))")
+                    println(
+                        ">>> ramp: first sheds at concurrency=$(cur_limit[]) rps=$(round(rps_r, digits = 1)) ",
+                        "(client_shed=$(N_SHED[]) gw_shed=+$(gw - base_gw) wk_shed=+$(wk - base_wk))"
+                    )
                     flush(stdout)
                     stop[] = true; break
                 elseif shed_point[] === nothing && cur_limit[] < effective_max
@@ -652,79 +678,85 @@ function main()
         while (time() < deadline || INFLIGHT[] > 0) && !stop[]
             sleep(REPORT_SEC)
             try
-            now = time()
-            ok = N_OK[]; n_err = N_ERR[]; n_dead = N_DEADLINE[]; n_shed = N_SHED[]
-            d_ok = ok - last_ok
-            rps = d_ok / max(now - last_t, 1e-6)
-            # Weight-cache load/evict totals across workers, with this window's delta. A rising evict
-            # rate is the worker-CPU "thrash" signal (the model set does not fit resident).
-            cache = scrape_counters()
-            cache_str = if cache === nothing
-                "cache=?"
-            else
-                s = "loads=$(cache.loads)(+$(cache.loads - last_loads)) evicts=$(cache.evicts)(+$(cache.evicts - last_evicts)) " *
-                    "gw_shed=$(cache.gw_shed) wk_shed=$(cache.worker_shed)"
-                last_loads = cache.loads; last_evicts = cache.evicts
-                s
-            end
-            conc_str = RAMP_MODE ? "conc=$(cur_limit[]) " : ""
-            counts = "ok=$ok err=$n_err dead=$n_dead(+$(n_dead - last_dead)) shed=$n_shed(+$(n_shed - last_shed))"
-            # Distribution over the requests completed THIS window: drain the samples (so a one-time
-            # startup-compile spike only shows in its own window, never pinning later windows) and
-            # report min / median / p95 / max plus the mean. Totals stay cumulative.
-            window = @lock LAT_LOCK begin
-                s = copy(LAT_SAMPLES); empty!(LAT_SAMPLES); s
-            end
-            sort!(window)
-            n = length(window)
-            ms(x) = round(x / 1e6, digits = 2)
-            stamp = round(Int, now - (deadline - DURATION))
-            if n == 0
-                println("[t+$(stamp)s] $conc_str$counts rps=$(round(rps, digits=1)) $cache_str (no completions this window)")
-            else
-                mean_ms = ms(sum(window) / n)
-                println("[t+$(stamp)s] $conc_str$counts rps=$(round(rps, digits=1)) ",
-                        "mean=$(mean_ms)ms min=$(ms(window[1]))ms p50=$(ms(_quantile_sorted(window, 0.5)))ms ",
-                        "p95=$(ms(_quantile_sorted(window, 0.95)))ms max=$(ms(window[n]))ms $cache_str")
-            end
-            # Surface the failure cause as soon as errors appear instead of only at soak end.
-            if !err_shown && n_err > 0
-                sample = @lock ERR_LOCK (isempty(SAMPLES[:error]) ? "(no sample captured)" : SAMPLES[:error][1])
-                println("    first error: ", sample)
-                err_shown = true
-            end
-            flush(stdout)   # piped stdout (docker logs) is block-buffered; flush so reports appear live
-            # Stall watchdog: completions (any class) stopped while requests are in flight means
-            # the transport is wedged — the blocked firing tasks will never observe the deadline,
-            # so bail out with the partial summary rather than hang until the container is killed.
-            total_done = ok + n_err + n_dead + n_shed
-            if STALL_WINDOWS > 0 && total_done == last_done && INFLIGHT[] > 0
-                stalled += 1
-                if stalled >= STALL_WINDOWS
-                    println("\nFATAL: no request completions in $stalled consecutive report ",
-                            "windows with $(INFLIGHT[]) requests in flight — transport wedged; ",
-                            "aborting (results below are partial)")
-                    # Wedge diagnosis: where are the stuck requests? in_multi > 0 means transfers
-                    # sit in libcurl without completing; sem_free == 0 with in_multi == 0 means the
-                    # concurrent-stream semaphore leaked and tasks are blocked before libcurl.
-                    try
-                        g = specs[1].model.grpc
-                        println("gRPC handle state: running=$(g.running) ",
-                                "in_multi=$(length(g.requests)) sem_free=$(Base.n_avail(g.sem)) ",
-                                "watchers=$(length(g.watchers)) timer_armed=$(g.timer !== nothing)")
-                    catch diag_ex
-                        println("gRPC handle state unavailable: ", sprint(showerror, diag_ex))
-                    end
-                    print_model_table(specs)
-                    print_skipped()
-                    flush(stdout)
-                    exit(4)
+                now = time()
+                ok = N_OK[]; n_err = N_ERR[]; n_dead = N_DEADLINE[]; n_shed = N_SHED[]
+                d_ok = ok - last_ok
+                rps = d_ok / max(now - last_t, 1.0e-6)
+                # Weight-cache load/evict totals across workers, with this window's delta. A rising evict
+                # rate is the worker-CPU "thrash" signal (the model set does not fit resident).
+                cache = scrape_counters()
+                cache_str = if cache === nothing
+                    "cache=?"
+                else
+                    s = "loads=$(cache.loads)(+$(cache.loads - last_loads)) evicts=$(cache.evicts)(+$(cache.evicts - last_evicts)) " *
+                        "gw_shed=$(cache.gw_shed) wk_shed=$(cache.worker_shed)"
+                    last_loads = cache.loads; last_evicts = cache.evicts
+                    s
                 end
-            else
-                stalled = 0
-            end
-            last_done = total_done
-            last_ok = ok; last_t = now; last_dead = n_dead; last_shed = n_shed
+                conc_str = RAMP_MODE ? "conc=$(cur_limit[]) " : ""
+                counts = "ok=$ok err=$n_err dead=$n_dead(+$(n_dead - last_dead)) shed=$n_shed(+$(n_shed - last_shed))"
+                # Distribution over the requests completed THIS window: drain the samples (so a one-time
+                # startup-compile spike only shows in its own window, never pinning later windows) and
+                # report min / median / p95 / max plus the mean. Totals stay cumulative.
+                window = @lock LAT_LOCK begin
+                    s = copy(LAT_SAMPLES); empty!(LAT_SAMPLES); s
+                end
+                sort!(window)
+                n = length(window)
+                ms(x) = round(x / 1.0e6, digits = 2)
+                stamp = round(Int, now - (deadline - DURATION))
+                if n == 0
+                    println("[t+$(stamp)s] $conc_str$counts rps=$(round(rps, digits = 1)) $cache_str (no completions this window)")
+                else
+                    mean_ms = ms(sum(window) / n)
+                    println(
+                        "[t+$(stamp)s] $conc_str$counts rps=$(round(rps, digits = 1)) ",
+                        "mean=$(mean_ms)ms min=$(ms(window[1]))ms p50=$(ms(_quantile_sorted(window, 0.5)))ms ",
+                        "p95=$(ms(_quantile_sorted(window, 0.95)))ms max=$(ms(window[n]))ms $cache_str"
+                    )
+                end
+                # Surface the failure cause as soon as errors appear instead of only at soak end.
+                if !err_shown && n_err > 0
+                    sample = @lock ERR_LOCK (isempty(SAMPLES[:error]) ? "(no sample captured)" : SAMPLES[:error][1])
+                    println("    first error: ", sample)
+                    err_shown = true
+                end
+                flush(stdout)   # piped stdout (docker logs) is block-buffered; flush so reports appear live
+                # Stall watchdog: completions (any class) stopped while requests are in flight means
+                # the transport is wedged — the blocked firing tasks will never observe the deadline,
+                # so bail out with the partial summary rather than hang until the container is killed.
+                total_done = ok + n_err + n_dead + n_shed
+                if STALL_WINDOWS > 0 && total_done == last_done && INFLIGHT[] > 0
+                    stalled += 1
+                    if stalled >= STALL_WINDOWS
+                        println(
+                            "\nFATAL: no request completions in $stalled consecutive report ",
+                            "windows with $(INFLIGHT[]) requests in flight — transport wedged; ",
+                            "aborting (results below are partial)"
+                        )
+                        # Wedge diagnosis: where are the stuck requests? in_multi > 0 means transfers
+                        # sit in libcurl without completing; sem_free == 0 with in_multi == 0 means the
+                        # concurrent-stream semaphore leaked and tasks are blocked before libcurl.
+                        try
+                            g = specs[1].model.grpc
+                            println(
+                                "gRPC handle state: running=$(g.running) ",
+                                "in_multi=$(length(g.requests)) sem_free=$(Base.n_avail(g.sem)) ",
+                                "watchers=$(length(g.watchers)) timer_armed=$(g.timer !== nothing)"
+                            )
+                        catch diag_ex
+                            println("gRPC handle state unavailable: ", sprint(showerror, diag_ex))
+                        end
+                        print_model_table(specs)
+                        print_skipped()
+                        flush(stdout)
+                        exit(4)
+                    end
+                else
+                    stalled = 0
+                end
+                last_done = total_done
+                last_ok = ok; last_t = now; last_dead = n_dead; last_shed = n_shed
             catch e
                 # A single bad iteration (e.g. a transient scrape/format error) must never kill the
                 # reporter and masquerade as a silent soak — log it and keep reporting.
@@ -740,10 +772,12 @@ function main()
 
     total_ok = N_OK[]; total_err = N_ERR[]; total_dead = N_DEADLINE[]; total_shed = N_SHED[]
     total_conn = N_CONN[]
-    println("\n== soak complete: ok=$total_ok err=$total_err (conn=$total_conn) ",
-            "dead=$total_dead shed=$total_shed ",
-            "rows=$(sum(spec.stats.rows[] for spec in specs)) ",
-            "mean=$(total_ok > 0 ? round((LAT_NS[]/total_ok)/1e6, digits=2) : 0)ms ==")
+    println(
+        "\n== soak complete: ok=$total_ok err=$total_err (conn=$total_conn) ",
+        "dead=$total_dead shed=$total_shed ",
+        "rows=$(sum(spec.stats.rows[] for spec in specs)) ",
+        "mean=$(total_ok > 0 ? round((LAT_NS[] / total_ok) / 1.0e6, digits = 2) : 0)ms =="
+    )
 
     print_model_table(specs)
     print_skipped()
@@ -790,8 +824,8 @@ function main()
     # here.)
     tolerated = (RAMP_MODE || DEADLINE_MODE) ? total_conn : 0
     hard_fail = (total_err - tolerated) > 0 ||
-                (!RAMP_MODE && !DEADLINE_MODE && (total_dead > 0 || total_shed > 0))
-    exit(hard_fail ? 1 : (isempty(shortfalls) ? 0 : 3))
+        (!RAMP_MODE && !DEADLINE_MODE && (total_dead > 0 || total_shed > 0))
+    return exit(hard_fail ? 1 : (isempty(shortfalls) ? 0 : 3))
 end
 
 # Run only when invoked as the program (`julia loadgen.jl`); skip on `include` so the driver can be

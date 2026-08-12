@@ -71,7 +71,7 @@ function parse_grpc_url(url::String)
         _bad()
     end
 
-    host, port, secure
+    return host, port, secure
 end
 
 # Per-message wire caps. The 4 MiB gRPC default is far below what inference tensors routinely
@@ -115,11 +115,15 @@ struct RetryPolicy
     jitter::Bool
     retry_unavailable::Bool
 end
-RetryPolicy(; enabled::Bool = true, initial_backoff::Real = 1.0, factor::Real = 2.0,
-            max_backoff::Real = Inf, min_budget::Real = 0.05, jitter::Bool = true,
-            retry_unavailable::Bool = true) =
-    RetryPolicy(enabled, Float64(initial_backoff), Float64(factor), Float64(max_backoff),
-                Float64(min_budget), jitter, retry_unavailable)
+RetryPolicy(;
+    enabled::Bool = true, initial_backoff::Real = 1.0, factor::Real = 2.0,
+    max_backoff::Real = Inf, min_budget::Real = 0.05, jitter::Bool = true,
+    retry_unavailable::Bool = true
+) =
+    RetryPolicy(
+    enabled, Float64(initial_backoff), Float64(factor), Float64(max_backoff),
+    Float64(min_budget), jitter, retry_unavailable
+)
 
 """
     KServeModel(host, port, model_name; secure=false, max_batch_size=1, deadline=10.0, ...)
@@ -163,21 +167,21 @@ struct KServeModel <: AbstractInferenceModel
     grpc::gRPCClient.gRPCCURL
 
     function KServeModel(
-        host,
-        port,
-        model_name;
-        secure = false,
-        max_batch_size = 1,
-        deadline = 10.0,
-        max_send_message_length = default_send_msg_bytes(),
-        max_receive_message_length = default_recv_msg_bytes(),
-        shared_memory = :auto,
-        retry = RetryPolicy(),
-        grpc = gRPCClient.grpc_global_handle(),
-    )
+            host,
+            port,
+            model_name;
+            secure = false,
+            max_batch_size = 1,
+            deadline = 10.0,
+            max_send_message_length = default_send_msg_bytes(),
+            max_receive_message_length = default_recv_msg_bytes(),
+            shared_memory = :auto,
+            retry = RetryPolicy(),
+            grpc = gRPCClient.grpc_global_handle(),
+        )
         shared_memory in (:auto, :on, :off) ||
             throw(ArgumentError("shared_memory must be :auto, :on, or :off, got $(repr(shared_memory))"))
-        new(
+        return new(
             host,
             port,
             secure,
@@ -193,19 +197,19 @@ struct KServeModel <: AbstractInferenceModel
     end
 
     function KServeModel(
-        url,
-        model_name;
-        max_batch_size = 1,
-        deadline = 10.0,
-        max_send_message_length = default_send_msg_bytes(),
-        max_receive_message_length = default_recv_msg_bytes(),
-        shared_memory = :auto,
-        retry = RetryPolicy(),
-        grpc = gRPCClient.grpc_global_handle(),
-    )
+            url,
+            model_name;
+            max_batch_size = 1,
+            deadline = 10.0,
+            max_send_message_length = default_send_msg_bytes(),
+            max_receive_message_length = default_recv_msg_bytes(),
+            shared_memory = :auto,
+            retry = RetryPolicy(),
+            grpc = gRPCClient.grpc_global_handle(),
+        )
         host, port, secure = parse_grpc_url(url)
 
-        KServeModel(
+        return KServeModel(
             host,
             port,
             model_name;
@@ -237,7 +241,7 @@ overall_deadline(::AbstractInferenceModel) = 0.0
 # remaining budget instead of a fresh full deadline. `grpc_infer_client(x)` keeps the full budget.
 grpc_infer_client(x::KServeModel) = grpc_infer_client(x, x.deadline)
 function grpc_infer_client(x::KServeModel, deadline_s::Real)
-    GRPCInferenceService_ModelInfer_Client(
+    return GRPCInferenceService_ModelInfer_Client(
         x.host,
         x.port;
         secure = x.secure,
@@ -250,7 +254,7 @@ function grpc_infer_client(x::KServeModel, deadline_s::Real)
 end
 
 function grpc_shm_unregister_client(x::KServeModel)
-    GRPCInferenceService_SystemSharedMemoryUnregister_Client(
+    return GRPCInferenceService_SystemSharedMemoryUnregister_Client(
         x.host,
         x.port;
         secure = x.secure,
@@ -259,7 +263,7 @@ function grpc_shm_unregister_client(x::KServeModel)
 end
 
 function grpc_shm_register_client(x::KServeModel)
-    GRPCInferenceService_SystemSharedMemoryRegister_Client(
+    return GRPCInferenceService_SystemSharedMemoryRegister_Client(
         x.host,
         x.port;
         secure = x.secure,
@@ -268,7 +272,7 @@ function grpc_shm_register_client(x::KServeModel)
 end
 
 function grpc_is_same_ipc_namespace_client(x::KServeModel; deadline = 10)
-    GRPCInferenceService_IsSameIPCNamespace_Client(
+    return GRPCInferenceService_IsSameIPCNamespace_Client(
         x.host,
         x.port;
         secure = x.secure,
@@ -278,7 +282,7 @@ function grpc_is_same_ipc_namespace_client(x::KServeModel; deadline = 10)
 end
 
 function grpc_metadata_client(x::KServeModel)
-    GRPCInferenceService_ModelMetadata_Client(
+    return GRPCInferenceService_ModelMetadata_Client(
         x.host,
         x.port;
         secure = x.secure,

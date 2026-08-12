@@ -75,7 +75,7 @@ struct TensorSpec
     name::String
     dtype::DType
     shape::Vector{Dim}
-    batch_axis::Union{Int,Nothing}   # 1-based index of the batch dim, or nothing
+    batch_axis::Union{Int, Nothing}   # 1-based index of the batch dim, or nothing
 end
 
 """
@@ -90,7 +90,7 @@ struct BatchingSpec
 end
 
 struct Provenance
-    fields::Dict{String,Any}
+    fields::Dict{String, Any}
 end
 
 """
@@ -110,15 +110,15 @@ struct Manifest
     description::String
     executable_inputs::Vector{TensorSpec}
     executable_outputs::Vector{TensorSpec}
-    client_inputs::Union{Vector{TensorSpec},Nothing}
-    client_outputs::Union{Vector{TensorSpec},Nothing}
+    client_inputs::Union{Vector{TensorSpec}, Nothing}
+    client_outputs::Union{Vector{TensorSpec}, Nothing}
     batching::BatchingSpec
     provenance::Provenance
-    input_batch_dim::Union{Int,Nothing}   # derived: 0-based batch axis of the inputs (or nothing)
+    input_batch_dim::Union{Int, Nothing}   # derived: 0-based batch axis of the inputs (or nothing)
     kind::String                          # "model" (default) or "meta"
     meta_calls::Vector{String}            # for kind=="meta": declared sub-model names; empty otherwise
     input_shapes::Vector{Vector{Int}}     # compiled input-shape variants: each is the variable-axis
-                                          # sizes in (executable-input, axis) order; empty => single shape
+    # sizes in (executable-input, axis) order; empty => single shape
 end
 
 # Backward-compatible 10-arg constructor: a regular model with no meta metadata and a single fixed
@@ -159,7 +159,7 @@ function parse_shape(shape_str::AbstractString, dims_map, tensor_name::AbstractS
         throw(ManifestError("tensor '$tensor_name' has more than one batch axis ('n'/'b') in shape '$shape_str'"))
 
     # Normalize dims_map keys to single-char strings for lookup.
-    dims_lookup = Dict{Char,Int}()
+    dims_lookup = Dict{Char, Int}()
     for (k, v) in dims_map
         ks = string(k)
         length(ks) == 1 && _is_ascii_letter(ks[1]) ||
@@ -210,7 +210,7 @@ function parse_tensor_spec(d)
     haskey(DTYPE_FROM_TOKEN, tok) || throw(ManifestError("tensor '$name' has unknown dtype '$tok'"))
     shp = get(d, "shape", nothing)
     shp isa AbstractString || throw(ManifestError("tensor '$name' missing string 'shape' (einsum letters)"))
-    dims_map = get(d, "dims", Dict{String,Any}())
+    dims_map = get(d, "dims", Dict{String, Any}())
     dims = parse_shape(String(shp), dims_map, String(name))
     return TensorSpec(String(name), DTYPE_FROM_TOKEN[tok], dims, _find_batch_axis(name, dims))
 end
@@ -285,7 +285,7 @@ end
 # `input_shapes` variants and the runtime variant key are both built in. `raw_inputs` is the raw
 # YAML list (parallel to `specs`), needed only to recover each variable axis's shape letter.
 function _variable_axes(raw_inputs, specs::Vector{TensorSpec})
-    out = Tuple{String,Int,Char}[]
+    out = Tuple{String, Int, Char}[]
     for (sp, raw) in zip(specs, raw_inputs)
         chars = collect(String(get(raw, "shape", "")))
         for (ax, dm) in enumerate(sp.shape)
@@ -311,7 +311,7 @@ function _parse_input_shapes(d::AbstractDict, raw_inputs, specs::Vector{TensorSp
     for (vi, v) in enumerate(blk)
         v isa AbstractDict ||
             throw(ManifestError("manifest '$name' input_shapes[$vi] must be a mapping of axis letters to sizes"))
-        lut = Dict{Char,Int}()
+        lut = Dict{Char, Int}()
         for (k, val) in v
             ks = string(k)
             (length(ks) == 1 && _is_ascii_letter(ks[1])) ||
@@ -370,9 +370,9 @@ function parse_manifest(d::AbstractDict)
     clin = haskey(d, "client_inputs") ? parse_tensor_list(d["client_inputs"], "client_inputs") : nothing
     clout = haskey(d, "client_outputs") ? parse_tensor_list(d["client_outputs"], "client_outputs") : nothing
 
-    batching = parse_batching(get(d, "batching", Dict{String,Any}()))
-    prov_raw = get(d, "provenance", Dict{String,Any}())
-    prov = Provenance(prov_raw isa AbstractDict ? Dict{String,Any}(prov_raw) : Dict{String,Any}())
+    batching = parse_batching(get(d, "batching", Dict{String, Any}()))
+    prov_raw = get(d, "provenance", Dict{String, Any}())
+    prov = Provenance(prov_raw isa AbstractDict ? Dict{String, Any}(prov_raw) : Dict{String, Any}())
 
     input_batch_dim = _derive_input_batch_dim(exin)
 
@@ -380,9 +380,11 @@ function parse_manifest(d::AbstractDict)
     raw_inputs isa AbstractVector || (raw_inputs = Any[])
     input_shapes = _parse_input_shapes(d, raw_inputs, exin, String(name))
 
-    return Manifest(string(fv), String(name), desc === nothing ? "" : string(desc),
-                    exin, exout, clin, clout, batching, prov, input_batch_dim, kind, meta_calls,
-                    input_shapes)
+    return Manifest(
+        string(fv), String(name), desc === nothing ? "" : string(desc),
+        exin, exout, clin, clout, batching, prov, input_batch_dim, kind, meta_calls,
+        input_shapes
+    )
 end
 
 function _check_unique_names(tensors::Vector{TensorSpec}, section::AbstractString)
@@ -391,12 +393,17 @@ function _check_unique_names(tensors::Vector{TensorSpec}, section::AbstractStrin
         t.name in seen && throw(ManifestError("duplicate tensor name '$(t.name)' in '$section'"))
         push!(seen, t.name)
     end
+    return
 end
 
 function validate_manifest(m::Manifest, dir::AbstractString, has_model_jl::Bool)
     m.format_version in SUPPORTED_FORMAT_VERSIONS ||
-        throw(ManifestError("unsupported format_version '$(m.format_version)'; " *
-                            "supported: $(join(SUPPORTED_FORMAT_VERSIONS, ", "))"))
+        throw(
+        ManifestError(
+            "unsupported format_version '$(m.format_version)'; " *
+                "supported: $(join(SUPPORTED_FORMAT_VERSIONS, ", "))"
+        )
+    )
 
     m.kind in SUPPORTED_KINDS ||
         throw(ManifestError("unsupported kind '$(m.kind)'; supported: $(join(SUPPORTED_KINDS, ", "))"))
@@ -432,9 +439,13 @@ function validate_manifest(m::Manifest, dir::AbstractString, has_model_jl::Bool)
     if any(t -> t.batch_axis !== nothing, m.executable_inputs)
         unbatched = String[t.name for t in m.executable_inputs if t.batch_axis === nothing]
         isempty(unbatched) ||
-            throw(ManifestError("model '$(m.name)' mixes batched and unbatched executable inputs; " *
-                                "every executable input must carry a batch axis ('n'/'b') or none may. " *
-                                "Unbatched input(s): $(join(unbatched, ", "))"))
+            throw(
+            ManifestError(
+                "model '$(m.name)' mixes batched and unbatched executable inputs; " *
+                    "every executable input must carry a batch axis ('n'/'b') or none may. " *
+                    "Unbatched input(s): $(join(unbatched, ", "))"
+            )
+        )
     end
 
     all(>(0), m.batching.compiled_batch_sizes) ||
@@ -443,14 +454,18 @@ function validate_manifest(m::Manifest, dir::AbstractString, has_model_jl::Bool)
     # Input-shape variants. A variable executable-input axis is only servable when the compiled
     # shapes are enumerated, so a regular model with one must declare `input_shapes`; a meta model
     # carries no executable, so it must not.
-    nvar_axes = sum(t -> count(dm -> dm.kind == VARIABLE, t.shape), m.executable_inputs; init=0)
+    nvar_axes = sum(t -> count(dm -> dm.kind == VARIABLE, t.shape), m.executable_inputs; init = 0)
     if is_meta(m)
         isempty(m.input_shapes) ||
             throw(ManifestError("meta model '$(m.name)' must not declare 'input_shapes'"))
     else
         nvar_axes > 0 && isempty(m.input_shapes) &&
-            throw(ManifestError("model '$(m.name)' has a variable executable-input axis but no 'input_shapes' " *
-                                "to enumerate the compiled shapes"))
+            throw(
+            ManifestError(
+                "model '$(m.name)' has a variable executable-input axis but no 'input_shapes' " *
+                    "to enumerate the compiled shapes"
+            )
+        )
         all(v -> length(v) == nvar_axes, m.input_shapes) ||
             throw(ManifestError("model '$(m.name)' input_shapes entries must each cover the $nvar_axes variable axes"))
     end
@@ -466,12 +481,18 @@ function validate_manifest(m::Manifest, dir::AbstractString, has_model_jl::Bool)
     # client-facing tensors using an unmappable dtype (e.g. FP8) would fail when a response or
     # ModelMetadata message is encoded. Reject them at load time rather than mid-request.
     # Executable-internal dtypes are unconstrained.
-    for (section, specs) in (("client_inputs", client_input_spec(m)),
-                             ("client_outputs", client_output_spec(m)))
+    for (section, specs) in (
+            ("client_inputs", client_input_spec(m)),
+            ("client_outputs", client_output_spec(m)),
+        )
         for t in specs
             haskey(DTYPE_TO_KSERVE, t.dtype) ||
-                throw(ManifestError("$section tensor '$(t.name)' has dtype $(dtype_token(t.dtype)) " *
-                                    "which has no KServe wire datatype mapping"))
+                throw(
+                ManifestError(
+                    "$section tensor '$(t.name)' has dtype $(dtype_token(t.dtype)) " *
+                        "which has no KServe wire datatype mapping"
+                )
+            )
         end
     end
     return m
@@ -490,7 +511,7 @@ and validation of `parse_manifest` but not the bundle-directory checks in
 a client deriving a model's I/O spec offline.
 """
 function load_manifest(path::AbstractString)
-    raw = YAML.load_file(String(path); dicttype = Dict{String,Any})
+    raw = YAML.load_file(String(path); dicttype = Dict{String, Any})
     raw isa AbstractDict || throw(ManifestError("manifest at $path is not a mapping"))
     return parse_manifest(raw)
 end

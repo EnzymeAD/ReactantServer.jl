@@ -35,7 +35,7 @@ struct InferContext
     registry::ModelRegistry
     shm::SharedMemoryRegistry
     platform::String
-    metrics::Union{WorkerMetrics,Nothing}
+    metrics::Union{WorkerMetrics, Nothing}
 end
 # Meta sub-calls are not routed from here: `infer` runs a meta's orchestration on this request task and
 # its sub-calls re-enter the scheduler in-process (see scheduler.jl `_run_meta_request`), so the context
@@ -43,7 +43,7 @@ end
 InferContext(sched, registry, shm, platform) = InferContext(sched, registry, shm, platform, nothing)
 
 # gRPC status code -> Prometheus label string, for worker_requests_total.
-const _GRPC_STATUS_NAME = Dict{Int,String}(
+const _GRPC_STATUS_NAME = Dict{Int, String}(
     _G.GRPC_OK => "OK", _G.GRPC_CANCELLED => "CANCELLED", _G.GRPC_UNKNOWN => "UNKNOWN",
     _G.GRPC_INVALID_ARGUMENT => "INVALID_ARGUMENT", _G.GRPC_DEADLINE_EXCEEDED => "DEADLINE_EXCEEDED",
     _G.GRPC_NOT_FOUND => "NOT_FOUND", _G.GRPC_ALREADY_EXISTS => "ALREADY_EXISTS",
@@ -53,7 +53,7 @@ const _GRPC_STATUS_NAME = Dict{Int,String}(
     _G.GRPC_INTERNAL => "INTERNAL", _G.GRPC_UNAVAILABLE => "UNAVAILABLE", _G.GRPC_DATA_LOSS => "DATA_LOSS",
 )
 _status_label(e) = e isa _G.gRPCServiceCallException ? get(_GRPC_STATUS_NAME, e.grpc_status, "UNKNOWN") :
-                   e isa DeadlineExceeded ? "DEADLINE_EXCEEDED" : "INTERNAL"
+    e isa DeadlineExceeded ? "DEADLINE_EXCEEDED" : "INTERNAL"
 
 # A request's effective absolute deadline (local time_ns()): the TIGHTEST of the in-body KV timeout
 # (carried through the gateway's raw-byte forwarding) and the grpc-timeout (which the gateway
@@ -100,7 +100,7 @@ function _model_ready(ctx::InferContext, name::AbstractString)
     meta = get_meta(ctx.registry, name)
     if meta !== nothing
         externally_managed || return true
-        return all(meta.calls; init=true) do sub
+        return all(meta.calls; init = true) do sub
             e = get_model(ctx.registry, sub)
             e !== nothing && e.executable !== nothing && e.executable.weights !== nothing
         end
@@ -125,8 +125,10 @@ function _handle_server_ready(ctx::InferContext)
 end
 
 _handle_server_metadata(::InferContext) =
-    inference.ServerMetadataResponse(; name=_SERVER_NAME, version=_SERVER_VERSION,
-                                     extensions=copy(_SERVER_EXTENSIONS))
+    inference.ServerMetadataResponse(;
+    name = _SERVER_NAME, version = _SERVER_VERSION,
+    extensions = copy(_SERVER_EXTENSIONS)
+)
 
 function _handle_model_metadata(ctx::InferContext, req)
     entry = get_model(ctx.registry, req.name)
@@ -188,7 +190,7 @@ end
 
 # Time and count every ModelInfer for the worker's Prometheus export (worker_requests_total by
 # model+status, worker_request_latency_seconds), then delegate to the handler body.
-function _handle_infer(ctx::InferContext, req, grpc_deadline_ns::Integer=0)
+function _handle_infer(ctx::InferContext, req, grpc_deadline_ns::Integer = 0)
     ctx.metrics === nothing && return _handle_infer_impl(ctx, req, grpc_deadline_ns)
     t0 = time()
     name = req.model_name
@@ -204,7 +206,7 @@ function _handle_infer(ctx::InferContext, req, grpc_deadline_ns::Integer=0)
     end
 end
 
-function _handle_infer_impl(ctx::InferContext, req, grpc_deadline_ns::Integer=0)
+function _handle_infer_impl(ctx::InferContext, req, grpc_deadline_ns::Integer = 0)
     name = req.model_name
     isempty(name) && _invalid("ModelInferRequest.model_name is empty")
     meta = get_meta(ctx.registry, name)
@@ -225,7 +227,7 @@ end
 # one-meta-at-a-time gate; its in-process sub-calls dispatch on the loop. Input validation reuses the
 # regular path (it reads only `manifest`, which MetaEntry also carries). `_infer_or_not_found` maps a
 # deadline bail to DEADLINE_EXCEEDED and an unknown/unloaded sub-model to NOT_FOUND, as the regular path.
-function _handle_meta_infer(ctx::InferContext, meta, req, grpc_deadline_ns::Integer=0)
+function _handle_meta_infer(ctx::InferContext, meta, req, grpc_deadline_ns::Integer = 0)
     decoded = _as_invalid(() -> decode_infer_request(req, ctx.shm))
     deadline_ns = _effective_deadline(decoded.request.deadline_ns, grpc_deadline_ns)
     request = InferRequest(meta.name, decoded.request.requested_outputs, decoded.request.inputs, deadline_ns)
@@ -273,22 +275,27 @@ Register the KServe V2 GRPCInferenceService handlers. The returned router is ser
 gRPCServer with an `InferContext` payload (see `serve`). The message-size caps default to
 `_MAX_MESSAGE_BYTES`; `serve` passes the configured `grpc.max_recv_msg_bytes` / `max_send_msg_bytes`.
 """
-function build_grpc_router(sched::Scheduler, registry::ModelRegistry, platform::AbstractString,
-                           shm::SharedMemoryRegistry;
-                           max_recv_msg_bytes::Integer=_MAX_MESSAGE_BYTES,
-                           max_send_msg_bytes::Integer=_MAX_MESSAGE_BYTES)
-    router = _G.gRPCRouter(; max_receive_message_length=max_recv_msg_bytes,
-                           max_send_message_length=max_send_msg_bytes)
-    register_GRPCInferenceService!(router;
-        ServerLive    = (req, ctx) -> inference.ServerLiveResponse(; live=true),
-        ServerReady   = (req, ctx) -> _handle_server_ready(ctx.payload),
-        ModelReady    = (req, ctx) -> _handle_model_ready(ctx.payload, req),
+function build_grpc_router(
+        sched::Scheduler, registry::ModelRegistry, platform::AbstractString,
+        shm::SharedMemoryRegistry;
+        max_recv_msg_bytes::Integer = _MAX_MESSAGE_BYTES,
+        max_send_msg_bytes::Integer = _MAX_MESSAGE_BYTES
+    )
+    router = _G.gRPCRouter(;
+        max_receive_message_length = max_recv_msg_bytes,
+        max_send_message_length = max_send_msg_bytes
+    )
+    register_GRPCInferenceService!(
+        router;
+        ServerLive = (req, ctx) -> inference.ServerLiveResponse(; live = true),
+        ServerReady = (req, ctx) -> _handle_server_ready(ctx.payload),
+        ModelReady = (req, ctx) -> _handle_model_ready(ctx.payload, req),
         ServerMetadata = (req, ctx) -> _handle_server_metadata(ctx.payload),
         ModelMetadata = (req, ctx) -> _handle_model_metadata(ctx.payload, req),
-        ModelInfer    = (req, ctx) -> _handle_infer(ctx.payload, req, ctx.deadline_ns),
+        ModelInfer = (req, ctx) -> _handle_infer(ctx.payload, req, ctx.deadline_ns),
         RepositoryIndex = (req, ctx) -> _handle_repository_index(ctx.payload, req),
-        SystemSharedMemoryStatus     = (req, ctx) -> _handle_shm_status(ctx.payload.shm, req.name),
-        SystemSharedMemoryRegister   = (req, ctx) -> _handle_shm_register(ctx.payload.shm, req),
+        SystemSharedMemoryStatus = (req, ctx) -> _handle_shm_status(ctx.payload.shm, req.name),
+        SystemSharedMemoryRegister = (req, ctx) -> _handle_shm_register(ctx.payload.shm, req),
         SystemSharedMemoryUnregister = (req, ctx) -> _handle_shm_unregister(ctx.payload.shm, req.name),
         IsSameIPCNamespace = (req, ctx) -> _handle_is_same_ipc_namespace(req.name),
     )

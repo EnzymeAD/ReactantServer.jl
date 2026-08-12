@@ -33,7 +33,7 @@ export IOSpec, write_bundle, export_bundle, export_torchscript_bundle, collect_p
 # or missing git is an expected, handled case).
 function _git_field(repo_dir::AbstractString, args::Vector{String})
     try
-        out = read(pipeline(`git -C $repo_dir $args`; stderr=devnull), String)
+        out = read(pipeline(`git -C $repo_dir $args`; stderr = devnull), String)
         return String(strip(out))
     catch
         return nothing
@@ -60,8 +60,8 @@ tree, or a repo has no `origin` remote, the affected fields are omitted (with a 
 for the non-repo case) and the function never throws. `extra` entries are merged last and
 override collected fields.
 """
-function collect_provenance(repo_dir::AbstractString=pwd(); extra=Dict{String,Any}())
-    prov = Dict{String,Any}(
+function collect_provenance(repo_dir::AbstractString = pwd(); extra = Dict{String, Any}())
+    prov = Dict{String, Any}(
         "exported_at" => Dates.format(Dates.now(Dates.UTC), dateformat"yyyy-mm-dd\THH:MM:SS\Z"),
         "julia_version" => string(VERSION),
         "reactantserverexport_version" => string(pkgversion(@__MODULE__)),
@@ -80,14 +80,14 @@ function collect_provenance(repo_dir::AbstractString=pwd(); extra=Dict{String,An
             # files, so tree sha1 + patch reconstructs the exported code exactly. Read raw
             # (not via _git_field): stripping the trailing newline corrupts the patch.
             diff = try
-                read(pipeline(`git -C $repo_dir diff --binary HEAD`; stderr=devnull), String)
+                read(pipeline(`git -C $repo_dir diff --binary HEAD`; stderr = devnull), String)
             catch
                 nothing
             end
             if diff !== nothing && !isempty(diff)
                 if sizeof(diff) > 20 * 1024 * 1024
-                    @warn "collect_provenance: working-tree diff is $(round(sizeof(diff) / 2^20; digits=1)) MiB; " *
-                          "omitting git_diff from provenance (commit the large changes to capture them)"
+                    @warn "collect_provenance: working-tree diff is $(round(sizeof(diff) / 2^20; digits = 1)) MiB; " *
+                        "omitting git_diff from provenance (commit the large changes to capture them)"
                 else
                     prov["git_diff"] = diff
                 end
@@ -97,14 +97,14 @@ function collect_provenance(repo_dir::AbstractString=pwd(); extra=Dict{String,An
         remote === nothing || (prov["repo_remote"] = remote)
     else
         @warn "collect_provenance: $repo_dir is not inside a git work tree (or git is " *
-              "unavailable); omitting the git provenance fields" maxlog = 1
+            "unavailable); omitting the git provenance fields" maxlog = 1
     end
-    return merge(prov, Dict{String,Any}(string(k) => v for (k, v) in extra))
+    return merge(prov, Dict{String, Any}(string(k) => v for (k, v) in extra))
 end
 
 # The fields the Reactant tracing frontend stamps on every bundle. User-passed provenance
 # wins on key collisions.
-_reactant_base_provenance() = Dict{String,Any}(
+_reactant_base_provenance() = Dict{String, Any}(
     "source_framework" => "reactant",
     "converter" => "ReactantServerExport.jl",
     "reactant_version" => string(pkgversion(Reactant)),
@@ -116,7 +116,7 @@ _reactant_base_provenance() = Dict{String,Any}(
 
 # Manifest dtype tokens, mirroring the server's dtypes. bf16 and the f8 types are intentionally
 # omitted here until a frontend needs them (they require extra deps).
-const DTYPE_TOKENS = Dict{DataType,String}(
+const DTYPE_TOKENS = Dict{DataType, String}(
     Float16 => "f16", Float32 => "f32", Float64 => "f64",
     Int8 => "i8", Int16 => "i16", Int32 => "i32", Int64 => "i64",
     UInt8 => "u8", UInt16 => "u16", UInt32 => "u32", UInt64 => "u64",
@@ -144,12 +144,14 @@ struct IOSpec
     name::String
     dtype::DataType
     shape::Vector{Int}
-    batch_axis::Union{Int,Nothing}
-    letters::Union{Nothing,Vector{Char}}
+    batch_axis::Union{Int, Nothing}
+    letters::Union{Nothing, Vector{Char}}
 end
-IOSpec(name, dtype, shape; batch_axis=nothing, letters=nothing) =
-    IOSpec(String(name), dtype, Int[shape...], batch_axis,
-           letters === nothing ? nothing : Char[letters...])
+IOSpec(name, dtype, shape; batch_axis = nothing, letters = nothing) =
+    IOSpec(
+    String(name), dtype, Int[shape...], batch_axis,
+    letters === nothing ? nothing : Char[letters...]
+)
 
 # 'n' and 'b' are reserved batch markers; everything else is fair game for non-batch axes.
 const _AXIS_LETTERS = "acdefghijklmopqrstuvwxyz"
@@ -175,7 +177,7 @@ end
 function _spec_dict(s::IOSpec)
     letters = _nonbatch_letters(s)
     shape_chars = Char[]
-    dims = Dict{String,Any}()
+    dims = Dict{String, Any}()
     k = 0
     for (i, d) in enumerate(s.shape)               # network axis = i - 1
         if s.batch_axis !== nothing && (i - 1) == s.batch_axis
@@ -187,8 +189,10 @@ function _spec_dict(s::IOSpec)
             dims[string(c)] = Int(d)
         end
     end
-    return Dict{String,Any}("name" => s.name, "dtype" => dtype_token(s.dtype),
-                            "shape" => String(shape_chars), "dims" => dims)
+    return Dict{String, Any}(
+        "name" => s.name, "dtype" => dtype_token(s.dtype),
+        "shape" => String(shape_chars), "dims" => dims
+    )
 end
 
 # The shape letters `_spec_dict` assigns to the variable (size -1) axes of each input, in
@@ -220,8 +224,10 @@ end
 function _serialize_module(mod::MLIR.IR.Module)
     vbytes, _ = _capture((cb, ref) -> MLIR.API.stablehloGetCurrentVersion(cb, ref))
     ver = String(vbytes)
-    bytes, sres = _capture((cb, ref) ->
-        MLIR.API.stablehloSerializePortableArtifactFromModule(mod, ver, cb, ref, true))
+    bytes, sres = _capture(
+        (cb, ref) ->
+        MLIR.API.stablehloSerializePortableArtifactFromModule(mod, ver, cb, ref, true)
+    )
     MLIR.IR.isfailure(MLIR.IR.LogicalResult(sres)) && error("ReactantServerExport: failed to serialize StableHLO")
     return bytes
 end
@@ -275,34 +281,38 @@ preprocess/postprocess transform between the two. They are emitted only when giv
 of a postprocessed detector). The server requires these only when a `model.jl` is present, so the
 caller is responsible for also shipping `model.jl` into the bundle dir (see the converter handlers).
 """
-function write_bundle(dir::AbstractString; name::AbstractString,
-                      executable_inputs::AbstractVector{IOSpec},
-                      executable_outputs::AbstractVector{IOSpec},
-                      modules::AbstractDict, weights,
-                      client_inputs::Union{Nothing,AbstractVector{IOSpec}}=nothing,
-                      client_outputs::Union{Nothing,AbstractVector{IOSpec}}=nothing,
-                      input_shapes::Union{Nothing,AbstractVector}=nothing,
-                      provenance=Dict{String,Any}())
+function write_bundle(
+        dir::AbstractString; name::AbstractString,
+        executable_inputs::AbstractVector{IOSpec},
+        executable_outputs::AbstractVector{IOSpec},
+        modules::AbstractDict, weights,
+        client_inputs::Union{Nothing, AbstractVector{IOSpec}} = nothing,
+        client_outputs::Union{Nothing, AbstractVector{IOSpec}} = nothing,
+        input_shapes::Union{Nothing, AbstractVector} = nothing,
+        provenance = Dict{String, Any}()
+    )
     basename(normpath(dir)) == String(name) ||
         error("ReactantServerExport: bundle dir basename must equal name '$name' (got '$(basename(normpath(dir)))')")
     mkpath(dir)
 
     wnames = String[String(first(p)) for p in weights]
-    wdata = Dict{String,AbstractArray}(String(first(p)) => collect(last(p)) for p in weights)
-    SafeTensors.serialize(joinpath(dir, "weights.safetensors"), wdata,
-                          Dict("argument_order" => JSON3.write(wnames)))
+    wdata = Dict{String, AbstractArray}(String(first(p)) => collect(last(p)) for p in weights)
+    SafeTensors.serialize(
+        joinpath(dir, "weights.safetensors"), wdata,
+        Dict("argument_order" => JSON3.write(wnames))
+    )
 
     # A `git_diff` provenance entry (from `collect_provenance` on a dirty tree) is
     # materialized as a patch file in the bundle rather than embedded in the manifest;
     # the manifest records the filename so the tree is reconstructible from
     # git_commit + `git apply --binary working_tree.patch`.
-    prov_dict = Dict{String,Any}(string(k) => v for (k, v) in provenance)
+    prov_dict = Dict{String, Any}(string(k) => v for (k, v) in provenance)
     if haskey(prov_dict, "git_diff")
         write(joinpath(dir, "working_tree.patch"), pop!(prov_dict, "git_diff"))
         prov_dict["git_diff_file"] = "working_tree.patch"
     end
 
-    manifest = Dict{String,Any}(
+    manifest = Dict{String, Any}(
         "format_version" => "2.0",
         "name" => String(name),
         "executable_inputs" => [_spec_dict(s) for s in executable_inputs],
@@ -312,7 +322,7 @@ function write_bundle(dir::AbstractString; name::AbstractString,
 
     if input_shapes === nothing
         sizes = _write_variant_modules(dir, "model", modules)
-        manifest["batching"] = Dict{String,Any}("compiled_batch_sizes" => sizes)
+        manifest["batching"] = Dict{String, Any}("compiled_batch_sizes" => sizes)
     else
         vletters = _variable_letters(executable_inputs)
         sizes = Int[]
@@ -326,9 +336,9 @@ function write_bundle(dir::AbstractString; name::AbstractString,
             vi == 1 ? (sizes = vsizes) :
                 (vsizes == sizes || error("ReactantServerExport: variant $vkey has batch sizes $vsizes, expected $sizes"))
         end
-        manifest["batching"] = Dict{String,Any}("compiled_batch_sizes" => sizes)
+        manifest["batching"] = Dict{String, Any}("compiled_batch_sizes" => sizes)
         manifest["input_shapes"] =
-            [Dict{String,Any}(string(vletters[j]) => Int(vk[j]) for j in eachindex(vletters)) for vk in input_shapes]
+            [Dict{String, Any}(string(vletters[j]) => Int(vk[j]) for j in eachindex(vletters)) for vk in input_shapes]
     end
 
     client_inputs === nothing || (manifest["client_inputs"] = [_spec_dict(s) for s in client_inputs])
@@ -342,7 +352,7 @@ end
 # ============================================================================
 
 # Ordered (name, array) leaves of a parameter tree (NamedTuple/Tuple/Vector/Array).
-function _named_leaves(x, prefix="", out=Tuple{String,Any}[])
+function _named_leaves(x, prefix = "", out = Tuple{String, Any}[])
     if x isa AbstractArray{<:Number}
         push!(out, (isempty(prefix) ? "param" : prefix, x))
     elseif x isa NamedTuple
@@ -358,7 +368,7 @@ function _named_leaves(x, prefix="", out=Tuple{String,Any}[])
 end
 
 # Rebuild a parameter tree shaped like `template`, drawing leaves in order from `ws`.
-function _rebuild(template, ws, idx=Ref(0))
+function _rebuild(template, ws, idx = Ref(0))
     if template isa AbstractArray{<:Number}
         idx[] += 1
         return ws[idx[]]
@@ -408,10 +418,12 @@ Trace `model(x, ps, st)` (taking the first return as the output) at each batch s
 write a bundle. The batch dimension is the last Julia axis (Lux convention) and the leading
 network axis. Works for any Reactant-traceable model; Lux itself is not required.
 """
-function export_bundle(::Val{:lux}, model, ps, st, example_input::AbstractArray;
-                       dir::AbstractString, name::AbstractString,
-                       input_name::AbstractString="input", output_name::AbstractString="output",
-                       batch_sizes::AbstractVector{<:Integer}=[1], provenance=Dict{String,Any}())
+function export_bundle(
+        ::Val{:lux}, model, ps, st, example_input::AbstractArray;
+        dir::AbstractString, name::AbstractString,
+        input_name::AbstractString = "input", output_name::AbstractString = "output",
+        batch_sizes::AbstractVector{<:Integer} = [1], provenance = Dict{String, Any}()
+    )
     leaves = _named_leaves(ps)
     isempty(leaves) && error("ReactantServerExport: model has no array parameters to export")
     wnames = String[p[1] for p in leaves]
@@ -424,14 +436,14 @@ function export_bundle(::Val{:lux}, model, ps, st, example_input::AbstractArray;
     g = (x, ws...) -> first(model(x, _rebuild(ps, collect(ws)), st))
 
     ctxs = Any[]                                   # keep contexts alive through serialization
-    modules = Dict{Int,Any}()
+    modules = Dict{Int, Any}()
     in_shape_julia = Int[]
     for s in batch_sizes
         x = _with_batch(example_input, batch_axis, s)
         ctx = Reactant.ReactantContext()
         push!(ctxs, ctx)
         args = (Reactant.to_rarray(x), map(Reactant.to_rarray, warrays)...)
-        mod, _ = Compiler.compile_mlir(ctx, g, args; drop_unsupported_attributes=true)
+        mod, _ = Compiler.compile_mlir(ctx, g, args; drop_unsupported_attributes = true)
         modules[Int(s)] = mod
         in_shape_julia = collect(Int, size(x))
     end
@@ -439,14 +451,16 @@ function export_bundle(::Val{:lux}, model, ps, st, example_input::AbstractArray;
     # Manifest is Julia order; batch axis is the 0-based Julia axis (Lux: last axis).
     in_batch_axis = ndims(example_input) - 1
     out_batch_axis = ndims(y0) - 1
-    inputs = [IOSpec(input_name, in_T, in_shape_julia; batch_axis=in_batch_axis)]
-    outputs = [IOSpec(output_name, eltype(y0), collect(Int, size(y0)); batch_axis=out_batch_axis)]
-    prov = merge(_reactant_base_provenance(), Dict{String,Any}(provenance))
+    inputs = [IOSpec(input_name, in_T, in_shape_julia; batch_axis = in_batch_axis)]
+    outputs = [IOSpec(output_name, eltype(y0), collect(Int, size(y0)); batch_axis = out_batch_axis)]
+    prov = merge(_reactant_base_provenance(), Dict{String, Any}(provenance))
 
     GC.@preserve ctxs begin
-        write_bundle(dir; name=name, executable_inputs=inputs, executable_outputs=outputs,
-            modules=modules, weights=[wnames[i] => warrays[i] for i in eachindex(wnames)],
-            provenance=prov)
+        write_bundle(
+            dir; name = name, executable_inputs = inputs, executable_outputs = outputs,
+            modules = modules, weights = [wnames[i] => warrays[i] for i in eachindex(wnames)],
+            provenance = prov
+        )
     end
     return dir
 end
@@ -475,15 +489,17 @@ tensor), so single-dispatch or partially-unbatched models can still be exported;
 requires all executable inputs to be batched or none, so a per-tensor opt-out that leaves a mix of
 batched and unbatched inputs is rejected at load time.
 """
-function export_bundle(::Val{:lux}, model, ps, st, example_inputs::Tuple;
-                       dir::AbstractString, name::AbstractString,
-                       input_names=nothing, output_names=nothing,
-                       output_select = y -> (y isa Tuple ? y : (y,)),
-                       input_batch_axes::Union{Nothing,AbstractVector}=nothing,
-                       output_batch_axes::Union{Nothing,AbstractVector}=nothing,
-                       client_inputs::Union{Nothing,AbstractVector{IOSpec}}=nothing,
-                       client_outputs::Union{Nothing,AbstractVector{IOSpec}}=nothing,
-                       batch_sizes::AbstractVector{<:Integer}=[1], provenance=Dict{String,Any}())
+function export_bundle(
+        ::Val{:lux}, model, ps, st, example_inputs::Tuple;
+        dir::AbstractString, name::AbstractString,
+        input_names = nothing, output_names = nothing,
+        output_select = y -> (y isa Tuple ? y : (y,)),
+        input_batch_axes::Union{Nothing, AbstractVector} = nothing,
+        output_batch_axes::Union{Nothing, AbstractVector} = nothing,
+        client_inputs::Union{Nothing, AbstractVector{IOSpec}} = nothing,
+        client_outputs::Union{Nothing, AbstractVector{IOSpec}} = nothing,
+        batch_sizes::AbstractVector{<:Integer} = [1], provenance = Dict{String, Any}()
+    )
     leaves = _named_leaves(ps)
     isempty(leaves) && error("ReactantServerExport: model has no array parameters to export")
     wnames = String[p[1] for p in leaves]
@@ -494,11 +510,11 @@ function export_bundle(::Val{:lux}, model, ps, st, example_inputs::Tuple;
     # `nothing` for a tensor that is genuinely unbatched. Keep entries as `Any` so both Int and
     # nothing survive.
     in_axes = input_batch_axes === nothing ? Any[ndims(x) for x in example_inputs] :
-              collect(Any, input_batch_axes)
+        collect(Any, input_batch_axes)
     length(in_axes) == nin ||
         error("ReactantServerExport: input_batch_axes has $(length(in_axes)) entries but $nin inputs")
     innames = input_names === nothing ? ["input_$(i - 1)" for i in 1:nin] :
-              collect(String, input_names)
+        collect(String, input_names)
 
     # `output_select` may return a single array or a tuple of arrays; normalize to a tuple.
     _as_tuple(y) = y isa Tuple ? y : (y,)
@@ -508,17 +524,19 @@ function export_bundle(::Val{:lux}, model, ps, st, example_inputs::Tuple;
     _modelarg(t) = nin == 1 ? t[1] : t
     # A batched input is resized to the current batch size along its axis; an unbatched one
     # (axis === nothing) keeps its example shape at every batch size.
-    mk_inputs(s) = ntuple(i -> in_axes[i] === nothing ? zeros(eltype(example_inputs[i]), size(example_inputs[i])...) :
-                               _with_batch(example_inputs[i], in_axes[i], s), nin)
+    mk_inputs(s) = ntuple(
+        i -> in_axes[i] === nothing ? zeros(eltype(example_inputs[i]), size(example_inputs[i])...) :
+            _with_batch(example_inputs[i], in_axes[i], s), nin
+    )
     y0 = _as_tuple(output_select(first(model(_modelarg(mk_inputs(first(batch_sizes))), ps, st))))
     all(o -> o isa AbstractArray, y0) ||
         error("ReactantServerExport: output_select must return only arrays; got $(map(typeof, y0))")
     nout = length(y0)
     outnames = output_names === nothing ? ["output_$(i - 1)" for i in 1:nout] :
-               collect(String, output_names)
+        collect(String, output_names)
     # Outputs default batch-last too; an explicit `nothing` marks an unbatched output.
     out_axes = output_batch_axes === nothing ? Any[ndims(o) for o in y0] :
-               collect(Any, output_batch_axes)
+        collect(Any, output_batch_axes)
     length(out_axes) == nout ||
         error("ReactantServerExport: output_batch_axes has $(length(out_axes)) entries but $nout outputs")
 
@@ -527,14 +545,14 @@ function export_bundle(::Val{:lux}, model, ps, st, example_inputs::Tuple;
     g = (a, ws...) -> _as_tuple(output_select(first(model(a, _rebuild(ps, collect(ws)), st))))
 
     ctxs = Any[]                                   # keep contexts alive through serialization
-    modules = Dict{Int,Any}()
+    modules = Dict{Int, Any}()
     in_shapes = [Int[] for _ in 1:nin]
     for s in batch_sizes
         xs = mk_inputs(s)
         ctx = Reactant.ReactantContext()
         push!(ctxs, ctx)
         args = (_modelarg(map(Reactant.to_rarray, xs)), map(Reactant.to_rarray, warrays)...)
-        mod, _ = Compiler.compile_mlir(ctx, g, args; drop_unsupported_attributes=true)
+        mod, _ = Compiler.compile_mlir(ctx, g, args; drop_unsupported_attributes = true)
         modules[Int(s)] = mod
         for i in 1:nin
             in_shapes[i] = collect(Int, size(xs[i]))
@@ -542,16 +560,26 @@ function export_bundle(::Val{:lux}, model, ps, st, example_inputs::Tuple;
     end
 
     # Manifest is Julia order; batch axis is the 0-based Julia axis (nothing stays unbatched).
-    in_specs = [IOSpec(innames[i], eltype(example_inputs[i]), in_shapes[i];
-                       batch_axis = in_axes[i] === nothing ? nothing : in_axes[i] - 1) for i in 1:nin]
-    out_specs = [IOSpec(outnames[i], eltype(y0[i]), collect(Int, size(y0[i]));
-                        batch_axis = out_axes[i] === nothing ? nothing : out_axes[i] - 1) for i in 1:nout]
-    prov = merge(_reactant_base_provenance(), Dict{String,Any}(provenance))
+    in_specs = [
+        IOSpec(
+                innames[i], eltype(example_inputs[i]), in_shapes[i];
+                batch_axis = in_axes[i] === nothing ? nothing : in_axes[i] - 1
+            ) for i in 1:nin
+    ]
+    out_specs = [
+        IOSpec(
+                outnames[i], eltype(y0[i]), collect(Int, size(y0[i]));
+                batch_axis = out_axes[i] === nothing ? nothing : out_axes[i] - 1
+            ) for i in 1:nout
+    ]
+    prov = merge(_reactant_base_provenance(), Dict{String, Any}(provenance))
 
     GC.@preserve ctxs begin
-        write_bundle(dir; name=name, executable_inputs=in_specs, executable_outputs=out_specs,
-            modules=modules, weights=[wnames[i] => warrays[i] for i in eachindex(wnames)],
-            client_inputs=client_inputs, client_outputs=client_outputs, provenance=prov)
+        write_bundle(
+            dir; name = name, executable_inputs = in_specs, executable_outputs = out_specs,
+            modules = modules, weights = [wnames[i] => warrays[i] for i in eachindex(wnames)],
+            client_inputs = client_inputs, client_outputs = client_outputs, provenance = prov
+        )
     end
     return dir
 end
@@ -563,10 +591,12 @@ end
 Generic single-size export for any Reactant-traceable `f(inputs..., weights...)`. `weights`
 is an ordered collection of `name => array` pairs. Produces one unbatched `model.mlir`.
 """
-function export_bundle(::Val{:reactant}, f, inputs::Tuple, weights::AbstractVector{<:Pair};
-                       dir::AbstractString, name::AbstractString,
-                       input_names=nothing, output_name::AbstractString="output",
-                       provenance=Dict{String,Any}())
+function export_bundle(
+        ::Val{:reactant}, f, inputs::Tuple, weights::AbstractVector{<:Pair};
+        dir::AbstractString, name::AbstractString,
+        input_names = nothing, output_name::AbstractString = "output",
+        provenance = Dict{String, Any}()
+    )
     wnames = String[String(first(p)) for p in weights]
     warrays = Any[last(p) for p in weights]
     innames = input_names === nothing ? ["input_$(i - 1)" for i in 1:length(inputs)] : collect(String, input_names)
@@ -576,17 +606,21 @@ function export_bundle(::Val{:reactant}, f, inputs::Tuple, weights::AbstractVect
 
     ctx = Reactant.ReactantContext()
     args = (map(Reactant.to_rarray, inputs)..., map(Reactant.to_rarray, warrays)...)
-    mod, _ = Compiler.compile_mlir(ctx, f, args; drop_unsupported_attributes=true)
+    mod, _ = Compiler.compile_mlir(ctx, f, args; drop_unsupported_attributes = true)
 
-    in_specs = [IOSpec(innames[i], eltype(inputs[i]), collect(Int, size(inputs[i])))
-                for i in 1:length(inputs)]
+    in_specs = [
+        IOSpec(innames[i], eltype(inputs[i]), collect(Int, size(inputs[i])))
+            for i in 1:length(inputs)
+    ]
     out_specs = [IOSpec(output_name, eltype(yarr), collect(Int, size(yarr)))]
-    prov = merge(_reactant_base_provenance(), Dict{String,Any}(provenance))
+    prov = merge(_reactant_base_provenance(), Dict{String, Any}(provenance))
 
     GC.@preserve ctx begin
-        write_bundle(dir; name=name, executable_inputs=in_specs, executable_outputs=out_specs,
-            modules=Dict(0 => mod), weights=[wnames[i] => warrays[i] for i in eachindex(wnames)],
-            provenance=prov)
+        write_bundle(
+            dir; name = name, executable_inputs = in_specs, executable_outputs = out_specs,
+            modules = Dict(0 => mod), weights = [wnames[i] => warrays[i] for i in eachindex(wnames)],
+            provenance = prov
+        )
     end
     return dir
 end

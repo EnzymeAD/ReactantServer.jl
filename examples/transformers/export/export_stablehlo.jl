@@ -16,7 +16,9 @@
 using PythonCall
 pyimport("torch"); pyimport("torch.export")
 pyimport("torchax.export"); pyimport("torchax.ops.jaten")
-try pyimport("triton._C.libtriton") catch end   # only present as a CUDA-wheel leftover
+try
+    pyimport("triton._C.libtriton")
+catch end   # only present as a CUDA-wheel leftover
 using ReactantServerExport
 using ReactantServerExport: IOSpec
 
@@ -24,9 +26,11 @@ using ReactantServerExport: IOSpec
 # Point it at the OS trust store that holds the corporate CA (same bundle the Docker images use),
 # so the checkpoint downloads trust a MitM proxy's CA. Mirrors examples/object_detection/export.
 if !haskey(ENV, "SSL_CERT_FILE")
-    for candidate in (get(ENV, "REQUESTS_CA_BUNDLE", ""), get(ENV, "CURL_CA_BUNDLE", ""),
-                      get(ENV, "JULIA_SSL_CA_ROOTS_PATH", ""),
-                      "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt")
+    for candidate in (
+            get(ENV, "REQUESTS_CA_BUNDLE", ""), get(ENV, "CURL_CA_BUNDLE", ""),
+            get(ENV, "JULIA_SSL_CA_ROOTS_PATH", ""),
+            "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
+        )
         if !isempty(candidate) && isfile(candidate)
             ENV["SSL_CERT_FILE"] = candidate
             @info "Using system CA bundle for Python TLS" SSL_CERT_FILE = candidate
@@ -67,146 +71,172 @@ end
 # must live inside the bundle (model.jl loads it at serve time relative to @__DIR__); the
 # tokenizer code does not, it comes from ReactantServer.BertText.
 function _stage(bundle_dir, model_name)
-    cp(joinpath(MODELS, model_name, "model.jl"), joinpath(bundle_dir, "model.jl"); force=true)
-    cp(joinpath(TOKENIZER, "vocab.txt"), joinpath(bundle_dir, "vocab.txt"); force=true)
+    cp(joinpath(MODELS, model_name, "model.jl"), joinpath(bundle_dir, "model.jl"); force = true)
+    return cp(joinpath(TOKENIZER, "vocab.txt"), joinpath(bundle_dir, "vocab.txt"); force = true)
 end
 
-_prov(extra) = merge(ReactantServerExport.collect_provenance(REPO_ROOT), Dict{String,Any}(extra...))
+_prov(extra) = merge(ReactantServerExport.collect_provenance(REPO_ROOT), Dict{String, Any}(extra...))
 
-function export_splade(; name="splade")
+function export_splade(; name = "splade")
     em = _builders()
     model = em.build_splade()
     example = (_ids(SEQ_LEN), _ones(SEQ_LEN))
     dir = joinpath(OUT, name)
-    export_bundle(:pytorch, model, example;
+    export_bundle(
+        :pytorch, model, example;
         dir, name,
-        input_names  = ["input_ids", "attention_mask"],
+        input_names = ["input_ids", "attention_mask"],
         output_names = ["term_scores"],
-        axis_letters = Dict("input_ids" => ['s'], "attention_mask" => ['s'],
-                            "term_scores" => ['v']),
+        axis_letters = Dict(
+            "input_ids" => ['s'], "attention_mask" => ['s'],
+            "term_scores" => ['v']
+        ),
         batch_sizes = BATCH_SIZES,
         matmul_precision = "highest",
         client_inputs = [
-            IOSpec("texts", UInt8, [1, -1]; batch_axis=0, letters=['c']),
-            IOSpec("text_lens", Int32, [1]; batch_axis=0),
+            IOSpec("texts", UInt8, [1, -1]; batch_axis = 0, letters = ['c']),
+            IOSpec("text_lens", Int32, [1]; batch_axis = 0),
         ],
         client_outputs = [
-            IOSpec("indices", Int32, [-1]; letters=['k']),
-            IOSpec("values", Float32, [-1]; letters=['w']),
-            IOSpec("row_offsets", Int64, [-1]; letters=['r']),
+            IOSpec("indices", Int32, [-1]; letters = ['k']),
+            IOSpec("values", Float32, [-1]; letters = ['w']),
+            IOSpec("row_offsets", Int64, [-1]; letters = ['r']),
         ],
-        provenance = _prov((
-            "model" => "SPLADE (BertForMaskedLM + in-graph log1p/relu/mask/max term-score head)",
-            "checkpoint" => "naver/splade-cocondenser-ensembledistil",
-            "source" => "https://huggingface.co/naver/splade-cocondenser-ensembledistil",
-            "hidden_size" => 768, "num_hidden_layers" => 12, "vocab_size" => 30522,
-            "seq_len" => SEQ_LEN,
-        )))
+        provenance = _prov(
+            (
+                "model" => "SPLADE (BertForMaskedLM + in-graph log1p/relu/mask/max term-score head)",
+                "checkpoint" => "naver/splade-cocondenser-ensembledistil",
+                "source" => "https://huggingface.co/naver/splade-cocondenser-ensembledistil",
+                "hidden_size" => 768, "num_hidden_layers" => 12, "vocab_size" => 30522,
+                "seq_len" => SEQ_LEN,
+            )
+        )
+    )
     _stage(dir, "splade")
     return dir
 end
 
-function export_embedding(; name="embedding")
+function export_embedding(; name = "embedding")
     em = _builders()
     model = em.build_embedding()
     example = (_ids(SEQ_LEN), _ones(SEQ_LEN))
     dir = joinpath(OUT, name)
-    export_bundle(:pytorch, model, example;
+    export_bundle(
+        :pytorch, model, example;
         dir, name,
-        input_names  = ["input_ids", "attention_mask"],
+        input_names = ["input_ids", "attention_mask"],
         output_names = ["embedding"],
-        axis_letters = Dict("input_ids" => ['s'], "attention_mask" => ['s'],
-                            "embedding" => ['d']),
+        axis_letters = Dict(
+            "input_ids" => ['s'], "attention_mask" => ['s'],
+            "embedding" => ['d']
+        ),
         batch_sizes = BATCH_SIZES,
         matmul_precision = "highest",
         client_inputs = [
-            IOSpec("texts", UInt8, [1, -1]; batch_axis=0, letters=['c']),
-            IOSpec("text_lens", Int32, [1]; batch_axis=0),
+            IOSpec("texts", UInt8, [1, -1]; batch_axis = 0, letters = ['c']),
+            IOSpec("text_lens", Int32, [1]; batch_axis = 0),
         ],
         client_outputs = [
-            IOSpec("embedding", Float32, [1, 384]; batch_axis=0, letters=['d']),
+            IOSpec("embedding", Float32, [1, 384]; batch_axis = 0, letters = ['d']),
         ],
-        provenance = _prov((
-            "model" => "dense embedding (BertModel + in-graph masked mean-pool + L2 normalize)",
-            "checkpoint" => "sentence-transformers/all-MiniLM-L6-v2",
-            "source" => "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
-            "hidden_size" => 384, "num_hidden_layers" => 6, "vocab_size" => 30522,
-            "embedding_dim" => 384, "seq_len" => SEQ_LEN,
-        )))
+        provenance = _prov(
+            (
+                "model" => "dense embedding (BertModel + in-graph masked mean-pool + L2 normalize)",
+                "checkpoint" => "sentence-transformers/all-MiniLM-L6-v2",
+                "source" => "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
+                "hidden_size" => 384, "num_hidden_layers" => 6, "vocab_size" => 30522,
+                "embedding_dim" => 384, "seq_len" => SEQ_LEN,
+            )
+        )
+    )
     _stage(dir, "embedding")
     return dir
 end
 
-function export_cross(; name="cross_encoder")
+function export_cross(; name = "cross_encoder")
     em = _builders()
     model = em.build_cross()
     example = (_ids(SEQ_LEN), _ones(SEQ_LEN), _zeros(SEQ_LEN))
     dir = joinpath(OUT, name)
-    export_bundle(:pytorch, model, example;
+    export_bundle(
+        :pytorch, model, example;
         dir, name,
-        input_names  = ["input_ids", "attention_mask", "token_type_ids"],
+        input_names = ["input_ids", "attention_mask", "token_type_ids"],
         output_names = ["logits"],
-        axis_letters = Dict("input_ids" => ['s'], "attention_mask" => ['s'],
-                            "token_type_ids" => ['s']),
+        axis_letters = Dict(
+            "input_ids" => ['s'], "attention_mask" => ['s'],
+            "token_type_ids" => ['s']
+        ),
         batch_sizes = BATCH_SIZES,
         matmul_precision = "highest",
         client_inputs = [
-            IOSpec("query", UInt8, [-1]; letters=['q']),
-            IOSpec("keys", UInt8, [1, -1]; batch_axis=0, letters=['c']),
-            IOSpec("key_lens", Int32, [1]; batch_axis=0),
+            IOSpec("query", UInt8, [-1]; letters = ['q']),
+            IOSpec("keys", UInt8, [1, -1]; batch_axis = 0, letters = ['c']),
+            IOSpec("key_lens", Int32, [1]; batch_axis = 0),
         ],
         client_outputs = [
-            IOSpec("logits", Float32, [1]; batch_axis=0),
-            IOSpec("prob", Float32, [1]; batch_axis=0),
+            IOSpec("logits", Float32, [1]; batch_axis = 0),
+            IOSpec("prob", Float32, [1]; batch_axis = 0),
         ],
-        provenance = _prov((
-            "model" => "cross encoder (BertForSequenceClassification, raw logits; sigmoid in model.jl)",
-            "checkpoint" => "cross-encoder/ms-marco-MiniLM-L-6-v2",
-            "source" => "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2",
-            "hidden_size" => 384, "num_hidden_layers" => 6, "vocab_size" => 30522,
-            "seq_len" => SEQ_LEN,
-        )))
+        provenance = _prov(
+            (
+                "model" => "cross encoder (BertForSequenceClassification, raw logits; sigmoid in model.jl)",
+                "checkpoint" => "cross-encoder/ms-marco-MiniLM-L-6-v2",
+                "source" => "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2",
+                "hidden_size" => 384, "num_hidden_layers" => 6, "vocab_size" => 30522,
+                "seq_len" => SEQ_LEN,
+            )
+        )
+    )
     _stage(dir, "cross_encoder")
     return dir
 end
 
-function export_sentiment(; name="sentiment")
+function export_sentiment(; name = "sentiment")
     em = _builders()
     model = em.build_sentiment()
     example = (_ids(SEQ_LEN), _ones(SEQ_LEN))
     dir = joinpath(OUT, name)
-    export_bundle(:pytorch, model, example;
+    export_bundle(
+        :pytorch, model, example;
         dir, name,
-        input_names  = ["input_ids", "attention_mask"],
+        input_names = ["input_ids", "attention_mask"],
         output_names = ["logits"],
-        axis_letters = Dict("input_ids" => ['s'], "attention_mask" => ['s'],
-                            "logits" => ['c']),
+        axis_letters = Dict(
+            "input_ids" => ['s'], "attention_mask" => ['s'],
+            "logits" => ['c']
+        ),
         batch_sizes = BATCH_SIZES,
         matmul_precision = "highest",
         client_inputs = [
-            IOSpec("texts", UInt8, [1, -1]; batch_axis=0, letters=['c']),
-            IOSpec("text_lens", Int32, [1]; batch_axis=0),
+            IOSpec("texts", UInt8, [1, -1]; batch_axis = 0, letters = ['c']),
+            IOSpec("text_lens", Int32, [1]; batch_axis = 0),
         ],
         client_outputs = [
-            IOSpec("logits", Float32, [1, 2]; batch_axis=0, letters=['c']),
-            IOSpec("probs", Float32, [1, 2]; batch_axis=0, letters=['c']),
-            IOSpec("label_id", Int32, [1]; batch_axis=0),
+            IOSpec("logits", Float32, [1, 2]; batch_axis = 0, letters = ['c']),
+            IOSpec("probs", Float32, [1, 2]; batch_axis = 0, letters = ['c']),
+            IOSpec("label_id", Int32, [1]; batch_axis = 0),
         ],
-        provenance = _prov((
-            "model" => "sentiment classifier (DistilBERT SST-2, raw logits; softmax in model.jl)",
-            "checkpoint" => "distilbert-base-uncased-finetuned-sst-2-english",
-            "source" => "https://huggingface.co/distilbert-base-uncased-finetuned-sst-2-english",
-            "hidden_size" => 768, "num_hidden_layers" => 6, "vocab_size" => 30522,
-            "num_labels" => 2, "id2label" => "0=NEGATIVE, 1=POSITIVE", "seq_len" => SEQ_LEN,
-        )))
+        provenance = _prov(
+            (
+                "model" => "sentiment classifier (DistilBERT SST-2, raw logits; softmax in model.jl)",
+                "checkpoint" => "distilbert-base-uncased-finetuned-sst-2-english",
+                "source" => "https://huggingface.co/distilbert-base-uncased-finetuned-sst-2-english",
+                "hidden_size" => 768, "num_hidden_layers" => 6, "vocab_size" => 30522,
+                "num_labels" => 2, "id2label" => "0=NEGATIVE, 1=POSITIVE", "seq_len" => SEQ_LEN,
+            )
+        )
+    )
     _stage(dir, "sentiment")
     return dir
 end
 
 function main()
     mkpath(OUT)
-    for (name, f) in (("splade", export_splade), ("embedding", export_embedding),
-                      ("cross_encoder", export_cross), ("sentiment", export_sentiment))
+    for (name, f) in (
+            ("splade", export_splade), ("embedding", export_embedding),
+            ("cross_encoder", export_cross), ("sentiment", export_sentiment),
+        )
         if isdir(joinpath(OUT, name))
             @info "Skipping $name (already built; delete $(joinpath(OUT, name)) to re-export)"
             continue
@@ -215,6 +245,7 @@ function main()
         dir = f(; name)
         println("exported: $dir")
     end
+    return
 end
 
 main()

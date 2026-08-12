@@ -91,7 +91,7 @@ function peek_batch_size(body::AbstractVector{UInt8}, input_name::AbstractString
             # A FRESH Ref per input: `decode!` into a singular-message Ref MERGES successive
             # occurrences (proto3 semantics for a repeated field decoded as singular), so reusing one
             # concatenates the shapes of every input and silently reports the wrong extent.
-            tensor = Ref{Union{Nothing,InferInputShape}}(nothing)
+            tensor = Ref{Union{Nothing, InferInputShape}}(nothing)
             PB.decode!(d, tensor)
             t = tensor[]
             if t !== nothing && t.name == input_name

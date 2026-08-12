@@ -47,9 +47,9 @@ mutable struct MetaGate
     capacity::Int
     n_held::Int
 end
-MetaGate(capacity::Integer=1) = MetaGate(Threads.Condition(), Int(capacity), 0)
+MetaGate(capacity::Integer = 1) = MetaGate(Threads.Condition(), Int(capacity), 0)
 
-function acquire_meta_gate!(g::MetaGate, who::AbstractString; deadline_ns::Integer=0)
+function acquire_meta_gate!(g::MetaGate, who::AbstractString; deadline_ns::Integer = 0)
     dl = Int64(deadline_ns)
     lock(g.cond)
     timer = nothing   # one-shot wake at the deadline; armed on first park, closed in finally
@@ -57,9 +57,16 @@ function acquire_meta_gate!(g::MetaGate, who::AbstractString; deadline_ns::Integ
         while g.n_held >= g.capacity
             dl != 0 && Int64(time_ns()) >= dl && throw(DeadlineExceeded(String(who)))
             if dl != 0 && timer === nothing
-                rem = (dl - Int64(time_ns())) / 1e9
+                rem = (dl - Int64(time_ns())) / 1.0e9
                 rem <= 0 && throw(DeadlineExceeded(String(who)))
-                timer = Timer(_ -> (try; @lock g.cond notify(g.cond); catch; end), rem)
+                timer = Timer(
+                    _ -> (
+                        try
+                            @lock g.cond notify(g.cond)
+                        catch
+                        end
+                    ), rem
+                )
             end
             wait(g.cond)   # releases the lock while parked, reacquires on wake
         end
@@ -97,23 +104,25 @@ mutable struct Scheduler
     cfg::SchedulerConfig
     cond::Threads.Condition          # guards the registry map + queues + control and signals the dispatch loop
     running::Bool
-    task::Union{Task,Nothing}
-    weight_cache::Union{WeightCache,Nothing}   # on-demand weight residency, or nothing when disabled
-    scratch_pool::Union{BufferPool,Nothing}    # local reuse pool for meta intermediates (plain Memory); nothing disables
+    task::Union{Task, Nothing}
+    weight_cache::Union{WeightCache, Nothing}   # on-demand weight residency, or nothing when disabled
+    scratch_pool::Union{BufferPool, Nothing}    # local reuse pool for meta intermediates (plain Memory); nothing disables
     control::Vector{ControlCommand}            # pending control commands, drained by the dispatch loop
     meta_gate::MetaGate                        # admits one meta orchestration at a time (capacity configurable)
     committed::Vector{QueuedRequest}           # in-flight metas' continuation sub-calls awaiting the next GPU slot, each
-                                               # dispatched ahead of the discipline scan. One entry per in-flight meta, so
-                                               # it is bounded by the gate: committed count == REACTANT_META_CONCURRENCY.
+    # dispatched ahead of the discipline scan. One entry per in-flight meta, so
+    # it is bounded by the gate: committed count == REACTANT_META_CONCURRENCY.
     compact_loads_mark::Int                    # weight-cache load count at the last automatic compaction; sole
-                                               # writer is the dispatch thread. Drives load-driven compaction:
-                                               # compact once `weight_cache.loads` advances by `cfg.compaction_interval`.
+    # writer is the dispatch thread. Drives load-driven compaction:
+    # compact once `weight_cache.loads` advances by `cfg.compaction_interval`.
 end
 
 function Scheduler(registry::ModelRegistry, backend::AbstractBackend, pool::MemoryPool, cfg::SchedulerConfig)
-    return Scheduler(registry, backend, pool, cfg,
-                     Threads.Condition(), false, nothing, nothing, nothing, ControlCommand[],
-                     MetaGate(1), QueuedRequest[], 0)
+    return Scheduler(
+        registry, backend, pool, cfg,
+        Threads.Condition(), false, nothing, nothing, nothing, ControlCommand[],
+        MetaGate(1), QueuedRequest[], 0
+    )
 end
 
 # A selected dispatch: the model entry, the chosen executable key (batch size; 0 = unbatched
@@ -236,8 +245,10 @@ function plan_batch(entry::ModelEntry, st::ModelSchedState)
 
     if !_coalescable(entry) || haskey(inner, 0)
         key = haskey(inner, 0) ? 0 :
-              (_smallest_ge(sizes, _request_rows(entry, front.req)) === nothing ? maximum(sizes) :
-               _smallest_ge(sizes, _request_rows(entry, front.req)))
+            (
+                _smallest_ge(sizes, _request_rows(entry, front.req)) === nothing ? maximum(sizes) :
+                _smallest_ge(sizes, _request_rows(entry, front.req))
+            )
         return (key, QueuedRequest[front])
     end
 
@@ -370,8 +381,8 @@ function _select_edf!(s::Scheduler)
         dl = _queue_min_deadline(st)
         oldest = st.queue[1].enqueued_at
         if chosen === nothing || dl < best_dl ||
-           (dl == best_dl && oldest < best_oldest) ||
-           (dl == best_dl && oldest == best_oldest && entry.name < chosen.name)
+                (dl == best_dl && oldest < best_oldest) ||
+                (dl == best_dl && oldest == best_oldest && entry.name < chosen.name)
             chosen, best_dl, best_oldest = entry, dl, oldest
         end
     end
@@ -386,8 +397,8 @@ function _select_fair!(s::Scheduler, now::Float64)
     for entry in values(s.registry.by_name)
         entry.sched === nothing || _decay_ema!(entry.sched, s.cfg.ema_halflife_seconds, now)
     end
-    total_ema = sum(e.sched.recent_compute_ema for e in values(s.registry.by_name) if e.sched !== nothing; init=0.0)
-    total_w = sum(e.sched.weight for e in values(s.registry.by_name) if e.sched !== nothing; init=0.0)
+    total_ema = sum(e.sched.recent_compute_ema for e in values(s.registry.by_name) if e.sched !== nothing; init = 0.0)
+    total_w = sum(e.sched.weight for e in values(s.registry.by_name) if e.sched !== nothing; init = 0.0)
 
     chosen = nothing
     chosen_plan = nothing
@@ -404,8 +415,8 @@ function _select_fair!(s::Scheduler, now::Float64)
         nema = total_ema == 0 ? 0.0 : st.recent_compute_ema / total_ema
         p = priority(share, nema, s.cfg.recency_penalty_cap, effective_cost(st, B, s.cfg.coalescing_discount))
         if chosen === nothing || p > best_p ||
-           (p == best_p && st.queue[1].enqueued_at < chosen.sched.queue[1].enqueued_at) ||
-           (p == best_p && st.queue[1].enqueued_at == chosen.sched.queue[1].enqueued_at && entry.name < chosen.name)
+                (p == best_p && st.queue[1].enqueued_at < chosen.sched.queue[1].enqueued_at) ||
+                (p == best_p && st.queue[1].enqueued_at == chosen.sched.queue[1].enqueued_at && entry.name < chosen.name)
             chosen, chosen_plan, best_p = entry, plan, p
         end
     end
@@ -430,11 +441,11 @@ function _coalesce_inputs(entry::ModelEntry, pres::Vector{Vector{NamedTensor}}, 
             continue
         end
         axis = sp.batch_axis
-        data = length(arrays) == 1 ? arrays[1] : cat(arrays...; dims=axis)
+        data = length(arrays) == 1 ? arrays[1] : cat(arrays...; dims = axis)
         if total_rows < B
             padshape = collect(size(data))
             padshape[axis] = B - total_rows
-            data = cat(data, zeros(eltype(data), padshape...); dims=axis)
+            data = cat(data, zeros(eltype(data), padshape...); dims = axis)
         end
         push!(merged, NamedTensor(sp.name, data))
     end
@@ -491,7 +502,7 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
     # dispatches; unseeded it defaults small, so the laxity drop is a no-op until the model has run once.
     now_ns = Int64(time_ns())
     laxity_ns = s.cfg.discipline == EDF ?
-        round(Int64, get(st.cost_estimate, B, _DEFAULT_COST) * 1e9) : Int64(0)
+        round(Int64, get(st.cost_estimate, B, _DEFAULT_COST) * 1.0e9) : Int64(0)
     live = QueuedRequest[]
     for qr in taken
         # A committed request is an in-flight meta's continuation: skip the laxity drop (we already
@@ -519,7 +530,7 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
         # padding, so pass its inputs straight through (this also covers non-batched models
         # whose manifest does not enumerate executable_inputs).
         merged = (length(taken) == 1 && (!_coalescable(entry) || rows[1] == B)) ?
-                 pres[1] : _coalesce_inputs(entry, pres, total, B)
+            pres[1] : _coalesce_inputs(entry, pres, total, B)
 
         # Ensure the model's weights are resident before running (loads on demand and evicts
         # LRU under budget pressure). Load time is excluded from compute_time, which feeds the
@@ -582,12 +593,12 @@ function _run_meta_request(s::Scheduler, meta::MetaEntry, req::InferRequest)
     # Base deadline check first: no point starting already-expired work (no GPU spent yet).
     req.deadline_ns != 0 && Int64(time_ns()) >= req.deadline_ns && throw(DeadlineExceeded(meta.name))
     gated = !isempty(meta.calls)   # compute-only metas (no sub-calls) skip the gate
-    gated && acquire_meta_gate!(s.meta_gate, meta.name; deadline_ns=req.deadline_ns)
+    gated && acquire_meta_gate!(s.meta_gate, meta.name; deadline_ns = req.deadline_ns)
     caller = QueueingCaller(s, s.scratch_pool)
     call_ns = Ref(Int64(0))
     try
-        out = run_meta(meta, caller, req.inputs; deadline_ns=req.deadline_ns, call_ns_out=call_ns)
-        compute = call_ns[] / 1e9     # sub-call (model) time only; the Julia glue between stages is excluded
+        out = run_meta(meta, caller, req.inputs; deadline_ns = req.deadline_ns, call_ns_out = call_ns)
+        compute = call_ns[] / 1.0e9     # sub-call (model) time only; the Julia glue between stages is excluded
         st = meta.sched
         lock(s.cond) do
             now = time()
@@ -635,9 +646,11 @@ function _probe_max_scratch!(s::Scheduler, pinned_bytes::Int)
     # the current model's weight, and `max_i (peak_i - pinned - maxweight_i)` is then provably exactly
     # `max_i scratch_i`, the worst single-model transient: peak_i >= pinned + W_i + S_i gives the >= S_i
     # bound, and W_j <= W_i for all j <= i gives the <= max(S) bound. No peak reset required.
-    probe = [e for e in values(s.registry.by_name)
-             if e.executable !== nothing && !is_device_pinned(e.executable) &&
-                !isempty(e.manifest.executable_inputs)]          # need synthesizable inputs to measure
+    probe = [
+        e for e in values(s.registry.by_name)
+            if e.executable !== nothing && !is_device_pinned(e.executable) &&
+            !isempty(e.manifest.executable_inputs)
+    ]          # need synthesizable inputs to measure
     sort!(probe; by = e -> e.executable.nbytes)                  # ascending weight
     max_scratch = 0
     max_weight = 0
@@ -679,16 +692,20 @@ function _autosize_weight_cache!(s::Scheduler, arena::Int, fraction::Float64, wi
     s.weight_cache === nothing && return nothing
     pinned = pinned_weight_bytes(s.registry)
     max_scratch = _probe_max_scratch!(s, pinned)
-    b = weight_budget(; arena = arena, fraction = fraction, wiggle = wiggle,
-                       max_scratch = max_scratch, pinned_bytes = pinned)
+    b = weight_budget(;
+        arena = arena, fraction = fraction, wiggle = wiggle,
+        max_scratch = max_scratch, pinned_bytes = pinned
+    )
     lock(s.weight_cache.lock) do
         s.weight_cache.max_bytes = b.on_demand_budget
         s.weight_cache.pinned_bytes = pinned
         s.weight_cache.max_scratch = max_scratch
         s.weight_cache.weight_pool = b.weight_pool
     end
-    has_ondemand = any(e -> e.executable !== nothing && !is_device_pinned(e.executable),
-                       values(s.registry.by_name))
+    has_ondemand = any(
+        e -> e.executable !== nothing && !is_device_pinned(e.executable),
+        values(s.registry.by_name)
+    )
     if b.pinned_over_commit
         @warn "weight budget: pinned weights plus execution scratch exceed the arena minus wiggle; pinned models may not fit" arena = arena pinned_bytes = pinned max_scratch = max_scratch weight_pool = b.weight_pool wiggle = wiggle
     elseif b.on_demand_budget == 0 && has_ondemand
@@ -704,8 +721,10 @@ end
 # worker when the on-demand cache is enabled), the isolation probe runs every model regardless of
 # discipline, doubling as the FAIR cost warmup and the scratch measurement, and the cache is sized
 # before serving begins.
-function start!(s::Scheduler; autosize_arena::Integer=0, autosize_fraction::Real=0.0,
-                autosize_wiggle::Real=0.0)
+function start!(
+        s::Scheduler; autosize_arena::Integer = 0, autosize_fraction::Real = 0.0,
+        autosize_wiggle::Real = 0.0
+    )
     now = time()
     for entry in values(s.registry.by_name)
         init_sched_state!(s, entry, now)
@@ -920,34 +939,38 @@ worker rejects it otherwise. Runs on the dispatch thread (the sole residency mut
 until applied. Raises on an unknown model or in self-managed mode.
 """
 function set_residency!(s::Scheduler, name::AbstractString, target::ResidencyState)
-    return _run_control(s, function (sch)
-        sch.weight_cache === nothing &&
-            throw(ErrorException("residency control requires the on-demand weight cache (set runtime.weight_cache_fraction > 0)"))
-        sch.weight_cache.mode == EXTERNALLY_MANAGED ||
-            throw(ErrorException("worker is self-managed; residency is not externally controllable"))
-        nm = String(name)
-        # A meta owns no weights: its residency is its sub-models' residency (the group is the unit).
-        # Pinning a meta pins each sub. When unpinning, leave a sub resident if another meta also
-        # declares it (conservative — avoids prematurely unpinning a shared stage that a sibling meta
-        # still needs; the cost is a little extra resident memory, never a wrong eviction).
-        meta = get(sch.registry.meta, nm, nothing)
-        if meta !== nothing
-            last = target
-            for sub in meta.calls
-                e = get(sch.registry.by_name, sub, nothing)
-                e === nothing && continue
-                if target == UNPINNED && any(other.name != nm && sub in other.calls
-                                             for other in values(sch.registry.meta))
-                    continue
+    return _run_control(
+        s, function (sch)
+            sch.weight_cache === nothing &&
+                throw(ErrorException("residency control requires the on-demand weight cache (set runtime.weight_cache_fraction > 0)"))
+            sch.weight_cache.mode == EXTERNALLY_MANAGED ||
+                throw(ErrorException("worker is self-managed; residency is not externally controllable"))
+            nm = String(name)
+            # A meta owns no weights: its residency is its sub-models' residency (the group is the unit).
+            # Pinning a meta pins each sub. When unpinning, leave a sub resident if another meta also
+            # declares it (conservative — avoids prematurely unpinning a shared stage that a sibling meta
+            # still needs; the cost is a little extra resident memory, never a wrong eviction).
+            meta = get(sch.registry.meta, nm, nothing)
+            if meta !== nothing
+                last = target
+                for sub in meta.calls
+                    e = get(sch.registry.by_name, sub, nothing)
+                    e === nothing && continue
+                    if target == UNPINNED && any(
+                            other.name != nm && sub in other.calls
+                                for other in values(sch.registry.meta)
+                        )
+                        continue
+                    end
+                    last = set_residency_state!(sch.weight_cache, e, target)
                 end
-                last = set_residency_state!(sch.weight_cache, e, target)
+                return last
             end
-            return last
+            entry = get(sch.registry.by_name, nm, nothing)
+            entry === nothing && throw(ErrorException("unknown model: $name"))
+            return set_residency_state!(sch.weight_cache, entry, target)
         end
-        entry = get(sch.registry.by_name, nm, nothing)
-        entry === nothing && throw(ErrorException("unknown model: $name"))
-        return set_residency_state!(sch.weight_cache, entry, target)
-    end)
+    )
 end
 
 """
@@ -956,7 +979,7 @@ end
 Update a model's live scheduler policy. `weight` is consulted only by the fair discipline.
 Available in both residency modes. Raises on an unknown model.
 """
-function set_policy!(s::Scheduler, name::AbstractString; weight::Union{Real,Nothing}=nothing)
+function set_policy!(s::Scheduler, name::AbstractString; weight::Union{Real, Nothing} = nothing)
     lock(s.cond) do
         entry = get(s.registry.by_name, String(name), nothing)
         (entry === nothing || entry.sched === nothing) && throw(ErrorException("unknown model: $name"))
@@ -973,9 +996,9 @@ end
 # Body assuming it already runs on the dispatch thread (mirrors `_admit_entry!`/`_evict_entry!`).
 # A no-op without the on-demand cache: there, every model is permanently device-resident from
 # startup (nothing churns), so there is no fragmenting working set to compact.
-function _compact_entry!(sch::Scheduler; reload_models::Vector{String}=String[])
+function _compact_entry!(sch::Scheduler; reload_models::Vector{String} = String[])
     sch.weight_cache === nothing && return 0
-    return compact!(sch.weight_cache, sch.registry; reload=reload_models)
+    return compact!(sch.weight_cache, sch.registry; reload = reload_models)
 end
 
 """
@@ -988,8 +1011,8 @@ once at startup, never reloaded from disk). A no-op when the on-demand weight ca
 Runs on the dispatch thread (the sole residency mutator) and blocks until applied. Returns the
 number of models reloaded.
 """
-compact!(s::Scheduler; reload_models::Vector{String}=String[]) =
-    _run_control(s, sch -> _compact_entry!(sch; reload_models=reload_models))
+compact!(s::Scheduler; reload_models::Vector{String} = String[]) =
+    _run_control(s, sch -> _compact_entry!(sch; reload_models = reload_models))
 
 # Automatic, worker-local compaction driven by `cfg.compaction_interval` (0 disables), counting
 # on-demand weight-cache loads, not dispatches: a load is what places a variable-size weight block
@@ -1070,8 +1093,10 @@ function _evict_entry!(sch::Scheduler, name::AbstractString)
         end
     end
     nbytes = entry.executable === nothing ? 0 : entry.executable.nbytes
-    log_model_unloaded(String(name), nbytes;
-        memory=memory_report(sch.backend, sch.pool; registry=sch.registry, weight_cache=sch.weight_cache))
+    log_model_unloaded(
+        String(name), nbytes;
+        memory = memory_report(sch.backend, sch.pool; registry = sch.registry, weight_cache = sch.weight_cache)
+    )
     return entry
 end
 
@@ -1109,14 +1134,20 @@ any existing model is evicted first so its device memory is freed before the new
 compiled, then the new entry is compiled (`build_loaded_model`) and admitted. This is the dynamic
 directory watcher's load/reload path. Returns the model name.
 """
-function load_model!(s::Scheduler, backend::AbstractBackend, pool::MemoryPool, entry::ModelEntry;
-                     state::ResidencyState, on_demand::Bool, store::WeightStore=PrivateWeightStore())
-    return _run_control(s, function (sch)
-        _evict_entry!(sch, entry.name)          # no-op on a fresh load; frees device memory on reload
-        entry.executable = build_loaded_model(backend, pool, entry;
-                                              state=state, on_demand=on_demand, store=store, source=:dynamic)
-        return _admit_entry!(sch, entry)
-    end)
+function load_model!(
+        s::Scheduler, backend::AbstractBackend, pool::MemoryPool, entry::ModelEntry;
+        state::ResidencyState, on_demand::Bool, store::WeightStore = PrivateWeightStore()
+    )
+    return _run_control(
+        s, function (sch)
+            _evict_entry!(sch, entry.name)          # no-op on a fresh load; frees device memory on reload
+            entry.executable = build_loaded_model(
+                backend, pool, entry;
+                state = state, on_demand = on_demand, store = store, source = :dynamic
+            )
+            return _admit_entry!(sch, entry)
+        end
+    )
 end
 
 """
@@ -1128,8 +1159,10 @@ Alias for [`evict!`](@ref): remove a model from the live system. Provided for sy
 unload_model!(s::Scheduler, name::AbstractString) = evict!(s, name)
 
 # Body assuming it already runs on the dispatch thread (mirrors `_admit_entry!`/`_evict_entry!`).
-function _rename_entry!(sch::Scheduler, old::String, new::String,
-                        residency::Union{ResidencyState,Nothing})
+function _rename_entry!(
+        sch::Scheduler, old::String, new::String,
+        residency::Union{ResidencyState, Nothing}
+    )
     old == new && return new
     entry = lock(sch.cond) do
         (haskey(sch.registry.by_name, new) || haskey(sch.registry.meta, new)) &&
@@ -1149,7 +1182,7 @@ function _rename_entry!(sch::Scheduler, old::String, new::String,
         # The residency floor is operator config keyed by model name, so the new name may resolve
         # to a different floor (e.g. `-production` is pinned where `-staging` was not). Apply it.
         if residency !== nothing && sch.weight_cache !== nothing &&
-           entry.executable !== nothing && entry.executable.state != residency
+                entry.executable !== nothing && entry.executable.state != residency
             set_residency_state!(sch.weight_cache, entry, residency)
         end
         # A meta calls its sub-models by name; a callee renamed out from under a meta will fail at
@@ -1174,8 +1207,10 @@ when given, is the residency floor resolved for the NEW name; it is applied if i
 the model's current floor. Queued requests ride along: they hold the entry itself. Raises when
 `old` is not registered or `new` already is. Returns the new name.
 """
-function rename_model!(s::Scheduler, old::AbstractString, new::AbstractString;
-                       residency::Union{ResidencyState,Nothing}=nothing)
+function rename_model!(
+        s::Scheduler, old::AbstractString, new::AbstractString;
+        residency::Union{ResidencyState, Nothing} = nothing
+    )
     return _run_control(s, sch -> _rename_entry!(sch, String(old), String(new), residency))
 end
 
@@ -1225,7 +1260,7 @@ proceeds in parallel and overlaps the single, serialized GPU execution. The disp
 and runs `qr.prepared` and never executes a request whose preprocess has not finished, since a
 request is only enqueued (made visible to the loop) after preprocess returns.
 """
-function infer(s::Scheduler, req::InferRequest; committed::Bool=false)
+function infer(s::Scheduler, req::InferRequest; committed::Bool = false)
     entry = get(s.registry.by_name, req.model_name, nothing)
     if entry === nothing
         # A meta has no executable: it runs its orchestration on this task under the meta gate, and its
@@ -1240,7 +1275,7 @@ function infer(s::Scheduler, req::InferRequest; committed::Bool=false)
     # preprocess/postprocess come from a bundle's model.jl, defined in a newer world age;
     # invokelatest crosses that boundary (harmless for identity).
     prepared = Base.invokelatest(entry.preprocess, req.inputs)
-    qr = QueuedRequest(req, prepared; committed=committed)
+    qr = QueuedRequest(req, prepared; committed = committed)
     submit!(s, qr)
     raw = take!(qr.reply)
     raw isa Exception && throw(raw)
@@ -1265,24 +1300,26 @@ Snapshot per-model observability: dispatch count, total compute consumed, curren
 EMA, queue-wait P50/P99, the histogram of dispatch batch sizes, and residency.
 """
 function scheduler_metrics(s::Scheduler)
-    lock(s.cond) do
+    return lock(s.cond) do
         now = time()
-        return Dict(entry.name => (
-            dispatch_count = entry.sched.dispatch_count,
-            requests_served = entry.sched.requests_served,
-            rows_served = entry.sched.rows_served,
-            total_compute = entry.sched.total_compute,
-            recent_compute_ema = _decay_ema!(entry.sched, s.cfg.ema_halflife_seconds, now),
-            queue_depth = length(entry.sched.queue),
-            wait_p50 = _percentile(entry.sched.wait_samples, 0.5),
-            wait_p99 = _percentile(entry.sched.wait_samples, 0.99),
-            batch_size_hist = copy(entry.sched.batch_size_hist),
-            max_batch_size = _effective_max_batch(entry),
-            state = entry.executable.state,
-            pinned = is_device_pinned(entry.executable),
-            resident = entry.executable.weights !== nothing,
-            weight_nbytes = entry.executable.nbytes,
-        ) for entry in values(s.registry.by_name) if entry.sched !== nothing && entry.executable !== nothing)
+        return Dict(
+            entry.name => (
+                    dispatch_count = entry.sched.dispatch_count,
+                    requests_served = entry.sched.requests_served,
+                    rows_served = entry.sched.rows_served,
+                    total_compute = entry.sched.total_compute,
+                    recent_compute_ema = _decay_ema!(entry.sched, s.cfg.ema_halflife_seconds, now),
+                    queue_depth = length(entry.sched.queue),
+                    wait_p50 = _percentile(entry.sched.wait_samples, 0.5),
+                    wait_p99 = _percentile(entry.sched.wait_samples, 0.99),
+                    batch_size_hist = copy(entry.sched.batch_size_hist),
+                    max_batch_size = _effective_max_batch(entry),
+                    state = entry.executable.state,
+                    pinned = is_device_pinned(entry.executable),
+                    resident = entry.executable.weights !== nothing,
+                    weight_nbytes = entry.executable.nbytes,
+                ) for entry in values(s.registry.by_name) if entry.sched !== nothing && entry.executable !== nothing
+        )
     end
 end
 
@@ -1324,15 +1361,17 @@ function _meta_group_status(s::Scheduler, meta::MetaEntry)
         Integer(e.executable.state) < Integer(floor) && (floor = e.executable.state)
     end
     any_sub || (dev = false; host = false; floor = UNPINNED)   # compute-only meta: no weights
-    return (state = floor, device_resident = dev, host_resident = host, weight_nbytes = nbytes,
-            weight = meta.sched.weight, queue_depth = length(meta.sched.queue),
-            total_compute = meta.sched.total_compute, requests_served = meta.sched.requests_served,
-            rows_served = meta.sched.rows_served,
-            dispatch_count = meta.sched.dispatch_count, max_batch_size = 0,
-            # A meta is non-coalescable, so it declares no wire batch axis: one item per request.
-            # `rows_served` is therefore incremented once per request too, which makes a meta's cost
-            # per item equal its cost per request. That is the honest figure for it.
-            batch_input_name = "", batch_axis = 0)
+    return (
+        state = floor, device_resident = dev, host_resident = host, weight_nbytes = nbytes,
+        weight = meta.sched.weight, queue_depth = length(meta.sched.queue),
+        total_compute = meta.sched.total_compute, requests_served = meta.sched.requests_served,
+        rows_served = meta.sched.rows_served,
+        dispatch_count = meta.sched.dispatch_count, max_batch_size = 0,
+        # A meta is non-coalescable, so it declares no wire batch axis: one item per request.
+        # `rows_served` is therefore incremented once per request too, which makes a meta's cost
+        # per item equal its cost per request. That is the honest figure for it.
+        batch_input_name = "", batch_axis = 0,
+    )
 end
 
 """
@@ -1344,10 +1383,10 @@ weights; the internal sub-models are folded into it and not reported on their ow
 packs and routes the group as one unit and never sees the stages.
 """
 function control_status(s::Scheduler)
-    lock(s.cond) do
+    return lock(s.cond) do
         mode = s.weight_cache === nothing ? SELF_MANAGED : s.weight_cache.mode
         subs = internal_submodels(s.registry)
-        models = Dict{String,Any}()
+        models = Dict{String, Any}()
         for entry in values(s.registry.by_name)
             (entry.sched === nothing || entry.executable === nothing) && continue
             entry.name in subs && continue   # internal stage of a meta: folded into the meta, hidden here
@@ -1382,8 +1421,10 @@ function control_status(s::Scheduler)
         # The on-demand weight budget is the memory capacity a gateway packs weight footprints
         # against; 0 (cache disabled, all weights resident) means memory is not a constraint.
         cache_max = s.weight_cache === nothing ? 0 : s.weight_cache.max_bytes
-        return (residency_mode = mode, discipline = s.cfg.discipline, models = models,
-                weight_cache_max_bytes = cache_max)
+        return (
+            residency_mode = mode, discipline = s.cfg.discipline, models = models,
+            weight_cache_max_bytes = cache_max,
+        )
     end
 end
 

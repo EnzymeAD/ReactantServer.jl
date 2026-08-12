@@ -79,7 +79,7 @@ end
 # only the precision-type fields in the op's own printed attribute guarantees a schema-valid
 # round-trip without hardcoding the DotAlgorithm field list; parsed in `ctx` so it attaches.
 _f32_algorithm(attr, ctx) =
-    parse(_RMLIR.IR.Attribute, replace(_attr_text(attr), "tf32" => "f32"); context=ctx)
+    parse(_RMLIR.IR.Attribute, replace(_attr_text(attr), "tf32" => "f32"); context = ctx)
 
 # Recurse operation -> regions -> blocks -> operations, converting each TF32 dot_general. We only
 # mutate an op's attributes (remove/replace), never erase the op, so it stays in its block and the
@@ -114,7 +114,7 @@ number of ops changed; the pass is idempotent and safe to run on an already-stri
 Operates in the module's own context, in place. Call only when the compile target does not support
 TF32 (see [`tf32_supported`](@ref)); on a capable device the TF32 algorithm must be preserved.
 """
-function maybe_strip_tf32!(mod::_RMLIR.IR.Module; force_rewrite::Bool=false)
+function maybe_strip_tf32!(mod::_RMLIR.IR.Module; force_rewrite::Bool = false)
     ctx = _RMLIR.IR.context(mod)
     n = 0
     for op in _RMLIR.IR.body(mod)
@@ -152,8 +152,10 @@ function _f32_operands(op)
 end
 
 _highest_precision_attr(ctx) =
-    parse(_RMLIR.IR.Attribute, "[#stablehlo<precision HIGHEST>, #stablehlo<precision HIGHEST>]";
-          context=ctx)
+    parse(
+    _RMLIR.IR.Attribute, "[#stablehlo<precision HIGHEST>, #stablehlo<precision HIGHEST>]";
+    context = ctx
+)
 
 # True when the op's precision_config already names HIGHEST for every operand.
 function _is_highest(op)
@@ -253,8 +255,12 @@ function assert_f32_pinned(mod::_RMLIR.IR.Module)
         _check_pinned_op(op, unpinned, opaque)
     end
     isempty(unpinned) ||
-        throw(ErrorException("numerics=f32 invariant violated: $(length(unpinned)) f32 matmul-class op(s) " *
-                             "remain at DEFAULT precision after pin_f32! ($(join(unique(unpinned), ", ")))"))
+        throw(
+        ErrorException(
+            "numerics=f32 invariant violated: $(length(unpinned)) f32 matmul-class op(s) " *
+                "remain at DEFAULT precision after pin_f32! ($(join(unique(unpinned), ", ")))"
+        )
+    )
     return (; opaque_ops = opaque)
 end
 
@@ -322,8 +328,10 @@ end
 # Compile and run the probe matmul under `numerics`, returning the C matrix. Everything device-side
 # is freed eagerly (see the block comment above on the scratch-probe interaction).
 function _run_probe_leg(backend, pool::MemoryPool, numerics::NumericsMode)
-    legpool = MemoryPool(pool.backend, pool.client, pool.device, pool.platform, pool.ctx,
-                         pool.autotune, numerics)
+    legpool = MemoryPool(
+        pool.backend, pool.client, pool.device, pool.platform, pool.ctx,
+        pool.autotune, numerics
+    )
     exec = compile_artifact(backend, legpool, _probe_artifact(pool.ctx), 2, 1)
     a = b = nothing
     outs = Any[]
@@ -372,8 +380,12 @@ function tf32_probe(backend, pool::MemoryPool)
         C = _run_probe_leg(backend, pool, NUMERICS_F32)
         pinned_exact = C == A
         pinned_exact ||
-            throw(ErrorException("numerics=f32 attestation failed: the pinned probe matmul did not " *
-                                 "reproduce exact f32 results on this device ($(pool.platform))"))
+            throw(
+            ErrorException(
+                "numerics=f32 attestation failed: the pinned probe matmul did not " *
+                    "reproduce exact f32 results on this device ($(pool.platform))"
+            )
+        )
     end
     @info "TF32 probe" numerics = pool.numerics tf32_active = tf32_active pinned_exact = pinned_exact
     return (; tf32_active, pinned_exact)

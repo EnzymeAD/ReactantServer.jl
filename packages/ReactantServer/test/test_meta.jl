@@ -12,14 +12,17 @@ function _meta_scale_model()
     sig = _RS.ModelSignature(["x"], DataType[Float32], ["w"], 1, ["y"], DataType[Float32], 0)
     weights = Any[_RS.MockBuffer(Float32[2, 2, 2, 2])]
     exec = _RS.MockExecutable(args -> [args[1] .* args[2]], 1)
-    return _RS.LoadedModel(sig, Dict{Int,Any}(0 => exec), weights)
+    return _RS.LoadedModel(sig, Dict{Int, Any}(0 => exec), weights)
 end
 
-_meta_manifest(name, calls) = _RS.parse_manifest(Dict{String,Any}(
-    "format_version" => "2.0", "name" => name, "kind" => "meta",
-    "meta" => Dict("calls" => collect(String, calls)),
-    "client_inputs" => [Dict("name" => "x", "dtype" => "f32", "shape" => "c", "dims" => Dict("c" => 4))],
-    "client_outputs" => [Dict("name" => "OUT", "dtype" => "f32", "shape" => "c", "dims" => Dict("c" => 4))]))
+_meta_manifest(name, calls) = _RS.parse_manifest(
+    Dict{String, Any}(
+        "format_version" => "2.0", "name" => name, "kind" => "meta",
+        "meta" => Dict("calls" => collect(String, calls)),
+        "client_inputs" => [Dict("name" => "x", "dtype" => "f32", "shape" => "c", "dims" => Dict("c" => 4))],
+        "client_outputs" => [Dict("name" => "OUT", "dtype" => "f32", "shape" => "c", "dims" => Dict("c" => 4))]
+    )
+)
 
 # A registry hosting the "scale" backbone, a started scheduler over it, and a QueueingCaller a meta
 # uses to run sub-models: each sub-call re-enters the started scheduler in-process (the loop dispatches
@@ -29,8 +32,10 @@ function _meta_local_caller()
     backend = _RS.MockBackend()
     pool = _RS.MemoryPool(backend, _RS.MockClient(), _RS.MockDevice(0), "mock", nothing)
     reg = _RS.ModelRegistry()
-    reg.by_name["scale"] = _RS.ModelEntry("scale", _trivial_manifest("scale"), Dict{Int,Vector{UInt8}}(),
-        "", nothing, _meta_scale_model(), nothing, identity, identity)
+    reg.by_name["scale"] = _RS.ModelEntry(
+        "scale", _trivial_manifest("scale"), Dict{Int, Vector{UInt8}}(),
+        "", nothing, _meta_scale_model(), nothing, identity, identity
+    )
     sched = _RS.Scheduler(reg, backend, pool, _RS.SchedulerConfig(30.0, 64, 30.0))
     _RS.start!(sched)
     return sched, _RS.QueueingCaller(sched, nothing)
@@ -46,9 +51,12 @@ end
     # A meta model requires model.jl.
     @test_throws _RS.ManifestError _RS.validate_manifest(m, "/tmp/detector", false)
     # client_inputs/outputs are mandatory for a meta model (no executable fallback).
-    @test_throws _RS.ManifestError _RS.parse_manifest(Dict{String,Any}(
-        "format_version" => "2.0", "name" => "d", "kind" => "meta",
-        "meta" => Dict("calls" => ["scale"]))) |> (m -> _RS.validate_manifest(m, "/tmp/d", true))
+    @test_throws _RS.ManifestError _RS.parse_manifest(
+        Dict{String, Any}(
+            "format_version" => "2.0", "name" => "d", "kind" => "meta",
+            "meta" => Dict("calls" => ["scale"])
+        )
+    ) |> (m -> _RS.validate_manifest(m, "/tmp/d", true))
     # A meta model may not list itself.
     @test_throws _RS.ManifestError _RS.validate_manifest(_meta_manifest("d", ["d"]), "/tmp/d", true)
     # A compute-only meta model may declare an empty calls list (does all work in Julia).
@@ -98,8 +106,10 @@ end
 
     # No-pool caller: buffers are backed by fresh heap Memory.
     sched, _ = _meta_local_caller()
-    out = _RS.run_meta(meta, _RS.QueueingCaller(sched, nothing),
-                       [_RS.NamedTensor("x", Float32[1, 2, 3, 4])])
+    out = _RS.run_meta(
+        meta, _RS.QueueingCaller(sched, nothing),
+        [_RS.NamedTensor("x", Float32[1, 2, 3, 4])]
+    )
     @test out[1].data == Float32[3, 5, 7, 9]
     _RS.shutdown!(sched)
 
@@ -165,29 +175,33 @@ end
 end
 
 # Write a minimal meta bundle (manifest.yaml + model.jl) under `root/name`.
-function _write_meta_bundle(root, name, calls; with_model_jl=true, run_body=nothing)
+function _write_meta_bundle(root, name, calls; with_model_jl = true, run_body = nothing)
     dir = joinpath(root, name)
     mkpath(dir)
     calls_yaml = "[" * join(calls, ", ") * "]"
-    write(joinpath(dir, "manifest.yaml"), """
-    format_version: "2.0"
-    name: $name
-    kind: meta
-    meta:
-      calls: $calls_yaml
-    client_inputs:
-      - {name: x, dtype: f32, shape: c, dims: {c: 4}}
-    client_outputs:
-      - {name: OUT, dtype: f32, shape: c, dims: {c: 4}}
-    """)
+    write(
+        joinpath(dir, "manifest.yaml"), """
+        format_version: "2.0"
+        name: $name
+        kind: meta
+        meta:
+          calls: $calls_yaml
+        client_inputs:
+          - {name: x, dtype: f32, shape: c, dims: {c: 4}}
+        client_outputs:
+          - {name: OUT, dtype: f32, shape: c, dims: {c: 4}}
+        """
+    )
     if with_model_jl
         body = run_body === nothing ?
             "_run(inputs, call) = [ReactantServer.NamedTensor(\"OUT\", call(\"scale\", inputs)[1].data .* 2)]" :
             run_body
-        write(joinpath(dir, "model.jl"), """
-        $body
-        register_meta_model("$name"; run=_run)
-        """)
+        write(
+            joinpath(dir, "model.jl"), """
+            $body
+            register_meta_model("$name"; run=_run)
+            """
+        )
     end
     return dir
 end
@@ -201,12 +215,14 @@ end
     @test entry.calls == ["scale"]
 
     # A meta bundle with no model.jl is rejected at load (validate_manifest enforces it).
-    bad = _write_meta_bundle(root, "no_jl", ["scale"]; with_model_jl=false)
+    bad = _write_meta_bundle(root, "no_jl", ["scale"]; with_model_jl = false)
     @test_throws _RS.ManifestError _RS.load_bundle_entry(bad)
 
     # A meta model.jl that calls register_model (not register_meta_model) is rejected.
-    wrongreg = _write_meta_bundle(root, "wrongreg", ["scale"];
-        run_body="register_model(\"wrongreg\")")
+    wrongreg = _write_meta_bundle(
+        root, "wrongreg", ["scale"];
+        run_body = "register_model(\"wrongreg\")"
+    )
     # The model.jl above never defines _run; register_model is called instead of register_meta_model.
     write(joinpath(wrongreg, "model.jl"), "register_model(\"wrongreg\")\n")
     @test_throws _RS.BundleError _RS.load_bundle_entry(wrongreg)
@@ -227,8 +243,10 @@ end
     backend = _RS.MockBackend()
     pool = _RS.MemoryPool(backend, _RS.MockClient(), _RS.MockDevice(0), "mock", nothing)
     reg = _RS.ModelRegistry()
-    reg.by_name["scale"] = _RS.ModelEntry("scale", _trivial_manifest("scale"), Dict{Int,Vector{UInt8}}(),
-        "", nothing, _meta_scale_model(), nothing, identity, identity)
+    reg.by_name["scale"] = _RS.ModelEntry(
+        "scale", _trivial_manifest("scale"), Dict{Int, Vector{UInt8}}(),
+        "", nothing, _meta_scale_model(), nothing, identity, identity
+    )
     run = (inputs, call) -> [_RS.NamedTensor("OUT", call("scale", inputs)[1].data .+ 1)]
     reg.meta["det"] = _RS.MetaEntry("det", _meta_manifest("det", ["scale"]), ["scale"], run)
     sched = _RS.Scheduler(reg, backend, pool, _RS.SchedulerConfig(30.0, 64, 30.0))
@@ -240,8 +258,10 @@ end
         @test out[1].data == Float32[3, 5, 7, 9]   # (x .* 2) .+ 1
         # A past-deadline meta request is dropped at admission (before taking a gate permit or running
         # the backbone) and surfaces as DeadlineExceeded.
-        past = _RS.InferRequest("det", String[], [_RS.NamedTensor("x", Float32[1, 2, 3, 4])],
-                                Int64(time_ns()) - Int64(1_000_000))
+        past = _RS.InferRequest(
+            "det", String[], [_RS.NamedTensor("x", Float32[1, 2, 3, 4])],
+            Int64(time_ns()) - Int64(1_000_000)
+        )
         @test_throws _RS.DeadlineExceeded _RS.infer(sched, past)
         # The meta's serving counters are recorded for the control plane (one successful run above).
         @test sched.registry.meta["det"].sched.requests_served == 1
@@ -270,10 +290,14 @@ end
     backend = _RS.MockBackend()
     pool = _RS.MemoryPool(backend, _RS.MockClient(), _RS.MockDevice(0), "mock", nothing)
     reg = _RS.ModelRegistry()
-    reg.by_name["scale"] = _RS.ModelEntry("scale", _trivial_manifest("scale"), Dict{Int,Vector{UInt8}}(),
-        "", nothing, _meta_scale_model(), nothing, identity, identity)
-    reg.by_name["other"] = _RS.ModelEntry("other", _trivial_manifest("other"), Dict{Int,Vector{UInt8}}(),
-        "", nothing, _meta_scale_model(), nothing, identity, identity)
+    reg.by_name["scale"] = _RS.ModelEntry(
+        "scale", _trivial_manifest("scale"), Dict{Int, Vector{UInt8}}(),
+        "", nothing, _meta_scale_model(), nothing, identity, identity
+    )
+    reg.by_name["other"] = _RS.ModelEntry(
+        "other", _trivial_manifest("other"), Dict{Int, Vector{UInt8}}(),
+        "", nothing, _meta_scale_model(), nothing, identity, identity
+    )
     gate_open = Channel{Nothing}(1)   # released by the test once the regular request has been served
     glue_entered = Channel{Nothing}(1)
     run = function (inputs, call)
@@ -286,8 +310,10 @@ end
     sched = _RS.Scheduler(reg, backend, pool, _RS.SchedulerConfig(30.0, 64, 30.0))
     _RS.start!(sched)
     try
-        meta_task = Threads.@spawn _RS.infer(sched,
-            _RS.InferRequest("det", String[], [_RS.NamedTensor("x", Float32[1, 2, 3, 4])]))
+        meta_task = Threads.@spawn _RS.infer(
+            sched,
+            _RS.InferRequest("det", String[], [_RS.NamedTensor("x", Float32[1, 2, 3, 4])])
+        )
         take!(glue_entered)                  # the meta is now parked in its glue, holding the gate
         # A regular request to another model is served while the meta holds the gate (GPU is free).
         ot = _RS.infer(sched, _RS.InferRequest("other", String[], [_RS.NamedTensor("x", Float32[5, 6, 7, 8])]))
@@ -307,8 +333,10 @@ end
     backend = _RS.MockBackend()
     pool = _RS.MemoryPool(backend, _RS.MockClient(), _RS.MockDevice(0), "mock", nothing)
     reg = _RS.ModelRegistry()
-    reg.by_name["scale"] = _RS.ModelEntry("scale", _trivial_manifest("scale"), Dict{Int,Vector{UInt8}}(),
-        "", nothing, _meta_scale_model(), nothing, identity, identity)
+    reg.by_name["scale"] = _RS.ModelEntry(
+        "scale", _trivial_manifest("scale"), Dict{Int, Vector{UInt8}}(),
+        "", nothing, _meta_scale_model(), nothing, identity, identity
+    )
     hold = Channel{Nothing}(1)
     entered = Channel{Nothing}(1)
     gpu_run = function (inputs, call)
@@ -325,8 +353,10 @@ end
     sched.meta_gate = _RS.MetaGate(1)
     _RS.start!(sched)
     try
-        gpu_task = Threads.@spawn _RS.infer(sched,
-            _RS.InferRequest("gpu_meta", String[], [_RS.NamedTensor("x", Float32[1, 2, 3, 4])]))
+        gpu_task = Threads.@spawn _RS.infer(
+            sched,
+            _RS.InferRequest("gpu_meta", String[], [_RS.NamedTensor("x", Float32[1, 2, 3, 4])])
+        )
         take!(entered)                              # the GPU meta now holds the only permit
         # The compute-only meta runs to completion despite the gate being fully held.
         co = _RS.infer(sched, _RS.InferRequest("compute_only", String[], [_RS.NamedTensor("x", Float32[1, 2, 3, 4])]))
@@ -346,8 +376,10 @@ end
     pool = _RS.MemoryPool(backend, _RS.MockClient(), _RS.MockDevice(0), "mock", nothing)
     reg = _RS.ModelRegistry()
     for nm in ("subA", "subB")
-        reg.by_name[nm] = _RS.ModelEntry(nm, _trivial_manifest(nm), Dict{Int,Vector{UInt8}}(),
-            "", nothing, _meta_scale_model(), nothing, identity, identity)
+        reg.by_name[nm] = _RS.ModelEntry(
+            nm, _trivial_manifest(nm), Dict{Int, Vector{UInt8}}(),
+            "", nothing, _meta_scale_model(), nothing, identity, identity
+        )
     end
     sched = _RS.Scheduler(reg, backend, pool, _RS.SchedulerConfig(30.0, 64, 30.0))
     now = time()
@@ -356,8 +388,8 @@ end
     end
     sched.running = true     # allow submit!; the dispatch loop is NOT started, so we select by hand
     x = [_RS.NamedTensor("x", Float32[1, 2, 3, 4])]
-    qrA = _RS.QueuedRequest(_RS.InferRequest("subA", String[], x); committed=true)
-    qrB = _RS.QueuedRequest(_RS.InferRequest("subB", String[], x); committed=true)
+    qrA = _RS.QueuedRequest(_RS.InferRequest("subA", String[], x); committed = true)
+    qrB = _RS.QueuedRequest(_RS.InferRequest("subB", String[], x); committed = true)
     _RS.submit!(sched, qrA)
     _RS.submit!(sched, qrB)
     @test length(sched.committed) == 2          # both retained; no single-slot overwrite

@@ -12,17 +12,21 @@ using ReactantServer
 const BUNDLES = abspath(normpath(joinpath(@__DIR__, "..", "bundles")))
 const EXPECTED = ("splade", "embedding", "cross_encoder", "sentiment")
 all(m -> isdir(joinpath(BUNDLES, m)), EXPECTED) ||
-    error("Missing bundles under $BUNDLES — run the export step first " *
-          "(examples/transformers/export/export_stablehlo.jl).")
+    error(
+    "Missing bundles under $BUNDLES — run the export step first " *
+        "(examples/transformers/export/export_stablehlo.jl)."
+)
 
 use_cpu = "--cpu" in ARGS
 port = parse(Int, get(ENV, "TX_PORT", "8080"))
 backend = use_cpu ? ReactantServer.CPU_BACKEND : ReactantServer.CUDA_BACKEND
 
-cfg = ReactantServer.ServerConfig([BUNDLES], "",
+cfg = ReactantServer.ServerConfig(
+    [BUNDLES], "",
     ReactantServer.RuntimeConfig(backend, 0, 0.9, true, true),
     ReactantServer.SchedulerConfig(30.0, 64, 30.0),
-    ReactantServer.EndpointsConfig("127.0.0.1", port))
+    ReactantServer.EndpointsConfig("127.0.0.1", port)
+)
 
 @info "Compiling and serving transformer bundles (Ctrl-C to stop)" port backend models = EXPECTED bundles = BUNDLES
 ReactantServer.serve(cfg; backend = ReactantServer.ReactantBackend())  # blocking

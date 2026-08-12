@@ -25,12 +25,16 @@ const VOCAB_SIZE = 30522
 
 function preprocess(inputs::Vector{NamedTensor})
     byname = Dict(t.name => t for t in inputs)
-    input_ids, attention_mask = BT.encode_text_batch(TOKENIZER,
+    input_ids, attention_mask = BT.encode_text_batch(
+        TOKENIZER,
         byname["texts"].data::Matrix{UInt8},             # (max_bytes, batch) col-major
         vec(byname["text_lens"].data);
-        max_len=MAX_LEN, buckets=SEQ_BUCKETS, lens_name="text_lens")
-    return NamedTensor[NamedTensor("input_ids", input_ids),
-                       NamedTensor("attention_mask", attention_mask)]
+        max_len = MAX_LEN, buckets = SEQ_BUCKETS, lens_name = "text_lens"
+    )
+    return NamedTensor[
+        NamedTensor("input_ids", input_ids),
+        NamedTensor("attention_mask", attention_mask),
+    ]
 end
 
 function postprocess(out::Vector{NamedTensor})
@@ -54,11 +58,13 @@ function postprocess(out::Vector{NamedTensor})
         end
         row_offsets[b + 1] = length(indices)
     end
-    return NamedTensor[NamedTensor("indices", indices),
-                       NamedTensor("values", values),
-                       NamedTensor("row_offsets", row_offsets)]
+    return NamedTensor[
+        NamedTensor("indices", indices),
+        NamedTensor("values", values),
+        NamedTensor("row_offsets", row_offsets),
+    ]
 end
 
 # The serving identity is the bundle directory's basename; register under it so the dated
 # bundle name lives in exactly one place.
-register_model(basename(@__DIR__); preprocess=preprocess, postprocess=postprocess)
+register_model(basename(@__DIR__); preprocess = preprocess, postprocess = postprocess)

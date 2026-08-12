@@ -40,7 +40,7 @@ function ReactantServerClient.infer_encode_chunk!(io::GoodIO, r, slot)
     v = pool_view(sub, Float32, n * 4)
     k = 1
     for i in r
-        v[k:k+3] .= io.data[i]
+        v[k:(k + 3)] .= io.data[i]
         k += 4
     end
     return [InferInput("INPUT__0", sub, [4, n], Float32)]   # Julia col-major: feature, batch last
@@ -161,7 +161,7 @@ end
         feats, mask = pool_view(inputs...)            # splat the descriptors, destructure the views
         @test feats isa Matrix{Float32} && mask isa Vector{Int32}
         feats .= reshape(collect(Float32, 1:12), 4, 3)
-        mask  .= Int32[7, 8, 9]
+        mask .= Int32[7, 8, 9]
 
         # Inline materialization builds the same wire tensors the manual InferInput path would.
         wire = ReactantServerClient._materialize_inputs(inputs, m, p)
@@ -224,10 +224,14 @@ end
         # Network sends row-major (N, ..., H, W); InferOutput reshapes directly to Julia order.
         data = collect(Float32, 1:6)
         raw = reinterpret(UInt8, data) |> collect
-        out = inference.var"ModelInferResponse.InferOutputTensor"(; name = "OUTPUT__0",
-            datatype = "FP32", shape = Int64[3, 2])
-        resp = inference.ModelInferResponse(; model_name = "m", id = "1",
-            outputs = [out], raw_output_contents = [raw])
+        out = inference.var"ModelInferResponse.InferOutputTensor"(;
+            name = "OUTPUT__0",
+            datatype = "FP32", shape = Int64[3, 2]
+        )
+        resp = inference.ModelInferResponse(;
+            model_name = "m", id = "1",
+            outputs = [out], raw_output_contents = [raw]
+        )
         got = InferOutput("OUTPUT__0", resp, Float32)
         @test size(got) == (2, 3)                        # reverse of wire shape (3, 2)
         @test vec(got) == data
@@ -250,8 +254,12 @@ end
     end
 
     @testset "item_output_bytes sums declared outputs" begin
-        io = _TestIO(10, 16, [OutputSpec("OUTPUT__0", Float32, [4]),     # 16 bytes/item
-                              OutputSpec("OUTPUT__1", UInt8, 2, 3)])     # 6 bytes/item
+        io = _TestIO(
+            10, 16, [
+                OutputSpec("OUTPUT__0", Float32, [4]),     # 16 bytes/item
+                OutputSpec("OUTPUT__1", UInt8, 2, 3),
+            ]
+        )     # 6 bytes/item
         @test item_output_bytes(io) == 16 + 6
         # Scalar (no per-item dims) counts as one element.
         @test item_output_bytes(_TestIO(1, 1, [OutputSpec("S", Float64, Int[])])) == 8
@@ -303,13 +311,19 @@ end
             sub = subslot(s, sizeof(data))
             pool_view(sub, Float32, length(data)) .= data             # server would write here
 
-            out = inference.var"ModelInferResponse.InferOutputTensor"(; name = "OUTPUT__0",
+            out = inference.var"ModelInferResponse.InferOutputTensor"(;
+                name = "OUTPUT__0",
                 datatype = "FP32", shape = Int64[3, 2],
-                parameters = Dict("shared_memory_region" => _strp(ReactantServerClient.pool_name(p)),
-                                  "shared_memory_offset" => _intp(sub.offset),
-                                  "shared_memory_byte_size" => _intp(sizeof(data))))
-            resp = inference.ModelInferResponse(; model_name = "m", id = "1",
-                outputs = [out], raw_output_contents = Vector{UInt8}[])
+                parameters = Dict(
+                    "shared_memory_region" => _strp(ReactantServerClient.pool_name(p)),
+                    "shared_memory_offset" => _intp(sub.offset),
+                    "shared_memory_byte_size" => _intp(sizeof(data))
+                )
+            )
+            resp = inference.ModelInferResponse(;
+                model_name = "m", id = "1",
+                outputs = [out], raw_output_contents = Vector{UInt8}[]
+            )
 
             norm = ReactantServerClient._rehydrate_response(resp, Dict("OUTPUT__0" => sub))
             @test length(norm.raw_output_contents) == 1
@@ -336,15 +350,22 @@ end
             inline_data = collect(Float32, 1:4)
             inline_raw = collect(reinterpret(UInt8, inline_data))
             inline_out = inference.var"ModelInferResponse.InferOutputTensor"(;
-                name = "INLINE", datatype = "FP32", shape = Int64[4])
-            shm_out = inference.var"ModelInferResponse.InferOutputTensor"(; name = "SHM",
+                name = "INLINE", datatype = "FP32", shape = Int64[4]
+            )
+            shm_out = inference.var"ModelInferResponse.InferOutputTensor"(;
+                name = "SHM",
                 datatype = "FP32", shape = Int64[4],
-                parameters = Dict("shared_memory_region" => _strp(ReactantServerClient.pool_name(p)),
-                                  "shared_memory_offset" => _intp(sub.offset),
-                                  "shared_memory_byte_size" => _intp(sizeof(shm_data))))
+                parameters = Dict(
+                    "shared_memory_region" => _strp(ReactantServerClient.pool_name(p)),
+                    "shared_memory_offset" => _intp(sub.offset),
+                    "shared_memory_byte_size" => _intp(sizeof(shm_data))
+                )
+            )
             # outputs has two entries; raw holds only the inline one (compressed).
-            resp = inference.ModelInferResponse(; model_name = "m", id = "1",
-                outputs = [inline_out, shm_out], raw_output_contents = [inline_raw])
+            resp = inference.ModelInferResponse(;
+                model_name = "m", id = "1",
+                outputs = [inline_out, shm_out], raw_output_contents = [inline_raw]
+            )
 
             norm = ReactantServerClient._rehydrate_response(resp, Dict("SHM" => sub))
             @test length(norm.raw_output_contents) == 2
@@ -415,25 +436,27 @@ end
         # Hermetic: write a tiny manifest and load it (no bundle directory needed).
         dir = mktempdir()
         path = joinpath(dir, "manifest.yaml")
-        write(path, """
-        format_version: "2.0"
-        name: "tinymodel"
-        executable_inputs:
-          - name: "INPUT__0"
-            dtype: "f32"
-            shape: "wcn"
-            dims:
-              w: 4
-              c: 3
-        executable_outputs:
-          - name: "OUTPUT__0"
-            dtype: "f32"
-            shape: "wn"
-            dims:
-              w: 4
-        batching:
-          compiled_batch_sizes: [1]
-        """)
+        write(
+            path, """
+            format_version: "2.0"
+            name: "tinymodel"
+            executable_inputs:
+              - name: "INPUT__0"
+                dtype: "f32"
+                shape: "wcn"
+                dims:
+                  w: 4
+                  c: 3
+            executable_outputs:
+              - name: "OUTPUT__0"
+                dtype: "f32"
+                shape: "wn"
+                dims:
+                  w: 4
+            batching:
+              compiled_batch_sizes: [1]
+            """
+        )
         spec = manifest_io_spec(path)
         # The spec reports Julia col-major shapes, reading in the same axis order as the manifest
         # einsum letters ("wcn" -> (w, c, n)); the batch letter n is -1.
@@ -519,15 +542,20 @@ end
 
     @testset "validation catches dtype and shape mismatches with a reversal hint" begin
         # Wrong declared dtype. Model shape is Julia col-major (feature 4, batch last).
-        spec = ModelIOSpec(Dict{String,TensorMeta}(),
-            Dict("O" => TensorMeta("O", "FP32", [4, -1])), String[], ["O"])
+        spec = ModelIOSpec(
+            Dict{String, TensorMeta}(),
+            Dict("O" => TensorMeta("O", "FP32", [4, -1])), String[], ["O"]
+        )
         @test_throws ErrorException ReactantServerClient._validate_output_specs(
-            spec, [OutputSpec("O", Float64, [4])])
+            spec, [OutputSpec("O", Float64, [4])]
+        )
 
         # 2-D per-item output: declaring the axis order reversed is rejected with a hint, while the
         # correct column-major declaration passes. Model col-major shape (4, 3, batch).
-        spec2 = ModelIOSpec(Dict{String,TensorMeta}(),
-            Dict("O" => TensorMeta("O", "FP32", [4, 3, -1])), String[], ["O"])
+        spec2 = ModelIOSpec(
+            Dict{String, TensorMeta}(),
+            Dict("O" => TensorMeta("O", "FP32", [4, 3, -1])), String[], ["O"]
+        )
         @test ReactantServerClient._validate_output_specs(spec2, [OutputSpec("O", Float32, [4, 3])]) === nothing
         err = try
             ReactantServerClient._validate_output_specs(spec2, [OutputSpec("O", Float32, [3, 4])])
@@ -562,8 +590,10 @@ end
     @test m2.max_receive_message_length == 456
 
     # The env var supplies the default when the kwarg is omitted (per direction); a kwarg still wins.
-    withenv("REACTANT_CLIENT_GRPC_MAX_RECV_MSG_BYTES" => "4096",
-            "REACTANT_CLIENT_GRPC_MAX_SEND_MSG_BYTES" => "8192") do
+    withenv(
+        "REACTANT_CLIENT_GRPC_MAX_RECV_MSG_BYTES" => "4096",
+        "REACTANT_CLIENT_GRPC_MAX_SEND_MSG_BYTES" => "8192"
+    ) do
         me = KServeModel("grpc://h:1", "x")
         @test me.max_receive_message_length == 4096
         @test me.max_send_message_length == 8192
@@ -591,8 +621,10 @@ end
     @test !RSC._retryable_shed(ErrorException("x"), p)
     # With retry_unavailable off, RESOURCE_EXHAUSTED is still retried but UNAVAILABLE is not.
     @test RSC._retryable_shed(shed(), RSC.RetryPolicy(retry_unavailable = false))
-    @test !RSC._retryable_shed(RSC.gRPCClient.gRPCServiceCallException(RSC.gRPCClient.GRPC_UNAVAILABLE, ""),
-                               RSC.RetryPolicy(retry_unavailable = false))
+    @test !RSC._retryable_shed(
+        RSC.gRPCClient.gRPCServiceCallException(RSC.gRPCClient.GRPC_UNAVAILABLE, ""),
+        RSC.RetryPolicy(retry_unavailable = false)
+    )
 
     fast = RSC.RetryPolicy(; initial_backoff = 0.02, factor = 2.0, jitter = false, min_budget = 0.01)
 
@@ -621,7 +653,9 @@ end
     t0 = time()
     n = Ref(0)
     err = try
-        RSC._infer_with_retry(m) do _; n[] += 1; throw(shed()); end
+        RSC._infer_with_retry(m) do _
+            n[] += 1; throw(shed())
+        end
         nothing
     catch e
         e
@@ -636,7 +670,9 @@ end
     d_attempts = Ref(0)
     d_budget = Ref(0.0)
     try
-        RSC._infer_with_retry(md) do b; d_attempts[] += 1; d_budget[] = b; throw(shed()); end
+        RSC._infer_with_retry(md) do b
+            d_attempts[] += 1; d_budget[] = b; throw(shed())
+        end
     catch
     end
     @test d_attempts[] == 1

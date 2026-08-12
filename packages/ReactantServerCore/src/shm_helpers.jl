@@ -25,17 +25,17 @@ WrappedCArray(shm::SharedMemory, ::Type{T}, shape) where {T} = WrappedArray(shm,
 
 # Public version of Base.FastContiguousSubArray{T}
 const MemCopySafeSubArray = SubArray{
-    T,N,P,I,true,
-} where {T,N,P,I<:Union{Tuple{Vararg{Real}},Tuple{AbstractUnitRange,Vararg{Any}}}}
+    T, N, P, I, true,
+} where {T, N, P, I <: Union{Tuple{Vararg{Real}}, Tuple{AbstractUnitRange, Vararg{Any}}}}
 
-const MemCopySafeReshapedArray{T,N} = Base.ReshapedArray{
-    T,N,P,Tuple{},
-} where {P<:Union{DenseArray{T},MemCopySafeSubArray{T}}}
+const MemCopySafeReshapedArray{T, N} = Base.ReshapedArray{
+    T, N, P, Tuple{},
+} where {P <: Union{DenseArray{T}, MemCopySafeSubArray{T}}}
 
 # All array types contiguous in memory (safe to use with unsafe_copyto!).
-const MemCopySafeArray{T,N} = Union{
-    DenseArray{T,N},MemCopySafeSubArray{T,N},MemCopySafeReshapedArray{T,N},
-} where {T,N}
+const MemCopySafeArray{T, N} = Union{
+    DenseArray{T, N}, MemCopySafeSubArray{T, N}, MemCopySafeReshapedArray{T, N},
+} where {T, N}
 
 memcpy_safe_arr_n_bytes(a::MemCopySafeArray) = Base.checked_mul(length(a), Base.elsize(typeof(a)))
 
@@ -44,7 +44,7 @@ memcpy_safe_arr_n_bytes(a::MemCopySafeArray) = Base.checked_mul(length(a), Base.
 # out from under the Memory while the alias is in use. Keyed by objectid(mem) rather than `mem`
 # itself: an IdDict{Memory,...} would hold the Memory strongly as a key, preventing its
 # finalizer from ever running and leaking the dict entry.
-const _SHM_KEEPALIVE = Dict{UInt,SharedMemory}()
+const _SHM_KEEPALIVE = Dict{UInt, SharedMemory}()
 const _SHM_KEEPALIVE_LOCK = ReentrantLock()
 
 # Wrap a SHM region as a Memory{T} that aliases the SHM bytes. own=false because IPC owns the
@@ -78,7 +78,7 @@ function memory_from_bytes(bytes::AbstractVector{UInt8}, ::Type{T}, n_elem::Inte
 end
 
 # Adopt an existing Memory as the storage of a FixedSizeArray without copying.
-fsa_from_memory(mem::Memory{T}, size::NTuple{N,<:Integer}) where {T,N} =
+fsa_from_memory(mem::Memory{T}, size::NTuple{N, <:Integer}) where {T, N} =
     FixedSizeArrays.new_fixed_size_array(mem, map(Int, size))
 
-fsa_from_memory(mem::Memory{T}, size::Vararg{Integer,N}) where {T,N} = fsa_from_memory(mem, size)
+fsa_from_memory(mem::Memory{T}, size::Vararg{Integer, N}) where {T, N} = fsa_from_memory(mem, size)

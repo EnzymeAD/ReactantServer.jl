@@ -21,13 +21,13 @@ module BertText
 # --- tokenizer ---
 
 struct BertTokenizer
-    vocab::Dict{String,Int32}          # token -> 0-based id (KServe wire ids match HF)
+    vocab::Dict{String, Int32}          # token -> 0-based id (KServe wire ids match HF)
     unk_id::Int32
     cls_id::Int32
     sep_id::Int32
     pad_id::Int32
     max_input_chars_per_word::Int
-    specials::Vector{Pair{String,Int32}}   # matched verbatim in raw text, pre-normalization
+    specials::Vector{Pair{String, Int32}}   # matched verbatim in raw text, pre-normalization
 end
 
 """
@@ -35,15 +35,17 @@ end
 
 Load a HuggingFace `vocab.txt` (one token per line, line number - 1 is the id).
 """
-function load_tokenizer(vocab_path::AbstractString; max_input_chars_per_word::Int=100)
-    vocab = Dict{String,Int32}()
+function load_tokenizer(vocab_path::AbstractString; max_input_chars_per_word::Int = 100)
+    vocab = Dict{String, Int32}()
     for (i, line) in enumerate(eachline(vocab_path))
         vocab[line] = Int32(i - 1)
     end
     id(tok) = get(() -> error("vocab has no $tok"), vocab, tok)
     specials = [tok => id(tok) for tok in ("[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]") if haskey(vocab, tok)]
-    return BertTokenizer(vocab, id("[UNK]"), id("[CLS]"), id("[SEP]"), id("[PAD]"),
-                         max_input_chars_per_word, specials)
+    return BertTokenizer(
+        vocab, id("[UNK]"), id("[CLS]"), id("[SEP]"), id("[PAD]"),
+        max_input_chars_per_word, specials
+    )
 end
 
 # --- character classes (utf8proc category codes via Base.Unicode) ---
@@ -77,15 +79,15 @@ end
 function _is_cjk(c::Char)
     u = UInt32(c)
     return (0x4E00 <= u <= 0x9FFF) || (0x3400 <= u <= 0x4DBF) ||
-           (0x20000 <= u <= 0x2A6DF) || (0x2A700 <= u <= 0x2B73F) ||
-           (0x2B740 <= u <= 0x2B81F) || (0x2B820 <= u <= 0x2CEAF) ||
-           (0xF900 <= u <= 0xFAFF) || (0x2F800 <= u <= 0x2FA1F)
+        (0x00020000 <= u <= 0x0002A6DF) || (0x0002A700 <= u <= 0x0002B73F) ||
+        (0x0002B740 <= u <= 0x0002B81F) || (0x0002B820 <= u <= 0x0002CEAF) ||
+        (0xF900 <= u <= 0xFAFF) || (0x0002F800 <= u <= 0x0002FA1F)
 end
 
 # --- BertNormalizer, in HF's order: clean_text, CJK spacing, strip accents, lowercase ---
 
 function _normalize(s::AbstractString)
-    io = IOBuffer(sizehint=ncodeunits(s) + 16)
+    io = IOBuffer(sizehint = ncodeunits(s) + 16)
     for c in s
         (c == '\0' || c == '�' || _is_control(c)) && continue
         if _is_cjk(c)
@@ -95,7 +97,7 @@ function _normalize(s::AbstractString)
         end
     end
     nfd = Base.Unicode.normalize(String(take!(io)), :NFD)
-    io = IOBuffer(sizehint=ncodeunits(nfd))
+    io = IOBuffer(sizehint = ncodeunits(nfd))
     for c in nfd
         Base.Unicode.category_code(c) == _CAT_MN || write(io, c)
     end
@@ -193,7 +195,7 @@ end
 
 `[CLS] text [SEP]`, truncated on the right to `max_len` total. token_type_ids are all zero.
 """
-function encode_single(t::BertTokenizer, text::AbstractString; max_len::Int=512)
+function encode_single(t::BertTokenizer, text::AbstractString; max_len::Int = 512)
     ids = _tokenize(t, text)
     keep = max_len - 2
     length(ids) > keep && resize!(ids, keep)
@@ -209,9 +211,9 @@ with the odd token removed from the originally shorter side (ties treat `b` as l
 An empty `b` string falls back to the single encoding, matching transformers' falsy
 `text_pair` handling.
 """
-function encode_pair(t::BertTokenizer, a::AbstractString, b::AbstractString; max_len::Int=512)
+function encode_pair(t::BertTokenizer, a::AbstractString, b::AbstractString; max_len::Int = 512)
     if isempty(b)
-        ids = encode_single(t, a; max_len=max_len)
+        ids = encode_single(t, a; max_len = max_len)
         return ids, zeros(Int32, length(ids))
     end
     ta = _tokenize(t, a)
@@ -262,8 +264,10 @@ wire_text(bytes::AbstractArray{UInt8}) = String(collect(UInt8, vec(bytes)))
 Decode a `(max_bytes, batch)` UInt8 matrix of zero-padded UTF-8 rows into `batch` Strings, using
 `lens[b]` as row `b`'s byte length. `lens_name` only names the offending tensor in error messages.
 """
-function wire_texts(texts::AbstractMatrix{UInt8}, lens::AbstractVector;
-                    lens_name::AbstractString="lens")
+function wire_texts(
+        texts::AbstractMatrix{UInt8}, lens::AbstractVector;
+        lens_name::AbstractString = "lens"
+    )
     B = size(texts, 2)
     length(lens) == B || error("$lens_name has $(length(lens)) entries for $B text rows")
     out = Vector{String}(undef, B)
@@ -284,8 +288,10 @@ function _bucket_for(encoded::AbstractVector{<:AbstractVector}, buckets)
     end
     seq = seq_bucket(maxlen, buckets)
     maxlen <= seq ||
-        error("encoded $maxlen tokens but the largest sequence bucket is $seq; lower max_len " *
-              "to the largest bucket or compile a longer one")
+        error(
+        "encoded $maxlen tokens but the largest sequence bucket is $seq; lower max_len " *
+            "to the largest bucket or compile a longer one"
+    )
     return seq
 end
 
@@ -312,8 +318,10 @@ end
 
 Pair-encoding form of [`pad_batch`](@ref): each entry is an `(ids, type_ids)` tuple.
 """
-function pad_batch(encoded::AbstractVector{<:Tuple{AbstractVector{Int32},AbstractVector{Int32}}},
-                   buckets)
+function pad_batch(
+        encoded::AbstractVector{<:Tuple{AbstractVector{Int32}, AbstractVector{Int32}}},
+        buckets
+    )
     B = length(encoded)
     seq = _bucket_for([e[1] for e in encoded], buckets)
     input_ids = zeros(Int64, seq, B)
@@ -338,10 +346,12 @@ One-text-per-row preprocess: decode the `(max_bytes, batch)` UInt8 rows, encode 
 `[CLS] text [SEP]`, and pad to the smallest bucket that fits. Both outputs are `(seq, batch)`
 Int64 matrices ready to hand back as executable inputs.
 """
-function encode_text_batch(t::BertTokenizer, texts::AbstractMatrix{UInt8}, lens::AbstractVector;
-                           max_len::Int=512, buckets=(512,), lens_name::AbstractString="lens")
-    rows = wire_texts(texts, lens; lens_name=lens_name)
-    encoded = [encode_single(t, s; max_len=max_len) for s in rows]
+function encode_text_batch(
+        t::BertTokenizer, texts::AbstractMatrix{UInt8}, lens::AbstractVector;
+        max_len::Int = 512, buckets = (512,), lens_name::AbstractString = "lens"
+    )
+    rows = wire_texts(texts, lens; lens_name = lens_name)
+    encoded = [encode_single(t, s; max_len = max_len) for s in rows]
     return pad_batch(encoded, buckets)
 end
 
@@ -353,11 +363,13 @@ Cross-encoder preprocess: score one `query` against every row of the `(max_bytes
 `keys` matrix, encoding each as `[CLS] query [SEP] key [SEP]` with LongestFirst truncation. An
 empty key row falls back to the single encoding (all-zero token_type_ids), matching HF.
 """
-function encode_pair_batch(t::BertTokenizer, query::AbstractString, keys::AbstractMatrix{UInt8},
-                           lens::AbstractVector; max_len::Int=512, buckets=(512,),
-                           lens_name::AbstractString="lens")
-    rows = wire_texts(keys, lens; lens_name=lens_name)
-    encoded = [encode_pair(t, query, key; max_len=max_len) for key in rows]
+function encode_pair_batch(
+        t::BertTokenizer, query::AbstractString, keys::AbstractMatrix{UInt8},
+        lens::AbstractVector; max_len::Int = 512, buckets = (512,),
+        lens_name::AbstractString = "lens"
+    )
+    rows = wire_texts(keys, lens; lens_name = lens_name)
+    encoded = [encode_pair(t, query, key; max_len = max_len) for key in rows]
     return pad_batch(encoded, buckets)
 end
 

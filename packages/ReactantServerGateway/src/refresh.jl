@@ -21,14 +21,16 @@ mutable struct RouteRefresher
     routes::DiscoveredRoutes
     metrics::GatewayMetrics
     lock::ReentrantLock
-    inflight::Union{Task,Nothing}   # the in-progress scan, shared by concurrent callers
+    inflight::Union{Task, Nothing}   # the in-progress scan, shared by concurrent callers
     last_refresh::Float64           # time() of the last completed scan (0.0 = never), for rate limiting
     min_interval::Float64           # floor between forced scans; storm guard
     scans::Int                      # total scans performed (observability / tests)
 end
 
-RouteRefresher(pool::ClientPool, routes::DiscoveredRoutes, metrics::GatewayMetrics;
-               min_interval::Real = REFRESH_MIN_INTERVAL_SECONDS) =
+RouteRefresher(
+    pool::ClientPool, routes::DiscoveredRoutes, metrics::GatewayMetrics;
+    min_interval::Real = REFRESH_MIN_INTERVAL_SECONDS
+) =
     RouteRefresher(pool, routes, metrics, ReentrantLock(), nothing, 0.0, Float64(min_interval), 0)
 
 # Spawn a discovery scan. The caller must hold `r.lock`. The scan runs `discover_routes`, swaps the
