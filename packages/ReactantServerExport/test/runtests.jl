@@ -346,8 +346,8 @@ _load_manifest(dir) = ReactantServer.parse_manifest(
                 jit_model.eval()
 
                 example = zeros(Float32, 4, 4, 3, 1)   # (W, H, C, batch) Julia = (batch, C, H, W) PyTorch
-                export_torchscript_bundle(
-                    pt_path, (example,);
+                export_bundle(
+                    :torchscript, pt_path, (example,);
                     dir = joinpath(root, "tinyconv"), name = "tinyconv",
                     input_names = ["input"], batch_sizes = [1, 2]
                 )

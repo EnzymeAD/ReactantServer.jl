@@ -40,8 +40,8 @@ float32 instead of colliding with float32 operands, while real float64 tensors a
 preserved.
 
 For TorchScript artifacts (`.pt` files produced by `torch.jit.script` or
-`torch.jit.trace`), use `export_torchscript_bundle` instead. It applies three
-workarounds before delegating to `export_bundle`: it re-wraps parameters as
+`torch.jit.trace`), use `export_bundle(:torchscript, ...)` instead. It applies three
+workarounds before delegating to the `:pytorch` frontend: it re-wraps parameters as
 `torch.nn.Parameter` (TorchScript stores them as bare tensors), registers a
 torchax handler for the deprecated `aten._convolution.default` overload that
 JIT graphs emit, and wraps the `ScriptModule` as a plain `nn.Module` so
@@ -52,7 +52,7 @@ module PyTorchExportExt
 
 using PythonCall
 import ReactantServerExport
-import ReactantServerExport: export_bundle, export_torchscript_bundle, _pyimports,
+import ReactantServerExport: export_bundle, _pyimports,
     _numpy_to_julia, _numpy_dtype_to_julia, _julia_to_numpy_dtype
 
 
@@ -180,7 +180,7 @@ function _pyimports()
     return
 end
 
-# TorchScript-specific shims for export_torchscript_bundle. Concerns:
+# TorchScript-specific shims for the `:torchscript` frontend. Concerns:
 #   1. JIT modules store parameters as plain `torch.Tensor` with a flag, but
 #      `torch.export`'s verifier requires real `torch.nn.Parameter`. Walk the
 #      module tree and re-wrap each leaf parameter.
@@ -670,13 +670,13 @@ function _try_version_of(name::AbstractString)
 end
 
 """
-    export_torchscript_bundle(pt_path::AbstractString, example_inputs::Tuple; ...)
-    export_torchscript_bundle(jit_module::Py, example_inputs::Tuple; ...)
+    export_bundle(:torchscript, pt_path::AbstractString, example_inputs::Tuple; ...)
+    export_bundle(:torchscript, jit_module::Py, example_inputs::Tuple; ...)
 
 Convert a TorchScript model (`.pt` file from `torch.jit.script` or
 `torch.jit.trace`) into a server bundle. Applies the three TorchScript-only
-workarounds described in the module docstring, then delegates to
-`export_bundle` with `strict=false`. The path overload loads the `.pt` via
+workarounds described in the module docstring, then delegates to the
+`:pytorch` frontend with `strict=false`. The path overload loads the `.pt` via
 `torch.jit.load(pt_path; map_location)` and records `torchscript_path` in
 provenance. The module overload accepts a pre-loaded `ScriptModule` (useful
 for in-memory scripts/traces or custom load options).
@@ -693,8 +693,8 @@ handler) are applied to `jit_module` before `wrap` is called.
 dense executable outputs into different client outputs (e.g. a variable detection count, encoded
 with `-1` for that axis). When you pass these you must also copy a `model.jl` into `dir`.
 """
-function export_torchscript_bundle(
-        pt_path::AbstractString,
+function export_bundle(
+        ::Val{:torchscript}, pt_path::AbstractString,
         example_inputs::Tuple;
         dir::AbstractString,
         name::AbstractString,
@@ -716,8 +716,8 @@ function export_torchscript_bundle(
         Dict{String, Any}("torchscript_path" => String(pt_path)),
         Dict{String, Any}(provenance)
     )
-    return export_torchscript_bundle(
-        jit_mod, example_inputs;
+    return export_bundle(
+        Val(:torchscript), jit_mod, example_inputs;
         dir = dir, name = name, input_names = input_names,
         output_name = output_name, output_names = output_names,
         batch_sizes = batch_sizes, shape_variants = shape_variants, matmul_precision = matmul_precision,
@@ -726,8 +726,8 @@ function export_torchscript_bundle(
     )
 end
 
-function export_torchscript_bundle(
-        jit_module::Py, example_inputs::Tuple;
+function export_bundle(
+        ::Val{:torchscript}, jit_module::Py, example_inputs::Tuple;
         dir::AbstractString,
         name::AbstractString,
         input_names = nothing,
