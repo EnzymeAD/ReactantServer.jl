@@ -135,9 +135,9 @@ export_bundle(:pytorch, model, (example_input,);
 
 The `:lux` and `:pytorch` frontends trace once per requested batch size and write a server-loadable
 bundle. The batch dimension is the last Julia axis (the leading PyTorch axis after the row-major /
-column-major reversal). `export_torchscript_bundle` exports a TorchScript artifact (a `.pt` file or
-a loaded `ScriptModule`) through the same extension; without `PythonCall` the `:pytorch` call fails
-with a message directing you to load it.
+column-major reversal). `export_bundle(:torchscript, ...)` exports a TorchScript artifact (a `.pt`
+file or a loaded `ScriptModule`) through the same extension; without `PythonCall` the `:pytorch`
+and `:torchscript` calls fail with a message directing you to load it.
 
 ### write_bundle and IOSpec
 

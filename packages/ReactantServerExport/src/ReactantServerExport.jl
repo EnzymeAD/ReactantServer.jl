@@ -9,8 +9,9 @@ server by the round-trip tests.
 
 `write_bundle`/`IOSpec` are the low-level writer. `export_bundle` traces a Reactant model (the
 former `LuxExport`; it needs only Reactant, not Lux). PyTorch support
-(`export_bundle(model, ::Tuple)` and `export_torchscript_bundle`) lives in a package extension
-that loads when `PythonCall` is present — `using ReactantServerExport, PythonCall` enables it.
+(`export_bundle(:pytorch, ...)` and `export_bundle(:torchscript, ...)`) lives in a package
+extension that loads when `PythonCall` is present — `using ReactantServerExport, PythonCall`
+enables it.
 """
 module ReactantServerExport
 
@@ -23,7 +24,7 @@ using Dates
 const MLIR = Reactant.MLIR
 const Compiler = Reactant.Compiler
 
-export IOSpec, write_bundle, export_bundle, export_torchscript_bundle, collect_provenance
+export IOSpec, write_bundle, export_bundle, collect_provenance
 
 # ============================================================================
 # Provenance
@@ -409,6 +410,8 @@ export_bundle(frontend::Symbol, args...; kwargs...) = export_bundle(Val(frontend
 # extension adds, so the real implementation wins once PythonCall is present).
 export_bundle(::Val{:pytorch}, args...; kwargs...) =
     error("ReactantServerExport: `export_bundle(:pytorch, ...)` requires `using PythonCall` to load the extension")
+export_bundle(::Val{:torchscript}, args...; kwargs...) =
+    error("ReactantServerExport: `export_bundle(:torchscript, ...)` requires `using PythonCall` to load the extension")
 
 """
     export_bundle(:lux, model, ps, st, example_input; dir, name, input_name="input",
@@ -630,15 +633,6 @@ end
 # methods by the PythonCall-triggered PyTorchExportExt. Calling these without `using PythonCall`
 # raises a MethodError directing you to load PythonCall.
 # ============================================================================
-
-"""
-    export_torchscript_bundle(pt_path_or_module, example_inputs::Tuple; ...) -> dir
-
-Export a TorchScript artifact (a `.pt` file or a loaded `ScriptModule`) to a bundle. Provided
-by the package extension; load `PythonCall` to enable it.
-"""
-export_torchscript_bundle(args...; kwargs...) =
-    error("ReactantServerExport: `export_torchscript_bundle` requires `using PythonCall` to load the extension")
 
 function _pyimports end
 function _numpy_to_julia end

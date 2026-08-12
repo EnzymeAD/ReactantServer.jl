@@ -420,8 +420,8 @@ function convert_model(
     ex = Tuple(example_input(e) for e in inputs)
     out_dir = joinpath(output_root, bundle_name)
 
-    do_export(sizes) = ReactantServerExport.export_torchscript_bundle(
-        pt_path, ex;
+    do_export(sizes) = ReactantServerExport.export_bundle(
+        :torchscript, pt_path, ex;
         dir = out_dir, name = bundle_name,
         input_names = in_names,
         output_names = isempty(out_names) ? nothing : out_names,
