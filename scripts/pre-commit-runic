@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runic pre-commit hook: format the source tree with Runic and re-stage the result.
 #
-# Runs `runic --inplace packages docs examples tools` — everything tracked except
+# Runs `runic --inplace packages docs examples tools docker` — everything tracked except
 # `lib/`, which holds only the gRPCServer.jl submodule (formatted in its own repo).
 #
 # Requires the `runic` CLI (Julia >= 1.12 Pkg app):
@@ -18,13 +18,13 @@ if ! command -v runic >/dev/null 2>&1; then
     exit 0
 fi
 
-echo "pre-commit: formatting packages/docs/examples/tools with Runic..." >&2
-runic --inplace --diff packages docs examples tools
+echo "pre-commit: formatting packages/docs/examples/tools/docker with Runic..." >&2
+runic --inplace --diff packages docs examples tools docker
 status=$?
 
 # Re-stage the .jl files the formatter touched so the commit includes the formatted code.
 # (git ls-files never errors on empty matches, unlike `git add -u` with an unmatched
 # pathspec, so a dir with no .jl files can't silently skip the re-stage.)
-git ls-files -m -z -- packages docs examples tools | grep -z '\.jl$' | xargs -0 -r git add --
+git ls-files -m -z -- packages docs examples tools docker | grep -z '\.jl$' | xargs -0 -r git add --
 
 exit $status

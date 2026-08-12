@@ -7,7 +7,7 @@
 ## Formatting: Runic.jl
 
 **Format Julia source with [Runic.jl](https://github.com/fredrikekre/Runic.jl) before committing.**
-Run `runic --inplace packages docs examples tools` (all tracked source; `lib/` holds only the
+Run `runic --inplace packages docs examples tools docker` (all tracked source; `lib/` holds only the
 gRPCServer.jl submodule and is not formatted here). The pre-commit hook runs this automatically.
 
 ## Prose

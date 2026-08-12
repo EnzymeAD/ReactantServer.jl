@@ -62,7 +62,7 @@ useful for CI):
 runic --check .
 ```
 
-A pre-commit hook runs `runic --inplace packages docs examples tools` and re-stages the formatted
+A pre-commit hook runs `runic --inplace packages docs examples tools docker` and re-stages the formatted
 files, so commits never ship unformatted code. `.git/hooks/` is machine-local and not versioned;
 (re)install the hook in a fresh clone with:
 

@@ -56,8 +56,9 @@ function ready_from_response(body::AbstractVector{UInt8})
 end
 
 function probe(port::Int)
-    client = gRPCClient.gRPCServiceClient{Vector{UInt8},false,Vector{UInt8},false}(
-        "127.0.0.1", port, "/inference.GRPCInferenceService/ServerReady"; deadline = 5)
+    client = gRPCClient.gRPCServiceClient{Vector{UInt8}, false, Vector{UInt8}, false}(
+        "127.0.0.1", port, "/inference.GRPCInferenceService/ServerReady"; deadline = 5
+    )
     return try
         ready_from_response(gRPCClient.grpc_sync_request(client, UInt8[]))
     catch
@@ -69,9 +70,9 @@ function main()
     # The supervisor leaves its materialized node file (synthesized workers list) at the
     # conventional runtime path; prefer it so auto-detected workers are probed too.
     node_file = isfile("/run/reactantserver/node.yaml") && isempty(WORKER) ?
-                "/run/reactantserver/node.yaml" : NODE
-    node = YAML.load_file(node_file; dicttype = Dict{String,Any})
-    exit(any(probe, worker_ports(node, WORKER)) ? 0 : 1)
+        "/run/reactantserver/node.yaml" : NODE
+    node = YAML.load_file(node_file; dicttype = Dict{String, Any})
+    return exit(any(probe, worker_ports(node, WORKER)) ? 0 : 1)
 end
 
 main()
