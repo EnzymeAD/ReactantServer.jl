@@ -16,10 +16,11 @@ using YAML
 # Canonical dtype vocabulary (no transport, no Reactant).
 include("dtypes.jl")
 
-# KServe V2 protobuf messages (ProtoBuf only; gRPC service stubs are package-local).
+# KServe V2 protobuf messages (ProtoBuf only; the gRPC service codegen lives in the consumer
+# packages, which generate their own message types from the same proto files).
 include("proto/inference/inference.jl")
 
-# ReactantServer ControlService protobuf messages (worker control plane).
+# ReactantServer ControlService protobuf messages (ProtoBuf only; worker control plane).
 include("proto/control/control.jl")
 
 # Shared-memory primitives: aliasing helpers (vendored MMISHM) and the slot-allocated pool.
@@ -45,18 +46,6 @@ function __init__()
     return nothing
 end
 
-# Paths to the split gRPC service-stub source files. Core ships them but does not compile them
-# (so Core stays free of gRPCClient/gRPCServer). Consumer packages `include` the one they need
-# into a module that has done `using ReactantServerCore.inference`, so the bare message-type
-# references in the stubs resolve.
-const _PROTO_DIR = joinpath(@__DIR__, "proto", "inference")
-inference_client_stubs_path() = joinpath(_PROTO_DIR, "grpc_client_stubs.jl")
-inference_server_stubs_path() = joinpath(_PROTO_DIR, "grpc_server_stubs.jl")
-
-const _CONTROL_PROTO_DIR = joinpath(@__DIR__, "proto", "control")
-control_server_stubs_path() = joinpath(_CONTROL_PROTO_DIR, "control_server_stubs.jl")
-control_client_stubs_path() = joinpath(_CONTROL_PROTO_DIR, "control_client_stubs.jl")
-
 # ---- dtypes ----
 export DType, F16, F32, F64, BF16, F8E5M2, F8E4M3, I8, I16, I32, I64, U8, U16, U32, U64, BOOL
 export DTYPE_FROM_TOKEN, DTYPE_TO_TOKEN, DTYPE_TO_JULIA, JULIA_TO_DTYPE, DTYPE_TO_KSERVE, KSERVE_TO_DTYPE
@@ -65,8 +54,6 @@ export TritonType, KSERVE_OUTPUT_DTYPE_TABLE, KSERVE_OUTPUT_DTYPE_TABLE_REVERSE
 
 # ---- protobuf modules ----
 export inference, control
-export inference_client_stubs_path, inference_server_stubs_path
-export control_server_stubs_path, control_client_stubs_path
 
 # ---- shared-memory helpers ----
 export shm_key, WrappedFArray, WrappedCArray, MemCopySafeArray, memcpy_safe_arr_n_bytes

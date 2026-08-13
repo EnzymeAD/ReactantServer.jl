@@ -1195,3 +1195,9 @@ function PB._encoded_size(x::ModelControlStatusResponse)
     x.weight_cache_max_bytes != zero(UInt64) && (encoded_size += PB._encoded_size(x.weight_cache_max_bytes, 4))
     return encoded_size
 end
+
+# SERVICE: No codegen handlers registered
+#    GatewayControlService
+
+# SERVICE: No codegen handlers registered
+#    ControlService
