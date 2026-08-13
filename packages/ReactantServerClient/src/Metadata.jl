@@ -121,7 +121,7 @@ function manifest_io_spec(path::AbstractString)
     # A served model is named by its bundle directory; fall back to that when the manifest omits
     # the (informational) `name` field.
     name = isempty(manifest.name) ? basename(normpath(dirname(abspath(String(path))))) : manifest.name
-    resp = encode_model_metadata(name, manifest, "")
+    resp = encode_model_metadata(inference, name, manifest, "")
     return _parse_io_spec(resp)
 end
 

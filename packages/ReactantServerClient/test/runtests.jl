@@ -1,7 +1,7 @@
 using Test
 using ReactantServerClient
 import ReactantServerCore
-using ReactantServerCore: inference
+using ReactantServerClient: inference
 using ProtoBuf: OneOf
 
 # Minimal IO for exercising the driver helpers without a server. `specs` drives output_specs.
