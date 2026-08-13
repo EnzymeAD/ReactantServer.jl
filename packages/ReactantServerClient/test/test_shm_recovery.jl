@@ -45,7 +45,7 @@ function _region_of(t)
 end
 
 function _mk_server(st::MockState, port::Integer)
-    server = gRPCServer.GRPCServer(
+    server = gRPCServer.GRPCServerHTTPJl(
         "127.0.0.1", Int(port); context = st,
         max_message_size = 64 * 1024 * 1024
     )

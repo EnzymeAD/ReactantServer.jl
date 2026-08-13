@@ -405,7 +405,7 @@ function build_gateway_server(
         h2_initial_window_size::Integer = _H2_INITIAL_WINDOW_BYTES,
         h2_connection_window_size::Integer = _H2_CONNECTION_WINDOW_BYTES
     )
-    server = gRPCServer.GRPCServer(
+    server = gRPCServer.GRPCServerHTTPJl(
         host, Int(port);
         context = state,
         max_receive_message_length = cfg.max_recv_msg_bytes,

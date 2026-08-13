@@ -85,7 +85,7 @@ mutable struct MockWorker
 end
 
 function _mock_server(port::Integer, worker::MockWorker)
-    server = gRPCServer.GRPCServer("127.0.0.1", Int(port); context = worker)
+    server = gRPCServer.GRPCServerHTTPJl("127.0.0.1", Int(port); context = worker)
     ReactantServerGateway.register_GRPCInferenceService!(
         server;
         ServerReady = (ctx, req) -> GWInf.ServerReadyResponse(; ready = true),

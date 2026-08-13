@@ -906,7 +906,7 @@ AffMockWorker(name, models; discipline = "fifo", rows_per_request = 1, batch_at 
 )
 
 function _aff_server(port::Integer, w::AffMockWorker)
-    server = gRPCServer.GRPCServer("127.0.0.1", Int(port); context = w)
+    server = gRPCServer.GRPCServerHTTPJl("127.0.0.1", Int(port); context = w)
     GW.register_GRPCInferenceService!(
         server;
         ServerReady = (ctx, req) -> AInf.ServerReadyResponse(; ready = true),
