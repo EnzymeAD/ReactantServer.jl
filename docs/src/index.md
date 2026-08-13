@@ -85,13 +85,12 @@ through a gRPC control plane, without a restart.
 ## Install
 
 ReactantServer is not yet registered in the General registry, so installation is from the
-repository. The one build dependency beyond the workspace is a vendored gRPC server fork, pulled
-in as a git submodule:
+repository. The one build dependency beyond the workspace, the gRPC server, is sourced from the
+`s-celles-merge` branch of `github.com/csvance/gRPCServer.jl` through the workspace `[sources]`:
 
 ```
 git clone https://github.com/EnzymeAD/ReactantServer.jl
 cd ReactantServer.jl
-git submodule update --init lib/gRPCServer.jl
 REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 ```
 

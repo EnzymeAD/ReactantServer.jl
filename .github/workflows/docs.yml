@@ -17,10 +17,6 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          # The docs environment resolves ReactantServer's vendored gRPC
-          # backend from lib/gRPCServer.jl, a git submodule.
-          submodules: recursive
       - uses: julia-actions/setup-julia@v2
         with:
           version: '1.12'

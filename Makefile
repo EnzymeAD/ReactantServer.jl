@@ -17,7 +17,7 @@ JULIA      ?= julia
 
 all: help
 
-## image: build the reactantserver node image (needs lib/gRPCServer.jl + a local Manifest.toml; see docker/README.md)
+## image: build the reactantserver node image (needs a local Manifest.toml; gRPCServer resolves from GitHub, see docker/README.md)
 image:
 	$(ENGINE) build -f docker/Dockerfile -t $(NODE_IMAGE) .
 

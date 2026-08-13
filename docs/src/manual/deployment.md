@@ -108,7 +108,6 @@ A container image is an alternative to running the supervisor directly. It runs 
 (supervisor + workers + embedded gateway) with the same `:8001`/`:8002` interface:
 
 ```bash
-git submodule update --init lib/gRPCServer.jl
 REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1 julia --project=. -e 'using Pkg; Pkg.instantiate()'  # Manifest.toml is gitignored
 make image        # or: docker build -f docker/Dockerfile -t reactantserver .
 REACTANTSERVER_MODELS=/path/to/bundles docker compose up

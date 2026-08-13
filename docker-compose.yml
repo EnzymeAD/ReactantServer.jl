@@ -4,7 +4,6 @@
 # line prefixes. Adding a GPU to the host means adding nothing here.
 #
 # Prerequisites:
-#   - git submodule update --init lib/gRPCServer.jl
 #   - NVIDIA Container Toolkit on the host for GPU access
 #   - a locally generated Manifest.toml in the build context (it is gitignored; see docker/README.md)
 #   - a model bundle repository on the host; point REACTANTSERVER_MODELS at it (defaults to ./bundles)
