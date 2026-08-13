@@ -22,3 +22,6 @@ Manifest-v*.toml
 /docs/node_modules/
 # Subagent working artifacts.
 /.pi-subagents/
+
+# Local (uncommitted) agent skills, installed from ~/Git/gRPCServer.jl/skills.
+/.pi/
