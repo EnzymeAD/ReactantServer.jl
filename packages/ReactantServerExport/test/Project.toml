@@ -23,3 +23,6 @@ ReactantServer = {path = "../../ReactantServer"}
 ReactantServerCore = {path = "../../ReactantServerCore"}
 ReactantServerExport = {path = ".."}
 gRPCServer = {url = "https://github.com/csvance/gRPCServer.jl", rev = "s-celles-merge"}
+
+[compat]
+gRPCClient = "1.1.0"

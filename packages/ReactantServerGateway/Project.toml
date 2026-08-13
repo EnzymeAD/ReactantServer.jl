@@ -33,4 +33,3 @@ test = ["Test", "Sockets", "Logging"]
 [sources]
 ReactantServerCore = {path = "../ReactantServerCore"}
 gRPCServer = {url = "https://github.com/csvance/gRPCServer.jl", rev = "s-celles-merge"}
-gRPCClient = {url = "https://github.com/JuliaIO/gRPCClient.jl", rev = "v1.1.0-rc2"}

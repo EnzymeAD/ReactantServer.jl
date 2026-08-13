@@ -24,6 +24,7 @@ gRPCServer = "608c6337-0d7d-447f-bb69-0f5674ee3959"
 [compat]
 Documenter = "1"
 DocumenterVitepress = "0.3"
+gRPCClient = "1.1.0"
 ReactantServer = "0.1"
 ReactantServerClient = "1"
 ReactantServerCore = "1"
