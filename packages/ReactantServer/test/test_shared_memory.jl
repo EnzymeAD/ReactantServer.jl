@@ -222,7 +222,7 @@ end
                 @test false
             catch ex
                 @test ex isa gRPCClient.gRPCServiceCallException
-                @test ex.grpc_status == ReactantServer._G.GRPC_FAILED_PRECONDITION
+                @test ex.grpc_status == Int(ReactantServer._G.StatusCode.FAILED_PRECONDITION)
             end
 
             # simulate a server restart: wipe the in-memory registry while the process keeps serving.
@@ -245,7 +245,7 @@ end
                 @test false
             catch ex
                 @test ex isa gRPCClient.gRPCServiceCallException
-                @test ex.grpc_status == ReactantServer._G.GRPC_FAILED_PRECONDITION
+                @test ex.grpc_status == Int(ReactantServer._G.StatusCode.FAILED_PRECONDITION)
             end
         finally
             ReactantServer.stop!(srv)

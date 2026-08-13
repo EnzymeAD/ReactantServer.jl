@@ -85,7 +85,7 @@ const _EInf = ReactantServer.inference
                 @test false
             catch ex
                 @test ex isa gRPCClient.gRPCServiceCallException
-                @test ex.grpc_status == ReactantServer._G.GRPC_NOT_FOUND
+                @test ex.grpc_status == Int(ReactantServer._G.StatusCode.NOT_FOUND)
             end
 
             # inference
@@ -111,7 +111,7 @@ const _EInf = ReactantServer.inference
                 @test false
             catch ex
                 @test ex isa gRPCClient.gRPCServiceCallException
-                @test ex.grpc_status == ReactantServer._G.GRPC_NOT_FOUND
+                @test ex.grpc_status == Int(ReactantServer._G.StatusCode.NOT_FOUND)
             end
 
             # repository index lists the loaded model (direct RepositoryIndex introspection)

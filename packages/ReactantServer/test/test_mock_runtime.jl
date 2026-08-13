@@ -268,7 +268,7 @@ end
     )
     _req(tensors) = ReactantServer.InferRequest("v", ["y"], tensors)
     _ok(rows) = ReactantServer.NamedTensor("x", zeros(Float32, 2, rows))
-    GE = ReactantServer.gRPCServer.gRPCServiceCallException
+    GE = ReactantServer.gRPCServer.GRPCError
 
     # Valid request passes; any batch extent is accepted on the batch axis.
     @test ReactantServer._validate_inputs(entry, _req([_ok(1)])) === nothing

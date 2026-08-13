@@ -14,7 +14,7 @@ const _SERVER_NAME = "ReactantServer"
 const _SERVER_VERSION = "0.1.0"
 const _SERVER_EXTENSIONS = String["system_shared_memory"]
 
-# gRPCRouter defaults to a 4 MiB per-message cap; inference tensors routinely exceed that and
+# gRPCServer defaults to a 4 MiB per-message cap; inference tensors routinely exceed that and
 # the HTTP transport this replaces had no body limit. Size generously so large inline tensors
 # are not rejected with RESOURCE_EXHAUSTED. Shared-memory-backed tensors stay small on the wire.
 const _MAX_MESSAGE_BYTES = 512 * 1024 * 1024
@@ -43,16 +43,19 @@ end
 InferContext(sched, registry, shm, platform) = InferContext(sched, registry, shm, platform, nothing)
 
 # gRPC status code -> Prometheus label string, for worker_requests_total.
+# Re-keyed from the old gRPCServer GRPC_* Int constants to the merged StatusCode enum
+# (identical integer values).
 const _GRPC_STATUS_NAME = Dict{Int, String}(
-    _G.GRPC_OK => "OK", _G.GRPC_CANCELLED => "CANCELLED", _G.GRPC_UNKNOWN => "UNKNOWN",
-    _G.GRPC_INVALID_ARGUMENT => "INVALID_ARGUMENT", _G.GRPC_DEADLINE_EXCEEDED => "DEADLINE_EXCEEDED",
-    _G.GRPC_NOT_FOUND => "NOT_FOUND", _G.GRPC_ALREADY_EXISTS => "ALREADY_EXISTS",
-    _G.GRPC_PERMISSION_DENIED => "PERMISSION_DENIED", _G.GRPC_RESOURCE_EXHAUSTED => "RESOURCE_EXHAUSTED",
-    _G.GRPC_FAILED_PRECONDITION => "FAILED_PRECONDITION", _G.GRPC_ABORTED => "ABORTED",
-    _G.GRPC_OUT_OF_RANGE => "OUT_OF_RANGE", _G.GRPC_UNIMPLEMENTED => "UNIMPLEMENTED",
-    _G.GRPC_INTERNAL => "INTERNAL", _G.GRPC_UNAVAILABLE => "UNAVAILABLE", _G.GRPC_DATA_LOSS => "DATA_LOSS",
+    Int(gRPCServer.StatusCode.OK) => "OK", Int(gRPCServer.StatusCode.CANCELLED) => "CANCELLED",
+    Int(gRPCServer.StatusCode.UNKNOWN) => "UNKNOWN", Int(gRPCServer.StatusCode.INVALID_ARGUMENT) => "INVALID_ARGUMENT",
+    Int(gRPCServer.StatusCode.DEADLINE_EXCEEDED) => "DEADLINE_EXCEEDED", Int(gRPCServer.StatusCode.NOT_FOUND) => "NOT_FOUND",
+    Int(gRPCServer.StatusCode.ALREADY_EXISTS) => "ALREADY_EXISTS", Int(gRPCServer.StatusCode.PERMISSION_DENIED) => "PERMISSION_DENIED",
+    Int(gRPCServer.StatusCode.RESOURCE_EXHAUSTED) => "RESOURCE_EXHAUSTED", Int(gRPCServer.StatusCode.FAILED_PRECONDITION) => "FAILED_PRECONDITION",
+    Int(gRPCServer.StatusCode.ABORTED) => "ABORTED", Int(gRPCServer.StatusCode.OUT_OF_RANGE) => "OUT_OF_RANGE",
+    Int(gRPCServer.StatusCode.UNIMPLEMENTED) => "UNIMPLEMENTED", Int(gRPCServer.StatusCode.INTERNAL) => "INTERNAL",
+    Int(gRPCServer.StatusCode.UNAVAILABLE) => "UNAVAILABLE", Int(gRPCServer.StatusCode.DATA_LOSS) => "DATA_LOSS",
 )
-_status_label(e) = e isa _G.gRPCServiceCallException ? get(_GRPC_STATUS_NAME, e.grpc_status, "UNKNOWN") :
+_status_label(e) = e isa gRPCServer.GRPCError ? get(_GRPC_STATUS_NAME, Int(e.code), "UNKNOWN") :
     e isa DeadlineExceeded ? "DEADLINE_EXCEEDED" : "INTERNAL"
 
 # A request's effective absolute deadline (local time_ns()): the TIGHTEST of the in-body KV timeout
@@ -67,11 +70,11 @@ function _effective_deadline(decoded_dl::Integer, grpc_dl::Integer)
     return min(a, b)
 end
 
-_not_found(msg) = throw(_G.gRPCServiceCallException(_G.GRPC_NOT_FOUND, msg))
-_invalid(msg) = throw(_G.gRPCServiceCallException(_G.GRPC_INVALID_ARGUMENT, msg))
+_not_found(msg) = throw(gRPCServer.GRPCError(gRPCServer.StatusCode.NOT_FOUND, msg))
+_invalid(msg) = throw(gRPCServer.GRPCError(gRPCServer.StatusCode.INVALID_ARGUMENT, msg))
 
 # Run `f`, converting any thrown error into INVALID_ARGUMENT unless it is already a
-# gRPCServiceCallException (which carries its own status, e.g. NOT_FOUND). A reference to a
+# GRPCError (which carries its own status, e.g. NOT_FOUND). A reference to a
 # shared-memory region the registry does not know (e.g. the client registered with a previous
 # incarnation of this process, before a restart wiped the in-memory registry) is mapped to
 # FAILED_PRECONDITION instead: it is recoverable by re-registering, so it is a distinct signal
@@ -80,9 +83,9 @@ function _as_invalid(f)
     try
         return f()
     catch e
-        e isa _G.gRPCServiceCallException && rethrow()
+        e isa gRPCServer.GRPCError && rethrow()
         e isa UnregisteredRegionError &&
-            throw(_G.gRPCServiceCallException(_G.GRPC_FAILED_PRECONDITION, sprint(showerror, e)))
+            throw(gRPCServer.GRPCError(gRPCServer.StatusCode.FAILED_PRECONDITION, sprint(showerror, e)))
         _invalid(sprint(showerror, e))
     end
 end
@@ -135,9 +138,9 @@ function _handle_model_metadata(ctx::InferContext, req)
     if entry === nothing
         meta = get_meta(ctx.registry, req.name)
         meta === nothing && _not_found("unknown model: $(req.name)")
-        return encode_model_metadata(req.name, meta.manifest, ctx.platform)
+        return encode_model_metadata(inference, req.name, meta.manifest, ctx.platform)
     end
-    return encode_model_metadata(req.name, entry.manifest, ctx.platform)
+    return encode_model_metadata(inference, req.name, entry.manifest, ctx.platform)
 end
 
 # Validate decoded inputs against the model's client-facing spec so a malformed request is
@@ -179,9 +182,9 @@ function _infer_or_not_found(ctx::InferContext, request)
     try
         return infer(ctx.sched, request)
     catch e
-        e isa _G.gRPCServiceCallException && rethrow()
+        e isa gRPCServer.GRPCError && rethrow()
         # A request the scheduler dropped at admission for an expired deadline -> DEADLINE_EXCEEDED.
-        e isa DeadlineExceeded && throw(_G.gRPCServiceCallException(_G.GRPC_DEADLINE_EXCEEDED, sprint(showerror, e)))
+        e isa DeadlineExceeded && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.DEADLINE_EXCEEDED, sprint(showerror, e)))
         msg = sprint(showerror, e)
         (occursin("unknown model", msg) || occursin("was unloaded", msg)) && _not_found(msg)
         rethrow()
@@ -213,14 +216,14 @@ function _handle_infer_impl(ctx::InferContext, req, grpc_deadline_ns::Integer = 
     meta === nothing || return _handle_meta_infer(ctx, meta, req, grpc_deadline_ns)
     entry = get_model(ctx.registry, name)
     entry === nothing && _not_found("unknown model: $name")
-    decoded = _as_invalid(() -> decode_infer_request(req, ctx.shm))
+    decoded = _as_invalid(() -> decode_infer_request(inference, req, ctx.shm))
     deadline_ns = _effective_deadline(decoded.request.deadline_ns, grpc_deadline_ns)
     request = InferRequest(name, decoded.request.requested_outputs, decoded.request.inputs, deadline_ns)
     _validate_inputs(entry, request)
     outputs = _infer_or_not_found(ctx, request)   # availability rejections -> NOT_FOUND; else INTERNAL
     # Encoding rejects a requested output the model does not produce: a client mistake, so
     # surface it as INVALID_ARGUMENT (matching the codec's documented contract).
-    return _as_invalid(() -> encode_infer_response(name, decoded, outputs, ctx.shm))
+    return _as_invalid(() -> encode_infer_response(inference, name, decoded, outputs, ctx.shm))
 end
 
 # A meta's orchestration runs on this request task (`infer` -> `_run_meta_request`), under the worker's
@@ -228,12 +231,12 @@ end
 # regular path (it reads only `manifest`, which MetaEntry also carries). `_infer_or_not_found` maps a
 # deadline bail to DEADLINE_EXCEEDED and an unknown/unloaded sub-model to NOT_FOUND, as the regular path.
 function _handle_meta_infer(ctx::InferContext, meta, req, grpc_deadline_ns::Integer = 0)
-    decoded = _as_invalid(() -> decode_infer_request(req, ctx.shm))
+    decoded = _as_invalid(() -> decode_infer_request(inference, req, ctx.shm))
     deadline_ns = _effective_deadline(decoded.request.deadline_ns, grpc_deadline_ns)
     request = InferRequest(meta.name, decoded.request.requested_outputs, decoded.request.inputs, deadline_ns)
     _validate_inputs(meta, request)
     outputs = _infer_or_not_found(ctx, request)
-    return _as_invalid(() -> encode_infer_response(meta.name, decoded, outputs, ctx.shm))
+    return _as_invalid(() -> encode_infer_response(inference, meta.name, decoded, outputs, ctx.shm))
 end
 
 # List models with per-model readiness reflecting residency. `req.ready` filters to ready models
@@ -242,64 +245,89 @@ end
 function _handle_repository_index(ctx::InferContext, req)
     entries = [name => _model_ready(ctx, name) for name in routable_model_names(ctx.registry)]
     req.ready && filter!(last, entries)
-    return encode_repository_index(entries)
+    return encode_repository_index(inference, entries)
 end
 
 _handle_shm_status(shm::SharedMemoryRegistry, name) =
-    _as_invalid(() -> encode_shm_status(shm, name))
+    _as_invalid(() -> encode_shm_status(inference, shm, name))
 
 function _handle_shm_register(shm::SharedMemoryRegistry, req)
     return _as_invalid() do
         shm_register!(shm, req.name, req.key, req.offset, req.byte_size)
-        encode_shm_register_response()
+        encode_shm_register_response(inference)
     end
 end
 
 function _handle_shm_unregister(shm::SharedMemoryRegistry, name)
     return _as_invalid() do
         shm_unregister!(shm, name)
-        encode_shm_unregister_response()
+        encode_shm_unregister_response(inference)
     end
 end
 
 # Non-Triton extension: answer whether we can see the client's shared-memory object, i.e.
 # whether system shared-memory transport can work with this client. No registry interaction.
 _handle_is_same_ipc_namespace(name) =
-    _as_invalid(() -> encode_is_same_ipc_namespace_response(same_ipc_namespace(name)))
+    _as_invalid(() -> encode_is_same_ipc_namespace_response(inference, same_ipc_namespace(name)))
+
+# Old gRPCServer handed handlers an absolute deadline on Julia's machine-relative time_ns()
+# clock (time_ns() + grpc-timeout). The merged package parses grpc-timeout into a wall-clock
+# DateTime; convert back onto the local clock the scheduler compares against (time_ns() >= dl in
+# scheduler.jl; _decode_deadline_ns uses time_ns() + budget).
+function _ctx_deadline_ns(ctx::gRPCServer.ServerContext)
+    ctx.deadline === nothing && return Int64(0)
+    rem = gRPCServer.remaining_time(ctx)
+    rem === nothing && return Int64(0)
+    budget = round(Int64, rem * 1.0e9)
+    now_ns = Int64(time_ns())
+    return budget > typemax(Int64) - now_ns ? typemax(Int64) : now_ns + budget   # saturate, mirroring _decode_deadline_ns
+end
 
 """
-    build_grpc_router(sched, registry, platform, shm;
-                      max_recv_msg_bytes=_MAX_MESSAGE_BYTES, max_send_msg_bytes=_MAX_MESSAGE_BYTES) -> gRPCRouter
+    build_grpc_server(sched, registry, platform, shm, host, port, ctx;
+                      max_recv_msg_bytes=_MAX_MESSAGE_BYTES, max_send_msg_bytes=_MAX_MESSAGE_BYTES,
+                      max_concurrent_requests=0,
+                      h2_initial_window_size=_H2_INITIAL_WINDOW_BYTES,
+                      h2_connection_window_size=_H2_CONNECTION_WINDOW_BYTES) -> GRPCServer
 
-Register the KServe V2 GRPCInferenceService handlers. The returned router is served by
-gRPCServer with an `InferContext` payload (see `serve`). The message-size caps default to
-`_MAX_MESSAGE_BYTES`; `serve` passes the configured `grpc.max_recv_msg_bytes` / `max_send_msg_bytes`.
+Register the KServe V2 GRPCInferenceService and ControlService handlers on a fresh
+[`gRPCServer.GRPCServer`](@ref). The server threads `ctx` (an [`InferContext`](@ref)) into
+every request's `ServerContext.payload`; `serve` supplies the metrics-bearing context after
+constructing the server. The message-size caps default to `_MAX_MESSAGE_BYTES`; `serve` passes
+the configured `grpc.max_recv_msg_bytes` / `max_send_msg_bytes` (mapped onto the merged
+package's single `max_message_size` cap).
 """
-function build_grpc_router(
+function build_grpc_server(
         sched::Scheduler, registry::ModelRegistry, platform::AbstractString,
-        shm::SharedMemoryRegistry;
+        shm::SharedMemoryRegistry, host::AbstractString, port::Integer, ctx::InferContext;
         max_recv_msg_bytes::Integer = _MAX_MESSAGE_BYTES,
-        max_send_msg_bytes::Integer = _MAX_MESSAGE_BYTES
+        max_send_msg_bytes::Integer = _MAX_MESSAGE_BYTES,
+        max_concurrent_requests::Integer = 0,
+        h2_initial_window_size::Integer = _H2_INITIAL_WINDOW_BYTES,
+        h2_connection_window_size::Integer = _H2_CONNECTION_WINDOW_BYTES
     )
-    router = _G.gRPCRouter(;
-        max_receive_message_length = max_recv_msg_bytes,
-        max_send_message_length = max_send_msg_bytes
+    server = gRPCServer.GRPCServer(
+        host, Int(port);
+        context = ctx,
+        max_message_size = max(max_recv_msg_bytes, max_send_msg_bytes),
+        max_concurrent_requests = (max_concurrent_requests > 0 ? max_concurrent_requests : nothing),
+        h2_initial_window_size = h2_initial_window_size,
+        h2_connection_window_size = h2_connection_window_size
     )
     register_GRPCInferenceService!(
-        router;
-        ServerLive = (req, ctx) -> inference.ServerLiveResponse(; live = true),
-        ServerReady = (req, ctx) -> _handle_server_ready(ctx.payload),
-        ModelReady = (req, ctx) -> _handle_model_ready(ctx.payload, req),
-        ServerMetadata = (req, ctx) -> _handle_server_metadata(ctx.payload),
-        ModelMetadata = (req, ctx) -> _handle_model_metadata(ctx.payload, req),
-        ModelInfer = (req, ctx) -> _handle_infer(ctx.payload, req, ctx.deadline_ns),
-        RepositoryIndex = (req, ctx) -> _handle_repository_index(ctx.payload, req),
-        SystemSharedMemoryStatus = (req, ctx) -> _handle_shm_status(ctx.payload.shm, req.name),
-        SystemSharedMemoryRegister = (req, ctx) -> _handle_shm_register(ctx.payload.shm, req),
-        SystemSharedMemoryUnregister = (req, ctx) -> _handle_shm_unregister(ctx.payload.shm, req.name),
-        IsSameIPCNamespace = (req, ctx) -> _handle_is_same_ipc_namespace(req.name),
+        server;
+        ServerLive = (ctx, req) -> inference.ServerLiveResponse(; live = true),
+        ServerReady = (ctx, req) -> _handle_server_ready(ctx.payload),
+        ModelReady = (ctx, req) -> _handle_model_ready(ctx.payload, req),
+        ServerMetadata = (ctx, req) -> _handle_server_metadata(ctx.payload),
+        ModelMetadata = (ctx, req) -> _handle_model_metadata(ctx.payload, req),
+        ModelInfer = (ctx, req) -> _handle_infer(ctx.payload, req, _ctx_deadline_ns(ctx)),
+        RepositoryIndex = (ctx, req) -> _handle_repository_index(ctx.payload, req),
+        SystemSharedMemoryStatus = (ctx, req) -> _handle_shm_status(ctx.payload.shm, req.name),
+        SystemSharedMemoryRegister = (ctx, req) -> _handle_shm_register(ctx.payload.shm, req),
+        SystemSharedMemoryUnregister = (ctx, req) -> _handle_shm_unregister(ctx.payload.shm, req.name),
+        IsSameIPCNamespace = (ctx, req) -> _handle_is_same_ipc_namespace(req.name)
     )
-    # The worker control plane (residency + live policy) rides on the same router and payload.
-    register_control_service!(router)
-    return router
+    register_control_service!(server)
+    return server
 end

@@ -5,18 +5,26 @@ module ReactantServer
 # ReactantServerCore; this package adds the model registry, the runtime (the only Reactant
 # consumer), the scheduler, and the KServe V2 gRPC server.
 
-using ReactantServerCore
-using ReactantServerCore.inference   # message types in scope for the server gRPC stubs
-using ReactantServerCore.control     # control-plane message types for the ControlService stubs
+import ReactantServerCore
+
+# Own generated gRPC codegen (messages + registration); protojl output from proto_src;
+# never hand-edit the pb content. These modules shadow Core's message-only modules, so the
+# worker's handlers see the worker-local message types.
+include("proto/inference/inference.jl")
+include("proto/control/control.jl")
 
 # Re-expose ReactantServerCore's public API through ReactantServer, so the shared substrate is
 # reachable as `ReactantServer.X` (and unqualified) exactly as it was before the monorepo split.
 # Every Core symbol is defined in Core alone, so none of these collide with worker definitions.
+# The two pb modules are skipped: the worker's own generated modules (included above) shadow
+# Core's message-only `inference`/`control` modules and carry the registration codegen.
 for _n in names(ReactantServerCore)
     _n === :ReactantServerCore && continue
+    (_n === :inference || _n === :control) && continue
     @eval import ReactantServerCore: $_n
     @eval export $_n
 end
+export inference, control
 
 using YAML
 using SafeTensors
@@ -26,12 +34,12 @@ using DLFP8Types
 using NNlib
 using ProtoBuf
 
-# Server-side gRPC service stubs (define register_GRPCInferenceService! and the per-RPC
-# Method helpers). Core ships the file but does not compile it; included here so its bare
-# message-type references resolve and `import gRPCServer` runs against this package's deps.
+# gRPC codegen: the generated modules carry the per-service registration functions, but
+# `using` does not re-export them, so re-export the two the worker registers.
 import gRPCServer
-include(ReactantServerCore.inference_server_stubs_path())
-include(ReactantServerCore.control_server_stubs_path())
+import .inference: register_GRPCInferenceService!
+import .control: register_ControlService!
+export register_GRPCInferenceService!, register_ControlService!
 
 # Per-model value types (defined before the registry so ModelEntry can hold them precisely).
 include("runtime/model_types.jl")
