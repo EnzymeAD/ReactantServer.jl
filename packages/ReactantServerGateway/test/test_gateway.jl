@@ -84,8 +84,9 @@ mutable struct MockWorker
     fail_exhausted::Bool        # shed ModelInfer with RESOURCE_EXHAUSTED (worker concurrency cap)
 end
 
-function _mock_server(port::Integer, worker::MockWorker)
-    server = gRPCServer.GRPCServerHTTPJl("127.0.0.1", Int(port); context = worker)
+function _mock_server(worker::MockWorker)
+    server = gRPCServer.GRPCServerHTTPJl("127.0.0.1", 1; context = worker)
+    server.port = 0   # OS-assigned ephemeral port; HTTP.port(server) reports it after start!
     ReactantServerGateway.register_GRPCInferenceService!(
         server;
         ServerReady = (ctx, req) -> GWInf.ServerReadyResponse(; ready = true),
@@ -114,8 +115,40 @@ function _mock_server(port::Integer, worker::MockWorker)
     return server
 end
 
-_start_mock(worker::MockWorker, port::Integer) =
-    (s = _mock_server(port, worker); gRPCServer.start!(s); s)
+# Start a mock worker on an OS-assigned port and block until it actually answers gRPC
+# (ServerReady), so the gateway's first synchronous discovery round always probes a live
+# worker. start! is async and the first request on a cold CI runner can be slow, so a
+# readiness poll beats a fixed sleep: the gateway must never discover a half-started mock.
+function _start_mock(worker::MockWorker; timeout::Real = 30.0)
+    server = _mock_server(worker)
+    gRPCServer.start!(server)
+    # HTTP.port reads the listener's bound address; with an ephemeral port it is only
+    # meaningful once start! has actually bound, so poll for it first.
+    deadline = time() + timeout
+    port = 0
+    while time() < deadline
+        port = try
+            Int(HTTP.port(server))
+        catch
+            0
+        end
+        port > 0 && break
+        sleep(0.1)
+    end
+    port > 0 || error("mock worker $(worker.name) never bound a port")
+    client = gRPCClient.gRPCServiceClient{GWInf.ServerReadyRequest, false, GWInf.ServerReadyResponse, false}(
+        "127.0.0.1", port, "/inference.GRPCInferenceService/ServerReady"
+    )
+    while time() < deadline
+        try
+            gRPCClient.grpc_sync_request(client, GWInf.ServerReadyRequest())
+            return server, port
+        catch
+            sleep(0.1)
+        end
+    end
+    error("mock worker $(worker.name) did not become ready on port $port")
+end
 
 # Send a typed ModelInfer through the gateway and return the response (or rethrow).
 _infer(port, model) = grpc_call(
@@ -136,13 +169,13 @@ end
     # from each worker's RepositoryIndex rather than from any config.
     w0 = MockWorker("worker0", ["replicated", "only0"], false, false, false)
     w1 = MockWorker("worker1", ["replicated"], false, false, false)
-    p0 = grpc_free_port()
-    p1 = grpc_free_port()
     gw_port = grpc_free_port()
     admin_port = grpc_free_port()
 
-    s0 = _start_mock(w0, p0)
-    s1 = _start_mock(w1, p1)
+    # OS-assigned worker ports: the mock binds an ephemeral port (no free-port race), and the
+    # readiness poll above guarantees it is serving before the gateway starts.
+    s0, p0 = _start_mock(w0)
+    s1, p1 = _start_mock(w1)
 
     gatewayfile = tempname() * ".yaml"
     write(
