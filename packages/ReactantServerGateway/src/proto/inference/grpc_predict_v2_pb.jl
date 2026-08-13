@@ -2,6 +2,9 @@
 # original file: grpc_predict_v2.proto (proto3 syntax)
 
 import ProtoBuf as PB
+import gRPCClient
+import gRPCServer
+using gRPCServer: GRPCServer
 using ProtoBuf: OneOf
 using ProtoBuf.EnumX: @enumx
 
@@ -1193,5 +1196,691 @@ function PB._encoded_size(x::ModelInferResponse)
     return encoded_size
 end
 
-# SERVICE: No codegen handlers registered
-#    GRPCInferenceService
+# gRPCClient.jl BEGIN
+GRPCInferenceService_ServerLive_Client(
+    host, port;
+    TRequest = ServerLiveRequest,
+    TResponse = ServerLiveResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/ServerLive";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_ServerLive_Client
+
+GRPCInferenceService_ServerReady_Client(
+    host, port;
+    TRequest = ServerReadyRequest,
+    TResponse = ServerReadyResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/ServerReady";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_ServerReady_Client
+
+GRPCInferenceService_ModelReady_Client(
+    host, port;
+    TRequest = ModelReadyRequest,
+    TResponse = ModelReadyResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/ModelReady";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_ModelReady_Client
+
+GRPCInferenceService_ServerMetadata_Client(
+    host, port;
+    TRequest = ServerMetadataRequest,
+    TResponse = ServerMetadataResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/ServerMetadata";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_ServerMetadata_Client
+
+GRPCInferenceService_ModelMetadata_Client(
+    host, port;
+    TRequest = ModelMetadataRequest,
+    TResponse = ModelMetadataResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/ModelMetadata";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_ModelMetadata_Client
+
+GRPCInferenceService_ModelInfer_Client(
+    host, port;
+    TRequest = ModelInferRequest,
+    TResponse = ModelInferResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/ModelInfer";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_ModelInfer_Client
+
+GRPCInferenceService_RepositoryIndex_Client(
+    host, port;
+    TRequest = RepositoryIndexRequest,
+    TResponse = RepositoryIndexResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/RepositoryIndex";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_RepositoryIndex_Client
+
+GRPCInferenceService_SystemSharedMemoryStatus_Client(
+    host, port;
+    TRequest = SystemSharedMemoryStatusRequest,
+    TResponse = SystemSharedMemoryStatusResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/SystemSharedMemoryStatus";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_SystemSharedMemoryStatus_Client
+
+GRPCInferenceService_SystemSharedMemoryRegister_Client(
+    host, port;
+    TRequest = SystemSharedMemoryRegisterRequest,
+    TResponse = SystemSharedMemoryRegisterResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/SystemSharedMemoryRegister";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_SystemSharedMemoryRegister_Client
+
+GRPCInferenceService_SystemSharedMemoryUnregister_Client(
+    host, port;
+    TRequest = SystemSharedMemoryUnregisterRequest,
+    TResponse = SystemSharedMemoryUnregisterResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/SystemSharedMemoryUnregister";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_SystemSharedMemoryUnregister_Client
+
+GRPCInferenceService_IsSameIPCNamespace_Client(
+    host, port;
+    TRequest = IsSameIPCNamespaceRequest,
+    TResponse = IsSameIPCNamespaceResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/IsSameIPCNamespace";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_IsSameIPCNamespace_Client
+# gRPCClient.jl END
+# gRPCServer.jl BEGIN
+# inference.GRPCInferenceService.ServerLive (unary)
+"""
+    GRPCInferenceService_ServerLive_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
+
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/inference.GRPCInferenceService/ServerLive`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::ServerLiveRequest) -> ServerLiveResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+GRPCInferenceService_ServerLive_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("ServerLive", gRPCServer.MethodType.UNARY, ServerLiveRequest, ServerLiveResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export GRPCInferenceService_ServerLive_Method
+
+"""
+    register_GRPCInferenceService_ServerLive!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_GRPCInferenceService_ServerLive!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/inference.GRPCInferenceService/ServerLive` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::ServerLiveRequest) -> ServerLiveResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`GRPCInferenceService_ServerLive_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_GRPCInferenceService_ServerLive!(server) do ctx, req
+    # compute and return a ServerLiveResponse
+end
+```
+"""
+function register_GRPCInferenceService_ServerLive!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "inference.GRPCInferenceService", GRPCInferenceService_ServerLive_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_GRPCInferenceService_ServerLive!(handler::Function, server::GRPCServer; kwargs...) = register_GRPCInferenceService_ServerLive!(server, handler; kwargs...)
+export register_GRPCInferenceService_ServerLive!
+
+# inference.GRPCInferenceService.ServerReady (unary)
+"""
+    GRPCInferenceService_ServerReady_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
+
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/inference.GRPCInferenceService/ServerReady`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::ServerReadyRequest) -> ServerReadyResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+GRPCInferenceService_ServerReady_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("ServerReady", gRPCServer.MethodType.UNARY, ServerReadyRequest, ServerReadyResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export GRPCInferenceService_ServerReady_Method
+
+"""
+    register_GRPCInferenceService_ServerReady!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_GRPCInferenceService_ServerReady!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/inference.GRPCInferenceService/ServerReady` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::ServerReadyRequest) -> ServerReadyResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`GRPCInferenceService_ServerReady_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_GRPCInferenceService_ServerReady!(server) do ctx, req
+    # compute and return a ServerReadyResponse
+end
+```
+"""
+function register_GRPCInferenceService_ServerReady!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "inference.GRPCInferenceService", GRPCInferenceService_ServerReady_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_GRPCInferenceService_ServerReady!(handler::Function, server::GRPCServer; kwargs...) = register_GRPCInferenceService_ServerReady!(server, handler; kwargs...)
+export register_GRPCInferenceService_ServerReady!
+
+# inference.GRPCInferenceService.ModelReady (unary)
+"""
+    GRPCInferenceService_ModelReady_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
+
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/inference.GRPCInferenceService/ModelReady`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::ModelReadyRequest) -> ModelReadyResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+GRPCInferenceService_ModelReady_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("ModelReady", gRPCServer.MethodType.UNARY, ModelReadyRequest, ModelReadyResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export GRPCInferenceService_ModelReady_Method
+
+"""
+    register_GRPCInferenceService_ModelReady!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_GRPCInferenceService_ModelReady!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/inference.GRPCInferenceService/ModelReady` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::ModelReadyRequest) -> ModelReadyResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`GRPCInferenceService_ModelReady_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_GRPCInferenceService_ModelReady!(server) do ctx, req
+    # compute and return a ModelReadyResponse
+end
+```
+"""
+function register_GRPCInferenceService_ModelReady!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "inference.GRPCInferenceService", GRPCInferenceService_ModelReady_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_GRPCInferenceService_ModelReady!(handler::Function, server::GRPCServer; kwargs...) = register_GRPCInferenceService_ModelReady!(server, handler; kwargs...)
+export register_GRPCInferenceService_ModelReady!
+
+# inference.GRPCInferenceService.ServerMetadata (unary)
+"""
+    GRPCInferenceService_ServerMetadata_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
+
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/inference.GRPCInferenceService/ServerMetadata`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::ServerMetadataRequest) -> ServerMetadataResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+GRPCInferenceService_ServerMetadata_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("ServerMetadata", gRPCServer.MethodType.UNARY, ServerMetadataRequest, ServerMetadataResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export GRPCInferenceService_ServerMetadata_Method
+
+"""
+    register_GRPCInferenceService_ServerMetadata!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_GRPCInferenceService_ServerMetadata!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/inference.GRPCInferenceService/ServerMetadata` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::ServerMetadataRequest) -> ServerMetadataResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`GRPCInferenceService_ServerMetadata_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_GRPCInferenceService_ServerMetadata!(server) do ctx, req
+    # compute and return a ServerMetadataResponse
+end
+```
+"""
+function register_GRPCInferenceService_ServerMetadata!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "inference.GRPCInferenceService", GRPCInferenceService_ServerMetadata_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_GRPCInferenceService_ServerMetadata!(handler::Function, server::GRPCServer; kwargs...) = register_GRPCInferenceService_ServerMetadata!(server, handler; kwargs...)
+export register_GRPCInferenceService_ServerMetadata!
+
+# inference.GRPCInferenceService.ModelMetadata (unary)
+"""
+    GRPCInferenceService_ModelMetadata_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
+
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/inference.GRPCInferenceService/ModelMetadata`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::ModelMetadataRequest) -> ModelMetadataResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+GRPCInferenceService_ModelMetadata_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("ModelMetadata", gRPCServer.MethodType.UNARY, ModelMetadataRequest, ModelMetadataResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export GRPCInferenceService_ModelMetadata_Method
+
+"""
+    register_GRPCInferenceService_ModelMetadata!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_GRPCInferenceService_ModelMetadata!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/inference.GRPCInferenceService/ModelMetadata` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::ModelMetadataRequest) -> ModelMetadataResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`GRPCInferenceService_ModelMetadata_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_GRPCInferenceService_ModelMetadata!(server) do ctx, req
+    # compute and return a ModelMetadataResponse
+end
+```
+"""
+function register_GRPCInferenceService_ModelMetadata!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "inference.GRPCInferenceService", GRPCInferenceService_ModelMetadata_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_GRPCInferenceService_ModelMetadata!(handler::Function, server::GRPCServer; kwargs...) = register_GRPCInferenceService_ModelMetadata!(server, handler; kwargs...)
+export register_GRPCInferenceService_ModelMetadata!
+
+# inference.GRPCInferenceService.ModelInfer (unary)
+"""
+    GRPCInferenceService_ModelInfer_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
+
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/inference.GRPCInferenceService/ModelInfer`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::ModelInferRequest) -> ModelInferResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+GRPCInferenceService_ModelInfer_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("ModelInfer", gRPCServer.MethodType.UNARY, ModelInferRequest, ModelInferResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export GRPCInferenceService_ModelInfer_Method
+
+"""
+    register_GRPCInferenceService_ModelInfer!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_GRPCInferenceService_ModelInfer!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/inference.GRPCInferenceService/ModelInfer` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::ModelInferRequest) -> ModelInferResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`GRPCInferenceService_ModelInfer_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_GRPCInferenceService_ModelInfer!(server) do ctx, req
+    # compute and return a ModelInferResponse
+end
+```
+"""
+function register_GRPCInferenceService_ModelInfer!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "inference.GRPCInferenceService", GRPCInferenceService_ModelInfer_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_GRPCInferenceService_ModelInfer!(handler::Function, server::GRPCServer; kwargs...) = register_GRPCInferenceService_ModelInfer!(server, handler; kwargs...)
+export register_GRPCInferenceService_ModelInfer!
+
+# inference.GRPCInferenceService.RepositoryIndex (unary)
+"""
+    GRPCInferenceService_RepositoryIndex_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
+
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/inference.GRPCInferenceService/RepositoryIndex`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::RepositoryIndexRequest) -> RepositoryIndexResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+GRPCInferenceService_RepositoryIndex_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("RepositoryIndex", gRPCServer.MethodType.UNARY, RepositoryIndexRequest, RepositoryIndexResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export GRPCInferenceService_RepositoryIndex_Method
+
+"""
+    register_GRPCInferenceService_RepositoryIndex!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_GRPCInferenceService_RepositoryIndex!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/inference.GRPCInferenceService/RepositoryIndex` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::RepositoryIndexRequest) -> RepositoryIndexResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`GRPCInferenceService_RepositoryIndex_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_GRPCInferenceService_RepositoryIndex!(server) do ctx, req
+    # compute and return a RepositoryIndexResponse
+end
+```
+"""
+function register_GRPCInferenceService_RepositoryIndex!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "inference.GRPCInferenceService", GRPCInferenceService_RepositoryIndex_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_GRPCInferenceService_RepositoryIndex!(handler::Function, server::GRPCServer; kwargs...) = register_GRPCInferenceService_RepositoryIndex!(server, handler; kwargs...)
+export register_GRPCInferenceService_RepositoryIndex!
+
+# inference.GRPCInferenceService.SystemSharedMemoryStatus (unary)
+"""
+    GRPCInferenceService_SystemSharedMemoryStatus_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
+
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/inference.GRPCInferenceService/SystemSharedMemoryStatus`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::SystemSharedMemoryStatusRequest) -> SystemSharedMemoryStatusResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+GRPCInferenceService_SystemSharedMemoryStatus_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("SystemSharedMemoryStatus", gRPCServer.MethodType.UNARY, SystemSharedMemoryStatusRequest, SystemSharedMemoryStatusResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export GRPCInferenceService_SystemSharedMemoryStatus_Method
+
+"""
+    register_GRPCInferenceService_SystemSharedMemoryStatus!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_GRPCInferenceService_SystemSharedMemoryStatus!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/inference.GRPCInferenceService/SystemSharedMemoryStatus` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::SystemSharedMemoryStatusRequest) -> SystemSharedMemoryStatusResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`GRPCInferenceService_SystemSharedMemoryStatus_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_GRPCInferenceService_SystemSharedMemoryStatus!(server) do ctx, req
+    # compute and return a SystemSharedMemoryStatusResponse
+end
+```
+"""
+function register_GRPCInferenceService_SystemSharedMemoryStatus!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "inference.GRPCInferenceService", GRPCInferenceService_SystemSharedMemoryStatus_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_GRPCInferenceService_SystemSharedMemoryStatus!(handler::Function, server::GRPCServer; kwargs...) = register_GRPCInferenceService_SystemSharedMemoryStatus!(server, handler; kwargs...)
+export register_GRPCInferenceService_SystemSharedMemoryStatus!
+
+# inference.GRPCInferenceService.SystemSharedMemoryRegister (unary)
+"""
+    GRPCInferenceService_SystemSharedMemoryRegister_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
+
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/inference.GRPCInferenceService/SystemSharedMemoryRegister`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::SystemSharedMemoryRegisterRequest) -> SystemSharedMemoryRegisterResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+GRPCInferenceService_SystemSharedMemoryRegister_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("SystemSharedMemoryRegister", gRPCServer.MethodType.UNARY, SystemSharedMemoryRegisterRequest, SystemSharedMemoryRegisterResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export GRPCInferenceService_SystemSharedMemoryRegister_Method
+
+"""
+    register_GRPCInferenceService_SystemSharedMemoryRegister!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_GRPCInferenceService_SystemSharedMemoryRegister!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/inference.GRPCInferenceService/SystemSharedMemoryRegister` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::SystemSharedMemoryRegisterRequest) -> SystemSharedMemoryRegisterResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`GRPCInferenceService_SystemSharedMemoryRegister_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_GRPCInferenceService_SystemSharedMemoryRegister!(server) do ctx, req
+    # compute and return a SystemSharedMemoryRegisterResponse
+end
+```
+"""
+function register_GRPCInferenceService_SystemSharedMemoryRegister!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "inference.GRPCInferenceService", GRPCInferenceService_SystemSharedMemoryRegister_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_GRPCInferenceService_SystemSharedMemoryRegister!(handler::Function, server::GRPCServer; kwargs...) = register_GRPCInferenceService_SystemSharedMemoryRegister!(server, handler; kwargs...)
+export register_GRPCInferenceService_SystemSharedMemoryRegister!
+
+# inference.GRPCInferenceService.SystemSharedMemoryUnregister (unary)
+"""
+    GRPCInferenceService_SystemSharedMemoryUnregister_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
+
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/inference.GRPCInferenceService/SystemSharedMemoryUnregister`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::SystemSharedMemoryUnregisterRequest) -> SystemSharedMemoryUnregisterResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+GRPCInferenceService_SystemSharedMemoryUnregister_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("SystemSharedMemoryUnregister", gRPCServer.MethodType.UNARY, SystemSharedMemoryUnregisterRequest, SystemSharedMemoryUnregisterResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export GRPCInferenceService_SystemSharedMemoryUnregister_Method
+
+"""
+    register_GRPCInferenceService_SystemSharedMemoryUnregister!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_GRPCInferenceService_SystemSharedMemoryUnregister!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/inference.GRPCInferenceService/SystemSharedMemoryUnregister` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::SystemSharedMemoryUnregisterRequest) -> SystemSharedMemoryUnregisterResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`GRPCInferenceService_SystemSharedMemoryUnregister_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_GRPCInferenceService_SystemSharedMemoryUnregister!(server) do ctx, req
+    # compute and return a SystemSharedMemoryUnregisterResponse
+end
+```
+"""
+function register_GRPCInferenceService_SystemSharedMemoryUnregister!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "inference.GRPCInferenceService", GRPCInferenceService_SystemSharedMemoryUnregister_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_GRPCInferenceService_SystemSharedMemoryUnregister!(handler::Function, server::GRPCServer; kwargs...) = register_GRPCInferenceService_SystemSharedMemoryUnregister!(server, handler; kwargs...)
+export register_GRPCInferenceService_SystemSharedMemoryUnregister!
+
+# inference.GRPCInferenceService.IsSameIPCNamespace (unary)
+"""
+    GRPCInferenceService_IsSameIPCNamespace_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
+
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/inference.GRPCInferenceService/IsSameIPCNamespace`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::IsSameIPCNamespaceRequest) -> IsSameIPCNamespaceResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+GRPCInferenceService_IsSameIPCNamespace_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("IsSameIPCNamespace", gRPCServer.MethodType.UNARY, IsSameIPCNamespaceRequest, IsSameIPCNamespaceResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export GRPCInferenceService_IsSameIPCNamespace_Method
+
+"""
+    register_GRPCInferenceService_IsSameIPCNamespace!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_GRPCInferenceService_IsSameIPCNamespace!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/inference.GRPCInferenceService/IsSameIPCNamespace` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::IsSameIPCNamespaceRequest) -> IsSameIPCNamespaceResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`GRPCInferenceService_IsSameIPCNamespace_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_GRPCInferenceService_IsSameIPCNamespace!(server) do ctx, req
+    # compute and return a IsSameIPCNamespaceResponse
+end
+```
+"""
+function register_GRPCInferenceService_IsSameIPCNamespace!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "inference.GRPCInferenceService", GRPCInferenceService_IsSameIPCNamespace_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_GRPCInferenceService_IsSameIPCNamespace!(handler::Function, server::GRPCServer; kwargs...) = register_GRPCInferenceService_IsSameIPCNamespace!(server, handler; kwargs...)
+export register_GRPCInferenceService_IsSameIPCNamespace!
+
+"""
+    register_GRPCInferenceService!(server::GRPCServer; ServerLive=nothing, ServerReady=nothing, ModelReady=nothing, ServerMetadata=nothing, ModelMetadata=nothing, ModelInfer=nothing, RepositoryIndex=nothing, SystemSharedMemoryStatus=nothing, SystemSharedMemoryRegister=nothing, SystemSharedMemoryUnregister=nothing, IsSameIPCNamespace=nothing) -> server
+
+Register the `inference.GRPCInferenceService` service on `server`: every non-`nothing` keyword
+registers its RPC. Each keyword accepts a handler or a `(handler,
+raw_request, raw_response)` tuple (raw flags per method). All-nothing is a
+no-op. Equivalent to calling the per-RPC `register_<Service>_<Rpc>!`
+functions individually.
+"""
+function register_GRPCInferenceService!(server::GRPCServer; ServerLive = nothing, ServerReady = nothing, ModelReady = nothing, ServerMetadata = nothing, ModelMetadata = nothing, ModelInfer = nothing, RepositoryIndex = nothing, SystemSharedMemoryStatus = nothing, SystemSharedMemoryRegister = nothing, SystemSharedMemoryUnregister = nothing, IsSameIPCNamespace = nothing)
+    if ServerLive !== nothing
+        handler, raw_request, raw_response = ServerLive isa Tuple ? ServerLive : (ServerLive, false, false)
+        register_GRPCInferenceService_ServerLive!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    if ServerReady !== nothing
+        handler, raw_request, raw_response = ServerReady isa Tuple ? ServerReady : (ServerReady, false, false)
+        register_GRPCInferenceService_ServerReady!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    if ModelReady !== nothing
+        handler, raw_request, raw_response = ModelReady isa Tuple ? ModelReady : (ModelReady, false, false)
+        register_GRPCInferenceService_ModelReady!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    if ServerMetadata !== nothing
+        handler, raw_request, raw_response = ServerMetadata isa Tuple ? ServerMetadata : (ServerMetadata, false, false)
+        register_GRPCInferenceService_ServerMetadata!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    if ModelMetadata !== nothing
+        handler, raw_request, raw_response = ModelMetadata isa Tuple ? ModelMetadata : (ModelMetadata, false, false)
+        register_GRPCInferenceService_ModelMetadata!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    if ModelInfer !== nothing
+        handler, raw_request, raw_response = ModelInfer isa Tuple ? ModelInfer : (ModelInfer, false, false)
+        register_GRPCInferenceService_ModelInfer!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    if RepositoryIndex !== nothing
+        handler, raw_request, raw_response = RepositoryIndex isa Tuple ? RepositoryIndex : (RepositoryIndex, false, false)
+        register_GRPCInferenceService_RepositoryIndex!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    if SystemSharedMemoryStatus !== nothing
+        handler, raw_request, raw_response = SystemSharedMemoryStatus isa Tuple ? SystemSharedMemoryStatus : (SystemSharedMemoryStatus, false, false)
+        register_GRPCInferenceService_SystemSharedMemoryStatus!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    if SystemSharedMemoryRegister !== nothing
+        handler, raw_request, raw_response = SystemSharedMemoryRegister isa Tuple ? SystemSharedMemoryRegister : (SystemSharedMemoryRegister, false, false)
+        register_GRPCInferenceService_SystemSharedMemoryRegister!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    if SystemSharedMemoryUnregister !== nothing
+        handler, raw_request, raw_response = SystemSharedMemoryUnregister isa Tuple ? SystemSharedMemoryUnregister : (SystemSharedMemoryUnregister, false, false)
+        register_GRPCInferenceService_SystemSharedMemoryUnregister!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    if IsSameIPCNamespace !== nothing
+        handler, raw_request, raw_response = IsSameIPCNamespace isa Tuple ? IsSameIPCNamespace : (IsSameIPCNamespace, false, false)
+        register_GRPCInferenceService_IsSameIPCNamespace!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    return server
+end
+export register_GRPCInferenceService!
+
+# gRPCServer.jl END

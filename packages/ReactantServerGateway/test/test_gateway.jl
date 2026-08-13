@@ -8,7 +8,7 @@ import gRPCClient
 import HTTP
 import ProtoBuf as TPB
 
-const GWInf = ReactantServerCore.inference
+const GWInf = ReactantServerGateway.inference
 
 @testset "peek_batch_size: item count by input name and axis" begin
     enc(msg) = (io = IOBuffer(); TPB.encode(TPB.ProtoEncoder(io), msg); take!(io))
@@ -84,38 +84,38 @@ mutable struct MockWorker
     fail_exhausted::Bool        # shed ModelInfer with RESOURCE_EXHAUSTED (worker concurrency cap)
 end
 
-function _mock_router()
-    router = gRPCServer.gRPCRouter()
+function _mock_server(port::Integer, worker::MockWorker)
+    server = gRPCServer.GRPCServerHTTPJl("127.0.0.1", Int(port); context = worker)
     ReactantServerGateway.register_GRPCInferenceService!(
-        router;
-        ServerReady = (req, c) -> GWInf.ServerReadyResponse(; ready = true),
-        RepositoryIndex = (req, c) -> GWInf.RepositoryIndexResponse(;
+        server;
+        ServerReady = (ctx, req) -> GWInf.ServerReadyResponse(; ready = true),
+        RepositoryIndex = (ctx, req) -> GWInf.RepositoryIndexResponse(;
             models = [
                 GWInf.var"RepositoryIndexResponse.ModelIndex"(; name = m, version = "", state = "READY", reason = "")
-                    for m in c.payload.models
+                    for m in ctx.payload.models
             ]
         ),
-        ModelInfer = (req, c) -> begin
-            w = c.payload
-            w.fail_infer && throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_UNAVAILABLE, "mock $(w.name) down"))
-            w.fail_exhausted && throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_RESOURCE_EXHAUSTED, "mock $(w.name) at capacity"))
+        ModelInfer = (ctx, req) -> begin
+            w = ctx.payload
+            w.fail_infer && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, "mock $(w.name) down"))
+            w.fail_exhausted && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.RESOURCE_EXHAUSTED, "mock $(w.name) at capacity"))
             # A real worker NOT_FOUNDs a model it no longer serves; mirror that so the gateway's
             # unloaded-model handling (route refresh on worker NOT_FOUND) can be exercised.
             (req.model_name in w.models) ||
-                throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_NOT_FOUND, "model $(req.model_name) not on $(w.name)"))
+                throw(gRPCServer.GRPCError(gRPCServer.StatusCode.NOT_FOUND, "model $(req.model_name) not on $(w.name)"))
             GWInf.ModelInferResponse(; model_name = w.name, id = req.id)
         end,
-        SystemSharedMemoryRegister = (req, c) -> begin
-            c.payload.fail_shm && throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_FAILED_PRECONDITION, "mock shm fail"))
+        SystemSharedMemoryRegister = (ctx, req) -> begin
+            ctx.payload.fail_shm && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.FAILED_PRECONDITION, "mock shm fail"))
             GWInf.SystemSharedMemoryRegisterResponse()
         end,
-        SystemSharedMemoryUnregister = (req, c) -> GWInf.SystemSharedMemoryUnregisterResponse(),
+        SystemSharedMemoryUnregister = (ctx, req) -> GWInf.SystemSharedMemoryUnregisterResponse(),
     )
-    return router
+    return server
 end
 
 _start_mock(worker::MockWorker, port::Integer) =
-    gRPCServer.serve!(_mock_router(), "127.0.0.1", port; context = worker)
+    (s = _mock_server(port, worker); gRPCServer.start!(s); s)
 
 # Send a typed ModelInfer through the gateway and return the response (or rethrow).
 _infer(port, model) = grpc_call(

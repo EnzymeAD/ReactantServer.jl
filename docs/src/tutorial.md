@@ -39,11 +39,11 @@ to one another only through files and the gRPC wire protocol.
    PythonCall weak dependencies the server image should not. Use its test project, which has them
    ready: `julia --project=packages/ReactantServerExport/test`.
 2. **Server environment.** The workspace under `packages/` (`ReactantServerCore`,
-   `ReactantServer`, `ReactantServerNode`, `ReactantServerGateway`) plus the vendored gRPC fork as
-   a git submodule under `lib/`. After cloning, populate the submodule and instantiate once:
+   `ReactantServer`, `ReactantServerNode`, `ReactantServerGateway`), with gRPCServer sourced from
+   its `s-celles-merge` branch on GitHub through the workspace `[sources]`. After cloning,
+   instantiate once:
 
 ```text
-git submodule update --init lib/gRPCServer.jl
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 ```
 

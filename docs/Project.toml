@@ -19,11 +19,12 @@ ReactantServerExport = "90fa0446-f028-4638-8833-e223884d9b4d"
 ReactantServerGateway = "b92f1031-7cb7-4fde-89de-b6dd50303018"
 ReactantServerNode = "49f09047-4fb9-4260-828b-8494ed8e9881"
 gRPCClient = "aaca4a50-36af-4a1d-b878-4c443f2061ad"
-gRPCServer = "b7f0dee4-5e6a-42e7-93b0-9c098bad2317"
+gRPCServer = "608c6337-0d7d-447f-bb69-0f5674ee3959"
 
 [compat]
 Documenter = "1"
 DocumenterVitepress = "0.3"
+gRPCClient = "1.1.0"
 ReactantServer = "0.1"
 ReactantServerClient = "1"
 ReactantServerCore = "1"
@@ -38,5 +39,4 @@ ReactantServerCore = {path = "../packages/ReactantServerCore"}
 ReactantServerGateway = {path = "../packages/ReactantServerGateway"}
 ReactantServerNode = {path = "../packages/ReactantServerNode"}
 ReactantServerExport = {path = "../packages/ReactantServerExport"}
-gRPCServer = {path = "../lib/gRPCServer.jl"}
-gRPCClient = {url = "https://github.com/JuliaIO/gRPCClient.jl", rev = "v1.1.0-rc1"}
+gRPCServer = {url = "https://github.com/csvance/gRPCServer.jl", rev = "s-celles-merge"}

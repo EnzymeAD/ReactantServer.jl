@@ -1,6 +1,5 @@
 # Build context is the repository root. Keep what the image needs (Project.toml, Manifest.toml,
-# packages/, the lib/ runtime submodule, docker/, config/) and drop everything else, especially the
-# large submodule .git dirs.
+# packages/, docker/, config/) and drop everything else.
 
 **/.git
 **/.gitignore

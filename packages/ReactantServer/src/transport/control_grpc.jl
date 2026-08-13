@@ -1,10 +1,10 @@
 # The ReactantServer ControlService gRPC handlers. Distinct from the KServe data plane, this
 # exposes residency and live-policy control to a gateway/control plane. Handlers translate
 # between the control protobuf and the scheduler's control functions (set_residency!, set_policy!,
-# control_status), which run the actual work on the dispatch thread. Registered on the same router
-# and InferContext payload as the inference service (see build_grpc_router).
+# control_status), which run the actual work on the dispatch thread. Registered on the same server
+# and InferContext payload as the inference service (see build_grpc_server).
 
-const _CTRL = ReactantServerCore.control
+const _CTRL = control
 
 # Map between the protobuf Residency enum and the Core ResidencyState.
 function _to_core_residency(r)
@@ -24,10 +24,10 @@ function _as_control(f)
     try
         return f()
     catch e
-        e isa _G.gRPCServiceCallException && rethrow()
+        e isa gRPCServer.GRPCError && rethrow()
         msg = sprint(showerror, e)
         occursin("unknown model", msg) && _not_found(msg)
-        throw(_G.gRPCServiceCallException(_G.GRPC_FAILED_PRECONDITION, msg))
+        throw(gRPCServer.GRPCError(gRPCServer.StatusCode.FAILED_PRECONDITION, msg))
     end
 end
 
@@ -82,15 +82,15 @@ function _handle_compact_memory(ctx::InferContext, req)
     end
 end
 
-# Register the ControlService handlers on an existing router (the inference router), reusing the
-# InferContext payload so both services share the scheduler.
-function register_control_service!(router)
+# Register the ControlService handlers on an existing gRPC server (the inference server),
+# reusing the InferContext payload so both services share the scheduler.
+function register_control_service!(server::gRPCServer.GRPCServer)
     register_ControlService!(
-        router;
-        ModelControlStatus = (req, ctx) -> _handle_model_control_status(ctx.payload),
-        SetModelResidency = (req, ctx) -> _handle_set_model_residency(ctx.payload, req),
-        SetModelPolicy = (req, ctx) -> _handle_set_model_policy(ctx.payload, req),
-        CompactMemory = (req, ctx) -> _handle_compact_memory(ctx.payload, req),
+        server;
+        ModelControlStatus = (ctx, req) -> _handle_model_control_status(ctx.payload),
+        SetModelResidency = (ctx, req) -> _handle_set_model_residency(ctx.payload, req),
+        SetModelPolicy = (ctx, req) -> _handle_set_model_policy(ctx.payload, req),
+        CompactMemory = (ctx, req) -> _handle_compact_memory(ctx.payload, req)
     )
-    return router
+    return server
 end

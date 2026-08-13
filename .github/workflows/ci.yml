@@ -41,15 +41,14 @@ jobs:
         with:
           # `common` (global files + Core) is folded into every suite, since Core is a dependency
           # of all of them and the global files affect everything. Each suite then adds its own
-          # package dir and the vendored lib/* it depends on (submodule bumps show as a change to
-          # the gitlink path `lib/X.jl`). Filters err toward over-inclusion so a real dependency
+          # package dir it depends on (a gRPCServer rev bump shows as a change to that package's
+          # Project.toml [sources]). Filters err toward over-inclusion so a real dependency
           # change can never produce a false green.
           filters: |
             common: &common
               - '.github/workflows/ci.yml'
               - '.github/workflows/_test.yml'
               - 'Project.toml'
-              - '.gitmodules'
               - 'packages/ReactantServerCore/**'
             core:
               - *common
@@ -59,13 +58,9 @@ jobs:
             gateway:
               - *common
               - 'packages/ReactantServerGateway/**'
-              - 'lib/gRPCServer.jl'
-              - 'lib/gRPCServer.jl/**'
             server:
               - *common
               - 'packages/ReactantServer/**'
-              - 'lib/gRPCServer.jl'
-              - 'lib/gRPCServer.jl/**'
             node:
               - *common
               - 'packages/ReactantServerNode/**'
@@ -74,8 +69,6 @@ jobs:
               - *common
               - 'packages/ReactantServerExport/**'
               - 'packages/ReactantServer/**'
-              - 'lib/gRPCServer.jl'
-              - 'lib/gRPCServer.jl/**'
             # The PyTorch round-trip provisions torch/jax/tensorflow via conda, so it runs only when
             # the PyTorch surface itself changes: the extension, its conda pins, its own test project,
             # or the shared test runner (which carries the torch-specific CPU-wheel and triton
@@ -166,8 +159,6 @@ jobs:
       actions: write   # julia-actions/cache prunes its old caches
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          submodules: recursive
       - uses: julia-actions/setup-julia@fa02766e078afaaf09b14210362cee14137e6a32 # v3.0.2
         with:
           version: '1.12'

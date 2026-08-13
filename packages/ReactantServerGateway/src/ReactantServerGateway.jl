@@ -20,8 +20,15 @@ import Prometheus
 import YAML
 
 using ReactantServerCore
-using ReactantServerCore.inference   # KServe message types in scope for the gRPC stubs
-using ReactantServerCore.control     # control-plane message types (lpt_packing cost polling)
+
+# Own generated gRPC codegen (messages + client stubs + registration); protojl output from
+# proto_src; never hand-edit the pb content. These modules shadow Core's message-only modules,
+# so the gateway's handlers and outbound clients use the gateway-local message types.
+include("proto/inference/inference.jl")
+include("proto/control/control.jl")
+using .inference
+using .control
+export inference, control
 
 # Internal config/parsing helpers reused from ReactantServerCore (not exported). The node-file
 # helpers are used only by `probe_worker_ready`, the worker container's healthcheck.
@@ -35,13 +42,12 @@ import ReactantServerCore:
     _parse_env,
     _parse_env_var
 
-# gRPC service stubs: client stubs for forwarding to workers, server stubs for terminating the
-# client connection. Core ships the files but does not compile them; included here so the bare
-# message-type references resolve and the gRPC imports run against this package's deps.
-include(ReactantServerCore.inference_client_stubs_path())
-include(ReactantServerCore.inference_server_stubs_path())
-include(ReactantServerCore.control_client_stubs_path())
-include(ReactantServerCore.control_server_stubs_path())   # gateway terminates ControlService/CompactMemory and fans it out
+# gRPC codegen: the generated modules carry client constructors and the per-service
+# registration functions, but `using` does not re-export them, so re-export the three
+# registration entry points the gateway uses (tests call them qualified and unqualified).
+import .inference: register_GRPCInferenceService!
+import .control: register_ControlService!, register_GatewayControlService!
+export register_GRPCInferenceService!, register_ControlService!, register_GatewayControlService!
 
 include("headers.jl")
 include("config.jl")
@@ -72,7 +78,7 @@ struct RunningGateway{S}
     metrics::GatewayMetrics
     admin::AdminServer
     prober::HealthProber
-    server::S          # the gRPC server handle; type inferred from gRPCServer.serve!
+    server::S          # the gRPC server handle (GRPCServer)
 end
 
 # HTTP/2 receive flow-control windows the gateway advertises to its clients. The protocol default
@@ -153,33 +159,21 @@ function serve_gateway(gateway_path::Union{AbstractString, Nothing} = nothing; b
         @warn "initial route discovery failed; the health prober will retry" exception = e
     end
     prober = start_prober!(HealthProber(pool, metrics, admin, routes; scheduler = scheduler, meta = meta))
-    router = build_gateway_router(state, cfg)
-
     host, port = _split_hostport(cfg.listen_grpc)
     # Inbound admission cap: a per-worker multiple of the configured budget, scaled by the fleet
     # size so the gateway sheds (RESOURCE_EXHAUSTED) only past what the workers can plausibly absorb.
-    # 0 (per-worker = 0) disables the cap. The atomics are read live by the admission metrics.
+    # 0 (per-worker = 0) disables the cap. The server's own admission atomics are read live by the
+    # admission metrics.
     max_concurrent = cfg.max_concurrent_requests_per_worker * length(cfg.workers)
-    inflight = Threads.Atomic{Int}(0)
-    shed = Threads.Atomic{Int}(0)
-    register_admission!(metrics, inflight, shed, max_concurrent)
+    server = build_gateway_server(state, cfg, host, port)
+    register_admission!(metrics, server.inflight, server.shed_total, max_concurrent)
     @info "Starting reactant-gateway" grpc = cfg.listen_grpc metrics = cfg.listen_metrics endpoints = cfg.workers max_concurrent_requests = max_concurrent outbound_streams_per_worker = cfg.max_concurrent_streams_per_worker
 
     if blocking
-        gRPCServer.serve(
-            router, host, port; context = state,
-            max_concurrent_requests = max_concurrent, inflight = inflight, shed_total = shed,
-            h2_initial_window_size = _H2_INITIAL_WINDOW_BYTES,
-            h2_connection_window_size = _H2_CONNECTION_WINDOW_BYTES
-        )
+        run(server)
         return nothing
     end
-    server = gRPCServer.serve!(
-        router, host, port; context = state,
-        max_concurrent_requests = max_concurrent, inflight = inflight, shed_total = shed,
-        h2_initial_window_size = _H2_INITIAL_WINDOW_BYTES,
-        h2_connection_window_size = _H2_CONNECTION_WINDOW_BYTES
-    )
+    gRPCServer.start!(server)
     return RunningGateway(cfg, pool, routes, gate, metrics, admin, prober, server)
 end
 

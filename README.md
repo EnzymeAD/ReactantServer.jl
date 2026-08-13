@@ -60,7 +60,6 @@ The node runs natively (no containers): run the supervisor over a directory of m
 scales to all visible GPUs.
 
 ```
-git submodule update --init lib/gRPCServer.jl   # the one vendored fork the build needs
 REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 INFERENCE_SERVER_MODEL_DIRS=/path/to/bundles \
@@ -114,8 +113,9 @@ pulls in the heavy Reactant/XLA stack:
 
 Offline model export lives in `packages/ReactantServerExport` (a Reactant tracing frontend plus a
 PythonCall-triggered PyTorch extension); it is deliberately **not** a workspace member, so its
-Lux/PythonCall weakdeps stay out of the server images. The vendored `gRPCServer` fork is the only
-remaining git submodule under `lib/`.
+Lux/PythonCall weakdeps stay out of the server images. `gRPCServer` is sourced from the
+`s-celles-merge` branch of `github.com/csvance/gRPCServer.jl` through the workspace `[sources]`;
+there are no git submodules.
 
 ## Acknowledgments
 

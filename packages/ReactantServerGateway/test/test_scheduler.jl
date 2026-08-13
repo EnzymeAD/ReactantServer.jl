@@ -72,7 +72,7 @@ end
 # A ModelInferRequest body carrying one named input with the given shape, encoded as the wire sees it.
 function _body(model, name, shape)
     QPB = ReactantServerGateway.PB
-    QInf = ReactantServerCore.inference
+    QInf = ReactantServerGateway.inference
     msg = QInf.ModelInferRequest(;
         model_name = model,
         inputs = [

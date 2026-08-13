@@ -1,14 +1,14 @@
 # Client for the CPU supervisor e2e (run_e2e_cpu.sh): drives the scale4 model through the
 # embedded gateway over the inline (TCP) data path and asserts exact results. Runs in the
-# ReactantServerGateway project (ReactantServerCore message types + gRPCClient), so it never
+# ReactantServerGateway project (ReactantServerGateway message types + gRPCClient), so it never
 # loads Reactant.
 #
 #   julia --project=packages/ReactantServerGateway client_cpu.jl <gateway_port> <worker0_port>
 
 import gRPCClient
 import ProtoBuf
-using ReactantServerCore
-const Inf = ReactantServerCore.inference
+using ReactantServerGateway
+const Inf = ReactantServerGateway.inference
 
 const GATEWAY_PORT = parse(Int, ARGS[1])
 const WORKER0_PORT = parse(Int, ARGS[2])

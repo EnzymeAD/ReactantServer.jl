@@ -2,6 +2,7 @@
 # original file: grpc_predict_v2.proto (proto3 syntax)
 
 import ProtoBuf as PB
+import gRPCClient
 using ProtoBuf: OneOf
 using ProtoBuf.EnumX: @enumx
 
@@ -1193,5 +1194,147 @@ function PB._encoded_size(x::ModelInferResponse)
     return encoded_size
 end
 
-# SERVICE: No codegen handlers registered
-#    GRPCInferenceService
+# gRPCClient.jl BEGIN
+GRPCInferenceService_ServerLive_Client(
+    host, port;
+    TRequest = ServerLiveRequest,
+    TResponse = ServerLiveResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/ServerLive";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_ServerLive_Client
+
+GRPCInferenceService_ServerReady_Client(
+    host, port;
+    TRequest = ServerReadyRequest,
+    TResponse = ServerReadyResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/ServerReady";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_ServerReady_Client
+
+GRPCInferenceService_ModelReady_Client(
+    host, port;
+    TRequest = ModelReadyRequest,
+    TResponse = ModelReadyResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/ModelReady";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_ModelReady_Client
+
+GRPCInferenceService_ServerMetadata_Client(
+    host, port;
+    TRequest = ServerMetadataRequest,
+    TResponse = ServerMetadataResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/ServerMetadata";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_ServerMetadata_Client
+
+GRPCInferenceService_ModelMetadata_Client(
+    host, port;
+    TRequest = ModelMetadataRequest,
+    TResponse = ModelMetadataResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/ModelMetadata";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_ModelMetadata_Client
+
+GRPCInferenceService_ModelInfer_Client(
+    host, port;
+    TRequest = ModelInferRequest,
+    TResponse = ModelInferResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/ModelInfer";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_ModelInfer_Client
+
+GRPCInferenceService_RepositoryIndex_Client(
+    host, port;
+    TRequest = RepositoryIndexRequest,
+    TResponse = RepositoryIndexResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/RepositoryIndex";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_RepositoryIndex_Client
+
+GRPCInferenceService_SystemSharedMemoryStatus_Client(
+    host, port;
+    TRequest = SystemSharedMemoryStatusRequest,
+    TResponse = SystemSharedMemoryStatusResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/SystemSharedMemoryStatus";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_SystemSharedMemoryStatus_Client
+
+GRPCInferenceService_SystemSharedMemoryRegister_Client(
+    host, port;
+    TRequest = SystemSharedMemoryRegisterRequest,
+    TResponse = SystemSharedMemoryRegisterResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/SystemSharedMemoryRegister";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_SystemSharedMemoryRegister_Client
+
+GRPCInferenceService_SystemSharedMemoryUnregister_Client(
+    host, port;
+    TRequest = SystemSharedMemoryUnregisterRequest,
+    TResponse = SystemSharedMemoryUnregisterResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/SystemSharedMemoryUnregister";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_SystemSharedMemoryUnregister_Client
+
+GRPCInferenceService_IsSameIPCNamespace_Client(
+    host, port;
+    TRequest = IsSameIPCNamespaceRequest,
+    TResponse = IsSameIPCNamespaceResponse,
+    grpc = gRPCClient.grpc_global_handle(),
+    options...
+) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
+    host, port, "/inference.GRPCInferenceService/IsSameIPCNamespace";
+    grpc = grpc,
+    options...
+)
+export GRPCInferenceService_IsSameIPCNamespace_Client
+# gRPCClient.jl END

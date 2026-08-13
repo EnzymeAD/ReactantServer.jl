@@ -18,10 +18,10 @@
 # its own bundled cuDNN 9 / NCCL 2 via $ORIGIN, and a system copy on LD_LIBRARY_PATH would shadow
 # them with a mismatched version.
 #
-# Build context is the repository root. The only git submodule is lib/gRPCServer.jl (Reactant, HTTP,
-# Prometheus, gRPCClient are registry deps); run `git submodule update --init lib/gRPCServer.jl`
-# before building. NOTE: Manifest.toml is gitignored, so `COPY Manifest.toml` needs a locally
-# generated Manifest in the build context (run `REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1
+# Build context is the repository root. Reactant, HTTP, Prometheus, and gRPCClient are registry
+# deps; gRPCServer resolves from the `s-celles-merge` branch of github.com/csvance/gRPCServer.jl
+# via the workspace [sources]. NOTE: Manifest.toml is gitignored, so `COPY Manifest.toml` needs a
+# locally generated Manifest in the build context (run `REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1
 # julia --project=. -e 'using Pkg; Pkg.instantiate()'` first); a fresh clone has none.
 #
 # Build (from the repo root):
@@ -75,13 +75,13 @@ COPY --from=cudalibs /usr/local/cuda/lib64/stubs/libcuda.so /opt/cuda-stub/libcu
 
 WORKDIR /opt/reactantserver
 
-# Workspace root environment, the member packages, and the vendored gRPCServer submodule (the
-# remaining forks resolve from the registries via the shared Manifest.toml). The worker is
-# built on the workspace root; the entrypoint then runs on the ReactantServer member project.
-# .dockerignore drops the package test trees (e.g. the large e2e weights) from the packages/ copy.
+# Workspace root environment and the member packages. gRPCServer resolves from its
+# s-celles-merge branch on GitHub via the shared Manifest.toml; the remaining forks resolve from
+# the registries. The worker is built on the workspace root; the entrypoint then runs on the
+# ReactantServer member project. .dockerignore drops the package test trees (e.g. the large e2e
+# weights) from the packages/ copy.
 COPY Project.toml Manifest.toml ./
 COPY packages/ ./packages/
-COPY lib/gRPCServer.jl/ ./lib/gRPCServer.jl/
 
 # CUDA artifact selection for Reactant_jll. Its platform augmentation honors REACTANT_GPU and
 # REACTANT_GPU_VERSION to choose the prebuilt artifact. Set as ENV (not ARG) so the same selection

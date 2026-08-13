@@ -1,6 +1,7 @@
 module ReactantServerClient
 
-# KServe V2 inference client. Builds requests against ReactantServerCore's protobuf messages
+# KServe V2 inference client. Builds requests against its own generated protobuf messages
+# (the `inference` module below, generated from the same proto as the worker and gateway)
 # and dtype vocabulary, stages tensor data through the concurrency-safe BufferPool from Core,
 # and forwards over gRPC. Ported from the (unpublished) SimpleKServe.jl; the shared-memory
 # pool/slot machinery and dtype tables now come from ReactantServerCore. This package never
@@ -14,7 +15,13 @@ using FixedSizeArrays
 using gRPCClient
 
 using ReactantServerCore
-using ReactantServerCore.inference   # KServe message types in scope for the client stubs
+
+# Own generated inference module (KServe messages + gRPC client constructors); protojl output
+# from proto_src; never hand-edit the pb content. It shadows Core's message-only module, so the
+# client's requests and responses use the client-local message types.
+include("proto/inference/inference.jl")
+using .inference
+export inference
 
 # These Core functions get new methods below (on InferenceBufferPool, and the client `scratch`
 # overload returning wire descriptors), so they must be imported to extend rather than shadow them.
@@ -22,10 +29,9 @@ import ReactantServerCore: acquire_slot!, is_shm_backed, scratch, pool_view
 
 import Base: length, sizeof, rm, elsize
 
-# gRPC client service stubs (define GRPCInferenceService_*_Client). Core ships the file but
-# does not compile it; included here so its bare message-type references resolve and
-# `import gRPCClient` runs against this package's deps.
-include(ReactantServerCore.inference_client_stubs_path())
+# The generated inference module carries the gRPC client constructors
+# (GRPCInferenceService_*_Client); `using .inference` above brings them in. No server-side stubs
+# are generated or needed: this package never serves gRPC.
 
 const DEFAULT_POOL_BYTES = 256 * 1024 * 1024  # 256 MiB
 const DEFAULT_POOL_SLOTS = 8                   # fixed slots per pool (the allocator's parallelism)

@@ -2,6 +2,8 @@
 # original file: reactant_control_v1.proto (proto3 syntax)
 
 import ProtoBuf as PB
+import gRPCServer
+using gRPCServer: GRPCServer
 using ProtoBuf: OneOf
 using ProtoBuf.EnumX: @enumx
 
@@ -1196,8 +1198,420 @@ function PB._encoded_size(x::ModelControlStatusResponse)
     return encoded_size
 end
 
-# SERVICE: No codegen handlers registered
-#    GatewayControlService
+# gRPCServer.jl BEGIN
+# reactant_control.GatewayControlService.GetSchedulingStatus (unary)
+"""
+    GatewayControlService_GetSchedulingStatus_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
 
-# SERVICE: No codegen handlers registered
-#    ControlService
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/reactant_control.GatewayControlService/GetSchedulingStatus`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::GetSchedulingStatusRequest) -> GetSchedulingStatusResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+GatewayControlService_GetSchedulingStatus_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("GetSchedulingStatus", gRPCServer.MethodType.UNARY, GetSchedulingStatusRequest, GetSchedulingStatusResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export GatewayControlService_GetSchedulingStatus_Method
+
+"""
+    register_GatewayControlService_GetSchedulingStatus!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_GatewayControlService_GetSchedulingStatus!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/reactant_control.GatewayControlService/GetSchedulingStatus` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::GetSchedulingStatusRequest) -> GetSchedulingStatusResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`GatewayControlService_GetSchedulingStatus_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_GatewayControlService_GetSchedulingStatus!(server) do ctx, req
+    # compute and return a GetSchedulingStatusResponse
+end
+```
+"""
+function register_GatewayControlService_GetSchedulingStatus!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "reactant_control.GatewayControlService", GatewayControlService_GetSchedulingStatus_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_GatewayControlService_GetSchedulingStatus!(handler::Function, server::GRPCServer; kwargs...) = register_GatewayControlService_GetSchedulingStatus!(server, handler; kwargs...)
+export register_GatewayControlService_GetSchedulingStatus!
+
+# reactant_control.GatewayControlService.SetSchedulingPolicy (unary)
+"""
+    GatewayControlService_SetSchedulingPolicy_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
+
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/reactant_control.GatewayControlService/SetSchedulingPolicy`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::SetSchedulingPolicyRequest) -> SetSchedulingPolicyResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+GatewayControlService_SetSchedulingPolicy_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("SetSchedulingPolicy", gRPCServer.MethodType.UNARY, SetSchedulingPolicyRequest, SetSchedulingPolicyResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export GatewayControlService_SetSchedulingPolicy_Method
+
+"""
+    register_GatewayControlService_SetSchedulingPolicy!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_GatewayControlService_SetSchedulingPolicy!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/reactant_control.GatewayControlService/SetSchedulingPolicy` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::SetSchedulingPolicyRequest) -> SetSchedulingPolicyResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`GatewayControlService_SetSchedulingPolicy_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_GatewayControlService_SetSchedulingPolicy!(server) do ctx, req
+    # compute and return a SetSchedulingPolicyResponse
+end
+```
+"""
+function register_GatewayControlService_SetSchedulingPolicy!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "reactant_control.GatewayControlService", GatewayControlService_SetSchedulingPolicy_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_GatewayControlService_SetSchedulingPolicy!(handler::Function, server::GRPCServer; kwargs...) = register_GatewayControlService_SetSchedulingPolicy!(server, handler; kwargs...)
+export register_GatewayControlService_SetSchedulingPolicy!
+
+# reactant_control.GatewayControlService.SetModelPlacement (unary)
+"""
+    GatewayControlService_SetModelPlacement_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
+
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/reactant_control.GatewayControlService/SetModelPlacement`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::SetModelPlacementRequest) -> SetModelPlacementResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+GatewayControlService_SetModelPlacement_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("SetModelPlacement", gRPCServer.MethodType.UNARY, SetModelPlacementRequest, SetModelPlacementResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export GatewayControlService_SetModelPlacement_Method
+
+"""
+    register_GatewayControlService_SetModelPlacement!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_GatewayControlService_SetModelPlacement!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/reactant_control.GatewayControlService/SetModelPlacement` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::SetModelPlacementRequest) -> SetModelPlacementResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`GatewayControlService_SetModelPlacement_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_GatewayControlService_SetModelPlacement!(server) do ctx, req
+    # compute and return a SetModelPlacementResponse
+end
+```
+"""
+function register_GatewayControlService_SetModelPlacement!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "reactant_control.GatewayControlService", GatewayControlService_SetModelPlacement_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_GatewayControlService_SetModelPlacement!(handler::Function, server::GRPCServer; kwargs...) = register_GatewayControlService_SetModelPlacement!(server, handler; kwargs...)
+export register_GatewayControlService_SetModelPlacement!
+
+# reactant_control.GatewayControlService.Repack (unary)
+"""
+    GatewayControlService_Repack_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
+
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/reactant_control.GatewayControlService/Repack`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::RepackRequest) -> RepackResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+GatewayControlService_Repack_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("Repack", gRPCServer.MethodType.UNARY, RepackRequest, RepackResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export GatewayControlService_Repack_Method
+
+"""
+    register_GatewayControlService_Repack!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_GatewayControlService_Repack!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/reactant_control.GatewayControlService/Repack` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::RepackRequest) -> RepackResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`GatewayControlService_Repack_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_GatewayControlService_Repack!(server) do ctx, req
+    # compute and return a RepackResponse
+end
+```
+"""
+function register_GatewayControlService_Repack!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "reactant_control.GatewayControlService", GatewayControlService_Repack_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_GatewayControlService_Repack!(handler::Function, server::GRPCServer; kwargs...) = register_GatewayControlService_Repack!(server, handler; kwargs...)
+export register_GatewayControlService_Repack!
+
+"""
+    register_GatewayControlService!(server::GRPCServer; GetSchedulingStatus=nothing, SetSchedulingPolicy=nothing, SetModelPlacement=nothing, Repack=nothing) -> server
+
+Register the `reactant_control.GatewayControlService` service on `server`: every non-`nothing` keyword
+registers its RPC. Each keyword accepts a handler or a `(handler,
+raw_request, raw_response)` tuple (raw flags per method). All-nothing is a
+no-op. Equivalent to calling the per-RPC `register_<Service>_<Rpc>!`
+functions individually.
+"""
+function register_GatewayControlService!(server::GRPCServer; GetSchedulingStatus = nothing, SetSchedulingPolicy = nothing, SetModelPlacement = nothing, Repack = nothing)
+    if GetSchedulingStatus !== nothing
+        handler, raw_request, raw_response = GetSchedulingStatus isa Tuple ? GetSchedulingStatus : (GetSchedulingStatus, false, false)
+        register_GatewayControlService_GetSchedulingStatus!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    if SetSchedulingPolicy !== nothing
+        handler, raw_request, raw_response = SetSchedulingPolicy isa Tuple ? SetSchedulingPolicy : (SetSchedulingPolicy, false, false)
+        register_GatewayControlService_SetSchedulingPolicy!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    if SetModelPlacement !== nothing
+        handler, raw_request, raw_response = SetModelPlacement isa Tuple ? SetModelPlacement : (SetModelPlacement, false, false)
+        register_GatewayControlService_SetModelPlacement!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    if Repack !== nothing
+        handler, raw_request, raw_response = Repack isa Tuple ? Repack : (Repack, false, false)
+        register_GatewayControlService_Repack!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    return server
+end
+export register_GatewayControlService!
+
+# gRPCServer.jl END
+
+# gRPCServer.jl BEGIN
+# reactant_control.ControlService.ModelControlStatus (unary)
+"""
+    ControlService_ModelControlStatus_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
+
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/reactant_control.ControlService/ModelControlStatus`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::ModelControlStatusRequest) -> ModelControlStatusResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+ControlService_ModelControlStatus_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("ModelControlStatus", gRPCServer.MethodType.UNARY, ModelControlStatusRequest, ModelControlStatusResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export ControlService_ModelControlStatus_Method
+
+"""
+    register_ControlService_ModelControlStatus!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_ControlService_ModelControlStatus!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/reactant_control.ControlService/ModelControlStatus` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::ModelControlStatusRequest) -> ModelControlStatusResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`ControlService_ModelControlStatus_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_ControlService_ModelControlStatus!(server) do ctx, req
+    # compute and return a ModelControlStatusResponse
+end
+```
+"""
+function register_ControlService_ModelControlStatus!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "reactant_control.ControlService", ControlService_ModelControlStatus_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_ControlService_ModelControlStatus!(handler::Function, server::GRPCServer; kwargs...) = register_ControlService_ModelControlStatus!(server, handler; kwargs...)
+export register_ControlService_ModelControlStatus!
+
+# reactant_control.ControlService.SetModelResidency (unary)
+"""
+    ControlService_SetModelResidency_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
+
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/reactant_control.ControlService/SetModelResidency`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::SetModelResidencyRequest) -> SetModelResidencyResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+ControlService_SetModelResidency_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("SetModelResidency", gRPCServer.MethodType.UNARY, SetModelResidencyRequest, SetModelResidencyResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export ControlService_SetModelResidency_Method
+
+"""
+    register_ControlService_SetModelResidency!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_ControlService_SetModelResidency!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/reactant_control.ControlService/SetModelResidency` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::SetModelResidencyRequest) -> SetModelResidencyResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`ControlService_SetModelResidency_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_ControlService_SetModelResidency!(server) do ctx, req
+    # compute and return a SetModelResidencyResponse
+end
+```
+"""
+function register_ControlService_SetModelResidency!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "reactant_control.ControlService", ControlService_SetModelResidency_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_ControlService_SetModelResidency!(handler::Function, server::GRPCServer; kwargs...) = register_ControlService_SetModelResidency!(server, handler; kwargs...)
+export register_ControlService_SetModelResidency!
+
+# reactant_control.ControlService.SetModelPolicy (unary)
+"""
+    ControlService_SetModelPolicy_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
+
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/reactant_control.ControlService/SetModelPolicy`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::SetModelPolicyRequest) -> SetModelPolicyResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+ControlService_SetModelPolicy_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("SetModelPolicy", gRPCServer.MethodType.UNARY, SetModelPolicyRequest, SetModelPolicyResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export ControlService_SetModelPolicy_Method
+
+"""
+    register_ControlService_SetModelPolicy!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_ControlService_SetModelPolicy!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/reactant_control.ControlService/SetModelPolicy` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::SetModelPolicyRequest) -> SetModelPolicyResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`ControlService_SetModelPolicy_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_ControlService_SetModelPolicy!(server) do ctx, req
+    # compute and return a SetModelPolicyResponse
+end
+```
+"""
+function register_ControlService_SetModelPolicy!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "reactant_control.ControlService", ControlService_SetModelPolicy_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_ControlService_SetModelPolicy!(handler::Function, server::GRPCServer; kwargs...) = register_ControlService_SetModelPolicy!(server, handler; kwargs...)
+export register_ControlService_SetModelPolicy!
+
+# reactant_control.ControlService.CompactMemory (unary)
+"""
+    ControlService_CompactMemory_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
+
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/reactant_control.ControlService/CompactMemory`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::CompactMemoryRequest) -> CompactMemoryResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+ControlService_CompactMemory_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("CompactMemory", gRPCServer.MethodType.UNARY, CompactMemoryRequest, CompactMemoryResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export ControlService_CompactMemory_Method
+
+"""
+    register_ControlService_CompactMemory!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_ControlService_CompactMemory!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/reactant_control.ControlService/CompactMemory` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::CompactMemoryRequest) -> CompactMemoryResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`ControlService_CompactMemory_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_ControlService_CompactMemory!(server) do ctx, req
+    # compute and return a CompactMemoryResponse
+end
+```
+"""
+function register_ControlService_CompactMemory!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "reactant_control.ControlService", ControlService_CompactMemory_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_ControlService_CompactMemory!(handler::Function, server::GRPCServer; kwargs...) = register_ControlService_CompactMemory!(server, handler; kwargs...)
+export register_ControlService_CompactMemory!
+
+"""
+    register_ControlService!(server::GRPCServer; ModelControlStatus=nothing, SetModelResidency=nothing, SetModelPolicy=nothing, CompactMemory=nothing) -> server
+
+Register the `reactant_control.ControlService` service on `server`: every non-`nothing` keyword
+registers its RPC. Each keyword accepts a handler or a `(handler,
+raw_request, raw_response)` tuple (raw flags per method). All-nothing is a
+no-op. Equivalent to calling the per-RPC `register_<Service>_<Rpc>!`
+functions individually.
+"""
+function register_ControlService!(server::GRPCServer; ModelControlStatus = nothing, SetModelResidency = nothing, SetModelPolicy = nothing, CompactMemory = nothing)
+    if ModelControlStatus !== nothing
+        handler, raw_request, raw_response = ModelControlStatus isa Tuple ? ModelControlStatus : (ModelControlStatus, false, false)
+        register_ControlService_ModelControlStatus!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    if SetModelResidency !== nothing
+        handler, raw_request, raw_response = SetModelResidency isa Tuple ? SetModelResidency : (SetModelResidency, false, false)
+        register_ControlService_SetModelResidency!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    if SetModelPolicy !== nothing
+        handler, raw_request, raw_response = SetModelPolicy isa Tuple ? SetModelPolicy : (SetModelPolicy, false, false)
+        register_ControlService_SetModelPolicy!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    if CompactMemory !== nothing
+        handler, raw_request, raw_response = CompactMemory isa Tuple ? CompactMemory : (CompactMemory, false, false)
+        register_ControlService_CompactMemory!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    return server
+end
+export register_ControlService!
+
+# gRPCServer.jl END

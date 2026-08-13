@@ -1,7 +1,7 @@
 # The gateway's own scheduling control plane (GatewayControlService): the pure state helpers, then the
 # four RPCs end to end against a mock fleet.
 #
-# The mock-worker harness (AffMockWorker, _aff_router, _aff_gatewayfile, _aff_infer) comes from
+# The mock-worker harness (AffMockWorker, _aff_server, _aff_gatewayfile, _aff_infer) comes from
 # test_lpt_packing.jl, which runtests.jl includes first.
 
 import ProtoBuf
@@ -78,8 +78,8 @@ end
     w0 = AffMockWorker("worker0", copy(models))
     w1 = AffMockWorker("worker1", copy(models))
     p0, p1 = grpc_free_port(), grpc_free_port()
-    s0 = gRPCServer.serve!(_aff_router(), "127.0.0.1", p0; context = w0)
-    s1 = gRPCServer.serve!(_aff_router(), "127.0.0.1", p1; context = w1)
+    s0 = _aff_server(p0, w0); gRPCServer.start!(s0)
+    s1 = _aff_server(p1, w1); gRPCServer.start!(s1)
 
     gw_port, admin_port = grpc_free_port(), grpc_free_port()
     gatewayfile = _aff_gatewayfile(gw_port, admin_port, [p0, p1])
@@ -376,7 +376,7 @@ end
 @testset "gateway control: the mutators require lpt_packing" begin
     w0 = AffMockWorker("worker0", ["alpha"])
     p0 = grpc_free_port()
-    s0 = gRPCServer.serve!(_aff_router(), "127.0.0.1", p0; context = w0)
+    s0 = _aff_server(p0, w0); gRPCServer.start!(s0)
     gw_port, admin_port = grpc_free_port(), grpc_free_port()
     path = tempname() * ".yaml"
     write(

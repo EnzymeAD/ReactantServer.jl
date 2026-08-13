@@ -218,20 +218,26 @@ function serve(
     # including the CPU glue between stages, but not the GPU itself: its sub-calls dispatch on the loop,
     # so other models run while the meta computes between stages.
     sched.meta_gate = MetaGate(_meta_concurrency())
-    # Admission counters shared with the gRPC server: the cap (endpoints.max_concurrent_requests,
-    # 0 = uncapped) sheds past `inflight`, counting each rejection in `shed`. The metrics collector
-    # reads both live, so they are exported even while `serve` blocks the calling task.
-    inflight = Threads.Atomic{Int}(0)
-    shed = Threads.Atomic{Int}(0)
+    # Build the gRPC server first (registered, with a metrics-less payload), then adopt the
+    # server's own admission atomics into the metrics collector, then swap in the real payload
+    # before the server starts accepting traffic.
+    ctx0 = InferContext(sched, registry, shm, pool.platform)   # metrics = nothing (4-arg form)
+    server = build_grpc_server(
+        sched, registry, pool.platform, shm,
+        cfg.endpoints.host, cfg.endpoints.port, ctx0;
+        max_recv_msg_bytes = cfg.grpc.max_recv_msg_bytes,
+        max_send_msg_bytes = cfg.grpc.max_send_msg_bytes,
+        max_concurrent_requests = cfg.endpoints.max_concurrent_requests,
+        h2_initial_window_size = _H2_INITIAL_WINDOW_BYTES,
+        h2_connection_window_size = _H2_CONNECTION_WINDOW_BYTES
+    )
+    inflight = server.inflight
+    shed = server.shed_total
     metrics = WorkerMetrics(
         sched, backend, pool, cfg; worker_name = worker_name,
         inflight = inflight, shed = shed
     )
-    router = build_grpc_router(
-        sched, registry, pool.platform, shm;
-        max_recv_msg_bytes = cfg.grpc.max_recv_msg_bytes, max_send_msg_bytes = cfg.grpc.max_send_msg_bytes
-    )
-    ctx = InferContext(sched, registry, shm, pool.platform, metrics)
+    server.context = InferContext(sched, registry, shm, pool.platform, metrics)   # swap before start!
     # Optional Prometheus metrics endpoint (opt-in via endpoints.metrics_port > 0). Request counting
     # is always on (the InferContext carries `metrics`); only the HTTP listener is gated.
     metrics_server = nothing
@@ -247,21 +253,9 @@ function serve(
     end
     @info "Starting gRPC control plane" host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests models = model_names(registry)
     if blocking
-        _G.serve(
-            router, cfg.endpoints.host, cfg.endpoints.port; context = ctx,
-            max_concurrent_requests = cfg.endpoints.max_concurrent_requests,
-            inflight = inflight, shed_total = shed,
-            h2_initial_window_size = _H2_INITIAL_WINDOW_BYTES,
-            h2_connection_window_size = _H2_CONNECTION_WINDOW_BYTES
-        )
+        run(server)
         return nothing
     end
-    server = _G.serve!(
-        router, cfg.endpoints.host, cfg.endpoints.port; context = ctx,
-        max_concurrent_requests = cfg.endpoints.max_concurrent_requests,
-        inflight = inflight, shed_total = shed,
-        h2_initial_window_size = _H2_INITIAL_WINDOW_BYTES,
-        h2_connection_window_size = _H2_CONNECTION_WINDOW_BYTES
-    )
+    gRPCServer.start!(server)
     return RunningServer(cfg, registry, sched, pool, shm, server, cfg.endpoints.port, watcher, metrics_server)
 end

@@ -8,7 +8,6 @@ worker to the public ports directly), and multiplexes all logs onto stdout with 
 `:8001`, health/metrics on `:8002`.
 
 ```
-git submodule update --init lib/gRPCServer.jl
 REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1 julia --project=. -e 'using Pkg; Pkg.instantiate()'  # generates Manifest.toml (gitignored)
 make image        # or: docker build -f docker/Dockerfile -t reactantserver .
 REACTANTSERVER_MODELS=/path/to/bundles docker compose up

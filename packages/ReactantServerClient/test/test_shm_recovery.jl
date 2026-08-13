@@ -12,18 +12,13 @@ module ShmRecoveryTests
 using Test
 using ReactantServerClient
 import ReactantServerCore
-using ReactantServerCore: inference
-using ReactantServerCore.inference   # bring the KServe message types into scope for the server stubs
+using ReactantServerClient: inference
+using ReactantServerClient.inference   # KServe message types in scope
 import gRPCServer
 using Sockets
 
 const RSC = ReactantServerClient
 const inf = inference
-
-# Server-side service stubs (register_GRPCInferenceService! + method descriptors). Included into this
-# module, which has `inference` message types in scope and `import gRPCServer`, exactly as the worker
-# and gateway include them.
-include(ReactantServerCore.inference_server_stubs_path())
 
 free_port() = (s = Sockets.listen(Sockets.localhost, 0); p = Int(Sockets.getsockname(s)[2]); close(s); p)
 
@@ -49,36 +44,48 @@ function _region_of(t)
     return p.parameter_choice.name === :string_param ? String(p.parameter_choice[]) : nothing
 end
 
-function _mk_router(st::MockState)
-    router = gRPCServer.gRPCRouter(;
-        max_receive_message_length = 64 * 1024 * 1024,
-        max_send_message_length = 64 * 1024 * 1024
+function _mk_server(st::MockState, port::Integer)
+    server = gRPCServer.GRPCServerHTTPJl(
+        "127.0.0.1", Int(port); context = st,
+        max_message_size = 64 * 1024 * 1024
     )
-    register_GRPCInferenceService!(
-        router;
-        IsSameIPCNamespace = (req, ctx) -> begin
+    # The client's generated module carries no server registration (it never serves gRPC), so the
+    # mock registers its four unary RPCs through the runtime primitive directly. Mirror the
+    # generated `register_GRPCInferenceService_<Rpc>!` call shape (MethodDescriptor + register_method!).
+    _reg = (name, Req, Resp, handler) -> gRPCServer.register_method!(
+        server.dispatcher, "inference.GRPCInferenceService",
+        gRPCServer.MethodDescriptor(name, gRPCServer.MethodType.UNARY, Req, Resp, handler)
+    )
+    _reg(
+        "IsSameIPCNamespace", inf.IsSameIPCNamespaceRequest, inf.IsSameIPCNamespaceResponse, (ctx, req) -> begin
             st.probe_sleep > 0 && sleep(st.probe_sleep)   # simulate a restarted-but-unresponsive server
             inf.IsSameIPCNamespaceResponse(; same = st.same_ns)
-        end,
-        SystemSharedMemoryRegister = (req, ctx) -> begin
+        end
+    )
+    _reg(
+        "SystemSharedMemoryRegister", inf.SystemSharedMemoryRegisterRequest, inf.SystemSharedMemoryRegisterResponse, (ctx, req) -> begin
             Threads.atomic_add!(st.register_calls, 1)
             st.reject_register &&
-                throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_INTERNAL, "register rejected"))
+                throw(gRPCServer.GRPCError(gRPCServer.StatusCode.INTERNAL, "register rejected"))
             @lock st.lock push!(st.regions, req.name)
             inf.SystemSharedMemoryRegisterResponse()
-        end,
-        SystemSharedMemoryUnregister = (req, ctx) -> begin
+        end
+    )
+    _reg(
+        "SystemSharedMemoryUnregister", inf.SystemSharedMemoryUnregisterRequest, inf.SystemSharedMemoryUnregisterResponse, (ctx, req) -> begin
             @lock st.lock (isempty(req.name) ? empty!(st.regions) : delete!(st.regions, req.name))
             inf.SystemSharedMemoryUnregisterResponse()
-        end,
-        ModelInfer = (req, ctx) -> begin
+        end
+    )
+    _reg(
+        "ModelInfer", inf.ModelInferRequest, inf.ModelInferResponse, (ctx, req) -> begin
             Threads.atomic_add!(st.infer_calls, 1)
             for t in req.inputs
                 name = _region_of(t)
                 name === nothing && continue           # inline input: nothing to check
                 @lock st.lock (name in st.regions) || throw(
-                    gRPCServer.gRPCServiceCallException(
-                        gRPCServer.GRPC_FAILED_PRECONDITION, "unregistered shared memory region: $name"
+                    gRPCServer.GRPCError(
+                        gRPCServer.StatusCode.FAILED_PRECONDITION, "unregistered shared memory region: $name"
                     )
                 )
             end
@@ -87,9 +94,9 @@ function _mk_router(st::MockState)
                 outputs = inf.var"ModelInferResponse.InferOutputTensor"[],
                 raw_output_contents = Vector{UInt8}[]
             )
-        end,
+        end
     )
-    return router
+    return server
 end
 
 # Minimal IO: one 4-element Float32 input per item, no declared outputs (inline). Decode just counts.
@@ -131,7 +138,7 @@ end
     st = MockState()
     st.reject_register = false
     port = free_port()
-    server = gRPCServer.serve!(_mk_router(st), "127.0.0.1", port)
+    server = _mk_server(st, port); gRPCServer.start!(server)
     try
         kserve_init(; pool_bytes = 1 << 20, n_slots = 8, shm_reprobe_interval = 0.0)
         m = KServeModel(
@@ -219,7 +226,7 @@ end
     st.same_ns = true
     st.probe_sleep = 2.0                         # the IsSameIPCNamespace handler stalls 2s
     port = free_port()
-    server = gRPCServer.serve!(_mk_router(st), "127.0.0.1", port)
+    server = _mk_server(st, port); gRPCServer.start!(server)
     try
         kserve_init(; pool_bytes = 1 << 20, n_slots = 4, shm_reprobe_interval = 0.02)
         m = KServeModel("127.0.0.1", port, "m"; shared_memory = :on)

@@ -9,6 +9,8 @@
 
 const _PB_INF = inference
 
+using Dates: DateTime
+
 const _SHM_REGION = "shared_memory_region"
 const _SHM_OFFSET = "shared_memory_offset"
 const _SHM_BYTE_SIZE = "shared_memory_byte_size"
@@ -27,14 +29,21 @@ const TIMEOUT_NS_PARAM = "reactant_timeout_ns"
 
 """
     deadline_params(budget_ns) -> Dict{String,InferParameter}
+    deadline_params(PB::Module, budget_ns) -> Dict{String,InferParameter}
 
 Build the request-level parameters map carrying a remaining-budget timeout of `budget_ns`
 nanoseconds (see [`TIMEOUT_NS_PARAM`](@ref)). A non-positive `budget_ns` yields an empty map (no
-deadline). Merge the result into a `ModelInferRequest`'s `parameters`.
+deadline). Merge the result into a `ModelInferRequest`'s `parameters`. The PB-first form builds the
+map from pb module `PB` (consumer packages pass their own generated module; the single-argument
+form uses this package's `inference` module).
 """
 function deadline_params(budget_ns::Integer)
-    budget_ns > 0 || return Dict{String, _PB_INF.InferParameter}()
-    return Dict{String, _PB_INF.InferParameter}(TIMEOUT_NS_PARAM => _int_param(Int64(budget_ns)))
+    return deadline_params(inference, budget_ns)
+end
+
+function deadline_params(PB::Module, budget_ns::Integer)
+    budget_ns > 0 || return Dict{String, PB.InferParameter}()
+    return Dict{String, PB.InferParameter}(TIMEOUT_NS_PARAM => _int_param(PB, Int64(budget_ns)))
 end
 
 # Read the relative timeout budget (ns) from a request's parameters and convert it to an absolute
@@ -45,6 +54,26 @@ function _decode_deadline_ns(params)
     (budget === nothing || budget <= 0) && return Int64(0)
     now = Int64(time_ns())
     return budget > typemax(Int64) - now ? typemax(Int64) : now + Int64(budget)
+end
+
+# Convert a request deadline carried as a wall-clock DateTime (or nothing) plus the still-remaining
+# budget in seconds (or nothing) into an absolute deadline on Julia's monotonic time_ns() clock,
+# saturating at typemax(Int64). Returns 0 when either input is nothing (no deadline on that
+# channel), matching _decode_deadline_ns's convention. The scheduler compares against time_ns()
+# (scheduler.jl; the gateway's _post_infer uses deadline_ns - time_ns()), so handlers on the
+# merged gRPCServer, which parses grpc-timeout into ctx.deadline::DateTime and offers
+# remaining_time(ctx) in seconds, recover the semantics the legacy runtime provided natively via
+# ctx.deadline_ns. Transport-agnostic: only the two primitives are touched.
+function deadline_to_time_ns(deadline::Union{DateTime, Nothing}, remaining_seconds::Union{Real, Nothing})
+    deadline === nothing && return Int64(0)
+    remaining_seconds === nothing && return Int64(0)
+    # Guard the conversion itself: a NaN or absurdly large remaining budget must
+    # saturate to a far-future deadline, never throw InexactError.
+    budget = Float64(remaining_seconds) * 1.0e9
+    (isnan(budget) || budget >= typemax(Int64)) && return typemax(Int64)
+    budget_i = round(Int64, budget)
+    now_ns = Int64(time_ns())
+    return budget_i > typemax(Int64) - now_ns ? typemax(Int64) : now_ns + budget_i
 end
 
 # Element count and byte size of an untrusted wire shape, validated BEFORE any allocation:
@@ -143,14 +172,24 @@ end
 
 """
     decode_infer_request(msg, registry=nothing) -> DecodedRequest
+    decode_infer_request(PB::Module, msg, registry=nothing) -> DecodedRequest
 
 Translate a decoded ModelInferRequest message into the boundary InferRequest. The transport
 (gRPC) hands us the already-decoded protobuf message, so the codec never touches wire bytes.
 Input tensor data is read from a registered shared-memory region (preferred when the tensor
 declares one), otherwise from raw_input_contents, otherwise from the typed contents field.
+The PB-first form accepts a message from pb module `PB` (consumer packages pass their own
+generated module; the shorter form uses this package's `inference` module).
 """
 function decode_infer_request(
-        msg::_PB_INF.ModelInferRequest,
+        msg, registry::Union{SharedMemoryRegistry, Nothing} = nothing
+    )
+    return decode_infer_request(inference, msg, registry)
+end
+
+function decode_infer_request(
+        PB::Module,
+        msg,
         registry::Union{SharedMemoryRegistry, Nothing} = nothing
     )
     n = length(msg.inputs)
@@ -206,13 +245,15 @@ function _raw_from_array(data::AbstractArray{T}) where {T}
     return out
 end
 
-_string_param(s) = _PB_INF.InferParameter(; parameter_choice = ProtoBuf.OneOf(:string_param, String(s)))
-_int_param(i) = _PB_INF.InferParameter(; parameter_choice = ProtoBuf.OneOf(:int64_param, Int64(i)))
+_string_param(PB::Module, s) =
+    PB.InferParameter(; parameter_choice = ProtoBuf.OneOf(:string_param, String(s)))
+_int_param(PB::Module, i) =
+    PB.InferParameter(; parameter_choice = ProtoBuf.OneOf(:int64_param, Int64(i)))
 
-function _output_tensor(t::NamedTensor; parameters = Dict{String, _PB_INF.InferParameter}())
+function _output_tensor(PB::Module, t::NamedTensor; parameters = Dict{String, PB.InferParameter}())
     # Wire shape is row-major: reverse of the Julia col-major NamedTensor.shape.
     wire_shape = Int64[Int64(s) for s in reverse(collect(t.shape))]
-    return _PB_INF.var"ModelInferResponse.InferOutputTensor"(;
+    return PB.var"ModelInferResponse.InferOutputTensor"(;
         name = t.name, datatype = kserve_string(t.dtype),
         shape = wire_shape, parameters = parameters
     )
@@ -232,43 +273,60 @@ function _select_outputs(outputs::Vector{NamedTensor}, requested::Vector{String}
     ]
 end
 
-_build_response(model_name, id, out_tensors, raw) =
-    _PB_INF.ModelInferResponse(;
+_build_response(PB::Module, model_name, id, out_tensors, raw) =
+    PB.ModelInferResponse(;
     model_name = String(model_name), id = String(id),
     outputs = out_tensors, raw_output_contents = raw
 )
 
 """
     encode_infer_response(model_name, id, outputs) -> ModelInferResponse
+    encode_infer_response(PB::Module, model_name, id, outputs) -> ModelInferResponse
 
 Build the response message with outputs entirely inline (raw_output_contents). The transport
-serializes the returned message.
+serializes the returned message. The PB-first form builds the message from pb module `PB`
+(consumer packages pass their own generated module; the shorter form uses this package's
+`inference` module).
 """
 function encode_infer_response(model_name::AbstractString, id::AbstractString, outputs::Vector{NamedTensor})
-    out_tensors = [_output_tensor(t) for t in outputs]
+    return encode_infer_response(inference, model_name, id, outputs)
+end
+
+function encode_infer_response(PB::Module, model_name::AbstractString, id::AbstractString, outputs::Vector{NamedTensor})
+    out_tensors = [_output_tensor(PB, t) for t in outputs]
     raw = Vector{UInt8}[_raw_from_array(t.data) for t in outputs]
-    return _build_response(model_name, id, out_tensors, raw)
+    return _build_response(PB, model_name, id, out_tensors, raw)
 end
 
 """
     encode_infer_response(model_name, decoded, outputs, registry) -> ModelInferResponse
+    encode_infer_response(PB::Module, model_name, decoded, outputs, registry) -> ModelInferResponse
 
 Build the response message, writing any output whose requested entry named a shared-memory
 region into that region (and referencing it in the response) instead of inline.
-raw_output_contents holds the inline outputs in order.
+raw_output_contents holds the inline outputs in order. The PB-first form builds the message
+from pb module `PB` (consumer packages pass their own generated module).
 """
 function encode_infer_response(
         model_name::AbstractString, decoded::DecodedRequest,
         outputs::Vector{NamedTensor},
         registry::Union{SharedMemoryRegistry, Nothing}
     )
-    out_tensors = _PB_INF.var"ModelInferResponse.InferOutputTensor"[]
+    return encode_infer_response(inference, model_name, decoded, outputs, registry)
+end
+
+function encode_infer_response(
+        PB::Module, model_name::AbstractString, decoded::DecodedRequest,
+        outputs::Vector{NamedTensor},
+        registry::Union{SharedMemoryRegistry, Nothing}
+    )
+    out_tensors = PB.var"ModelInferResponse.InferOutputTensor"[]
     raw = Vector{UInt8}[]
     selected = _select_outputs(outputs, decoded.request.requested_outputs)
     for t in selected
         tgt = get(decoded.output_targets, t.name, nothing)
         if tgt === nothing
-            push!(out_tensors, _output_tensor(t))
+            push!(out_tensors, _output_tensor(PB, t))
             push!(raw, _raw_from_array(t.data))
         else
             registry === nothing && error("output '$(t.name)' targets shared memory but the server has no registry")
@@ -277,14 +335,14 @@ function encode_infer_response(
                 error("output '$(t.name)' produced $(length(bytes)) bytes but region slot is $(tgt.byte_size)")
             shm_write!(registry, tgt.region, tgt.offset, bytes)
             params = Dict(
-                _SHM_REGION => _string_param(tgt.region),
-                _SHM_OFFSET => _int_param(tgt.offset),
-                _SHM_BYTE_SIZE => _int_param(length(bytes)),
+                _SHM_REGION => _string_param(PB, tgt.region),
+                _SHM_OFFSET => _int_param(PB, tgt.offset),
+                _SHM_BYTE_SIZE => _int_param(PB, length(bytes)),
             )
-            push!(out_tensors, _output_tensor(t; parameters = params))
+            push!(out_tensors, _output_tensor(PB, t; parameters = params))
         end
     end
-    return _build_response(model_name, id_of(decoded), out_tensors, raw)
+    return _build_response(PB, model_name, id_of(decoded), out_tensors, raw)
 end
 
 id_of(d::DecodedRequest) = d.id
@@ -296,31 +354,40 @@ id_of(d::DecodedRequest) = d.id
 # to call back into the gateway). Data travels inline via raw_input_contents / raw_output_contents;
 # shared memory is deliberately not used on this path.
 
-function _input_tensor(t::NamedTensor)
+function _input_tensor(PB::Module, t::NamedTensor)
     # Wire shape is row-major: the reverse of the Julia col-major NamedTensor.shape.
     wire_shape = Int64[Int64(s) for s in reverse(collect(t.shape))]
-    return _PB_INF.var"ModelInferRequest.InferInputTensor"(;
+    return PB.var"ModelInferRequest.InferInputTensor"(;
         name = t.name, datatype = kserve_string(t.dtype), shape = wire_shape
     )
 end
 
 """
     encode_infer_request(model_name, inputs; requested_outputs=String[], id="") -> ModelInferRequest
+    encode_infer_request(PB::Module, model_name, inputs; requested_outputs=String[], id="") -> ModelInferRequest
 
 Build a ModelInferRequest from boundary [`NamedTensor`](@ref) inputs, with tensor data inline in
-raw_input_contents. `requested_outputs`, when non-empty, names the outputs to return.
+raw_input_contents. `requested_outputs`, when non-empty, names the outputs to return. The PB-first
+form builds the message from pb module `PB` (consumer packages pass their own generated module).
 """
 function encode_infer_request(
+        model_name::AbstractString, inputs::Vector{NamedTensor}; kwargs...
+    )
+    return encode_infer_request(inference, model_name, inputs; kwargs...)
+end
+
+function encode_infer_request(
+        PB::Module,
         model_name::AbstractString, inputs::Vector{NamedTensor};
         requested_outputs::Vector{String} = String[], id::AbstractString = "",
-        parameters::Dict{String, _PB_INF.InferParameter} = Dict{String, _PB_INF.InferParameter}()
+        parameters = Dict{String, PB.InferParameter}()
     )
-    in_tensors = [_input_tensor(t) for t in inputs]
+    in_tensors = [_input_tensor(PB, t) for t in inputs]
     raw = Vector{UInt8}[_raw_from_array(t.data) for t in inputs]
-    outs = _PB_INF.var"ModelInferRequest.InferRequestedOutputTensor"[
-        _PB_INF.var"ModelInferRequest.InferRequestedOutputTensor"(; name = String(n)) for n in requested_outputs
+    outs = PB.var"ModelInferRequest.InferRequestedOutputTensor"[
+        PB.var"ModelInferRequest.InferRequestedOutputTensor"(; name = String(n)) for n in requested_outputs
     ]
-    return _PB_INF.ModelInferRequest(;
+    return PB.ModelInferRequest(;
         model_name = String(model_name), id = String(id),
         inputs = in_tensors, outputs = outs, raw_input_contents = raw, parameters = parameters
     )
@@ -328,42 +395,52 @@ end
 
 # Build an InferInputTensor that references bytes already staged in a shared-memory region rather
 # than inlining them (the meta fan-out's transport==scratch path; mirrors the client encoder).
-function _shm_input_tensor(t::NamedTensor, region::AbstractString, offset::Integer, byte_size::Integer)
+function _shm_input_tensor(PB::Module, t::NamedTensor, region::AbstractString, offset::Integer, byte_size::Integer)
     wire_shape = Int64[Int64(s) for s in reverse(collect(t.shape))]
-    params = Dict{String, _PB_INF.InferParameter}(
-        _SHM_REGION => _string_param(region),
-        _SHM_OFFSET => _int_param(offset),
-        _SHM_BYTE_SIZE => _int_param(byte_size)
+    params = Dict{String, PB.InferParameter}(
+        _SHM_REGION => _string_param(PB, region),
+        _SHM_OFFSET => _int_param(PB, offset),
+        _SHM_BYTE_SIZE => _int_param(PB, byte_size)
     )
-    return _PB_INF.var"ModelInferRequest.InferInputTensor"(;
+    return PB.var"ModelInferRequest.InferInputTensor"(;
         name = t.name, datatype = kserve_string(t.dtype), shape = wire_shape, parameters = params
     )
 end
 
 """
     encode_infer_request_shm(model_name, inputs, region, offsets; requested_outputs, id)
+    encode_infer_request_shm(PB::Module, model_name, inputs, region, offsets; requested_outputs, id)
 
 Encode a request whose inputs are ALL staged in shared-memory `region` at the given byte `offsets`
-(parallel to `inputs`); no `raw_input_contents` — the receiver reads each tensor via `shm_read`. The
+(parallel to `inputs`); no `raw_input_contents` (the receiver reads each tensor via `shm_read`). The
 receiver must have `region` registered. This is all-or-nothing per request: the decode path treats
-`raw_input_contents` as parallel-to-inputs, so a request never mixes raw and SHM inputs.
+`raw_input_contents` as parallel-to-inputs, so a request never mixes raw and SHM inputs. The PB-first
+form builds the message from pb module `PB`.
 """
 function encode_infer_request_shm(
         model_name::AbstractString, inputs::Vector{NamedTensor},
+        region::AbstractString, offsets::Vector{<:Integer}; kwargs...
+    )
+    return encode_infer_request_shm(inference, model_name, inputs, region, offsets; kwargs...)
+end
+
+function encode_infer_request_shm(
+        PB::Module,
+        model_name::AbstractString, inputs::Vector{NamedTensor},
         region::AbstractString, offsets::Vector{<:Integer};
         requested_outputs::Vector{String} = String[], id::AbstractString = "",
-        parameters::Dict{String, _PB_INF.InferParameter} = Dict{String, _PB_INF.InferParameter}()
+        parameters = Dict{String, PB.InferParameter}()
     )
     length(offsets) == length(inputs) ||
         throw(ArgumentError("encode_infer_request_shm: offsets ($(length(offsets))) != inputs ($(length(inputs)))"))
     in_tensors = [
-        _shm_input_tensor(inputs[i], region, offsets[i], sizeof(inputs[i].data))
+        _shm_input_tensor(PB, inputs[i], region, offsets[i], sizeof(inputs[i].data))
             for i in eachindex(inputs)
     ]
-    outs = _PB_INF.var"ModelInferRequest.InferRequestedOutputTensor"[
-        _PB_INF.var"ModelInferRequest.InferRequestedOutputTensor"(; name = String(n)) for n in requested_outputs
+    outs = PB.var"ModelInferRequest.InferRequestedOutputTensor"[
+        PB.var"ModelInferRequest.InferRequestedOutputTensor"(; name = String(n)) for n in requested_outputs
     ]
-    return _PB_INF.ModelInferRequest(;
+    return PB.ModelInferRequest(;
         model_name = String(model_name), id = String(id),
         inputs = in_tensors, outputs = outs, parameters = parameters
     )
@@ -371,12 +448,18 @@ end
 
 """
     decode_infer_response(msg) -> Vector{NamedTensor}
+    decode_infer_response(PB::Module, msg) -> Vector{NamedTensor}
 
 Translate a ModelInferResponse into boundary [`NamedTensor`](@ref) outputs. Data is read from
 raw_output_contents when present, otherwise from the typed contents field. Shared-memory-backed
-outputs are not supported on this path (the caller never requests them).
+outputs are not supported on this path (the caller never requests them). The PB-first form accepts
+a message from pb module `PB` (consumer packages pass their own generated module).
 """
-function decode_infer_response(msg::_PB_INF.ModelInferResponse)
+function decode_infer_response(msg)
+    return decode_infer_response(inference, msg)
+end
+
+function decode_infer_response(PB::Module, msg)
     n = length(msg.outputs)
     use_raw = !isempty(msg.raw_output_contents)
     if use_raw && length(msg.raw_output_contents) != n
@@ -403,63 +486,89 @@ end
 # reverse (row-major), so Triton/KServe-style clients see canonical network dims.
 _julia_shape_int64(s::TensorSpec) = Int64[d.kind == FIXED ? Int64(d.size) : Int64(-1) for d in s.shape]
 
-function _tensor_metadata(s::TensorSpec)
-    return _PB_INF.var"ModelMetadataResponse.TensorMetadata"(;
+function _tensor_metadata(PB::Module, s::TensorSpec)
+    return PB.var"ModelMetadataResponse.TensorMetadata"(;
         name = s.name, datatype = kserve_string(s.dtype), shape = reverse(_julia_shape_int64(s))
     )
 end
 
 """
     encode_model_metadata(name, manifest, platform) -> ModelMetadataResponse
+    encode_model_metadata(PB::Module, name, manifest, platform) -> ModelMetadataResponse
 
-Build a ModelMetadataResponse message from the manifest's client-facing I/O spec.
+Build a ModelMetadataResponse message from the manifest's client-facing I/O spec. The PB-first
+form builds the message from pb module `PB` (consumer packages pass their own generated module).
 """
 function encode_model_metadata(name::AbstractString, manifest::Manifest, platform::AbstractString)
-    return _PB_INF.ModelMetadataResponse(;
+    return encode_model_metadata(inference, name, manifest, platform)
+end
+
+function encode_model_metadata(PB::Module, name::AbstractString, manifest::Manifest, platform::AbstractString)
+    return PB.ModelMetadataResponse(;
         name = String(name), versions = String[], platform = String(platform),
-        inputs = [_tensor_metadata(s) for s in client_input_spec(manifest)],
-        outputs = [_tensor_metadata(s) for s in client_output_spec(manifest)]
+        inputs = [_tensor_metadata(PB, s) for s in client_input_spec(manifest)],
+        outputs = [_tensor_metadata(PB, s) for s in client_output_spec(manifest)]
     )
 end
 
 """
     encode_repository_index(names) -> RepositoryIndexResponse
     encode_repository_index(entries::AbstractVector{<:Pair}) -> RepositoryIndexResponse
+    encode_repository_index(PB::Module, names) -> RepositoryIndexResponse
+    encode_repository_index(PB::Module, entries::AbstractVector{<:Pair}) -> RepositoryIndexResponse
 
 Build a RepositoryIndexResponse. The first form lists every model as READY (direct-client
 introspection). The second takes `name => ready::Bool` pairs and reports `READY` or `UNAVAILABLE`
 per model, so the gateway can discover which replicas actually serve a model (readiness reflects
-residency on the worker).
+residency on the worker). The PB-first forms build the message from pb module `PB`.
 """
 function encode_repository_index(names::AbstractVector{<:AbstractString})
-    return encode_repository_index([String(n) => true for n in names])
+    return encode_repository_index(inference, names)
 end
 
 function encode_repository_index(entries::AbstractVector{<:Pair})
+    return encode_repository_index(inference, entries)
+end
+
+function encode_repository_index(PB::Module, names::AbstractVector{<:AbstractString})
+    return encode_repository_index(PB, [String(n) => true for n in names])
+end
+
+function encode_repository_index(PB::Module, entries::AbstractVector{<:Pair})
     models = [
-        _PB_INF.var"RepositoryIndexResponse.ModelIndex"(;
+        PB.var"RepositoryIndexResponse.ModelIndex"(;
                 name = String(first(p)), version = "",
                 state = (last(p) ? "READY" : "UNAVAILABLE"), reason = ""
             ) for p in entries
     ]
-    return _PB_INF.RepositoryIndexResponse(; models = models)
+    return PB.RepositoryIndexResponse(; models = models)
 end
 
 # Build the registered regions into a SystemSharedMemoryStatusResponse message.
 function encode_shm_status(reg::SharedMemoryRegistry, name::AbstractString)
+    return encode_shm_status(inference, reg, name)
+end
+
+function encode_shm_status(PB::Module, reg::SharedMemoryRegistry, name::AbstractString)
     regions = shm_regions(reg)
     sel = isempty(name) ? regions : filter(p -> first(p) == name, regions)
-    out = Dict{String, _PB_INF.var"SystemSharedMemoryStatusResponse.RegionStatus"}()
+    out = Dict{String, PB.var"SystemSharedMemoryStatusResponse.RegionStatus"}()
     for (rname, r) in sel
-        out[rname] = _PB_INF.var"SystemSharedMemoryStatusResponse.RegionStatus"(;
+        out[rname] = PB.var"SystemSharedMemoryStatusResponse.RegionStatus"(;
             name = r.name, key = r.key, offset = UInt64(r.offset), byte_size = UInt64(r.byte_size)
         )
     end
-    return _PB_INF.SystemSharedMemoryStatusResponse(; regions = out)
+    return PB.SystemSharedMemoryStatusResponse(; regions = out)
 end
 
-encode_shm_register_response() = _PB_INF.SystemSharedMemoryRegisterResponse()
-encode_shm_unregister_response() = _PB_INF.SystemSharedMemoryUnregisterResponse()
+encode_shm_register_response() = encode_shm_register_response(inference)
+encode_shm_register_response(PB::Module) = PB.SystemSharedMemoryRegisterResponse()
+
+encode_shm_unregister_response() = encode_shm_unregister_response(inference)
+encode_shm_unregister_response(PB::Module) = PB.SystemSharedMemoryUnregisterResponse()
 
 encode_is_same_ipc_namespace_response(same::Bool) =
-    _PB_INF.IsSameIPCNamespaceResponse(; same = same)
+    encode_is_same_ipc_namespace_response(inference, same)
+
+encode_is_same_ipc_namespace_response(PB::Module, same::Bool) =
+    PB.IsSameIPCNamespaceResponse(; same = same)

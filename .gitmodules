@@ -1,3 +1,0 @@
-[submodule "lib/gRPCServer.jl"]
-	path = lib/gRPCServer.jl
-	url = https://github.com/csvance/gRPCServer.jl.git

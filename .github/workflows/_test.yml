@@ -1,5 +1,5 @@
 # Reusable workflow: run one CPU test suite. Called per-package by ci.yml so the pinned action
-# SHAs, submodule checkout, and depot caching live in one place. Not triggered on its own.
+# SHAs, checkout, and depot caching live in one place. Not triggered on its own.
 name: test suite
 
 on:
@@ -31,10 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60   # generous for the first run's Reactant CPU artifact download + compile
     steps:
-      # The packages source the vendored forks from lib/* via path, so submodules are required.
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          submodules: recursive
       - uses: julia-actions/setup-julia@fa02766e078afaaf09b14210362cee14137e6a32 # v3.0.2
         with:
           version: ${{ inputs.julia-version }}

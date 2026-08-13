@@ -3,10 +3,10 @@
 Developer notes for working on ReactantServer.jl. For using the server, start with
 [Getting Started](docs/src/manual/getting_started.md).
 
-After cloning, populate the vendored submodules and instantiate the workspace:
+After cloning, instantiate the workspace (gRPCServer resolves from the `s-celles-merge` branch of
+github.com/csvance/gRPCServer.jl via the workspace `[sources]`):
 
 ```
-git submodule update --init --recursive
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 ```
 

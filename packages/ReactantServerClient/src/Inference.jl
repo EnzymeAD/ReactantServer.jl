@@ -247,13 +247,13 @@ end
 # once it passes, instead of spending GPU on work the client has already abandoned. The gRPC client
 # also sends `grpc-timeout`, but the gateway replaces that with its own per-call deadline, so the
 # in-body KV param is what survives the hop. Models without a deadline send an empty map (no change).
-_request_deadline_params(::AbstractInferenceModel) = deadline_params(0)
+_request_deadline_params(::AbstractInferenceModel) = deadline_params(inference, 0)
 _request_deadline_params(m::KServeModel) =
-    deadline_params(deadline(m) > 0 ? round(Int64, deadline(m) * 1.0e9) : 0)
+    deadline_params(inference, deadline(m) > 0 ? round(Int64, deadline(m) * 1.0e9) : 0)
 # Per-attempt variant: carry an explicit remaining budget (seconds) rather than the model's full
 # deadline, so each retry admits against what is actually left of the original budget.
 _request_deadline_params(budget_s::Real) =
-    deadline_params(budget_s > 0 ? round(Int64, budget_s * 1.0e9) : 0)
+    deadline_params(inference, budget_s > 0 ? round(Int64, budget_s * 1.0e9) : 0)
 
 # A stale shared-memory registration: the server no longer knows the region our request references,
 # because it restarted (or otherwise dropped its registry) since we registered. The worker maps it to
