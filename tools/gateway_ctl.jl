@@ -23,7 +23,7 @@
 
 using Printf
 using ReactantServerGateway
-using ReactantServerCore.control
+using ReactantServerGateway.control
 import gRPCClient
 
 const GW = ReactantServerGateway
