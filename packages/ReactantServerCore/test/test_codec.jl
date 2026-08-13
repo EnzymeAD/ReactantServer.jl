@@ -3,6 +3,8 @@
 # messages and the boundary types (the transport owns wire framing), so these tests work with
 # message objects directly. Exercises both raw_input_contents and inline typed contents.
 
+using Dates
+
 const _Inf = ReactantServer.inference
 
 @testset "codec round-trip (raw contents)" begin
@@ -172,4 +174,23 @@ end
         )
     )
     @test size(good.request.inputs[1].data) == (2, 2)
+end
+
+@testset "deadline_to_time_ns" begin
+    # No deadline on either channel -> 0 (the codec's "unset" convention).
+    @test ReactantServer.deadline_to_time_ns(nothing, nothing) == 0
+    @test ReactantServer.deadline_to_time_ns(Dates.now(), nothing) == 0
+    @test ReactantServer.deadline_to_time_ns(nothing, 5.0) == 0
+
+    # A deadline with remaining budget projects onto the time_ns() clock.
+    dl = Dates.now() + Dates.Millisecond(5000)
+    v = ReactantServer.deadline_to_time_ns(dl, 5.0)
+    @test v > Int64(time_ns())
+    @test v - Int64(time_ns()) < 10 * 1_000_000_000
+
+    # An absurd remaining budget saturates instead of wrapping.
+    @test ReactantServer.deadline_to_time_ns(Dates.now(), typemax(Float64)) == typemax(Int64)
+
+    # An already-expired deadline yields a past deadline on the monotonic clock.
+    @test ReactantServer.deadline_to_time_ns(Dates.now() - Dates.Second(1), -1.0) < Int64(time_ns())
 end

@@ -388,16 +388,8 @@ end
 
 # Old gRPCServer handed handlers an absolute deadline on Julia's machine-relative time_ns()
 # clock (time_ns() + grpc-timeout). The merged package parses grpc-timeout into a wall-clock
-# DateTime; convert back onto the local clock the gateway compares against (deadline_ns -
-# time_ns() in _post_infer). Mirrors the worker's _ctx_deadline_ns in ReactantServer.
-function _ctx_deadline_ns(ctx::gRPCServer.ServerContext)
-    ctx.deadline === nothing && return Int64(0)
-    rem = gRPCServer.remaining_time(ctx)
-    rem === nothing && return Int64(0)
-    budget = round(Int64, rem * 1.0e9)
-    now_ns = Int64(time_ns())
-    return budget > typemax(Int64) - now_ns ? typemax(Int64) : now_ns + budget   # saturate
-end
+# DateTime; the shared ReactantServerCore.deadline_to_time_ns converts ctx.deadline back onto
+# the local clock the gateway compares against (deadline_ns - time_ns() in _post_infer).
 
 """
     build_gateway_server(state, cfg, host, port) -> GRPCServer
@@ -416,14 +408,15 @@ function build_gateway_server(
     server = gRPCServer.GRPCServer(
         host, Int(port);
         context = state,
-        max_message_size = max(cfg.max_recv_msg_bytes, cfg.max_send_msg_bytes),
+        max_receive_message_length = cfg.max_recv_msg_bytes,
+        max_send_message_length = cfg.max_send_msg_bytes,
         h2_initial_window_size = h2_initial_window_size,
         h2_connection_window_size = h2_connection_window_size
     )
     # Raw-byte passthrough RPCs: the generated register functions take the raw_* kwargs.
     register_GRPCInferenceService_ModelInfer!(
         server,
-        (ctx, body) -> _gw_infer(body, ctx.payload, _ctx_deadline_ns(ctx));
+        (ctx, body) -> _gw_infer(body, ctx.payload, deadline_to_time_ns(ctx.deadline, gRPCServer.remaining_time(ctx)));
         raw_request = true, raw_response = true
     )
     register_GRPCInferenceService_SystemSharedMemoryRegister!(

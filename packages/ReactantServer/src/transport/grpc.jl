@@ -272,16 +272,9 @@ _handle_is_same_ipc_namespace(name) =
 
 # Old gRPCServer handed handlers an absolute deadline on Julia's machine-relative time_ns()
 # clock (time_ns() + grpc-timeout). The merged package parses grpc-timeout into a wall-clock
-# DateTime; convert back onto the local clock the scheduler compares against (time_ns() >= dl in
-# scheduler.jl; _decode_deadline_ns uses time_ns() + budget).
-function _ctx_deadline_ns(ctx::gRPCServer.ServerContext)
-    ctx.deadline === nothing && return Int64(0)
-    rem = gRPCServer.remaining_time(ctx)
-    rem === nothing && return Int64(0)
-    budget = round(Int64, rem * 1.0e9)
-    now_ns = Int64(time_ns())
-    return budget > typemax(Int64) - now_ns ? typemax(Int64) : now_ns + budget   # saturate, mirroring _decode_deadline_ns
-end
+# DateTime; the shared ReactantServerCore.deadline_to_time_ns converts ctx.deadline back onto
+# the local clock the scheduler compares against (time_ns() >= dl in scheduler.jl; the codec's
+# _decode_deadline_ns uses time_ns() + budget).
 
 """
     build_grpc_server(sched, registry, platform, shm, host, port, ctx;
@@ -294,8 +287,8 @@ Register the KServe V2 GRPCInferenceService and ControlService handlers on a fre
 [`gRPCServer.GRPCServer`](@ref). The server threads `ctx` (an [`InferContext`](@ref)) into
 every request's `ServerContext.payload`; `serve` supplies the metrics-bearing context after
 constructing the server. The message-size caps default to `_MAX_MESSAGE_BYTES`; `serve` passes
-the configured `grpc.max_recv_msg_bytes` / `max_send_msg_bytes` (mapped onto the merged
-package's single `max_message_size` cap).
+the configured `grpc.max_recv_msg_bytes` / `max_send_msg_bytes` (passed through as the merged
+package's per-direction caps).
 """
 function build_grpc_server(
         sched::Scheduler, registry::ModelRegistry, platform::AbstractString,
@@ -309,7 +302,8 @@ function build_grpc_server(
     server = gRPCServer.GRPCServer(
         host, Int(port);
         context = ctx,
-        max_message_size = max(max_recv_msg_bytes, max_send_msg_bytes),
+        max_receive_message_length = max_recv_msg_bytes,
+        max_send_message_length = max_send_msg_bytes,
         max_concurrent_requests = (max_concurrent_requests > 0 ? max_concurrent_requests : nothing),
         h2_initial_window_size = h2_initial_window_size,
         h2_connection_window_size = h2_connection_window_size
@@ -321,7 +315,7 @@ function build_grpc_server(
         ModelReady = (ctx, req) -> _handle_model_ready(ctx.payload, req),
         ServerMetadata = (ctx, req) -> _handle_server_metadata(ctx.payload),
         ModelMetadata = (ctx, req) -> _handle_model_metadata(ctx.payload, req),
-        ModelInfer = (ctx, req) -> _handle_infer(ctx.payload, req, _ctx_deadline_ns(ctx)),
+        ModelInfer = (ctx, req) -> _handle_infer(ctx.payload, req, deadline_to_time_ns(ctx.deadline, gRPCServer.remaining_time(ctx))),
         RepositoryIndex = (ctx, req) -> _handle_repository_index(ctx.payload, req),
         SystemSharedMemoryStatus = (ctx, req) -> _handle_shm_status(ctx.payload.shm, req.name),
         SystemSharedMemoryRegister = (ctx, req) -> _handle_shm_register(ctx.payload.shm, req),

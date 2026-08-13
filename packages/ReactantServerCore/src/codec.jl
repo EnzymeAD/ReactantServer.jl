@@ -9,6 +9,8 @@
 
 const _PB_INF = inference
 
+using Dates: DateTime
+
 const _SHM_REGION = "shared_memory_region"
 const _SHM_OFFSET = "shared_memory_offset"
 const _SHM_BYTE_SIZE = "shared_memory_byte_size"
@@ -52,6 +54,26 @@ function _decode_deadline_ns(params)
     (budget === nothing || budget <= 0) && return Int64(0)
     now = Int64(time_ns())
     return budget > typemax(Int64) - now ? typemax(Int64) : now + Int64(budget)
+end
+
+# Convert a request deadline carried as a wall-clock DateTime (or nothing) plus the still-remaining
+# budget in seconds (or nothing) into an absolute deadline on Julia's monotonic time_ns() clock,
+# saturating at typemax(Int64). Returns 0 when either input is nothing (no deadline on that
+# channel), matching _decode_deadline_ns's convention. The scheduler compares against time_ns()
+# (scheduler.jl; the gateway's _post_infer uses deadline_ns - time_ns()), so handlers on the
+# merged gRPCServer, which parses grpc-timeout into ctx.deadline::DateTime and offers
+# remaining_time(ctx) in seconds, recover the semantics the legacy runtime provided natively via
+# ctx.deadline_ns. Transport-agnostic: only the two primitives are touched.
+function deadline_to_time_ns(deadline::Union{DateTime, Nothing}, remaining_seconds::Union{Real, Nothing})
+    deadline === nothing && return Int64(0)
+    remaining_seconds === nothing && return Int64(0)
+    # Guard the conversion itself: a NaN or absurdly large remaining budget must
+    # saturate to a far-future deadline, never throw InexactError.
+    budget = Float64(remaining_seconds) * 1.0e9
+    (isnan(budget) || budget >= typemax(Int64)) && return typemax(Int64)
+    budget_i = round(Int64, budget)
+    now_ns = Int64(time_ns())
+    return budget_i > typemax(Int64) - now_ns ? typemax(Int64) : now_ns + budget_i
 end
 
 # Element count and byte size of an untrusted wire shape, validated BEFORE any allocation:
