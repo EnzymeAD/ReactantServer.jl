@@ -18,18 +18,18 @@ end
 
 # Map a gateway status string to a server-side gRPC exception with the matching code.
 function _server_exc(status::AbstractString, msg::AbstractString)
-    status == STATUS_NOT_FOUND && return gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_NOT_FOUND, msg)
+    status == STATUS_NOT_FOUND && return gRPCServer.GRPCError(gRPCServer.StatusCode.NOT_FOUND, msg)
     # A worker shedding at its concurrency cap is transient overload, so surface it verbatim as
     # RESOURCE_EXHAUSTED (not FAILED_PRECONDITION): it is the standard signal for a client to back
     # off and retry, which ReactantServerClient does within the request's deadline budget.
-    status == STATUS_RESOURCE_EXHAUSTED && return gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_RESOURCE_EXHAUSTED, msg)
+    status == STATUS_RESOURCE_EXHAUSTED && return gRPCServer.GRPCError(gRPCServer.StatusCode.RESOURCE_EXHAUSTED, msg)
     # A stale shared-memory registration surfaces as FAILED_PRECONDITION; preserve the code so the
     # client re-registers and retries instead of treating it as a transient UNAVAILABLE. _try_replicas
     # returns it immediately (no failover): the client's pool registration is host-global, so every
     # worker rejects it identically until the client re-registers through the gateway's fan-out.
-    status == STATUS_FAILED_PRE && return gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_FAILED_PRECONDITION, msg)
-    status == STATUS_INTERNAL && return gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_INTERNAL, msg)
-    return gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_UNAVAILABLE, msg)
+    status == STATUS_FAILED_PRE && return gRPCServer.GRPCError(gRPCServer.StatusCode.FAILED_PRECONDITION, msg)
+    status == STATUS_INTERNAL && return gRPCServer.GRPCError(gRPCServer.StatusCode.INTERNAL, msg)
+    return gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, msg)
 end
 
 # --- ModelInfer -------------------------------------------------------------------------------
@@ -44,7 +44,7 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64)
     if wc === nothing
         @error "infer: routing table referenced unknown worker" worker = url model
         return nothing, STATUS_INTERNAL,
-            gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_INTERNAL, "routing table referenced unknown worker")
+            gRPCServer.GRPCError(gRPCServer.StatusCode.INTERNAL, "routing table referenced unknown worker")
     end
     gate_wait(st.gate, url)
     deadline_s = nothing
@@ -52,8 +52,8 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64)
         rem = deadline_ns - Int64(time_ns())
         if rem <= 0
             return nothing, STATUS_DEADLINE,
-                gRPCServer.gRPCServiceCallException(
-                    gRPCServer.GRPC_DEADLINE_EXCEEDED,
+                gRPCServer.GRPCError(
+                    gRPCServer.StatusCode.DEADLINE_EXCEEDED,
                     "deadline exceeded at gateway for model \"$model\""
                 )
         end
@@ -82,7 +82,7 @@ end
 # route (the request itself still fails over / returns the error; it is not retried after refresh).
 function _try_replicas(st::GatewayState, urls, model, id, body, deadline_ns::Int64)
     last_status = STATUS_UNAVAILABLE
-    last_exc = gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_UNAVAILABLE, "no replica available")
+    last_exc = gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, "no replica available")
     for url in urls
         resp, status, exc = _post_infer(st, url, model, id, body, deadline_ns)
         exc === nothing && return resp, status, nothing
@@ -113,7 +113,7 @@ function _dispatch_infer(st::GatewayState, model, id, body, deadline_ns::Int64)
     if sel === nothing
         @info "infer: model not found" model request_id = id
         return nothing, STATUS_NOT_FOUND,
-            gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_NOT_FOUND, "model \"$model\" not found on any worker")
+            gRPCServer.GRPCError(gRPCServer.StatusCode.NOT_FOUND, "model \"$model\" not found on any worker")
     end
     urls, reservation = sel
     # Release the reservation exactly once, on every path (success, retryable error, hard error, or
@@ -133,8 +133,8 @@ function _gw_infer(body::Vector{UInt8}, st::GatewayState, deadline_ns::Integer =
     catch e
         inc_requests!(st.metrics, "ModelInfer", "", STATUS_INVALID)
         throw(
-            gRPCServer.gRPCServiceCallException(
-                gRPCServer.GRPC_INVALID_ARGUMENT,
+            gRPCServer.GRPCError(
+                gRPCServer.StatusCode.INVALID_ARGUMENT,
                 "malformed ModelInferRequest: $(sprint(showerror, e))"
             )
         )
@@ -142,8 +142,8 @@ function _gw_infer(body::Vector{UInt8}, st::GatewayState, deadline_ns::Integer =
     if isempty(model)
         inc_requests!(st.metrics, "ModelInfer", "", STATUS_INVALID)
         throw(
-            gRPCServer.gRPCServiceCallException(
-                gRPCServer.GRPC_INVALID_ARGUMENT,
+            gRPCServer.GRPCError(
+                gRPCServer.StatusCode.INVALID_ARGUMENT,
                 "ModelInferRequest.model_name is empty"
             )
         )
@@ -219,8 +219,8 @@ function _gw_shm_register(body::Vector{UInt8}, st::GatewayState)
     catch e
         inc_requests!(st.metrics, "SystemSharedMemoryRegister", "", STATUS_INVALID)
         throw(
-            gRPCServer.gRPCServiceCallException(
-                gRPCServer.GRPC_INVALID_ARGUMENT,
+            gRPCServer.GRPCError(
+                gRPCServer.StatusCode.INVALID_ARGUMENT,
                 "malformed SystemSharedMemoryRegisterRequest: $(sprint(showerror, e))"
             )
         )
@@ -228,8 +228,8 @@ function _gw_shm_register(body::Vector{UInt8}, st::GatewayState)
     if isempty(region)
         inc_requests!(st.metrics, "SystemSharedMemoryRegister", "", STATUS_INVALID)
         throw(
-            gRPCServer.gRPCServiceCallException(
-                gRPCServer.GRPC_INVALID_ARGUMENT,
+            gRPCServer.GRPCError(
+                gRPCServer.StatusCode.INVALID_ARGUMENT,
                 "SystemSharedMemoryRegisterRequest.name is empty"
             )
         )
@@ -250,8 +250,8 @@ function _gw_shm_register(body::Vector{UInt8}, st::GatewayState)
     end
     inc_requests!(st.metrics, "SystemSharedMemoryRegister", region, STATUS_FAILED_PRE)
     throw(
-        gRPCServer.gRPCServiceCallException(
-            gRPCServer.GRPC_FAILED_PRECONDITION,
+        gRPCServer.GRPCError(
+            gRPCServer.StatusCode.FAILED_PRECONDITION,
             "SHM register failed on workers: $(failed)"
         )
     )
@@ -265,8 +265,8 @@ function _gw_shm_unregister(body::Vector{UInt8}, st::GatewayState)
     catch e
         inc_requests!(st.metrics, "SystemSharedMemoryUnregister", "", STATUS_INVALID)
         throw(
-            gRPCServer.gRPCServiceCallException(
-                gRPCServer.GRPC_INVALID_ARGUMENT,
+            gRPCServer.GRPCError(
+                gRPCServer.StatusCode.INVALID_ARGUMENT,
                 "malformed SystemSharedMemoryUnregisterRequest: $(sprint(showerror, e))"
             )
         )
@@ -279,8 +279,8 @@ function _gw_shm_unregister(body::Vector{UInt8}, st::GatewayState)
         @warn "shm.unregister: every worker failed" region failed_workers = failed
         inc_requests!(st.metrics, "SystemSharedMemoryUnregister", region, STATUS_UNAVAILABLE)
         throw(
-            gRPCServer.gRPCServiceCallException(
-                gRPCServer.GRPC_UNAVAILABLE,
+            gRPCServer.GRPCError(
+                gRPCServer.StatusCode.UNAVAILABLE,
                 "SHM unregister failed on all workers: $(failed)"
             )
         )
@@ -372,8 +372,8 @@ function _gw_compact(req::CompactMemoryRequest, st::GatewayState)
         inc_requests!(st.metrics, "CompactMemory", "", STATUS_UNAVAILABLE)
         @warn "compact: every worker failed" failed_workers = failed
         throw(
-            gRPCServer.gRPCServiceCallException(
-                gRPCServer.GRPC_UNAVAILABLE,
+            gRPCServer.GRPCError(
+                gRPCServer.StatusCode.UNAVAILABLE,
                 "compaction failed on all workers: $(failed)"
             )
         )
@@ -384,46 +384,66 @@ function _gw_compact(req::CompactMemoryRequest, st::GatewayState)
     return CompactMemoryResponse(; reloaded_models = Int64(total))
 end
 
-# --- Router -----------------------------------------------------------------------------------
+# --- Server ---------------------------------------------------------------------------------
+
+# Old gRPCServer handed handlers an absolute deadline on Julia's machine-relative time_ns()
+# clock (time_ns() + grpc-timeout). The merged package parses grpc-timeout into a wall-clock
+# DateTime; convert back onto the local clock the gateway compares against (deadline_ns -
+# time_ns() in _post_infer). Mirrors the worker's _ctx_deadline_ns in ReactantServer.
+function _ctx_deadline_ns(ctx::gRPCServer.ServerContext)
+    ctx.deadline === nothing && return Int64(0)
+    rem = gRPCServer.remaining_time(ctx)
+    rem === nothing && return Int64(0)
+    budget = round(Int64, rem * 1.0e9)
+    now_ns = Int64(time_ns())
+    return budget > typemax(Int64) - now_ns ? typemax(Int64) : now_ns + budget   # saturate
+end
 
 """
-    build_gateway_router(state, cfg) -> gRPCRouter
+    build_gateway_server(state, cfg, host, port) -> GRPCServer
 
-Register the forwarded RPCs. ModelInfer and the two SHM register/unregister RPCs are raw
-`Vector{UInt8}` methods (bytes pass through unchanged); IsSameIPCNamespace is typed because the
-gateway aggregates each worker's answer rather than forwarding one. Every other
-GRPCInferenceService RPC is left unimplemented (clients get UNIMPLEMENTED).
+Register the forwarded RPCs on a fresh [`gRPCServer.GRPCServer`](@ref) bound to `host:port`.
+ModelInfer and the two SHM register/unregister RPCs are raw `Vector{UInt8}` methods (bytes pass
+through unchanged); IsSameIPCNamespace is typed because the gateway aggregates each worker's
+answer rather than forwarding one. Every other GRPCInferenceService RPC is left unimplemented
+(clients get UNIMPLEMENTED).
 """
-function build_gateway_router(state::GatewayState, cfg::GatewayConfig)
-    router = gRPCServer.gRPCRouter(;
-        max_receive_message_length = cfg.max_recv_msg_bytes,
-        max_send_message_length = cfg.max_send_msg_bytes
+function build_gateway_server(
+        state::GatewayState, cfg::GatewayConfig, host::AbstractString, port::Integer;
+        h2_initial_window_size::Integer = _H2_INITIAL_WINDOW_BYTES,
+        h2_connection_window_size::Integer = _H2_CONNECTION_WINDOW_BYTES
     )
-    raw(rpc) = rpc(; TRequest = Vector{UInt8}, TResponse = Vector{UInt8})
-    gRPCServer.handle!(
-        router, raw(GRPCInferenceService_ModelInfer_Method),
-        (req, ctx) -> _gw_infer(req, ctx.payload, ctx.deadline_ns)
+    server = gRPCServer.GRPCServer(
+        host, Int(port);
+        context = state,
+        max_message_size = max(cfg.max_recv_msg_bytes, cfg.max_send_msg_bytes),
+        h2_initial_window_size = h2_initial_window_size,
+        h2_connection_window_size = h2_connection_window_size
     )
-    gRPCServer.handle!(
-        router, raw(GRPCInferenceService_SystemSharedMemoryRegister_Method),
-        (req, ctx) -> _gw_shm_register(req, ctx.payload)
+    # Raw-byte passthrough RPCs: the generated register functions take the raw_* kwargs.
+    register_GRPCInferenceService_ModelInfer!(
+        server,
+        (ctx, body) -> _gw_infer(body, ctx.payload, _ctx_deadline_ns(ctx));
+        raw_request = true, raw_response = true
     )
-    gRPCServer.handle!(
-        router, raw(GRPCInferenceService_SystemSharedMemoryUnregister_Method),
-        (req, ctx) -> _gw_shm_unregister(req, ctx.payload)
+    register_GRPCInferenceService_SystemSharedMemoryRegister!(
+        server,
+        (ctx, body) -> _gw_shm_register(body, ctx.payload);
+        raw_request = true, raw_response = true
     )
-    # Typed (decoded) so the handler can read each worker's `.same` and aggregate; not forwarded raw.
-    gRPCServer.handle!(
-        router, GRPCInferenceService_IsSameIPCNamespace_Method(),
-        (req, ctx) -> _gw_is_same_ipc_namespace(req, ctx.payload)
+    register_GRPCInferenceService_SystemSharedMemoryUnregister!(
+        server,
+        (ctx, body) -> _gw_shm_unregister(body, ctx.payload);
+        raw_request = true, raw_response = true
+    )
+    register_GRPCInferenceService_IsSameIPCNamespace!(
+        server,
+        (ctx, req) -> _gw_is_same_ipc_namespace(req, ctx.payload)
     )
     # Control plane: a single CompactMemory RPC to the gateway fans out to every worker.
-    register_ControlService!(
-        router;
-        CompactMemory = (req, ctx) -> _gw_compact(req, ctx.payload)
-    )
+    register_ControlService!(server; CompactMemory = (ctx, req) -> _gw_compact(req, ctx.payload))
     # The gateway's own scheduling control plane (see control_service.jl). A distinct service, so the
     # worker-facing ControlService above keeps its meaning.
-    register_gateway_control_service!(router, state)
-    return router
+    register_gateway_control_service!(server, state)
+    return server
 end

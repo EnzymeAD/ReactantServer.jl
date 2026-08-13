@@ -7,13 +7,12 @@ import gRPCClient
 import HTTP
 import Sockets
 import Logging
-using ReactantServerCore.control   # bare message types for the included server stubs
+using ReactantServerGateway.control   # bare message types for the included server stubs
 
-const AInf = ReactantServerCore.inference
-const ACtl = ReactantServerCore.control
+const AInf = ReactantServerGateway.inference
+const ACtl = ReactantServerGateway.control
 
 # Server-side control stubs for the mock workers (the gateway module ships only the client side).
-include(ReactantServerCore.control_server_stubs_path())
 
 const GW = ReactantServerGateway
 const NOPREV = Dict{String, GW.Placement}()
@@ -661,7 +660,7 @@ end
 
 @testset "request_units: the worker says where the batch axis is" begin
     import ProtoBuf as QPB
-    QInf = ReactantServerCore.inference
+    QInf = ReactantServerGateway.inference
     enc(msg) = (io = IOBuffer(); QPB.encode(QPB.ProtoEncoder(io), msg); take!(io))
     body(name, shape) = enc(
         QInf.ModelInferRequest(;
@@ -906,19 +905,19 @@ AffMockWorker(name, models; discipline = "fifo", rows_per_request = 1, batch_at 
     Dict{String, Int}(), rows_per_request, batch_at
 )
 
-function _aff_router()
-    router = gRPCServer.gRPCRouter()
+function _aff_server(port::Integer, w::AffMockWorker)
+    server = gRPCServer.GRPCServer("127.0.0.1", Int(port); context = w)
     GW.register_GRPCInferenceService!(
-        router;
-        ServerReady = (req, c) -> AInf.ServerReadyResponse(; ready = true),
-        RepositoryIndex = (req, c) -> AInf.RepositoryIndexResponse(;
+        server;
+        ServerReady = (ctx, req) -> AInf.ServerReadyResponse(; ready = true),
+        RepositoryIndex = (ctx, req) -> AInf.RepositoryIndexResponse(;
             models = [
                 AInf.var"RepositoryIndexResponse.ModelIndex"(; name = m, version = "", state = "READY", reason = "")
-                    for m in c.payload.models
+                    for m in ctx.payload.models
             ]
         ),
-        ModelInfer = (req, c) -> begin
-            w = c.payload
+        ModelInfer = (ctx, req) -> begin
+            w = ctx.payload
             w.served[req.model_name] = get(w.served, req.model_name, 0) + 1
             w.rows[req.model_name] = get(w.rows, req.model_name, 0) + w.rows_per_request
             w.compute[req.model_name] = get(w.compute, req.model_name, 0.0) + 0.05
@@ -926,9 +925,9 @@ function _aff_router()
         end,
     )
     register_ControlService!(
-        router;
-        ModelControlStatus = (req, c) -> begin
-            w = c.payload
+        server;
+        ModelControlStatus = (ctx, req) -> begin
+            w = ctx.payload
             ACtl.ModelControlStatusResponse(;
                 residency_mode = "self_managed", discipline = w.discipline,
                 models = [
@@ -950,9 +949,9 @@ function _aff_router()
         end,
         # Eager compaction is the default now, so the gateway may fan CompactMemory out after a
         # placement-changing repack; answer it so the call never hits the generous client deadline.
-        CompactMemory = (req, c) -> ACtl.CompactMemoryResponse(; reloaded_models = Int64(0)),
+        CompactMemory = (ctx, req) -> ACtl.CompactMemoryResponse(; reloaded_models = Int64(0)),
     )
-    return router
+    return server
 end
 
 _aff_infer(port, model) = grpc_call(
@@ -983,8 +982,8 @@ end
     w0 = AffMockWorker("worker0", copy(models))
     w1 = AffMockWorker("worker1", copy(models))
     p0, p1 = grpc_free_port(), grpc_free_port()
-    s0 = gRPCServer.serve!(_aff_router(), "127.0.0.1", p0; context = w0)
-    s1 = gRPCServer.serve!(_aff_router(), "127.0.0.1", p1; context = w1)
+    s0 = _aff_server(p0, w0); gRPCServer.start!(s0)
+    s1 = _aff_server(p1, w1); gRPCServer.start!(s1)
 
     gw_port, admin_port = grpc_free_port(), grpc_free_port()
     gatewayfile = _aff_gatewayfile(gw_port, admin_port, [p0, p1])
@@ -1105,7 +1104,7 @@ end
     # A worker reporting fair discipline is rejected.
     wfair = AffMockWorker("worker0", copy(models); discipline = "fair")
     pf = grpc_free_port()
-    sf = gRPCServer.serve!(_aff_router(), "127.0.0.1", pf; context = wfair)
+    sf = _aff_server(pf, wfair); gRPCServer.start!(sf)
     f1 = _aff_gatewayfile(gw_port, admin_port, [pf])
     @test_throws ErrorException GW.serve_gateway(f1; blocking = false)
     close(sf)
@@ -1114,8 +1113,8 @@ end
     wa = AffMockWorker("worker0", ["alpha", "beta"])
     wb = AffMockWorker("worker1", ["alpha"])
     pa, pb = grpc_free_port(), grpc_free_port()
-    sa = gRPCServer.serve!(_aff_router(), "127.0.0.1", pa; context = wa)
-    sb = gRPCServer.serve!(_aff_router(), "127.0.0.1", pb; context = wb)
+    sa = _aff_server(pa, wa); gRPCServer.start!(sa)
+    sb = _aff_server(pb, wb); gRPCServer.start!(sb)
     f2 = _aff_gatewayfile(gw_port, admin_port, [pa, pb])
     @test_throws ErrorException GW.serve_gateway(f2; blocking = false)
     close(sa); close(sb)
@@ -1138,8 +1137,8 @@ end
     w0 = AffMockWorker("worker0", copy(models); rows_per_request = 4, batch_at = ("IN", 2))
     w1 = AffMockWorker("worker1", copy(models); rows_per_request = 4, batch_at = ("IN", 2))
     p0, p1 = grpc_free_port(), grpc_free_port()
-    s0 = gRPCServer.serve!(_aff_router(), "127.0.0.1", p0; context = w0)
-    s1 = gRPCServer.serve!(_aff_router(), "127.0.0.1", p1; context = w1)
+    s0 = _aff_server(p0, w0); gRPCServer.start!(s0)
+    s1 = _aff_server(p1, w1); gRPCServer.start!(s1)
 
     gw_port, admin_port = grpc_free_port(), grpc_free_port()
     gatewayfile = _aff_gatewayfile(gw_port, admin_port, [p0, p1])

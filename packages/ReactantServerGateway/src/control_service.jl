@@ -10,7 +10,7 @@
 # after values, because the log is the only record that a change happened, and each mutating response
 # carries `persisted = false` plus a `generation` an operator can read back.
 
-const _CTRL_GW = ReactantServerCore.control
+const _CTRL_GW = control
 
 # Bounded wait for a forced repack. The prober is nudged awake as soon as a request lands (see
 # `scheduler_repack_seq` in scheduler.jl), so the wait normally resolves in well under a second; the
@@ -26,13 +26,13 @@ function _as_gateway_control(f)
     try
         return f()
     catch e
-        e isa gRPCServer.gRPCServiceCallException && rethrow()
+        e isa gRPCServer.GRPCError && rethrow()
         e isa ReactantServerCore.ConfigError &&
-            throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_INVALID_ARGUMENT, e.msg))
+            throw(gRPCServer.GRPCError(gRPCServer.StatusCode.INVALID_ARGUMENT, e.msg))
         @error "gateway control: handler failed" exception = (e, catch_backtrace())
         throw(
-            gRPCServer.gRPCServiceCallException(
-                gRPCServer.GRPC_INTERNAL,
+            gRPCServer.GRPCError(
+                gRPCServer.StatusCode.INTERNAL,
                 "gateway control call failed: $(sprint(showerror, e))"
             )
         )
@@ -40,7 +40,7 @@ function _as_gateway_control(f)
 end
 
 _invalid_arg(msg) =
-    throw(gRPCServer.gRPCServiceCallException(gRPCServer.GRPC_INVALID_ARGUMENT, msg))
+    throw(gRPCServer.GRPCError(gRPCServer.StatusCode.INVALID_ARGUMENT, msg))
 
 # The scheduling mode name, derived from the scheduler object actually routing rather than from the
 # config, so a reported mode can never disagree with reality.
@@ -53,8 +53,8 @@ _mode_name(::LptPackingState) = "lpt_packing"
 # rather than a string compare on the config.
 _require_packing(s::GatewayScheduler) =
     throw(
-    gRPCServer.gRPCServiceCallException(
-        gRPCServer.GRPC_FAILED_PRECONDITION,
+    gRPCServer.GRPCError(
+        gRPCServer.StatusCode.FAILED_PRECONDITION,
         "gateway scheduling mode is '$(_mode_name(s))'; the scheduler control RPCs require lpt_packing"
     )
 )
@@ -381,8 +381,8 @@ function _gw_set_model_placement(req::_CTRL_GW.SetModelPlacementRequest, st::Gat
         isempty(name) && _invalid_arg("name is empty")
         if !req.allow_unknown_model && !has_model(st.routes, name)
             throw(
-                gRPCServer.gRPCServiceCallException(
-                    gRPCServer.GRPC_NOT_FOUND,
+                gRPCServer.GRPCError(
+                    gRPCServer.StatusCode.NOT_FOUND,
                     "no worker currently serves model '$name'; set allow_unknown_model to pre-seed an override for a model that is about to be loaded"
                 )
             )
@@ -448,8 +448,8 @@ function _gw_repack(req::_CTRL_GW.RepackRequest, st::GatewayState)
         # fleet with none would burn the whole budget to no purpose, so say so instead.
         if budget > 0 && isempty((@atomic s.tick).ready_workers)
             throw(
-                gRPCServer.gRPCServiceCallException(
-                    gRPCServer.GRPC_UNAVAILABLE,
+                gRPCServer.GRPCError(
+                    gRPCServer.StatusCode.UNAVAILABLE,
                     "no worker was ready at the last prober tick, so a repack cannot run; retry once a worker is ready (or pass wait_seconds=0 to queue it)"
                 )
             )
@@ -467,12 +467,12 @@ function _gw_repack(req::_CTRL_GW.RepackRequest, st::GatewayState)
     end
 end
 
-# Register the four handlers on the gateway's router (see build_gateway_router).
-register_gateway_control_service!(router, state::GatewayState) =
+# Register the four handlers on the gateway's server (see build_gateway_server).
+register_gateway_control_service!(server, state::GatewayState) =
     register_GatewayControlService!(
-    router;
-    GetSchedulingStatus = (req, ctx) -> _gw_scheduling_status(req, ctx.payload),
-    SetSchedulingPolicy = (req, ctx) -> _gw_set_scheduling_policy(req, ctx.payload),
-    SetModelPlacement = (req, ctx) -> _gw_set_model_placement(req, ctx.payload),
-    Repack = (req, ctx) -> _gw_repack(req, ctx.payload)
+    server;
+    GetSchedulingStatus = (ctx, req) -> _gw_scheduling_status(req, ctx.payload),
+    SetSchedulingPolicy = (ctx, req) -> _gw_set_scheduling_policy(req, ctx.payload),
+    SetModelPlacement = (ctx, req) -> _gw_set_model_placement(req, ctx.payload),
+    Repack = (ctx, req) -> _gw_repack(req, ctx.payload)
 )
