@@ -19,4 +19,4 @@ ReactantServer = {path = "../.."}
 # Offline bundle export, used by gen_bit_resnet50.jl to trace the Luximm model into the
 # bit_resnet50 bundle the stack serves.
 ReactantServerExport = {path = "../../../ReactantServerExport"}
-gRPCServer = {path = "../../../../lib/gRPCServer.jl"}
+gRPCServer = {url = "https://github.com/csvance/gRPCServer.jl", rev = "s-celles-merge"}

@@ -13,8 +13,8 @@ gRPCServer = "608c6337-0d7d-447f-bb69-0f5674ee3959"
 HTTP = {path = "../../../lib/HTTP.jl"}
 ReactantServer = {path = "../../../packages/ReactantServer"}
 ReactantServerCore = {path = "../../../packages/ReactantServerCore"}
-gRPCClient = {path = "../../../lib/gRPCClient.jl"}
-gRPCServer = {path = "../../../lib/gRPCServer.jl"}
+gRPCClient = {url = "https://github.com/JuliaIO/gRPCClient.jl", rev = "v1.1.0-rc2"}
+gRPCServer = {url = "https://github.com/csvance/gRPCServer.jl", rev = "s-celles-merge"}
 
 [compat]
 julia = "1.12"

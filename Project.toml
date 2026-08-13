@@ -1,7 +1,7 @@
 # Workspace root for the ReactantServer monorepo. This environment is not itself a package;
 # it lists the member packages under [workspace] (they share the single root Manifest) and
-# declares the path [sources] for the vendored lib/* submodules and the inter-package
-# ReactantServerCore dependency, so every member resolves them consistently.
+# declares the [sources] for gRPCServer (the s-celles-merge branch of the upstream repo) and
+# the inter-package ReactantServerCore dependency, so every member resolves them consistently.
 
 # packages/ReactantServerExport is intentionally NOT listed here: it is the offline export
 # tooling, kept out of the shared workspace manifest so its Lux/PythonCall weakdeps never get
@@ -26,7 +26,7 @@ gRPCServer = "608c6337-0d7d-447f-bb69-0f5674ee3959"
 
 [sources]
 ReactantServerCore = {path = "packages/ReactantServerCore"}
-gRPCServer = {path = "lib/gRPCServer.jl"}
+gRPCServer = {url = "https://github.com/csvance/gRPCServer.jl", rev = "s-celles-merge"}
 gRPCClient = {url = "https://github.com/JuliaIO/gRPCClient.jl", rev = "v1.1.0-rc2"}
 
 [compat]
