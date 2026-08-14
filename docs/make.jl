@@ -1,14 +1,20 @@
-# The Documenter build, on the DocumenterVitepress theme (the VitePress look
-# Lux.jl's docs use). `doctest = false` on purpose: the guide pages carry
-# illustrative Julia rather than executable examples, because executing any of
-# them would compile XLA programs and turn the docs build into a GPU-hours
-# exercise. The API page reads docstrings only, which is the point of @autodocs.
+# The Documenter build, on the default Documenter HTML theme with two plugins:
+# DocumenterLandingPage renders the VitePress-style landing page (hero + emoji
+# capability tiles) from the YAML frontmatter in docs/src/index.md, and
+# DocumenterCodeBlocks enhances the code blocks (line numbers, reference
+# links, hover tooltips, JuliaSyntax highlighting). `doctest = false` on
+# purpose: the guide pages carry illustrative Julia rather than executable
+# examples, because executing any of them would compile XLA programs and turn
+# the docs build into a GPU-hours exercise. The API page reads docstrings only,
+# which is the point of @autodocs.
 #
-# The landing page (docs/src/index.md) carries a VitePress home layout: the hero
-# and the emoji capability boxes are YAML frontmatter inside a @raw html block,
-# exactly as Lux.jl's index.md does.
+# The landing page frontmatter (docs/src/index.md) is exactly the VitePress
+# home layout the docs previously carried under DocumenterVitepress; the
+# plugin replaces the block with rendered HTML at build time.
 using Documenter
-using DocumenterVitepress
+using DocumenterCodeBlocks
+using DocumenterLandingPage
+using Dates
 using ReactantServer
 using ReactantServerClient
 using ReactantServerCore
@@ -35,18 +41,23 @@ makedocs(;
     # this Documenter, and there are none left by the time this is committed;
     # the category below is the safety valve while a docstring is being edited.
     warnonly = [:missing_docs],
-    # Only the pages listed above are built: the legacy manual/api/design pages
+    # Only the pages listed below are built: the legacy manual/api/design pages
     # from the pre-Vitepress docs remain in the tree but are not processed.
     pagesonly = true,
-    format = DocumenterVitepress.MarkdownVitepress(;
-        repo = "github.com/EnzymeAD/ReactantServer.jl",
-        devbranch = "main",
-        deploy_url = "https://enzymead.github.io/ReactantServer.jl/",
+    repo = Documenter.Remotes.GitHub("EnzymeAD", "ReactantServer.jl"),
+    format = Documenter.HTML(
+        edit_link = "main",
+        canonical = "https://enzymead.github.io/ReactantServer.jl/",
         # The workspace root (../Project.toml) is not a package, so Documenter
         # cannot infer a version for the search inventory; set it explicitly to
         # match the member packages.
         inventory_version = "0.1.0",
+        footer = "Made with [Documenter.jl](https://documenter.juliadocs.org/stable/), [DocumenterLandingPage.jl](https://github.com/csvance/DocumenterLandingPage.jl), and [DocumenterCodeBlocks.jl](https://github.com/fredrikekre/DocumenterCodeBlocks.jl)<br>© Copyright $(Dates.year(Dates.today())).",
     ),
+    plugins = [
+        LandingPage(),
+        CodeBlocks(),
+    ],
     pages = [
         "Home" => "index.md",
         "Tutorial" => "tutorial.md",
@@ -64,9 +75,10 @@ makedocs(;
     ],
 )
 
-# Documenter.deploydocs is NOT compatible with DocumenterVitepress; this is the
-# theme's own deployer. `push_preview = true` lands PR builds on a preview URL.
-DocumenterVitepress.deploydocs(;
+# PRs get a preview URL via `push_preview = true`; pushes to main (or a tag)
+# deploy the live site. This is Documenter's own deployer, unlike the
+# VitePress-specific DocumenterVitepress.deploydocs the docs previously used.
+Documenter.deploydocs(;
     repo = "github.com/EnzymeAD/ReactantServer.jl.git",
     push_preview = true,
     devbranch = "main",

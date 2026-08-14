@@ -3,7 +3,7 @@
 Developer notes for working on ReactantServer.jl. For using the server, start with
 [Getting Started](docs/src/manual/getting_started.md).
 
-After cloning, instantiate the workspace (gRPCServer resolves from the `s-celles-merge` branch of
+After cloning, instantiate the workspace (gRPCServer resolves from the `scelles-merge` tag of
 github.com/csvance/gRPCServer.jl via the workspace `[sources]`):
 
 ```
@@ -122,10 +122,13 @@ the two stub files are hand-maintained:
 
 ## Documentation
 
-The docs are built with Documenter (DocumenterVitepress) and published to GitHub Pages by the
-`.github/workflows/docs.yml` workflow: every push and PR builds, and pushes to `main` (or a tag)
-deploy the live site — PRs get a preview URL (`deploydocs(push_preview = true)` in
-`docs/make.jl`). To build locally:
+The docs are built with Documenter on its default HTML theme, with two plugins:
+DocumenterLandingPage renders the VitePress-style landing page (hero + emoji
+feature tiles) from the YAML frontmatter block in `docs/src/index.md`, and
+DocumenterCodeBlocks enhances the code blocks. They are published to GitHub
+Pages by the `.github/workflows/docs.yml` workflow: every push and PR builds,
+and pushes to `main` (or a tag) deploy the live site — PRs get a preview URL
+(`deploydocs(push_preview = true)` in `docs/make.jl`). To build locally:
 
 ```
 julia --project=docs -e 'using Pkg; Pkg.instantiate()'
@@ -133,3 +136,13 @@ julia --project=docs docs/make.jl
 ```
 
 Output lands in `docs/build/`.
+
+The landing page's `@raw html` frontmatter in `docs/src/index.md` is the single
+source of truth for the hero and tile copy; it is the same VitePress `home`
+layout the docs used under DocumenterVitepress. The plugin that renders it
+lives at `github.com/csvance/DocumenterLandingPage.jl`, and `docs/Project.toml`
+sources it from that git URL so the workflow's `Pkg.instantiate()` can resolve
+it. For local work on the plugin, override the entry with a path to a local
+checkout, e.g. `[sources] DocumenterLandingPage = {path =
+"../../DocumenterLandingPage.jl"}`, then `Pkg.instantiate()` again. No Node
+or npm is needed anywhere in the build.

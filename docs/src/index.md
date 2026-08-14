@@ -86,7 +86,7 @@ through a gRPC control plane, without a restart.
 
 ReactantServer is not yet registered in the General registry, so installation is from the
 repository. The one build dependency beyond the workspace, the gRPC server, is sourced from the
-`s-celles-merge` branch of `github.com/csvance/gRPCServer.jl` through the workspace `[sources]`:
+`scelles-merge` tag of `github.com/csvance/gRPCServer.jl` through the workspace `[sources]`:
 
 ```
 git clone https://github.com/EnzymeAD/ReactantServer.jl

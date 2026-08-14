@@ -114,7 +114,7 @@ pulls in the heavy Reactant/XLA stack:
 Offline model export lives in `packages/ReactantServerExport` (a Reactant tracing frontend plus a
 PythonCall-triggered PyTorch extension); it is deliberately **not** a workspace member, so its
 Lux/PythonCall weakdeps stay out of the server images. `gRPCServer` is sourced from the
-`s-celles-merge` branch of `github.com/csvance/gRPCServer.jl` through the workspace `[sources]`;
+`scelles-merge` tag of `github.com/csvance/gRPCServer.jl` through the workspace `[sources]`;
 there are no git submodules.
 
 ## Acknowledgments

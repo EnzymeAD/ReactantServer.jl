@@ -1,7 +1,9 @@
 # Builds the docs on every push and PR, deploys to GitHub Pages on main and on
 # tags. `deploydocs(push_preview = true)` in docs/make.jl makes PR builds land
 # on a preview URL instead of the live site, so a PR can be reviewed with its
-# docs rendered before it merges.
+# docs rendered before it merges. No Node is involved: the build is pure
+# Julia (Documenter + the DocumenterLandingPage and DocumenterCodeBlocks
+# plugins).
 name: Docs
 
 on:
@@ -23,13 +25,9 @@ jobs:
       - uses: julia-actions/cache@v2
       - name: Install Julia dependencies
         # docs/Manifest.toml is gitignored, so the docs environment is resolved
-        # fresh here (ReactantServer and friends come from the [sources] paths).
+        # fresh here (ReactantServer and friends come from the [sources] paths,
+        # and DocumenterLandingPage from its git URL, see CONTRIBUTING.md).
         run: julia --project=docs -e 'using Pkg; Pkg.instantiate()'
-      - name: Install VitePress dependencies
-        # DocumenterVitepress builds the site with its bundled Node but does not
-        # run npm install when docs/package.json exists, so the dependencies are
-        # installed here, from the committed lockfile for determinism.
-        run: npm ci --prefix docs
       - name: Build and deploy
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
