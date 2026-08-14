@@ -1,7 +1,9 @@
 # ReactantServer.jl
 
 [![Documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://enzymead.github.io/ReactantServer.jl/dev/)
-[![CI](https://img.shields.io/github/checks-status/enzymead/ReactantServer.jl/main?label=CI)](https://github.com/enzymead/ReactantServer.jl/commits/main)
+[![CI](https://github.com/EnzymeAD/ReactantServer.jl/actions/workflows/ci.yml/badge.svg)](https://github.com/EnzymeAD/ReactantServer.jl/commits/main)
+[![Julia 1.12](https://img.shields.io/badge/Julia-1.12-9558b2)](https://julialang.org)
+[![code style: runic](https://img.shields.io/badge/code_style-%E1%9A%B1%E1%9A%A2%E1%9A%BE%E1%9B%81%E1%9A%B2-black)](https://github.com/fredrikekre/Runic.jl)
 
 A production inference server for XLA-accelerated models, compiled through Reactant.jl
 (StableHLO via XLA today). It speaks the KServe V2 inference API natively over gRPC, so standard
