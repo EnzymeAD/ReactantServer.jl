@@ -25,3 +25,6 @@ Manifest-v*.toml
 
 # Local (uncommitted) agent skills, installed from ~/Git/gRPCServer.jl/skills.
 /.pi/
+# Scratch space for agent work (throwaway by definition).
+/.scratch/
+PLAN.md

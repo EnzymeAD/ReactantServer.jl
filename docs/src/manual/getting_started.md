@@ -19,7 +19,7 @@ ReactantServer is a Julia workspace of five packages under `packages/` (`Reactan
 `ReactantServer`, `ReactantServerGateway`, `ReactantServerClient`, `ReactantServerNode`), plus the
 non-member `ReactantServerExport` for offline bundle export (see
 [Architecture](../design/architecture.md)). It sources its gRPCServer dependency from the
-`s-celles-merge` branch of `github.com/csvance/gRPCServer.jl` through the workspace `[sources]`;
+`scelles-merge` tag of `github.com/csvance/gRPCServer.jl` through the workspace `[sources]`;
 the remaining dependencies resolve from the package registries. After cloning, instantiate the
 workspace:
 
