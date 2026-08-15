@@ -8,6 +8,13 @@ jobs:
   TagBot:
     if: github.event_name == 'workflow_dispatch' || github.actor == 'JuliaTagBot'
     runs-on: ubuntu-latest
+    # The repo default workflow token is read-only, so without this block TagBot
+    # cannot create the GitHub release (the git tag itself is pushed over SSH via
+    # DOCUMENTER_KEY). contents: write creates the release; issues: write lets
+    # TagBot open a "manual intervention" issue if release creation ever fails.
+    permissions:
+      contents: write
+      issues: write
     strategy:
       matrix:
         # One run per registered monorepo subpackage; each job only tags when the
@@ -16,7 +23,7 @@ jobs:
         # and ReactantServerNode here when they are registered.
         subdir: [packages/ReactantServerCore, packages/ReactantServerClient, packages/ReactantServerExport]
     steps:
-      - uses: JuliaRegistries/TagBot@v1
+      - uses: JuliaRegistries/TagBot@cded32665b34ca0496d3ac10a67d08ddfc726963 # v1.25.11
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           ssh: ${{ secrets.DOCUMENTER_KEY }}

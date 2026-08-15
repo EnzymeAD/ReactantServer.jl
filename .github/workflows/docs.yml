@@ -1,15 +1,20 @@
-# Builds the docs on every push and PR, deploys to GitHub Pages on main and on
-# tags. `deploydocs(push_preview = true)` in docs/make.jl makes PR builds land
-# on a preview URL instead of the live site, so a PR can be reviewed with its
-# docs rendered before it merges. No Node is involved: the build is pure
-# Julia (Documenter + the DocumenterLandingPage and DocumenterCodeBlocks
-# plugins).
+# Builds the docs on every push and PR, deploys to GitHub Pages on main.
+# `deploydocs(push_preview = true)` in docs/make.jl makes PR builds land on a
+# preview URL instead of the live site, so a PR can be reviewed with its docs
+# rendered before it merges. No Node is involved: the build is pure Julia
+# (Documenter + the DocumenterLandingPage and DocumenterCodeBlocks plugins).
+#
+# Deliberately NOT triggered on tag pushes: TagBot tags each registered
+# subpackage at the commit the General registry references, which need not sit
+# on main (the ReactantServerExport-v1.0.0 tag landed on an orphaned feature
+# branch commit whose tree could not resolve the docs environment). The live
+# site tracks main, so a tag build would only rebuild the same site from a
+# possibly stale tree.
 name: Docs
 
 on:
   push:
     branches: [main]
-    tags: ['*']
   pull_request:
 
 jobs:
