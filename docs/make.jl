@@ -75,8 +75,9 @@ makedocs(;
     ],
 )
 
-# PRs get a preview URL via `push_preview = true`; pushes to main (or a tag)
-# deploy the live site. This is Documenter's own deployer, unlike the
+# PRs get a preview URL via `push_preview = true`; pushes to main deploy the
+# live site (tag pushes deliberately do not build, see .github/workflows/docs.yml).
+# This is Documenter's own deployer, unlike the
 # VitePress-specific DocumenterVitepress.deploydocs the docs previously used.
 Documenter.deploydocs(;
     repo = "github.com/EnzymeAD/ReactantServer.jl.git",
