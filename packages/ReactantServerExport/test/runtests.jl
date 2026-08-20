@@ -68,6 +68,10 @@ end
 using ReactantServerExport
 using ReactantServer
 using Lux
+# `Reactant` for building a device-resident value in the entry-arity test below. Imported HERE and
+# not at the top: the PythonCall block above must initialize torch's native libraries before
+# Reactant's MLIR/LLVM, and this line is past it.
+using Reactant
 
 # Load a bundle and run it through the ReactantServer runtime (CPU backend).
 function run_bundle(root, name, inputs::Vector{<:Pair})
@@ -181,6 +185,88 @@ _load_manifest(dir) = ReactantServer.parse_manifest(
             x = reshape(Float32[2, 3, 4], 3, 1)
             out = run_bundle(root, "affine", ["x" => x])
             @test isapprox(vec(out[1].data), vec(W * x .+ bvec); rtol = 1.0e-5)
+        end
+    end
+
+
+    @testset "entry-arity gate refuses an unservable bundle before writing it" begin
+        # THE 2026-08-11 AND 2026-08-19 DEFECT, reproduced. `export_bundle(:lux, ...)` CAPTURES `st`
+        # in the closure it compiles rather than passing it, and Reactant lifts every device-resident
+        # value reachable from a traced callable into an MLIR argument whether the program reads it or
+        # not. The `st` below stands in for the real case, which is `st.<layer>.rng.seed` on any Lux
+        # model carrying a `Dropout`: two `UInt64`s, never read in eval mode, and the difference
+        # between a servable bundle and one that fails every inference.
+        lifting_model(x, ps, st) = (ps.W * x, st)
+        W = Float32[1 0 0; 0 1 0]
+        st_dev = (; seed = Reactant.to_rarray(UInt64[1, 2]))
+
+        mktempdir() do root
+            dir = joinpath(root, "lifted")
+            err = try
+                export_bundle(
+                    :lux, lifting_model, (; W = W), st_dev, randn(Float32, 3, 1);
+                    dir = dir, name = "lifted"
+                )
+                nothing
+            catch e
+                e
+            end
+            @test err isa ErrorException
+            @test occursin("UNSERVABLE", err.msg)
+            # x + W + the lifted seed = 3, against one declared input plus one weight.
+            @test occursin("compiled entry arguments : 3", err.msg)
+            @test occursin("expected                 : 2", err.msg)
+            @test occursin("rng", err.msg)                 # the message names the known cause
+            # Refusing BEFORE the write is the point: the old failure wrote a complete-looking bundle
+            # and was diagnosed from a server that could report two numbers and no cause.
+            @test !isfile(joinpath(dir, "weights.safetensors"))
+            @test !isfile(joinpath(dir, "manifest.yaml"))
+        end
+    end
+
+    @testset "auditing a bundle that is already on disk" begin
+        rng = Random.Xoshiro(0)
+        model = Lux.Chain(Lux.Dense(4 => 8, tanh), Lux.Dense(8 => 3))
+        ps, st = Lux.setup(rng, model)
+
+        mktempdir() do root
+            dir = joinpath(root, "audited")
+            export_bundle(
+                :lux, model, ps, st, randn(Float32, 4, 1);
+                dir = dir, name = "audited", batch_sizes = [1, 4]
+            )
+
+            r = bundle_arity_report(dir)
+            @test r.servable
+            @test r.name == "audited"
+            @test r.n_inputs == 1
+            @test r.n_weights == 4                       # two Dense layers, weight and bias each
+            @test r.expected == r.n_inputs + r.n_weights
+            @test length(r.modules) == 2                 # one per compiled batch size
+            @test all(m -> m.entry_args == r.expected, r.modules)
+            @test bundle_entry_arity(joinpath(dir, "model.b1.mlir")) == r.expected
+            @test assert_bundle_arity(dir).servable
+
+            # A bundle whose graph and manifest disagree is exactly what neither readable half of a
+            # bundle shows, so give the manifest a second declared input and check the audit notices.
+            # This is the shape of the incident, reached from the artifact rather than from a trace.
+            man = joinpath(dir, "manifest.yaml")
+            m = ReactantServer.YAML.load_file(man)
+            push!(m["executable_inputs"], deepcopy(m["executable_inputs"][1]))
+            ReactantServer.YAML.write_file(man, m)
+
+            bad = bundle_arity_report(dir)
+            @test !bad.servable
+            @test bad.expected == r.expected + 1
+            e = try
+                assert_bundle_arity(dir)
+                nothing
+            catch err
+                err
+            end
+            @test e isa ErrorException
+            @test occursin("UNSERVABLE", e.msg)
+            @test occursin("audited", e.msg)
         end
     end
 
