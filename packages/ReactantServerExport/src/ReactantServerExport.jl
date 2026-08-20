@@ -25,6 +25,7 @@ const MLIR = Reactant.MLIR
 const Compiler = Reactant.Compiler
 
 export IOSpec, write_bundle, export_bundle, collect_provenance
+export bundle_entry_arity, bundle_arity_report, assert_bundle_arity
 
 # ============================================================================
 # Provenance
@@ -348,6 +349,186 @@ function write_bundle(
     return dir
 end
 
+# ── The entry-arity gate ─────────────────────────────────────────────────────────────
+#
+# A bundle is served as `executable(inputs..., weights...)`. BOTH halves of that contract are
+# declared in artifacts a human can read: `manifest.yaml` lists the inputs and `weights.safetensors`
+# holds the weights. The number the EXECUTABLE actually wants is declared in neither. It lives inside
+# `model*.mlir`, which is a serialized vhlo artifact rather than text.
+#
+# So an export could emit a graph whose arity disagreed with its own bundle and report success. It
+# has happened twice, on two unrelated models, and both times the diagnosis started from a serving
+# error that names two numbers and no cause:
+#
+#     2026-08-11  INVALID_ARGUMENT: Execution supplied 216 arguments but compiled program expected 217
+#     2026-08-19  INVALID_ARGUMENT: Execution supplied 164 arguments but compiled program expected 167
+#
+# Both surpluses were values Reactant LIFTED out of the traced closure rather than baked: a
+# device-resident RNG seed in layer state, and device-resident configuration fields. Reactant lifts
+# every device-resident value reachable from the traced callable into an MLIR argument whether the
+# program reads it or not, and the `:lux` frontend below captures `st` and whatever `model` closes
+# over. Nothing here was comparing the result against the bundle it was about to write.
+#
+# The check is cheap and total: `compile_mlir` already returns the traced function's result, whose
+# `in_tys` ARE the emitted entry signature's input types (allocated from `linear_args`, which has
+# `skipped_args` removed before it is built), so the arity is in hand at no cost. Refusing here means
+# an unservable bundle is never written, rather than written, checked, registered, deployed and then
+# diagnosed from the far end.
+
+# The compiled entry point's argument count, or `nothing` if this Reactant does not expose it. The
+# guard is deliberate: this reads a field of Reactant's internal trace result, and a gate that
+# silently stops gating is worse than one that admits it cannot look.
+function _entry_arity(fn_res)
+    for f in (:in_tys, :linear_args)
+        hasproperty(fn_res, f) && return length(getproperty(fn_res, f))
+    end
+    return nothing
+end
+
+function _check_entry_arity(fn_res, n_inputs::Integer, n_weights::Integer, label::AbstractString)
+    got = _entry_arity(fn_res)
+    got === nothing && return nothing
+    expected = Int(n_inputs) + Int(n_weights)
+    got == expected && return nothing
+    surplus = got - expected
+    cause = if surplus > 0
+        "A surplus argument is a value Reactant LIFTED out of the traced closure rather than baking \
+         into the graph: it lifts every DEVICE-RESIDENT value reachable from the traced callable, \
+         whether the program reads it or not. The known cases are an RNG in layer state \
+         (`st.<layer>.rng.seed`, which appears as a leading `tensor<2xui64>`) and device-resident \
+         configuration captured by the model. Read those back to the host before tracing and they \
+         bake as constants instead of becoming arguments."
+    else
+        "A shortfall means the weights being serialized outnumber the graph's arguments, so the \
+         parameter tree walked for serialization is not the one the graph was traced against."
+    end
+    return error(
+        """
+        ReactantServerExport: the compiled program is UNSERVABLE and has not been written ($label).
+          compiled entry arguments : $got
+          declared inputs          : $(Int(n_inputs))
+          weights to serialize     : $(Int(n_weights))
+          expected                 : $expected  ($(Int(n_inputs)) + $(Int(n_weights)))
+          $(surplus > 0 ? "surplus" : "shortfall") of              : $(abs(surplus))
+
+        A bundle is served as `executable(inputs..., weights...)`, so every argument must be a
+        declared input or a serialized weight. $cause
+
+        Serving this would fail every inference with `Execution supplied $expected arguments but
+        compiled program expected $got`, reported by a process that can give those two numbers and
+        nothing about which value or which model is responsible."""
+    )
+end
+
+# ── Auditing a bundle that has already been written ──────────────────────────────────
+#
+# The gate above refuses an unservable bundle at the moment of writing, which is the right place for
+# every export from now on. It says nothing about the bundles already on disk, and after two
+# incidents "which of the existing artifacts are affected" is a question somebody has to be able to
+# answer without deploying each one and watching it fail.
+#
+# This is that answer, and it reads its three numbers from the artifact rather than from the process
+# that produced it, so it is also the check a bundle from ANY writer can be held to.
+
+"""
+    bundle_entry_arity(mlir_path) -> Int
+
+The number of arguments the compiled program in `mlir_path` takes, read out of the StableHLO
+portable artifact.
+
+`model*.mlir` is a serialized `vhlo` artifact, so `parse(MLIR.IR.Module, ...)` fails with
+"dialect 'vhlo' does not implement the bytecode interface": it has to be deserialized against a
+Reactant context first. That is the whole reason this is a function rather than a regex at a call
+site.
+"""
+function bundle_entry_arity(mlir_path::AbstractString)
+    artifact = read(String(mlir_path), String)
+    ctx = Reactant.ReactantContext()
+    mref = Reactant.MLIR.API.stablehloDeserializePortableArtifactNoError(artifact, ctx)
+    m = Reactant.MLIR.IR.Module(mref)
+    txt = string(Reactant.MLIR.IR.Operation(m))
+    i = findfirst("func.func", txt)
+    i === nothing && error("ReactantServerExport: no `func.func` in the module at `$mlir_path`.")
+    seg = txt[first(i):min(lastindex(txt), first(i) + 200_000)]
+    k = findfirst(") -> ", seg)
+    sig = k === nothing ? seg : seg[1:first(k)]
+    return length(collect(eachmatch(r"%arg\d+\s*:", sig)))
+end
+
+"""
+    bundle_arity_report(dir) -> NamedTuple
+
+Read a written bundle's three numbers and say whether they agree: the inputs its `manifest.yaml`
+declares, the tensors its `weights.safetensors` holds, and the arity of each compiled module.
+
+Returns `(; name, n_inputs, n_weights, expected, modules, servable)`, where `modules` is one
+`(; module_file, entry_args, servable)` per `*.mlir`. Nothing is thrown for a mismatch, so this can
+be run across a directory of bundles to triage them; [`assert_bundle_arity`](@ref) is the same check
+as a refusal.
+"""
+function bundle_arity_report(dir::AbstractString)
+    d = String(dir)
+    manifest = YAML.load_file(joinpath(d, "manifest.yaml"))
+    ni = length(get(manifest, "executable_inputs", []))
+    nw = _safetensors_tensor_count(joinpath(d, "weights.safetensors"))
+    expected = ni + nw
+    mlirs = sort(filter(f -> endswith(f, ".mlir"), readdir(d; join = true)))
+    isempty(mlirs) && error("ReactantServerExport: no `*.mlir` under `$d`.")
+    mods = map(mlirs) do p
+        got = bundle_entry_arity(p)
+        return (; module_file = basename(p), entry_args = got, servable = got == expected)
+    end
+    return (;
+        name = get(manifest, "name", basename(normpath(d))),
+        n_inputs = ni, n_weights = nw, expected,
+        modules = mods, servable = all(m -> m.servable, mods),
+    )
+end
+
+"""
+    assert_bundle_arity(dir) -> NamedTuple
+
+[`bundle_arity_report`](@ref) as a refusal: raise unless every compiled module in `dir` takes exactly
+`declared inputs + serialized weights` arguments. Returns the report when it passes.
+"""
+function assert_bundle_arity(dir::AbstractString)
+    r = bundle_arity_report(dir)
+    r.servable && return r
+    rows = join(
+        [
+            "    $(m.module_file): $(m.entry_args)$(m.servable ? "" : "  <- disagrees")"
+                for m in r.modules
+        ], "\n"
+    )
+    return error(
+        """
+        ReactantServerExport: bundle `$(r.name)` is UNSERVABLE. Its compiled program's arity does not
+        match the bundle around it, and both readable halves of a bundle can be correct while that is
+        true, which is why this is read from the graph.
+          declared inputs                : $(r.n_inputs)
+          tensors in weights.safetensors : $(r.n_weights)
+          expected entry arguments       : $(r.expected)
+        compiled modules:
+        $rows
+
+        A surplus argument is usually a value Reactant lifted out of the traced closure rather than
+        baking: a device-resident RNG seed in layer state appears as a leading `tensor<2xui64>`, and
+        device-resident configuration captured by the model appears in its own shape. Serving this
+        fails every inference with an argument-count mismatch."""
+    )
+end
+
+# safetensors: little-endian UInt64 header length, then that many bytes of JSON. `ltoh` is a no-op on
+# x86 and the difference between correct and accidentally correct anywhere else.
+function _safetensors_tensor_count(path::AbstractString)
+    isfile(path) || error("ReactantServerExport: no `weights.safetensors` at `$path`.")
+    return open(path, "r") do io
+        n = ltoh(read(io, UInt64))
+        hdr = JSON3.read(String(read(io, Int(n))))
+        return count(k -> String(k) != "__metadata__", keys(hdr))
+    end
+end
+
 # ============================================================================
 # Reactant tracing frontend (the former LuxExport; needs Reactant, not Lux)
 # ============================================================================
@@ -446,7 +627,8 @@ function export_bundle(
         ctx = Reactant.ReactantContext()
         push!(ctxs, ctx)
         args = (Reactant.to_rarray(x), map(Reactant.to_rarray, warrays)...)
-        mod, _ = Compiler.compile_mlir(ctx, g, args; drop_unsupported_attributes = true)
+        mod, fn_res = Compiler.compile_mlir(ctx, g, args; drop_unsupported_attributes = true)
+        _check_entry_arity(fn_res, 1, length(warrays), "batch size $s")
         modules[Int(s)] = mod
         in_shape_julia = collect(Int, size(x))
     end
@@ -555,7 +737,8 @@ function export_bundle(
         ctx = Reactant.ReactantContext()
         push!(ctxs, ctx)
         args = (_modelarg(map(Reactant.to_rarray, xs)), map(Reactant.to_rarray, warrays)...)
-        mod, _ = Compiler.compile_mlir(ctx, g, args; drop_unsupported_attributes = true)
+        mod, fn_res = Compiler.compile_mlir(ctx, g, args; drop_unsupported_attributes = true)
+        _check_entry_arity(fn_res, nin, length(warrays), "batch size $s")
         modules[Int(s)] = mod
         for i in 1:nin
             in_shapes[i] = collect(Int, size(xs[i]))
@@ -609,7 +792,8 @@ function export_bundle(
 
     ctx = Reactant.ReactantContext()
     args = (map(Reactant.to_rarray, inputs)..., map(Reactant.to_rarray, warrays)...)
-    mod, _ = Compiler.compile_mlir(ctx, f, args; drop_unsupported_attributes = true)
+    mod, fn_res = Compiler.compile_mlir(ctx, f, args; drop_unsupported_attributes = true)
+    _check_entry_arity(fn_res, length(inputs), length(warrays), "unbatched")
 
     in_specs = [
         IOSpec(innames[i], eltype(inputs[i]), collect(Int, size(inputs[i])))

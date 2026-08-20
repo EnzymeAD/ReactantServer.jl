@@ -165,12 +165,48 @@ code exactly.
 
 The test suite also builds small bundles directly; see `test/stablehlo_fixtures.jl`.
 
+## Checking that a bundle is servable
+
+A bundle is served as `executable(inputs..., weights...)`, so the compiled program must take exactly
+as many arguments as the manifest declares inputs plus the weights file holds tensors. Both of those
+halves are readable, and the number the executable actually wants is in neither: it lives inside
+`model*.mlir`, which is a serialized `vhlo` artifact rather than text. A bundle can therefore be
+internally inconsistent while every readable part of it looks correct, and the symptom is that the
+model registers and serves and then fails every inference with
+
+```
+INVALID_ARGUMENT: Execution supplied 216 arguments but compiled program expected 217
+```
+
+`export_bundle` now checks this itself and refuses to write a bundle whose graph disagrees with it,
+naming both numbers and the usual cause. The usual cause is a device-resident value reachable from
+the traced closure: Reactant lifts every one of those into an argument whether the program reads it
+or not, so an RNG in layer state (which appears as a leading `tensor<2xui64>`) or a device-resident
+configuration value captured by the model becomes an argument no client can supply. Reading such
+values back to the host before tracing bakes them into the graph as constants instead.
+
+For bundles that were written before that check existed, `assert_bundle_arity` reads the same three
+numbers back out of the artifact:
+
+```julia
+using ReactantServerExport
+
+assert_bundle_arity("export_out/my_model_v1")          # raises if the bundle is unservable
+r = bundle_arity_report("export_out/my_model_v1")      # the numbers, without raising
+r.servable, r.n_inputs, r.n_weights, r.expected
+```
+
+`bundle_arity_report` never raises, so it can be run across a directory of bundles to triage them,
+and `bundle_entry_arity` reads one module's arity on its own. All three read the artifact rather than
+the process that produced it, so they hold for a bundle from any writer.
+
 ## Related pages
 
 The manifest and boundary types are documented on the [API](api.md) page: [`Manifest`](@ref),
 [`TensorSpec`](@ref), [`Dim`](@ref), [`BatchingSpec`](@ref), [`load_manifest`](@ref),
-[`DType`](@ref), and [`NamedTensor`](@ref). `export_bundle`, `write_bundle`, `IOSpec`, and
-`collect_provenance` are documented in the `ReactantServerExport` docstrings. The
+[`DType`](@ref), and [`NamedTensor`](@ref). `export_bundle`, `write_bundle`, `IOSpec`,
+`collect_provenance`, `assert_bundle_arity`, `bundle_arity_report`, and `bundle_entry_arity` are
+documented in the `ReactantServerExport` docstrings. The
 [Tutorial](tutorial.md) walks the full export-to-serve path, and
 [Node Configuration](node_config.md) covers how the server loads and watches a repository of
 bundles.
