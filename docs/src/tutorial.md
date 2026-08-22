@@ -40,7 +40,7 @@ to one another only through files and the gRPC wire protocol.
    ready: `julia --project=packages/ReactantServerExport/test`.
 2. **Server environment.** The workspace under `packages/` (`ReactantServerCore`,
    `ReactantServer`, `ReactantServerNode`, `ReactantServerGateway`), with gRPCServer sourced from
-   its `scelles-merge` tag on GitHub through the workspace `[sources]`. After cloning,
+   its `main` branch on GitHub through the workspace `[sources]`. After cloning,
    instantiate once:
 
 ```text

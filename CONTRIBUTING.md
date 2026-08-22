@@ -3,7 +3,7 @@
 Developer notes for working on ReactantServer.jl. For using the server, start with
 [Getting Started](docs/src/manual/getting_started.md).
 
-After cloning, instantiate the workspace (gRPCServer resolves from the `scelles-merge` tag of
+After cloning, instantiate the workspace (gRPCServer resolves from the `main` branch of
 github.com/csvance/gRPCServer.jl via the workspace `[sources]`):
 
 ```
@@ -119,6 +119,36 @@ the two stub files are hand-maintained:
    Move the `<Service>_<Rpc>_Method` builders and `register_<Service>!` into
    `control_server_stubs.jl` and the `<Service>_<Rpc>_Client` constructors into
    `control_client_stubs.jl`, preserving the hand-tuned deadlines already in those files.
+
+## Kaimon gate tools (dev only)
+
+`packages/ReactantServer/ext/KaimonGateExt.jl` registers four `rserver_*` GateTools with a running
+[Kaimon](https://github.com/kahliburke/Kaimon.jl) gate, so an agent (or a REPL) can bring a worker
+up in the session where the code is loaded: `rserver_start` (model directory, optional model
+allowlist, `accelerator`, GPU `device`, ports), `rserver_status`, `rserver_models`, and
+`rserver_stop`. KaimonGate is a weak dependency, nothing in `src/` references it, and a session
+that never loads it pays nothing. This is a development surface; deployment is still
+ReactantServerNode, one worker subprocess per GPU.
+
+Two properties are worth knowing before using it:
+
+- `device` is the ordinal among the devices VISIBLE to the process, the same numbering CUDA uses.
+  Which physical card that is stays out of band (`CUDA_VISIBLE_DEVICES` or whatever the process
+  prefers), exactly as it is for a worker under the supervisor.
+- Reactant's XLA client is process-global and is created by the first server, so `mem_fraction` and
+  the preallocated arena are fixed for the whole session. The extension records what the first CUDA
+  start committed to and refuses a later start that disagrees rather than letting it silently
+  inherit the existing arena.
+
+`rserver_start` returns before the server is up (bundle loading and compilation run on a background
+task, and a Kaimon tool call has a hard deadline), so the agent polls `rserver_status`. Argument
+and configuration errors are raised by the call itself.
+
+To drive the tools from a REPL rather than an agent, or after a manual `KaimonGate.stop()`:
+
+```julia
+Base.get_extension(ReactantServer, :KaimonGateExt).reinstall_kaimon_tools()
+```
 
 ## Documentation
 
