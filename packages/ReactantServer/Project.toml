@@ -18,12 +18,29 @@ SafeTensors = "eeda0dda-7046-4914-a807-2495fc7abb89"
 YAML = "ddb6d928-2868-570f-bddf-ab3f9cf99eb6"
 gRPCServer = "608c6337-0d7d-447f-bb69-0f5674ee3959"
 
+# KaimonGate is the Kaimon MCP gate's session library, a weak dependency for the extension seam
+# only: when it is loaded alongside ReactantServer, KaimonGateExt registers the `rserver_*`
+# GateTools so an agent can start, inspect, and stop a worker in the session where the code is
+# loaded. Nothing in `src/` references either, a user who never loads KaimonGate pays nothing, and
+# Kaimon appends KaimonGate's OWN environment to JULIA_LOAD_PATH when it spawns a session, so the
+# declaration does not oblige this project's manifest to carry it. It is in test extras so the
+# suite can exercise the extension.
+[weakdeps]
+KaimonGate = "5ee84a8c-75bd-412f-a7b8-4e6463aa635f"
+
+[extensions]
+KaimonGateExt = "KaimonGate"
+
 [compat]
 BFloat16s = "0.6.1"
 DLFP8Types = "0.1.0"
 HTTP = "2"
 InterProcessCommunication = "0.1.6"
 JSON3 = "1.14.3"
+# 1.3 is a floor, not a preference: it is the first release where `serve(tools = ...)` MERGES
+# tools by name on a running gate. Under the older wholesale replacement, loading a second
+# extension (or a notebook worker registering its own tools) silently dropped ours.
+KaimonGate = "1.3"
 NNlib = "0.9"
 Prometheus = "1.5.1"
 ProtoBuf = "1.3.0"
@@ -32,18 +49,19 @@ ReactantServerCore = "1.0.0"
 SafeTensors = "1.2.1"
 YAML = "0.4.16"
 gRPCClient = "1.1.0"
-gRPCServer = "0.3"
+gRPCServer = "1.0.0"
 julia = "1.12"
 
 [extras]
+KaimonGate = "5ee84a8c-75bd-412f-a7b8-4e6463aa635f"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 gRPCClient = "aaca4a50-36af-4a1d-b878-4c443f2061ad"
 
 [targets]
-test = ["Test", "Logging", "Sockets", "gRPCClient"]
+test = ["Test", "KaimonGate", "Logging", "Sockets", "gRPCClient"]
 
 [sources]
 ReactantServerCore = {path = "../ReactantServerCore"}
-gRPCServer = {url = "https://github.com/csvance/gRPCServer.jl", rev = "s-celles-merge"}
+gRPCServer = {url = "https://github.com/csvance/gRPCServer.jl", rev = "main"}

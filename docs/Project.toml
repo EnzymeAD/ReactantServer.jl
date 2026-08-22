@@ -42,7 +42,7 @@ ReactantServerCore = {path = "../packages/ReactantServerCore"}
 ReactantServerGateway = {path = "../packages/ReactantServerGateway"}
 ReactantServerNode = {path = "../packages/ReactantServerNode"}
 ReactantServerExport = {path = "../packages/ReactantServerExport"}
-gRPCServer = {url = "https://github.com/csvance/gRPCServer.jl", rev = "scelles-merge"}
+gRPCServer = {url = "https://github.com/csvance/gRPCServer.jl", rev = "main"}
 # The landing-page plugin, from its git URL so the docs CI can resolve it;
 # a local build can override this with a path entry (see CONTRIBUTING.md).
 DocumenterLandingPage = {url = "https://github.com/csvance/DocumenterLandingPage.jl"}

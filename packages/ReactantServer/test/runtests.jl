@@ -23,6 +23,8 @@ let prefdir = mktempdir()
 end
 
 using ReactantServer
+# Loads the KaimonGateExt extension (no gate runs here; the tests call its handlers directly).
+using KaimonGate
 
 include("stablehlo_fixtures.jl")
 include("grpc_helpers.jl")
@@ -42,4 +44,5 @@ include("grpc_helpers.jl")
     include("test_server_e2e.jl")
     include("test_watcher.jl")
     include("test_shared_memory.jl")
+    include("test_kaimon_ext.jl")
 end
