@@ -4,10 +4,40 @@
 # `using KaimonGate` (in runtests.jl) is what loads the extension; no gate is running here, so
 # registration is a no-op and only the handlers are exercised, which is what an agent calls anyway.
 
-const KGE = Base.get_extension(ReactantServer, :KaimonGateExt)
+const KGE = Base.get_extension(ReactantServer, :ReactantServerKaimonGateExt)
 
 @testset "KaimonGate extension" begin
     @test KGE !== nothing
+
+    @testset "a serve guard can refuse a start before anything is allocated" begin
+        ReactantServer.clear_serve_guards!()
+        asked = Any[]
+        ReactantServer.register_serve_guard!(cfg -> push!(asked, cfg))
+        ReactantServer.register_serve_guard!(cfg -> error("no card for you"))
+        err = try
+            ReactantServer._check_serve_guards(:cfg); nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException && err.msg == "no card for you"
+        @test asked == Any[:cfg]
+        ReactantServer.clear_serve_guards!()
+        @test ReactantServer._check_serve_guards(:cfg) === nothing
+    end
+
+    @testset "heartbeat registration" begin
+        events = Any[]
+        ReactantServer.clear_heartbeats!()
+        ReactantServer.register_heartbeat!((ev, d) -> push!(events, (ev, d)))
+        ReactantServer.register_heartbeat!((ev, d) -> error("a callback that throws must not take the request"))
+        ReactantServer._beat(:up, nothing)
+        ReactantServer._beat(:request, "m")
+        ReactantServer._beat(:down, nothing)
+        @test events == Any[(:up, nothing), (:request, "m"), (:down, nothing)]
+        ReactantServer.clear_heartbeats!()
+        ReactantServer._beat(:request, "m")
+        @test length(events) == 3
+    end
 
     @testset "argument handling" begin
         @test KGE._model_names(nothing) == String[]

@@ -23,7 +23,7 @@ let prefdir = mktempdir()
 end
 
 using ReactantServer
-# Loads the KaimonGateExt extension (no gate runs here; the tests call its handlers directly).
+# Loads the ReactantServerKaimonGateExt extension (no gate runs here; the tests call its handlers directly).
 using KaimonGate
 
 include("stablehlo_fixtures.jl")

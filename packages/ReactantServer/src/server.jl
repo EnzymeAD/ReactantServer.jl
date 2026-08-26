@@ -24,6 +24,77 @@ struct RunningServer
     metrics_server::Any        # HTTP metrics listener, or nothing when metrics_port == 0
 end
 
+# ── Heartbeat registration ──────────────────────────────────────────────────────────────────────
+#
+# A process that decides whether this server may keep its accelerator needs two facts only this
+# package knows: that a server is up, and when it last did work. Neither is a metric (Prometheus is
+# opt-in and scrapes from outside), and this package must not know what a supervisor, a lease, or
+# a phase is. So the facts are published as a heartbeat: a registered callback receives every
+# lifecycle and traffic event, synchronously, and decides for itself what to do with it. Callbacks
+# that throw are logged and swallowed; a slow callback slows the request that fired it, so keep it
+# to a timestamp or a beat.
+
+const _HEARTBEATS = Any[]
+const _HEARTBEAT_LOCK = ReentrantLock()
+
+"""
+    register_heartbeat!(f) -> f
+
+Register `f(event::Symbol, detail)` to receive this process's serving heartbeat:
+
+* `:up`, `detail::ServerConfig`: a server finished bring-up and is accepting traffic
+* `:request`, `detail::String`: a ModelInfer request for that model completed or failed
+* `:down`, `detail::ServerConfig`: `stop!` tore the server down (a blocking `serve` fires it when
+  `run` returns)
+
+`:request` fires on failure too: a failing client is still a client using this server. The
+callback is fired synchronously on the request task and must not block.
+"""
+register_heartbeat!(f) = (lock(() -> push!(_HEARTBEATS, f), _HEARTBEAT_LOCK); f)
+
+"Remove every registered heartbeat callback. For tests."
+clear_heartbeats!() = lock(() -> (empty!(_HEARTBEATS); nothing), _HEARTBEAT_LOCK)
+
+# ── Serve guards ────────────────────────────────────────────────────────────────────────────────
+#
+# The heartbeat lets an outside party learn what this server is doing; a guard lets it say whether
+# a server may start at all. What the policy is (an accelerator that has to be reserved first, a
+# process that has to be supervised, a port that is off limits) is the registrant's business. This
+# package only promises to ask before it brings anything up.
+
+const _SERVE_GUARDS = Any[]
+
+"""
+    register_serve_guard!(f) -> f
+
+Register `f(cfg::ServerConfig)` to be called before every `serve` brings a server up. A guard
+refuses by throwing; the error propagates to the caller of `serve` unchanged and nothing has been
+allocated yet. Guards run in registration order.
+"""
+register_serve_guard!(f) = (lock(() -> push!(_SERVE_GUARDS, f), _HEARTBEAT_LOCK); f)
+
+"Remove every registered serve guard. For tests."
+clear_serve_guards!() = lock(() -> (empty!(_SERVE_GUARDS); nothing), _HEARTBEAT_LOCK)
+
+function _check_serve_guards(cfg)
+    for f in lock(() -> copy(_SERVE_GUARDS), _HEARTBEAT_LOCK)
+        f(cfg)
+    end
+    return nothing
+end
+
+function _beat(event::Symbol, detail)
+    fs = lock(() -> copy(_HEARTBEATS), _HEARTBEAT_LOCK)
+    for f in fs
+        try
+            f(event, detail)
+        catch err
+            @warn "ReactantServer: a heartbeat callback threw; the server is unaffected." event exception = (err, catch_backtrace())
+        end
+    end
+    return nothing
+end
+
 """
     stop!(s::RunningServer)
 
@@ -37,6 +108,7 @@ function stop!(s::RunningServer)
     close(s.server)
     shutdown!(s.scheduler)
     shm_teardown!(s.shm)
+    _beat(:down, s.config)
     return nothing
 end
 
@@ -208,6 +280,7 @@ function serve(
         cfg::ServerConfig; backend::AbstractBackend = ReactantBackend(), blocking::Bool = true,
         worker_name::AbstractString = ""
     )
+    _check_serve_guards(cfg)
     shm = SharedMemoryRegistry()   # client-facing SystemSharedMemory feature (decode/encode shm path)
     pool, registry, sched, watcher = _bring_up(cfg, backend)
     # Local reuse pool for meta-model intermediates: plain Memory, never shared. With one meta at a time
@@ -253,9 +326,15 @@ function serve(
     end
     @info "Starting gRPC control plane" host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests models = model_names(registry)
     if blocking
-        run(server)
+        _beat(:up, cfg)
+        try
+            run(server)
+        finally
+            _beat(:down, cfg)
+        end
         return nothing
     end
     gRPCServer.start!(server)
+    _beat(:up, cfg)
     return RunningServer(cfg, registry, sched, pool, shm, server, cfg.endpoints.port, watcher, metrics_server)
 end

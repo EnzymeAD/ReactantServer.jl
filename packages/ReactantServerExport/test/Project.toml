@@ -1,6 +1,6 @@
 # Lux-only round-trip environment. PythonCall and CondaPkg are deliberately absent: their mere
 # presence in the manifest makes `Pkg.instantiate` precompile the PythonCall-triggered extensions
-# (ReactantServerExport -> PyTorchExportExt and Reactant -> ReactantPythonCallExt), and precompiling
+# (ReactantServerExport -> ReactantServerExportPythonCallExt and Reactant -> ReactantPythonCallExt), and precompiling
 # those loads PythonCall, which provisions the whole torch/jax/tensorflow CondaPkg environment
 # (measured at 7.4 GB in the tree plus a 7.4 GB pixi cache in the depot). All of that happens during
 # instantiate, before runtests.jl runs, so REACTANTSERVER_SKIP_PYTORCH cannot prevent it. The PyTorch

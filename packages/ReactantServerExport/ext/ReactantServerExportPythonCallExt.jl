@@ -48,7 +48,7 @@ JIT graphs emit, and wraps the `ScriptModule` as a plain `nn.Module` so
 `torch.export` accepts it. Export runs with `strict=false` because Dynamo
 cannot trace JIT graphs.
 """
-module PyTorchExportExt
+module ReactantServerExportPythonCallExt
 
 using PythonCall
 import ReactantServerExport
@@ -769,4 +769,4 @@ function export_bundle(
     )
 end
 
-end # module PyTorchExportExt
+end # module ReactantServerExportPythonCallExt

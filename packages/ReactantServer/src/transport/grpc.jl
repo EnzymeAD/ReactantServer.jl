@@ -194,9 +194,15 @@ end
 # Time and count every ModelInfer for the worker's Prometheus export (worker_requests_total by
 # model+status, worker_request_latency_seconds), then delegate to the handler body.
 function _handle_infer(ctx::InferContext, req, grpc_deadline_ns::Integer = 0)
-    ctx.metrics === nothing && return _handle_infer_impl(ctx, req, grpc_deadline_ns)
-    t0 = time()
     name = req.model_name
+    if ctx.metrics === nothing
+        try
+            return _handle_infer_impl(ctx, req, grpc_deadline_ns)
+        finally
+            _beat(:request, String(name))
+        end
+    end
+    t0 = time()
     try
         resp = _handle_infer_impl(ctx, req, grpc_deadline_ns)
         observe_request!(ctx.metrics, name, time() - t0)
@@ -206,6 +212,9 @@ function _handle_infer(ctx::InferContext, req, grpc_deadline_ns::Integer = 0)
         observe_request!(ctx.metrics, name, time() - t0)
         inc_request!(ctx.metrics, name, _status_label(e))
         rethrow()
+    finally
+        # Fired on success and failure alike: a failing request is still a client using this server.
+        _beat(:request, String(name))
     end
 end
 

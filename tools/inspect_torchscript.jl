@@ -141,7 +141,7 @@ pyexec(
             return head + "\\n" + "\\n".join(f"{pad}  {k}:\\n" + describe_output(v, depth+2) for k, v in o.items())
         return f"{pad}{type(o).__name__}: {repr(o)[:80]}"
 
-    # --- the real TorchScript export patches (mirror PyTorchExportExt._TORCHSCRIPT_PATCHES_PY) ---
+    # --- the real TorchScript export patches (mirror ReactantServerExportPythonCallExt._TORCHSCRIPT_PATCHES_PY) ---
     def _fix_jit_parameters(mod):
         for name in list(mod._parameters.keys()):
             p = mod._parameters[name]

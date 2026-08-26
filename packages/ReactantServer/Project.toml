@@ -1,6 +1,6 @@
 name = "ReactantServer"
 uuid = "faa8a0e4-1926-4c6b-a0e2-e70699715ecf"
-version = "0.1.10"
+version = "0.1.11"
 authors = ["Carroll Vance <cvance@medicalmetrics.com>"]
 
 [deps]
@@ -19,7 +19,7 @@ YAML = "ddb6d928-2868-570f-bddf-ab3f9cf99eb6"
 gRPCServer = "608c6337-0d7d-447f-bb69-0f5674ee3959"
 
 # KaimonGate is the Kaimon MCP gate's session library, a weak dependency for the extension seam
-# only: when it is loaded alongside ReactantServer, KaimonGateExt registers the `rserver_*`
+# only: when it is loaded alongside ReactantServer, ReactantServerKaimonGateExt registers the `rserver_*`
 # GateTools so an agent can start, inspect, and stop a worker in the session where the code is
 # loaded. Nothing in `src/` references either, a user who never loads KaimonGate pays nothing, and
 # Kaimon appends KaimonGate's OWN environment to JULIA_LOAD_PATH when it spawns a session, so the
@@ -29,7 +29,7 @@ gRPCServer = "608c6337-0d7d-447f-bb69-0f5674ee3959"
 KaimonGate = "5ee84a8c-75bd-412f-a7b8-4e6463aa635f"
 
 [extensions]
-KaimonGateExt = "KaimonGate"
+ReactantServerKaimonGateExt = "KaimonGate"
 
 [compat]
 BFloat16s = "0.6.1"
