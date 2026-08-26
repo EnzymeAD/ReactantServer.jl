@@ -1,4 +1,4 @@
-# KaimonGateExt.jl
+# ReactantServerKaimonGateExt.jl
 #
 # The KaimonGate extension: registers `rserver_*` GateTools with the running Kaimon gate so an
 # agent can bring a worker up in the very session where the server code is loaded, ask what it is
@@ -35,10 +35,10 @@
 # merges by name (additive since KaimonGate 1.3), so registering here cannot drop another
 # registrant's tools. What it cannot do is register before the gate binds, and the gate normally
 # binds after the session's `using` lines run, so the extension registers on load and then keeps
-# retrying for a short window. `KaimonGateExt.reinstall_kaimon_tools()` is the manual hammer: it
+# retrying for a short window. `ReactantServerKaimonGateExt.reinstall_kaimon_tools()` is the manual hammer: it
 # registers unconditionally, starting a gate if none is running, exactly as a bare `serve()` would.
 
-module KaimonGateExt
+module ReactantServerKaimonGateExt
 
 import ReactantServer
 import KaimonGate
@@ -94,18 +94,18 @@ function _resolve(id::Union{AbstractString, Nothing})
         if id !== nothing
             s = get(SERVERS, String(id), nothing)
             s === nothing && error(
-                "ReactantServer KaimonGateExt: no server with id `$(id)` in this session. \
+                "ReactantServer ReactantServerKaimonGateExt: no server with id `$(id)` in this session. \
                  `rserver_status()` lists what there is."
             )
             return s
         end
         live = [s for s in values(SERVERS) if _is_live(s)]
         isempty(live) && error(
-            "ReactantServer KaimonGateExt: no server is running in this session. Start one with \
+            "ReactantServer ReactantServerKaimonGateExt: no server is running in this session. Start one with \
              `rserver_start(model_dir=\"...\")`."
         )
         length(live) == 1 || error(
-            "ReactantServer KaimonGateExt: $(length(live)) servers are running \
+            "ReactantServer ReactantServerKaimonGateExt: $(length(live)) servers are running \
              ($(join(sort([s.id for s in live]), ", "))); pass `id`."
         )
         return only(live)
@@ -121,7 +121,7 @@ function _normalize_accelerator(s::AbstractString)
     (a == "gpu" || a == "cuda") && return "cuda"
     a == "cpu" && return "cpu"
     return error(
-        "ReactantServer KaimonGateExt: `accelerator` must be \"gpu\" (equivalently \"cuda\") or \
+        "ReactantServer ReactantServerKaimonGateExt: `accelerator` must be \"gpu\" (equivalently \"cuda\") or \
          \"cpu\", got \"$(s)\"."
     )
 end
@@ -150,7 +150,7 @@ function _build_config(;
     )
     dir = abspath(expanduser(String(model_dir)))
     poll = something(poll_seconds, 0.0)
-    poll >= 0 || error("ReactantServer KaimonGateExt: `poll_seconds` must be non-negative.")
+    poll >= 0 || error("ReactantServer ReactantServerKaimonGateExt: `poll_seconds` must be non-negative.")
 
     runtime = Dict{String, Any}("backend" => accelerator, "device_ordinal" => device)
     mem_fraction === nothing || (runtime["mem_fraction"] = mem_fraction)
@@ -185,7 +185,7 @@ function _check_ports_locked(cfg)
         for p in (cfg.endpoints.port, cfg.endpoints.metrics_port)
             p == 0 && continue
             p in used && error(
-                "ReactantServer KaimonGateExt: port $(p) is already used by server $(s.id) \
+                "ReactantServer ReactantServerKaimonGateExt: port $(p) is already used by server $(s.id) \
                  (gRPC $(s.cfg.endpoints.port), metrics $(s.cfg.endpoints.metrics_port)). \
                  Pick another port."
             )
@@ -202,7 +202,7 @@ function _check_client_commit_locked(cfg)
     have = CLIENT_COMMIT[]
     if have !== nothing && have != want
         error(
-            "ReactantServer KaimonGateExt: this session's XLA client was already created with \
+            "ReactantServer ReactantServerKaimonGateExt: this session's XLA client was already created with \
              mem_fraction=$(have.mem_fraction), preallocate=$(have.preallocate), and the client \
              is process-global: a second server cannot change the BFC arena, it can only inherit \
              it. Either start this server with those settings, or restart the session. \
@@ -405,9 +405,9 @@ function rserver_start(
         poll_seconds::Union{Float64, Nothing} = nothing,
     )
     accel = _normalize_accelerator(accelerator)
-    device >= 0 || error("ReactantServer KaimonGateExt: `device` must be non-negative.")
+    device >= 0 || error("ReactantServer ReactantServerKaimonGateExt: `device` must be non-negative.")
     accel == "cpu" && device != 0 && error(
-        "ReactantServer KaimonGateExt: `device` is a GPU index; the CPU backend has one device, \
+        "ReactantServer ReactantServerKaimonGateExt: `device` is a GPU index; the CPU backend has one device, \
          so leave it at 0."
     )
     cfg = _build_config(;
@@ -555,7 +555,7 @@ function _install_tools()
         KaimonGate.serve(force = true, tools = _build_tools())
         return true
     catch e
-        @warn "ReactantServer KaimonGateExt: registering the rserver_* tools failed" exception = e
+        @warn "ReactantServer ReactantServerKaimonGateExt: registering the rserver_* tools failed" exception = e
         return false
     end
 end
@@ -587,7 +587,7 @@ this registers unconditionally: if no gate is running it starts one, exactly as 
 would.
 
 Reach it from a session as
-`Base.get_extension(ReactantServer, :KaimonGateExt).reinstall_kaimon_tools()`. It lives in the
+`Base.get_extension(ReactantServer, :ReactantServerKaimonGateExt).reinstall_kaimon_tools()`. It lives in the
 extension module rather than in ReactantServer because a precompiled module cannot create a new
 binding in another module, only add methods to existing ones.
 """
@@ -601,4 +601,4 @@ function __init__()
     return nothing
 end
 
-end # module KaimonGateExt
+end # module ReactantServerKaimonGateExt

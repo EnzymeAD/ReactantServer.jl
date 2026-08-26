@@ -122,7 +122,7 @@ the two stub files are hand-maintained:
 
 ## Kaimon gate tools (dev only)
 
-`packages/ReactantServer/ext/KaimonGateExt.jl` registers four `rserver_*` GateTools with a running
+`packages/ReactantServer/ext/ReactantServerKaimonGateExt.jl` registers four `rserver_*` GateTools with a running
 [Kaimon](https://github.com/kahliburke/Kaimon.jl) gate, so an agent (or a REPL) can bring a worker
 up in the session where the code is loaded: `rserver_start` (model directory, optional model
 allowlist, `accelerator`, GPU `device`, ports), `rserver_status`, `rserver_models`, and
@@ -147,7 +147,7 @@ and configuration errors are raised by the call itself.
 To drive the tools from a REPL rather than an agent, or after a manual `KaimonGate.stop()`:
 
 ```julia
-Base.get_extension(ReactantServer, :KaimonGateExt).reinstall_kaimon_tools()
+Base.get_extension(ReactantServer, :ReactantServerKaimonGateExt).reinstall_kaimon_tools()
 ```
 
 ## Documentation

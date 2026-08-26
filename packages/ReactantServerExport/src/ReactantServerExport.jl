@@ -814,7 +814,7 @@ end
 
 # ============================================================================
 # Extension seams: defined here (so callers reach them as ReactantServerExport.X) and given
-# methods by the PythonCall-triggered PyTorchExportExt. Calling these without `using PythonCall`
+# methods by the PythonCall-triggered ReactantServerExportPythonCallExt. Calling these without `using PythonCall`
 # raises a MethodError directing you to load PythonCall.
 # ============================================================================
 

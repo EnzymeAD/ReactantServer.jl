@@ -77,11 +77,11 @@ jobs:
             # matching change (for instance after editing the job itself), put the
             # `ci:export-pytorch` label on the PR.
             #
-            # Known gap from this narrowness: PyTorchExportExt overrides fallback stubs defined in
+            # Known gap from this narrowness: ReactantServerExportPythonCallExt overrides fallback stubs defined in
             # ReactantServerExport/src, so a signature change there can break the extension without
             # this job running. The Lux arm does not load the extension, so nothing else catches it.
             export_pytorch:
-              - 'packages/ReactantServerExport/ext/PyTorchExportExt.jl'
+              - 'packages/ReactantServerExport/ext/ReactantServerExportPythonCallExt.jl'
               - 'packages/ReactantServerExport/CondaPkg.toml'
               - 'packages/ReactantServerExport/test/pytorch/**'
               - 'packages/ReactantServerExport/test/runtests.jl'
