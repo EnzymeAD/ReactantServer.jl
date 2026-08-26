@@ -14,7 +14,11 @@ const KGE = Base.get_extension(ReactantServer, :ReactantServerKaimonGateExt)
         asked = Any[]
         ReactantServer.register_serve_guard!(cfg -> push!(asked, cfg))
         ReactantServer.register_serve_guard!(cfg -> error("no card for you"))
-        err = try; ReactantServer._check_serve_guards(:cfg); nothing; catch e; e; end
+        err = try
+            ReactantServer._check_serve_guards(:cfg); nothing
+        catch e
+            e
+        end
         @test err isa ErrorException && err.msg == "no card for you"
         @test asked == Any[:cfg]
         ReactantServer.clear_serve_guards!()
