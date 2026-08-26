@@ -19,7 +19,7 @@
 # them with a mismatched version.
 #
 # Build context is the repository root. Reactant, HTTP, Prometheus, and gRPCClient are registry
-# deps; gRPCServer resolves from the `main` branch of github.com/csvance/gRPCServer.jl
+# deps; gRPCServer resolves from the `main` branch of github.com/JuliaIO/gRPCServer.jl
 # via the workspace [sources]. NOTE: Manifest.toml is gitignored, so `COPY Manifest.toml` needs a
 # locally generated Manifest in the build context (run `REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1
 # julia --project=. -e 'using Pkg; Pkg.instantiate()'` first); a fresh clone has none.

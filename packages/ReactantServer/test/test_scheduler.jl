@@ -126,6 +126,34 @@ end
     @test length(taken4) == 1
 end
 
+@testset "an oversize request is split into compiled-size pieces and joined back" begin
+    # A client batching 32 against a bundle compiled for [1] used to get INTERNAL on every call; two
+    # rounds of n=1 verification could not see it. The split is coalescing run backwards.
+    e = _sched_entry("o", [1, 4]; coalescable = true)
+    x = NamedTensor("x", reshape(Float32.(1:20), 2, 10))          # 10 rows, batch axis 2
+    req = InferRequest("o", ["y"], [x], Int64(0))
+    prepared = req.inputs
+    @test ReactantServer._max_compiled_rows(e, prepared) == 4
+    @test ReactantServer._executable_rows(e, prepared) == 10
+    @test ReactantServer._splittable(e, req, prepared, 10)
+    @test ReactantServer._split_ranges(10, 4) == [1:4, 5:8, 9:10]
+    @test ReactantServer._split_ranges(4, 4) == [1:4]
+    pieces = [
+        ReactantServer._take_rows(prepared, e.manifest.executable_inputs, r)
+            for r in ReactantServer._split_ranges(10, 4)
+    ]
+    @test [size(only(pc).data, 2) for pc in pieces] == [4, 4, 2]
+    @test only(pieces[3]).data == x.data[:, 9:10]
+    # Pretend each piece produced its own rows as output; the join restores the full batch in order.
+    outs = [NamedTensor[NamedTensor("y", only(pc).data .* 2)] for pc in pieces]
+    joined = ReactantServer._join_outputs(e, outs)
+    @test only(joined).data == x.data .* 2
+    # Unbatched (key 0) and uncompiled variants are never split; a row-changing preprocess is not either.
+    e0 = _sched_entry("u", [0]; coalescable = true)
+    @test ReactantServer._max_compiled_rows(e0, prepared) === nothing
+    @test !ReactantServer._splittable(e, req, [NamedTensor("x", zeros(Float32, 2, 3))], 3)
+end
+
 @testset "plan_batch respects per-model max_batch_size" begin
     # the cap limits coalescing: four 2-row requests with sizes [1,4,8] and cap 4 pick B=4 and
     # take two requests (uncapped this queue would fill B=8 with all four)
