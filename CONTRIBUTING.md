@@ -4,7 +4,7 @@ Developer notes for working on ReactantServer.jl. For using the server, start wi
 [Getting Started](docs/src/manual/getting_started.md).
 
 After cloning, instantiate the workspace (gRPCServer resolves from the `main` branch of
-github.com/csvance/gRPCServer.jl via the workspace `[sources]`):
+github.com/JuliaIO/gRPCServer.jl via the workspace `[sources]`):
 
 ```
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
