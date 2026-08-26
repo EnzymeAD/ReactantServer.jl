@@ -46,6 +46,8 @@ Register `f(event::Symbol, detail)` to receive this process's serving heartbeat:
 * `:request`, `detail::String`: a ModelInfer request for that model completed or failed
 * `:down`, `detail::ServerConfig`: `stop!` tore the server down (a blocking `serve` fires it when
   `run` returns)
+* `:load` / `:unload`, `detail::String`: the directory watcher loaded (or reloaded) or unloaded
+  that bundle
 
 `:request` fires on failure too: a failing client is still a client using this server. The
 callback is fired synchronously on the request task and must not block.

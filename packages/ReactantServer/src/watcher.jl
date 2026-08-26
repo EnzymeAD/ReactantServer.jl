@@ -145,6 +145,10 @@ function _apply_change!(
             w.seen[name] = desired
             w.dir_ids[name] = _dir_id(dir)
         end
+        # On the heartbeat as well as in the log: a hot-load is an event a supervisor wants to see
+        # (it is the server doing work), and a log line is not something another process can
+        # subscribe to. One squad run proved a hot-load only by reading /proc/<pid>/maps.
+        _beat(action === :unload ? :unload : :load, String(name))
     catch err
         @warn "watcher: failed to apply model change; will retry next poll" name exception = (err, catch_backtrace())
     end

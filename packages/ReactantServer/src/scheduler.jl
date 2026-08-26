@@ -1275,11 +1275,107 @@ function infer(s::Scheduler, req::InferRequest; committed::Bool = false)
     # preprocess/postprocess come from a bundle's model.jl, defined in a newer world age;
     # invokelatest crosses that boundary (harmless for identity).
     prepared = Base.invokelatest(entry.preprocess, req.inputs)
+    # A request larger than the largest compiled batch is split into pieces the model can run and
+    # the pieces' outputs are joined back, so a client that batches 32 against a bundle compiled for
+    # `[1]` gets an answer rather than an INTERNAL error. The inverse of coalescing: the same batch
+    # axes, the same slicing, run in the other direction.
+    maxB = _max_compiled_rows(entry, prepared)
+    rows = _executable_rows(entry, prepared)
+    if maxB !== nothing && rows > maxB && _splittable(entry, req, prepared, rows)
+        return _infer_split(s, entry, req, prepared, rows, maxB; committed)
+    end
     qr = QueuedRequest(req, prepared; committed = committed)
     submit!(s, qr)
     raw = take!(qr.reply)
     raw isa Exception && throw(raw)
     return Base.invokelatest(entry.postprocess, raw)
+end
+
+# ---------------------------------------------------------------------------------------------
+# Oversize requests: split, run, join
+# ---------------------------------------------------------------------------------------------
+#
+# The largest compiled batch for this request's shape variant, or `nothing` when the variant is
+# uncompiled (then the ordinary path raises the precise error) or the model is unbatched (key 0).
+function _max_compiled_rows(entry::ModelEntry, prepared::Vector{NamedTensor})
+    _coalescable(entry) || return nothing
+    execs = entry.executable.execs
+    variant = _request_variant(entry, prepared)
+    haskey(execs, variant) || return nothing
+    inner = execs[variant]
+    haskey(inner, 0) && return nothing
+    isempty(inner) && return nothing
+    return maximum(keys(inner))
+end
+
+# Splitting is only sound when the preprocess hook kept one client row per executable row: then a
+# slice of the client inputs preprocesses to the same slice of the prepared inputs, and the outputs
+# can be joined along the executable output batch axes in order. A hook that changes the row count
+# (crops per image, say) has no such correspondence, and that request runs whole as before.
+function _splittable(entry::ModelEntry, req::InferRequest, prepared::Vector{NamedTensor}, rows::Int)
+    _request_rows(entry, req) == rows || return false
+    # Every executable output must carry a batch axis, or a join has nothing to join along; an
+    # output without one would silently be taken from the first piece.
+    return all(sp -> sp.batch_axis !== nothing, entry.manifest.executable_outputs)
+end
+
+# `[1:B, B+1:2B, ...]` covering `rows`, each piece at most `maxB` rows.
+_split_ranges(rows::Int, maxB::Int) = [i:min(i + maxB - 1, rows) for i in 1:maxB:rows]
+
+# The `rng` rows of every tensor that has a batch axis in `specs`; tensors without one are shared.
+function _take_rows(tensors::AbstractVector{NamedTensor}, specs, rng::UnitRange{Int})
+    axes = Dict{String, Int}(sp.name => sp.batch_axis for sp in specs if sp.batch_axis !== nothing)
+    return NamedTensor[
+        haskey(axes, t.name) ? NamedTensor(t.name, collect(selectdim(t.data, axes[t.name], rng))) : t
+            for t in tensors
+    ]
+end
+
+# Join the pieces' outputs along each output's batch axis, in piece order.
+function _join_outputs(entry::ModelEntry, pieces::Vector{Vector{NamedTensor}})
+    specs = entry.manifest.executable_outputs
+    first_piece = pieces[1]
+    joined = NamedTensor[]
+    for (i, t) in enumerate(first_piece)
+        sp = i <= length(specs) ? specs[i] : nothing
+        if sp === nothing || sp.batch_axis === nothing
+            push!(joined, t)
+        else
+            data = cat((pc[i].data for pc in pieces)...; dims = sp.batch_axis)
+            push!(joined, NamedTensor(t.name, data))
+        end
+    end
+    return joined
+end
+
+function _infer_split(
+        s::Scheduler, entry::ModelEntry, req::InferRequest, prepared::Vector{NamedTensor},
+        rows::Int, maxB::Int; committed::Bool
+    )
+    in_specs = entry.manifest.executable_inputs
+    ranges = _split_ranges(rows, maxB)
+    # Submit every piece before waiting on any, so the pieces coalesce with each other and with
+    # other traffic exactly as separate requests would; the deadline and the requested outputs are
+    # the whole request's.
+    qrs = QueuedRequest[]
+    for rng in ranges
+        piece = _take_rows(prepared, in_specs, rng)
+        qr = QueuedRequest(req, piece; committed = committed)
+        submit!(s, qr)
+        push!(qrs, qr)
+    end
+    raws = Vector{Vector{NamedTensor}}(undef, length(qrs))
+    failure = nothing
+    for (i, qr) in enumerate(qrs)
+        r = take!(qr.reply)
+        if r isa Exception
+            failure === nothing && (failure = r)
+        else
+            raws[i] = r
+        end
+    end
+    failure === nothing || throw(failure)
+    return Base.invokelatest(entry.postprocess, _join_outputs(entry, raws))
 end
 
 # ---------------------------------------------------------------------------------------------

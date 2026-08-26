@@ -64,4 +64,4 @@ test = ["Test", "KaimonGate", "Logging", "Sockets", "gRPCClient"]
 
 [sources]
 ReactantServerCore = {path = "../ReactantServerCore"}
-gRPCServer = {url = "https://github.com/csvance/gRPCServer.jl", rev = "main"}
+gRPCServer = {url = "https://github.com/JuliaIO/gRPCServer.jl", rev = "main"}
