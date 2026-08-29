@@ -85,8 +85,7 @@ through a gRPC control plane, without a restart.
 ## Install
 
 ReactantServer is not yet registered in the General registry, so installation is from the
-repository. The one build dependency beyond the workspace, the gRPC server, is sourced from the
-`main` branch of `github.com/JuliaIO/gRPCServer.jl` through the workspace `[sources]`:
+repository:
 
 ```
 git clone https://github.com/EnzymeAD/ReactantServer.jl

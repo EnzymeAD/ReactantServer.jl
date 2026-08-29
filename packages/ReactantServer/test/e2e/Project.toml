@@ -14,12 +14,11 @@ gRPCServer = "608c6337-0d7d-447f-bb69-0f5674ee3959"
 [sources]
 # A standalone environment does not inherit a path-dependency's own [sources], so this env
 # declares the full vendored path-source closure itself (same pattern as docs/Project.toml):
-# the packages under test plus the unregistered/forked deps under lib/.
+# the path-sourced packages under test (ReactantServer and ReactantServerExport).
 ReactantServer = {path = "../.."}
 # Offline bundle export, used by gen_bit_resnet50.jl to trace the Luximm model into the
 # bit_resnet50 bundle the stack serves.
 ReactantServerExport = {path = "../../../ReactantServerExport"}
-gRPCServer = {url = "https://github.com/JuliaIO/gRPCServer.jl", rev = "main"}
 
 [compat]
 gRPCClient = "1.1.0"

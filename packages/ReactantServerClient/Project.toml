@@ -33,4 +33,3 @@ test = ["Test", "Sockets", "gRPCServer"]
 
 [sources]
 ReactantServerCore = {path = "../ReactantServerCore"}
-gRPCServer = {url = "https://github.com/JuliaIO/gRPCServer.jl", rev = "main"}
