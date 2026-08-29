@@ -101,6 +101,21 @@ jobs:
       cache-name: client
       command: "julia --color=yes --project=packages/ReactantServerClient -e 'using Pkg; Pkg.test(; julia_args=[\"--threads=auto,1\"])'"
 
+  # The client is the Reactant-free package users run on workstations, so it is the one suite
+  # worth exercising beyond Linux: macOS enforces a 31-byte POSIX shm name limit (PSHMNAMLEN)
+  # that Linux does not, and the client's shared-memory transport mints such names. Windows is
+  # deliberately not covered: InterProcessCommunication.jl is POSIX-only (unix.jl throughout,
+  # CI on ubuntu only), so the client cannot load there until upstream support exists; revisit
+  # with a @static-if inline-only fallback if that ever changes.
+  client-macos:
+    needs: changes
+    if: ${{ needs.changes.outputs.client == 'true' }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      cache-name: client-macos
+      os: macos-latest
+      command: "julia --color=yes --project=packages/ReactantServerClient -e 'using Pkg; Pkg.test(; julia_args=[\"--threads=auto,1\"])'"
+
   gateway:
     needs: changes
     if: ${{ needs.changes.outputs.gateway == 'true' }}
@@ -170,7 +185,7 @@ jobs:
           julia --color=yes --project=packages/ReactantServerExport/test/pytorch packages/ReactantServerExport/test/runtests.jl
 
   ci-ok:
-    needs: [core, client, gateway, server, node, export-lux, export-pytorch]
+    needs: [core, client, client-macos, gateway, server, node, export-lux, export-pytorch]
     if: always()
     runs-on: ubuntu-latest
     steps:
