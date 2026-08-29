@@ -73,6 +73,10 @@ and writes `models/mlp/`: a `manifest.yaml`, one compiled StableHLO module per b
 those names. The `:lux` frontend works for any Reactant-traceable `model(x, ps, st)`; Lux itself
 is not required by the frontend, only by this example that builds the model.
 
+A bundle compiled for `[1]` still answers larger client batches: the worker splits a request
+larger than the largest compiled size into pieces the model can run and joins the outputs back
+(see [Scheduling](scheduling.md)).
+
 `models/` is now a model repository: every immediate subdirectory with a `manifest.yaml` is a
 servable model, keyed by its directory name (`mlp` here). See [Bundles](bundles.md) for the
 manifest format and custom pre/post-processing via a `model.jl`.
