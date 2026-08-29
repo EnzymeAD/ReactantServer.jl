@@ -15,9 +15,9 @@ convention follows Julia's (column-major, batch-last axes).
 It targets static-graph workloads — computer vision, scientific computing — where many models
 share a GPU and one model executes at a time.
 
-Not sure which setup fits you? [Common Use Cases](https://enzymead.github.io/ReactantServer.jl/dev/manual/common_use_cases/) walks
-through the deployment shapes (single GPU, multi-GPU distributed or replicated, multi-node) with
-an example configuration for each.
+Not sure which setup fits you? The [deployment shapes](https://enzymead.github.io/ReactantServer.jl/dev/deployment/#Deployment-shapes)
+section walks through the options (single GPU, multi-GPU distributed or replicated, multi-node)
+and what each one optimizes for.
 
 ## Highlights
 
@@ -25,36 +25,36 @@ an example configuration for each.
   executables through Reactant's PJRT bindings. The runtime is device-agnostic (CUDA today, CPU
   for dev/fallback); supporting more accelerators is a goal, not a redesign. → [Architecture](https://enzymead.github.io/ReactantServer.jl/dev/design/architecture/), [Philosophy](https://enzymead.github.io/ReactantServer.jl/dev/design/philosophy/)
 - **Julia-first pre/postprocessing.** A bundle's `model.jl` registers `preprocess`/`postprocess`
-  hooks in plain Julia; they run per request, in parallel and overlapped with GPU execution. → [Bundles & model.jl](https://enzymead.github.io/ReactantServer.jl/dev/manual/bundles/)
+  hooks in plain Julia; they run per request, in parallel and overlapped with GPU execution. → [Bundles & model.jl](https://enzymead.github.io/ReactantServer.jl/dev/bundles/)
 - **Julia-aligned conventions.** Shapes are column-major with the batch axis last, the way Julia
   and Lux write them; the codec converts to KServe's row-major wire at the boundary, so Triton
-  clients are unchanged and you never reason about row-major order. → [Getting Started](https://enzymead.github.io/ReactantServer.jl/dev/manual/getting_started/)
+  clients are unchanged and you never reason about row-major order. → [Tutorial](https://enzymead.github.io/ReactantServer.jl/dev/tutorial/)
 - **Elegant configuration.** One typed YAML node file (with environment-variable overrides)
-  describes a machine; manifests declare tensors with an einsum-style named-axis notation. → [Node Configuration](https://enzymead.github.io/ReactantServer.jl/dev/manual/node_config/), [Bundles & model.jl](https://enzymead.github.io/ReactantServer.jl/dev/manual/bundles/)
+  describes a machine; manifests declare tensors with an einsum-style named-axis notation. → [Node Configuration](https://enzymead.github.io/ReactantServer.jl/dev/node_config/), [Bundles & model.jl](https://enzymead.github.io/ReactantServer.jl/dev/bundles/)
 - **Standard inference protocol.** KServe V2 over gRPC. Tensor data travels inline or through the
-  Triton-compatible system-shared-memory extension for zero-copy local clients. → [Client Usage](https://enzymead.github.io/ReactantServer.jl/dev/manual/client_usage/)
+  Triton-compatible system-shared-memory extension for zero-copy local clients. → [Client Usage](https://enzymead.github.io/ReactantServer.jl/dev/client/)
 - **One process, single or multi-GPU.** A node supervisor runs one worker per visible GPU: a
   single worker serves the public ports directly; two or more get an embedded gateway behind one
   endpoint. The external interface (`:8001` gRPC, `:8002` metrics/health) is identical either way.
-  → [Deployment](https://enzymead.github.io/ReactantServer.jl/dev/manual/deployment/), [Scaling to Multiple GPUs](https://enzymead.github.io/ReactantServer.jl/dev/manual/scaling/)
+  → [Deployment](https://enzymead.github.io/ReactantServer.jl/dev/deployment/), [Multi-GPU Gateway](https://enzymead.github.io/ReactantServer.jl/dev/gateway/)
 - **Balances memory and compute.** Every model's weights stay resident in host RAM and stream
   onto the GPU on demand, evicted LRU under a byte budget — so a card serves far more models than
-  fit in VRAM, paying a single host-to-device transfer on a cold call. → [On-demand Weights](https://enzymead.github.io/ReactantServer.jl/dev/manual/on_demand_weights/)
+  fit in VRAM, paying a single host-to-device transfer on a cold call. → [On-demand Weights](https://enzymead.github.io/ReactantServer.jl/dev/on_demand_weights/)
 - **Batch coalescing.** Concurrent same-model requests are merged into one execution at a compiled
   batch size, amortizing per-launch overhead and the one-time weight transfer across the batch.
   → [Architecture](https://enzymead.github.io/ReactantServer.jl/dev/design/architecture/)
 - **Scheduling modes for single and multi-GPU.** On a worker, `fair` (deficit-weighted,
   cost-aware) or `fifo`; across GPUs, the gateway offers `round_robin` or memory-aware
   `lpt_packing` that concentrates each model's traffic to fill batches, with a gRPC control plane for
-  retuning placement without a restart. → [Architecture](https://enzymead.github.io/ReactantServer.jl/dev/design/architecture/), [Multi-GPU Gateway](https://enzymead.github.io/ReactantServer.jl/dev/manual/multi_gpu_gateway/)
+  retuning placement without a restart. → [Architecture](https://enzymead.github.io/ReactantServer.jl/dev/design/architecture/), [Multi-GPU Gateway](https://enzymead.github.io/ReactantServer.jl/dev/gateway/)
 - **Fast iteration.** In `dynamic` mode the server watches the model repository and hot-loads,
   unloads, and reloads bundles online — weights, MLIR, manifest, and `model.jl` alike — with no
   restart (`static` and `explicit` control modes are also available). A model is named by its
   bundle directory, and a renamed directory (a registry promotion such as `-staging` to
-  `-production`) renames the live model in place with no recompile. → [Node Configuration](https://enzymead.github.io/ReactantServer.jl/dev/manual/node_config/)
+  `-production`) renames the live model in place with no recompile. → [Node Configuration](https://enzymead.github.io/ReactantServer.jl/dev/node_config/)
 - **Meta models.** A `kind: meta` bundle chains several models with data-dependent Julia between
   stages: its `model.jl` registers a `run` hook that calls sub-models, runs off the GPU dispatch
-  loop, and re-enters the scheduler for each sub-call. → [Meta Models](https://enzymead.github.io/ReactantServer.jl/dev/manual/meta_models/)
+  loop, and re-enters the scheduler for each sub-call. → [Meta Models](https://enzymead.github.io/ReactantServer.jl/dev/meta_models/)
 
 ## Quick start
 
@@ -71,7 +71,7 @@ REACTANT_NODE_FILE=config/node.default.yaml \
 ```
 
 The first server startup is slow, since every model compiles before the gRPC plane accepts
-traffic. See [Deployment](https://enzymead.github.io/ReactantServer.jl/dev/manual/deployment/) for
+traffic. See [Deployment](https://enzymead.github.io/ReactantServer.jl/dev/deployment/) for
 configuration and running it as a service.
 
 Or from pure Julia:
@@ -82,9 +82,9 @@ ReactantServerNode.supervise("config/node.yaml")   # one worker per GPU (+ gatew
 ```
 
 Clients speak KServe V2 gRPC to `:8001`; health and metrics are on `:8002`. Walk through exporting
-a model, configuring a node, and querying it in [Getting Started](https://enzymead.github.io/ReactantServer.jl/dev/manual/getting_started/).
+a model, configuring a node, and querying it in the [Tutorial](https://enzymead.github.io/ReactantServer.jl/dev/tutorial/).
 ReactantServer is designed for a trusted network; read
-[Security](https://enzymead.github.io/ReactantServer.jl/dev/manual/deployment/#Security) before exposing an endpoint.
+[Security](https://enzymead.github.io/ReactantServer.jl/dev/deployment/#Security) before exposing an endpoint.
 
 ## Status
 

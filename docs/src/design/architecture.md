@@ -26,12 +26,12 @@ Reactant/XLA stack:
   concurrency-safe staging `BufferPool`. The other packages all build on it.
 - **ReactantServer** — the inference worker. It owns the model registry, the runtime, the
   scheduler, and the KServe V2 gRPC server, and is the **only** package that loads Reactant.
-  Exports `serve`, `serve_worker`, `stop!`, `register_model`.
+  Exports `serve`, `serve_worker`, `stop!`, `register_model`, `register_meta_model`.
 - **ReactantServerGateway** — the multi-GPU reverse proxy (`serve_gateway`,
   `probe_worker_ready`). Builds only on Core and the gRPC layer; no Reactant.
 - **ReactantServerClient** — the inference client (`KServeModel`, `infer_sync`,
   `infer_async`, `InferInput`, `InferOutput`). Also Reactant-free, so it installs on a plain
-  client machine. See [Client Usage](../manual/client_usage.md).
+  client machine. See [Client Usage](../client.md).
 - **ReactantServerNode** — the node supervisor (`supervise`). It detects the
   visible GPUs and runs one worker subprocess per device, plus the embedded gateway when there
   is more than one worker. Reactant-free (it only orchestrates subprocesses).
@@ -58,8 +58,8 @@ lowers cost per inference. Two technical levers deliver this:
 
 The broader mission, the target audience, and the explicit non-goals are on the
 [Philosophy](philosophy.md) page. Operational and format details are in the
-[Getting Started](../manual/getting_started.md) and
-[Node Configuration](../manual/node_config.md) guides.
+[Tutorial](../tutorial.md) and
+[Node Configuration](../node_config.md) guides.
 
 ## How it fits together
 
@@ -75,8 +75,8 @@ The broader mission, the target audience, and the explicit non-goals are on the
   embedded gateway that gives clients one endpoint and routes each model's traffic across
   workers, either uniformly (round robin) or by packing each model onto a fixed,
   operator-configured number of GPUs with coalescing-aware routing (`lpt_packing`).
-  See the [Scaling to Multiple GPUs](../manual/scaling.md) and
-  [Multi-GPU Gateway](../manual/multi_gpu_gateway.md) guides.
+  See the [Multi-GPU Gateway](../gateway.md) and
+  [Deployment](../deployment.md) guides.
 - **Weights as explicit arguments.** Weights are passed to the compiled executable as arguments
   rather than baked into it. This is what makes on-demand loading and weight sharing across
   batch sizes possible: compilation is independent of where the weights currently live.
@@ -207,6 +207,15 @@ set per variant over a single shared set of weights, and only requests resolving
 variant coalesce together, since different input shapes cannot be concatenated along the batch
 axis.
 
+Coalescing has an inverse for requests that are individually too large: a request whose batch
+exceeds the largest compiled size for its shape variant is split into pieces the model can run
+before it is queued, the pieces are submitted as separate requests (so they coalesce with each
+other and with other traffic exactly as separate requests would, under the whole request's
+deadline), and the outputs are joined back along each output's batch axis and post-processed
+once. Splitting requires the `preprocess` hook to keep one client row per executable row and
+every executable output to carry a batch axis; a request that cannot be split soundly runs whole
+as before.
+
 Coalescing is the throughput lever. Packing many requests into one execution amortizes the fixed
 per-launch overhead and, for a model that had to be loaded on demand, the one-time weight
 transfer, across every image in the batch. On a representative compute-heavy model, per-image
@@ -232,9 +241,9 @@ orchestration runs on the request task, off the dispatch loop, under a gate that
 a time by default so meta glue never blocks the GPU; each sub-call it makes re-enters the scheduler
 as a committed request (step 1 of the decision order above) and is dispatched and coalesced like
 any other work. The meta's remaining deadline budget rides along to those sub-calls. The
-[Object Detection](../manual/object_detection.md) guide is a worked example, a torchvision Faster
+[Object Detection](../object_detection.md) guide is a worked example, a torchvision Faster
 R-CNN split into two StableHLO stages joined by Julia detection glue. See
-[Meta Models](../manual/meta_models.md) for the full model.
+[Meta Models](../meta_models.md) for the full model.
 
 ## The compiler advantage
 
