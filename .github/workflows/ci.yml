@@ -41,8 +41,7 @@ jobs:
         with:
           # `common` (global files + Core) is folded into every suite, since Core is a dependency
           # of all of them and the global files affect everything. Each suite then adds its own
-          # package dir it depends on (a gRPCServer rev bump shows as a change to that package's
-          # Project.toml [sources]). Filters err toward over-inclusion so a real dependency
+          # package dir it depends on. Filters err toward over-inclusion so a real dependency
           # change can never produce a false green.
           filters: |
             common: &common

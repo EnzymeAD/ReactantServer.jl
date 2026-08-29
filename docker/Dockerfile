@@ -18,9 +18,8 @@
 # its own bundled cuDNN 9 / NCCL 2 via $ORIGIN, and a system copy on LD_LIBRARY_PATH would shadow
 # them with a mismatched version.
 #
-# Build context is the repository root. Reactant, HTTP, Prometheus, and gRPCClient are registry
-# deps; gRPCServer resolves from the `main` branch of github.com/JuliaIO/gRPCServer.jl
-# via the workspace [sources]. NOTE: Manifest.toml is gitignored, so `COPY Manifest.toml` needs a
+# Build context is the repository root. Reactant, HTTP, Prometheus, gRPCServer, and gRPCClient
+# are registry deps. NOTE: Manifest.toml is gitignored, so `COPY Manifest.toml` needs a
 # locally generated Manifest in the build context (run `REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1
 # julia --project=. -e 'using Pkg; Pkg.instantiate()'` first); a fresh clone has none.
 #
@@ -75,9 +74,9 @@ COPY --from=cudalibs /usr/local/cuda/lib64/stubs/libcuda.so /opt/cuda-stub/libcu
 
 WORKDIR /opt/reactantserver
 
-# Workspace root environment and the member packages. gRPCServer resolves from its
-# main branch on GitHub via the shared Manifest.toml; the remaining forks resolve from
-# the registries. The worker is built on the workspace root; the entrypoint then runs on the
+# Workspace root environment and the member packages; all dependencies, including gRPCServer,
+# resolve from the registries into the shared Manifest.toml. The worker is built on the
+# workspace root; the entrypoint then runs on the
 # ReactantServer member project. .dockerignore drops the package test trees (e.g. the large e2e
 # weights) from the packages/ copy.
 COPY Project.toml Manifest.toml ./

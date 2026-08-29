@@ -22,7 +22,6 @@ gRPCServer = "608c6337-0d7d-447f-bb69-0f5674ee3959"
 ReactantServer = {path = "../../ReactantServer"}
 ReactantServerCore = {path = "../../ReactantServerCore"}
 ReactantServerExport = {path = ".."}
-gRPCServer = {url = "https://github.com/JuliaIO/gRPCServer.jl", rev = "main"}
 
 [compat]
 gRPCClient = "1.1.0"
