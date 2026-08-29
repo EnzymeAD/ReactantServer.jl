@@ -194,6 +194,22 @@ than being held back, so the oldest request is always served within a bounded nu
 lone request that already fills the dispatch passes its inputs straight through with no
 concatenation or padding.
 
+### Requests larger than every compiled size
+
+A request whose batch exceeds the largest compiled size for its shape variant is split before it
+is queued. The inputs are cut into pieces of at most the largest compiled size, the pieces are
+submitted as separate requests so they coalesce with each other and with other traffic exactly as
+if the client had sent them separately, and the outputs are joined back along each output's batch
+axis and post-processed once. The whole request's deadline rides along on every piece. This is
+coalescing run in the other direction: a client that batches 32 against a bundle compiled for
+`[1]` gets an answer rather than an error.
+
+Splitting is only sound when the bundle's `preprocess` hook keeps one client row per executable
+row (a hook that changes the row count, cropping per image say, breaks the correspondence) and
+every executable output carries a batch axis to join along. A request that cannot be split runs
+whole and fails at execution with the shape error, as before. This mechanism is separate from
+`max_batch_size`, which caps how many rows coalesce into one dispatch and never splits a request.
+
 ### Why coalescing is the throughput lever
 
 Packing many requests into one execution amortizes the fixed per-launch overhead and, for a model

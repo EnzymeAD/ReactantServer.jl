@@ -41,8 +41,10 @@ makedocs(;
     # this Documenter, and there are none left by the time this is committed;
     # the category below is the safety valve while a docstring is being edited.
     warnonly = [:missing_docs],
-    # Only the pages listed below are built: the legacy manual/api/design pages
-    # from the pre-Vitepress docs remain in the tree but are not processed.
+    # Only the pages listed below are built; nothing else under docs/src is processed.
+    # The design pages (architecture, philosophy) are the pre-Vitepress design docs, kept
+    # alive and linked from the README; the legacy manual/ and api/ trees were superseded
+    # by the flat guide pages and deleted.
     pagesonly = true,
     repo = Documenter.Remotes.GitHub("EnzymeAD", "ReactantServer.jl"),
     format = Documenter.HTML(
@@ -71,6 +73,8 @@ makedocs(;
         "Object Detection" => "object_detection.md",
         "Transformer Text Models" => "transformers.md",
         "Deployment" => "deployment.md",
+        "Architecture" => "design/architecture.md",
+        "Philosophy" => "design/philosophy.md",
         "API" => "api.md",
     ],
 )

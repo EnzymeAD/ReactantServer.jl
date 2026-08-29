@@ -3,6 +3,8 @@
 # once, and concurrently-held slots must occupy disjoint byte ranges. This is the property the
 # old fixed-index/lockstep scheme lacked across independent top-level callers.
 
+using InterProcessCommunication: SharedMemory
+
 @testset "buffer pool slot allocator" begin
     @testset "construction + geometry" begin
         p = ReactantServerCore.BufferPool(4096; n_slots = 4, use_shm = false)
@@ -242,5 +244,55 @@
         @test size(m) == (3, 3) && m isa Matrix{Float64}
         ReactantServerCore.release_slot!(s2)
         ReactantServerCore.release_slot!(s)
+    end
+
+    @testset "shm keys fit the POSIX name budget on every platform" begin
+        # macOS (XNU) rejects shm names longer than 31 bytes after the leading slash; Linux allows
+        # 255, so an overlong key only fails on macOS. Every key we mint must fit the tighter
+        # budget regardless of the semantic pool name handed to the pool.
+        names = (
+            "reactant_server_pool", "reactant_server_client_pool",
+            "a", "abcde", "abcdef",
+            repeat("long_name_", 20),
+            "spaced name/with/slashes and:colons",
+        )
+        for name in names
+            key = ReactantServerCore.shm_key(name)
+            @test startswith(key, "/shm-")
+            @test length(key) <= 31
+            @test !occursin('/', key[2:end])            # only the leading slash survives
+        end
+        # Distinct names in one process map to distinct keys, and the mapping is stable for the
+        # process's lifetime (the per-process token does not move under a live pool).
+        @test ReactantServerCore.shm_key("reactant_server_pool") !=
+            ReactantServerCore.shm_key("reactant_server_client_pool")
+        @test ReactantServerCore.shm_key("x") == ReactantServerCore.shm_key("x")
+    end
+
+    @testset "shm-backed pool round-trips through a short key" begin
+        # End to end on the POSIX path: the minted key must be creatable by shm_open (the
+        # BufferPool constructor) under the 31-byte budget the key was designed for, the region
+        # name clients register is the key without its leading slash, and a second mapping of the
+        # same key (what the server does for registration and IsSameIPCNamespace) observes
+        # writes from the first.
+        p = ReactantServerCore.BufferPool(4096; n_slots = 4, use_shm = true)
+        try
+            @test ReactantServerCore.is_shm_backed(p)
+            region = ReactantServerCore.pool_region_name(p)
+            @test length(region) + 1 <= 31                       # + leading slash
+            @test !occursin('/', region)
+            s = ReactantServerCore.acquire_slot!(p)
+            v = ReactantServerCore.pool_view(s, UInt8, 8)
+            v .= 0x5a
+            peer = SharedMemory("/" * region; readonly = true)
+            GC.@preserve peer begin
+                got = unsafe_wrap(Vector{UInt8}, convert(Ptr{UInt8}, pointer(peer)), 8)
+                @test all(==(0x5a), got)
+            end
+            finalize(peer)
+            ReactantServerCore.release_slot!(s)
+        finally
+            rm(p.backing)
+        end
     end
 end

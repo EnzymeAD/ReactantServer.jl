@@ -7,14 +7,31 @@
 # and a finalizer closure keeps the SharedMemory alive for the lifetime of the Memory.
 
 # Random, per-process suffix for every SHM key produced by `shm_key`. Combining the PID with
-# 64 bits of entropy makes collisions vanishingly unlikely even when two processes share an
+# 32 bits of entropy makes collisions vanishingly unlikely even when two processes share an
 # IPC namespace, while keeping the PID prefix so orphans in /dev/shm can be attributed to a
 # process during ops triage. Set by `_init_shm_naming!` from the module `__init__`.
 const _naming_token = Ref{String}("")
 
-_init_shm_naming!() = (_naming_token[] = string(getpid(), "-", bytes2hex(rand(UInt8, 8))); nothing)
+_init_shm_naming!() = (_naming_token[] = string(getpid(), "-", bytes2hex(rand(UInt8, 4))); nothing)
 
-shm_key(name::AbstractString) = "/shm-$(name)-$(_naming_token[])"
+# macOS (XNU) rejects POSIX shared-memory names longer than PSHMNAMLEN (31) bytes after the
+# leading slash, far below Linux's 255, so keys are minted against that budget on every platform
+# rather than only where it is enforced. Layout: /shm-<pid>-<32-bit token>-<name fragment>, where
+# a long semantic name folds to a sanitized 5-byte prefix plus a 16-bit hash of the full name, so
+# distinct pools in one process stay disjoint without spending name bytes. With a 7-digit PID
+# (Linux's pid_max ceiling) the whole key is at most 31 bytes including the slash.
+function _shm_name_fragment(name::String)
+    length(name) <= 5 && return name
+    return string(name[1:5], string(hash(name) & 0xffff; base = 16, pad = 4))
+end
+
+function shm_key(name::AbstractString)
+    s = replace(String(name), r"[^A-Za-z0-9_.-]" => '_')
+    key = string("/shm-", _naming_token[], "-", _shm_name_fragment(s))
+    length(key) <= 31 ||
+        error("shm_key: 31-byte name budget exceeded (PID longer than 7 digits?)")
+    return key
+end
 
 WrappedFArray(shm::SharedMemory, ::Type{T}, shape) where {T} = WrappedArray(shm, T, shape...)
 

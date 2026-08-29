@@ -1,6 +1,6 @@
 name = "ReactantServerCore"
 uuid = "387a5f05-f7b4-4d57-bca9-cd3358e52bdc"
-version = "1.0.0"
+version = "1.1.0"
 authors = ["Carroll Vance <cvance@medicalmetrics.com>"]
 
 [deps]
@@ -24,6 +24,7 @@ julia = "1.12"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+InterProcessCommunication = "a7427343-1d15-5490-a218-bfcb7db836a2"
 
 [targets]
-test = ["Test"]
+test = ["Test", "InterProcessCommunication"]

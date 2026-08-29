@@ -1,7 +1,7 @@
 # Contributing
 
 Developer notes for working on ReactantServer.jl. For using the server, start with
-[Getting Started](docs/src/manual/getting_started.md).
+the [Tutorial](docs/src/tutorial.md).
 
 After cloning, instantiate the workspace (dependencies resolve from the package registries,
 plus the tree-internal path sources):
