@@ -51,6 +51,11 @@ is the per-request timeout in seconds. Run the snippet under the client project 
 server you have started, for example a worker on the e2e `scale4` bundle; the
 [Tutorial](tutorial.md) walks through the full setup end to end.
 
+The one-shot path encodes tensor data element by element as typed contents, so it emits a
+one-time performance warning (once per session) and suits small, occasional requests. For
+datasets, use the IO-driven drivers below: they stage through the buffer pool and ship raw
+bytes on every transport.
+
 ## Batched inference over a dataset
 
 For many items, implement [`AbstractInferenceIO`](@ref) and use [`infer_async`](@ref)
@@ -59,7 +64,11 @@ through a shared staging pool, an `InferenceBufferPool` wrapping
 `ReactantServerCore.BufferPool`. The first call to each server probes it with the
 `IsSameIPCNamespace` RPC: if the server confirms it shares the client's IPC namespace, inputs
 travel over the system shared-memory data plane with zero extra copies on the wire; otherwise,
-or if the server does not implement the probe, the driver uses inline transport.
+or if the server does not implement the probe, the driver uses inline transport. Inline sends
+one raw little-endian byte blob per input (`raw_input_contents`) that aliases the staging
+pool directly, so no typed per-element encoding happens on the client either; what shared
+memory still buys is skipping the transfer itself, since the server reads the registered
+region instead of receiving the payload.
 
 The `shared_memory` keyword on [`KServeModel`](@ref) controls this choice:
 

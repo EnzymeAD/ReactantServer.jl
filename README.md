@@ -31,7 +31,8 @@ and what each one optimizes for.
   clients are unchanged and you never reason about row-major order. → [Tutorial](https://enzymead.github.io/ReactantServer.jl/dev/tutorial/)
 - **Elegant configuration.** One typed YAML node file (with environment-variable overrides)
   describes a machine; manifests declare tensors with an einsum-style named-axis notation. → [Node Configuration](https://enzymead.github.io/ReactantServer.jl/dev/node_config/), [Bundles & model.jl](https://enzymead.github.io/ReactantServer.jl/dev/bundles/)
-- **Standard inference protocol.** KServe V2 over gRPC. Tensor data travels inline or through the
+- **Standard inference protocol.** KServe V2 over gRPC. Tensor data travels inline
+  (`raw_input_contents` / `raw_output_contents`) or through the
   Triton-compatible system-shared-memory extension for zero-copy local clients. → [Client Usage](https://enzymead.github.io/ReactantServer.jl/dev/client/)
 - **One process, single or multi-GPU.** A node supervisor runs one worker per visible GPU: a
   single worker serves the public ports directly; two or more get an embedded gateway behind one

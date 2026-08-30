@@ -163,13 +163,24 @@ end
         feats .= reshape(collect(Float32, 1:12), 4, 3)
         mask .= Int32[7, 8, 9]
 
-        # Inline materialization builds the same wire tensors the manual InferInput path would.
-        wire = ReactantServerClient._materialize_inputs(inputs, m, p)
+        # Inline materialization sends raw bytes: no typed contents, one blob per input that
+        # aliases the pool, parallel to the wire tensors.
+        wire, raws = ReactantServerClient._materialize_inputs(inputs, m, p)
         @test wire[1].name == "INPUT__0" && wire[1].datatype == "FP32"
         @test wire[1].shape == [3, 4]                             # reversed col-major -> row-major
-        @test wire[1].contents.fp32_contents == collect(Float32, 1:12)
+        @test wire[1].contents === nothing                        # payload rides in raw_input_contents
         @test wire[2].datatype == "INT32"
-        @test wire[2].contents.int_contents == Int32[7, 8, 9]
+        @test length(raws) == length(wire)
+        @test reinterpret(Float32, raws[1]) == collect(Float32, 1:12)
+        @test reinterpret(Int32, raws[2]) == Int32[7, 8, 9]
+        @test pointer(raws[1]) == pointer(feats)                   # zero-copy: blob aliases the pool
+
+        # FP16 has no typed-contents constructor; the raw path covers it for free.
+        f16 = scratch(s, "F16", (2,), Float16)
+        pool_view(f16) .= Float16[3, 4]
+        w16, r16 = ReactantServerClient._materialize_inputs((f16,), m, p)
+        @test w16[1].datatype == "FP16" && w16[1].contents === nothing
+        @test reinterpret(Float16, r16[1]) == Float16[3, 4]
         release_slot!(s)
     end
 
@@ -179,7 +190,8 @@ end
             m = KServeModel("grpc://h:1", "x"; max_batch_size = 100000)
             s = acquire_slot!(p, 2)
             inputs = scratch(s, ["A" => ((4,), Float32), "B" => ((2,), Int32)])
-            wire = ReactantServerClient._materialize_inputs(inputs, m, p)
+            wire, raws = ReactantServerClient._materialize_inputs(inputs, m, p)
+            @test isempty(raws)                                  # SHM: payload stays in the region
             pa = wire[1].parameters
             @test pa["shared_memory_region"].parameter_choice[] == ReactantServerClient.pool_name(p)
             @test pa["shared_memory_offset"].parameter_choice[] == s.offset
@@ -218,6 +230,23 @@ end
         b = InferInput("MASK", [1, 4], collect(UInt8, 1:4))
         @test b.datatype == "UINT8"
         @test b.contents.uint_contents == collect(UInt8, 1:4)
+    end
+
+    @testset "one-shot infer_sync warns about typed contents" begin
+        # The one-shot path still encodes typed contents element by element; it warns once per
+        # session (maxlog = 1). This must stay the suite's only one-shot infer_sync call, or a
+        # maxlog-suppressed earlier call swallows the record before it gets here.
+        m = KServeModel(
+            "grpc://127.0.0.1:1", "x";
+            retry = ReactantServerClient.RetryPolicy(enabled = false), deadline = 1.0
+        )
+        logs, _ = Test.collect_test_logs() do
+            try
+                infer_sync(m, [InferInput("INPUT__0", Float32[1, 2, 3, 4])])
+            catch
+            end                                    # nothing listens on port 1; the RPC just fails
+        end
+        @test any(l -> occursin("typed contents", l.message), logs)
     end
 
     @testset "InferOutput decodes a response" begin

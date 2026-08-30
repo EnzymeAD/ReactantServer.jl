@@ -26,7 +26,9 @@
 
 # A deferred descriptor produced by infer_encode_chunk! (directly, or by `scratch`). The
 # SHM-vs-inline choice is resolved by `materialize_input` at gRPC-request time, based on whether the
-# pool that owns the slot is SHM-backed.
+# pool that owns the slot is SHM-backed: SHM references the registered region by offset, while
+# inline emits one raw little-endian byte blob per input into `raw_input_contents` (no typed
+# `InferTensorContents`, no per-element encoding).
 struct PoolInferInput
     name::String
     subslot::PoolSlot
@@ -107,6 +109,25 @@ item_output_bytes(io::AbstractInferenceIO) =
 
 # ---- Materialize PoolInferInput descriptors against a model + pool. ----
 
+"""
+    materialize_input(d::PoolInferInput, model, pool) -> (tensor, raw)
+
+Resolve one deferred descriptor against the pool: the wire tensor plus its payload. On an
+SHM-backed pool the tensor carries the three `shared_memory_*` parameters and `raw` is empty
+(`UInt8[]`); the payload stays in the registered region. On an inline pool the tensor carries
+only `name`, `datatype`, and reversed row-major `shape` (no `contents` field), and `raw` is a
+`Vector{UInt8}` aliasing the pool slot (zero-copy `unsafe_wrap`). `raw` is parallel to the
+tensor: `_materialize_inputs` lines it up with `inputs` so `raw_input_contents[i]` corresponds
+to `inputs[i]`. The server codec rejects a request whose `raw_input_contents` is non-empty
+but does not match the input count; that all-or-nothing property holds because
+`is_shm_backed` is a property of the pool, so every input in a chunk takes the same branch.
+
+The raw blob is little-endian by specification while pool memory is host-native; the two agree
+on every supported (little-endian) target. The driven path covers numeric `TritonType` values
+only, so no `BYTES` dtype needs per-element length prefixes. Callers must keep the pool rooted
+while the blob is alive (see `_run_chunk`'s `GC.@preserve`): the alias does not root the
+pool's backing on its own, and it must not outlive the slot it points into.
+"""
 function materialize_input(
         d::PoolInferInput,
         model::AbstractInferenceModel,
@@ -115,29 +136,48 @@ function materialize_input(
     n_bytes = sizeof(d.dtype) * prod(d.shape)
     return if is_shm_backed(pool)
         var"ModelInferRequest.InferInputTensor"(
-            name = d.name,
-            datatype = KSERVE_OUTPUT_DTYPE_TABLE_REVERSE[d.dtype],
-            shape = reverse(d.shape),   # Julia column-major -> network row-major
-            parameters = Dict(
-                "shared_memory_region" =>
+                name = d.name,
+                datatype = KSERVE_OUTPUT_DTYPE_TABLE_REVERSE[d.dtype],
+                shape = reverse(d.shape),   # Julia column-major -> network row-major
+                parameters = Dict(
+                    "shared_memory_region" =>
                     InferParameter(parameter_choice = OneOf(:string_param, pool_name(pool))),
-                "shared_memory_offset" => InferParameter(
-                    parameter_choice = OneOf(:int64_param, Int64(d.subslot.offset)),
+                    "shared_memory_offset" => InferParameter(
+                        parameter_choice = OneOf(:int64_param, Int64(d.subslot.offset)),
+                    ),
+                    "shared_memory_byte_size" => InferParameter(
+                        parameter_choice = OneOf(:int64_param, Int64(n_bytes)),
+                    ),
                 ),
-                "shared_memory_byte_size" => InferParameter(
-                    parameter_choice = OneOf(:int64_param, Int64(n_bytes)),
-                ),
-            ),
-        )
+            ), UInt8[]
     else
-        n_elems = prod(d.shape)
-        view = pool_view(d.subslot, d.dtype, n_elems)
-        InferInput(d.name, d.shape, view)
+        # No typed contents: the payload travels in raw_input_contents as one byte blob per
+        # input, aliased straight off the pool (zero-copy; the caller keeps the pool rooted
+        # until the request is encoded and the response decoded).
+        var"ModelInferRequest.InferInputTensor"(
+                name = d.name,
+                datatype = KSERVE_OUTPUT_DTYPE_TABLE_REVERSE[d.dtype],
+                shape = reverse(d.shape),   # Julia column-major -> network row-major
+            ), pool_view(d.subslot, UInt8, n_bytes)
     end
 end
 
+# Materialize descriptors into the wire tensors plus, for inline pools, the parallel
+# raw_input_contents byte blobs. On the SHM branch every payload travels through the registered
+# region, so `raws` stays empty (not one empty blob per input): the server codec rejects a
+# request whose raw_input_contents is non-empty but does not match the input count, and that
+# all-or-nothing property holds because `is_shm_backed` is a property of the pool, not of an
+# individual input.
 function _materialize_inputs(inputs, model, pool::InferenceBufferPool)
-    return [materialize_input(d, model, pool) for d in inputs]
+    tensors = var"ModelInferRequest.InferInputTensor"[]
+    raws = Vector{Vector{UInt8}}()
+    inline = !is_shm_backed(pool)
+    for d in inputs
+        tensor, raw = materialize_input(d, model, pool)
+        push!(tensors, tensor)
+        inline && push!(raws, raw)
+    end
+    return tensors, raws
 end
 
 # `infer_encode_chunk!` may return a single `PoolInferInput` (e.g. straight from the scalar
@@ -347,7 +387,11 @@ end
 Synchronous inference. The [`AbstractInferenceIO`](@ref) form drives `io` one chunk at a time
 (no concurrency). The second form is a one-shot call: `network_inputs` is a vector of wire
 tensors built with [`InferInput`](@ref), sent inline in a single `ModelInferRequest`, and the
-decoded `ModelInferResponse` is returned for reading with [`InferOutput`](@ref).
+decoded `ModelInferResponse` is returned for reading with [`InferOutput`](@ref). The one-shot
+form encodes tensor data element by element as typed contents, so it emits a one-time
+performance warning (once per session) steering large or repeated workloads to the
+`AbstractInferenceIO` drivers, which stage through the buffer pool and ship raw bytes on every
+transport.
 """
 function infer_sync(m::AbstractInferenceModel, io::AbstractInferenceIO)
     return _infer_pool_driven(m, io; force_serial = true)
@@ -490,19 +534,25 @@ function _run_chunk(m, io, pool, fill_lock, r, slot)
         # both through one registered region. Outputs are read back before the slot is released.
         requested, out_subslots = _build_requested_outputs(output_specs(io), slot, r, pool)
         # Materialize inputs once; only the per-attempt deadline (client timeout + in-body budget)
-        # changes across retries, and SHM-backed inputs stay valid until the slot is released below.
-        materialized = _materialize_inputs(inputs, m, pool)
-        response = _send_with_shm_recovery(m, pool) do
-            _infer_with_retry(m) do budget_s
-                grpc_sync_request(
-                    grpc_infer_client(m, budget_s),
-                    ModelInferRequest(
-                        model_name = model_name(m),
-                        inputs = materialized,
-                        outputs = requested,
-                        parameters = _request_deadline_params(budget_s),
-                    ),
-                )
+        # changes across retries, and the staged bytes stay valid until the slot is released below.
+        # On inline pools the raw blobs alias the pool's backing (unsafe_wrap does not root it), so
+        # GC.@preserve keeps the backing alive from encoding through response decode; the slot is
+        # released only in the `finally` after this send returns.
+        materialized, raws = _materialize_inputs(inputs, m, pool)
+        response = GC.@preserve pool begin
+            _send_with_shm_recovery(m, pool) do
+                _infer_with_retry(m) do budget_s
+                    grpc_sync_request(
+                        grpc_infer_client(m, budget_s),
+                        ModelInferRequest(
+                            model_name = model_name(m),
+                            inputs = materialized,
+                            outputs = requested,
+                            parameters = _request_deadline_params(budget_s),
+                            raw_input_contents = raws,
+                        ),
+                    )
+                end
             end
         end
         infer_decode_chunk!(io, r, _rehydrate_response(response, out_subslots))
@@ -562,6 +612,10 @@ function _drive_pool_inference(
 end
 
 function infer_sync(m::AbstractInferenceModel, network_inputs)
+    @warn "infer_sync(model, inputs) sends tensor data as typed contents, encoded element by " *
+        "element, which is slow for large or repeated requests; implement an AbstractInferenceIO " *
+        "and use infer_async or infer_sync(model, io) to stage through the buffer pool and send " *
+        "raw bytes" maxlog = 1
     return _infer_with_retry(m) do budget_s
         grpc_sync_request(
             grpc_infer_client(m, budget_s),
@@ -678,8 +732,10 @@ end
 """
     InferInput(name, array) -> ModelInferRequest.InferInputTensor
 
-Build a wire input tensor named `name` from a Julia `array`, shipping the bytes inline. You pass
-the array in its natural Julia column-major shape `(W, H, …, N)`; the client reverses it to the
+Build a wire input tensor named `name` from a Julia `array`, shipping the bytes inline as
+typed contents, encoded element by element (the one-shot path warns once about this cost; see
+[`infer_sync`](@ref)). You pass the array in its natural Julia column-major shape
+`(W, H, …, N)`; the client reverses it to the
 network's row-major `(N, …, H, W)` internally (the bytes are unchanged). Pass a vector of these to
 the one-shot [`infer_sync`](@ref)`(model, inputs)`. Variants taking an explicit Julia column-major
 `shape` and a typed `contents` vector are also provided.
