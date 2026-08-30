@@ -68,7 +68,12 @@ config.
   only `model_name` (field 1) and `id` (field 3). Under `lpt_packing` a second partial decode
   reads one named tensor's shape to size the request in items (see the fill quantum below).
   ProtoBuf seeks past everything else, including every tensor payload; shapes precede the data on
-  the wire, so neither decode touches it.
+  the wire, so neither decode touches it. Requests from this repo's client make that property
+  stronger: their inputs ship as `raw_input_contents`, so every `InferInputTensor` descriptor
+  stays contiguous in field 5 and the whole payload moves to field 7, letting a prefix scan read
+  every input's name, datatype, and shape. That is a property of these requests, not a protocol
+  guarantee: a Triton client may still inline typed contents, and the gateway keeps handling
+  that.
 - **SHM broadcast:** `SystemSharedMemoryRegister` / `Unregister` are fanned out to every worker.
   POSIX SHM regions are host-local; every worker attaches via `shm_open` independently. Register
   succeeds only if all workers succeed (it rolls back partial success); unregister succeeds if
