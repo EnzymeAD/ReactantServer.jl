@@ -2,6 +2,7 @@ using Test
 using ReactantServerClient
 import ReactantServerCore
 using ReactantServerClient: inference
+using ProtoBuf
 using ProtoBuf: OneOf
 
 # Minimal IO for exercising the driver helpers without a server. `specs` drives output_specs.
@@ -181,6 +182,51 @@ end
         w16, r16 = ReactantServerClient._materialize_inputs((f16,), m, p)
         @test w16[1].datatype == "FP16" && w16[1].contents === nothing
         @test reinterpret(Float16, r16[1]) == Float16[3, 4]
+        release_slot!(s)
+    end
+
+    @testset "inline raw request round-trips through the wire" begin
+        # The full chain a worker sees for an inline chunk: the client materializes raw blobs
+        # aliasing the pool, protobuf carries them as raw_input_contents (no typed contents),
+        # and the server codec rebuilds Julia arrays that equal what was staged, column-major
+        # shape included. FP16 rides along: it has no typed constructor, raw is its only path.
+        p = InferenceBufferPool(4096; n_slots = 4, use_shm = false)
+        m = KServeModel("grpc://h:1", "x"; max_batch_size = 100000)
+        s = acquire_slot!(p, 2)
+        inputs = scratch(
+            s, [
+                "INPUT__0" => ((4, 3), Float32),
+                "MASK" => ((3,), Int32),
+                "F16" => ((2,), Float16),
+            ]
+        )
+        feats, mask, f16 = pool_view(inputs...)
+        feats .= reshape(collect(Float32, 1:12), 4, 3)
+        mask .= Int32[7, 8, 9]
+        f16 .= Float16[3, 4]
+
+        tensors, raws = ReactantServerClient._materialize_inputs(inputs, m, p)
+        req = inference.ModelInferRequest(;
+            model_name = "x",
+            inputs = tensors,
+            outputs = inference.var"ModelInferRequest.InferRequestedOutputTensor"[],
+            parameters = Dict{String, inference.InferParameter}(),
+            raw_input_contents = raws,
+        )
+        io = IOBuffer()
+        ProtoBuf.encode(ProtoBuf.ProtoEncoder(io), req)             # client -> wire
+        msg = ProtoBuf.decode(
+            ProtoBuf.ProtoDecoder(IOBuffer(take!(io))), inference.ModelInferRequest
+        )                                                          # wire -> worker message
+        @test all(t -> t.contents === nothing, msg.inputs)          # payload never typed
+        @test length(msg.raw_input_contents) == length(msg.inputs)
+
+        dec = ReactantServerCore.decode_infer_request(msg)          # worker codec
+        got = Dict(t.name => t.data for t in dec.request.inputs)
+        @test got["INPUT__0"] == reshape(collect(Float32, 1:12), 4, 3)
+        @test size(got["INPUT__0"]) == (4, 3)                        # col-major shape preserved
+        @test got["MASK"] == Int32[7, 8, 9]
+        @test got["F16"] == Float16[3, 4]
         release_slot!(s)
     end
 
