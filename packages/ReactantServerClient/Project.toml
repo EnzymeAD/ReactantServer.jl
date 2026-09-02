@@ -1,6 +1,6 @@
 name = "ReactantServerClient"
 uuid = "df172679-9d9b-4a02-a92c-27cb5f9e1c5c"
-version = "1.0.0"
+version = "1.0.1"
 authors = ["Carroll Vance <cvance@medicalmetrics.com>"]
 
 [deps]
