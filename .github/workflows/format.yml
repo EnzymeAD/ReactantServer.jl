@@ -31,4 +31,4 @@ jobs:
         with:
           # Keep in sync with the local `runic` CLI:
           #   julia -e 'using Pkg; Pkg.Apps.add("Runic")'
-          version: '1.7'
+          version: '1.10'

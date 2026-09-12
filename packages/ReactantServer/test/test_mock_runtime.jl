@@ -196,7 +196,7 @@ end
     # Four single-row requests coalesced into one dispatch: one dispatch, four requests, four ROWS.
     qrs = [
         let req = ReactantServer.InferRequest("bscale", ["y"], [ReactantServer.NamedTensor("x", reshape(Float32[k, k], 2, 1))])
-                ReactantServer.QueuedRequest(req, req.inputs, 0.0, Channel{Any}(1))
+            ReactantServer.QueuedRequest(req, req.inputs, 0.0, Channel{Any}(1))
         end for k in 1:4
     ]
     append!(sched.registry.by_name["bscale"].sched.queue, qrs)
@@ -224,7 +224,7 @@ end
     sched = _batched_scheduler("bscale", [1, 4])
     qrs = [
         let req = ReactantServer.InferRequest("bscale", ["y"], [ReactantServer.NamedTensor("x", reshape(Float32[k, k], 2, 1))])
-                ReactantServer.QueuedRequest(req, req.inputs, 0.0, Channel{Any}(1))
+            ReactantServer.QueuedRequest(req, req.inputs, 0.0, Channel{Any}(1))
         end for k in 1:4
     ]
     for qr in qrs

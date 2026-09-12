@@ -1478,21 +1478,21 @@ function scheduler_metrics(s::Scheduler)
         now = time()
         return Dict(
             entry.name => (
-                    dispatch_count = entry.sched.dispatch_count,
-                    requests_served = entry.sched.requests_served,
-                    rows_served = entry.sched.rows_served,
-                    total_compute = entry.sched.total_compute,
-                    recent_compute_ema = _decay_ema!(entry.sched, s.cfg.ema_halflife_seconds, now),
-                    queue_depth = length(entry.sched.queue),
-                    wait_p50 = _percentile(entry.sched.wait_samples, 0.5),
-                    wait_p99 = _percentile(entry.sched.wait_samples, 0.99),
-                    batch_size_hist = copy(entry.sched.batch_size_hist),
-                    max_batch_size = _effective_max_batch(entry),
-                    state = entry.executable.state,
-                    pinned = is_device_pinned(entry.executable),
-                    resident = entry.executable.weights !== nothing,
-                    weight_nbytes = entry.executable.nbytes,
-                ) for entry in values(s.registry.by_name) if entry.sched !== nothing && entry.executable !== nothing
+                dispatch_count = entry.sched.dispatch_count,
+                requests_served = entry.sched.requests_served,
+                rows_served = entry.sched.rows_served,
+                total_compute = entry.sched.total_compute,
+                recent_compute_ema = _decay_ema!(entry.sched, s.cfg.ema_halflife_seconds, now),
+                queue_depth = length(entry.sched.queue),
+                wait_p50 = _percentile(entry.sched.wait_samples, 0.5),
+                wait_p99 = _percentile(entry.sched.wait_samples, 0.99),
+                batch_size_hist = copy(entry.sched.batch_size_hist),
+                max_batch_size = _effective_max_batch(entry),
+                state = entry.executable.state,
+                pinned = is_device_pinned(entry.executable),
+                resident = entry.executable.weights !== nothing,
+                weight_nbytes = entry.executable.nbytes,
+            ) for entry in values(s.registry.by_name) if entry.sched !== nothing && entry.executable !== nothing
         )
     end
 end
