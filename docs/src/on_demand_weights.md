@@ -70,6 +70,18 @@ one-time startup work and doubles as an execution smoke test; the resolved budge
 logged. Pinned weights or scratch large enough to leave no room are logged as a warning,
 since no sizing can fix that.
 
+The measurement is exact per model when the backend can reset the allocator's high-water mark,
+which the Reactant backend can on a CUDA device (through `Reactant.XLA.clear_memory_stats!`):
+before each model the peak is reset, so `peak - in_use_before` is that model's own transient, and
+nothing that happened earlier, in particular XLA's autotuning scratch during compile (many times a
+model's real run scratch), can inflate it. Pinned models are measured too. A model that cannot be
+run at startup falls back to the compiler's static scratch accounting
+(`Reactant.XLA.compiled_memory_stats`), padded. The same measurement runs when the directory
+watcher loads a model into a running worker, and the budget is re-resolved on the spot, so neither
+a fresh autotune nor a hot-loaded model requires a restart to be sized correctly. Without a
+resettable peak (a Reactant without the binding) the probe falls back to an ordering-based estimate
+that is exact for a clean session but inherits whatever moved the peak before it ran.
+
 ## Pinning hot models
 
 A model that must never pay the on-demand transfer cost can be pinned to stay GPU-resident
@@ -226,8 +238,9 @@ The worker also exports the BFC allocator's live numbers as Prometheus gauges (a
 through the gateway's `/metrics`): `worker_device_memory_in_use_bytes`,
 `worker_device_memory_free_bytes`, `worker_device_memory_peak_in_use_bytes` (the session
 high-water, your empirical scratch + resident ceiling), and
-`worker_device_memory_pool_bytes`. The peak gauge is what the startup auto-sizing measured;
-a rising peak over a long uptime is the signal to revisit the budget. Note the GPU BFC
+`worker_device_memory_pool_bytes`. The peak gauge is reset once compilation finishes and again
+before each probed model, so after startup it tracks execution only; a rising peak over a long
+uptime is the signal to revisit the budget. Note the GPU BFC
 allocator does not report a largest-contiguous-free-block figure, so fragmentation is not
 directly observable here; in practice it surfaces as an allocation failing despite ample
 reported free bytes, which is what compaction (above) addresses.

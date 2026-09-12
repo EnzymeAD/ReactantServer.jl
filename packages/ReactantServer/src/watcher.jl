@@ -26,10 +26,13 @@ const DirId = Tuple{UInt64, UInt64}
 _dir_id(dir::AbstractString) = (st = stat(dir); (UInt64(st.device), UInt64(st.inode)))
 
 # The files that actually define a bundle (and thus affect compilation/serving). Other files in the
-# directory are ignored so unrelated touches do not trigger a reload.
+# directory are ignored so unrelated touches do not trigger a reload; in particular everything the
+# server itself writes under `.cache/` (the serialized-executable cache) is invisible here, so a
+# cache write can never cause the model that produced it to be reloaded. Multi-shape bundles carry
+# per-variant modules (`model.v{i}.b{N}.mlir`), which count as bundle files too.
 _is_bundle_file(f::AbstractString) =
     f == "manifest.yaml" || f == "weights.safetensors" || f == "model.jl" ||
-    occursin(r"^model(\.b\d+)?\.mlir$", f)
+    occursin(r"^model(\.v\d+)?(\.b\d+)?\.mlir$", f)
 
 function bundle_signature(dir::AbstractString)::BundleSig
     sig = Tuple{String, Float64, Int}[]
@@ -139,7 +142,8 @@ function _apply_change!(
                 state = _resolve_residency(w.cfg, name, w.on_demand)
                 load_model!(
                     w.scheduler, w.backend, w.pool, entry;
-                    state = state, on_demand = w.on_demand, store = w.store
+                    state = state, on_demand = w.on_demand, store = w.store,
+                    executable_cache = w.cfg.runtime.executable_cache
                 )
             end
             w.seen[name] = desired

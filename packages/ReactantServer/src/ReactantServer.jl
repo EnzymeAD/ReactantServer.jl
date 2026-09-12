@@ -56,6 +56,8 @@ include("runtime/weights.jl")
 include("runtime/model.jl")
 include("runtime/weight_cache.jl")
 include("runtime/execution.jl")
+# Per-bundle serialized-executable cache (backend-agnostic policy: layout, hashes, invalidation).
+include("runtime/executable_cache.jl")
 include("runtime/reactant_backend.jl")
 # Load-time TF32 stripping for portable artifacts; uses the backend's _RMLIR/_RXLA aliases.
 include("runtime/tf32.jl")
