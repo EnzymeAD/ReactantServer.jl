@@ -72,6 +72,8 @@ global:
     preallocate: true          # claim the pool up front (GPU only)
     allow_cpu_fallback: false
     numerics: auto             # f32 | auto | tf32; see below
+    engine: auto               # auto | reactant | pjrt_capi; XLA driver on CUDA workers, see below
+    executable_cache: true     # cache compiled programs under each bundle's .cache/ (pjrt_capi only)
     weight_cache_fraction: 1.0 # arena fraction for all weights (pinned + on-demand); 0 disables
     weight_cache_wiggle_fraction: 0.1  # arena fraction kept free; drives startup auto-sizing
     autotune: true             # XLA GPU compile autotuner; false = default kernels, no trials
@@ -113,6 +115,25 @@ startup fails on hardware that cannot run TF32, so a mixed fleet cannot silently
 numerics. On CUDA workers a startup probe logs whether TF32 arithmetic is actually in use and,
 under `f32`, proves the pin bit-exactly; the per-model outcome (ops pinned, algorithms rewritten
 or stripped) is recorded in each "model loaded" log line.
+
+`runtime.engine` selects what drives XLA on a CUDA worker. `auto` (the default) uses the PJRT C API
+backend, which drives the PJRT function table that Reactant_jll's library exports directly, and
+falls back to Reactant's C++ shims when the installed Reactant's generated bindings do not match
+its library; `pjrt_capi` requires the C API backend and fails startup otherwise; `reactant` always
+uses the shims. Both compile the same program with the same options and produce byte-identical
+outputs. Only the C API backend can serialize compiled programs and reset the allocator's
+high-water mark, so it alone serves `runtime.executable_cache` and gives the startup memory probe
+its exact per-model measurement. CPU workers always run on the Reactant backend.
+
+`runtime.executable_cache` (default `true`) stores every compiled program under the bundle's
+`.cache/` directory and loads it on later starts, turning a 5 to 30 second compile per program into
+a load of well under 100 ms. Entries are partitioned by the Reactant_jll build, the CUDA runtime,
+and the device kind and compute capability, none of which XLA checks on load, and named by the
+MLIR source's content hash. `.cache/mlir_hashes.json` records the hash of every `model*.mlir`; a
+module whose content changes has its programs dropped on the next load, while a weights-only update
+keeps them. The directory watcher never reacts to anything under `.cache/`, so cache writes cannot
+reload the model that produced them. The bundle directory must be writable by the worker; when it is
+not, the cache logs a warning and every program is compiled as before.
 
 `model_control_mode` sets how the loaded model set evolves: `dynamic` (the default) watches the
 repository and loads, unloads, reloads, and renames bundles online as files change (a renamed
@@ -293,6 +314,8 @@ overrides were applied, is logged at startup.
 | `INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE` | `runtime.autotune_cache` | bool |
 | `INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE_DIR` | `runtime.autotune_cache_dir` | path |
 | `INFERENCE_SERVER_RUNTIME_NUMERICS` | `runtime.numerics` | `f32` \| `auto` \| `tf32` |
+| `INFERENCE_SERVER_RUNTIME_ENGINE` | `runtime.engine` | `auto` \| `reactant` \| `pjrt_capi` |
+| `INFERENCE_SERVER_RUNTIME_EXECUTABLE_CACHE` | `runtime.executable_cache` | bool |
 | `INFERENCE_SERVER_RUNTIME_SHARED_HOST_WEIGHTS` | `runtime.shared_host_weights` | bool |
 | `INFERENCE_SERVER_RUNTIME_SHARED_HOST_WEIGHTS_MODE` | `runtime.shared_host_weights_mode` | octal string |
 | `INFERENCE_SERVER_SCHEDULER_DISCIPLINE` | `scheduler.discipline` | `fair` \| `fifo` \| `edf` |

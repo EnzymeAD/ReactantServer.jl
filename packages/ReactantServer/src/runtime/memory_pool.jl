@@ -33,6 +33,9 @@ function resolve_client(backend::AbstractBackend, cfg::RuntimeConfig)
     catch err
         if cfg.backend == CUDA_BACKEND && cfg.allow_cpu_fallback
             @warn "CUDA backend unavailable; falling back to CPU" exception = (err, catch_backtrace())
+            # The PJRT C API backend is CUDA-only (no CPU table in the JLL); CPU always runs on the
+            # Reactant backend. Callers read the effective backend back from `pool.backend`.
+            backend = backend isa PJRTCAPIBackend ? ReactantBackend() : backend
             client = make_client(
                 backend, "cpu"; mem_fraction = cfg.mem_fraction, preallocate = cfg.preallocate,
                 autotune_cache = cfg.autotune_cache, autotune_cache_dir = cfg.autotune_cache_dir

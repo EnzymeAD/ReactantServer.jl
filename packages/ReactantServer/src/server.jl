@@ -133,14 +133,37 @@ function _warn_unenforced_config(cfg::ServerConfig)
     return nothing
 end
 
+# Pick the runtime that drives XLA. The caller's explicit choice wins whenever it is not the default
+# Reactant backend (tests pass mocks); on a CUDA worker the default resolves through
+# `runtime.engine`: the PJRT C API backend when the installed JLL exposes a matching table (the only
+# path with the executable cache and the resettable memory probe), else Reactant's shims. CPU has
+# no C API table in the JLL and always runs on Reactant.
+function _select_engine(cfg::ServerConfig, backend::AbstractBackend)
+    backend isa ReactantBackend || return backend
+    cfg.runtime.backend == CUDA_BACKEND || return backend
+    cfg.runtime.engine == REACTANT_ENGINE && return backend
+    ok, reason = PJRTCAPI.availability()
+    ok && return PJRTCAPIBackend()
+    cfg.runtime.engine == PJRT_CAPI_ENGINE &&
+        throw(ErrorException("runtime.engine 'pjrt_capi' requested but the PJRT C API backend is unavailable: $reason"))
+    @warn "PJRT C API backend unavailable; serving through the Reactant backend (no executable cache)" reason
+    return backend
+end
+
 function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     _warn_unenforced_config(cfg)
+    backend = _select_engine(cfg, backend)
     # numerics=f32 defense in depth: NVIDIA_TF32_OVERRIDE must be in the environment before the
     # CUDA client (and its cuBLAS/cuDNN handles) exists. It covers library-internal matmul paths
     # the op-level precision pin cannot see; it does NOT govern XLA's Triton GEMMs, which the pin
     # does, so the two mechanisms cover each other's gaps.
     cfg.runtime.numerics == NUMERICS_F32 && (ENV["NVIDIA_TF32_OVERRIDE"] = "0")
     pool = resolve_client(backend, cfg.runtime)
+    backend = pool.backend                      # the CPU fallback may have swapped the backend
+    use_exec_cache = cfg.runtime.executable_cache && supports_executable_cache(backend)
+    if cfg.runtime.executable_cache && !use_exec_cache
+        @info "executable cache: not available on this backend; every program is compiled" backend = typeof(backend) platform = pool.platform
+    end
     # numerics=tf32 is a hard requirement, not a preference: on a target that cannot run TF32
     # (pre-Ampere GPU, or the CPU-fallback path), failing startup loudly beats a worker whose
     # numerics silently diverge from the rest of the fleet.
@@ -186,9 +209,16 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     # models loaded later by the directory watcher (see `_resolve_residency`).
     for entry in values(registry.by_name)
         state = _resolve_residency(cfg, entry.name, on_demand)
-        @info "Compiling model" name = entry.name residency = state on_demand = on_demand
-        entry.executable = build_loaded_model(backend, pool, entry; state = state, on_demand = on_demand, store = store)
+        @info "Compiling model" name = entry.name residency = state on_demand = on_demand executable_cache = use_exec_cache
+        entry.executable = build_loaded_model(
+            backend, pool, entry;
+            state = state, on_demand = on_demand, store = store, executable_cache = use_exec_cache
+        )
     end
+    # Compilation is over: drop the allocator high-water mark it left behind (autotuning scratch can
+    # dwarf any model's real run scratch), so the probe below and the exported peak gauge measure
+    # execution only. A backend that cannot reset reports false and the probe uses its fallback.
+    clear_memory_stats!(backend, pool)
     sched = Scheduler(registry, backend, pool, cfg.scheduler)
     if on_demand
         # Provisional budget for the probe; the isolation probe (in start!) frees between models so

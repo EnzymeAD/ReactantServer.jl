@@ -14,10 +14,16 @@ function select_device end               # (backend, client, ordinal::Int) -> de
 function device_ordinal end              # (backend, device) -> Int
 
 # Compilation. compile_artifact parses the StableHLO portable artifact and compiles it. The
-# Reactant method accepts a `numerics_stats` keyword: a NumericsStats accumulator recording what
+# device backends accept a `numerics_stats` keyword: a NumericsStats accumulator recording what
 # the numerics policy (runtime.numerics, see NumericsMode) did to the module, aggregated across a
-# model's artifacts by build_loaded_model for the model-loaded log.
-function compile_artifact end            # (backend, pool, mlir_bytes, num_parameters, num_outputs) -> executable
+# model's artifacts by build_loaded_model for the model-loaded log. Backends that
+# `supports_executable_cache` also accept `cache::ExecutableCacheSlot` (see executable_cache.jl)
+# and load the compiled program from the bundle's `.cache/` when present instead of compiling.
+function compile_artifact end            # (backend, pool, mlir_bytes, num_parameters, num_outputs; numerics_stats, cache) -> executable
+
+# Whether compile_artifact can serialize compiled programs into the per-bundle executable cache.
+# Default false: the Reactant backend has no serialization binding, MockBackend has nothing to cache.
+supports_executable_cache(::AbstractBackend) = false
 
 mutable struct NumericsStats
     algorithms_rewritten::Int   # explicit TF32 DotAlgorithms rewritten to f32 (NUMERICS_F32)
@@ -71,3 +77,15 @@ backend_tf32_capable(::AbstractBackend, pool) = false
 # `(in_use, limit, free)` of byte counts, or `nothing` when the backend/device cannot report it
 # (e.g. the CPU client or MockBackend). Callers degrade gracefully on `nothing`.
 device_memory_stats(::AbstractBackend, pool) = nothing
+
+# Reset the device allocator's high-water mark (`peak_in_use`) to the current in-use bytes. Returns
+# true when the reset happened. With it, a scratch measurement is `peak - in_use_before` for exactly
+# the work run in between; without it (default false) the peak is a monotone session value that
+# compile-time autotuning scratch inflates, and callers fall back to the ordering-based estimate.
+clear_memory_stats!(::AbstractBackend, pool) = false
+
+# The compiler's static memory accounting for a compiled executable, or `nothing` when the backend
+# cannot report it: a NamedTuple with at least `temp` (scratch) and `outputs` byte counts. A lower
+# bound on the allocator's view of a run (it excludes allocator rounding and library workspaces),
+# available before the program is ever executed.
+compiled_memory_stats(::AbstractBackend, exec) = nothing

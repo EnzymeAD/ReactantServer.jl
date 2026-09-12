@@ -28,6 +28,7 @@ gRPCServer = "608c6337-0d7d-447f-bb69-0f5674ee3959"
 ReactantServerCore = {path = "packages/ReactantServerCore"}
 
 [compat]
-gRPCClient = "1.1.0"
-gRPCServer = "0.1"
+Reactant = "0.2.285"
+gRPCClient = "1"
+gRPCServer = "0"
 julia = "1.12"

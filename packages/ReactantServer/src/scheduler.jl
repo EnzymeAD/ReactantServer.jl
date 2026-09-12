@@ -115,13 +115,16 @@ mutable struct Scheduler
     compact_loads_mark::Int                    # weight-cache load count at the last automatic compaction; sole
     # writer is the dispatch thread. Drives load-driven compaction:
     # compact once `weight_cache.loads` advances by `cfg.compaction_interval`.
+    autosize::Union{Nothing, NamedTuple{(:arena, :fraction, :wiggle), Tuple{Int, Float64, Float64}}}
+    # the arena and knobs the startup auto-sizing ran with, kept so a hot-loaded
+    # model can be probed and the weight budget re-resolved without a restart
 end
 
 function Scheduler(registry::ModelRegistry, backend::AbstractBackend, pool::MemoryPool, cfg::SchedulerConfig)
     return Scheduler(
         registry, backend, pool, cfg,
         Threads.Condition(), false, nothing, nothing, nothing, ControlCommand[],
-        MetaGate(1), QueuedRequest[], 0
+        MetaGate(1), QueuedRequest[], 0, nothing
     )
 end
 
@@ -630,58 +633,92 @@ end
 
 # Measure the worst-case execution scratch (transient device memory beyond resident weights) by
 # probing each model in ISOLATION: free all non-pinned device weights so only pinned + the probed
-# model are resident, run every compiled (variant,size), and read the allocator's peak. Subtracting
-# the KNOWN isolated resident floor (pinned + the model's own footprint) from the global peak keeps
-# the estimate sound despite `peak_bytes_in_use` being a monotone, non-resettable high-water (later
-# models inherit earlier peaks, so the result is a conservative over-estimate, the safe direction).
-# The per-model run also seeds the fair discipline's cost estimates. Returns max scratch in bytes
-# (0 when the backend reports no device stats, e.g. CPU/mock).
+# model are resident, run every compiled (variant,size), and read the allocator's peak. The
+# per-model run also seeds the fair discipline's cost estimates. Returns max scratch in bytes (0 when
+# the backend reports no device stats, e.g. CPU/mock).
+#
+# Two measurement modes, chosen by whether the backend can reset the allocator's high-water mark
+# (`clear_memory_stats!`):
+#
+# * Resettable (the PJRT C API backend, and the Reactant backend on a CUDA client): before each model
+#   the peak is reset, so `peak - in_use_before` is exactly that model's transient, whatever ran
+#   earlier. Compile-time autotuning scratch, which can be many times a model's real run scratch and
+#   used to force an operator restart before a clean measurement, cannot leak in, and pinned models
+#   are measured too.
+# * Monotone peak (fallback): the peak only grows, so a naive `peak - (pinned + this_model.nbytes)`
+#   leaks the heaviest model's weights into every later model's "scratch" and depends on iteration
+#   order. Probing in ascending weight order and subtracting the largest weight set resident so far
+#   makes `max_i (peak_i - pinned - maxweight_i)` provably exactly `max_i scratch_i` (peak_i >=
+#   pinned + W_i + S_i gives the >= bound, W_j <= W_i for j <= i the <= bound), but anything that
+#   moved the peak before the probe (autotuning) still inflates it.
 function _probe_max_scratch!(s::Scheduler, pinned_bytes::Int)
     (s.weight_cache === nothing || device_memory_stats(s.backend, s.pool) === nothing) && return 0
-    # `peak_in_use` is the allocator's monotonic session high-water mark, and we cannot reset it between
-    # models, so a naive `peak - (pinned + this_model.nbytes)` leaks the heaviest model's weights into
-    # every later model's "scratch" and depends on iteration order (non-deterministic, over-reserving).
-    # Two changes make the estimate deterministic AND exact: (1) probe in ascending weight order, and
-    # (2) subtract the largest weight set resident so far. In ascending order the running max weight is
-    # the current model's weight, and `max_i (peak_i - pinned - maxweight_i)` is then provably exactly
-    # `max_i scratch_i`, the worst single-model transient: peak_i >= pinned + W_i + S_i gives the >= S_i
-    # bound, and W_j <= W_i for all j <= i gives the <= max(S) bound. No peak reset required.
+    resettable = clear_memory_stats!(s.backend, s.pool)
+    resettable || @info "memory probe: allocator peak is not resettable on this backend; using the ordering-based estimate (pinned models unmeasured)"
     probe = [
         e for e in values(s.registry.by_name)
-            if e.executable !== nothing && !is_device_pinned(e.executable) &&
-            !isempty(e.manifest.executable_inputs)
+            if e.executable !== nothing && !isempty(e.manifest.executable_inputs) &&
+            (resettable || !is_device_pinned(e.executable))
     ]          # need synthesizable inputs to measure
     sort!(probe; by = e -> e.executable.nbytes)                  # ascending weight
     max_scratch = 0
     max_weight = 0
     for entry in probe
         model = entry.executable
-        _free_nonpinned!(s.weight_cache)                         # isolate: only pinned + M will be resident
-        try
-            acquire!(s.weight_cache, entry)
-        catch err
-            err isa NotResidentError && continue                 # externally-managed: cannot load to measure
-            rethrow()
-        end
-        max_weight = max(max_weight, model.nbytes)               # == model.nbytes given ascending order
-        for (variant, inner) in model.execs
-            for sz in keys(inner)
-                inputs = _zero_inputs(entry, variant, sz)
-                inputs === nothing && continue
-                try
-                    t0 = time()
-                    run_model(s.backend, s.pool, model, inputs)
-                    entry.sched.cost_estimate[sz] = max(time() - t0, eps())
-                catch err
-                    @warn "memory probe / warmup run failed; using default cost" model = entry.name variant = variant size = sz exception = err
-                end
+        if !is_device_pinned(model)
+            _free_nonpinned!(s.weight_cache)                     # isolate: only pinned + M will be resident
+            try
+                acquire!(s.weight_cache, entry)
+            catch err
+                err isa NotResidentError && continue             # externally-managed: cannot load to measure
+                rethrow()
             end
         end
-        dm = device_memory_stats(s.backend, s.pool)
-        dm === nothing && continue
-        max_scratch = max(max_scratch, dm.peak_in_use - (pinned_bytes + max_weight))
+        max_weight = max(max_weight, model.nbytes)               # == model.nbytes given ascending order
+        scratch = _probe_entry_scratch!(s, entry, resettable, pinned_bytes + max_weight)
+        max_scratch = max(max_scratch, scratch)
     end
     return max(0, max_scratch)
+end
+
+# Run every compiled (variant, size) of one resident model, seeding its FAIR cost estimates, and
+# return its scratch estimate in bytes. Resettable: the peak is reset first and the result is
+# `peak - in_use_before`, exact for this model. Otherwise `peak - resident_floor`, the monotone-peak
+# formula (`resident_floor` = pinned + the heaviest weight set resident so far). When the model
+# cannot be run (no synthesizable inputs, or the run failed) the compiler's static `temp + outputs`
+# accounting, padded by half (it undershoots the allocator's view by 7 to 50 percent in
+# measurements), stands in so the model still reserves its declared scratch.
+function _probe_entry_scratch!(s::Scheduler, entry::ModelEntry, resettable::Bool, resident_floor::Int)
+    model = entry.executable
+    baseline = 0
+    if resettable
+        clear_memory_stats!(s.backend, s.pool)
+        dm0 = device_memory_stats(s.backend, s.pool)
+        baseline = dm0 === nothing ? 0 : dm0.in_use
+    end
+    static = 0
+    ran = false
+    for (variant, inner) in model.execs
+        for (sz, exec) in inner
+            cms = compiled_memory_stats(s.backend, exec)
+            cms === nothing || (static = max(static, Int(cms.temp) + Int(cms.outputs)))
+            inputs = _zero_inputs(entry, variant, sz)
+            inputs === nothing && continue
+            try
+                t0 = time()
+                run_model(s.backend, s.pool, model, inputs)
+                entry.sched === nothing || (entry.sched.cost_estimate[sz] = max(time() - t0, eps()))
+                ran = true
+            catch err
+                @warn "memory probe / warmup run failed; using default cost" model = entry.name variant = variant size = sz exception = err
+            end
+        end
+    end
+    ran || return ceil(Int, 1.5 * static)
+    dm = device_memory_stats(s.backend, s.pool)
+    dm === nothing && return ceil(Int, 1.5 * static)
+    measured = resettable ? dm.peak_in_use - baseline : dm.peak_in_use - resident_floor
+    return max(0, measured)
 end
 
 # Size the on-demand cache from the unified memory model: pinned reserve their footprint, the
@@ -690,6 +727,7 @@ end
 # dispatch loop spawns (so mutating `max_bytes` does not race the loop).
 function _autosize_weight_cache!(s::Scheduler, arena::Int, fraction::Float64, wiggle::Float64)
     s.weight_cache === nothing && return nothing
+    s.autosize = (arena = arena, fraction = fraction, wiggle = wiggle)
     pinned = pinned_weight_bytes(s.registry)
     max_scratch = _probe_max_scratch!(s, pinned)
     b = weight_budget(;
@@ -1136,18 +1174,58 @@ directory watcher's load/reload path. Returns the model name.
 """
 function load_model!(
         s::Scheduler, backend::AbstractBackend, pool::MemoryPool, entry::ModelEntry;
-        state::ResidencyState, on_demand::Bool, store::WeightStore = PrivateWeightStore()
+        state::ResidencyState, on_demand::Bool, store::WeightStore = PrivateWeightStore(),
+        executable_cache::Bool = false
     )
     return _run_control(
         s, function (sch)
             _evict_entry!(sch, entry.name)          # no-op on a fresh load; frees device memory on reload
             entry.executable = build_loaded_model(
                 backend, pool, entry;
-                state = state, on_demand = on_demand, store = store, source = :dynamic
+                state = state, on_demand = on_demand, store = store, source = :dynamic,
+                executable_cache = executable_cache
             )
-            return _admit_entry!(sch, entry)
+            name = _admit_entry!(sch, entry)
+            _reprobe_after_load!(sch, entry)
+            return name
         end
     )
+end
+
+# After a hot load, fold the new model into the weight budget without a restart: reset the
+# allocator peak the compile left behind, measure this one model's scratch in isolation of that
+# peak, and re-resolve the budget with the arena and knobs the startup auto-sizing used. Only the
+# max scratch can grow here (a reload of a lighter version keeps the old ceiling until restart, the
+# safe direction). No-op when the cache or auto-sizing is off, or the backend has no device stats.
+function _reprobe_after_load!(sch::Scheduler, entry::ModelEntry)
+    (sch.weight_cache === nothing || sch.autosize === nothing || entry.executable === nothing) && return nothing
+    device_memory_stats(sch.backend, sch.pool) === nothing && return nothing
+    isempty(entry.manifest.executable_inputs) && return nothing
+    resettable = clear_memory_stats!(sch.backend, sch.pool)
+    if !is_device_pinned(entry.executable)
+        try
+            acquire!(sch.weight_cache, entry)
+        catch err
+            err isa NotResidentError && return nothing
+            rethrow()
+        end
+    end
+    pinned = pinned_weight_bytes(sch.registry)
+    scratch = _probe_entry_scratch!(sch, entry, resettable, pinned + entry.executable.nbytes)
+    a = sch.autosize
+    lock(sch.weight_cache.lock) do
+        max_scratch = max(sch.weight_cache.max_scratch, scratch)
+        b = weight_budget(;
+            arena = a.arena, fraction = a.fraction, wiggle = a.wiggle,
+            max_scratch = max_scratch, pinned_bytes = pinned
+        )
+        sch.weight_cache.max_bytes = b.on_demand_budget
+        sch.weight_cache.pinned_bytes = pinned
+        sch.weight_cache.max_scratch = max_scratch
+        sch.weight_cache.weight_pool = b.weight_pool
+        @info "weight budget re-resolved after model load" model = entry.name model_scratch = scratch max_scratch = max_scratch pinned_bytes = pinned weight_pool = b.weight_pool on_demand_budget = b.on_demand_budget resettable_peak = resettable
+    end
+    return nothing
 end
 
 """

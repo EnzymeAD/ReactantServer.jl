@@ -1,4 +1,5 @@
-# The Reactant/PJRT backend. This is the ONLY file in the server that imports Reactant.
+# The Reactant/PJRT backend. This file (and the PJRT C API backend, which reuses these aliases)
+# are the only places in the server that import Reactant.
 #
 # It maps the backend protocol onto Reactant's runtime execution interface, exactly the
 # call sequence validated by test/spike_reactant.jl. Reactant's tracing, compilation, and
@@ -6,6 +7,8 @@
 # StableHLO portable-artifact deserialization.
 
 import Reactant
+import Reactant_jll
+using Libdl: Libdl
 
 const _RXLA = Reactant.XLA
 const _RMLIR = Reactant.MLIR
@@ -148,10 +151,64 @@ function device_memory_stats(::ReactantBackend, pool::MemoryPool)
     end
 end
 
+# Reset the BFC allocator's high-water mark on the GPU client. Reactant binds only the stats
+# getter (PjRtDeviceGetAllocatorStats), but the method behind PJRT_Device_ClearMemoryStats is an
+# exported, argument-free C++ symbol on the StreamExecutor GPU device class, and the PjRtDevice*
+# Reactant holds is that object (single-inheritance chain, same address). Its absl::Status return
+# travels through a hidden result pointer whose OK representation is the tagged value 0x1. Verified
+# on Reactant_jll 0.0.391 and 0.0.407; anything unexpected (missing symbol, non-cuda platform, a
+# non-OK status) reports false and the callers keep the ordering-based fallback. Retires when the
+# PJRT C API backend is the only GPU path.
+const _SE_GPU_CLEAR_MEMORY_STATS_SYMBOL = "_ZN3xla23StreamExecutorGpuDevice16ClearMemoryStatsEv"
+const _ABSL_STATUS_OK_REP = UInt64(0x01)
+
+function clear_memory_stats!(::ReactantBackend, pool::MemoryPool)
+    pool.platform == "cuda" || return false
+    dev = pool.device
+    (dev isa _RXLA.PJRT.Device && dev.device != C_NULL) || return false
+    Reactant_jll.is_available() || return false
+    sym = Libdl.dlsym_e(Reactant_jll.libReactantExtra_handle, _SE_GPU_CLEAR_MEMORY_STATS_SYMBOL)
+    sym == C_NULL && return false
+    sret = Ref{UInt64}(0)
+    GC.@preserve dev begin
+        ccall(sym, Ptr{Cvoid}, (Ref{UInt64}, Ptr{Cvoid}), sret, dev.device)
+    end
+    return sret[] == _ABSL_STATUS_OK_REP
+end
+
+# Numerics policy (runtime.numerics; see tf32.jl and NumericsMode), applied to a freshly
+# deserialized module before XLA sees it. AUTO follows the hardware: explicit TF32 DotAlgorithms are
+# a hard compile error on non-Ampere targets, so strip them there; elsewhere TF32 resolves through
+# DEFAULT precision. F32 pins hardware-invariant full-f32 numerics and machine-checks the result.
+# TF32 passes the module through untouched; its capability gate ran once at startup (_bring_up).
+# Shared by both device backends so the compiled program is the same whichever runs the compile.
+function _apply_numerics_policy!(
+        mod::_RMLIR.IR.Module, pool::MemoryPool, tf32_capable::Bool,
+        numerics_stats::Union{NumericsStats, Nothing}
+    )
+    if pool.numerics == NUMERICS_F32
+        st = pin_f32!(mod)
+        inv = assert_f32_pinned(mod)
+        if numerics_stats !== nothing
+            numerics_stats.algorithms_rewritten += st.algorithms_rewritten
+            numerics_stats.dots_pinned += st.dots_pinned
+            numerics_stats.convs_pinned += st.convs_pinned
+            append!(numerics_stats.opaque_ops, inv.opaque_ops)
+        end
+    elseif pool.numerics == NUMERICS_AUTO && !tf32_capable
+        n = maybe_strip_tf32!(mod)
+        numerics_stats === nothing || (numerics_stats.tf32_stripped += n)
+    end
+    return mod
+end
+
+# `cache` is accepted for protocol uniformity and ignored: Reactant binds no executable
+# serialization, so this backend always compiles (supports_executable_cache is false).
 function compile_artifact(
         backend::ReactantBackend, pool::MemoryPool, mlir_bytes,
         n_parameters::Int, n_outputs::Int;
-        numerics_stats::Union{NumericsStats, Nothing} = nothing
+        numerics_stats::Union{NumericsStats, Nothing} = nothing,
+        cache::Union{ExecutableCacheSlot, Nothing} = nothing
     )
     ctx = pool.ctx
     _RMLIR.IR.activate(ctx)
@@ -161,24 +218,7 @@ function compile_artifact(
         artifact = String(copy(Vector{UInt8}(mlir_bytes)))
         mlir_mod = _RMLIR.API.stablehloDeserializePortableArtifactNoError(artifact, ctx)
         mod = _RMLIR.IR.Module(mlir_mod)
-        # Numerics policy (runtime.numerics; see tf32.jl and NumericsMode). AUTO follows the
-        # hardware: explicit TF32 DotAlgorithms are a hard compile error on non-Ampere targets, so
-        # strip them there; elsewhere TF32 resolves through DEFAULT precision. F32 pins
-        # hardware-invariant full-f32 numerics and machine-checks the result. TF32 passes the
-        # module through untouched; its capability gate ran once at startup (_bring_up).
-        if pool.numerics == NUMERICS_F32
-            st = pin_f32!(mod)
-            inv = assert_f32_pinned(mod)
-            if numerics_stats !== nothing
-                numerics_stats.algorithms_rewritten += st.algorithms_rewritten
-                numerics_stats.dots_pinned += st.dots_pinned
-                numerics_stats.convs_pinned += st.convs_pinned
-                append!(numerics_stats.opaque_ops, inv.opaque_ops)
-            end
-        elseif pool.numerics == NUMERICS_AUTO && !tf32_supported(pool.client, pool.device)
-            n = maybe_strip_tf32!(mod)
-            numerics_stats === nothing || (numerics_stats.tf32_stripped += n)
-        end
+        _apply_numerics_policy!(mod, pool, tf32_supported(pool.client, pool.device), numerics_stats)
         # When autotuning is disabled, force xla_gpu_autotune_level=0: XLA uses default gemm/conv
         # algorithm selection with no device timing trials. This removes the autotuner's run-to-run
         # non-determinism and the compile-time scratch that otherwise inflates the startup memory

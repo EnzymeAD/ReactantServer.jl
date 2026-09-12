@@ -56,9 +56,15 @@ include("runtime/weights.jl")
 include("runtime/model.jl")
 include("runtime/weight_cache.jl")
 include("runtime/execution.jl")
+# Per-bundle serialized-executable cache (backend-agnostic policy: layout, hashes, invalidation).
+include("runtime/executable_cache.jl")
 include("runtime/reactant_backend.jl")
 # Load-time TF32 stripping for portable artifacts; uses the backend's _RMLIR/_RXLA aliases.
 include("runtime/tf32.jl")
+# The PJRT C API driven directly (CUDA only): bindings from Reactant's generated CAPI.jl, then the
+# backend that serves through them and owns the executable cache and the resettable memory probe.
+include("runtime/pjrt_capi.jl")
+include("runtime/pjrt_capi_backend.jl")
 
 # Lifecycle observability helpers (formatting + structured load/unload/residency logs). After the
 # backend (for device_memory_stats) and weight_cache (for weight_cache_stats); before scheduler.

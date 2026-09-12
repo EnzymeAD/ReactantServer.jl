@@ -83,6 +83,7 @@ export SignatureValidator, NullSignatureValidator, validate_against_signature
 
 # ---- config ----
 export ConfigError, BackendKind, CPU_BACKEND, CUDA_BACKEND
+export EngineKind, AUTO_ENGINE, REACTANT_ENGINE, PJRT_CAPI_ENGINE
 export ResidencyState, UNPINNED, PINNED_SYSTEM, PINNED_DEVICE
 export ResidencyMode, SELF_MANAGED, EXTERNALLY_MANAGED
 export ModelControlMode, STATIC, DYNAMIC, EXPLICIT

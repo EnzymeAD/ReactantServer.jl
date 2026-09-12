@@ -550,3 +550,45 @@ end
         @test_throws ReactantServer.ConfigError ReactantServer.load_node(clash)
     end
 end
+
+@testset "runtime.engine and runtime.executable_cache" begin
+    mktempdir() do dir
+        modeldir = joinpath(dir, "models"); mkpath(modeldir)
+        rt(body) = load_single_worker(dir, body; model_repo = modeldir)[1].runtime
+
+        # Defaults: auto engine, cache on.
+        r = rt("runtime:\n  backend: cuda")
+        @test r.engine == ReactantServer.AUTO_ENGINE
+        @test r.executable_cache
+        @test rt("runtime:\n  backend: cuda\n  engine: reactant").engine == ReactantServer.REACTANT_ENGINE
+        @test rt("runtime:\n  backend: cuda\n  engine: pjrt_capi").engine == ReactantServer.PJRT_CAPI_ENGINE
+        @test rt("runtime:\n  backend: cuda\n  engine: PJRT-CAPI").engine == ReactantServer.PJRT_CAPI_ENGINE
+        @test !rt("runtime:\n  backend: cuda\n  executable_cache: false").executable_cache
+        @test_throws ReactantServer.ConfigError rt("runtime:\n  backend: cuda\n  engine: xla")
+
+        # Env overrides.
+        withenv("INFERENCE_SERVER_RUNTIME_ENGINE" => "reactant", "INFERENCE_SERVER_RUNTIME_EXECUTABLE_CACHE" => "false") do
+            cfg, applied, _ = load_single_worker(dir, "runtime:\n  backend: cuda"; model_repo = modeldir)
+            @test cfg.runtime.engine == ReactantServer.REACTANT_ENGINE
+            @test !cfg.runtime.executable_cache
+            @test length(applied) == 2
+        end
+
+        # The C API engine has no CPU table to drive: requiring it on a CPU worker fails validation.
+        cfgbad, _, _ = load_single_worker(dir, "runtime:\n  backend: cpu\n  engine: pjrt_capi"; model_repo = modeldir)
+        @test_throws ReactantServer.ConfigError ReactantServer.validate_config(cfgbad)
+        # Auto on CPU is fine (it resolves to the Reactant backend at startup).
+        cfgok, _, _ = load_single_worker(dir, "runtime:\n  backend: cpu"; model_repo = modeldir)
+        @test ReactantServer.validate_config(cfgok) === cfgok
+
+        # Positional constructors default the new fields.
+        c5 = ReactantServer.RuntimeConfig(ReactantServer.CPU_BACKEND, 0, 0.9, true, true)
+        @test c5.engine == ReactantServer.AUTO_ENGINE && c5.executable_cache
+        c14 = ReactantServer.RuntimeConfig(
+            ReactantServer.CUDA_BACKEND, 1, 0.8, false, false, ReactantServer.SELF_MANAGED, false, 0o660,
+            0.5, 0.1, true, nothing, "", ReactantServer.NUMERICS_F32
+        )
+        @test c14.engine == ReactantServer.AUTO_ENGINE && c14.executable_cache
+        @test c14.shared_host_weights_mode == 0o660 && c14.numerics == ReactantServer.NUMERICS_F32
+    end
+end

@@ -15,6 +15,9 @@ A bundle is a directory containing:
   `weights.safetensors`.
 - `weights.safetensors` - the model weights, memory-mapped at load time.
 - `model.jl` - optional; registers custom pre/post-processing (see below).
+- `.cache/` - written by the worker, never by you: the serialized-executable cache (compiled
+  programs keyed by MLIR content, Reactant_jll build and device) plus `mlir_hashes.json`. Safe to
+  delete at any time; the watcher ignores it. See `runtime.executable_cache` in [Node config](node_config.md).
 
 The directory name is the model name: renaming the directory renames the model, with no edits to
 the manifest or `model.jl` (a `name` declared in either is informational and ignored). Each

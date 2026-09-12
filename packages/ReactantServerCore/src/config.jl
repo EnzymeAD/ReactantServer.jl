@@ -91,6 +91,18 @@ silently degrading per worker in a mixed fleet.
 @enum NumericsMode NUMERICS_F32 NUMERICS_AUTO NUMERICS_TF32
 
 """
+    EngineKind
+
+Which runtime drives XLA on a CUDA worker (`runtime.engine`). `AUTO_ENGINE` (default) uses the PJRT
+C API backend when the installed Reactant_jll exposes a matching PJRT table and falls back to the
+Reactant backend otherwise; `PJRT_CAPI_ENGINE` requires the C API backend and fails startup when it
+is unavailable; `REACTANT_ENGINE` always uses Reactant's C++ shims. CPU workers always run on the
+Reactant backend (the JLL exports no CPU PJRT table). Only the C API backend can serve the
+per-bundle executable cache and reset the allocator high-water mark between memory probes.
+"""
+@enum EngineKind AUTO_ENGINE REACTANT_ENGINE PJRT_CAPI_ENGINE
+
+"""
     RuntimeConfig
 
 Runtime and device settings (the `runtime:` config block). `backend` selects CPU or CUDA
@@ -117,7 +129,12 @@ the startup memory probe (`_probe_max_scratch!`) on the first, un-cached start. 
 per-fusion autotune cache, and `autotune_cache_dir` (default `""`, inherit) sets its directory; both
 are applied to Reactant's compile cache at worker startup, so a container can drive them by env.
 `numerics` (default `auto`) sets the f32 matmul/convolution precision policy; see
-[`NumericsMode`](@ref).
+[`NumericsMode`](@ref). `engine` (default `auto`) selects the XLA driver on CUDA workers; see
+[`EngineKind`](@ref). `executable_cache` (default `true`) stores each compiled program under the
+bundle's `.cache/` directory and loads it on later starts instead of recompiling, keyed by the
+Reactant_jll build, the device, and the MLIR content (a changed `model*.mlir` invalidates its
+programs; a weights-only update does not); it is served only by the PJRT C API engine and is
+otherwise a no-op.
 """
 struct RuntimeConfig
     backend::BackendKind
@@ -134,6 +151,8 @@ struct RuntimeConfig
     autotune_cache::Union{Bool, Nothing}   # persistent per-fusion autotune cache; nothing = inherit Reactant's LocalPreferences
     autotune_cache_dir::String            # persistent autotune cache directory; "" = inherit Reactant's LocalPreferences
     numerics::NumericsMode                # f32 matmul/conv precision policy (see NumericsMode)
+    engine::EngineKind                    # XLA driver on CUDA: auto (C API when available), reactant, pjrt_capi
+    executable_cache::Bool                # per-bundle serialized-executable cache (C API engine only)
 end
 
 # Five-argument form: device/backend only; residency self-managed, private host weights, and the
@@ -145,7 +164,7 @@ RuntimeConfig(
 ) =
     RuntimeConfig(
     backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
-    SELF_MANAGED, false, 0o666, 0.0, 0.0, true, nothing, "", NUMERICS_AUTO
+    SELF_MANAGED, false, 0o666, 0.0, 0.0, true, nothing, "", NUMERICS_AUTO, AUTO_ENGINE, true
 )
 
 # Seven-argument form: adds residency mode and the shared-host-weights flag (cache still off unless
@@ -157,7 +176,23 @@ RuntimeConfig(
 ) =
     RuntimeConfig(
     backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
-    residency_mode, shared_host_weights, 0o666, 0.0, 0.0, true, nothing, "", NUMERICS_AUTO
+    residency_mode, shared_host_weights, 0o666, 0.0, 0.0, true, nothing, "", NUMERICS_AUTO, AUTO_ENGINE, true
+)
+
+# Fourteen-argument form: the previous full positional layout (through `numerics`), with the
+# engine defaulting to auto and the executable cache on. Keeps existing call sites compiling.
+RuntimeConfig(
+    backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
+    preallocate::Bool, allow_cpu_fallback::Bool, residency_mode::ResidencyMode,
+    shared_host_weights::Bool, shared_host_weights_mode::Integer,
+    weight_cache_fraction::Real, weight_cache_wiggle_fraction::Real, autotune::Bool,
+    autotune_cache::Union{Bool, Nothing}, autotune_cache_dir::AbstractString, numerics::NumericsMode
+) =
+    RuntimeConfig(
+    backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
+    residency_mode, shared_host_weights, UInt16(shared_host_weights_mode),
+    Float64(weight_cache_fraction), Float64(weight_cache_wiggle_fraction), autotune,
+    autotune_cache, String(autotune_cache_dir), numerics, AUTO_ENGINE, true
 )
 
 """
@@ -350,6 +385,8 @@ const ENV_PATHS = Tuple{String, Vector{String}, DataType}[
     ("RUNTIME_AUTOTUNE_CACHE", ["runtime", "autotune_cache"], Bool),
     ("RUNTIME_AUTOTUNE_CACHE_DIR", ["runtime", "autotune_cache_dir"], String),
     ("RUNTIME_NUMERICS", ["runtime", "numerics"], String),
+    ("RUNTIME_ENGINE", ["runtime", "engine"], String),
+    ("RUNTIME_EXECUTABLE_CACHE", ["runtime", "executable_cache"], Bool),
     ("RUNTIME_SHARED_HOST_WEIGHTS", ["runtime", "shared_host_weights"], Bool),
     ("RUNTIME_SHARED_HOST_WEIGHTS_MODE", ["runtime", "shared_host_weights_mode"], String),
     ("SCHEDULER_DISCIPLINE", ["scheduler", "discipline"], String),
@@ -498,6 +535,14 @@ function _parse_residency(s)
     throw(ConfigError("residency must be 'unpinned', 'system', or 'device', got '$s'"))
 end
 
+function _parse_engine(s)
+    v = lowercase(strip(String(s)))
+    v == "auto" && return AUTO_ENGINE
+    v == "reactant" && return REACTANT_ENGINE
+    (v == "pjrt_capi" || v == "pjrt-capi" || v == "capi") && return PJRT_CAPI_ENGINE
+    throw(ConfigError("runtime.engine must be 'auto', 'reactant', or 'pjrt_capi', got '$s'"))
+end
+
 function _parse_numerics(s)
     ls = lowercase(strip(s))
     ls == "f32" && return NUMERICS_F32
@@ -562,6 +607,8 @@ function build_config(raw::AbstractDict)
         _opt(rt, "autotune_cache", Bool, nothing),
         _opt(rt, "autotune_cache_dir", String, ""),
         _parse_numerics(_opt(rt, "numerics", String, "auto")),
+        _parse_engine(_opt(rt, "engine", String, "auto")),
+        _opt(rt, "executable_cache", Bool, true),
     )
 
     sc = _subdict(raw, "scheduler")
@@ -641,6 +688,8 @@ function validate_config(cfg::ServerConfig)
     # satisfied, so fail at config time. GPU capability is checked at startup once a device exists.
     !(cfg.runtime.numerics == NUMERICS_TF32 && cfg.runtime.backend == CPU_BACKEND) ||
         throw(ConfigError("runtime.numerics 'tf32' requires a CUDA backend; the CPU backend cannot run TF32"))
+    !(cfg.runtime.engine == PJRT_CAPI_ENGINE && cfg.runtime.backend == CPU_BACKEND) ||
+        throw(ConfigError("runtime.engine 'pjrt_capi' requires a CUDA backend; Reactant_jll exports no CPU PJRT table"))
     cfg.model_poll_seconds >= 0 || throw(ConfigError("model_poll_seconds must be non-negative"))
     cfg.model_control_mode != DYNAMIC || cfg.model_poll_seconds > 0 ||
         throw(ConfigError("model_control_mode 'dynamic' requires model_poll_seconds > 0"))
@@ -652,7 +701,7 @@ end
 # `apply_env_overrides!` is applied on top by `node_server_config`.
 
 function log_effective_config(cfg::ServerConfig, applied)
-    @info "Effective configuration" model_dirs = cfg.model_dirs models_include = cfg.models_include model_control_mode = cfg.model_control_mode model_poll_seconds = cfg.model_poll_seconds cache_dir = cfg.cache_dir backend = cfg.runtime.backend device_ordinal = cfg.runtime.device_ordinal mem_fraction = cfg.runtime.mem_fraction preallocate = cfg.runtime.preallocate allow_cpu_fallback = cfg.runtime.allow_cpu_fallback weight_cache_fraction = cfg.runtime.weight_cache_fraction weight_cache_wiggle_fraction = cfg.runtime.weight_cache_wiggle_fraction autotune = cfg.runtime.autotune autotune_cache = cfg.runtime.autotune_cache autotune_cache_dir = cfg.runtime.autotune_cache_dir numerics = cfg.runtime.numerics residency_mode = cfg.runtime.residency_mode shared_host_weights = cfg.runtime.shared_host_weights shared_host_weights_mode = string(cfg.runtime.shared_host_weights_mode; base = 8) host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests discipline = cfg.scheduler.discipline ema_halflife_seconds = cfg.scheduler.ema_halflife_seconds recency_penalty_cap = cfg.scheduler.recency_penalty_cap coalescing_discount = cfg.scheduler.coalescing_discount cost_ema_alpha = cfg.scheduler.cost_ema_alpha max_queue_depth = cfg.scheduler.max_queue_depth compaction_interval = cfg.scheduler.compaction_interval scheduler_models = collect(keys(cfg.scheduler.models))
+    @info "Effective configuration" model_dirs = cfg.model_dirs models_include = cfg.models_include model_control_mode = cfg.model_control_mode model_poll_seconds = cfg.model_poll_seconds cache_dir = cfg.cache_dir backend = cfg.runtime.backend device_ordinal = cfg.runtime.device_ordinal mem_fraction = cfg.runtime.mem_fraction preallocate = cfg.runtime.preallocate allow_cpu_fallback = cfg.runtime.allow_cpu_fallback weight_cache_fraction = cfg.runtime.weight_cache_fraction weight_cache_wiggle_fraction = cfg.runtime.weight_cache_wiggle_fraction autotune = cfg.runtime.autotune autotune_cache = cfg.runtime.autotune_cache autotune_cache_dir = cfg.runtime.autotune_cache_dir numerics = cfg.runtime.numerics engine = cfg.runtime.engine executable_cache = cfg.runtime.executable_cache residency_mode = cfg.runtime.residency_mode shared_host_weights = cfg.runtime.shared_host_weights shared_host_weights_mode = string(cfg.runtime.shared_host_weights_mode; base = 8) host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests discipline = cfg.scheduler.discipline ema_halflife_seconds = cfg.scheduler.ema_halflife_seconds recency_penalty_cap = cfg.scheduler.recency_penalty_cap coalescing_discount = cfg.scheduler.coalescing_discount cost_ema_alpha = cfg.scheduler.cost_ema_alpha max_queue_depth = cfg.scheduler.max_queue_depth compaction_interval = cfg.scheduler.compaction_interval scheduler_models = collect(keys(cfg.scheduler.models))
     isempty(applied) || @info "Configuration overridden by environment" overrides = ["$k=$v" for (k, v) in applied]
     return nothing
 end
