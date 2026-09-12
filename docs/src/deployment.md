@@ -335,8 +335,11 @@ compile with cuBLASLt's "Invalid handle was passed to cublasLtCreate"; the copie
 that.
 
 The container needs the host NVIDIA Container Toolkit for GPU access, and the compose file mounts
-the model repository read-only plus a persistent volume for the Reactant compile cache (autotune
-results), so tuned kernels survive container recreation. The container shares the host IPC
+the model repository plus a persistent volume for the Reactant compile cache (autotune
+results), so tuned kernels survive container recreation. Compiled programs themselves are cached
+under each bundle's `.cache/` directory (`runtime.executable_cache`, on by default), which is what
+makes a restart load models in milliseconds instead of recompiling them; mount the repository
+writable, or accept that a read-only repository compiles every program on every start. The container shares the host IPC
 namespace (`ipc: host`) so POSIX shared-memory regions created by a client are visible to the
 workers. The autotune knobs are settable as container env
 (`INFERENCE_SERVER_RUNTIME_AUTOTUNE`, `INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE`,

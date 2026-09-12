@@ -72,6 +72,7 @@ global:
     preallocate: true          # claim the pool up front (GPU only)
     allow_cpu_fallback: false
     numerics: auto             # f32 | auto | tf32; see below
+    executable_cache: true     # cache compiled programs under each bundle's .cache/; see below
     weight_cache_fraction: 1.0 # arena fraction for all weights (pinned + on-demand); 0 disables
     weight_cache_wiggle_fraction: 0.1  # arena fraction kept free; drives startup auto-sizing
     autotune: true             # XLA GPU compile autotuner; false = default kernels, no trials
@@ -113,6 +114,18 @@ startup fails on hardware that cannot run TF32, so a mixed fleet cannot silently
 numerics. On CUDA workers a startup probe logs whether TF32 arithmetic is actually in use and,
 under `f32`, proves the pin bit-exactly; the per-model outcome (ops pinned, algorithms rewritten
 or stripped) is recorded in each "model loaded" log line.
+
+`runtime.executable_cache` (default `true`) stores every compiled program under the bundle's
+`.cache/` directory and loads it on later starts, turning a 5 to 30 second compile per program into
+a load of well under 100 ms. Entries are partitioned by the Reactant_jll build, the platform, and
+the device kind and compute capability, none of which XLA checks on load, and named by the MLIR
+source's content hash. `.cache/mlir_hashes.json` records the hash of every `model*.mlir`; a module
+whose content changes has its programs dropped on the next load, while a weights-only update keeps
+them. The directory watcher never reacts to anything under `.cache/`, so cache writes cannot reload
+the model that produced them. The bundle directory must be writable by the worker; when it is not,
+the cache logs a warning and every program is compiled as before. The cache needs a Reactant that
+exposes executable serialization (`Reactant.XLA.serialize_executable`); on an older Reactant the
+worker logs that the cache is unavailable and compiles everything.
 
 `model_control_mode` sets how the loaded model set evolves: `dynamic` (the default) watches the
 repository and loads, unloads, reloads, and renames bundles online as files change (a renamed
@@ -293,6 +306,7 @@ overrides were applied, is logged at startup.
 | `INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE` | `runtime.autotune_cache` | bool |
 | `INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE_DIR` | `runtime.autotune_cache_dir` | path |
 | `INFERENCE_SERVER_RUNTIME_NUMERICS` | `runtime.numerics` | `f32` \| `auto` \| `tf32` |
+| `INFERENCE_SERVER_RUNTIME_EXECUTABLE_CACHE` | `runtime.executable_cache` | bool |
 | `INFERENCE_SERVER_RUNTIME_SHARED_HOST_WEIGHTS` | `runtime.shared_host_weights` | bool |
 | `INFERENCE_SERVER_RUNTIME_SHARED_HOST_WEIGHTS_MODE` | `runtime.shared_host_weights_mode` | octal string |
 | `INFERENCE_SERVER_SCHEDULER_DISCIPLINE` | `scheduler.discipline` | `fair` \| `fifo` \| `edf` |

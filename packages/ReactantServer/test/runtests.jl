@@ -43,6 +43,7 @@ include("grpc_helpers.jl")
     include("test_tf32.jl")
     include("test_server_e2e.jl")
     include("test_watcher.jl")
+    include("test_executable_cache.jl")
     include("test_shared_memory.jl")
     include("test_kaimon_ext.jl")
 end

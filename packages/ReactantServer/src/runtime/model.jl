@@ -11,12 +11,16 @@ model's weights are loaded to the device and kept resident, the original behavio
 enabled the initial residency follows `state`: `PINNED_DEVICE` loads to the device at startup;
 `PINNED_SYSTEM` materializes the host floor and starts evicted from the device; `UNPINNED`
 holds no floor and starts fully evicted (the weight cache loads it from the mmap on first
-dispatch). Called once per model at startup.
+dispatch). With `executable_cache = true` on a backend that `supports_executable_cache`, each
+module's compiled program is loaded from, or stored into, the bundle's `.cache/` directory (see
+executable_cache.jl); MLIR hashes are synced first so a changed module never serves a stale
+program. Called once per model at startup and again by the directory watcher on a reload.
 """
 function build_loaded_model(
         backend::AbstractBackend, pool::MemoryPool, entry::ModelEntry;
         state::ResidencyState = UNPINNED, on_demand::Bool = false,
-        store::WeightStore = PrivateWeightStore(), source::Symbol = :startup
+        store::WeightStore = PrivateWeightStore(), source::Symbol = :startup,
+        executable_cache::Bool = false
     )
     m = entry.manifest
     input_names = String[t.name for t in m.executable_inputs]
@@ -72,11 +76,13 @@ function build_loaded_model(
     # The numerics accumulator aggregates what the numerics policy did across all artifacts so the
     # model-loaded log records the model's effective precision in one line.
     nstats = NumericsStats()
+    slots = (executable_cache && supports_executable_cache(backend)) ? executable_cache_slots(entry) : nothing
     execs = Dict{VariantKey, Dict{Int, Any}}()
     for (vkey, batchmap) in entry.mlir_bytes
         inner = Dict{Int, Any}()
         for (sz, bytes) in batchmap
-            inner[sz] = compile_artifact(backend, pool, bytes, np, n_outputs; numerics_stats = nstats)
+            slot = slots === nothing ? nothing : get(slots, (vkey, sz), nothing)
+            inner[sz] = compile_artifact(backend, pool, bytes, np, n_outputs; numerics_stats = nstats, cache = slot)
         end
         execs[vkey] = inner
     end
