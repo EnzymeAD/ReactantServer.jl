@@ -66,15 +66,15 @@ function load_image(path)
     return arr, img
 end
 
-# OUTPUT__0 is [x1,y1,x2,y2,score,class] per detection; the meta emits (6, Ndet). Detect orientation.
+# OUTPUT__0 is [x1,y1,x2,y2,score,class] per detection; the bundle emits (6, Ndet). Detect orientation.
 function parse_detections(out)
     ndims(out) == 2 || (out = reshape(out, length(out) ÷ 6, 6))
     dets = size(out, 1) == 6 ? out : permutedims(out)
     return [
         (;
-                x1 = Float64(dets[1, j]), y1 = Float64(dets[2, j]), x2 = Float64(dets[3, j]),
-                y2 = Float64(dets[4, j]), score = Float64(dets[5, j]), class = round(Int, dets[6, j]),
-            )
+            x1 = Float64(dets[1, j]), y1 = Float64(dets[2, j]), x2 = Float64(dets[3, j]),
+            y2 = Float64(dets[4, j]), score = Float64(dets[5, j]), class = round(Int, dets[6, j]),
+        )
             for j in 1:size(dets, 2)
     ]
 end

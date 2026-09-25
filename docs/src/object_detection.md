@@ -1,47 +1,49 @@
 # Object Detection (GeneralizedRCNN)
 
-A two-stage object detector is the canonical case for a [meta model](meta_models.md). A torchvision
-Faster R-CNN (`torchvision.models.detection.fasterrcnn_resnet50_fpn`, an FPN backbone + RPN +
-RoIHeads GeneralizedRCNN) is mostly dense tensor math, but the middle of the pipeline is not:
-selecting RPN proposals, running NMS, pooling ROI features with `roi_align`, decoding boxes, and the
-final per-class NMS are all data-dependent and cannot be captured by `torch.export` as a single
-static graph. The shape of the work changes with the contents of the tensors, which is exactly
-what a static StableHLO program cannot express.
+A two-stage object detector (an FPN backbone + RPN + RoIHeads GeneralizedRCNN, such as a
+torchvision `fasterrcnn_resnet50_fpn`) is mostly dense tensor math with a data-dependent middle:
+selecting RPN proposals, running NMS, pooling ROI features with ROIAlign, decoding boxes, and the
+final per-class NMS. `torch.export` cannot capture that middle, because the host implementations
+use `findall`, variable-length lists, and loops whose trip count depends on the data.
 
-The package ships a converter that handles this split for you. It produces two dense StableHLO
-bundles for the parts that trace cleanly and a meta bundle whose `model.jl` runs the data-dependent
-glue in Julia between them. The reusable detection math (NMS, `roi_align`, box decode, anchor
-generation) lives in the `ReactantServer.DetectionGlue` module and is already part of the package,
-so the generated `model.jl` is small and the conversion is config-driven.
+For inference none of that needs to be variable-shape. The number of proposals handed to the box
+head is a fixed `K` (1000 in torchvision), every other intermediate is bounded by a configuration
+value, and only the *values* depend on the image. `ReactantServerExport` therefore traces the
+whole detector (stage1, the glue, stage2, and the final NMS) into **one** static StableHLO
+program and serves it as a plain bundle. The glue lives in `ReactantServerExport.Detection`; the
+high-level entry point is `export_two_stage_detector`.
 
-This page walks through converting a standard torchvision detector end to end. For the
-underlying execution model (the meta gate, committed sub-calls, placement) see
-[Meta Models](meta_models.md).
+## Why the glue has a fixed-shape form
 
-## The shape of the conversion
+Each data-dependent step is rewritten over fixed-size buffers with a validity mask:
 
-One source model is emitted as three bundles under the output root:
+- **Proposal selection.** Per FPN level, the top `pre_nms_topk` anchors by objectness come from a
+  stable sort; a level with fewer anchors is padded to `pre_nms_topk` with invalid entries. Clipping
+  and the empty-box filter update the mask instead of dropping rows.
+- **NMS.** Greedy NMS in descending-score order is the unique solution of the recurrence
+  `keep[i] = valid[i] && no kept j before i overlaps i above the threshold`. That recurrence is a
+  DAG in sort order, so iterating it from `keep = valid` reaches exactly the greedy result. Each
+  iteration is one batched `(M x M)` mat-vec, one column per NMS group (an FPN level or a class),
+  inside a traced `while` loop that typically settles in a handful of iterations.
+- **Top-k with ties.** Sorts are stable with an index operand (`Ops.sort(...; is_stable=true)`),
+  so equal scores keep their input order, as the host implementation's stable `sortperm` does.
+  `Base.sortperm` on a traced array is not stable.
+- **ROIAlign.** Each box picks its FPN level from its area, and all levels are concatenated so a
+  single gather serves every box. With adaptive sampling (`sampling_ratio = 0`) the per-box
+  sample grid is `ceil(roi / pooled)` per axis, which is data-dependent; the program loops over the
+  sample index up to the largest grid in the batch and masks out samples a box does not have.
+- **Anchors.** The anchor grid is built in the program from the cell anchors and two iotas, so
+  a multi-shape bundle carries no per-shape anchor constants.
 
-| Bundle | Contents | Kind |
-| --- | --- | --- |
-| `<name>_stage1` | Backbone + RPN head | StableHLO |
-| `<name>_stage2` | Box head + box predictor over a fixed number of ROIs | StableHLO |
-| `<name>` | Chains stage1, then `DetectionGlue`, then stage2, then final NMS | `meta` |
+The program returns a fixed-size, zero-padded `DETECTIONS` buffer (`detections_per_img` rows) plus
+`NUM_DETECTIONS`, and the bundle's `model.jl` trims the buffer to the detections found (see
+[Variable-length results](bundles.md#Variable-length-results)).
 
-`stage1` takes the preprocessed image and returns 14 dense tensors: the four ROI-pooling feature
-maps (`feat_0`-`feat_3`), the five per-level objectness maps (`obj_0`-`obj_4`), and the five
-per-level box deltas (`delta_0`-`delta_4`). `stage2` takes ROI-pooled features for a fixed `K`
-proposals (`[K, 256, 7, 7]` in torch, `(7, 7, 256, K)` in the Julia column-major wire layout) and
-returns `cls_logits` (`[K, num_classes]`) and `bbox_deltas` (`[K, num_classes*4]`). The meta bundle
-owns no weights of its own; it is placed as a group with its two stages and routed by the gateway as
-a single unit (see the placement section of [Meta Models](meta_models.md)).
-
-Only `<name>` is addressable by clients. The two stages are internal to the meta and never appear in
-the gateway's routing table.
-
-Crucially, both stages are plain `nn.Module`s that `torch.export` traces directly: the converter
-builds the torchvision model, wraps `backbone` + `rpn.head` and `box_head` + `box_predictor`, and
-exports them. There is no `torch.jit` load and no reaching into a scripted graph's frozen internals.
+Weights stay program **arguments**: each stage's weights are written to `weights.safetensors`
+prefixed `stage1.` and `stage2.`, and the export refuses a program whose entry arity does not equal
+inputs plus weights. The programs are small next to their weights (the served detectors' programs
+are 104 KB to 9 MB against 159 to 402 MB of weights), which is also how a constant-folding
+regression would show up.
 
 ## Running the converter
 
@@ -66,92 +68,57 @@ handlers:
 
 Relative paths (including `file:` and any option key ending in `_dir`/`_path`) resolve against the
 config file's directory. With `weights: DEFAULT` the converter builds the pretrained COCO model, so
-no source artifact is needed (the runnable demo path); to convert your own trained detector, point
-`weights` at a saved `state_dict` and set `num_classes` to match its head. A handler runs after the
-torch/torchax/triton imports, so it may freely call `pyexec`/`pyimport`.
+no source artifact is needed; to convert your own trained detector, point `weights` at a saved
+`state_dict` and set `num_classes` to match its head.
 
-Run it from the repository root, instantiating against an environment that has torch, torchvision,
-torchax, and `ReactantServerExport`:
+Run it from the repository root, in an environment that has torch, torchvision, torchax, and
+`ReactantServerExport`:
 
 ```text
 julia tools/convert_to_stablehlo.jl <config>.yaml --only my_detector
 ```
 
 Use `--dry-run` to validate the config and handler load without paying torch startup, and `--force`
-to rebuild a bundle that already exists. The run emits `my_detector_stage1`,
-`my_detector_stage2`, and the `my_detector` meta bundle.
+to rebuild a bundle that already exists. The run emits one bundle, `my_detector`.
 
-## The generated meta `model.jl`
+## What the handler does
 
-The handler bakes the per-model config it reads from the live model (the per-level `cell_anchors`,
-the RPN/ROI box-coder weights, the RPN pre-NMS top-k and NMS threshold, and the final
-`score`/`nms`/`detections_per_img`) into the meta bundle's `model.jl`, then registers the
-orchestration with [`register_meta_model`](@ref). The emitted function, lightly abridged, is:
+The handler builds the torchvision model and wraps `backbone` + `rpn.head` (stage1) and
+`box_head` + `box_predictor` (stage2) as two small `nn.Module`s that `torch.export` traces directly.
+It exports each into a scratch directory, reads the programs and weights back with
+`read_stage_bundle`, and fuses them:
 
 ```julia
-const _G = ReactantServer.DetectionGlue
+using ReactantServerExport
 
-function _run(inputs, call)
-    iw = size(inputs[1].data, 1); ih = size(inputs[1].data, 2)
-
-    # Stage 1: backbone + RPN head. 14 dense outputs.
-    s1 = call("my_detector_stage1", inputs)
-    d  = Dict(t.name => t.data for t in s1)
-
-    # Per-level: generate anchors, decode RPN deltas to boxes, flatten objectness.
-    bl = Matrix{Float64}[]; sl = Vector{Float64}[]
-    for i in 1:5
-        O = d[_OBJ[i]]; D = d[_DEL[i]]
-        anc = _G.generate_anchors(size(O, 2), size(O, 1), _STR[i], _CELL[i])
-        push!(bl, _G.decode_boxes(_G.deltas_matrix(D), anc, _RPNW))
-        push!(sl, _G.objectness_flat(O))
-    end
-
-    # Select the top-K proposals (NMS across levels), then ROIAlign the feature maps.
-    pb = _G.select_rpn_proposals(bl, sl, ih, iw; pre=_PRE, post=_K, nms_thresh=_RPNNMS)
-    Kp = size(pb, 1)
-    feats = [_G.feature_chw(d[f]) for f in _FEAT]
-    roi = call.scratch((7, 7, 256, _K), Float32); fill!(roi, 0f0)
-    lv = [_G.assign_level(@view pb[k, :]) for k in 1:Kp]
-    for l in 0:3
-        sel = findall(==(l), lv); isempty(sel) && continue
-        _G.roi_align_wire!(view(roi, :, :, :, sel), feats[l+1], pb[sel, :], _SCALES[l+1];
-                           ratio=2, aligned=false)
-    end
-
-    # Stage 2: box head + predictor on the pooled ROIs, then the final per-class NMS.
-    s2 = call("my_detector_stage2", [ReactantServer.NamedTensor("ROI_FEATS", roi)])
-    d2 = Dict(t.name => t.data for t in s2)
-    cls = permutedims(d2["cls_logits"], (2, 1))[1:Kp, :]
-    dl  = permutedims(d2["bbox_deltas"], (2, 1))[1:Kp, :]
-    bx, sc, cl = _G.fast_rcnn_inference(cls, dl, pb, ih, iw;
-        score_thresh=_SCORE, nms_thresh=_NMS, topk=_TOPK, weights=_ROIW,
-        bg_first=true, min_size=1e-2)
-
-    out = isempty(sc) ? zeros(Float32, 6, 0) :
-        Array{Float32}(permutedims(hcat(bx, sc, Float64.(cl)), (2, 1)))
-    return [ReactantServer.NamedTensor("OUTPUT__0", out)]
-end
-
-register_meta_model("my_detector"; run = _run)
+cfg = DetectorConfig(;
+    strides = [4, 8, 16, 32, 64], scales = [0.25, 0.125, 0.0625, 0.03125],
+    cell_anchors = cells,                     # per level, [A, 4] xyxy, read off the live model
+    rpn_weights, roi_weights,                 # box-coder weights
+    pre_nms_topk = 1000, post_nms_topk = 1000, rpn_nms_thresh = 0.7,
+    score_thresh = 0.05, nms_thresh = 0.5, detections_per_img = 100,
+    # torchvision conventions (the defaults are detectron2's)
+    aligned = false, sampling_ratio = 2, bg_first = true, min_size = 1e-2,
+)
+S1 = read_stage_bundle(stage1_dir); S2 = read_stage_bundle(stage2_dir)
+export_two_stage_detector("models/my_detector"; name = "my_detector",
+    input = IOSpec("INPUT__0", UInt8, [640, 640, 3, 1]; letters = ['w', 'h', 'c', 'a']),
+    stage1 = S1.texts, stage1_weights = S1.weights,
+    stage2 = S2.texts[Int[]], stage2_weights = S2.weights, cfg,
+    output_columns = 6)
 ```
 
-Above `_run`, the handler emits the per-model constants the function references: the FPN strides and
-scales (`_STR`, `_SCALES`), the per-level cell anchors (`_CELL`), the RPN and ROI box-coder weights
-(`_RPNW`, `_ROIW`), the RPN pre-NMS top-k (`_PRE`) and NMS threshold (`_RPNNMS`), and the final
-`score`/`nms`/`detections_per_img` (`_SCORE`, `_NMS`, `_TOPK`). With `output_cols: 5` the output
-assembly line instead emits `[box4, score]` rows.
+Stage1 takes the image and returns 14 dense tensors: the four ROI-pooling feature maps, the five
+per-level objectness maps, and the five per-level box deltas. Stage2 takes ROI-pooled features for
+`K` proposals (`[K, 256, 7, 7]` in torch) and returns `cls_logits` and `bbox_deltas`. The
+`DetectorConfig` fields that differ between frameworks:
 
-Every data-dependent step is a plain function in `ReactantServer.DetectionGlue`:
-`generate_anchors`, `decode_boxes`, `select_rpn_proposals`, `roi_align_wire!`, `assign_level`, and
-`fast_rcnn_inference`. A few `DetectionGlue` knobs select the torchvision conventions:
-`roi_align_wire!(...; aligned=false)` uses torchvision's ROIAlign offset and malformed-ROI clamp,
-and `fast_rcnn_inference(...; bg_first=true, min_size=1e-2)` treats class 0 as background and
-drops sub-pixel final boxes the way torchvision's `postprocess_detections` does. The ROI feature
-tensor is the large intermediate handed between stages, so it is allocated from the worker's reuse
-pool with `call.scratch`; in a fleet that buffer is backed by a shared-memory slot so the sub-call
-sends it by reference instead of serializing it (see the `call.scratch` section of
-[Meta Models](meta_models.md)).
+| Field | detectron2 (default) | torchvision |
+| --- | --- | --- |
+| `aligned` | `true` (half-pixel ROIAlign offset) | `false` (and malformed ROIs clamp to 1 px) |
+| `sampling_ratio` | `0` (adaptive) | `2` |
+| `bg_first` | `false` (background is the last class column) | `true` (background is column 0) |
+| `min_size` | `0.0` | `1e-2` (drop sub-pixel final boxes) |
 
 ## Options and assumptions
 
@@ -164,22 +131,40 @@ sends it by reference instead of serializing it (see the `call.scratch` section 
 | `output_cols` | `6` | Per-detection width: `5` = `[box4, score]`, `6` = `[box4, score, class]`. |
 | `input_shapes` | none | Optional `[W, H]` pairs for extra aspect ratios, one weight set. |
 
-Each `input_shapes` edge must be divisible by 64. The meta routes each request to the matching
-variant by its input shape; stage2 is shared, because its ROI input is always the fixed 7x7 grid.
+Each `input_shapes` edge must be divisible by 64. Every variant is its own program in the same
+bundle, sharing one weight set, and the server routes each request to the variant matching its
+input shape. Boxes are clipped to the input's own width and height, which also covers letterboxed
+inputs.
 
 Two assumptions are worth calling out:
 
-- **Input is a batched RGB image.** The client sends an NCHW image (`[1, 3, H, W]`) at the compiled
-  size; stage1 bakes the ImageNet normalization (and the `/255` for `u8`) so the client sends a
-  raw image. The served wrapper letterboxes to one of the compiled `image_size`/`input_shapes`;
-  the model is not resized at run time.
+- **Input is one RGB image.** The client sends an NCHW image (`[1, 3, H, W]`, Julia `(W, H, 3, 1)`)
+  at a compiled size; stage1 bakes the ImageNet normalization (and the `/255` for `u8`), so the
+  client sends a raw image, resized or letterboxed to a compiled size. The model is not resized at
+  run time.
 - **Class ids follow torchvision.** With `output_cols: 6` the emitted class is the torchvision label
   (`1..num_classes-1`); background (class 0) is dropped.
+
+## Validating a conversion
+
+Compare against a reference as **detection sets**, not as ordered lists. When two overlapping
+detections score within about `1e-6` of each other (a saturated softmax, for example 0.9999964 vs
+0.9999958), a last-digit difference in the ROI features decides which one NMS keeps. The traced
+ROIAlign accumulates in Float32, so its features can differ from a Float64 host implementation by
+a few `1e-6`, which is far smaller than the difference between a GPU run (TF32) and any CPU run.
+Inlining stage1 into the larger program also lets XLA compile it slightly differently, which can
+reorder near-tied proposals without changing the final detections. A good acceptance check: every
+reference detection has a served one with the same class, a box within half a pixel, and a score
+within `1e-4`, and the counts match; report any unmatched detection together with its score gap to
+its nearest neighbour.
+
+The `ReactantServerExport` test suite checks the traced glue this way against a host
+implementation, for both convention sets, on synthetic stage outputs.
 
 ## Runnable example
 
 `examples/object_detection/` in the repository is a complete, runnable version of this walkthrough:
-export a torchvision Faster R-CNN pretrained on COCO into StableHLO bundles, serve them on a single
+export a torchvision Faster R-CNN pretrained on COCO into one StableHLO bundle, serve it on a single
 GPU, send an image, and draw the predicted boxes + COCO labels back onto it with CairoMakie
 (`detections.jpg`). The demo model is named `object_detector`, configured by
 `examples/object_detection/detector.convert.yaml`:
@@ -213,7 +198,7 @@ done
 Then run the three steps in order (the server stays running; drive it from a second terminal):
 
 ```text
-# 1. Export the bundles (first time only; writes ./bundles/). Needs network for the COCO weights.
+# 1. Export the bundle (first time only; writes ./bundles/). Needs network for the COCO weights.
 julia --project=examples/object_detection/export \
     examples/object_detection/export/export.jl
 
@@ -232,20 +217,20 @@ Pass your own image to step 3 as the first argument (a local path). The server p
 ### Export
 
 `export/export.jl` drives the shared converter in-process, so torch imports before Reactant (the
-converter's required order), and writes `examples/object_detection/bundles/` with the
-`object_detector`, `object_detector_stage1`, and `object_detector_stage2` bundles. It skips
-conversion when the bundles already exist (delete the `bundles/` dir to re-export). The pretrained
-COCO weights are downloaded by torchvision on the first run, so export needs network. On corporate
-networks `export.jl` points Python's TLS at the OS CA bundle (`SSL_CERT_FILE`, defaulting from
-`REQUESTS_CA_BUNDLE`/`CURL_CA_BUNDLE`/`JULIA_SSL_CA_ROOTS_PATH` or
-`/etc/ssl/certs/ca-certificates.crt`) so the weight download trusts a MitM proxy's CA. The Python
-dependencies are export-only: torch/torchax/jax come from `ReactantServerExport`'s CondaPkg and
-`torchvision` from `export/CondaPkg.toml`; CondaPkg resolves and installs them on the first export.
+converter's required order), and writes the `object_detector` bundle under
+`examples/object_detection/bundles/`. It skips conversion when the bundle already exists (delete the
+`bundles/` dir to re-export). The pretrained COCO weights are downloaded by torchvision on the first
+run, so export needs network. On corporate networks `export.jl` points Python's TLS at the OS CA
+bundle (`SSL_CERT_FILE`, defaulting from `REQUESTS_CA_BUNDLE`/`CURL_CA_BUNDLE`/
+`JULIA_SSL_CA_ROOTS_PATH` or `/etc/ssl/certs/ca-certificates.crt`) so the weight download trusts a
+MitM proxy's CA. The Python dependencies are export-only: torch/torchax/jax come from
+`ReactantServerExport`'s CondaPkg and `torchvision` from `export/CondaPkg.toml`; CondaPkg resolves
+and installs them on the first export.
 
 ### Serve
 
-`server/serve.jl` serves the `object_detector` meta bundle on `127.0.0.1:$OD_PORT` (default 8080)
-and blocks until Ctrl-C. Pass `--cpu` to use `ReactantServer.CPU_BACKEND` for a GPU-free smoke test;
+`server/serve.jl` serves the `object_detector` bundle on `127.0.0.1:$OD_PORT` (default 8080) and
+blocks until Ctrl-C. Pass `--cpu` to use `ReactantServer.CPU_BACKEND` for a GPU-free smoke test;
 otherwise it uses `ReactantServer.CUDA_BACKEND`.
 
 ### Client
@@ -260,13 +245,31 @@ boxes in the 640x640 input pixel space, `class` a COCO id mapped to a name throu
 `categories` table in `detect.jl`. The model bakes a 0.05 score threshold; the client
 additionally only draws detections scoring at least 0.5.
 
-On the first true end-to-end run, watch the client's `Raw output size=...` log line: it confirms the
-`OUTPUT__0` orientation (`parse_detections` handles either), and sanity-check that the drawn boxes
-land on the right objects.
+## Reactant tracing pitfalls
+
+Each of these cost an iteration while building the traced glue, and applies to any hand-written
+traced export:
+
+- **A returned `reshape` wrapper is emitted with its parent's shape.** `reshape(x, 2, 4, 6, 1)` as a
+  function result produced an `(8, 6)` program output, and the server trusts the executable's shape,
+  not the manifest. Materialize outputs with `Reactant.ReactantCore.materialize_traced_array`.
+- **`@trace while` bodies.** Loop-carried values must be distinct arrays (`copy` before the loop),
+  and captured values must be materialized traced arrays, not `reshape` wrappers. Referencing a type
+  parameter such as `T(0.5)` inside the body breaks the macro; hoist constants out of the loop.
+- **`map(1:n) do ... end` inside a trace failed;** plain `for` loops work.
+- **Matrix products.** A traced `A * B` fell back to generic LinearAlgebra in one context; use
+  `Ops.dot_general`. Number constructors on traced scalars (`Float32(x)`, `Int64(x)`, `sign(x)`) are
+  not traceable; use `Ops.convert(TracedRArray{Int64, N}, x)` and `ifelse`.
+- **Sorting.** `Base.sortperm` on traced arrays is not stable; use `Ops.sort(...; is_stable=true)`
+  with an index operand where tie order matters.
+- **Gathers.** `A[:, idx]` needs `idx` to be a materialized traced `Int64` vector.
+- **Per-shape constants add up.** Baking anchor grids as Float64 constants added about 200 MB to a
+  15-variant bundle; build such grids in the program from iotas instead.
 
 ## See also
 
-- [Meta Models](meta_models.md) for the execution model, gating, deadlines, and placement
-- [Bundles & model.jl](bundles.md) for the plain bundle path and the manifest encoding
+- [Bundles & model.jl](bundles.md) for the plain bundle path, the manifest encoding, and the
+  fixed-size buffer + trim pattern
 - [Client Usage](client.md) for the client library the demo uses
-- [`register_meta_model`](@ref) in the API reference
+- `export_two_stage_detector`, `DetectorConfig`, and `read_stage_bundle` in the
+  [API reference](api.md)
