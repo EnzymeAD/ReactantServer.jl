@@ -42,12 +42,10 @@ on nothing but `Base`. It matches the HuggingFace Rust tokenizer, including the 
 unassigned codepoints stay in the word, ASCII symbols like `` $ + < = > ^ ` | ~ `` count as
 punctuation, `LongestFirst` pair truncation, and special-token literals in raw text.
 
-`BertText` is the request-side counterpart to `ReactantServer.DetectionGlue` (the reusable
-detection math behind the [Object Detection](object_detection.md) converter): shared code lives in
-the package, per-model configuration is baked into `model.jl`, and the only tokenizer asset the
-export driver copies into a bundle is the checkpoint's `vocab.txt` (loaded at serve time relative
-to `model.jl`'s directory). A bundle exported this way needs a server that has `BertText`, the
-same version coupling the detector bundles already accept for `DetectionGlue`.
+Shared code lives in the package and per-model configuration is baked into `model.jl`: the only
+tokenizer asset the export driver copies into a bundle is the checkpoint's `vocab.txt` (loaded at
+serve time relative to `model.jl`'s directory). A bundle exported this way needs a server that has
+`BertText`, so the bundle and the server version are coupled.
 
 `preprocess` turns the wire tensors into the executable's token-id inputs. The single-sequence
 models (`splade`, `embedding`, `sentiment`) call `encode_text_batch` and emit `input_ids` +
@@ -241,5 +239,6 @@ sentiment labels (0 NEGATIVE, 1 POSITIVE) with their probabilities.
 
 - `examples/transformers/` for the runnable end-to-end example (export, serve, client)
 - [Bundles & model.jl](bundles.md) for the bundle contract, `IOSpec`, and the manifest encoding
-- [Object Detection](object_detection.md) for the data-dependent (meta) export path
+- [Object Detection](object_detection.md) for exporting a detector's data-dependent middle as one
+  static program
 - [Client Usage](client.md) for building requests with `InferInput`/`InferOutput`

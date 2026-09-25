@@ -1,7 +1,7 @@
 # Object detection demo
 
 Serving an object detector with ReactantServer, end to end: export a torchvision Faster R-CNN
-(`fasterrcnn_resnet50_fpn`, pretrained on COCO) into StableHLO bundles, serve them on a single GPU,
+(`fasterrcnn_resnet50_fpn`, pretrained on COCO) into one StableHLO bundle, serve it on a single GPU,
 send an image, and draw the predicted boxes + COCO labels back onto it with CairoMakie.
 
 It is split into three single-purpose Julia environments so each loads only what it needs (and they
@@ -19,7 +19,7 @@ done
 Then run the three steps in order (the server stays running; drive it from a second terminal):
 
 ```sh
-# 1. Export the bundles (first time only; writes ./bundles/). Needs network for the COCO weights.
+# 1. Export the bundle (first time only; writes ./bundles/). Needs network for the COCO weights.
 julia --project=examples/object_detection/export examples/object_detection/export/export.jl
 
 # 2. Serve on a single GPU (blocks; Ctrl-C to stop). Add --cpu for a GPU-free smoke test.

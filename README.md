@@ -53,9 +53,10 @@ and what each one optimizes for.
   restart (`static` and `explicit` control modes are also available). A model is named by its
   bundle directory, and a renamed directory (a registry promotion such as `-staging` to
   `-production`) renames the live model in place with no recompile. → [Node Configuration](https://enzymead.github.io/ReactantServer.jl/dev/node_config/)
-- **Meta models.** A `kind: meta` bundle chains several models with data-dependent Julia between
-  stages: its `model.jl` registers a `run` hook that calls sub-models, runs off the GPU dispatch
-  loop, and re-enters the scheduler for each sub-call. → [Meta Models](https://enzymead.github.io/ReactantServer.jl/dev/meta_models/)
+- **Meta models (experimental).** A `kind: meta` bundle chains several models with data-dependent
+  Julia between stages: its `model.jl` registers a `run` hook that calls sub-models, runs off the
+  GPU dispatch loop, and re-enters the scheduler for each sub-call. The design is subject to change;
+  do not build production pipelines on it. → [Meta Models](https://enzymead.github.io/ReactantServer.jl/dev/meta_models/)
 
 ## Quick start
 

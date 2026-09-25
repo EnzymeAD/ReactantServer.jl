@@ -267,9 +267,9 @@ function _select_outputs(outputs::Vector{NamedTensor}, requested::Vector{String}
     byname = Dict(t.name => t for t in outputs)
     return NamedTensor[
         get(
-                () -> error("requested output '$name' is not produced by the model"),
-                byname, name
-            ) for name in requested
+            () -> error("requested output '$name' is not produced by the model"),
+            byname, name
+        ) for name in requested
     ]
 end
 
@@ -537,9 +537,9 @@ end
 function encode_repository_index(PB::Module, entries::AbstractVector{<:Pair})
     models = [
         PB.var"RepositoryIndexResponse.ModelIndex"(;
-                name = String(first(p)), version = "",
-                state = (last(p) ? "READY" : "UNAVAILABLE"), reason = ""
-            ) for p in entries
+            name = String(first(p)), version = "",
+            state = (last(p) ? "READY" : "UNAVAILABLE"), reason = ""
+        ) for p in entries
     ]
     return PB.RepositoryIndexResponse(; models = models)
 end

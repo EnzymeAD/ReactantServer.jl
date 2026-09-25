@@ -27,8 +27,9 @@ jobs:
         with:
           version: '1.12'
       - uses: julia-actions/cache@a45e8fa8be21c18a06b7177052533149e61e9b38 # v3.1.0
-      - uses: fredrikekre/runic-action@96f1a78f233c313e349afcb770728471371d5887 # v1
+      - uses: fredrikekre/runic-action@26bdc21c15f81fbd4c7605a5f94fb5a0060820a6 # v1.4.0
         with:
-          # Keep in sync with the local `runic` CLI:
-          #   julia -e 'using Pkg; Pkg.Apps.add("Runic")'
-          version: '1.7'
+          # Keep in sync with the local `runic` CLI: Runic versions format differently, so a local
+          # runic that is newer or older than this fails the check on files the hook reformatted.
+          #   julia -e 'using Pkg; Pkg.Apps.add("Runic")'     # or Pkg.Apps.update("Runic")
+          version: '1.11'

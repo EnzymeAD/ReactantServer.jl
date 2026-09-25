@@ -1,10 +1,10 @@
-# Step 1 of 3: export the object detection bundles.
+# Step 1 of 3: export the object detection bundle.
 #
 #   julia --project=examples/object_detection/export examples/object_detection/export/export.jl
 #
-# Writes examples/object_detection/bundles/{object_detector, _stage1, _stage2}. Skips if present
-# (delete the bundles dir to re-export). Drives the shared converter in-process so torch imports
-# before Reactant (the converter's required order).
+# Writes examples/object_detection/bundles/object_detector, one bundle whose single program runs the
+# whole detector. Skips if present (delete the bundles dir to re-export). Drives the shared
+# converter in-process so torch imports before Reactant (the converter's required order).
 
 const CONFIG = normpath(joinpath(@__DIR__, "..", "detector.convert.yaml"))
 const CONVERTER = normpath(joinpath(@__DIR__, "..", "..", "..", "tools", "convert_to_stablehlo.jl"))

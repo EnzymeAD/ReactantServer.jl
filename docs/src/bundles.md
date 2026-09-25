@@ -93,7 +93,32 @@ declare the client-facing tensors via `client_inputs` / `client_outputs` in the 
 [`register_model`](@ref) in the API reference for the exact hook signatures.
 
 For a bundle whose `model.jl` chains several models with data-dependent logic rather than wrapping
-one executable, see [Meta Models](meta_models.md).
+one executable, see [Meta Models](meta_models.md). That feature is experimental and its design is
+subject to change; prefer a single program with the fixed-size result pattern below where possible.
+
+## Variable-length results
+
+A StableHLO program has static output shapes, so a model whose result count depends on the data
+(detections, matches, tokens above a threshold) returns a **fixed-size buffer plus a count**: the
+program fills the first `n` rows of a buffer sized to the configured maximum, zeroes the rest, and
+returns `n` as a second output. A `model.jl` postprocess hook trims the buffer, so clients receive
+exactly the rows that exist:
+
+```julia
+# model.jl: DETECTIONS is (columns, max_detections), NUM_DETECTIONS is Int64[n]
+function _trim(outputs)
+    by = Dict(t.name => t.data for t in outputs)
+    n = Int(by["NUM_DETECTIONS"][1])
+    return [ReactantServer.NamedTensor("OUTPUT__0", by["DETECTIONS"][:, 1:n])]
+end
+
+register_model(basename(@__DIR__); postprocess = _trim)
+```
+
+The manifest declares the executable outputs at their fixed sizes and the trimmed client output with
+a variable axis (`-1`) under `client_outputs`. Inside the program, variable selections become masks
+over fixed-size arrays rather than `findall`; the two-stage detectors are the worked example, see
+[Object Detection](object_detection.md).
 
 ## Producing bundles
 

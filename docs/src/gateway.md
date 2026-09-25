@@ -179,8 +179,8 @@ on zeros:
   charge N times the per-request cost; counting rows without reporting an axis would divide the
   cost by N and then charge one of them.
 
-A meta is also the clearest argument for `compute` over `items`. Its work is data-dependent (a
-detection meta's ROI count varies per image, and its Julia glue is not GPU time at all), so no
+A meta is also the clearest argument for `compute` over `items`. Its work is data-dependent (the
+glue between stages can vary per request, and it is not GPU time at all), so no
 item count predicts it, while under `items` the most expensive thing on the fleet would charge
 one unit and a cheap batched model would charge 32. Note that a meta's `total_compute` counts its
 sub-call GPU time only, and its sub-models are folded into it and hidden from the gateway, so

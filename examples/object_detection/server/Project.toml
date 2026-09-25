@@ -11,7 +11,6 @@ gRPCClient = "aaca4a50-36af-4a1d-b878-4c443f2061ad"
 gRPCServer = "608c6337-0d7d-447f-bb69-0f5674ee3959"
 
 [sources]
-HTTP = {path = "../../../lib/HTTP.jl"}
 ReactantServer = {path = "../../../packages/ReactantServer"}
 ReactantServerCore = {path = "../../../packages/ReactantServerCore"}
 

@@ -932,16 +932,16 @@ function _aff_server(port::Integer, w::AffMockWorker)
                 residency_mode = "self_managed", discipline = w.discipline,
                 models = [
                     ACtl.ModelStatus(;
-                            name = m,
-                            weight_nbytes = Int64(256 * 1024 * 1024),
-                            total_compute_seconds = get(w.compute, m, 0.0),
-                            requests_served = UInt64(get(w.served, m, 0)),
-                            rows_served = UInt64(get(w.rows, m, 0)),
-                            dispatch_count = UInt64(get(w.served, m, 0)),
-                            max_batch_size = Int64(8),
-                            batch_input_name = w.batch_at[1],
-                            batch_axis = Int64(w.batch_at[2])
-                        )
+                        name = m,
+                        weight_nbytes = Int64(256 * 1024 * 1024),
+                        total_compute_seconds = get(w.compute, m, 0.0),
+                        requests_served = UInt64(get(w.served, m, 0)),
+                        rows_served = UInt64(get(w.rows, m, 0)),
+                        dispatch_count = UInt64(get(w.served, m, 0)),
+                        max_batch_size = Int64(8),
+                        batch_input_name = w.batch_at[1],
+                        batch_axis = Int64(w.batch_at[2])
+                    )
                         for m in w.models
                 ],
                 weight_cache_max_bytes = UInt64(8) * 1024^3

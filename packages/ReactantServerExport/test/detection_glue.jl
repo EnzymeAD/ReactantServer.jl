@@ -1,8 +1,8 @@
-# LEGACY: kept only for existing two-stage detector meta bundles whose model.jl references
-# ReactantServer.DetectionGlue. New detectors export as one StableHLO program with
-# ReactantServerExport.export_two_stage_detector (the traced glue in ReactantServerExport.Detection)
-# and need nothing from the server.
-#
+# Test oracle for ReactantServerExport.Detection: the host-side detection glue the two-stage
+# detector meta bundles ran in Julia (formerly ReactantServer.DetectionGlue, Float64, loops and
+# findall). The traced glue is checked against it; keeping it only in the tests is what lets the
+# runtime drop it.
+
 # Julia detection glue for two-stage object detectors (FPN backbone + RPN + RoIHeads, e.g. a
 # torchvision Faster R-CNN). Ports the data-dependent pipeline that sits between the two StableHLO
 # executables: anchor generation, box decode, RPN proposal NMS, ROIAlign, and per-class final NMS.

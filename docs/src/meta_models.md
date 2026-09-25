@@ -4,6 +4,16 @@ CurrentModule = ReactantServer
 
 # Meta Models
 
+!!! warning "Experimental"
+    Meta models are an experimental feature and their design is subject to change, including the
+    manifest keys, the `register_meta_model` hook, the `call`/`call.scratch` interface, and the
+    scheduling behavior described below. Do not build production pipelines on them. Most logic that
+    looks data-dependent has a fixed-shape form that exports as a plain bundle: the two-stage
+    object detectors this feature was first built for now compile to a single StableHLO program
+    (see [Object Detection](object_detection.md)), and a variable-length result is a fixed-size
+    buffer plus a count trimmed by a `model.jl` hook (see
+    [Variable-length results](bundles.md#Variable-length-results)).
+
 A meta model is a bundle whose `model.jl` orchestrates *other* models with ordinary Julia in
 between, rather than wrapping a single compiled executable. It exists for the logic `torch.export`
 cannot trace: data-dependent control flow, loops whose bounds depend on a tensor's contents, or a
@@ -13,7 +23,7 @@ own name exactly like any other model.
 
 If your model is a single traced graph, use a plain bundle with optional pre/post hooks (see
 [Bundles](bundles.md)). Reach for a meta model only when the glue between sub-models is real
-program logic.
+program logic with no fixed-shape form, and keep in mind that the feature is experimental.
 
 ## Anatomy
 
@@ -175,8 +185,8 @@ sub-call as a contiguous array (a reshape or contiguous prefix is fine).
 
 ## See also
 
-- [Object Detection](object_detection.md) for a worked end-to-end meta model: converting a
-  torchvision Faster R-CNN into two StableHLO stages chained by data-dependent Julia glue
+- [Object Detection](object_detection.md) for how a two-stage detector, the original motivating
+  case for meta models, exports as one plain bundle instead
 - [Bundles](bundles.md) for the plain (non-meta) bundle path and pre/post hooks
 - [Multi-GPU Gateway](gateway.md) for how the gateway routes and places models
 - [Node Configuration](node_config.md) for the scheduling disciplines, including `edf`

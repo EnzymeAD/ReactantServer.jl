@@ -206,7 +206,7 @@ validation, and the shared-memory data path.
 - [On-demand Weights](on_demand_weights.md): serving more models than fit in GPU memory.
 - [Gateway](gateway.md): multi-GPU deployments behind one client endpoint.
 - [Client](client.md): the full client API and data paths.
-- [Meta Models](meta_models.md) and the worked examples [Object Detection](object_detection.md)
-  and [Transformers](transformers.md).
+- The worked examples [Object Detection](object_detection.md) and [Transformers](transformers.md).
+- [Meta Models](meta_models.md), an experimental feature whose design is subject to change.
 - [Deployment](deployment.md): systemd, Docker, health, and metrics.
 - [API](api.md): every documented name, collected automatically.

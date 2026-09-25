@@ -1,5 +1,5 @@
 # Handlers-only conversion config for the object detection demo: builds a single torchvision
-# Faster R-CNN (pretrained COCO) into three StableHLO bundles under ./bundles/ with no Triton
+# Faster R-CNN (pretrained COCO) into one StableHLO bundle under ./bundles/ with no Triton
 # source repository. Run from this directory:
 #
 #   julia --project=. ../../tools/convert_to_stablehlo.jl detector.convert.yaml --only object_detector

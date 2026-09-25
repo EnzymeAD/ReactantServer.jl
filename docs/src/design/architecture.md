@@ -234,16 +234,17 @@ and the histogram of coalesced batch sizes, plus weight cache residency and load
 
 ### Meta models
 
-A `kind: meta` bundle does not wrap a single executable. Its `model.jl` registers a `run` hook that
-chains several ordinary models with data-dependent Julia between the stages, the shape that an
-exported static graph cannot capture (a detector's per-image proposal count, for instance). The
+Meta models are experimental and their design is subject to change. A `kind: meta` bundle does not
+wrap a single executable. Its `model.jl` registers a `run` hook that chains several ordinary models
+with data-dependent Julia between the stages, for logic with no fixed-shape form. The
 orchestration runs on the request task, off the dispatch loop, under a gate that admits one meta at
 a time by default so meta glue never blocks the GPU; each sub-call it makes re-enters the scheduler
 as a committed request (step 1 of the decision order above) and is dispatched and coalesced like
-any other work. The meta's remaining deadline budget rides along to those sub-calls. The
-[Object Detection](../object_detection.md) guide is a worked example, a torchvision Faster
-R-CNN split into two StableHLO stages joined by Julia detection glue. See
-[Meta Models](../meta_models.md) for the full model.
+any other work. The meta's remaining deadline budget rides along to those sub-calls. Two-stage
+detectors, the original motivating case, no longer need it: their proposal selection, NMS, and
+ROIAlign have fixed-shape forms and compile into one program (see
+[Object Detection](../object_detection.md)). See [Meta Models](../meta_models.md) for the full
+model.
 
 ## The compiler advantage
 

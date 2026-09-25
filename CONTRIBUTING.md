@@ -47,6 +47,11 @@ Install the `runic` CLI (Julia ≥ 1.12 provides it as a Pkg app):
 julia -e 'using Pkg; Pkg.Apps.add("Runic")'
 ```
 
+Keep it on the same minor version as the CI check (`version:` in `.github/workflows/format.yml`,
+currently 1.11). Output can differ between Runic versions, so a local `runic` that is older or newer
+than CI's makes the pre-commit hook produce formatting the check rejects. Update it with
+`julia -e 'using Pkg; Pkg.Apps.update("Runic")'`.
+
 Format in place (repo, directory, or single file):
 
 ```
