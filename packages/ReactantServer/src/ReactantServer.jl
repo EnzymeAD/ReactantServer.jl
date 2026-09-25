@@ -72,6 +72,7 @@ include("watcher.jl")
 
 # Self-contained detection glue (anchors/decode/NMS/roi_align) for two-stage detector meta models.
 # Referenced from a bundle's model.jl as ReactantServer.DetectionGlue. No deps on the runtime above.
+# Legacy: new detectors export as one program (ReactantServerExport.export_two_stage_detector).
 include("postprocess/detection.jl")
 
 # Self-contained BERT WordPiece tokenization + wire padding for text bundles. Referenced from a

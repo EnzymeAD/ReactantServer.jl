@@ -125,7 +125,8 @@ before exposing an endpoint.
 - [On-demand Weights](on_demand_weights.md): host-RAM weights and the LRU byte budget.
 - [Multi-GPU Gateway](gateway.md): the reverse proxy and its scheduling modes.
 - [Client Usage](client.md): the Reactant-free client and its shared-memory transport.
-- [Meta Models](meta_models.md): chaining models with data-dependent Julia between stages.
+- [Meta Models](meta_models.md) (experimental): chaining models with data-dependent Julia between
+  stages.
 - The worked examples, [Object Detection](object_detection.md) and
   [Transformer Text Models](transformers.md), end to end.
 - [Deployment](deployment.md): systemd, Docker, monitoring, and the deployment shapes.

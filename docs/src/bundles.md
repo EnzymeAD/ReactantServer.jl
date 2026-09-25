@@ -93,7 +93,8 @@ declare the client-facing tensors via `client_inputs` / `client_outputs` in the 
 [`register_model`](@ref) in the API reference for the exact hook signatures.
 
 For a bundle whose `model.jl` chains several models with data-dependent logic rather than wrapping
-one executable, see [Meta Models](meta_models.md).
+one executable, see [Meta Models](meta_models.md). That feature is experimental and its design is
+subject to change; prefer a single program with the fixed-size result pattern below where possible.
 
 ## Variable-length results
 
