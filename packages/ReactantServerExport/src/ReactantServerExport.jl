@@ -26,6 +26,7 @@ const Compiler = Reactant.Compiler
 
 export IOSpec, write_bundle, export_bundle, collect_provenance
 export bundle_entry_arity, bundle_arity_report, assert_bundle_arity
+export DetectorConfig, export_two_stage_detector, read_stage_bundle, stablehlo_text
 
 # ============================================================================
 # Provenance
@@ -748,15 +749,15 @@ function export_bundle(
     # Manifest is Julia order; batch axis is the 0-based Julia axis (nothing stays unbatched).
     in_specs = [
         IOSpec(
-                innames[i], eltype(example_inputs[i]), in_shapes[i];
-                batch_axis = in_axes[i] === nothing ? nothing : in_axes[i] - 1
-            ) for i in 1:nin
+            innames[i], eltype(example_inputs[i]), in_shapes[i];
+            batch_axis = in_axes[i] === nothing ? nothing : in_axes[i] - 1
+        ) for i in 1:nin
     ]
     out_specs = [
         IOSpec(
-                outnames[i], eltype(y0[i]), collect(Int, size(y0[i]));
-                batch_axis = out_axes[i] === nothing ? nothing : out_axes[i] - 1
-            ) for i in 1:nout
+            outnames[i], eltype(y0[i]), collect(Int, size(y0[i]));
+            batch_axis = out_axes[i] === nothing ? nothing : out_axes[i] - 1
+        ) for i in 1:nout
     ]
     prov = merge(_reactant_base_provenance(), Dict{String, Any}(provenance))
 
@@ -811,6 +812,10 @@ function export_bundle(
     end
     return dir
 end
+
+include("detection.jl")
+using .Detection: DetectorConfig
+include("two_stage_detector.jl")
 
 # ============================================================================
 # Extension seams: defined here (so callers reach them as ReactantServerExport.X) and given

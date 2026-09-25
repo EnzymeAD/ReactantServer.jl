@@ -270,6 +270,8 @@ _load_manifest(dir) = ReactantServer.parse_manifest(
         end
     end
 
+    include("test_detection.jl")
+
     if HAS_TORCH
         np = pyimport("numpy")
         torch = pyimport("torch")
