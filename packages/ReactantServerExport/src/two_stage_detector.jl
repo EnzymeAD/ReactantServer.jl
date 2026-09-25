@@ -23,13 +23,15 @@ end
 """
     read_stage_bundle(dir) -> (; texts, weights, input_shapes)
 
-Read a written bundle back as the pieces [`export_two_stage_detector`](@ref) takes for one stage:
-`texts` maps each input-shape variant key (`Int[]` for a single-shape bundle, otherwise the
-manifest `input_shapes` entry in (input, axis) order of the variable axes) to the StableHLO text of
-its program, `weights` is the `name => array` list in `argument_order` with each array in the axis
-order of the program's StableHLO signature (for a torch export, torch order), which is what
-`Ops.hlo_call` takes, and `input_shapes` lists the variant keys in manifest order. Each variant must
-carry exactly one module (one batch size).
+Read a stage bundle's programs and weights back for fusing.
+
+Returns the pieces [`export_two_stage_detector`](@ref) takes for one stage: `texts` maps each
+input-shape variant key (`Int[]` for a single-shape bundle, otherwise the manifest `input_shapes`
+entry in (input, axis) order of the variable axes) to the StableHLO text of its program, `weights`
+is the `name => array` list in `argument_order` with each array in the axis order of the program's
+StableHLO signature (for a torch export, torch order), which is what `Ops.hlo_call` takes, and
+`input_shapes` lists the variant keys in manifest order. Each variant must carry exactly one module
+(one batch size).
 """
 function read_stage_bundle(dir::AbstractString)
     d = String(dir)
@@ -85,9 +87,11 @@ register_model(basename(@__DIR__); postprocess = _trim)
                               input_shapes=nothing, output_columns=6, output_layout=:cn,
                               glue_precision=Float64, provenance=Dict()) -> dir
 
-Export a two-stage (FPN + RPN + RoIHeads) detector as ONE plain bundle: stage1, the traced
-`ReactantServerExport.Detection` glue, stage2, and the per-class NMS compile to a single StableHLO program per
-input shape, and a `model.jl` postprocess hook trims the program's fixed-size detection buffer.
+Export a two-stage detector as one plain bundle.
+
+Stage1, the traced `ReactantServerExport.Detection` glue, stage2, and the per-class NMS compile to a
+single StableHLO program per input shape, and a `model.jl` postprocess hook trims the program's
+fixed-size detection buffer.
 
 - `input`: the client image [`IOSpec`](@ref), for example
   `IOSpec("INPUT__0", UInt8, [512, 512, 1]; letters = ['w', 'h', 'c'])`. Its first two Julia axes
