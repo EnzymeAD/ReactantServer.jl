@@ -194,9 +194,9 @@ function check_model(bundle::String)
             xs = [make_input(e, n, rng) for e in inputs]
             in_tensors = [
                 _Inf.var"ModelInferRequest.InferInputTensor"(;
-                        name = inputs[i].name, datatype = KSERVE_OF[eltype(xs[i])],
-                        shape = collect(Int64, reverse(size(xs[i])))
-                    ) for i in eachindex(xs)
+                    name = inputs[i].name, datatype = KSERVE_OF[eltype(xs[i])],
+                    shape = collect(Int64, reverse(size(xs[i])))
+                ) for i in eachindex(xs)
             ]
             req = _Inf.ModelInferRequest(;
                 model_name = bundle, inputs = in_tensors,

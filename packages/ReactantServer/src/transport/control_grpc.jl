@@ -35,22 +35,22 @@ function _handle_model_control_status(ctx::InferContext)
     snap = control_status(ctx.sched)
     models = [
         _CTRL.ModelStatus(;
-                name = String(name),
-                residency = _from_core_residency(m.state),
-                device_resident = m.device_resident, host_resident = m.host_resident,
-                weight_nbytes = m.weight_nbytes, weight = m.weight, queue_depth = m.queue_depth,
-                total_compute_seconds = m.total_compute,
-                requests_served = UInt64(m.requests_served),
-                dispatch_count = UInt64(m.dispatch_count),
-                max_batch_size = Int64(m.max_batch_size),
-                # Routing metadata: where the batch axis is, and the row counter that turns
-                # total_compute_seconds into a cost per ITEM rather than per request. A gateway
-                # that routes by work needs both; omitting either silently degrades it to
-                # counting requests, which is indistinguishable from working.
-                batch_input_name = String(m.batch_input_name),
-                batch_axis = Int64(m.batch_axis),
-                rows_served = UInt64(m.rows_served)
-            )
+            name = String(name),
+            residency = _from_core_residency(m.state),
+            device_resident = m.device_resident, host_resident = m.host_resident,
+            weight_nbytes = m.weight_nbytes, weight = m.weight, queue_depth = m.queue_depth,
+            total_compute_seconds = m.total_compute,
+            requests_served = UInt64(m.requests_served),
+            dispatch_count = UInt64(m.dispatch_count),
+            max_batch_size = Int64(m.max_batch_size),
+            # Routing metadata: where the batch axis is, and the row counter that turns
+            # total_compute_seconds into a cost per ITEM rather than per request. A gateway
+            # that routes by work needs both; omitting either silently degrades it to
+            # counting requests, which is indistinguishable from working.
+            batch_input_name = String(m.batch_input_name),
+            batch_axis = Int64(m.batch_axis),
+            rows_served = UInt64(m.rows_served)
+        )
             for (name, m) in snap.models
     ]
     return _CTRL.ModelControlStatusResponse(;
