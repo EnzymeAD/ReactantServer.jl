@@ -14,6 +14,7 @@ Prometheus = "f25c1797-fe98-4e0c-b252-1b4fe3b6bde6"
 ProtoBuf = "3349acd9-ac6a-5e09-bcdb-63829b23a429"
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 ReactantServerCore = "387a5f05-f7b4-4d57-bca9-cd3358e52bdc"
+Reactant_jll = "0192cb87-2b54-54ad-80e0-3be72ad8a3c0"
 SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 SafeTensors = "eeda0dda-7046-4914-a807-2495fc7abb89"
 YAML = "ddb6d928-2868-570f-bddf-ab3f9cf99eb6"
@@ -45,8 +46,15 @@ KaimonGate = "1.3"
 NNlib = "0.9"
 Prometheus = "1.5.1"
 ProtoBuf = "1.3.0"
-Reactant = "0.2.264"
+# 0.2.287 is the first Reactant on a Reactant_jll (0.0.410) built with the executable
+# serialization and allocator-statistics C API (EnzymeAD/Reactant.jl#3277). The Julia side of that
+# API (#3305) is not released yet, so runtime/xla_serialization.jl carries it; see there.
+Reactant = "0.2.287"
 ReactantServerCore = "1.0.0"
+# A floor, not a ceiling: for a 0.0.x version a plain "0.0.410" would admit 0.0.410 alone. The
+# worker calls PjRtLoadedExecutableSerialize and friends directly, so this row states the real
+# requirement even though Reactant's own bound already implies it.
+Reactant_jll = ">= 0.0.410"
 SHA = "0.7, 1"
 SafeTensors = "1.2.1"
 YAML = "0.4.16"

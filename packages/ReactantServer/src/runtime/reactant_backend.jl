@@ -148,27 +148,20 @@ function device_memory_stats(::ReactantBackend, pool::MemoryPool)
     end
 end
 
-# Reactant exposes executable serialization and allocator-statistics control through
-# XLA.serialize_executable, XLA.load_serialized_executable, XLA.clear_memory_stats! and
-# XLA.compiled_memory_stats (EnzymeAD/Reactant.jl, "Add executable serialization, allocator stats
-# reset, and compiled memory stats"). They are feature-detected so this file loads against an older
-# Reactant too; the cache then compiles every program and the memory probe uses its ordering-based
-# fallback, exactly as before.
-const _HAS_EXECUTABLE_SERIALIZATION =
-    isdefined(_RXLA, :serialize_executable) && isdefined(_RXLA, :load_serialized_executable)
-const _HAS_CLEAR_MEMORY_STATS = isdefined(_RXLA, :clear_memory_stats!)
-const _HAS_COMPILED_MEMORY_STATS = isdefined(_RXLA, :compiled_memory_stats)
+# Executable serialization and allocator-statistics control. The C API is in every Reactant_jll the
+# [compat] floor admits (0.0.410+, EnzymeAD/Reactant.jl#3277); the Julia bindings are vendored in
+# xla_serialization.jl until a Reactant release carries #3305. Point this at `_RXLA` then.
+const _XS = VendoredXLA
 
-supports_executable_cache(::ReactantBackend) = _HAS_EXECUTABLE_SERIALIZATION
+supports_executable_cache(::ReactantBackend) = true
 
 # Reset the allocator's high-water mark so the next measurement sees only what runs after it. Only the
-# GPU allocator keeps statistics (the CPU device throws), and a Reactant without the binding reports
-# false, in which case callers keep the ordering-based fallback.
+# GPU allocator keeps statistics (the CPU device throws), so anything else reports false and callers
+# keep the ordering-based fallback.
 function clear_memory_stats!(::ReactantBackend, pool::MemoryPool)
-    _HAS_CLEAR_MEMORY_STATS || return false
     pool.platform == "cuda" || return false
     try
-        _RXLA.clear_memory_stats!(pool.device)
+        _XS.clear_memory_stats!(pool.device)
         return true
     catch err
         @warn "could not reset the device allocator statistics; the memory probe uses the ordering-based estimate" exception = err maxlog = 1
@@ -178,9 +171,8 @@ end
 
 # The compiler's static memory accounting for a compiled program, in the shape the probe consumes.
 function compiled_memory_stats(::ReactantBackend, exec)
-    _HAS_COMPILED_MEMORY_STATS || return nothing
     try
-        s = _RXLA.compiled_memory_stats(exec)
+        s = _XS.compiled_memory_stats(exec)
         return (
             temp = Int(s.temp_size_in_bytes), outputs = Int(s.output_size_in_bytes),
             arguments = Int(s.argument_size_in_bytes),
@@ -311,7 +303,7 @@ function compile_artifact(
         if blob !== nothing
             t0 = time()
             try
-                exec = _RXLA.load_serialized_executable(pool.client, blob; program...)
+                exec = _XS.load_serialized_executable(pool.client, blob; program...)
                 record_exec_cache!(:hit, time() - t0)
                 @info "executable cache: hit" source = cache.source seconds = round(time() - t0; digits = 3) bytes = length(blob) path
                 return exec
@@ -326,7 +318,7 @@ function compile_artifact(
         elapsed = time() - t0
         record_exec_cache!(:miss, elapsed)
         try
-            bytes = _RXLA.serialize_executable(exec)
+            bytes = _XS.serialize_executable(exec)
             stored = store_entry(path, bytes)
             stored && record_exec_cache!(:store, 0.0)
             @info "executable cache: miss, compiled and stored" source = cache.source compile_seconds = round(elapsed; digits = 3) bytes = length(bytes) stored path

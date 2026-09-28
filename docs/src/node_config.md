@@ -123,9 +123,7 @@ source's content hash. `.cache/mlir_hashes.json` records the hash of every `mode
 whose content changes has its programs dropped on the next load, while a weights-only update keeps
 them. The directory watcher never reacts to anything under `.cache/`, so cache writes cannot reload
 the model that produced them. The bundle directory must be writable by the worker; when it is not,
-the cache logs a warning and every program is compiled as before. The cache needs a Reactant that
-exposes executable serialization (`Reactant.XLA.serialize_executable`); on an older Reactant the
-worker logs that the cache is unavailable and compiles everything.
+the cache logs a warning and every program is compiled as before.
 
 `model_control_mode` sets how the loaded model set evolves: `dynamic` (the default) watches the
 repository and loads, unloads, reloads, and renames bundles online as files change (a renamed

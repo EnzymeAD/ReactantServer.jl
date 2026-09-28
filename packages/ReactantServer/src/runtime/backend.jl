@@ -22,8 +22,8 @@ function device_ordinal end              # (backend, device) -> Int
 function compile_artifact end            # (backend, pool, mlir_bytes, num_parameters, num_outputs; numerics_stats, cache) -> executable
 
 # Whether compile_artifact can serialize compiled programs into the per-bundle executable cache.
-# Default false (MockBackend has nothing to cache); the Reactant backend reports true when its Reactant
-# exposes XLA.serialize_executable and XLA.load_serialized_executable.
+# Default false (MockBackend has nothing to cache); the Reactant backend always can (see
+# xla_serialization.jl for where the bindings come from).
 supports_executable_cache(::AbstractBackend) = false
 
 mutable struct NumericsStats

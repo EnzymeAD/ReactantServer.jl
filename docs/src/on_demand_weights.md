@@ -71,15 +71,15 @@ logged. Pinned weights or scratch large enough to leave no room are logged as a 
 since no sizing can fix that.
 
 The measurement is exact per model when the backend can reset the allocator's high-water mark,
-which the Reactant backend can on a CUDA device (through `Reactant.XLA.clear_memory_stats!`):
+which the Reactant backend can on a CUDA device (through the allocator's `ClearMemoryStats`):
 before each model the peak is reset, so `peak - in_use_before` is that model's own transient, and
 nothing that happened earlier, in particular XLA's autotuning scratch during compile (many times a
 model's real run scratch), can inflate it. Pinned models are measured too. A model that cannot be
 run at startup falls back to the compiler's static scratch accounting
-(`Reactant.XLA.compiled_memory_stats`), padded. The same measurement runs when the directory
+(XLA's compiled memory statistics), padded. The same measurement runs when the directory
 watcher loads a model into a running worker, and the budget is re-resolved on the spot, so neither
 a fresh autotune nor a hot-loaded model requires a restart to be sized correctly. Without a
-resettable peak (a Reactant without the binding) the probe falls back to an ordering-based estimate
+resettable peak (any non-CUDA device) the probe falls back to an ordering-based estimate
 that is exact for a clean session but inherits whatever moved the peak before it ran.
 
 ## Pinning hot models

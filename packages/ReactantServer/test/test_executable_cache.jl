@@ -2,7 +2,7 @@
 # memory probe (scheduler.jl), exercised without a GPU: the cache's layout, hash record,
 # invalidation and atomic writes are pure filesystem logic, the probe is driven against a mock
 # backend with a simulated allocator, and the real round trip (compile, serialize, store, load, run)
-# runs on the CPU PJRT client through Reactant's own bindings when the installed Reactant has them.
+# runs on the CPU PJRT client.
 
 using ReactantServer: ExecutableCacheSlot, module_filename, target_slug, entry_path,
     sync_mlir_hashes!, lookup_entry, store_entry, drop_entry, executable_cache_slots,
@@ -116,79 +116,73 @@ end
     @test !supports_executable_cache(mock)
     @test clear_memory_stats!(mock, pool) === false
     @test compiled_memory_stats(mock, ReactantServer.MockExecutable(x -> x, 1)) === nothing
-    # The Reactant backend reports the cache exactly when its Reactant exposes the serialization API.
-    @test supports_executable_cache(ReactantServer.ReactantBackend()) ==
-        (isdefined(Reactant.XLA, :serialize_executable) && isdefined(Reactant.XLA, :load_serialized_executable))
+    # The Reactant_jll floor guarantees the serialization C API, so the Reactant backend always caches.
+    @test supports_executable_cache(ReactantServer.ReactantBackend())
 end
 
-# ── The real thing: compile, serialize, store, load, run, through Reactant's bindings only ──────
+# ── The real thing: compile, serialize, store, load, run, on Reactant's CPU client ──────
 
 @testset "executable cache: Reactant backend round trip (CPU)" begin
     backend = ReactantServer.ReactantBackend()
-    if !supports_executable_cache(backend)
-        @warn "the installed Reactant has no executable serialization (Reactant.XLA.serialize_executable); the round-trip test is skipped"
-        @test_skip supports_executable_cache(backend)
-    else
-        cfg = ReactantServer.RuntimeConfig(ReactantServer.CPU_BACKEND, 0, 0.9, true, true)
-        pool = ReactantServer.resolve_client(backend, cfg)
-        mktempdir() do root
-            dir = _write_scale_bundle(root, "cached"; w = Float32[3, 3, 3, 3])
-            x = ReactantServer.NamedTensor("x", Float32[1, 2, 3, 4])
-            expected = Float32[3, 6, 9, 12]
-            cached_programs() = String[
-                joinpath(d, f) for (d, _, files) in walkdir(joinpath(dir, ".cache")) for f in files if endswith(f, EXEC_CACHE_EXT)
-            ]
-            load(; cache) = (
-                e = load_bundle_entry(dir);
-                e.executable = ReactantServer.build_loaded_model(backend, pool, e; executable_cache = cache);
-                e
-            )
-            run(e) = ReactantServer.run_model(backend, pool, e.executable, [x])[1].data
+    cfg = ReactantServer.RuntimeConfig(ReactantServer.CPU_BACKEND, 0, 0.9, true, true)
+    pool = ReactantServer.resolve_client(backend, cfg)
+    mktempdir() do root
+        dir = _write_scale_bundle(root, "cached"; w = Float32[3, 3, 3, 3])
+        x = ReactantServer.NamedTensor("x", Float32[1, 2, 3, 4])
+        expected = Float32[3, 6, 9, 12]
+        cached_programs() = String[
+            joinpath(d, f) for (d, _, files) in walkdir(joinpath(dir, ".cache")) for f in files if endswith(f, EXEC_CACHE_EXT)
+        ]
+        load(; cache) = (
+            e = load_bundle_entry(dir);
+            e.executable = ReactantServer.build_loaded_model(backend, pool, e; executable_cache = cache);
+            e
+        )
+        run(e) = ReactantServer.run_model(backend, pool, e.executable, [x])[1].data
 
-            reset_exec_cache_stats!()
-            # Cold start: no entry, so compile and store.
-            e1 = load(; cache = true)
-            s = exec_cache_snapshot()
-            @test (s.hits, s.misses, s.stores, s.failures) == (0, 1, 1, 0)
-            files = cached_programs()
-            @test length(files) == 1
-            @test startswith(basename(dirname(first(files))), "jll-")          # the target partition
-            @test startswith(basename(first(files)), "model.mlir.")            # named after its source
-            @test run(e1) == expected
+        reset_exec_cache_stats!()
+        # Cold start: no entry, so compile and store.
+        e1 = load(; cache = true)
+        s = exec_cache_snapshot()
+        @test (s.hits, s.misses, s.stores, s.failures) == (0, 1, 1, 0)
+        files = cached_programs()
+        @test length(files) == 1
+        @test startswith(basename(dirname(first(files))), "jll-")          # the target partition
+        @test startswith(basename(first(files)), "model.mlir.")            # named after its source
+        @test run(e1) == expected
 
-            # Warm start: the stored program is loaded, not compiled, and computes the same result.
-            e2 = load(; cache = true)
-            s = exec_cache_snapshot()
-            @test (s.hits, s.misses, s.stores, s.failures) == (1, 1, 1, 0)
-            @test run(e2) == expected
+        # Warm start: the stored program is loaded, not compiled, and computes the same result.
+        e2 = load(; cache = true)
+        s = exec_cache_snapshot()
+        @test (s.hits, s.misses, s.stores, s.failures) == (1, 1, 1, 0)
+        @test run(e2) == expected
 
-            # The compiler's static accounting is available on the loaded program too; the CPU
-            # allocator keeps no statistics, so the reset reports false and callers fall back.
-            exec = first(values(e2.executable.execs[ReactantServer.VariantKey()]))
-            cms = compiled_memory_stats(backend, exec)
-            @test cms !== nothing && cms.temp >= 0 && cms.outputs >= 0
-            @test clear_memory_stats!(backend, pool) === false
+        # The compiler's static accounting is available on the loaded program too; the CPU
+        # allocator keeps no statistics, so the reset reports false and callers fall back.
+        exec = first(values(e2.executable.execs[ReactantServer.VariantKey()]))
+        cms = compiled_memory_stats(backend, exec)
+        @test cms !== nothing && cms.temp >= 0 && cms.outputs >= 0
+        @test clear_memory_stats!(backend, pool) === false
 
-            # A corrupt entry is dropped, then the program is compiled and stored again.
-            write(first(files), rand(UInt8, 32))
-            e3 = load(; cache = true)
-            s = exec_cache_snapshot()
-            @test (s.hits, s.misses, s.stores, s.failures) == (1, 2, 2, 1)
-            @test length(cached_programs()) == 1
-            @test run(e3) == expected
+        # A corrupt entry is dropped, then the program is compiled and stored again.
+        write(first(files), rand(UInt8, 32))
+        e3 = load(; cache = true)
+        s = exec_cache_snapshot()
+        @test (s.hits, s.misses, s.stores, s.failures) == (1, 2, 2, 1)
+        @test length(cached_programs()) == 1
+        @test run(e3) == expected
 
-            # A changed weight keeps the program (weights are not part of the key) and hits.
-            _write_scale_bundle(root, "cached"; w = Float32[5, 5, 5, 5])
-            e4 = load(; cache = true)
-            @test exec_cache_snapshot().hits == 2
-            @test run(e4) == Float32[5, 10, 15, 20]
+        # A changed weight keeps the program (weights are not part of the key) and hits.
+        _write_scale_bundle(root, "cached"; w = Float32[5, 5, 5, 5])
+        e4 = load(; cache = true)
+        @test exec_cache_snapshot().hits == 2
+        @test run(e4) == Float32[5, 10, 15, 20]
 
-            # With the cache off nothing is read or written.
-            before = exec_cache_snapshot()
-            e5 = load(; cache = false)
-            @test exec_cache_snapshot() == before
-            @test run(e5) == Float32[5, 10, 15, 20]
-        end
+        # With the cache off nothing is read or written.
+        before = exec_cache_snapshot()
+        e5 = load(; cache = false)
+        @test exec_cache_snapshot() == before
+        @test run(e5) == Float32[5, 10, 15, 20]
     end
 end
 
