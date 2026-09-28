@@ -64,12 +64,24 @@ _ENTRY_PROJECTS = [
 _CPU_TARGET = "generic;sandybridge,-xsaveopt,clone_all;haswell,-rdrnd,base(1);x86-64-v4,-rdrnd,base(1)"
 
 _STAGE = """
+workspace_path() {
+    # workspace_path <execroot path>: the file's path inside this repository. When another module
+    # builds the image through a bazel_dep, this repository's files arrive as
+    # external/<repo>/<path> (or ../<repo>/<path> with the sibling layout), and that prefix must
+    # not reach the image or Pkg: the workspace would land one level too deep.
+    case "$$1" in
+        external/*) p="$${1#external/}"; echo "$${p#*/}" ;;
+        ../*) p="$${1#../}"; echo "$${p#*/}" ;;
+        *) echo "$$1" ;;
+    esac
+}
 stage_workspace() {
     # stage_workspace <dir>: the root Project.toml and the member Project.tomls at their workspace
     # paths, plus the committed manifest beside the root. -L because Bazel stages srcs as symlinks.
     for f in $(locations //:workspace_projects); do
-        mkdir -p "$$1/$$(dirname "$$f")"
-        cp -L "$$f" "$$1/$$f"
+        rel="$$(workspace_path "$$f")"
+        mkdir -p "$$1/$$(dirname "$$rel")"
+        cp -L "$$f" "$$1/$$rel"
     done
     cp -L $(location Manifest.toml) "$$1/Manifest.toml"
 }
@@ -284,8 +296,9 @@ trap 'rm -rf "$$stage"' EXIT
 app="$$stage{app}"
 mkdir -p "$$app"
 for f in $(locations //:workspace_sources) $(locations //:runtime_files); do
-    mkdir -p "$$app/$$(dirname "$$f")"
-    cp -L "$$f" "$$app/$$f"
+    rel="$$(workspace_path "$$f")"
+    mkdir -p "$$app/$$(dirname "$$rel")"
+    cp -L "$$f" "$$app/$$rel"
 done
 stage_workspace "$$app"
 chmod a+x "$$app/docker/"*.sh
