@@ -1,0 +1,141 @@
+# Reproducible node image (Bazel)
+
+`//deploy:image` builds the same node image as `docker/Dockerfile` (the `ReactantServerNode`
+supervisor as entrypoint under `tini`, KServe V2 gRPC on `:8001`, health and metrics on `:8002`),
+but from committed locks instead of a resolve at build time. The same commit always yields the same
+packages, artifacts, and system libraries, which is what a validated production deployment needs.
+Nothing else in the repository depends on Bazel: tests, docs, and the native deployment stay plain
+Julia.
+
+```
+bazel build //deploy:image
+bazel run   //deploy:image_load          # loads it into podman as localhost/reactantserver:bazel
+bazel run   //deploy:image_check         # the loaded image starts without precompiling
+bazel test  //deploy:manifest_current    # the Julia lock still matches the workspace Project.toml files
+bazel run   //deploy:relock              # re-resolve the Julia lock after a [deps] or [compat] change
+bazel run   //deploy:relock_debs         # re-resolve the Ubuntu package lock (curl, tini)
+```
+
+Or `make bazel-image`, which builds and loads it.
+
+Julia, the CUDA base image, and every package are fetched and pinned by Bazel. The build host needs
+Bazel (the version in `.bazelversion`; Bazelisk picks it up), GNU tar, and a C compiler with `make`,
+because InterProcessCommunication.jl generates its constants file by compiling a small C program when
+the depot is instantiated. Podman is needed only to load, check, and run the result, and to
+re-resolve the Ubuntu lock.
+
+## The Julia lock: `deploy/Manifest.toml`
+
+The workspace root `Manifest.toml` stays gitignored so development and CI resolve fresh and pick up
+compat bumps. The image must not, so `deploy/Manifest.toml` is the production lock for the root
+`Project.toml`: every build action stages the root project, the member `Project.toml` files, and
+this manifest in a temporary tree and instantiates from it, with no `Pkg.resolve` anywhere in the
+build. It lives under `deploy/` only so the root gitignore can stay as it is; a symlinked
+`deploy/Project.toml` does not work, because Pkg resolves the real path of the project and would
+read the root manifest instead.
+
+`//deploy:manifest_current` fails when a `[deps]` or `[compat]` change leaves the lock stale, or
+when the lock was resolved under a Julia other than the pinned toolchain. Move it deliberately and
+review the diff like code:
+
+```
+bazel run //deploy:relock                           # keep every version that still resolves
+bazel run //deploy:relock -- Reactant Reactant_jll  # also move the named packages forward
+```
+
+## The Ubuntu lock: `deploy/debs.lock.json`
+
+`curl` (the healthcheck) and `tini` (PID 1) are not in the CUDA base, so the image adds them and the
+libraries `curl` needs as pinned `.deb` files. `//deploy:relock_debs` resolves them by running apt
+inside the pinned base image, so the lock holds exactly what the base lacks: a layer that re-shipped
+a package the base already has (`libc6`, `libssl3t64`) would overwrite the base's copy. Each package
+is pinned by a `snapshot.ubuntu.com` URL, which serves the archive as it was at the lock's timestamp
+indefinitely, and by sha256. The build downloads them through `deploy/debs.bzl` and unpacks them
+with the `bsdtar` toolchain, so neither `apt` nor `dpkg` runs during the build. Each package's
+control stanza is written to `/var/lib/dpkg/status.d/`, so image scanners (Trivy, Grype, Syft) still
+see what was added.
+
+```
+bazel run //deploy:relock_debs                      # resolve against today's snapshot
+bazel run //deploy:relock_debs -- 20260928T000000Z  # resolve against a given snapshot
+```
+
+Moving the base image digest in `MODULE.bazel` calls for a relock, since the delta is computed
+against the base.
+
+## Layers
+
+- `debs_layer`: `curl`, `tini`, and their libraries, from the Ubuntu lock.
+- `depot_layer`: the Julia depot at `/opt/julia-depot`, instantiated from the Julia lock into an
+  empty depot (the General registry is fetched fresh; the lock pins every package by tree hash, so
+  the registry state cannot change what is installed). Set `JULIA_PKG_SERVER` through
+  `--action_env` in an untracked `user.bazelrc` to go through a mirror.
+- `compiled_layer`: the precompile caches for every project the image starts Julia in (the
+  supervisor, a worker, the gateway, and the worker-role healthcheck), so a container serves without
+  first compiling about 150 packages.
+- `julia_layer`: Julia at `/opt/julia`.
+- `app_layer`: the workspace at `/opt/reactantserver` (root project plus the Julia lock, member
+  packages without their tests, `docker/`, `config/`), the entrypoints and healthchecks linked into
+  `/usr/local/bin`, and the default node file at `/etc/reactantserver/node.yaml`, all where
+  `docker/Dockerfile` puts them.
+
+The base is `nvidia/cuda:13.1.2-cudnn-devel-ubuntu24.04`, pinned by digest. It is deliberately
+fat: Reactant_jll's CUDA 13.1 artifact links cuDNN and cuBLASLt statically but `dlopen`s
+`libnvJitLink.so.13`, `libnvrtc.so.13`, and `libcupti.so` by soname, and the NVIDIA container
+runtime injects none of them (only the driver's `libcuda.so.1`). `REACTANT_GPU=cuda` and
+`REACTANT_GPU_VERSION=13.1` are set both when the depot is instantiated (they select the Reactant
+artifact) and in the image environment (they select it again at load time); they must agree with
+the base image's CUDA version.
+
+### How the caches are built outside the image
+
+A Julia precompile cache records the source files it was built from, and Julia rejects it when those
+files are not where it expects. Files inside a depot are recorded relative to it (`@depot/...`),
+which is what lets registry packages move; files outside every depot are recorded by absolute path.
+The workspace's own packages live outside the package depot, so the image lists the workspace root
+as a depot too:
+
+```
+JULIA_DEPOT_PATH=/opt/julia-depot:/opt/reactantserver:/opt/julia/local/share/julia:/opt/julia/share/julia
+```
+
+`compiled_layer` unpacks the depot and application layers into one temporary tree with the image's
+layout and precompiles against the same list with that tree in place of `/opt`, so its caches
+load unchanged in the image. The loader needs `libcuda.so.1` to load Reactant; the build takes the
+driver stub from the CUDA base (`cuda_stub`) and hides the host's GPUs. The caches are compiled for
+the official Julia build's x86_64 CPU targets, so they load on any x86_64 host, not only CPUs like
+the build machine's. `//deploy:image_check` verifies that each entry project loads with no cache
+rejected and nothing precompiled.
+
+## Running it
+
+The image expects the host driver to be provided at run time, like any CUDA image. With the NVIDIA
+Container Toolkit and a CDI spec podman can read, `--device nvidia.com/gpu=<n>` is enough. Where CDI
+is unavailable, bind the device nodes (`/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia<minor>`)
+and the driver libraries onto their sonames (`libcuda.so.1`, `libnvidia-ml.so.1`,
+`libnvidia-nvvm.so.4`, `libnvidia-ptxjitcompiler.so.1`, `libnvidia-gpucomp.so.<version>`). Note that
+`/dev/nvidia<minor>` is the device-node minor number from `nvidia-smi -q`, which need not equal
+`nvidia-smi`'s index.
+
+Mount the model repository at `/var/lib/reactantserver/models` read-write: the serialized
+executable cache lives inside each bundle (`<bundle>/.cache/`), so a read-only mount recompiles
+every program on every start. Mount your own node file over `/etc/reactantserver/node.yaml` to
+change the configuration. Do not mount a volume over `/opt/julia-depot/compiled`: it would hide the
+baked caches.
+
+The healthcheck is `/usr/local/bin/healthcheck.node.sh`, as in the Dockerfile image, but it is not
+part of the image: an OCI image configuration has no healthcheck field (only Docker's image format
+does), so rules_oci cannot set one. Pass it at run time, or set it in the compose file:
+
+```
+podman run ... --health-cmd /usr/local/bin/healthcheck.node.sh --health-interval 30s \
+    --health-timeout 20s --health-retries 3 --health-start-period 300s localhost/reactantserver:bazel
+```
+
+## Consuming from another module
+
+The image and its layers are public. A deployment repository can take a `bazel_dep` on
+`reactant_server` (with a `git_override` on a commit) and `oci_load` or extend
+`@reactant_server//deploy:image` instead of rebuilding it. The repository names this module
+declares (`reactantserver_julia`, `reactantserver_cuda_base`, `reactantserver_debs`) are prefixed so
+they cannot collide with a consumer's own.

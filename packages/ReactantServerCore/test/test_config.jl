@@ -550,3 +550,31 @@ end
         @test_throws ReactantServer.ConfigError ReactantServer.load_node(clash)
     end
 end
+
+@testset "runtime.executable_cache" begin
+    mktempdir() do dir
+        modeldir = joinpath(dir, "models"); mkpath(modeldir)
+        rt(body) = load_single_worker(dir, body; model_repo = modeldir)[1].runtime
+
+        # Default: cache on.
+        @test rt("runtime:\n  backend: cuda").executable_cache
+        @test !rt("runtime:\n  backend: cuda\n  executable_cache: false").executable_cache
+
+        # Env override.
+        withenv("INFERENCE_SERVER_RUNTIME_EXECUTABLE_CACHE" => "false") do
+            cfg, applied, _ = load_single_worker(dir, "runtime:\n  backend: cuda"; model_repo = modeldir)
+            @test !cfg.runtime.executable_cache
+            @test length(applied) == 1
+        end
+
+        # Positional constructors default the new field.
+        c5 = ReactantServer.RuntimeConfig(ReactantServer.CPU_BACKEND, 0, 0.9, true, true)
+        @test c5.executable_cache
+        c14 = ReactantServer.RuntimeConfig(
+            ReactantServer.CUDA_BACKEND, 1, 0.8, false, false, ReactantServer.SELF_MANAGED, false, 0o660,
+            0.5, 0.1, true, nothing, "", ReactantServer.NUMERICS_F32
+        )
+        @test c14.executable_cache
+        @test c14.shared_host_weights_mode == 0o660 && c14.numerics == ReactantServer.NUMERICS_F32
+    end
+end

@@ -1,0 +1,73 @@
+module(
+    name = "reactant_server",
+    version = "0.0.0",
+)
+
+# Bazel builds the reproducible node image (//deploy:image); nothing else in this repository
+# depends on it. Tests, docs and the native deployment stay plain Julia (see CONTRIBUTING.md), and
+# docker/Dockerfile remains the build-with-the-network-open alternative. What Bazel adds is an image
+# assembled from a COMMITTED manifest (deploy/Manifest.toml) with no Pkg resolve anywhere in the
+# build, so the same commit always yields the same package and artifact set.
+
+# Bazel 9 moved sh_binary/sh_test out of the core into rules_shell.
+bazel_dep(name = "rules_shell", version = "0.7.1")
+
+# rules_oci assembles OCI images with no daemon; podman is needed only to load and run the result.
+bazel_dep(name = "rules_oci", version = "2.2.6")
+
+# rules_oci 2.2.6 pins aspect_bazel_lib 2.7.2, which registers its tar and zstd toolchains
+# against @local_config_platform. Bazel 9 removed that repo, so toolchain resolution fails for
+# every target, including ones unrelated to images ("invalid registered toolchain
+# '@zstd_toolchains//:all'"). MVS takes the higher version, so naming it here is the whole fix.
+bazel_dep(name = "aspect_bazel_lib", version = "2.22.5")
+
+# bsdtar, from the same toolchain rules_oci uses, reads .deb files (ar archives holding zstd or xz
+# tarballs) and the pulled base image's layers, so //deploy needs neither dpkg nor ar on the host.
+bazel_lib_toolchains = use_extension("@aspect_bazel_lib//lib:extensions.bzl", "toolchains")
+use_repo(bazel_lib_toolchains, "bsd_tar_toolchains")
+
+# The Ubuntu packages the image adds to the CUDA base (curl, tini and their dependencies), each
+# pinned by snapshot URL and sha256 in deploy/debs.lock.json. Re-resolve with
+# `bazel run //deploy:relock_debs`.
+debs = use_extension("//deploy:debs.bzl", "debs")
+debs.lock(
+    name = "reactantserver_debs",
+    lock = "//deploy:debs.lock.json",
+)
+use_repo(debs, "reactantserver_debs")
+
+# The Julia toolchain, the clean-depot image layer and the podman loader.
+bazel_dep(name = "rules_julia_depot", version = "0.1.0")
+git_override(
+    module_name = "rules_julia_depot",
+    commit = "49bc678d037fa967920edccc380a6721a20050ee",
+    remote = "https://github.com/csvance/rules_julia_depot.git",
+)
+
+# Julia, fetched and pinned by sha256, so no build host needs it installed. It must match
+# deploy/Manifest.toml's julia_version; //deploy:manifest_current fails when they disagree. The
+# repository name is prefixed because toolchain names share one namespace across every module
+# that uses the extension: a consumer that declares its own `julia_dist` must not collide.
+julia = use_extension("@rules_julia_depot//julia:extensions.bzl", "julia")
+julia.toolchain(
+    name = "reactantserver_julia",
+    version = "1.12.7",
+)
+use_repo(julia, "reactantserver_julia")
+
+oci = use_extension("@rules_oci//oci:extensions.bzl", "oci")
+oci.pull(
+    name = "reactantserver_cuda_base",
+    # nvidia/cuda:13.1.2-cudnn-devel-ubuntu24.04, pinned by digest.
+    #
+    # Deliberately fat. Reactant_jll's CUDA 13.1 artifact statically links cuDNN and cuBLASLt but
+    # dlopens libnvJitLink.so.13, libnvrtc.so.13 and libcupti.so by soname, and none of the three
+    # is injected by the NVIDIA container runtime (only libcuda.so.1 is). A -devel base carries
+    # them all; this is the configuration that was proven on an A6000 with the executable cache.
+    # Trim to a smaller base only after a GPU run shows which libraries are touched. The CUDA
+    # version must match REACTANT_GPU_VERSION in //deploy:image.
+    digest = "sha256:08d6facb6a72f918beb3ffe5b57cff72402a203f44428831262e95c7466d4188",
+    image = "index.docker.io/nvidia/cuda",
+    platforms = ["linux/amd64"],
+)
+use_repo(oci, "reactantserver_cuda_base", "reactantserver_cuda_base_linux_amd64")

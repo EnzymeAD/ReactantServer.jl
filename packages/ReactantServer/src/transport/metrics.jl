@@ -44,6 +44,9 @@ Prometheus.metric_names(::WorkerSnapshotCollector) = (
     "worker_device_memory_peak_in_use_bytes", "worker_device_memory_pool_bytes",
     "worker_device_memory_process_used_bytes", "worker_device_memory_out_of_pool_bytes",
     "worker_models_loaded", "worker_models_resident", "worker_resident_weight_bytes",
+    "worker_executable_cache_hits_total", "worker_executable_cache_misses_total",
+    "worker_executable_cache_stores_total", "worker_executable_cache_failures_total",
+    "worker_executable_cache_load_seconds_total", "worker_executable_cache_compile_seconds_total",
     "worker_info",
 )
 
@@ -193,6 +196,17 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
         )
     end
 
+    # Serialized-executable cache counters (zero on backends without the cache).
+    ec = exec_cache_snapshot()
+    push!(
+        metrics,
+        _scalar("worker_executable_cache_hits_total", "counter", "Compiled programs loaded from the per-bundle executable cache.", ec.hits),
+        _scalar("worker_executable_cache_misses_total", "counter", "Programs compiled because no cached program was usable.", ec.misses),
+        _scalar("worker_executable_cache_stores_total", "counter", "Compiled programs written to the executable cache.", ec.stores),
+        _scalar("worker_executable_cache_failures_total", "counter", "Cached programs that failed to load and were dropped.", ec.failures),
+        _scalar("worker_executable_cache_load_seconds_total", "counter", "Cumulative seconds spent loading cached programs.", ec.load_seconds),
+        _scalar("worker_executable_cache_compile_seconds_total", "counter", "Cumulative seconds spent compiling on cache misses.", ec.compile_seconds),
+    )
     # Device memory, when the backend can report it (absent on CPU / MockBackend).
     dm = device_memory_stats(c.backend, c.pool)
     if dm !== nothing

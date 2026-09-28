@@ -13,6 +13,9 @@ make image        # or: docker build -f docker/Dockerfile -t reactantserver .
 REACTANTSERVER_MODELS=/path/to/bundles docker compose up
 ```
 
+For a production image built from a committed lock rather than a local resolve, use the Bazel
+build in [`deploy/`](../deploy/README.md) (`bazel run //deploy:image_load`).
+
 ## Why this image works (the nvJitLink fix)
 
 The earlier image aborted at first GPU compile with `Invalid handle. Cannot load symbol

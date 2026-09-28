@@ -68,6 +68,7 @@ const SCALE_CLAMP = log(1000.0 / 16.0)
 _iota(n) = Ops.constant(collect(1:n))
 _mat(x) = Reactant.ReactantCore.materialize_traced_array(x)
 _int(x) = _mat(vec(Ops.convert(Reactant.TracedRArray{Int64, ndims(x)}, _mat(x))))   # float -> Int64 index vector
+_unval(::Val{N}) where {N} = N   # a static size carried in a type, out of reach of traced-loop capture
 
 # Stable descending argsort along dim 1 (each column independently for a matrix). Greedy NMS and
 # top-k selection must break score ties by input order, as a stable sortperm(rev=true) does;
@@ -250,8 +251,11 @@ function roi_align_fpn(feats, x1, y1, x2, y2, valid, cfg::DetectorConfig, ::Type
     cnt = gh .* gw
     nmax = maximum(ifelse.(valid, cnt, one(T)))
 
-    # (pw, ph, k) layouts
-    k3(v) = _mat(reshape(v, 1, 1, K))
+    # (pw, ph, k) layouts. K reaches k3 as a type parameter, not a captured Int: the traced loop
+    # below captures k3, and Reactant (from 0.2.289) traces every Number a `@trace while` body
+    # captures, which would turn K into a TracedRNumber that reshape cannot take as a dimension.
+    kv = Val(K)
+    k3(v) = _mat(reshape(v, 1, 1, _unval(kv)))
     PW = Ops.constant(reshape(T.(0:(Pd - 1)), Pd, 1, 1))
     PH = Ops.constant(reshape(T.(0:(Pd - 1)), 1, Pd, 1))
     acc = Ops.constant(zeros(Float32, C, Pd * Pd * K))

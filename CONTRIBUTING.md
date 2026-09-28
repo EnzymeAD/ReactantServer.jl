@@ -125,6 +125,28 @@ the two stub files are hand-maintained:
    `control_server_stubs.jl` and the `<Service>_<Rpc>_Client` constructors into
    `control_client_stubs.jl`, preserving the hand-tuned deadlines already in those files.
 
+## The production image lock
+
+The locked node image is built with Bazel from `deploy/Manifest.toml`, a committed manifest for the
+root `Project.toml` (see [`deploy/README.md`](deploy/README.md)). A change to any `[deps]` or
+`[compat]` in the root or a member `Project.toml` makes that lock stale; re-resolve it in the same
+change and check it:
+
+```
+bazel run //deploy:relock
+bazel test //deploy:manifest_current
+```
+
+The Ubuntu packages the image adds to the CUDA base (`curl`, `tini`) are locked the same way in
+`deploy/debs.lock.json`; moving the base image digest in `MODULE.bazel` calls for
+`bazel run //deploy:relock_debs`. After any change to the image, load it and check that it starts
+without precompiling:
+
+```
+bazel run //deploy:image_load
+bazel run //deploy:image_check
+```
+
 ## Kaimon gate tools (dev only)
 
 `packages/ReactantServer/ext/ReactantServerKaimonGateExt.jl` registers four `rserver_*` GateTools with a running

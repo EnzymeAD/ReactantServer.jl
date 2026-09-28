@@ -141,6 +141,11 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     # does, so the two mechanisms cover each other's gaps.
     cfg.runtime.numerics == NUMERICS_F32 && (ENV["NVIDIA_TF32_OVERRIDE"] = "0")
     pool = resolve_client(backend, cfg.runtime)
+    backend = pool.backend                      # the CPU fallback may have swapped the backend
+    use_exec_cache = cfg.runtime.executable_cache && supports_executable_cache(backend)
+    if cfg.runtime.executable_cache && !use_exec_cache
+        @info "executable cache: not available on this backend; every program is compiled" backend = typeof(backend) platform = pool.platform
+    end
     # numerics=tf32 is a hard requirement, not a preference: on a target that cannot run TF32
     # (pre-Ampere GPU, or the CPU-fallback path), failing startup loudly beats a worker whose
     # numerics silently diverge from the rest of the fleet.
@@ -186,9 +191,16 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     # models loaded later by the directory watcher (see `_resolve_residency`).
     for entry in values(registry.by_name)
         state = _resolve_residency(cfg, entry.name, on_demand)
-        @info "Compiling model" name = entry.name residency = state on_demand = on_demand
-        entry.executable = build_loaded_model(backend, pool, entry; state = state, on_demand = on_demand, store = store)
+        @info "Compiling model" name = entry.name residency = state on_demand = on_demand executable_cache = use_exec_cache
+        entry.executable = build_loaded_model(
+            backend, pool, entry;
+            state = state, on_demand = on_demand, store = store, executable_cache = use_exec_cache
+        )
     end
+    # Compilation is over: drop the allocator high-water mark it left behind (autotuning scratch can
+    # dwarf any model's real run scratch), so the probe below and the exported peak gauge measure
+    # execution only. A backend that cannot reset reports false and the probe uses its fallback.
+    clear_memory_stats!(backend, pool)
     sched = Scheduler(registry, backend, pool, cfg.scheduler)
     if on_demand
         # Provisional budget for the probe; the isolation probe (in start!) frees between models so

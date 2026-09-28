@@ -2,6 +2,7 @@
 # natively (see the Deployment page in the docs); the container image is an alternative (docker/).
 #
 #   make image      # build the reactantserver node image (docker/Dockerfile)
+#   make bazel-image # build the locked production image with Bazel and load it (deploy/)
 #   make e2e        # native CPU end-to-end test (host processes; no containers)
 #   make docs       # build the Documenter site into docs/build/ (CPU only; no GPU needed)
 #   make clean      # remove the image this Makefile builds
@@ -13,13 +14,17 @@ ENGINE     ?= podman
 NODE_IMAGE ?= reactantserver:latest
 JULIA      ?= julia
 
-.PHONY: all image e2e docs clean help
+.PHONY: all image bazel-image e2e docs clean help
 
 all: help
 
 ## image: build the reactantserver node image (needs a local Manifest.toml; gRPCServer resolves from GitHub, see docker/README.md)
 image:
 	$(ENGINE) build -f docker/Dockerfile -t $(NODE_IMAGE) .
+
+## bazel-image: build the locked production image (deploy/Manifest.toml) with Bazel and load it into podman
+bazel-image:
+	bazel run //deploy:image_load
 
 ## e2e: native CPU end-to-end test (supervisor + embedded gateway as host processes; no containers)
 e2e:
