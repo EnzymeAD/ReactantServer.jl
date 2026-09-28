@@ -28,3 +28,8 @@ Manifest-v*.toml
 # Scratch space for agent work (throwaway by definition).
 /.scratch/
 PLAN.md
+# The node image's pinned environment IS committed: it is what //deploy:image is built from.
+!/deploy/Manifest.toml
+# Bazel's convenience symlinks and per-user settings.
+/bazel-*
+/user.bazelrc

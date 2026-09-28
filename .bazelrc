@@ -1,0 +1,7 @@
+# Bazel 9 is bzlmod-only. Do not add a WORKSPACE file.
+
+test --test_output=errors
+
+# Per-user settings (output base, a remote cache, --config choices) live in an untracked
+# user.bazelrc. Nothing site-specific belongs in this file.
+try-import %workspace%/user.bazelrc

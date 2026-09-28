@@ -1,0 +1,6 @@
+# Trees with no Bazel targets that are large or not ours to scan.
+docs/node_modules
+docs/build
+lib
+private
+examples

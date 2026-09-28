@@ -1,0 +1,41 @@
+# The workspace, as //deploy consumes it. packages/ has no BUILD files of its own, so its files
+# belong to this package and are grouped here.
+
+package(default_visibility = ["//deploy:__pkg__"])
+
+# ReactantServerExport is offline tooling and not a workspace member (see Project.toml); the image
+# does not carry it.
+_NOT_IN_IMAGE = ["packages/ReactantServerExport/**"]
+
+# Exactly what resolving and instantiating the workspace reads: the root project and each member's
+# Project.toml. Kept apart from the sources so a code edit does not rebuild the depot layer.
+filegroup(
+    name = "workspace_projects",
+    srcs = ["Project.toml"] + glob(
+        ["packages/*/Project.toml"],
+        exclude = _NOT_IN_IMAGE,
+    ),
+)
+
+# The member packages as the running server loads them, LocalPreferences.toml included (it points
+# Reactant's persistent compile cache at the image's volume). Test trees are left out: they carry
+# e2e weights and are never loaded by `using`.
+filegroup(
+    name = "workspace_sources",
+    srcs = glob(
+        ["packages/**"],
+        exclude = _NOT_IN_IMAGE + [
+            "packages/*/test/**",
+            "packages/**/*.md",
+        ],
+    ),
+)
+
+# The container entrypoints and the default node config the image runs with.
+filegroup(
+    name = "runtime_files",
+    srcs = glob(["docker/*.sh", "docker/*.jl"]) + [
+        "config/node.default.yaml",
+        "config/node.yaml",
+    ],
+)

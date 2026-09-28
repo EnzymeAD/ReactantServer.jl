@@ -1,0 +1,416 @@
+load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+# The image and its layers are public so another module (a deployment repository) can load,
+# extend or push them with a bazel_dep on this one instead of rebuilding them.
+package(default_visibility = ["//visibility:public"])
+
+# The ReactantServer node image, built from the committed deploy/Manifest.toml.
+#
+#   bazel build //deploy:image
+#   bazel run //deploy:image_load          # loads it into podman as reactantserver:bazel
+#   bazel run //deploy:image_check         # the loaded image starts without precompiling
+#   bazel test //deploy:manifest_current   # the manifest still matches the workspace
+#   bazel run //deploy:relock              # re-resolve deploy/Manifest.toml after a Project change
+#   bazel run //deploy:relock_debs         # re-resolve deploy/debs.lock.json (curl, tini)
+#
+# WHY A SECOND MANIFEST. The workspace root's Manifest.toml is gitignored on purpose: development
+# and CI resolve fresh so compat bumps are picked up. An image must not: this manifest is the
+# production lock, moved deliberately with //deploy:relock and reviewed like any other change.
+# It is a manifest for the ROOT Project.toml, and it lives here only so the gitignore can stay as
+# it is. Every action stages it beside the root project and the member Project.tomls in a
+# temporary tree, because Pkg resolves a manifest next to its (real, symlink-resolved) project.
+
+# CUDA userspace the Reactant_jll artifact is selected for. Must agree with the base image
+# (@reactantserver_cuda_base, MODULE.bazel): Reactant_jll's platform augmentation reads these at
+# instantiate time to pick the artifact and at run time to load it, and a mismatch loads the wrong
+# library.
+_REACTANT_GPU_ENV = {
+    "REACTANT_GPU": "cuda",
+    "REACTANT_GPU_VERSION": "13.1",
+}
+
+# Where the image keeps Julia's state, and the order Julia searches it. The workspace root is a
+# depot too, and not by accident: Julia records a precompiled package's source files relative to
+# the depot that holds them ("@depot/..."), which is what lets a cache built in a temporary tree
+# load from /opt. Packages outside every depot are recorded by absolute path and would be stale in
+# the image, so the workspace root is listed as a depot to make the workspace's own packages
+# relocatable like the registry ones. Julia's bundled depots follow, for the stdlib caches.
+# //deploy:compiled_layer builds against exactly this list, with the build tree in place of /opt.
+_DEPOT = "/opt/julia-depot"
+_APP = "/opt/reactantserver"
+_JULIA = "/opt/julia"
+_DEPOT_PATH = ":".join([_DEPOT, _APP, _JULIA + "/local/share/julia", _JULIA + "/share/julia"])
+
+# The projects the image starts Julia in, each precompiled by //deploy:compiled_layer and checked
+# by //deploy:image_check. A package's cache depends on the active project's preferences (the
+# worker's LocalPreferences.toml configures Reactant), so each entry point needs its own.
+#   packages/ReactantServerNode     the supervisor (docker/entrypoint.node.sh)
+#   packages/ReactantServer         a worker (spawned by the supervisor, or entrypoint.worker.sh)
+#   packages/ReactantServerGateway  the embedded gateway (spawned by the supervisor)
+#   .                               the worker-role healthcheck (docker/healthcheck.worker.jl)
+_ENTRY_PROJECTS = [
+    "packages/ReactantServerNode",
+    "packages/ReactantServer",
+    "packages/ReactantServerGateway",
+    ".",
+]
+
+# The CPU targets the caches are compiled for: the official Julia build's x86_64 set, so the caches
+# load on any x86_64 host rather than only on CPUs like the build machine's. Julia rejects a cache
+# built for a CPU it is not running on and recompiles, which is the first-start cost this layer
+# exists to remove.
+_CPU_TARGET = "generic;sandybridge,-xsaveopt,clone_all;haswell,-rdrnd,base(1);x86-64-v4,-rdrnd,base(1)"
+
+_STAGE = """
+stage_workspace() {
+    # stage_workspace <dir>: the root Project.toml and the member Project.tomls at their workspace
+    # paths, plus the committed manifest beside the root. -L because Bazel stages srcs as symlinks.
+    for f in $(locations //:workspace_projects); do
+        mkdir -p "$$1/$$(dirname "$$f")"
+        cp -L "$$f" "$$1/$$f"
+    done
+    cp -L $(location Manifest.toml) "$$1/Manifest.toml"
+}
+"""
+
+# The layers write deterministic tars: sorted, epoch mtimes, root-owned by number. Without these a
+# layer's digest changes on every build and nothing downstream can be cached or compared.
+_TAR = "tar --create --file \"$@\" --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner"
+
+# The Ubuntu packages the image adds to the base (curl, tini and the libraries curl needs), from
+# the pinned downloads in deploy/debs.lock.json, unpacked the way dpkg would lay them out.
+#
+# The control stanza of each package lands in /var/lib/dpkg/status.d/<name>, where image scanners
+# (Trivy, Grype, Syft) inventory packages installed without dpkg, so the added packages stay
+# visible to vulnerability scans.
+#
+# /bin, /lib and friends are symlinks into /usr in the base (Ubuntu's merged /usr). A package that
+# still ships files under /lib would otherwise put a real lib/ directory in this layer, which
+# replaces the base's symlink and hides every library under it, so those files are moved to their
+# /usr home first, as dpkg does on a merged-/usr system.
+genrule(
+    name = "debs_layer",
+    srcs = ["@reactantserver_debs//:debs"],
+    outs = ["reactantserver-debs.tar"],
+    cmd = """
+set -euo pipefail
+stage="$$(mktemp -d)"
+trap 'rm -rf "$$stage"' EXIT
+status="$$stage/var/lib/dpkg/status.d"
+mkdir -p "$$status"
+for deb in $(locations @reactantserver_debs//:debs); do
+    $(BSDTAR_BIN) -xOf "$$deb" 'data.tar.*' | $(BSDTAR_BIN) -xf - -C "$$stage"
+    control="$$($(BSDTAR_BIN) -xOf "$$deb" 'control.tar.*' | $(BSDTAR_BIN) -xOf - ./control)"
+    name="$$(printf '%s\\n' "$$control" | sed -n 's/^Package: //p')"
+    printf '%s\\n' "$$control" > "$$status/$$name"
+done
+for d in bin sbin lib lib32 lib64 libx32; do
+    if [ -d "$$stage/$$d" ] && [ ! -L "$$stage/$$d" ]; then
+        mkdir -p "$$stage/usr/$$d"
+        cp -a "$$stage/$$d/." "$$stage/usr/$$d/"
+        rm -rf "$$stage/$$d"
+    fi
+done
+[ -x "$$stage/usr/bin/curl" ] && [ -x "$$stage/usr/bin/tini" ] || { echo "FAILED: curl or tini missing from the layer" >&2; exit 1; }
+# The children of the stage, never the stage itself: a "./" entry would carry mktemp's 0700 onto /.
+""" + _TAR + """ --directory "$$stage" $$(ls -A "$$stage")
+""",
+    toolchains = ["@bsd_tar_toolchains//:resolved_toolchain"],
+    tools = ["@bsd_tar_toolchains//:resolved_toolchain"],
+)
+
+# The CUDA driver stub, libcuda.so, taken from the pinned CUDA base itself so it always matches the
+# base's CUDA release. Build time only: the CUDA build of libReactantExtra.so lists libcuda.so.1 as
+# NEEDED, so loading Reactant (which precompiling does) fails on a host without an NVIDIA driver,
+# and would load the host's real driver on one that has it. The stub answers every call with "no
+# device" and never reaches the image; a container gets the real driver from its host.
+#
+# The layers are searched in manifest order and the last copy wins, as an overlay would resolve it.
+genrule(
+    name = "cuda_stub",
+    srcs = ["@reactantserver_cuda_base_linux_amd64"],
+    outs = ["cuda_stub/libcuda.so.1"],
+    cmd = """
+set -euo pipefail
+layout=$(location @reactantserver_cuda_base_linux_amd64)
+blobs="$$layout/blobs/sha256"
+member=usr/local/cuda-{gpu_version}/targets/x86_64-linux/lib/stubs/libcuda.so
+manifest="$$(grep -o 'sha256:[0-9a-f]*' "$$layout/index.json" | head -1 | cut -d: -f2)"
+found="$$(mktemp -d)"
+trap 'rm -rf "$$found"' EXIT
+for layer in $$(tr ',' '\\n' < "$$blobs/$$manifest" | sed -n '/"layers"/,$$p' | grep -o 'sha256:[0-9a-f]*' | cut -d: -f2); do
+    $(BSDTAR_BIN) -xf "$$blobs/$$layer" -C "$$found" "$$member" 2>/dev/null || true
+done
+[ -f "$$found/$$member" ] || {{ echo "FAILED: $$member is not in the base image" >&2; exit 1; }}
+cp "$$found/$$member" "$@"
+""".format(gpu_version = _REACTANT_GPU_ENV["REACTANT_GPU_VERSION"]),
+    toolchains = ["@bsd_tar_toolchains//:resolved_toolchain"],
+    tools = ["@bsd_tar_toolchains//:resolved_toolchain"],
+)
+
+# The depot, instantiated from the manifest into an empty tree and tarred at /opt/julia-depot.
+#
+# FULL, not artifacts-only: the image loads its packages from source (with the caches of
+# //deploy:compiled_layer), not from a sysimage, so the packages themselves are the code.
+#
+# The source depot handed to image_depot.sh is EMPTY, so the General registry is fetched into the
+# clean depot rather than copied from whatever this host has; the manifest pins every package by
+# tree hash, so the registry's state cannot change what is installed. Set JULIA_PKG_SERVER in
+# user.bazelrc (--action_env) to go through a mirror.
+genrule(
+    name = "depot_layer",
+    srcs = [
+        "Manifest.toml",
+        "//:workspace_projects",
+        "@reactantserver_julia//:dist",
+        "@reactantserver_julia//:bin/julia",
+    ],
+    outs = ["reactantserver-depot.tar"],
+    cmd = _STAGE + """
+set -euo pipefail
+export JULIA_BIN="$$(cd "$$(dirname $(location @reactantserver_julia//:bin/julia))" && pwd)/julia"
+stage="$$(mktemp -d)"
+src_depot="$$(mktemp -d)"
+trap 'rm -rf "$$stage" "$$src_depot"' EXIT
+stage_workspace "$$stage"
+export JULIA_DEPOT_PATH="$$src_depot"
+export REACTANT_GPU={gpu} REACTANT_GPU_VERSION={gpu_version}
+JULIA_DEPOT_CONTENTS=full \\
+    $(location @rules_julia_depot//julia:image_depot.sh) "$$stage" "$@"
+""".format(
+        gpu = _REACTANT_GPU_ENV["REACTANT_GPU"],
+        gpu_version = _REACTANT_GPU_ENV["REACTANT_GPU_VERSION"],
+    ),
+    tags = ["requires-network"],  # packages, artifacts and the registry from the package server
+    tools = ["@rules_julia_depot//julia:image_depot.sh"],
+)
+
+# The precompile caches, so a container starts serving without first compiling ~150 packages.
+#
+# Built from the depot and application layers themselves, unpacked into one tree with the image's
+# layout, so the caches are for exactly the files the image ships. Julia validates a cache against
+# its sources by content, and records them relative to their depot (see _DEPOT_PATH), so caches
+# compiled here under <tmp>/opt load unchanged from /opt. The CUDA stub stands in for the driver
+# while Reactant loads; GPUs are hidden so the build never touches the host's.
+#
+# Precompiling is also the first time the whole stack is loaded, so a package that fails to load
+# fails the build here rather than a container at start.
+genrule(
+    name = "compiled_layer",
+    srcs = [
+        ":app_layer",
+        ":cuda_stub",
+        ":depot_layer",
+        "@reactantserver_julia//:bin/julia",
+        "@reactantserver_julia//:dist",
+    ],
+    outs = ["reactantserver-compiled.tar"],
+    cmd = """
+set -euo pipefail
+julia="$$(readlink -f $(location @reactantserver_julia//:bin/julia))"
+julia_prefix="$$(cd "$$(dirname "$$julia")/.." && pwd)"
+root="$$(mktemp -d)"
+stub="$$(mktemp -d)"
+# Pkg leaves installed packages read-only, which rm -rf alone cannot delete.
+trap 'chmod -R u+w "$$root"; rm -rf "$$root" "$$stub"' EXIT
+tar --extract --file $(location :depot_layer) --directory "$$root" --no-same-owner
+tar --extract --file $(location :app_layer) --directory "$$root" --no-same-owner
+cp $(location :cuda_stub) "$$stub/libcuda.so.1"
+# _DEPOT_PATH, with the build tree in place of /opt and the toolchain's Julia in place of /opt/julia.
+export JULIA_DEPOT_PATH="$$root{depot}:$$root{app}:$$julia_prefix/local/share/julia:$$julia_prefix/share/julia"
+export JULIA_CPU_TARGET='{cpu_target}'
+export JULIA_PKG_OFFLINE=true
+export CUDA_VISIBLE_DEVICES=
+export LD_LIBRARY_PATH="$$stub"
+export REACTANT_GPU={gpu} REACTANT_GPU_VERSION={gpu_version}
+for p in {projects}; do
+    echo "==> precompiling $$p"
+    "$$julia" --startup-file=no --project="$$root{app}/$$p" -e 'using Pkg; Pkg.precompile(; strict = true)'
+done
+""".format(
+        app = _APP,
+        cpu_target = _CPU_TARGET,
+        depot = _DEPOT,
+        gpu = _REACTANT_GPU_ENV["REACTANT_GPU"],
+        gpu_version = _REACTANT_GPU_ENV["REACTANT_GPU_VERSION"],
+        projects = " ".join(_ENTRY_PROJECTS),
+    ) + _TAR + """ --directory "$$root" {compiled}
+""".format(compiled = _DEPOT.lstrip("/") + "/compiled"),
+)
+
+# Julia as a layer at /opt/julia rather than as the base, because the base has to be CUDA's.
+genrule(
+    name = "julia_layer",
+    srcs = [
+        "@reactantserver_julia//:dist",
+        "@reactantserver_julia//:bin/julia",
+    ],
+    outs = ["reactantserver-julia.tar"],
+    cmd = """
+set -euo pipefail
+root="$$(cd "$$(dirname $(location @reactantserver_julia//:bin/julia))/.." && pwd)"
+stage="$$(mktemp -d)"
+trap 'rm -rf "$$stage"' EXIT
+mkdir -p "$$stage/opt"
+# -L, NOT plain -a: an external repo is a tree of symlinks into the execroot, and copying the
+# links would ship /opt/julia/bin/julia pointing at a path that exists only on the build host.
+cp -aL "$$root" "$$stage/opt/julia"
+chmod -R u+w "$$stage/opt/julia"
+rm -f "$$stage/opt/julia/BUILD.bazel" "$$stage/opt/julia/WORKSPACE" "$$stage/opt/julia/REPO.bazel"
+""" + _TAR + """ --directory "$$stage" opt
+""",
+)
+
+# The application at /opt/reactantserver, in the workspace layout the entrypoints expect: the root
+# Project.toml with THIS manifest beside it, the member packages, docker/ and config/. The
+# entrypoints and healthchecks are also linked into /usr/local/bin and the default node file copied
+# to /etc/reactantserver/node.yaml, where docker/Dockerfile puts them, so a compose file, a
+# healthcheck command or a mounted node file works the same against either image.
+genrule(
+    name = "app_layer",
+    srcs = [
+        "Manifest.toml",
+        "//:workspace_projects",
+        "//:workspace_sources",
+        "//:runtime_files",
+    ],
+    outs = ["reactantserver-app.tar"],
+    cmd = _STAGE + """
+set -euo pipefail
+stage="$$(mktemp -d)"
+trap 'rm -rf "$$stage"' EXIT
+app="$$stage{app}"
+mkdir -p "$$app"
+for f in $(locations //:workspace_sources) $(locations //:runtime_files); do
+    mkdir -p "$$app/$$(dirname "$$f")"
+    cp -L "$$f" "$$app/$$f"
+done
+stage_workspace "$$app"
+chmod a+x "$$app/docker/"*.sh
+mkdir -p "$$stage/usr/local/bin" "$$stage/etc/reactantserver"
+for f in entrypoint.node.sh entrypoint.worker.sh healthcheck.node.sh healthcheck.worker.jl; do
+    ln -s "{app}/docker/$$f" "$$stage/usr/local/bin/$$f"
+done
+cp "$$app/config/node.default.yaml" "$$stage/etc/reactantserver/node.yaml"
+chmod -R a+rX "$$stage/opt" "$$stage/etc"
+""".format(app = _APP) + _TAR + """ --directory "$$stage" etc opt usr
+""",
+)
+
+# Root, and not by oversight: the entrypoint's GPU-reclaim gate and the supervisor expect it, and a
+# stale cache (a mounted, edited package) must still be able to precompile into the depot.
+oci_image(
+    name = "image",
+    base = "@reactantserver_cuda_base",
+    # tini as PID 1: it reaps the zombies a supervisor of subprocesses leaves behind and forwards
+    # signals, so `podman stop` reaches the supervisor's own SIGTERM handler, which shuts the
+    # workers down gracefully.
+    entrypoint = [
+        "/usr/bin/tini",
+        "--",
+        "/usr/local/bin/entrypoint.node.sh",
+    ],
+    env = _REACTANT_GPU_ENV | {
+        # Julia is a layer, so nothing else puts it on PATH; the entrypoints exec a bare `julia`.
+        # The rest is the CUDA base's own PATH, repeated because this key replaces it.
+        "PATH": _JULIA + "/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "JULIA_DEPOT_PATH": _DEPOT_PATH,
+        "JULIA_PROJECT": _APP,
+        "REACTANT_WORKSPACE_ROOT": _APP,
+        "JULIA_SSL_CA_ROOTS_PATH": "/etc/ssl/certs/ca-certificates.crt",
+        # utility as well as compute: the entrypoint's GPU-reclaim gate runs nvidia-smi.
+        "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
+        "NVIDIA_VISIBLE_DEVICES": "all",
+    },
+    # The embedded gateway's gRPC and metrics/health ports. The workers role binds per-worker ports
+    # (base_port+i, metrics_base_port+i) instead; publish the range you configured.
+    exposed_ports = [
+        "8001/tcp",
+        "8002/tcp",
+    ],
+    tars = [
+        ":debs_layer",
+        ":depot_layer",
+        ":compiled_layer",
+        ":julia_layer",
+        ":app_layer",
+    ],
+    workdir = _APP,
+)
+
+oci_load(
+    name = "image_load",
+    image = ":image",
+    # Explicit, because rules_oci probes for docker first, and on hosts where a docker CLI is
+    # installed but its socket is unreachable that probe wins and fails.
+    loader = "@rules_julia_depot//oci:podman.sh",
+    repo_tags = ["reactantserver:bazel"],
+)
+
+# Check a loaded image: every entry project loads from the baked caches without precompiling, and
+# the tools the entrypoint and healthcheck call are present. Needs podman, and the image loaded
+# first (bazel run //deploy:image_load); runs on a host with or without a GPU.
+sh_binary(
+    name = "image_check",
+    srcs = ["image_check.sh"],
+    env = {
+        "RS_IMAGE": "localhost/reactantserver:bazel",
+        "RS_PROJECTS": " ".join(_ENTRY_PROJECTS),
+        "RS_APP": _APP,
+        "RS_STUB": "/usr/local/cuda-{}/targets/x86_64-linux/lib/stubs/libcuda.so".format(
+            _REACTANT_GPU_ENV["REACTANT_GPU_VERSION"],
+        ),
+    },
+    tags = ["manual"],  # podman, and a loaded image
+)
+
+# The committed manifest must be current for the root project and its members. Without this, a
+# [deps] or [compat] change merges, the image instantiates a manifest for a project that no longer
+# exists in that form, and Pkg either re-resolves at container start or refuses.
+sh_test(
+    name = "manifest_current",
+    size = "small",
+    srcs = ["manifest_current.sh"],
+    data = [
+        "Manifest.toml",
+        "//:workspace_projects",
+        "@reactantserver_julia//:dist",
+        "@reactantserver_julia//:bin/julia",
+    ],
+    env = {
+        "RS_JULIA": "$(rootpath @reactantserver_julia//:bin/julia)",
+        "RS_MANIFEST": "$(rootpath Manifest.toml)",
+        "RS_PROJECTS": "$(rootpaths //:workspace_projects)",
+    },
+)
+
+# Re-resolve deploy/Manifest.toml against the current workspace and write it back into the source
+# tree. Keeps every version it can (Pkg.resolve, not Pkg.update); pass package names to move those:
+#
+#   bazel run //deploy:relock                         # after a [deps]/[compat] change
+#   bazel run //deploy:relock -- Reactant Reactant_jll # deliberately take newer versions
+sh_binary(
+    name = "relock",
+    srcs = ["relock.sh"],
+    data = [
+        "@reactantserver_julia//:dist",
+        "@reactantserver_julia//:bin/julia",
+    ],
+    env = _REACTANT_GPU_ENV | {
+        "RS_JULIA": "$(rootpath @reactantserver_julia//:bin/julia)",
+    },
+    tags = ["manual"],  # network, and rewrites the source tree
+)
+
+# Re-resolve deploy/debs.lock.json: the packages the base lacks for curl and tini, resolved by apt
+# inside the pinned base and pinned to an Ubuntu snapshot. Needs podman.
+#
+#   bazel run //deploy:relock_debs                      # today's snapshot
+#   bazel run //deploy:relock_debs -- 20260928T000000Z  # a given snapshot
+sh_binary(
+    name = "relock_debs",
+    srcs = ["relock_debs.sh"],
+    tags = ["manual"],  # podman, network, and rewrites the source tree
+)
