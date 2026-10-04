@@ -221,7 +221,7 @@ julia_image_env(
 # distribution's own relative symlinks are kept, so its libraries are not shipped twice.
 julia_dist_layer(
     name = "julia_layer",
-    julia = "@reactantserver_julia//:dist",
+    julia = "@reactantserver_julia",
 )
 
 # The depot, instantiated from the manifest into an empty tree at /opt/julia-depot.
@@ -237,7 +237,7 @@ julia_depot_layer(
     name = "depot_layer",
     contents = "full",
     env = _REACTANT_GPU_ENV,
-    julia = "@reactantserver_julia//:dist",
+    julia = "@reactantserver_julia",
     manifest = "Manifest.toml",
     project = "//:Project.toml",
     # The member Project.tomls, which the workspace's [workspace] table needs to instantiate.
@@ -300,7 +300,7 @@ julia_compiled_layer(
     name = "compiled_layer",
     env = _BUILD_LOAD_ENV,
     image_env = ":image_env",
-    julia = "@reactantserver_julia//:dist",
+    julia = "@reactantserver_julia",
     layers = [
         ":julia_layer",
         ":depot_layer",
@@ -352,7 +352,7 @@ julia_precompile_test(
     size = "large",
     env = _BUILD_LOAD_ENV,
     image_env = ":image_env",
-    julia = "@reactantserver_julia//:dist",
+    julia = "@reactantserver_julia",
     layers = [l for l in _IMAGE_LAYERS if l != ":debs_layer"] + [":cuda_stub_layer"],
     projects = _ENTRY_PROJECT_PATHS,
     tags = ["manual"],
