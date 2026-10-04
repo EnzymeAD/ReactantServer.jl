@@ -60,23 +60,27 @@ and what each one optimizes for.
 
 ## Quick start
 
-The node runs natively (no containers): run the supervisor over a directory of model bundles and it
-scales to all visible GPUs.
+ReactantServer is deployed as a container image. All a host needs is the NVIDIA driver and a
+container runtime with the NVIDIA Container Toolkit; the image carries Julia, every package
+(precompiled), and the CUDA libraries. Run it over a directory of model bundles and it serves on
+every GPU you give it:
 
 ```
-REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1 julia --project=. -e 'using Pkg; Pkg.instantiate()'
-
-CUDA_VISIBLE_DEVICES=0,1,2,3 INFERENCE_SERVER_MODEL_DIRS=/path/to/bundles \
-REACTANT_NODE_FILE=config/node.default.yaml \
-  julia --handle-signals=no --project=packages/ReactantServerNode \
-    -e 'using ReactantServerNode; ReactantServerNode.main()'
+podman run -d --name reactantserver --device nvidia.com/gpu=all --ipc=host --pids-limit=-1 \
+  -p 8001:8001 -p 8002:8002 -v /path/to/bundles:/var/lib/reactantserver/models \
+  docker.io/csvance4/reactantserver:latest
 ```
 
-The first server startup is slow, since every model compiles before the gRPC plane accepts
-traffic. See [Deployment](https://enzymead.github.io/ReactantServer.jl/dev/deployment/) for
-configuration and running it as a service.
+With Docker, use `--gpus all` in place of `--device nvidia.com/gpu=all`, or run the repository's
+`docker-compose.yml`. The first start is slow, since every model compiles before the gRPC plane
+accepts traffic; compiled programs are then cached inside each bundle. See
+[Deployment](https://enzymead.github.io/ReactantServer.jl/dev/deployment/#Running-the-container)
+for the container settings (shared memory, thread limits, health), and `deploy/` to build the
+image yourself with Bazel.
 
-Or from pure Julia:
+For a quick try from a source checkout, without a container, instantiate the workspace once
+(`REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1 julia --project=. -e 'using Pkg; Pkg.instantiate()'`)
+and run the supervisor from Julia:
 
 ```julia
 using ReactantServerNode

@@ -1,7 +1,7 @@
 # Self-contained Grafana + Prometheus monitoring stack for a ReactantServer node.
 #
-# The node runs natively on the host (not in a container), so Prometheus scrapes the host's metrics
-# port rather than a container over a shared Docker network. The prometheus service maps
+# Prometheus scrapes the metrics port the node container publishes on the host (8002), so this stack
+# needs no shared Docker network with the node. The prometheus service maps
 # `host.docker.internal` to the host gateway (`extra_hosts` below) and prometheus.yml targets
 # `host.docker.internal:8002`. If your node listens on a remote host, edit that target in
 # prometheus.yml instead. Independent lifecycle: bring this up/down without touching the server.
@@ -19,7 +19,7 @@ services:
     image: prom/prometheus:latest
     container_name: reactant-prometheus
     restart: unless-stopped
-    # Reach the natively-running node on the host. host-gateway resolves host.docker.internal to the
+    # Reach the node's published port on the host. host-gateway resolves host.docker.internal to the
     # host from inside the container (Docker 20.10+); prometheus.yml targets host.docker.internal:8002.
     extra_hosts:
       - "host.docker.internal:host-gateway"

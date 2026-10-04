@@ -2,8 +2,8 @@
 
 A self-contained Grafana + Prometheus stack that scrapes a running ReactantServer node and ships a
 seven-dashboard suite. It runs as its own compose project with an independent lifecycle (restart the
-server without touching Grafana, and vice versa). The node runs natively on the host, so Prometheus
-scrapes the host's metrics port rather than a container over a shared network.
+server without touching Grafana, and vice versa). Prometheus scrapes the metrics port the node
+container publishes on the host, so the two stacks need no shared network.
 
 ## Run it
 
@@ -17,7 +17,7 @@ docker compose -f "$COMPOSE" ps
 docker compose -f "$COMPOSE" down
 ```
 
-Prometheus reaches the natively-running node at `host.docker.internal:8002`, mapped to the host
+Prometheus reaches the node's published port at `host.docker.internal:8002`, mapped to the host
 gateway by `extra_hosts` in the compose file (Docker 20.10+). If the node listens on a **different
 host**, edit the target in `prometheus.yml` to that host's `address:8002` instead.
 
