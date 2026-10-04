@@ -52,7 +52,7 @@ use_repo(debs, "reactantserver_debs")
 bazel_dep(name = "rules_julia_depot", version = "0.1.0")
 git_override(
     module_name = "rules_julia_depot",
-    commit = "f8d7c226136e7f02146d80088c02cb59a97096ad",
+    commit = "cead3479d64e7bf56fac66a15b72e9c4cd45ddc8",
     remote = "https://github.com/csvance/rules_julia_depot.git",
 )
 
