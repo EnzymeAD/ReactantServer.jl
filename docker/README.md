@@ -12,7 +12,7 @@ build, the base image, and how to run it. This directory holds the runtime scrip
 and the repository root's `docker-compose.yml` runs it:
 
 ```
-make image        # bazel run //deploy:image_load, loads localhost/reactantserver:bazel
+bazel run //deploy:image_load    # loads localhost/reactantserver:bazel
 REACTANTSERVER_MODELS=/path/to/bundles docker compose up
 ```
 

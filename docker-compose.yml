@@ -5,12 +5,12 @@
 #
 # Prerequisites:
 #   - NVIDIA Container Toolkit on the host for GPU access
-#   - the node image, built with Bazel and loaded locally (`make image`, see deploy/README.md), or
+#   - the node image, built with Bazel and loaded locally (see deploy/README.md), or
 #     pulled from a registry by setting REACTANTSERVER_IMAGE
 #   - a model bundle repository on the host; point REACTANTSERVER_MODELS at it (defaults to ./bundles)
 #
 # Usage:
-#   make image
+#   bazel run //deploy:image_load
 #   REACTANTSERVER_MODELS=/path/to/bundles docker compose up
 #
 # Equivalent without compose:

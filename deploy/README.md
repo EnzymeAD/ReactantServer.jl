@@ -18,8 +18,6 @@ bazel run   //deploy:relock              # re-resolve the Julia lock after a [de
 bazel run   //deploy:relock_debs         # re-resolve the Ubuntu package lock (curl, tini)
 ```
 
-Or `make image`, which builds and loads it.
-
 The Julia-specific parts (the distribution, depot and precompile-cache layers, the image
 environment, and the precompile test) are the image rules of
 [rules_julia_depot](https://github.com/csvance/rules_julia_depot) (`julia/image.bzl`); this

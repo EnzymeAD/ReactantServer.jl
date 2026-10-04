@@ -313,7 +313,7 @@ built with Bazel from committed locks (`deploy/Manifest.toml` for Julia, a diges
 so the same commit always yields the same packages and artifacts:
 
 ```text
-make image        # bazel run //deploy:image_load, loads localhost/reactantserver:bazel into podman
+bazel run //deploy:image_load    # loads localhost/reactantserver:bazel into podman
 REACTANTSERVER_MODELS=/path/to/bundles docker compose up
 ```
 
