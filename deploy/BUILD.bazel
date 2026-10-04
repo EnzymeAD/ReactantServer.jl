@@ -54,10 +54,10 @@ _APP = "/opt/reactantserver"
 # //deploy:compiled_layer and checked by //deploy:image_precompile_test. A package's cache depends
 # on the active project's preferences (the worker's LocalPreferences.toml configures Reactant), so
 # each entry point needs its own.
-#   packages/ReactantServerNode     the supervisor (docker/entrypoint.node.sh)
+#   packages/ReactantServerNode     the supervisor (runtime/entrypoint.node.sh)
 #   packages/ReactantServer         a worker (spawned by the supervisor, or entrypoint.worker.sh)
 #   packages/ReactantServerGateway  the embedded gateway (spawned by the supervisor)
-#   .                               the worker-role healthcheck (docker/healthcheck.worker.jl)
+#   .                               the worker-role healthcheck (runtime/healthcheck.worker.jl)
 _ENTRY_PROJECTS = [
     "packages/ReactantServerNode",
     "packages/ReactantServer",
@@ -244,18 +244,25 @@ julia_depot_layer(
     srcs = ["//:workspace_projects"],
 )
 
+# The container's entrypoints and healthchecks (see runtime/README.md).
+filegroup(
+    name = "runtime_scripts",
+    srcs = glob(["runtime/*.sh", "runtime/*.jl"]),
+)
+
 # The application at /opt/reactantserver, in the workspace layout the entrypoints expect: the root
-# Project.toml with THIS manifest beside it, the member packages, docker/ and config/. The
-# entrypoints and healthchecks are also linked into /usr/local/bin and the default node file copied
-# to /etc/reactantserver/node.yaml, the paths docker-compose.yml, its healthcheck command and a
+# Project.toml with THIS manifest beside it, the member packages and config/. The entrypoints and
+# healthchecks are installed in /usr/local/bin and the default node file copied to
+# /etc/reactantserver/node.yaml, the paths docker-compose.yml, its healthcheck command and a
 # mounted node file expect.
 genrule(
     name = "app_layer",
     srcs = [
         "Manifest.toml",
+        ":runtime_scripts",
+        "//:node_config",
         "//:workspace_projects",
         "//:workspace_sources",
-        "//:runtime_files",
     ],
     outs = ["reactantserver-app.tar"],
     cmd = _STAGE + """
@@ -264,17 +271,17 @@ stage="$$(mktemp -d)"
 trap 'rm -rf "$$stage"' EXIT
 app="$$stage{app}"
 mkdir -p "$$app"
-for f in $(locations //:workspace_sources) $(locations //:runtime_files); do
+for f in $(locations //:workspace_sources) $(locations //:node_config); do
     rel="$$(workspace_path "$$f")"
     mkdir -p "$$app/$$(dirname "$$rel")"
     cp -L "$$f" "$$app/$$rel"
 done
 stage_workspace "$$app"
-chmod a+x "$$app/docker/"*.sh
 mkdir -p "$$stage/usr/local/bin" "$$stage/etc/reactantserver"
-for f in entrypoint.node.sh entrypoint.worker.sh healthcheck.node.sh healthcheck.worker.jl; do
-    ln -s "{app}/docker/$$f" "$$stage/usr/local/bin/$$f"
+for f in $(locations :runtime_scripts); do
+    cp -L "$$f" "$$stage/usr/local/bin/"
 done
+chmod a+x "$$stage/usr/local/bin/"*.sh
 cp "$$app/config/node.default.yaml" "$$stage/etc/reactantserver/node.yaml"
 """.format(app = _APP) + _TAR + """ --directory "$$stage" etc opt usr
 """,

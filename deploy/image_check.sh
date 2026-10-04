@@ -19,7 +19,7 @@ echo "==> checking $image"
 podman image exists "$image" || { echo "FAILED: $image is not loaded (bazel run //deploy:image_load)" >&2; exit 1; }
 
 # What each entry project loads. The root project serves the worker-role healthcheck, which
-# imports only these two (docker/healthcheck.worker.jl).
+# imports only these two (deploy/runtime/healthcheck.worker.jl).
 modules_for() {
     case "$1" in
         .) echo "gRPCClient YAML" ;;

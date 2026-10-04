@@ -34,10 +34,10 @@ filegroup(
     ),
 )
 
-# The container entrypoints and the default node config the image runs with.
+# The default node config the image runs with, and its commented template.
 filegroup(
-    name = "runtime_files",
-    srcs = glob(["docker/*.sh", "docker/*.jl"]) + [
+    name = "node_config",
+    srcs = [
         "config/node.default.yaml",
         "config/node.yaml",
     ],

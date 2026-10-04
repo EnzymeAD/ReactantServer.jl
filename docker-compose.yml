@@ -44,7 +44,7 @@ services:
       # so the entrypoint GPU-reclaim gate and the worker out-of-pool memory metric work. Pinned here
       # rather than relying on the host container-runtime default capability set.
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
-      # Autotune knobs, settable here (see docker/README.md). Defaults shown; uncomment to change.
+      # Autotune knobs, settable here (see deploy/runtime/README.md). Defaults shown; uncomment to change.
       #   RUNTIME_AUTOTUNE=false disables the GPU compile autotuner (deterministic kernels, cleaner
       #   startup memory probe); AUTOTUNE_CACHE toggles the persistent per-fusion autotune cache and
       #   AUTOTUNE_CACHE_DIR is where it lives (mount a volume there, as above, to persist it).
