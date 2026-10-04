@@ -23,7 +23,7 @@
 
 services:
   reactantserver:
-    image: ${REACTANTSERVER_IMAGE:-docker.io/csvance4/reactantserver:latest}
+    image: ${REACTANTSERVER_IMAGE:-ghcr.io/enzymead/reactantserver:latest}
     volumes:
       # Writable: the serialized executable cache lives inside each bundle (<bundle>/.cache/), so a
       # read-only mount recompiles every program on every start.
