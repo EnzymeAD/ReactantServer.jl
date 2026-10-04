@@ -4,9 +4,9 @@
 # gateway_* series AND fans out to every worker's metrics endpoint, merging them into one exposition.
 # Each worker self-tags its series with `worker` and `gpu` labels, so they never collide.
 #
-# The node runs natively on the host, so the target is `host.docker.internal:8002` (mapped to the
-# host gateway by docker-compose.monitoring.yml). For a node on a different host, replace it with
-# that host's `address:8002`.
+# The node container publishes :8002 on the host, so the target is `host.docker.internal:8002`
+# (mapped to the host gateway by docker-compose.monitoring.yml). For a node on a different host,
+# replace it with that host's `address:8002`.
 global:
   scrape_interval: 15s
   scrape_timeout: 10s

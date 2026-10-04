@@ -5,17 +5,17 @@
 #
 # Prerequisites:
 #   - NVIDIA Container Toolkit on the host for GPU access
-#   - the node image, built with Bazel and loaded locally (see deploy/README.md), or
-#     pulled from a registry by setting REACTANTSERVER_IMAGE
 #   - a model bundle repository on the host; point REACTANTSERVER_MODELS at it (defaults to ./bundles)
 #
 # Usage:
-#   bazel run //deploy:image_load
-#   REACTANTSERVER_MODELS=/path/to/bundles docker compose up
+#   REACTANTSERVER_MODELS=/path/to/bundles docker compose up -d
 #
-# Equivalent without compose:
-#   docker run --gpus all --ipc=host -p 8001:8001 -p 8002:8002 \
-#     -v /path/to/bundles:/var/lib/reactantserver/models localhost/reactantserver:bazel
+# This runs the published image. To run one you built with Bazel instead (see deploy/README.md):
+#   bazel run //deploy:image_load
+#   REACTANTSERVER_IMAGE=localhost/reactantserver:bazel docker compose up -d
+#
+# The Deployment page of the docs explains each setting below, and gives the equivalent
+# `podman run` / `docker run` command.
 #
 # Clients speak KServe V2 gRPC to :8001; metrics and health (/readyz, /metrics) are on :8002.
 # With one GPU the supervisor runs a single worker (no gateway) on those ports; with more, it
@@ -23,7 +23,7 @@
 
 services:
   reactantserver:
-    image: ${REACTANTSERVER_IMAGE:-localhost/reactantserver:bazel}
+    image: ${REACTANTSERVER_IMAGE:-docker.io/csvance4/reactantserver:latest}
     volumes:
       # Writable: the serialized executable cache lives inside each bundle (<bundle>/.cache/), so a
       # read-only mount recompiles every program on every start.
@@ -37,8 +37,15 @@ services:
       # explicitly; see config/node.yaml for the commented template.
       # - ./config/node.yaml:/etc/reactantserver/node.yaml:ro
     # Share the host IPC namespace so POSIX shared-memory regions (KServe system shared memory)
-    # created by a client are visible to the workers via shm_open.
+    # created by a client are visible to the workers via shm_open, and so /dev/shm is the host's
+    # rather than the container default of 64 MiB, which is too small for client regions or for
+    # runtime.shared_host_weights. To keep a private namespace instead, drop this line and size it
+    # explicitly with `shm_size:` (above the combined weights of every model, when sharing them).
     ipc: host
+    # The process limit counts threads, and each worker runs several thread pools, so a multi-GPU
+    # node can exceed podman's default of 2048 while it loads models and abort in pthread_create.
+    # -1 defers to the host's limits.
+    pids_limit: -1
     environment:
       # Inject nvidia-smi + NVML (the "utility" driver capability) alongside the compute libraries,
       # so the entrypoint GPU-reclaim gate and the worker out-of-pool memory metric work. Pinned here
@@ -66,7 +73,7 @@ services:
       interval: 30s
       timeout: 20s
       retries: 3
-      start_period: 300s
+      start_period: 3600s
     deploy:
       resources:
         reservations:

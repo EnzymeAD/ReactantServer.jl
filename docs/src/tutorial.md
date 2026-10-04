@@ -1,8 +1,8 @@
 # Tutorial: Export to Inference, End to End
 
 This page walks one model through the whole system: export a small Lux MLP into a bundle with
-`export_bundle(:lux, ...)`, write the minimal single-GPU node file, run the server with the
-supervisor (the container launcher) or from pure Julia, and query it with `ReactantServerClient`
+`export_bundle(:lux, ...)`, write the minimal single-GPU node file, serve it with the container
+image (or from pure Julia for a quick try), and query it with `ReactantServerClient`
 over KServe V2 gRPC. The commands target a CUDA GPU host (`backend: cuda`, a visible GPU). The
 runtime is device agnostic, so the same steps work on CPU by setting `backend: cpu` and dropping
 the GPU flags; that is handy for following along without a GPU.
@@ -38,10 +38,10 @@ to one another only through files and the gRPC wire protocol.
 1. **Export environment.** `ReactantServerExport` is not a workspace member; it carries Lux and
    PythonCall weak dependencies the server image should not. Use its test project, which has them
    ready: `julia --project=packages/ReactantServerExport/test`.
-2. **Server environment.** The workspace under `packages/` (`ReactantServerCore`,
-   `ReactantServer`, `ReactantServerNode`, `ReactantServerGateway`), with gRPCServer sourced from
-   its `main` branch on GitHub through the workspace `[sources]`. After cloning,
-   instantiate once:
+2. **Server environment.** The container image, which carries the server and everything it
+   needs. For the pure-Julia route in Step 4 instead, use the workspace under `packages/`
+   (`ReactantServerCore`, `ReactantServer`, `ReactantServerNode`, `ReactantServerGateway`) and
+   instantiate it once after cloning:
 
 ```text
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
@@ -108,20 +108,24 @@ The explicit one-entry `workers:` list works with every run path below, includin
 workers bring up the embedded [Gateway](gateway.md). See [Node Configuration](node_config.md) for
 the full surface: scheduler tuning, on-demand weights, per-model pinning, environment overrides.
 
-## Step 3: Run the node supervisor
+## Step 3: Run the container
 
-Run the supervisor, pointing it at the repository from Step 1. `INFERENCE_SERVER_MODEL_DIRS`
-overrides the node file's `model_repo`, and `REACTANT_NODE_FILE` names the node file:
+Run the published image with the repository from Step 1 mounted where the node file expects it,
+and the node file mounted over the image's default:
 
 ```text
-CUDA_VISIBLE_DEVICES=0 INFERENCE_SERVER_MODEL_DIRS=$PWD/models REACTANT_NODE_FILE=node.yaml \
-  julia --handle-signals=no --project=packages/ReactantServerNode \
-    -e 'using ReactantServerNode; ReactantServerNode.main()'
+podman run --rm --name reactantserver --device nvidia.com/gpu=0 \
+  --ipc=host --pids-limit=-1 -p 8001:8001 -p 8002:8002 \
+  -v $PWD/models:/var/lib/reactantserver/models \
+  -v $PWD/node.yaml:/etc/reactantserver/node.yaml:ro \
+  docker.io/csvance4/reactantserver:latest
 ```
 
-This is the pure-Julia form of the container launcher: in the image,
-`deploy/runtime/entrypoint.node.sh` runs the same entry point, detects the visible GPUs, spawns one
-worker subprocess per device, and restarts children that die.
+With Docker, use `--gpus device=0` in place of `--device nvidia.com/gpu=0`. The image's
+entrypoint is the node supervisor: it detects the GPUs granted to the container, spawns one worker
+subprocess per device, and restarts children that die. `--ipc=host` shares the host's `/dev/shm`
+so a client on the host can use the shared-memory transport, and `--pids-limit=-1` lifts podman's
+thread cap; [Deployment](deployment.md) explains these and the other container settings.
 
 With a single GPU the node runs one worker and no gateway: the worker serves the KServe V2 gRPC
 API on `localhost:8001` and metrics/health on `localhost:8002` (`/readyz`, `/healthz`,
@@ -130,9 +134,10 @@ API on `localhost:8001` and metrics/health on `localhost:8002` (`/readyz`, `/hea
 
 ## Step 4: Or serve from pure Julia
 
-Two entry points, differing only in which ports are exposed. First the supervisor, which behaves
-exactly like the container launcher `deploy/runtime/entrypoint.node.sh`: one worker (no gateway) on
-the public ports 8001 (gRPC) and 8002 (metrics):
+For a quick try without a container, or while developing the server itself, run it from the
+workspace. Two entry points, differing only in which ports are exposed. First the supervisor,
+which is what the container's entrypoint (`deploy/runtime/entrypoint.node.sh`) runs: one worker
+(no gateway) on the public ports 8001 (gRPC) and 8002 (metrics):
 
 ```julia
 using ReactantServerNode
@@ -158,8 +163,8 @@ server = ReactantServer.serve("node.yaml"; blocking = false)
 ReactantServer.stop!(server)
 ```
 
-`supervise` is the right choice for deployment (it is what the launcher runs, and it scales to
-many GPUs unchanged); a bare `serve` is convenient for a quick single-worker REPL session.
+`supervise` behaves like the container (it scales to many GPUs unchanged); a bare `serve` is
+convenient for a quick single-worker REPL session. For deployment, use the container from Step 3.
 
 Start Julia multithreaded so per-request `preprocess`/`postprocess` hooks overlap the GPU
 execution: `julia --threads=auto,1` gives a default pool for the hooks plus one interactive
@@ -173,7 +178,7 @@ just without the overlap.
 
 The server speaks KServe V2 over gRPC, so any Triton/KServe client works; this repository ships
 the Reactant-free `ReactantServerClient`. From the client environment, point it at the port your
-server is using (8001 for the supervisor, 8080 for a bare `serve`) and use the bundle's tensor
+server is using (8001 for the container or the supervisor, 8080 for a bare `serve`) and use the bundle's tensor
 names `input` / `output`:
 
 ```julia
@@ -208,5 +213,5 @@ validation, and the shared-memory data path.
 - [Client](client.md): the full client API and data paths.
 - The worked examples [Object Detection](object_detection.md) and [Transformers](transformers.md).
 - [Meta Models](meta_models.md), an experimental feature whose design is subject to change.
-- [Deployment](deployment.md): systemd, Docker, health, and metrics.
+- [Deployment](deployment.md): running the container image, its settings, health, and metrics.
 - [API](api.md): every documented name, collected automatically.

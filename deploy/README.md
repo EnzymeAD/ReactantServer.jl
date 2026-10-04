@@ -2,10 +2,11 @@
 
 `//deploy:image` builds the node image (the `ReactantServerNode` supervisor as entrypoint under
 `tini`, KServe V2 gRPC on `:8001`, health and metrics on `:8002`) from committed locks, with no
-resolve at build time. The same commit always yields the same
-packages, artifacts, and system libraries, which is what a validated production deployment needs.
-Nothing else in the repository depends on Bazel: tests, docs, and the native deployment stay plain
-Julia.
+resolve at build time. The same commit always yields the same packages, artifacts, and system
+libraries, which is what a validated production deployment needs. This image is the supported way
+to deploy ReactantServer; it is published as `docker.io/csvance4/reactantserver:latest`, and the
+docs' Deployment page covers running it. Nothing else in the repository depends on Bazel: tests,
+docs, and running from a source checkout stay plain Julia.
 
 ```
 bazel build //deploy:image
@@ -124,6 +125,10 @@ container, that each entry project loads with no cache rejected and nothing prec
 the entrypoints.
 
 ## Running it
+
+The docs' Deployment page ("Running the container") is the guide to running the image, including
+the shared-memory, process-limit and thread settings a container needs. What follows are the
+details specific to how this image is built.
 
 The image expects the host driver to be provided at run time, like any CUDA image. With the NVIDIA
 Container Toolkit and a CDI spec podman can read, `--device nvidia.com/gpu=<n>` is enough. Where CDI

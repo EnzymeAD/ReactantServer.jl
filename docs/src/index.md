@@ -84,25 +84,28 @@ through a gRPC control plane, without a restart.
 
 ## Install
 
-ReactantServer is not yet registered in the General registry, so installation is from the
-repository:
+ReactantServer is deployed as a container image. A host needs only the NVIDIA driver and a
+container runtime with the NVIDIA Container Toolkit; the image carries Julia, every package
+(precompiled), and the CUDA libraries. Run it over a directory of model bundles and it serves on
+every GPU you give it:
+
+```
+podman run -d --name reactantserver --device nvidia.com/gpu=all --ipc=host --pids-limit=-1 \
+  -p 8001:8001 -p 8002:8002 -v /path/to/bundles:/var/lib/reactantserver/models \
+  docker.io/csvance4/reactantserver:latest
+```
+
+With Docker, use `--gpus all` in place of `--device nvidia.com/gpu=all`. See
+[Running the container](@ref) for the settings and [Building the image](@ref) to build your own.
+
+For development, or a quick try without a container, clone the repository (it is not yet in the
+General registry) and run the supervisor from pure Julia:
 
 ```
 git clone https://github.com/EnzymeAD/ReactantServer.jl
 cd ReactantServer.jl
 REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 ```
-
-Run the supervisor over a directory of model bundles and it scales to every visible GPU:
-
-```
-CUDA_VISIBLE_DEVICES=0,1,2,3 INFERENCE_SERVER_MODEL_DIRS=/path/to/bundles \
-REACTANT_NODE_FILE=config/node.default.yaml \
-  julia --handle-signals=no --project=packages/ReactantServerNode \
-    -e 'using ReactantServerNode; ReactantServerNode.main()'
-```
-
-Or from pure Julia:
 
 ```julia
 using ReactantServerNode
@@ -129,5 +132,6 @@ before exposing an endpoint.
   stages.
 - The worked examples, [Object Detection](object_detection.md) and
   [Transformer Text Models](transformers.md), end to end.
-- [Deployment](deployment.md): systemd, Docker, monitoring, and the deployment shapes.
+- [Deployment](deployment.md): running the container image, its settings, monitoring, and the
+  deployment shapes.
 - The [API](api.md): every documented name, collected automatically.

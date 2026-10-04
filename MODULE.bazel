@@ -3,10 +3,11 @@ module(
     version = "0.0.0",
 )
 
-# Bazel builds the reproducible node image (//deploy:image); nothing else in this repository
-# depends on it. Tests, docs and the native deployment stay plain Julia (see CONTRIBUTING.md). What
-# Bazel adds is an image assembled from a COMMITTED manifest (deploy/Manifest.toml) with no Pkg resolve anywhere in the
-# build, so the same commit always yields the same package and artifact set.
+# Bazel builds the reproducible node image (//deploy:image), which is the supported deployment;
+# nothing else in this repository depends on it. Tests, docs and running from a source checkout
+# stay plain Julia (see CONTRIBUTING.md). What Bazel adds is an image assembled from a COMMITTED
+# manifest (deploy/Manifest.toml) with no Pkg resolve anywhere in the build, so the same commit
+# always yields the same package and artifact set.
 
 # Bazel 9 moved sh_binary/sh_test out of the core into rules_shell.
 bazel_dep(name = "rules_shell", version = "0.8.0")

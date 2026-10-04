@@ -7,9 +7,13 @@ embedded gateway on the public ports; with a single worker it binds that worker 
 ports directly. The external interface is the same either way: KServe V2 gRPC on `:8001`, health
 and metrics on `:8002` (`/readyz`, `/healthz`, `/metrics`), matching Triton's ports.
 
-The supported deployment is **native** (no containers): the supervisor uses the host's NVIDIA
-driver directly. A container image is also provided as an alternative and runs the same node with
-the same interface; see [Docker (container) deployment](#docker-container-deployment) below.
+The supported deployment is the **container image**: pull the published image, or build your own
+with Bazel, and run it under podman or Docker. The image carries Julia, every package, their
+precompiled caches, and the CUDA userspace Reactant needs, so a host needs only an NVIDIA driver
+and a container runtime with the NVIDIA Container Toolkit. See
+[Running the container](@ref) below. Running the supervisor straight from a
+source checkout also works and is handy for development; see
+[Running from source](@ref).
 
 ## Audience and mission
 
@@ -214,136 +218,141 @@ is described by one YAML node file; the commented templates under `config/` (`no
 `node.yaml`) are reference configs, and gateway scheduling (`round_robin` or `lpt_packing`) is
 covered on the [Multi-GPU Gateway](gateway.md) page.
 
-## Running natively
+## Running the container
 
-Instantiate the workspace once, then run the node supervisor. `ReactantServerNode.main()` reads
-`REACTANT_NODE_FILE` for the node config and honors the standard environment overrides:
+The image is published as `docker.io/csvance4/reactantserver:latest`. Its entrypoint is the node
+supervisor, so one container runs the whole node: one worker per GPU it is given, plus the
+embedded gateway when there are two or more. Mount a model repository and publish the two ports:
+
+```text
+podman run -d --name reactantserver \
+  --device nvidia.com/gpu=all \
+  --ipc=host --pids-limit=-1 \
+  -p 8001:8001 -p 8002:8002 \
+  -v /path/to/bundles:/var/lib/reactantserver/models \
+  -v reactant-compile-cache:/var/cache/reactant-compile \
+  --health-cmd /usr/local/bin/healthcheck.node.sh --health-start-period 3600s \
+  --stop-timeout 30 \
+  docker.io/csvance4/reactantserver:latest
+```
+
+With Docker, replace `--device nvidia.com/gpu=all` with `--gpus all`; the other flags are the
+same. The repository's `docker-compose.yml` is the same deployment as a compose file:
+
+```text
+REACTANTSERVER_MODELS=/path/to/bundles docker compose up -d
+```
+
+Every model compiles to a device executable on every worker before the gRPC plane accepts
+traffic, so the first start is slow (minutes to hours for a large model set). Compiled programs
+are cached inside each bundle (`<bundle>/.cache/`), so later starts load them in milliseconds.
+Watch readiness with `curl -sf http://127.0.0.1:8002/readyz` or the container's health status,
+not the container state. On stop, the supervisor drains its workers on SIGTERM; give it room
+before the runtime escalates to SIGKILL (`--stop-timeout`, or `stop_grace_period` in compose).
+
+### Container settings
+
+Most of these flags exist because a container's defaults are sized for small services, not for
+a process that maps model weights into shared memory and runs several thread pools per GPU.
+
+**GPU access.** The host needs the NVIDIA driver and the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/).
+Podman reads GPUs through CDI (`--device nvidia.com/gpu=all`, or `nvidia.com/gpu=0` for one
+card; generate the spec with `nvidia-ctk cdi generate`), Docker through `--gpus`. The supervisor
+runs one worker per GPU it can see, so the GPUs you grant the container are the topology. The
+image sets `NVIDIA_DRIVER_CAPABILITIES=compute,utility`; keep `utility`, which injects
+`nvidia-smi` and NVML for the entrypoint's GPU-reclaim wait and the out-of-pool memory metric. If CDI is unavailable on an older podman, bind
+the device nodes and driver libraries instead; `deploy/README.md` lists them.
+
+**Shared memory (`/dev/shm`).** Two features place data in POSIX shared memory: clients that send
+tensors through the [shared-memory transport](client.md) (the client's staging pool is 256 MiB by
+default), and `runtime.shared_host_weights`, which keeps one host copy of every model's weights
+for all of a node's workers (see [On-demand Weights](on_demand_weights.md)). A container's own
+`/dev/shm` defaults to 64 MiB, far too small for either. There are two ways to provide it:
+
+- `--ipc=host` (compose: `ipc: host`) shares the host's IPC namespace and its `/dev/shm`, which
+  is usually sized at half of RAM. This is also what lets a client running on the host, outside
+  the container, use the shared-memory transport.
+- A private namespace with an explicit size, `--shm-size 32g` (compose: `shm_size: 32g`), or a
+  podman pod created with `--share ipc --shm-size` so that client containers in the same pod
+  share it. Use this when the host namespace is not yours to share.
+
+With `shared_host_weights` on, size `/dev/shm` above the combined weights of every model the node
+serves, plus room for the client regions. A tmpfs is allocated lazily, so a generous limit costs
+nothing until it is used. `--shm-size` does not apply together with `--ipc=host`.
+
+**Process and thread limits.** Podman limits a container to 2048 processes by default
+(`--pids-limit`), and the limit counts threads. Each worker runs a Julia compute pool, XLA's
+asynchronous runners, and the host libraries' own pools, so a multi-GPU node can cross 2048
+while it loads models; the worker then aborts with `pthread_create() failed` (errno 11, EAGAIN).
+Pass `--pids-limit=-1` (compose: `pids_limit: -1`) to defer to the host's limits, or a value
+large enough for your worker count. Docker sets no limit by default unless its daemon is
+configured with one.
+
+Each worker's compute pool is sized to its share of the CPUs Julia detects, `min(CPUs ÷ workers,
+16)` plus one interactive thread (see [The node supervisor](@ref)); the startup
+log prints the result as `worker compute threads: ...`. If you limit the container's CPUs (for
+example with `--cpus`), check that line and set `REACTANT_WORKER_THREADS` to the number of
+compute threads each worker should run.
+
+**Model repository.** Mount it at `/var/lib/reactantserver/models`, writable: the compiled
+executable cache lives inside each bundle, so a read-only mount recompiles every program on every
+start. In `dynamic` mode the server watches the mount and hot-loads changes.
+
+**Persistent caches.** Mount a volume at `/var/cache/reactant-compile` to keep XLA's autotune
+results across container recreation; without it every start re-times every GEMM and convolution.
+Never mount anything over `/opt/julia-depot/compiled`, which holds the image's precompiled
+packages.
+
+**Node file.** The image runs `/etc/reactantserver/node.yaml`, a copy of
+`config/node.default.yaml` (`gpus: auto`, one worker per visible GPU). Mount your own file over
+that path to change it; `config/node.yaml` is the commented template, and
+[Node Configuration](node_config.md) covers every key and its `INFERENCE_SERVER_*` environment
+override, which can be passed with `-e`.
+
+**Health.** An OCI image cannot carry a healthcheck, so pass one at run time:
+`/usr/local/bin/healthcheck.node.sh` reports healthy once the node's `/readyz` answers. Set the
+start period longer than a cold start, which compiles every model before `/readyz` succeeds.
+
+### Building the image
+
+The image is built with Bazel from committed locks: `deploy/Manifest.toml` pins every Julia
+package and artifact, and the CUDA base image is pinned by digest, so the same commit always
+yields the same image. To build it and load it into podman:
+
+```text
+bazel run //deploy:image_load    # loads localhost/reactantserver:bazel
+REACTANTSERVER_IMAGE=localhost/reactantserver:bazel docker compose up -d
+```
+
+See `deploy/README.md` for the build itself, the precompiled caches, pushing to a registry, and
+consuming the image from another Bazel module, and `deploy/runtime/README.md` for the entrypoint
+and healthcheck scripts.
+
+## Running from source
+
+For development, or a quick look on a machine where you already have Julia, run the supervisor
+from a checkout. This is the same entry point the image runs:
 
 ```text
 # once, to resolve and precompile the workspace (selects the CUDA build via REACTANT_GPU_*):
 REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1 \
   julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
 
-# run the supervisor across four GPUs, serving a bundle directory:
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
+CUDA_VISIBLE_DEVICES=0 \
 INFERENCE_SERVER_MODEL_DIRS=/path/to/bundles \
 REACTANT_NODE_FILE=config/node.default.yaml \
   julia --handle-signals=no --project=packages/ReactantServerNode \
     -e 'using ReactantServerNode; ReactantServerNode.main()'
 ```
 
-`--handle-signals=no` lets the supervisor's own handler run so it shuts its worker children down
-on SIGTERM. `REACTANT_GPU_VERSION` selects the Reactant CUDA build (`12.9` or `13.1`) and must be
-set before `instantiate`. `INFERENCE_SERVER_MODEL_DIRS` overrides the node file's model repository
-(colon-separated); the runtime tunables under [Node Configuration](node_config.md) take
-`INFERENCE_SERVER_*` overrides the same way. For an always-on service, run this command under a
-process manager such as systemd, with `Restart=on-failure` and a SIGTERM-based graceful stop
-(`KillMode=mixed` pairs with `--handle-signals=no`).
-
-Every model compiles to a device executable on every worker before the gRPC plane accepts traffic,
-so first startup is slow (minutes to hours for a large model set). Watch readiness with
-`curl -sf http://127.0.0.1:8002/readyz`, not the process state.
-
-## Running under systemd
-
-For an always-on node, run the supervisor from a system service. Put the tunables in an
-`EnvironmentFile` and let the unit run the same command as above. Adjust the user, the checkout
-path, and the GPU list for your host.
-
-`/etc/reactantserver/reactantserver.env`:
-
-```text
-CUDA_VISIBLE_DEVICES=0,1,2,3
-INFERENCE_SERVER_MODEL_DIRS=/path/to/bundles
-REACTANT_NODE_FILE=config/node.default.yaml
-REACTANT_GPU=cuda
-REACTANT_GPU_VERSION=13.1
-```
-
-`/etc/systemd/system/reactantserver.service`:
-
-```text
-[Unit]
-Description=ReactantServer node supervisor
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=exec
-User=YOUR_DEPLOY_USER
-WorkingDirectory=/path/to/ReactantServer.jl
-EnvironmentFile=/etc/reactantserver/reactantserver.env
-# Absolute path to julia: systemd does not source your shell rc, so a juliaup install under the
-# user's home is not on PATH. `julia --version` in a login shell shows the binary to use here.
-ExecStart=/home/YOUR_DEPLOY_USER/.juliaup/bin/julia --handle-signals=no --project=packages/ReactantServerNode -e 'using ReactantServerNode; ReactantServerNode.main()'
-Restart=on-failure
-RestartSec=10
-# First boot compiles every model on every worker (minutes to hours) AFTER the unit is already
-# active; systemd cannot gate that (the supervisor sends no sd_notify). Check readiness with
-# `curl -sf http://127.0.0.1:8002/readyz`, not `systemctl is-active`.
-TimeoutStartSec=infinity
-# Graceful stop: SIGTERM to the supervisor only, which drains its workers; pairs with
-# --handle-signals=no. Anything still alive after TimeoutStopSec is SIGKILLed.
-KillMode=mixed
-KillSignal=SIGTERM
-TimeoutStopSec=45
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable and watch it:
-
-```text
-sudo systemctl daemon-reload
-sudo systemctl enable --now reactantserver.service
-journalctl -u reactantserver -f
-until curl -sf http://127.0.0.1:8002/readyz; do sleep 15; done; echo READY
-```
-
-`sudo systemctl stop reactantserver` sends SIGTERM to the supervisor, which drains its workers
-within `TimeoutStopSec` before exiting. Run the workspace `Pkg.instantiate()` once (as in the
-previous section) before enabling the unit, so the first start is not also resolving dependencies.
-
-## Docker (container) deployment
-
-A container image is an alternative to running the supervisor directly. It runs the same node
-(supervisor + workers + embedded gateway) with the same `:8001`/`:8002` interface. The image is
-built with Bazel from committed locks (`deploy/Manifest.toml` for Julia, a digest-pinned CUDA base),
-so the same commit always yields the same packages and artifacts:
-
-```text
-bazel run //deploy:image_load    # loads localhost/reactantserver:bazel into podman
-REACTANTSERVER_MODELS=/path/to/bundles docker compose up
-```
-
-Set `REACTANTSERVER_IMAGE` to run a pushed image instead of the locally loaded one. The equivalent
-without compose is:
-
-```text
-docker run --gpus all --ipc=host -p 8001:8001 -p 8002:8002 \
-  --health-cmd /usr/local/bin/healthcheck.node.sh --health-start-period 300s \
-  -v /path/to/bundles:/var/lib/reactantserver/models localhost/reactantserver:bazel
-```
-
-The base is a CUDA 13.1 cuDNN image because Reactant's CUDA artifact `dlopen`s
-`libnvJitLink.so.13`, `libnvrtc.so.13`, and `libcupti.so` by soname, and the NVIDIA container
-runtime injects none of them (only the driver's `libcuda.so.1`). The image carries no baked
-healthcheck (an OCI image configuration has no such field), so the compose file sets one. See
-`deploy/README.md` for the build, the precompiled caches, and publishing.
-
-The container needs the host NVIDIA Container Toolkit for GPU access, and the compose file mounts
-the model repository plus a persistent volume for the Reactant compile cache (autotune
-results), so tuned kernels survive container recreation. Compiled programs themselves are cached
-under each bundle's `.cache/` directory (`runtime.executable_cache`, on by default), which is what
-makes a restart load models in milliseconds instead of recompiling them; mount the repository
-writable, or accept that a read-only repository compiles every program on every start. The container shares the host IPC
-namespace (`ipc: host`) so POSIX shared-memory regions created by a client are visible to the
-workers. The autotune knobs are settable as container env
-(`INFERENCE_SERVER_RUNTIME_AUTOTUNE`, `INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE`,
-`INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE_DIR`); the baked default node file sits at
-`/etc/reactantserver/node.yaml` and can be overridden by mounting your own over that path. See
-`deploy/runtime/README.md` for the runtime scripts.
+`--handle-signals=no` lets the supervisor's own handler run so it shuts its workers down on
+SIGTERM. `REACTANT_GPU_VERSION` selects the Reactant CUDA build (`12.9` or `13.1`) and must be
+set before `instantiate`. `INFERENCE_SERVER_MODEL_DIRS` overrides the node file's model
+repository (colon-separated). Unlike the image, a checkout resolves its dependencies fresh, so it
+does not get the image's locked versions or its precompiled caches, and the host needs the CUDA
+libraries Reactant loads by name (`libnvJitLink.so.13`, `libnvrtc.so.13`, `libcupti.so`). Use
+the container for anything long-running.
 
 ## Metrics
 
@@ -355,9 +364,9 @@ series with `worker` and `gpu` labels itself (the `gpu` value is the physical de
 example `sum by (gpu) (rate(worker_dispatch_total[1m]))`.
 
 A ready-to-run Prometheus + Grafana stack lives under `config/monitoring/` with a seven-dashboard
-suite. Because the node runs natively (not in a container), that stack's Prometheus scrapes the
-host at `host.docker.internal:8002` rather than over a Docker network; if the node listens on a
-different host, edit the target in `prometheus.yml` to that host's `address:8002`. Grafana is at
+suite. Its Prometheus scrapes `host.docker.internal:8002`, the metrics port the node container
+publishes on the host; if the node runs on a different host, edit the target in `prometheus.yml`
+to that host's `address:8002`. Grafana is at
 `http://<host>:3000` (anonymous viewing on; `admin` / `admin` to edit) and Prometheus at
 `http://<host>:9090`. See `config/monitoring/README.md` for the compose commands and dashboards.
 
