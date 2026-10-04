@@ -1,8 +1,8 @@
 # Developer tasks for ReactantServer. The supported deployment is running the node supervisor
-# natively (see the Deployment page in the docs); the container image is an alternative (docker/).
+# natively (see the Deployment page in the docs); the container image, built with Bazel, is an
+# alternative (deploy/).
 #
-#   make image      # build the reactantserver node image (docker/Dockerfile)
-#   make bazel-image # build the locked production image with Bazel and load it (deploy/)
+#   make image      # build the locked node image with Bazel and load it into podman (deploy/)
 #   make e2e        # native CPU end-to-end test (host processes; no containers)
 #   make docs       # build the Documenter site into docs/build/ (CPU only; no GPU needed)
 #   make clean      # remove the image this Makefile builds
@@ -11,19 +11,15 @@
 SHELL := /bin/bash
 
 ENGINE     ?= podman
-NODE_IMAGE ?= reactantserver:latest
+NODE_IMAGE ?= localhost/reactantserver:bazel
 JULIA      ?= julia
 
-.PHONY: all image bazel-image e2e docs clean help
+.PHONY: all image e2e docs clean help
 
 all: help
 
-## image: build the reactantserver node image (needs a local Manifest.toml; gRPCServer resolves from GitHub, see docker/README.md)
+## image: build the locked node image (deploy/Manifest.toml) with Bazel and load it into podman as localhost/reactantserver:bazel
 image:
-	$(ENGINE) build -f docker/Dockerfile -t $(NODE_IMAGE) .
-
-## bazel-image: build the locked production image (deploy/Manifest.toml) with Bazel and load it into podman
-bazel-image:
 	bazel run //deploy:image_load
 
 ## e2e: native CPU end-to-end test (supervisor + embedded gateway as host processes; no containers)
@@ -35,7 +31,7 @@ docs:
 	$(JULIA) --project=docs -e 'using Pkg; Pkg.instantiate()'
 	$(JULIA) --project=docs docs/make.jl
 
-## clean: remove the image built by this Makefile (ignores it if absent)
+## clean: remove the image loaded by this Makefile (ignores it if absent)
 clean:
 	-$(ENGINE) rmi $(NODE_IMAGE)
 
