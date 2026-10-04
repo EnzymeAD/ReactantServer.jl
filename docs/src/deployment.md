@@ -308,31 +308,29 @@ previous section) before enabling the unit, so the first start is not also resol
 ## Docker (container) deployment
 
 A container image is an alternative to running the supervisor directly. It runs the same node
-(supervisor + workers + embedded gateway) with the same `:8001`/`:8002` interface:
+(supervisor + workers + embedded gateway) with the same `:8001`/`:8002` interface. The image is
+built with Bazel from committed locks (`deploy/Manifest.toml` for Julia, a digest-pinned CUDA base),
+so the same commit always yields the same packages and artifacts:
 
 ```text
-REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1 julia --project=. -e 'using Pkg; Pkg.instantiate()'  # Manifest.toml is gitignored
-make image        # or: docker build -f docker/Dockerfile -t reactantserver .
+bazel run //deploy:image_load    # loads localhost/reactantserver:bazel into podman
 REACTANTSERVER_MODELS=/path/to/bundles docker compose up
 ```
 
-`make image` builds through the configured engine (`ENGINE`, default `podman`). The equivalent
+Set `REACTANTSERVER_IMAGE` to run a pushed image instead of the locally loaded one. The equivalent
 without compose is:
 
 ```text
 docker run --gpus all --ipc=host -p 8001:8001 -p 8002:8002 \
-  -v /path/to/bundles:/var/lib/reactantserver/models:ro reactantserver
+  --health-cmd /usr/local/bin/healthcheck.node.sh --health-start-period 300s \
+  -v /path/to/bundles:/var/lib/reactantserver/models localhost/reactantserver:bazel
 ```
 
-The image is a multi-stage build on `julia:1.12.6-trixie` that copies only `libnvJitLink.so.13`
-(the one CUDA userspace library Reactant needs but does not bundle) from an official CUDA 13.1
-image; it deliberately does not bring the rest of the CUDA userspace, so the base cannot shadow
-Reactant's bundled cuDNN/NCCL. Why that one library matters: Reactant statically links cuBLASLt
-into `libReactantExtra.so`, but CUDA-13 cuBLASLt dlopens `libnvJitLink.so.13` to JIT its GEMM
-kernels, and the library is neither in the Reactant artifact nor injected by the NVIDIA container
-runtime (which adds only `libcuda.so.1`). A bare Julia image without it aborts at the first GPU
-compile with cuBLASLt's "Invalid handle was passed to cublasLtCreate"; the copied library fixes
-that.
+The base is a CUDA 13.1 cuDNN image because Reactant's CUDA artifact `dlopen`s
+`libnvJitLink.so.13`, `libnvrtc.so.13`, and `libcupti.so` by soname, and the NVIDIA container
+runtime injects none of them (only the driver's `libcuda.so.1`). The image carries no baked
+healthcheck (an OCI image configuration has no such field), so the compose file sets one. See
+`deploy/README.md` for the build, the precompiled caches, and publishing.
 
 The container needs the host NVIDIA Container Toolkit for GPU access, and the compose file mounts
 the model repository plus a persistent volume for the Reactant compile cache (autotune
@@ -345,7 +343,7 @@ workers. The autotune knobs are settable as container env
 (`INFERENCE_SERVER_RUNTIME_AUTOTUNE`, `INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE`,
 `INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE_DIR`); the baked default node file sits at
 `/etc/reactantserver/node.yaml` and can be overridden by mounting your own over that path. See
-`docker/README.md` for details.
+`docker/README.md` for the runtime scripts.
 
 ## Metrics
 

@@ -247,8 +247,8 @@ julia_depot_layer(
 # The application at /opt/reactantserver, in the workspace layout the entrypoints expect: the root
 # Project.toml with THIS manifest beside it, the member packages, docker/ and config/. The
 # entrypoints and healthchecks are also linked into /usr/local/bin and the default node file copied
-# to /etc/reactantserver/node.yaml, where docker/Dockerfile puts them, so a compose file, a
-# healthcheck command or a mounted node file works the same against either image.
+# to /etc/reactantserver/node.yaml, the paths docker-compose.yml, its healthcheck command and a
+# mounted node file expect.
 genrule(
     name = "app_layer",
     srcs = [

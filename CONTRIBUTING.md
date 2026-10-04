@@ -36,6 +36,14 @@ The PyTorch portion skips gracefully when `torch`/`torchax` are unavailable.
 `packages/ReactantServer/test/spike_reactant.jl` (and the `spike_*.jl` siblings) are standalone
 scripts that exercise the Reactant runtime and export paths in isolation.
 
+The CPU end-to-end test runs the node supervisor with two CPU workers and the embedded gateway as
+host processes (no containers, no GPU), drives a model through the gateway, and checks graceful
+shutdown:
+
+```
+bash packages/ReactantServer/test/e2e/run_e2e_cpu.sh
+```
+
 ## Formatting
 
 [Runic.jl](https://github.com/fredrikekre/Runic.jl) is the formatter. Runic has **no

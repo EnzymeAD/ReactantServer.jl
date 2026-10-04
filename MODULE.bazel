@@ -4,9 +4,8 @@ module(
 )
 
 # Bazel builds the reproducible node image (//deploy:image); nothing else in this repository
-# depends on it. Tests, docs and the native deployment stay plain Julia (see CONTRIBUTING.md), and
-# docker/Dockerfile remains the build-with-the-network-open alternative. What Bazel adds is an image
-# assembled from a COMMITTED manifest (deploy/Manifest.toml) with no Pkg resolve anywhere in the
+# depends on it. Tests, docs and the native deployment stay plain Julia (see CONTRIBUTING.md). What
+# Bazel adds is an image assembled from a COMMITTED manifest (deploy/Manifest.toml) with no Pkg resolve anywhere in the
 # build, so the same commit always yields the same package and artifact set.
 
 # Bazel 9 moved sh_binary/sh_test out of the core into rules_shell.

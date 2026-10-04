@@ -1,8 +1,8 @@
 # Reproducible node image (Bazel)
 
-`//deploy:image` builds the same node image as `docker/Dockerfile` (the `ReactantServerNode`
-supervisor as entrypoint under `tini`, KServe V2 gRPC on `:8001`, health and metrics on `:8002`),
-but from committed locks instead of a resolve at build time. The same commit always yields the same
+`//deploy:image` builds the node image (the `ReactantServerNode` supervisor as entrypoint under
+`tini`, KServe V2 gRPC on `:8001`, health and metrics on `:8002`) from committed locks, with no
+resolve at build time. The same commit always yields the same
 packages, artifacts, and system libraries, which is what a validated production deployment needs.
 Nothing else in the repository depends on Bazel: tests, docs, and the native deployment stay plain
 Julia.
@@ -17,8 +17,6 @@ bazel test  //deploy:manifest_current    # the Julia lock still matches the work
 bazel run   //deploy:relock              # re-resolve the Julia lock after a [deps] or [compat] change
 bazel run   //deploy:relock_debs         # re-resolve the Ubuntu package lock (curl, tini)
 ```
-
-Or `make bazel-image`, which builds and loads it.
 
 The Julia-specific parts (the distribution, depot and precompile-cache layers, the image
 environment, and the precompile test) are the image rules of
@@ -87,8 +85,7 @@ layers:
   first compiling about 150 packages.
 - `app_layer`: the workspace at `/opt/reactantserver` (root project plus the Julia lock, member
   packages without their tests, `docker/`, `config/`), the entrypoints and healthchecks linked into
-  `/usr/local/bin`, and the default node file at `/etc/reactantserver/node.yaml`, all where
-  `docker/Dockerfile` puts them.
+  `/usr/local/bin`, and the default node file at `/etc/reactantserver/node.yaml`.
 
 `image_env` writes the image's environment: the depot path below, `JULIA_PROJECT`, the portable
 `JULIA_CPU_TARGET`, `JULIA_PKG_OFFLINE=true`, Julia's `bin/` ahead of the base's `PATH`, and the
@@ -141,9 +138,9 @@ every program on every start. Mount your own node file over `/etc/reactantserver
 change the configuration. Do not mount a volume over `/opt/julia-depot/compiled`: it would hide the
 baked caches.
 
-The healthcheck is `/usr/local/bin/healthcheck.node.sh`, as in the Dockerfile image, but it is not
-part of the image: an OCI image configuration has no healthcheck field (only Docker's image format
-does), so rules_oci cannot set one. Pass it at run time, or set it in the compose file:
+The healthcheck is `/usr/local/bin/healthcheck.node.sh`, but it is not part of the image: an OCI
+image configuration has no healthcheck field (only Docker's image format does), so rules_oci cannot
+set one. The repository's `docker-compose.yml` sets it; with `podman run`, pass it at run time:
 
 ```
 podman run ... --health-cmd /usr/local/bin/healthcheck.node.sh --health-interval 30s \
