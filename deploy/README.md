@@ -9,14 +9,22 @@ Julia.
 
 ```
 bazel build //deploy:image
+bazel test  //deploy:image_precompile_test  # the image starts without precompiling (no podman)
 bazel run   //deploy:image_load          # loads it into podman as localhost/reactantserver:bazel
-bazel run   //deploy:image_check         # the loaded image starts without precompiling
+bazel run   //deploy:image_check         # the loaded image: caches, tini, curl, entrypoints
+bazel run   //deploy:image_push -- --repository index.docker.io/<org>/<name>   # push as :latest
 bazel test  //deploy:manifest_current    # the Julia lock still matches the workspace Project.toml files
 bazel run   //deploy:relock              # re-resolve the Julia lock after a [deps] or [compat] change
 bazel run   //deploy:relock_debs         # re-resolve the Ubuntu package lock (curl, tini)
 ```
 
 Or `make bazel-image`, which builds and loads it.
+
+The Julia-specific parts (the distribution, depot and precompile-cache layers, the image
+environment, and the precompile test) are the image rules of
+[rules_julia_depot](https://github.com/csvance/rules_julia_depot) (`julia/image.bzl`); this
+package adds the Ubuntu packages, the CUDA driver stub the build loads Reactant against, the
+application layer, and the image itself, assembled with rules_oci.
 
 Julia, the CUDA base image, and every package are fetched and pinned by Bazel. The build host needs
 Bazel (the version in `.bazelversion`; Bazelisk picks it up), GNU tar, and a C compiler with `make`,
@@ -65,7 +73,11 @@ against the base.
 
 ## Layers
 
+In image order, least often changed first, so a push after a code change moves only the last
+layers:
+
 - `debs_layer`: `curl`, `tini`, and their libraries, from the Ubuntu lock.
+- `julia_layer`: Julia at `/opt/julia`, its relative symlinks kept.
 - `depot_layer`: the Julia depot at `/opt/julia-depot`, instantiated from the Julia lock into an
   empty depot (the General registry is fetched fresh; the lock pins every package by tree hash, so
   the registry state cannot change what is installed). Set `JULIA_PKG_SERVER` through
@@ -73,11 +85,14 @@ against the base.
 - `compiled_layer`: the precompile caches for every project the image starts Julia in (the
   supervisor, a worker, the gateway, and the worker-role healthcheck), so a container serves without
   first compiling about 150 packages.
-- `julia_layer`: Julia at `/opt/julia`.
 - `app_layer`: the workspace at `/opt/reactantserver` (root project plus the Julia lock, member
   packages without their tests, `docker/`, `config/`), the entrypoints and healthchecks linked into
   `/usr/local/bin`, and the default node file at `/etc/reactantserver/node.yaml`, all where
   `docker/Dockerfile` puts them.
+
+`image_env` writes the image's environment: the depot path below, `JULIA_PROJECT`, the portable
+`JULIA_CPU_TARGET`, `JULIA_PKG_OFFLINE=true`, Julia's `bin/` ahead of the base's `PATH`, and the
+CUDA and NVIDIA variables.
 
 The base is `nvidia/cuda:13.1.2-cudnn-devel-ubuntu24.04`, pinned by digest. It is deliberately
 fat: Reactant_jll's CUDA 13.1 artifact links cuDNN and cuBLASLt statically but `dlopen`s
@@ -102,10 +117,13 @@ JULIA_DEPOT_PATH=/opt/julia-depot:/opt/reactantserver:/opt/julia/local/share/jul
 `compiled_layer` unpacks the depot and application layers into one temporary tree with the image's
 layout and precompiles against the same list with that tree in place of `/opt`, so its caches
 load unchanged in the image. The loader needs `libcuda.so.1` to load Reactant; the build takes the
-driver stub from the CUDA base (`cuda_stub`) and hides the host's GPUs. The caches are compiled for
+driver stub from the CUDA base as a build-time layer (`cuda_stub_layer`, unpacked beside the others
+but never part of the image), puts it on `LD_LIBRARY_PATH`, and hides the host's GPUs. The caches are compiled for
 the official Julia build's x86_64 CPU targets, so they load on any x86_64 host, not only CPUs like
-the build machine's. `//deploy:image_check` verifies that each entry project loads with no cache
-rejected and nothing precompiled.
+the build machine's. `//deploy:image_precompile_test` verifies, on the layers and without a
+container, that each entry project loads with no cache rejected and nothing precompiled;
+`//deploy:image_check` repeats that inside a loaded container and also checks `tini`, `curl`, and
+the entrypoints.
 
 ## Running it
 
@@ -131,6 +149,16 @@ does), so rules_oci cannot set one. Pass it at run time, or set it in the compos
 podman run ... --health-cmd /usr/local/bin/healthcheck.node.sh --health-interval 30s \
     --health-timeout 20s --health-retries 3 --health-start-period 300s localhost/reactantserver:bazel
 ```
+
+## Publishing
+
+`.github/workflows/image.yml` builds the image, runs `//deploy:manifest_current` and
+`//deploy:image_precompile_test`, and pushes it to Docker Hub as `:latest`. It runs only when
+triggered by hand (Actions, Image, Run workflow). It reads the target from the
+`DOCKERHUB_REPOSITORY` repository variable (for example `index.docker.io/<org>/<name>`) and logs
+in with the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` secrets. Releases are not named, so each run
+replaces `:latest`; the run summary records the pushed digest and commit, so pull by digest to pin
+a deployment.
 
 ## Consuming from another module
 

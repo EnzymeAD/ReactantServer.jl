@@ -139,13 +139,17 @@ bazel test //deploy:manifest_current
 
 The Ubuntu packages the image adds to the CUDA base (`curl`, `tini`) are locked the same way in
 `deploy/debs.lock.json`; moving the base image digest in `MODULE.bazel` calls for
-`bazel run //deploy:relock_debs`. After any change to the image, load it and check that it starts
-without precompiling:
+`bazel run //deploy:relock_debs`. After any change to the image, check that it starts without
+precompiling, on its layers and then in a loaded container:
 
 ```
+bazel test //deploy:image_precompile_test
 bazel run //deploy:image_load
 bazel run //deploy:image_check
 ```
+
+The image is published to Docker Hub as `:latest` by the manually triggered
+`.github/workflows/image.yml`; see [`deploy/README.md`](deploy/README.md#publishing).
 
 ## Kaimon gate tools (dev only)
 

@@ -10,21 +10,32 @@ module(
 # build, so the same commit always yields the same package and artifact set.
 
 # Bazel 9 moved sh_binary/sh_test out of the core into rules_shell.
-bazel_dep(name = "rules_shell", version = "0.7.1")
+bazel_dep(name = "rules_shell", version = "0.8.0")
 
 # rules_oci assembles OCI images with no daemon; podman is needed only to load and run the result.
-bazel_dep(name = "rules_oci", version = "2.2.6")
+#
+# 2.3.3, the latest release, which has not reached the Bazel Central Registry (2.3.0 is the newest
+# there), so it is fetched from the release archive. The fix that matters here is oci_load's: before
+# 2.3.1 (#881) it reported success when the tar it streams into the loader failed, so a broken
+# load of this multi-gigabyte image looked like a good one. 2.3.1 also makes oci_pull repositories
+# resolve their own dependencies under bzlmod (#891). Since 2.3.0 it also depends on a
+# current aspect_bazel_lib, so the Bazel 9 workaround of naming aspect_bazel_lib here is gone.
+# Drop the override once the registry has 2.3.3 or later.
+bazel_dep(name = "rules_oci", version = "2.3.3")
+archive_override(
+    module_name = "rules_oci",
+    integrity = "sha256-JD6sh+xB1o0dnm0hiEpQ7CjgMfcCsLn83H+Xw/PVOJo=",
+    strip_prefix = "rules_oci-2.3.3",
+    urls = ["https://github.com/bazel-contrib/rules_oci/releases/download/v2.3.3/rules_oci-v2.3.3.tar.gz"],
+)
 
-# rules_oci 2.2.6 pins aspect_bazel_lib 2.7.2, which registers its tar and zstd toolchains
-# against @local_config_platform. Bazel 9 removed that repo, so toolchain resolution fails for
-# every target, including ones unrelated to images ("invalid registered toolchain
-# '@zstd_toolchains//:all'"). MVS takes the higher version, so naming it here is the whole fix.
-bazel_dep(name = "aspect_bazel_lib", version = "2.22.5")
+# bsdtar, from the toolchain rules_oci uses (tar.bzl since rules_oci 2.3), reads .deb files (ar
+# archives holding zstd or xz tarballs) and the pulled base image's layers, so //deploy needs
+# neither dpkg nor ar on the host.
+bazel_dep(name = "tar.bzl", version = "0.10.9")
 
-# bsdtar, from the same toolchain rules_oci uses, reads .deb files (ar archives holding zstd or xz
-# tarballs) and the pulled base image's layers, so //deploy needs neither dpkg nor ar on the host.
-bazel_lib_toolchains = use_extension("@aspect_bazel_lib//lib:extensions.bzl", "toolchains")
-use_repo(bazel_lib_toolchains, "bsd_tar_toolchains")
+tar = use_extension("@tar.bzl//tar:extensions.bzl", "toolchains")
+use_repo(tar, "bsd_tar_toolchains")
 
 # The Ubuntu packages the image adds to the CUDA base (curl, tini and their dependencies), each
 # pinned by snapshot URL and sha256 in deploy/debs.lock.json. Re-resolve with
@@ -36,11 +47,12 @@ debs.lock(
 )
 use_repo(debs, "reactantserver_debs")
 
-# The Julia toolchain, the clean-depot image layer and the podman loader.
+# The Julia toolchain, and the image rules (julia/image.bzl): the distribution, depot and
+# precompile-cache layers, the image environment, and the precompile test.
 bazel_dep(name = "rules_julia_depot", version = "0.1.0")
 git_override(
     module_name = "rules_julia_depot",
-    commit = "49bc678d037fa967920edccc380a6721a20050ee",
+    commit = "f8d7c226136e7f02146d80088c02cb59a97096ad",
     remote = "https://github.com/csvance/rules_julia_depot.git",
 )
 

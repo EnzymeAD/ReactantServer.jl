@@ -3,6 +3,9 @@
 
 package(default_visibility = ["//deploy:__pkg__"])
 
+# The root project, which //deploy:depot_layer instantiates from the committed deploy/Manifest.toml.
+exports_files(["Project.toml"])
+
 # ReactantServerExport is offline tooling and not a workspace member (see Project.toml); the image
 # does not carry it.
 _NOT_IN_IMAGE = ["packages/ReactantServerExport/**"]
