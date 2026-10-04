@@ -4,7 +4,7 @@
 `tini`, KServe V2 gRPC on `:8001`, health and metrics on `:8002`) from committed locks, with no
 resolve at build time. The same commit always yields the same packages, artifacts, and system
 libraries, which is what a validated production deployment needs. This image is the supported way
-to deploy ReactantServer; it is published as `docker.io/csvance4/reactantserver:latest`, and the
+to deploy ReactantServer; it is published as `ghcr.io/enzymead/reactantserver:latest`, and the
 docs' Deployment page covers running it. Nothing else in the repository depends on Bazel: tests,
 docs, and running from a source checkout stay plain Julia.
 
@@ -13,7 +13,7 @@ bazel build //deploy:image
 bazel test  //deploy:image_precompile_test  # the image starts without precompiling (no podman)
 bazel run   //deploy:image_load          # loads it into podman as localhost/reactantserver:bazel
 bazel run   //deploy:image_check         # the loaded image: caches, tini, curl, entrypoints
-bazel run   //deploy:image_push -- --repository index.docker.io/<org>/<name>   # push as :latest
+bazel run   //deploy:image_push -- --repository ghcr.io/<owner>/reactantserver   # push as :latest
 bazel test  //deploy:manifest_current    # the Julia lock still matches the workspace Project.toml files
 bazel run   //deploy:relock              # re-resolve the Julia lock after a [deps] or [compat] change
 bazel run   //deploy:relock_debs         # re-resolve the Ubuntu package lock (curl, tini)
@@ -156,12 +156,29 @@ podman run ... --health-cmd /usr/local/bin/healthcheck.node.sh --health-interval
 ## Publishing
 
 `.github/workflows/image.yml` builds the image, runs `//deploy:manifest_current` and
-`//deploy:image_precompile_test`, and pushes it to Docker Hub as `:latest`. It runs only when
-triggered by hand (Actions, Image, Run workflow). It reads the target from the
-`DOCKERHUB_REPOSITORY` repository variable (for example `index.docker.io/<org>/<name>`) and logs
-in with the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` secrets. Releases are not named, so each run
+`//deploy:image_precompile_test`, pushes it to the GitHub Container Registry as
+`ghcr.io/enzymead/reactantserver:latest`, and attests its build provenance. It runs only when
+triggered by hand (Actions, Image, Run workflow). It needs no secrets: the run's own
+`GITHUB_TOKEN` pushes the image, and the owner in the path is the repository's, lowercased, so a
+fork publishes to its own namespace. The first push creates the package, which an organization
+owner then makes public once in the package's settings. Releases are not named, so each run
 replaces `:latest`; the run summary records the pushed digest and commit, so pull by digest to pin
 a deployment.
+
+The attestation is [SLSA build provenance](https://slsa.dev/spec/v1.0/provenance), produced by
+`actions/attest`: a statement that this repository's `image.yml`, at a given commit and run, built
+the image with a given digest, signed through Sigstore with the run's OIDC identity (no signing
+key is kept anywhere). It is stored with GitHub and pushed next to the image. This matters more
+for this image than for most because the build is not bit-for-bit reproducible (the precompile
+caches differ between builds), so rebuilding from source does not reproduce the published digest;
+the attestation is what ties a digest to its source. Verify an image before deploying it with:
+
+```
+gh attestation verify oci://ghcr.io/enzymead/reactantserver:latest --repo EnzymeAD/ReactantServer.jl
+```
+
+`gh` needs to be logged in (`gh auth login`), and verifies the digest the tag currently resolves
+to; pass `@sha256:<digest>` instead of `:latest` to check a pinned image.
 
 ## Consuming from another module
 

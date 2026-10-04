@@ -156,8 +156,9 @@ bazel run //deploy:image_load
 bazel run //deploy:image_check
 ```
 
-The image is published to Docker Hub as `:latest` by the manually triggered
-`.github/workflows/image.yml`; see [`deploy/README.md`](deploy/README.md#publishing).
+The image is published to the GitHub Container Registry as `ghcr.io/enzymead/reactantserver:latest`,
+with signed build provenance, by the manually triggered `.github/workflows/image.yml`; see
+[`deploy/README.md`](deploy/README.md#publishing).
 
 ## Kaimon gate tools (dev only)
 

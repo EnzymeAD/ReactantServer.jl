@@ -20,7 +20,7 @@ package(default_visibility = ["//visibility:public"])
 #   bazel test  //deploy:image_precompile_test  # the image starts without precompiling (no podman)
 #   bazel run   //deploy:image_load             # loads it into podman as reactantserver:bazel
 #   bazel run   //deploy:image_check            # the loaded image: caches, tini, curl, entrypoints
-#   bazel run   //deploy:image_push -- --repository index.docker.io/<org>/<name>   # pushes :latest
+#   bazel run   //deploy:image_push -- --repository ghcr.io/<owner>/reactantserver   # pushes :latest
 #   bazel test  //deploy:manifest_current       # the manifest still matches the workspace
 #   bazel run   //deploy:relock                 # re-resolve deploy/Manifest.toml after a Project change
 #   bazel run   //deploy:relock_debs            # re-resolve deploy/debs.lock.json (curl, tini)
@@ -371,7 +371,7 @@ oci_load(
 # account; credentials come from the docker config (`docker login`, `podman login --authfile
 # ~/.docker/config.json`, or docker/login-action in CI):
 #
-#   bazel run //deploy:image_push -- --repository index.docker.io/<org>/<name>
+#   bazel run //deploy:image_push -- --repository ghcr.io/<owner>/reactantserver
 #
 # .github/workflows/image.yml runs exactly this.
 oci_push(

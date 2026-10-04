@@ -68,7 +68,7 @@ every GPU you give it:
 ```
 podman run -d --name reactantserver --device nvidia.com/gpu=all --ipc=host --pids-limit=-1 \
   -p 8001:8001 -p 8002:8002 -v /path/to/bundles:/var/lib/reactantserver/models \
-  docker.io/csvance4/reactantserver:latest
+  ghcr.io/enzymead/reactantserver:latest
 ```
 
 With Docker, use `--gpus all` in place of `--device nvidia.com/gpu=all`, or run the repository's

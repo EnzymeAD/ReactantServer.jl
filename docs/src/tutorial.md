@@ -118,7 +118,7 @@ podman run --rm --name reactantserver --device nvidia.com/gpu=0 \
   --ipc=host --pids-limit=-1 -p 8001:8001 -p 8002:8002 \
   -v $PWD/models:/var/lib/reactantserver/models \
   -v $PWD/node.yaml:/etc/reactantserver/node.yaml:ro \
-  docker.io/csvance4/reactantserver:latest
+  ghcr.io/enzymead/reactantserver:latest
 ```
 
 With Docker, use `--gpus device=0` in place of `--device nvidia.com/gpu=0`. The image's

@@ -220,7 +220,7 @@ covered on the [Multi-GPU Gateway](gateway.md) page.
 
 ## Running the container
 
-The image is published as `docker.io/csvance4/reactantserver:latest`. Its entrypoint is the node
+The image is published as `ghcr.io/enzymead/reactantserver:latest`. Its entrypoint is the node
 supervisor, so one container runs the whole node: one worker per GPU it is given, plus the
 embedded gateway when there are two or more. Mount a model repository and publish the two ports:
 
@@ -233,7 +233,7 @@ podman run -d --name reactantserver \
   -v reactant-compile-cache:/var/cache/reactant-compile \
   --health-cmd /usr/local/bin/healthcheck.node.sh --health-start-period 3600s \
   --stop-timeout 30 \
-  docker.io/csvance4/reactantserver:latest
+  ghcr.io/enzymead/reactantserver:latest
 ```
 
 With Docker, replace `--device nvidia.com/gpu=all` with `--gpus all`; the other flags are the
@@ -242,6 +242,18 @@ same. The repository's `docker-compose.yml` is the same deployment as a compose 
 ```text
 REACTANTSERVER_MODELS=/path/to/bundles docker compose up -d
 ```
+
+Each published image carries signed [SLSA build provenance](https://slsa.dev/spec/v1.0/provenance)
+naming the commit and workflow run that built it. Check it before deploying (with the GitHub CLI,
+logged in):
+
+```text
+gh attestation verify oci://ghcr.io/enzymead/reactantserver:latest --repo EnzymeAD/ReactantServer.jl
+```
+
+Pin a deployment by digest (`ghcr.io/enzymead/reactantserver@sha256:...`) rather than `:latest`,
+which moves with every publish; `deploy/README.md` describes how the image is published and
+attested.
 
 Every model compiles to a device executable on every worker before the gRPC plane accepts
 traffic, so the first start is slow (minutes to hours for a large model set). Compiled programs

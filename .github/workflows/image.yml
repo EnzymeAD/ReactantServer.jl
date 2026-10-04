@@ -1,13 +1,19 @@
-# Build the locked CUDA node image with Bazel (//deploy:image) and push it to Docker Hub as :latest.
+# Build the locked CUDA node image with Bazel (//deploy:image), push it to the GitHub Container
+# Registry as ghcr.io/<owner>/reactantserver:latest, and attest its build provenance.
 # Triggered by hand only: Actions > Image > Run workflow, or `gh workflow run image.yml --ref <branch>`.
 #
 # Releases are not named yet, so every run overwrites :latest. The image digest is printed in the
 # run summary; pull by that digest to pin a deployment.
 #
-# Needs, in the repository settings:
-#   variable DOCKERHUB_REPOSITORY  the target, e.g. index.docker.io/<org>/<name>
-#   secret   DOCKERHUB_USERNAME
-#   secret   DOCKERHUB_TOKEN       a Docker Hub access token with write access to that repository
+# No secrets: the run's own GITHUB_TOKEN pushes the image, and its OIDC identity signs the
+# attestation through Sigstore. The owner is the repository's (lowercased, as registry paths must
+# be), so a fork publishes to its own namespace. The first push creates the package; an owner of the
+# organization then makes it public once, in the package's settings, so it can be pulled
+# anonymously.
+#
+# The attestation is SLSA build provenance binding the pushed digest to this repository, commit,
+# workflow and run. It is stored with GitHub and next to the image in the registry. Verify with:
+#   gh attestation verify oci://ghcr.io/enzymead/reactantserver:latest --repo EnzymeAD/ReactantServer.jl
 name: Image
 
 on:
@@ -25,6 +31,12 @@ jobs:
   image:
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    permissions:
+      contents: read
+      packages: write           # push the image to ghcr.io
+      id-token: write           # the OIDC token Sigstore issues the signing certificate for
+      attestations: write       # store the attestation with GitHub
+      artifact-metadata: write  # record where the attested image is stored
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
@@ -52,21 +64,36 @@ jobs:
       - name: Build the image and check it starts warm
         run: bazel test //deploy:image_precompile_test
 
-      - name: Log in to Docker Hub
+      # Writes the credential to ~/.docker/config.json, which crane (run by oci_push) reads to push
+      # the image and the attest step uses to push the attestation beside it.
+      - name: Log in to the GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The digest comes from the OCI layout that was pushed, so it is what a pull by digest
+      # returns and what the attestation is bound to.
       - name: Push :latest
-        env:
-          REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+        id: push
         run: |
-          : "${REPOSITORY:?set the DOCKERHUB_REPOSITORY repository variable}"
-          bazel run //deploy:image_push -- --repository "$REPOSITORY"
+          repository="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/reactantserver"
+          bazel run //deploy:image_push -- --repository "$repository"
           digest="$(jq -r '.manifests[0].digest' bazel-bin/deploy/image/index.json)"
+          echo "repository=$repository" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
           {
-            echo "Pushed \`$REPOSITORY:latest\`"
+            echo "Pushed \`$repository:latest\`"
             echo
             echo "Digest: \`$digest\` (commit \`$GITHUB_SHA\`)"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # SLSA build provenance for the pushed digest (no predicate given, so provenance is the
+      # default), signed with this run's identity and pushed beside the image.
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.push.outputs.repository }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
