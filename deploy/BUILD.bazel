@@ -1,4 +1,12 @@
-load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load")
+load(
+    "@rules_julia_depot//julia:image.bzl",
+    "julia_compiled_layer",
+    "julia_depot_layer",
+    "julia_dist_layer",
+    "julia_image_env",
+    "julia_precompile_test",
+)
+load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load", "oci_push")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
@@ -9,18 +17,25 @@ package(default_visibility = ["//visibility:public"])
 # The ReactantServer node image, built from the committed deploy/Manifest.toml.
 #
 #   bazel build //deploy:image
-#   bazel run //deploy:image_load          # loads it into podman as reactantserver:bazel
-#   bazel run //deploy:image_check         # the loaded image starts without precompiling
-#   bazel test //deploy:manifest_current   # the manifest still matches the workspace
-#   bazel run //deploy:relock              # re-resolve deploy/Manifest.toml after a Project change
-#   bazel run //deploy:relock_debs         # re-resolve deploy/debs.lock.json (curl, tini)
+#   bazel test  //deploy:image_precompile_test  # the image starts without precompiling (no podman)
+#   bazel run   //deploy:image_load             # loads it into podman as reactantserver:bazel
+#   bazel run   //deploy:image_check            # the loaded image: caches, tini, curl, entrypoints
+#   bazel run   //deploy:image_push -- --repository index.docker.io/<org>/<name>   # pushes :latest
+#   bazel test  //deploy:manifest_current       # the manifest still matches the workspace
+#   bazel run   //deploy:relock                 # re-resolve deploy/Manifest.toml after a Project change
+#   bazel run   //deploy:relock_debs            # re-resolve deploy/debs.lock.json (curl, tini)
+#
+# The Julia-specific layers (the distribution, the depot, the precompile caches), the image's
+# environment and the precompile test come from @rules_julia_depot//julia:image.bzl. What stays here
+# is what is ours: the Ubuntu packages, the CUDA driver stub the build loads Reactant against, the
+# application layer, and the image itself.
 #
 # WHY A SECOND MANIFEST. The workspace root's Manifest.toml is gitignored on purpose: development
 # and CI resolve fresh so compat bumps are picked up. An image must not: this manifest is the
 # production lock, moved deliberately with //deploy:relock and reviewed like any other change.
 # It is a manifest for the ROOT Project.toml, and it lives here only so the gitignore can stay as
-# it is. Every action stages it beside the root project and the member Project.tomls in a
-# temporary tree, because Pkg resolves a manifest next to its (real, symlink-resolved) project.
+# it is. The depot layer stages it beside the root project and the member Project.tomls, because
+# Pkg resolves a manifest next to its (real, symlink-resolved) project.
 
 # CUDA userspace the Reactant_jll artifact is selected for. Must agree with the base image
 # (@reactantserver_cuda_base, MODULE.bazel): Reactant_jll's platform augmentation reads these at
@@ -31,21 +46,14 @@ _REACTANT_GPU_ENV = {
     "REACTANT_GPU_VERSION": "13.1",
 }
 
-# Where the image keeps Julia's state, and the order Julia searches it. The workspace root is a
-# depot too, and not by accident: Julia records a precompiled package's source files relative to
-# the depot that holds them ("@depot/..."), which is what lets a cache built in a temporary tree
-# load from /opt. Packages outside every depot are recorded by absolute path and would be stale in
-# the image, so the workspace root is listed as a depot to make the workspace's own packages
-# relocatable like the registry ones. Julia's bundled depots follow, for the stdlib caches.
-# //deploy:compiled_layer builds against exactly this list, with the build tree in place of /opt.
-_DEPOT = "/opt/julia-depot"
+# Where the image keeps the application. Julia and the depot take image.bzl's defaults,
+# /opt/julia and /opt/julia-depot.
 _APP = "/opt/reactantserver"
-_JULIA = "/opt/julia"
-_DEPOT_PATH = ":".join([_DEPOT, _APP, _JULIA + "/local/share/julia", _JULIA + "/share/julia"])
 
-# The projects the image starts Julia in, each precompiled by //deploy:compiled_layer and checked
-# by //deploy:image_check. A package's cache depends on the active project's preferences (the
-# worker's LocalPreferences.toml configures Reactant), so each entry point needs its own.
+# The projects the image starts Julia in, relative to _APP, each precompiled by
+# //deploy:compiled_layer and checked by //deploy:image_precompile_test. A package's cache depends
+# on the active project's preferences (the worker's LocalPreferences.toml configures Reactant), so
+# each entry point needs its own.
 #   packages/ReactantServerNode     the supervisor (docker/entrypoint.node.sh)
 #   packages/ReactantServer         a worker (spawned by the supervisor, or entrypoint.worker.sh)
 #   packages/ReactantServerGateway  the embedded gateway (spawned by the supervisor)
@@ -57,11 +65,18 @@ _ENTRY_PROJECTS = [
     ".",
 ]
 
-# The CPU targets the caches are compiled for: the official Julia build's x86_64 set, so the caches
-# load on any x86_64 host rather than only on CPUs like the build machine's. Julia rejects a cache
-# built for a CPU it is not running on and recompiles, which is the first-start cost this layer
-# exists to remove.
-_CPU_TARGET = "generic;sandybridge,-xsaveopt,clone_all;haswell,-rdrnd,base(1);x86-64-v4,-rdrnd,base(1)"
+_ENTRY_PROJECT_PATHS = [_APP if p == "." else _APP + "/" + p for p in _ENTRY_PROJECTS]
+
+# Where the CUDA driver stub sits in the build-time tree. Never in the image; see :cuda_stub_layer.
+_CUDA_STUB_DIR = "/build/cuda-stub"
+
+# What Julia needs to load the stack on a build host: the driver stub in place of libcuda.so.1, the
+# host's GPUs hidden so a build never touches them, and the artifact selection. `{root}` is the
+# tree the layers are unpacked into (see image.bzl).
+_BUILD_LOAD_ENV = _REACTANT_GPU_ENV | {
+    "CUDA_VISIBLE_DEVICES": "",
+    "LD_LIBRARY_PATH": "{root}" + _CUDA_STUB_DIR,
+}
 
 _STAGE = """
 workspace_path() {
@@ -87,9 +102,10 @@ stage_workspace() {
 }
 """
 
-# The layers write deterministic tars: sorted, epoch mtimes, root-owned by number. Without these a
-# layer's digest changes on every build and nothing downstream can be cached or compared.
-_TAR = "tar --create --file \"$@\" --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner"
+# The layers written here are deterministic tars in the same form as image.bzl's: sorted, epoch
+# mtimes, root-owned by number, permissions normalised. Without these a layer's digest changes on
+# every build and nothing downstream can be cached or compared.
+_TAR = "LC_ALL=C tar --create --file \"$@\" --format=gnu --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --mode='u=rwX,go=rX'"
 
 # The Ubuntu packages the image adds to the base (curl, tini and the libraries curl needs), from
 # the pinned downloads in deploy/debs.lock.json, unpacked the way dpkg would lay them out.
@@ -134,16 +150,18 @@ done
 )
 
 # The CUDA driver stub, libcuda.so, taken from the pinned CUDA base itself so it always matches the
-# base's CUDA release. Build time only: the CUDA build of libReactantExtra.so lists libcuda.so.1 as
-# NEEDED, so loading Reactant (which precompiling does) fails on a host without an NVIDIA driver,
-# and would load the host's real driver on one that has it. The stub answers every call with "no
-# device" and never reaches the image; a container gets the real driver from its host.
+# base's CUDA release, as a layer at _CUDA_STUB_DIR. BUILD TIME ONLY: it is among the layers of
+# :compiled_layer and :image_precompile_test and never among the image's. The CUDA build of
+# libReactantExtra.so lists libcuda.so.1 as NEEDED, so loading Reactant (which precompiling does)
+# fails on a host without an NVIDIA driver, and would load the host's real driver on one that has
+# it. The stub answers every call with "no device"; a container gets the real driver from its host.
 #
-# The layers are searched in manifest order and the last copy wins, as an overlay would resolve it.
+# The base's layers are searched in manifest order and the last copy wins, as an overlay would
+# resolve it.
 genrule(
-    name = "cuda_stub",
+    name = "cuda_stub_layer",
     srcs = ["@reactantserver_cuda_base_linux_amd64"],
-    outs = ["cuda_stub/libcuda.so.1"],
+    outs = ["reactantserver-cuda-stub.tar"],
     cmd = """
 set -euo pipefail
 layout=$(location @reactantserver_cuda_base_linux_amd64)
@@ -151,128 +169,79 @@ blobs="$$layout/blobs/sha256"
 member=usr/local/cuda-{gpu_version}/targets/x86_64-linux/lib/stubs/libcuda.so
 manifest="$$(grep -o 'sha256:[0-9a-f]*' "$$layout/index.json" | head -1 | cut -d: -f2)"
 found="$$(mktemp -d)"
-trap 'rm -rf "$$found"' EXIT
+stage="$$(mktemp -d)"
+trap 'rm -rf "$$found" "$$stage"' EXIT
 for layer in $$(tr ',' '\\n' < "$$blobs/$$manifest" | sed -n '/"layers"/,$$p' | grep -o 'sha256:[0-9a-f]*' | cut -d: -f2); do
     $(BSDTAR_BIN) -xf "$$blobs/$$layer" -C "$$found" "$$member" 2>/dev/null || true
 done
 [ -f "$$found/$$member" ] || {{ echo "FAILED: $$member is not in the base image" >&2; exit 1; }}
-cp "$$found/$$member" "$@"
-""".format(gpu_version = _REACTANT_GPU_ENV["REACTANT_GPU_VERSION"]),
+mkdir -p "$$stage{stub_dir}"
+cp "$$found/$$member" "$$stage{stub_dir}/libcuda.so.1"
+""".format(
+        gpu_version = _REACTANT_GPU_ENV["REACTANT_GPU_VERSION"],
+        stub_dir = _CUDA_STUB_DIR,
+    ) + _TAR + """ --directory "$$stage" {top}
+""".format(top = _CUDA_STUB_DIR.split("/")[1]),
     toolchains = ["@bsd_tar_toolchains//:resolved_toolchain"],
     tools = ["@bsd_tar_toolchains//:resolved_toolchain"],
 )
 
-# The depot, instantiated from the manifest into an empty tree and tarred at /opt/julia-depot.
+# The image's Julia layout and environment, declared once: the oci_image takes the file this
+# writes, and the compiled layer and the precompile test take the same facts, so the caches are
+# built for, and checked against, exactly the environment the image runs with.
+#
+# The workspace root is a depot too (extra_depots), and not by accident: Julia records a
+# precompiled package's source files relative to the depot that holds them ("@depot/..."), which is
+# what lets a cache built in a temporary tree load from /opt. Packages outside every depot are
+# recorded by absolute path and would be stale in the image, so the workspace root is listed to make
+# the workspace's own packages relocatable like the registry ones. The search order comes out as
+#
+#   /opt/julia-depot:/opt/reactantserver:/opt/julia/local/share/julia:/opt/julia/share/julia
+#
+# The caches are compiled for the official Julia build's x86_64 CPU targets (image.bzl's default),
+# so they load on any x86_64 host rather than only on CPUs like the build machine's.
+#
+# PATH becomes /opt/julia/bin:$PATH, which rules_oci expands against the CUDA base's own PATH.
+# JULIA_PKG_OFFLINE is set too: nothing in the image resolves or installs, and a stale cache (a
+# mounted, edited package) still precompiles into the depot offline.
+julia_image_env(
+    name = "image_env",
+    env = _REACTANT_GPU_ENV | {
+        "REACTANT_WORKSPACE_ROOT": _APP,
+        "JULIA_SSL_CA_ROOTS_PATH": "/etc/ssl/certs/ca-certificates.crt",
+        # utility as well as compute: the entrypoint's GPU-reclaim gate runs nvidia-smi.
+        "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
+        "NVIDIA_VISIBLE_DEVICES": "all",
+    },
+    extra_depots = [_APP],
+    project = _APP,
+)
+
+# Julia at /opt/julia rather than as the base, because the base has to be CUDA's. The
+# distribution's own relative symlinks are kept, so its libraries are not shipped twice.
+julia_dist_layer(
+    name = "julia_layer",
+    julia = "@reactantserver_julia//:dist",
+)
+
+# The depot, instantiated from the manifest into an empty tree at /opt/julia-depot.
 #
 # FULL, not artifacts-only: the image loads its packages from source (with the caches of
 # //deploy:compiled_layer), not from a sysimage, so the packages themselves are the code.
 #
-# The source depot handed to image_depot.sh is EMPTY, so the General registry is fetched into the
-# clean depot rather than copied from whatever this host has; the manifest pins every package by
-# tree hash, so the registry's state cannot change what is installed. Set JULIA_PKG_SERVER in
-# user.bazelrc (--action_env) to go through a mirror.
-genrule(
+# No `depot`, so the General registry is fetched into the clean depot rather than copied from
+# whatever this host has; the manifest pins every package by tree hash, so the registry's state
+# cannot change what is installed. Set JULIA_PKG_SERVER in user.bazelrc (--action_env) to go
+# through a mirror.
+julia_depot_layer(
     name = "depot_layer",
-    srcs = [
-        "Manifest.toml",
-        "//:workspace_projects",
-        "@reactantserver_julia//:dist",
-        "@reactantserver_julia//:bin/julia",
-    ],
-    outs = ["reactantserver-depot.tar"],
-    cmd = _STAGE + """
-set -euo pipefail
-export JULIA_BIN="$$(cd "$$(dirname $(location @reactantserver_julia//:bin/julia))" && pwd)/julia"
-stage="$$(mktemp -d)"
-src_depot="$$(mktemp -d)"
-trap 'rm -rf "$$stage" "$$src_depot"' EXIT
-stage_workspace "$$stage"
-export JULIA_DEPOT_PATH="$$src_depot"
-export REACTANT_GPU={gpu} REACTANT_GPU_VERSION={gpu_version}
-JULIA_DEPOT_CONTENTS=full \\
-    $(location @rules_julia_depot//julia:image_depot.sh) "$$stage" "$@"
-""".format(
-        gpu = _REACTANT_GPU_ENV["REACTANT_GPU"],
-        gpu_version = _REACTANT_GPU_ENV["REACTANT_GPU_VERSION"],
-    ),
-    tags = ["requires-network"],  # packages, artifacts and the registry from the package server
-    tools = ["@rules_julia_depot//julia:image_depot.sh"],
-)
-
-# The precompile caches, so a container starts serving without first compiling ~150 packages.
-#
-# Built from the depot and application layers themselves, unpacked into one tree with the image's
-# layout, so the caches are for exactly the files the image ships. Julia validates a cache against
-# its sources by content, and records them relative to their depot (see _DEPOT_PATH), so caches
-# compiled here under <tmp>/opt load unchanged from /opt. The CUDA stub stands in for the driver
-# while Reactant loads; GPUs are hidden so the build never touches the host's.
-#
-# Precompiling is also the first time the whole stack is loaded, so a package that fails to load
-# fails the build here rather than a container at start.
-genrule(
-    name = "compiled_layer",
-    srcs = [
-        ":app_layer",
-        ":cuda_stub",
-        ":depot_layer",
-        "@reactantserver_julia//:bin/julia",
-        "@reactantserver_julia//:dist",
-    ],
-    outs = ["reactantserver-compiled.tar"],
-    cmd = """
-set -euo pipefail
-julia="$$(readlink -f $(location @reactantserver_julia//:bin/julia))"
-julia_prefix="$$(cd "$$(dirname "$$julia")/.." && pwd)"
-root="$$(mktemp -d)"
-stub="$$(mktemp -d)"
-# Pkg leaves installed packages read-only, which rm -rf alone cannot delete.
-trap 'chmod -R u+w "$$root"; rm -rf "$$root" "$$stub"' EXIT
-tar --extract --file $(location :depot_layer) --directory "$$root" --no-same-owner
-tar --extract --file $(location :app_layer) --directory "$$root" --no-same-owner
-cp $(location :cuda_stub) "$$stub/libcuda.so.1"
-# _DEPOT_PATH, with the build tree in place of /opt and the toolchain's Julia in place of /opt/julia.
-export JULIA_DEPOT_PATH="$$root{depot}:$$root{app}:$$julia_prefix/local/share/julia:$$julia_prefix/share/julia"
-export JULIA_CPU_TARGET='{cpu_target}'
-export JULIA_PKG_OFFLINE=true
-export CUDA_VISIBLE_DEVICES=
-export LD_LIBRARY_PATH="$$stub"
-export REACTANT_GPU={gpu} REACTANT_GPU_VERSION={gpu_version}
-for p in {projects}; do
-    echo "==> precompiling $$p"
-    "$$julia" --startup-file=no --project="$$root{app}/$$p" -e 'using Pkg; Pkg.precompile(; strict = true)'
-done
-""".format(
-        app = _APP,
-        cpu_target = _CPU_TARGET,
-        depot = _DEPOT,
-        gpu = _REACTANT_GPU_ENV["REACTANT_GPU"],
-        gpu_version = _REACTANT_GPU_ENV["REACTANT_GPU_VERSION"],
-        projects = " ".join(_ENTRY_PROJECTS),
-    ) + _TAR + """ --directory "$$root" {compiled}
-""".format(compiled = _DEPOT.lstrip("/") + "/compiled"),
-)
-
-# Julia as a layer at /opt/julia rather than as the base, because the base has to be CUDA's.
-genrule(
-    name = "julia_layer",
-    srcs = [
-        "@reactantserver_julia//:dist",
-        "@reactantserver_julia//:bin/julia",
-    ],
-    outs = ["reactantserver-julia.tar"],
-    cmd = """
-set -euo pipefail
-root="$$(cd "$$(dirname $(location @reactantserver_julia//:bin/julia))/.." && pwd)"
-stage="$$(mktemp -d)"
-trap 'rm -rf "$$stage"' EXIT
-mkdir -p "$$stage/opt"
-# -L, NOT plain -a: an external repo is a tree of symlinks into the execroot, and copying the
-# links would ship /opt/julia/bin/julia pointing at a path that exists only on the build host.
-cp -aL "$$root" "$$stage/opt/julia"
-chmod -R u+w "$$stage/opt/julia"
-rm -f "$$stage/opt/julia/BUILD.bazel" "$$stage/opt/julia/WORKSPACE" "$$stage/opt/julia/REPO.bazel"
-""" + _TAR + """ --directory "$$stage" opt
-""",
+    contents = "full",
+    env = _REACTANT_GPU_ENV,
+    julia = "@reactantserver_julia//:dist",
+    manifest = "Manifest.toml",
+    project = "//:Project.toml",
+    # The member Project.tomls, which the workspace's [workspace] table needs to instantiate.
+    srcs = ["//:workspace_projects"],
 )
 
 # The application at /opt/reactantserver, in the workspace layout the entrypoints expect: the root
@@ -307,10 +276,42 @@ for f in entrypoint.node.sh entrypoint.worker.sh healthcheck.node.sh healthcheck
     ln -s "{app}/docker/$$f" "$$stage/usr/local/bin/$$f"
 done
 cp "$$app/config/node.default.yaml" "$$stage/etc/reactantserver/node.yaml"
-chmod -R a+rX "$$stage/opt" "$$stage/etc"
 """.format(app = _APP) + _TAR + """ --directory "$$stage" etc opt usr
 """,
 )
+
+# The precompile caches, so a container starts serving without first compiling ~150 packages.
+#
+# Built from the image's own Julia, depot and application layers, unpacked into one tree with the
+# image's layout, so the caches are for exactly the files the image ships, and compiled for the
+# depot path and CPU targets of :image_env, so they load unchanged from /opt. The driver stub layer
+# rides along for the build only.
+#
+# Precompiling is also the first time the whole stack is loaded, so a package that fails to load
+# fails the build here rather than a container at start.
+julia_compiled_layer(
+    name = "compiled_layer",
+    env = _BUILD_LOAD_ENV,
+    image_env = ":image_env",
+    julia = "@reactantserver_julia//:dist",
+    layers = [
+        ":julia_layer",
+        ":depot_layer",
+        ":app_layer",
+        ":cuda_stub_layer",
+    ],
+    projects = _ENTRY_PROJECT_PATHS,
+)
+
+# The layers in the order they change, least often first, so a push or a pull after a code change
+# moves only the application layer (and the caches, when a package's sources change).
+_IMAGE_LAYERS = [
+    ":debs_layer",
+    ":julia_layer",
+    ":depot_layer",
+    ":compiled_layer",
+    ":app_layer",
+]
 
 # Root, and not by oversight: the entrypoint's GPU-reclaim gate and the supervisor expect it, and a
 # stale cache (a mounted, edited package) must still be able to precompile into the depot.
@@ -325,32 +326,29 @@ oci_image(
         "--",
         "/usr/local/bin/entrypoint.node.sh",
     ],
-    env = _REACTANT_GPU_ENV | {
-        # Julia is a layer, so nothing else puts it on PATH; the entrypoints exec a bare `julia`.
-        # The rest is the CUDA base's own PATH, repeated because this key replaces it.
-        "PATH": _JULIA + "/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        "JULIA_DEPOT_PATH": _DEPOT_PATH,
-        "JULIA_PROJECT": _APP,
-        "REACTANT_WORKSPACE_ROOT": _APP,
-        "JULIA_SSL_CA_ROOTS_PATH": "/etc/ssl/certs/ca-certificates.crt",
-        # utility as well as compute: the entrypoint's GPU-reclaim gate runs nvidia-smi.
-        "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
-        "NVIDIA_VISIBLE_DEVICES": "all",
-    },
+    env = ":image_env",
     # The embedded gateway's gRPC and metrics/health ports. The workers role binds per-worker ports
     # (base_port+i, metrics_base_port+i) instead; publish the range you configured.
     exposed_ports = [
         "8001/tcp",
         "8002/tcp",
     ],
-    tars = [
-        ":debs_layer",
-        ":depot_layer",
-        ":compiled_layer",
-        ":julia_layer",
-        ":app_layer",
-    ],
+    tars = _IMAGE_LAYERS,
     workdir = _APP,
+)
+
+# Every entry project loads from the baked caches with nothing precompiled and no cache rejected,
+# checked on the image's layers without a container, so it needs no podman. Manual because it
+# builds the whole image; //deploy:image_check covers what only a container shows.
+julia_precompile_test(
+    name = "image_precompile_test",
+    size = "large",
+    env = _BUILD_LOAD_ENV,
+    image_env = ":image_env",
+    julia = "@reactantserver_julia//:dist",
+    layers = [l for l in _IMAGE_LAYERS if l != ":debs_layer"] + [":cuda_stub_layer"],
+    projects = _ENTRY_PROJECT_PATHS,
+    tags = ["manual"],
 )
 
 oci_load(
@@ -358,8 +356,21 @@ oci_load(
     image = ":image",
     # Explicit, because rules_oci probes for docker first, and on hosts where a docker CLI is
     # installed but its socket is unreachable that probe wins and fails.
-    loader = "@rules_julia_depot//oci:podman.sh",
+    loader = "podman.sh",
     repo_tags = ["reactantserver:bazel"],
+)
+
+# Push the image as :latest. The repository is given at run time, so this file names no registry
+# account; credentials come from the docker config (`docker login`, `podman login --authfile
+# ~/.docker/config.json`, or docker/login-action in CI):
+#
+#   bazel run //deploy:image_push -- --repository index.docker.io/<org>/<name>
+#
+# .github/workflows/image.yml runs exactly this.
+oci_push(
+    name = "image_push",
+    image = ":image",
+    remote_tags = ["latest"],
 )
 
 # Check a loaded image: every entry project loads from the baked caches without precompiling, and

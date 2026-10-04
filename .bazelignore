@@ -4,3 +4,5 @@ docs/build
 lib
 private
 examples
+# The Python env CondaPkg creates for the export tests; it ships BUILD files of its own.
+packages/ReactantServerExport/test/.CondaPkg
