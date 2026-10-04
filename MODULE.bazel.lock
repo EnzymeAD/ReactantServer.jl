@@ -249,8 +249,8 @@
     },
     "@@rules_julia_depot+//julia:extensions.bzl%julia": {
       "general": {
-        "bzlTransitiveDigest": "OsJA58rY4YQkeDkx4AoHFcLUMQpp9niR9zYBH9RsVzU=",
-        "usagesDigest": "q7Bd7QbGrrET2i00DqmYTp6D2HZoVCDu+7paK+cXnqM=",
+        "bzlTransitiveDigest": "FRYRvkM3+b9fSfcuFE2MAYMccK2S0MTgtfO3zCJOFUE=",
+        "usagesDigest": "WqeJBDcoCwjlf5XzQ0YhpvScQFN10Ht3SBxpU/8hFKo=",
         "recordedInputs": [
           "REPO_MAPPING:rules_julia_depot+,bazel_tools bazel_tools"
         ],
@@ -258,7 +258,7 @@
           "reactantserver_julia": {
             "repoRuleId": "@@bazel_tools//tools/build_defs/repo:http.bzl%http_archive",
             "attributes": {
-              "build_file_content": "\nfilegroup(\n    name = \"dist\",\n    srcs = glob([\"**\"], exclude = [\"BUILD.bazel\", \"WORKSPACE\"]),\n    visibility = [\"//visibility:public\"],\n)\n\nexports_files([\"bin/julia\"])\n",
+              "build_file_content": "\nfilegroup(\n    name = \"dist\",\n    srcs = glob([\"**\"], exclude = [\"BUILD.bazel\", \"WORKSPACE\"]),\n    visibility = [\"//visibility:public\"],\n)\n\nexports_files([\"bin/julia\", \"include/julia/julia_version.h\"])\n\nalias(\n    name = \"reactantserver_julia\",\n    actual = \":dist\",\n    visibility = [\"//visibility:public\"],\n)\n",
               "sha256": "4e7e9e776634d24835250de67cde39b0d4af15bc432eb20697e6be6c28ea69e8",
               "strip_prefix": "julia-1.12.7",
               "urls": [

@@ -19,7 +19,7 @@ m = TOML.parsefile(joinpath(dirname(Base.active_project()), "Manifest.toml"))
 ok = true
 if m["julia_version"] != string(VERSION)
     println(stderr, "FAIL: deploy/Manifest.toml was resolved under Julia ", m["julia_version"],
-        " but the pinned toolchain is ", VERSION, ".")
+        " but the pinned distribution is ", VERSION, ".")
     ok = false
 end
 if !Pkg.is_manifest_current(Pkg.Types.Context())

@@ -42,8 +42,8 @@ build. It lives under `deploy/` only so the root gitignore can stay as it is; a 
 read the root manifest instead.
 
 `//deploy:manifest_current` fails when a `[deps]` or `[compat]` change leaves the lock stale, or
-when the lock was resolved under a Julia other than the pinned toolchain. Move it deliberately and
-review the diff like code:
+when the lock was resolved under a Julia other than the pinned distribution. Move it deliberately
+and review the diff like code:
 
 ```
 bazel run //deploy:relock                           # keep every version that still resolves
