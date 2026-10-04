@@ -343,7 +343,7 @@ workers. The autotune knobs are settable as container env
 (`INFERENCE_SERVER_RUNTIME_AUTOTUNE`, `INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE`,
 `INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE_DIR`); the baked default node file sits at
 `/etc/reactantserver/node.yaml` and can be overridden by mounting your own over that path. See
-`docker/README.md` for the runtime scripts.
+`deploy/runtime/README.md` for the runtime scripts.
 
 ## Metrics
 

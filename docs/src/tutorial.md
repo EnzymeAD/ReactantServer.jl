@@ -119,9 +119,9 @@ CUDA_VISIBLE_DEVICES=0 INFERENCE_SERVER_MODEL_DIRS=$PWD/models REACTANT_NODE_FIL
     -e 'using ReactantServerNode; ReactantServerNode.main()'
 ```
 
-This is the pure-Julia form of the container launcher: in the image, `docker/entrypoint.node.sh`
-runs the same entry point, detects the visible GPUs, spawns one worker subprocess per device, and
-restarts children that die.
+This is the pure-Julia form of the container launcher: in the image,
+`deploy/runtime/entrypoint.node.sh` runs the same entry point, detects the visible GPUs, spawns one
+worker subprocess per device, and restarts children that die.
 
 With a single GPU the node runs one worker and no gateway: the worker serves the KServe V2 gRPC
 API on `localhost:8001` and metrics/health on `localhost:8002` (`/readyz`, `/healthz`,
@@ -131,8 +131,8 @@ API on `localhost:8001` and metrics/health on `localhost:8002` (`/readyz`, `/hea
 ## Step 4: Or serve from pure Julia
 
 Two entry points, differing only in which ports are exposed. First the supervisor, which behaves
-exactly like the container launcher `docker/entrypoint.node.sh`: one worker (no gateway) on the
-public ports 8001 (gRPC) and 8002 (metrics):
+exactly like the container launcher `deploy/runtime/entrypoint.node.sh`: one worker (no gateway) on
+the public ports 8001 (gRPC) and 8002 (metrics):
 
 ```julia
 using ReactantServerNode

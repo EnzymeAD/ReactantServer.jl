@@ -84,8 +84,9 @@ layers:
   supervisor, a worker, the gateway, and the worker-role healthcheck), so a container serves without
   first compiling about 150 packages.
 - `app_layer`: the workspace at `/opt/reactantserver` (root project plus the Julia lock, member
-  packages without their tests, `docker/`, `config/`), the entrypoints and healthchecks linked into
-  `/usr/local/bin`, and the default node file at `/etc/reactantserver/node.yaml`.
+  packages without their tests, `config/`), the entrypoints and healthchecks from
+  [`runtime/`](runtime/README.md) in `/usr/local/bin`, and the default node file at
+  `/etc/reactantserver/node.yaml`.
 
 `image_env` writes the image's environment: the depot path below, `JULIA_PROJECT`, the portable
 `JULIA_CPU_TARGET`, `JULIA_PKG_OFFLINE=true`, Julia's `bin/` ahead of the base's `PATH`, and the
