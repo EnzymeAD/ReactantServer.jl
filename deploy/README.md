@@ -21,7 +21,7 @@ bazel run   //deploy:relock_debs         # re-resolve the Ubuntu package lock (c
 
 The Julia-specific parts (the distribution, depot and precompile-cache layers, the image
 environment, and the precompile test) are the image rules of
-[rules_julia_depot](https://github.com/csvance/rules_julia_depot) (`julia/image.bzl`); this
+[julia_depot](https://github.com/csvance/julia_depot) (`julia/image.bzl`); this
 package adds the Ubuntu packages, the CUDA driver stub the build loads Reactant against, the
 application layer, and the image itself, assembled with rules_oci.
 

@@ -225,6 +225,24 @@
   },
   "selectedYankedVersions": {},
   "moduleExtensions": {
+    "@@julia_depot+//julia:extensions.bzl%julia": {
+      "general": {
+        "bzlTransitiveDigest": "t0C7/eh7dFhvfV0fS0A39Elaqee9+kxUUqu2AEW6hZs=",
+        "usagesDigest": "PTsZm6Jg5HquePleXP48biPA/GphSvs7jOXg3taJySQ=",
+        "recordedInputs": [],
+        "generatedRepoSpecs": {
+          "reactantserver_julia": {
+            "repoRuleId": "@@julia_depot+//julia:dist.bzl%julia_dist",
+            "attributes": {
+              "version": "1.12.7",
+              "sha256": {},
+              "url": "https://julialang-s3.julialang.org/bin/linux/{arch_dir}/{minor}/julia-{version}-{platform}.tar.gz",
+              "strip_prefix": "julia-{version}"
+            }
+          }
+        }
+      }
+    },
     "@@pybind11_bazel+//:internal_configure.bzl%internal_configure_extension": {
       "general": {
         "bzlTransitiveDigest": "NRXra7941UfmNUyIxnLt82V5hULluVGL2nBsijTl4j4=",
@@ -241,28 +259,6 @@
               "strip_prefix": "pybind11-2.12.0",
               "urls": [
                 "https://github.com/pybind/pybind11/archive/v2.12.0.zip"
-              ]
-            }
-          }
-        }
-      }
-    },
-    "@@rules_julia_depot+//julia:extensions.bzl%julia": {
-      "general": {
-        "bzlTransitiveDigest": "FRYRvkM3+b9fSfcuFE2MAYMccK2S0MTgtfO3zCJOFUE=",
-        "usagesDigest": "WqeJBDcoCwjlf5XzQ0YhpvScQFN10Ht3SBxpU/8hFKo=",
-        "recordedInputs": [
-          "REPO_MAPPING:rules_julia_depot+,bazel_tools bazel_tools"
-        ],
-        "generatedRepoSpecs": {
-          "reactantserver_julia": {
-            "repoRuleId": "@@bazel_tools//tools/build_defs/repo:http.bzl%http_archive",
-            "attributes": {
-              "build_file_content": "\nfilegroup(\n    name = \"dist\",\n    srcs = glob([\"**\"], exclude = [\"BUILD.bazel\", \"WORKSPACE\"]),\n    visibility = [\"//visibility:public\"],\n)\n\nexports_files([\"bin/julia\", \"include/julia/julia_version.h\"])\n\nalias(\n    name = \"reactantserver_julia\",\n    actual = \":dist\",\n    visibility = [\"//visibility:public\"],\n)\n",
-              "sha256": "4e7e9e776634d24835250de67cde39b0d4af15bc432eb20697e6be6c28ea69e8",
-              "strip_prefix": "julia-1.12.7",
-              "urls": [
-                "https://julialang-s3.julialang.org/bin/linux/x64/1.12/julia-1.12.7-linux-x86_64.tar.gz"
               ]
             }
           }

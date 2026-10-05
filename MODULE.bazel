@@ -49,18 +49,18 @@ use_repo(debs, "reactantserver_debs")
 
 # Julia itself, and the image rules (julia/image.bzl): the distribution, depot and
 # precompile-cache layers, the image environment, and the precompile test.
-bazel_dep(name = "rules_julia_depot", version = "0.1.0")
+bazel_dep(name = "julia_depot", version = "0.1.0")
 git_override(
-    module_name = "rules_julia_depot",
-    commit = "0f35a92b3660eed9db7d50905cfeea3d3c259669",
-    remote = "https://github.com/csvance/rules_julia_depot.git",
+    module_name = "julia_depot",
+    commit = "e351760be3cd849d0920d7c46204c22a17be9ffa",
+    remote = "https://github.com/csvance/julia_depot.git",
 )
 
 # Julia, fetched and pinned by sha256, so no build host needs it installed. It must match
 # deploy/Manifest.toml's julia_version; //deploy:manifest_current fails when they disagree. The
 # repository name is prefixed because distribution names share one namespace across every module
 # that uses the extension: a consumer that declares its own `julia_dist` must not collide.
-julia = use_extension("@rules_julia_depot//julia:extensions.bzl", "julia")
+julia = use_extension("@julia_depot//julia:extensions.bzl", "julia")
 julia.dist(
     name = "reactantserver_julia",
     version = "1.12.7",
