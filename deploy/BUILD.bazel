@@ -1,5 +1,5 @@
 load(
-    "@rules_julia_depot//julia:image.bzl",
+    "@julia_depot//julia:image.bzl",
     "julia_compiled_layer",
     "julia_depot_layer",
     "julia_dist_layer",
@@ -26,7 +26,7 @@ package(default_visibility = ["//visibility:public"])
 #   bazel run   //deploy:relock_debs            # re-resolve deploy/debs.lock.json (curl, tini)
 #
 # The Julia-specific layers (the distribution, the depot, the precompile caches), the image's
-# environment and the precompile test come from @rules_julia_depot//julia:image.bzl. What stays here
+# environment and the precompile test come from @julia_depot//julia:image.bzl. What stays here
 # is what is ours: the Ubuntu packages, the CUDA driver stub the build loads Reactant against, the
 # application layer, and the image itself.
 #
