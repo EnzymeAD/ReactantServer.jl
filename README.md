@@ -12,8 +12,10 @@ container; and it squeezes the most models out of each GPU by balancing model **
 **compute**. It is Julia-first throughout — custom pre/postprocessing is plain Julia, and every
 convention follows Julia's (column-major, batch-last axes).
 
-It targets static-graph workloads — computer vision, scientific computing — where many models
-share a GPU and one model executes at a time.
+It serves compiled models, such as computer vision and scientific computing workloads, where many
+models share a GPU and one model executes at a time. Local serving of large language models is a
+goal of the project: splitting a model into compiled stages and streaming their weights from
+storage, so a GPU can serve models larger than its memory.
 
 Not sure which setup fits you? The [deployment shapes](https://enzymead.github.io/ReactantServer.jl/dev/deployment/#Deployment-shapes)
 section walks through the options (single GPU, multi-GPU distributed or replicated, multi-node)

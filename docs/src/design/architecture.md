@@ -6,8 +6,10 @@ ReactantServer is a production inference server that serves many models compiled
 Reactant.jl from a single Julia process on one GPU. Models are delivered as self-contained
 bundles (an MLIR module, its weights, and a manifest), compiled once through Reactant's PJRT
 bindings, and served over the KServe V2 inference API via gRPC, so standard Triton and KServe
-clients connect without changes. It targets static-graph workloads such as computer vision and
-scientific computing, where many models share a GPU and one model executes at a time.
+clients connect without changes. It serves compiled models, such as computer vision and
+scientific computing workloads, where many models share a GPU and one model executes at a time.
+Local serving of large language models, including models larger than device memory, is a goal of
+the project (see [Philosophy](philosophy.md)).
 
 The server is Reactant-centric, not XLA-specific: it runs whatever Reactant can lower to a device
 executable. Today that means StableHLO compiled by XLA — the only dialect and backend currently
@@ -260,8 +262,10 @@ without duplicating parameters.
 
 ## Scope
 
-ReactantServer is opinionated and deliberately narrow. It is for small and mid-size engineering
-organizations that need efficient inference on static-graph models and that measure their own
-systems. It is Reactant-centric — currently focused on StableHLO/XLA — and is not a general
-multi-framework server, not an LLM serving stack, and not a managed service. The reasoning behind
-these boundaries is on the [Philosophy](philosophy.md) page.
+ReactantServer is opinionated about its design point. It is for small and mid-size engineering
+organizations that need efficient inference on compiled models and that measure their own systems:
+many models per GPU today, and, as the project's LLM direction, models larger than a GPU served
+locally by splitting them into compiled stages and streaming their weights from storage. It is
+Reactant-centric, currently focused on StableHLO/XLA, and it is infrastructure that its users
+operate themselves. The reasoning behind these choices is on the [Philosophy](philosophy.md)
+page.
