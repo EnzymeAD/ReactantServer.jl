@@ -45,6 +45,7 @@ include("grpc_helpers.jl")
     include("test_watcher.jl")
     include("test_xla_serialization.jl")
     include("test_executable_cache.jl")
+    include("test_batch_sizes.jl")
     include("test_shared_memory.jl")
     include("test_kaimon_ext.jl")
 end

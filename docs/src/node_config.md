@@ -73,6 +73,9 @@ global:
     allow_cpu_fallback: false
     numerics: auto             # f32 | auto | tf32; see below
     executable_cache: true     # cache compiled programs under each bundle's .cache/; see below
+    profile: default           # default | regulated; see below
+    batch_sizes: all           # all | largest compiled batch size per model (profile default)
+    xla_flags: {}              # XLA DebugOptions overrides, e.g. xla_gpu_deterministic_ops: true
     weight_cache_fraction: 1.0 # arena fraction for all weights (pinned + on-demand); 0 disables
     weight_cache_wiggle_fraction: 0.1  # arena fraction kept free; drives startup auto-sizing
     autotune: true             # XLA GPU compile autotuner; false = default kernels, no trials
@@ -124,6 +127,30 @@ whose content changes has its programs dropped on the next load, while a weights
 them. The directory watcher never reacts to anything under `.cache/`, so cache writes cannot reload
 the model that produced them. The bundle directory must be writable by the worker; when it is not,
 the cache logs a warning and every program is compiled as before.
+
+`runtime.batch_sizes` selects which of a bundle's compiled batch sizes are loaded. `all` (the
+default) loads every `model.b{N}.mlir` the manifest declares, and the scheduler picks the largest
+size a dispatch can fill. `largest` loads only the largest declared size, per input-shape variant,
+and never reads the others (they need not even be present). Every dispatch then runs that one
+program, padded with zero rows when fewer requests are queued and sliced back per request, so a
+row's result no longer depends on how many other requests were coalesced with it; the cost is the
+full batch's compute on every dispatch, including a lone one-row request. Unbatched bundles are
+unaffected. Workers with different settings can share a bundle directory: a `largest` worker keeps
+the cached programs of the sizes it skipped.
+
+`runtime.xla_flags` is a mapping of XLA `DebugOptions` field names (no leading `--`) to values,
+applied to every compile. At startup each name is checked against the XLA linked into the worker
+and each value against the field's type (booleans, integers, numbers, strings, and enum fields by
+enumerator name), so a typo fails startup instead of being ignored. The flags are part of the
+executable cache key. An explicit `xla_gpu_autotune_level` here wins over `autotune: false`.
+
+`runtime.profile` applies a named set of defaults. `regulated` defaults `batch_sizes` to
+`largest` and adds `xla_gpu_exclude_nondeterministic_ops: true` to `xla_flags`; anything set
+explicitly wins, so `batch_sizes: all` or `xla_gpu_exclude_nondeterministic_ops: false` turns a
+piece back off. The profile does not change `numerics`. Instead, unless `numerics` is `f32`, the
+worker logs a prominent startup warning naming the f32 matmul/convolution precision actually in
+effect on its device (TF32 on Ampere and newer under `auto`), because only `f32` is invariant
+across GPU generations.
 
 `model_control_mode` sets how the loaded model set evolves: `dynamic` (the default) watches the
 repository and loads, unloads, reloads, and renames bundles online as files change (a renamed
@@ -305,6 +332,8 @@ overrides were applied, is logged at startup.
 | `INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE_DIR` | `runtime.autotune_cache_dir` | path |
 | `INFERENCE_SERVER_RUNTIME_NUMERICS` | `runtime.numerics` | `f32` \| `auto` \| `tf32` |
 | `INFERENCE_SERVER_RUNTIME_EXECUTABLE_CACHE` | `runtime.executable_cache` | bool |
+| `INFERENCE_SERVER_RUNTIME_PROFILE` | `runtime.profile` | `default` \| `regulated` |
+| `INFERENCE_SERVER_RUNTIME_BATCH_SIZES` | `runtime.batch_sizes` | `all` \| `largest` |
 | `INFERENCE_SERVER_RUNTIME_SHARED_HOST_WEIGHTS` | `runtime.shared_host_weights` | bool |
 | `INFERENCE_SERVER_RUNTIME_SHARED_HOST_WEIGHTS_MODE` | `runtime.shared_host_weights_mode` | octal string |
 | `INFERENCE_SERVER_SCHEDULER_DISCIPLINE` | `scheduler.discipline` | `fair` \| `fifo` \| `edf` |

@@ -134,7 +134,8 @@ function _apply_change!(
             delete!(w.seen, name)
             delete!(w.dir_ids, name)
         else
-            entry = load_bundle_entry(dir)   # named by its directory basename, i.e. `name`
+            # named by its directory basename, i.e. `name`
+            entry = load_bundle_entry(dir; batch_sizes = w.cfg.runtime.batch_sizes)
             if entry isa MetaEntry
                 # Meta bundles need no compilation; register them straight into the meta map.
                 put_meta!(w.scheduler, entry)

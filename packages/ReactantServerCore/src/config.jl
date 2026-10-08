@@ -91,6 +91,38 @@ silently degrading per worker in a mixed fleet.
 @enum NumericsMode NUMERICS_F32 NUMERICS_AUTO NUMERICS_TF32
 
 """
+    BatchSizeMode
+
+Which of a bundle's compiled batch sizes the worker loads (the `runtime.batch_sizes` knob).
+`BATCH_SIZES_ALL` (the default) loads every `model.b{N}.mlir` the manifest declares, so the
+scheduler can pick the largest size a dispatch can fill. `BATCH_SIZES_LARGEST` loads only the
+largest declared size (per input-shape variant) and never reads the others, so every dispatch
+runs the same compiled program, padded with zero rows when fewer requests are queued. That makes
+a row's result independent of how many other requests happened to be coalesced with it, at the
+cost of paying the full batch's compute on every dispatch. Unbatched bundles (`model.mlir`) are
+unaffected.
+"""
+@enum BatchSizeMode BATCH_SIZES_ALL BATCH_SIZES_LARGEST
+
+"""
+    RuntimeProfile
+
+A named set of runtime defaults (the `runtime.profile` knob). `PROFILE_DEFAULT` changes nothing.
+`PROFILE_REGULATED` is for validated deployments that need reproducible results: it defaults
+`batch_sizes` to `largest` and adds `xla_gpu_exclude_nondeterministic_ops: true` to `xla_flags`.
+Anything set explicitly in the config wins over the profile, so each piece can be turned back off.
+The profile does not change `numerics`; instead the worker logs a prominent warning at startup
+naming the f32 matmul/convolution precision actually in effect unless `numerics` is `f32`.
+"""
+@enum RuntimeProfile PROFILE_DEFAULT PROFILE_REGULATED
+
+# The xla_flags a profile contributes underneath the user's own.
+_profile_xla_flags(p::RuntimeProfile) =
+    p == PROFILE_REGULATED ? Dict{String, Any}("xla_gpu_exclude_nondeterministic_ops" => true) :
+    Dict{String, Any}()
+_profile_batch_sizes(p::RuntimeProfile) = p == PROFILE_REGULATED ? BATCH_SIZES_LARGEST : BATCH_SIZES_ALL
+
+"""
     RuntimeConfig
 
 Runtime and device settings (the `runtime:` config block). `backend` selects CPU or CUDA
@@ -121,7 +153,12 @@ are applied to Reactant's compile cache at worker startup, so a container can dr
 bundle's `.cache/` directory and loads it on later starts instead of recompiling, keyed by the
 Reactant_jll build, the device, and the MLIR content (a changed `model*.mlir` invalidates its
 programs; a weights-only update does not); it needs a Reactant that exposes executable
-serialization and is otherwise a no-op.
+serialization and is otherwise a no-op. `profile` (default `default`) applies a named set of
+defaults; see [`RuntimeProfile`](@ref). `batch_sizes` (default `all`, or the profile's) selects
+which compiled batch sizes are loaded; see [`BatchSizeMode`](@ref). `xla_flags` (default empty,
+plus the profile's) is a mapping of XLA `DebugOptions` field names to values, passed to every
+compile, for example `xla_gpu_exclude_nondeterministic_ops: true`; names and value types are
+checked against the linked XLA at startup, and the flags are part of the executable cache key.
 """
 struct RuntimeConfig
     backend::BackendKind
@@ -139,7 +176,28 @@ struct RuntimeConfig
     autotune_cache_dir::String            # persistent autotune cache directory; "" = inherit Reactant's LocalPreferences
     numerics::NumericsMode                # f32 matmul/conv precision policy (see NumericsMode)
     executable_cache::Bool                # per-bundle serialized-executable cache
+    profile::RuntimeProfile               # named defaults for batch_sizes and xla_flags
+    batch_sizes::BatchSizeMode            # which compiled batch sizes to load (resolved; profile applied)
+    xla_flags::Dict{String, Any}          # XLA DebugOptions overrides (resolved; profile applied)
 end
+
+# Fifteen-argument form: the previous full positional layout (through `executable_cache`), with the
+# default profile, every batch size, and no XLA flags.
+RuntimeConfig(
+    backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
+    preallocate::Bool, allow_cpu_fallback::Bool, residency_mode::ResidencyMode,
+    shared_host_weights::Bool, shared_host_weights_mode::Integer,
+    weight_cache_fraction::Real, weight_cache_wiggle_fraction::Real, autotune::Bool,
+    autotune_cache::Union{Bool, Nothing}, autotune_cache_dir::AbstractString, numerics::NumericsMode,
+    executable_cache::Bool
+) =
+    RuntimeConfig(
+    backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
+    residency_mode, shared_host_weights, UInt16(shared_host_weights_mode),
+    Float64(weight_cache_fraction), Float64(weight_cache_wiggle_fraction), autotune,
+    autotune_cache, String(autotune_cache_dir), numerics, executable_cache,
+    PROFILE_DEFAULT, BATCH_SIZES_ALL, Dict{String, Any}()
+)
 
 # Five-argument form: device/backend only; residency self-managed, private host weights, and the
 # on-demand cache off (fraction 0). Used by tests and programmatic construction; the YAML path
@@ -372,6 +430,8 @@ const ENV_PATHS = Tuple{String, Vector{String}, DataType}[
     ("RUNTIME_AUTOTUNE_CACHE_DIR", ["runtime", "autotune_cache_dir"], String),
     ("RUNTIME_NUMERICS", ["runtime", "numerics"], String),
     ("RUNTIME_EXECUTABLE_CACHE", ["runtime", "executable_cache"], Bool),
+    ("RUNTIME_PROFILE", ["runtime", "profile"], String),
+    ("RUNTIME_BATCH_SIZES", ["runtime", "batch_sizes"], String),
     ("RUNTIME_SHARED_HOST_WEIGHTS", ["runtime", "shared_host_weights"], Bool),
     ("RUNTIME_SHARED_HOST_WEIGHTS_MODE", ["runtime", "shared_host_weights_mode"], String),
     ("SCHEDULER_DISCIPLINE", ["scheduler", "discipline"], String),
@@ -528,6 +588,39 @@ function _parse_numerics(s)
     throw(ConfigError("runtime.numerics must be 'f32', 'auto', or 'tf32', got '$s'"))
 end
 
+function _parse_profile(s)
+    ls = lowercase(strip(s))
+    ls == "default" && return PROFILE_DEFAULT
+    ls == "regulated" && return PROFILE_REGULATED
+    throw(ConfigError("runtime.profile must be 'default' or 'regulated', got '$s'"))
+end
+
+function _parse_batch_sizes(s)
+    ls = lowercase(strip(s))
+    ls == "all" && return BATCH_SIZES_ALL
+    ls == "largest" && return BATCH_SIZES_LARGEST
+    throw(ConfigError("runtime.batch_sizes must be 'all' or 'largest', got '$s'"))
+end
+
+# runtime.xla_flags: a mapping of XLA DebugOptions field names to scalar values, layered over the
+# profile's flags (an explicit entry wins, so `false` turns a profile flag back off). Only the shape
+# is checked here; field names and value types are checked against the linked XLA at startup.
+function _parse_xla_flags(rt, profile::RuntimeProfile)
+    flags = _profile_xla_flags(profile)
+    raw = get(rt, "xla_flags", nothing)
+    raw === nothing && return flags
+    raw isa AbstractDict || throw(ConfigError("config 'runtime.xla_flags' must be a mapping"))
+    for (k, v) in raw
+        name = String(k)
+        startswith(name, "xla_") ||
+            throw(ConfigError("runtime.xla_flags.$name: XLA option names start with 'xla_' (no leading '--')"))
+        (v isa Union{Bool, Real, AbstractString}) ||
+            throw(ConfigError("runtime.xla_flags.$name must be a boolean, number, or string"))
+        flags[name] = v isa AbstractString ? String(v) : v
+    end
+    return flags
+end
+
 # Per-model scheduler overrides under scheduler.models. Each entry may set `weight` (relative
 # compute share, default 1.0), `residency` (initial residency floor), and `max_batch_size`
 # (coalescing cap, default uncapped). `pin_to_gpu: true` is accepted as a back-compat alias for
@@ -569,6 +662,7 @@ function build_config(raw::AbstractDict)
 
     rt = _subdict(raw, "runtime")
     haskey(rt, "residency_mode") && throw(ConfigError(_RESIDENCY_MODE_REMOVED_MSG))
+    profile = _parse_profile(_opt(rt, "profile", String, "default"))
     runtime = RuntimeConfig(
         _parse_backend(_opt(rt, "backend", String, "cpu")),
         _opt(rt, "device_ordinal", Int, 0),
@@ -585,6 +679,11 @@ function build_config(raw::AbstractDict)
         _opt(rt, "autotune_cache_dir", String, ""),
         _parse_numerics(_opt(rt, "numerics", String, "auto")),
         _opt(rt, "executable_cache", Bool, true),
+        profile,
+        haskey(rt, "batch_sizes") ?
+            _parse_batch_sizes(_coerce(String, rt["batch_sizes"], "runtime.batch_sizes")) :
+            _profile_batch_sizes(profile),
+        _parse_xla_flags(rt, profile),
     )
 
     sc = _subdict(raw, "scheduler")
@@ -675,7 +774,7 @@ end
 # `apply_env_overrides!` is applied on top by `node_server_config`.
 
 function log_effective_config(cfg::ServerConfig, applied)
-    @info "Effective configuration" model_dirs = cfg.model_dirs models_include = cfg.models_include model_control_mode = cfg.model_control_mode model_poll_seconds = cfg.model_poll_seconds cache_dir = cfg.cache_dir backend = cfg.runtime.backend device_ordinal = cfg.runtime.device_ordinal mem_fraction = cfg.runtime.mem_fraction preallocate = cfg.runtime.preallocate allow_cpu_fallback = cfg.runtime.allow_cpu_fallback weight_cache_fraction = cfg.runtime.weight_cache_fraction weight_cache_wiggle_fraction = cfg.runtime.weight_cache_wiggle_fraction autotune = cfg.runtime.autotune autotune_cache = cfg.runtime.autotune_cache autotune_cache_dir = cfg.runtime.autotune_cache_dir numerics = cfg.runtime.numerics executable_cache = cfg.runtime.executable_cache residency_mode = cfg.runtime.residency_mode shared_host_weights = cfg.runtime.shared_host_weights shared_host_weights_mode = string(cfg.runtime.shared_host_weights_mode; base = 8) host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests discipline = cfg.scheduler.discipline ema_halflife_seconds = cfg.scheduler.ema_halflife_seconds recency_penalty_cap = cfg.scheduler.recency_penalty_cap coalescing_discount = cfg.scheduler.coalescing_discount cost_ema_alpha = cfg.scheduler.cost_ema_alpha max_queue_depth = cfg.scheduler.max_queue_depth compaction_interval = cfg.scheduler.compaction_interval scheduler_models = collect(keys(cfg.scheduler.models))
+    @info "Effective configuration" model_dirs = cfg.model_dirs models_include = cfg.models_include model_control_mode = cfg.model_control_mode model_poll_seconds = cfg.model_poll_seconds cache_dir = cfg.cache_dir backend = cfg.runtime.backend device_ordinal = cfg.runtime.device_ordinal mem_fraction = cfg.runtime.mem_fraction preallocate = cfg.runtime.preallocate allow_cpu_fallback = cfg.runtime.allow_cpu_fallback weight_cache_fraction = cfg.runtime.weight_cache_fraction weight_cache_wiggle_fraction = cfg.runtime.weight_cache_wiggle_fraction autotune = cfg.runtime.autotune autotune_cache = cfg.runtime.autotune_cache autotune_cache_dir = cfg.runtime.autotune_cache_dir numerics = cfg.runtime.numerics executable_cache = cfg.runtime.executable_cache profile = cfg.runtime.profile batch_sizes = cfg.runtime.batch_sizes xla_flags = sort!(["$k=$v" for (k, v) in cfg.runtime.xla_flags]) residency_mode = cfg.runtime.residency_mode shared_host_weights = cfg.runtime.shared_host_weights shared_host_weights_mode = string(cfg.runtime.shared_host_weights_mode; base = 8) host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests discipline = cfg.scheduler.discipline ema_halflife_seconds = cfg.scheduler.ema_halflife_seconds recency_penalty_cap = cfg.scheduler.recency_penalty_cap coalescing_discount = cfg.scheduler.coalescing_discount cost_ema_alpha = cfg.scheduler.cost_ema_alpha max_queue_depth = cfg.scheduler.max_queue_depth compaction_interval = cfg.scheduler.compaction_interval scheduler_models = collect(keys(cfg.scheduler.models))
     isempty(applied) || @info "Configuration overridden by environment" overrides = ["$k=$v" for (k, v) in applied]
     return nothing
 end

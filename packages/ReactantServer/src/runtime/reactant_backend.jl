@@ -212,12 +212,55 @@ end
 # When autotuning is disabled, force xla_gpu_autotune_level=0: XLA uses default gemm/conv algorithm
 # selection with no device timing trials. This removes the autotuner's run-to-run non-determinism and
 # the compile-time scratch that otherwise inflates the startup memory probe on the first (un-cached)
-# start. When enabled, pass no override so the compile is byte-identical to the previous behavior.
+# start. `runtime.xla_flags` is layered on top, so an explicit xla_gpu_autotune_level there wins.
+# With neither, pass no override so the compile is byte-identical to the previous behavior.
 function _compile_options(pool::MemoryPool, device_id::Int)
-    pool.autotune && return _RXLA.make_compile_options(; device_id = Int64(device_id))
+    pool.autotune && isempty(pool.xla_flags) &&
+        return _RXLA.make_compile_options(; device_id = Int64(device_id))
+    base = pool.autotune ? (;) : (; xla_gpu_autotune_level = Int32(0))
     return _RXLA.make_compile_options(;
-        device_id = Int64(device_id), xla_debug_options = (; xla_gpu_autotune_level = Int32(0))
+        device_id = Int64(device_id), xla_debug_options = merge(base, NamedTuple(pool.xla_flags))
     )
+end
+
+# runtime.xla_flags against the DebugOptions proto of the linked XLA: an unknown name or a value
+# that does not fit the field's type is a ConfigError at startup, rather than a Setfield error on the
+# first compile or, worse, a flag that is silently not what the operator meant.
+function resolve_xla_flags(::ReactantBackend, flags::AbstractDict)
+    T = Reactant.Proto.xla.DebugOptions
+    out = Pair{Symbol, Any}[]
+    for (k, v) in flags
+        name = Symbol(k)
+        hasfield(T, name) ||
+            throw(ConfigError("runtime.xla_flags.$k is not an XLA DebugOptions field in Reactant $(pkgversion(Reactant))"))
+        push!(out, name => _xla_flag_value(fieldtype(T, name), String(k), v))
+    end
+    return sort!(out; by = first)
+end
+
+_xla_flag_error(k, v, what) = throw(ConfigError("runtime.xla_flags.$k must be $what, got $(repr(v))"))
+_xla_flag_value(::Type{Bool}, k, v) = v isa Bool ? v : _xla_flag_error(k, v, "a boolean")
+function _xla_flag_value(::Type{T}, k, v) where {T <: Integer}
+    (v isa Integer && !(v isa Bool)) || _xla_flag_error(k, v, "an integer")
+    typemin(T) <= v <= typemax(T) || _xla_flag_error(k, v, "an integer that fits $T")
+    return T(v)
+end
+_xla_flag_value(::Type{T}, k, v) where {T <: AbstractFloat} =
+    (v isa Real && !(v isa Bool)) ? T(v) : _xla_flag_error(k, v, "a number")
+_xla_flag_value(::Type{String}, k, v) = v isa AbstractString ? String(v) : _xla_flag_error(k, v, "a string")
+# Enum fields take the enumerator's name; repeated and message fields are not supported.
+function _xla_flag_value(::Type{T}, k, v) where {T}
+    names = try
+        [string(Symbol(x)) => x for x in instances(T)]
+    catch
+        throw(ConfigError("runtime.xla_flags.$k has type $T, which runtime.xla_flags cannot set"))
+    end
+    if v isa AbstractString
+        for (n, x) in names
+            n == v && return x
+        end
+    end
+    return _xla_flag_error(k, v, "one of " * join(first.(names), ", "))
 end
 
 # ── The executable cache (executable_cache.jl) on the Reactant backend ───────────────────────────
@@ -259,7 +302,9 @@ end
 function _cache_policy(pool::MemoryPool, tf32_capable::Bool)
     return string(
         "reactant=", pkgversion(Reactant), ";autotune=", pool.autotune, ";numerics=", pool.numerics,
-        ";tf32=", tf32_capable, ";format=", EXEC_CACHE_FORMAT
+        ";tf32=", tf32_capable, ";format=", EXEC_CACHE_FORMAT,
+        # Only when set, so programs cached before runtime.xla_flags existed keep their keys.
+        isempty(pool.xla_flags) ? "" : ";xla=" * join([string(k, "=", v) for (k, v) in pool.xla_flags], ",")
     )
 end
 

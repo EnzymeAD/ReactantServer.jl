@@ -119,17 +119,29 @@ Record the bundle's current MLIR source hashes (file name to sha256) in the cach
 delete every cached executable whose source changed hash or is no longer part of the bundle.
 Returns the names of the invalidated sources. Weights are not part of the record. Fails open:
 an I/O error logs a warning and returns an empty list.
+
+`retain` names sources that are still part of the bundle but were not read by this worker
+(`runtime.batch_sizes: largest` skips the smaller batch sizes). Their recorded hashes and cached
+programs are kept as they are, so a worker loading only the largest size does not delete programs
+that a worker loading every size, on the same bundle directory, still uses.
 """
-function sync_mlir_hashes!(cache_dir::AbstractString, sources::Dict{String, String})
+function sync_mlir_hashes!(
+        cache_dir::AbstractString, sources::Dict{String, String};
+        retain = ()
+    )
     try
         prev = _read_hashes(cache_dir)
-        stale = String[get(sources, src, nothing) == sha ? "" : src for (src, sha) in prev]
+        record = copy(sources)
+        for src in retain
+            haskey(prev, src) && !haskey(record, src) && (record[src] = prev[src])
+        end
+        stale = String[get(record, src, nothing) == sha ? "" : src for (src, sha) in prev]
         filter!(!isempty, stale)
         for src in stale
             n = _sweep_entries!(cache_dir, src)
             @info "executable cache: MLIR source changed; dropped cached programs" cache_dir source = src entries = n
         end
-        prev == sources || _write_hashes(cache_dir, sources)
+        prev == record || _write_hashes(cache_dir, record)
         return stale
     catch err
         @warn "executable cache: could not sync MLIR hashes (cache disabled for this bundle)" cache_dir exception = err
@@ -166,6 +178,14 @@ end
 "Remove an entry that failed to load, so the next start recompiles instead of retrying it."
 drop_entry(path::AbstractString) = (rm(path; force = true); nothing)
 
+# Every per-batch-size module file the manifest declares, across all variants. A declared file this
+# worker did not read is still part of the bundle, so its cache record is retained (see
+# `sync_mlir_hashes!`).
+function _declared_module_files(m::Manifest)
+    vkeys = isempty(m.input_shapes) ? [VariantKey()] : m.input_shapes
+    return Set{String}(module_filename(m, vkey, sz) for vkey in vkeys for sz in m.batching.compiled_batch_sizes)
+end
+
 # Build the per-module cache slots for a bundle entry: sync the hash record, then one slot per
 # (variant, batch size). Returns `nothing` when the bundle cannot host a cache.
 function executable_cache_slots(entry::ModelEntry)
@@ -180,7 +200,7 @@ function executable_cache_slots(entry::ModelEntry)
         sources[f] = sha
         shas[(vkey, sz)] = (f, sha)
     end
-    sync_mlir_hashes!(cache_dir, sources)
+    sync_mlir_hashes!(cache_dir, sources; retain = _declared_module_files(entry.manifest))
     return Dict{Tuple{VariantKey, Int}, ExecutableCacheSlot}(
         k => ExecutableCacheSlot(cache_dir, f, sha) for (k, (f, sha)) in shas
     )

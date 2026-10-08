@@ -330,7 +330,7 @@ end
 function _run_probe_leg(backend, pool::MemoryPool, numerics::NumericsMode)
     legpool = MemoryPool(
         pool.backend, pool.client, pool.device, pool.platform, pool.ctx,
-        pool.autotune, numerics
+        pool.autotune, numerics, pool.xla_flags
     )
     exec = compile_artifact(backend, legpool, _probe_artifact(pool.ctx), 2, 1)
     a = b = nothing
