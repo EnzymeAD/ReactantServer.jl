@@ -41,27 +41,37 @@ end
 # Discover the per-batch-size StableHLO modules for one variant prefix. The prefix is `model` for
 # a single-shape bundle and `model.v{i}` for variant `i` of a multi-shape bundle. A variant has
 # either per-batch-size files `<prefix>.b{N}.mlir` (keyed by N) or a single `<prefix>.mlir`
-# (keyed by 0, used for any batch size).
-function _discover_batch_modules(dir::AbstractString, m::Manifest, prefix::AbstractString)
-    modules = Dict{Int, Vector{UInt8}}()
+# (keyed by 0, used for any batch size). Under `BATCH_SIZES_LARGEST` only the largest size's file is
+# read; the others are neither read nor required to exist.
+function _discover_batch_modules(
+        dir::AbstractString, m::Manifest, prefix::AbstractString;
+        batch_sizes::BatchSizeMode = BATCH_SIZES_ALL
+    )
+    files = Dict{Int, String}()
     rx = Regex("^" * replace(prefix, "." => "\\.") * "\\.b(\\d+)\\.mlir\$")
     for f in readdir(dir)
         mt = match(rx, f)
         mt === nothing && continue
-        modules[parse(Int, mt.captures[1])] = read(joinpath(dir, f))
+        files[parse(Int, mt.captures[1])] = joinpath(dir, f)
     end
-    if isempty(modules)
+    if isempty(files)
         single = joinpath(dir, prefix * ".mlir")
         isfile(single) ||
             throw(BundleError("bundle '$(m.name)' has no $(prefix).mlir or $(prefix).b{N}.mlir"))
-        modules[0] = read(single)
-        return modules
+        return Dict{Int, Vector{UInt8}}(0 => read(single))
     end
-    for sz in m.batching.compiled_batch_sizes
-        haskey(modules, sz) ||
+    declared = m.batching.compiled_batch_sizes
+    wanted = if batch_sizes == BATCH_SIZES_LARGEST
+        [isempty(declared) ? maximum(keys(files)) : maximum(declared)]
+    else
+        declared
+    end
+    for sz in wanted
+        haskey(files, sz) ||
             throw(BundleError("bundle '$(m.name)' declares batch size $sz but has no $(prefix).b$sz.mlir"))
     end
-    return modules
+    keep = batch_sizes == BATCH_SIZES_LARGEST ? wanted : collect(keys(files))
+    return Dict{Int, Vector{UInt8}}(sz => read(files[sz]) for sz in keep)
 end
 
 # Discover every variant's StableHLO module(s), keyed by variant. A single-shape bundle (no
@@ -69,28 +79,34 @@ end
 # multi-shape bundle yields one entry per declared `input_shapes` variant `i`, read from
 # `model.v{i}.*.mlir`; the variant key is the same variable-axis size vector the manifest resolved
 # and the runtime derives from a request, so dispatch lines up with what was compiled.
-function _discover_modules(dir::AbstractString, m::Manifest)
+function _discover_modules(dir::AbstractString, m::Manifest; batch_sizes::BatchSizeMode = BATCH_SIZES_ALL)
     if isempty(m.input_shapes)
-        return Dict{VariantKey, Dict{Int, Vector{UInt8}}}(VariantKey() => _discover_batch_modules(dir, m, "model"))
+        return Dict{VariantKey, Dict{Int, Vector{UInt8}}}(
+            VariantKey() => _discover_batch_modules(dir, m, "model"; batch_sizes)
+        )
     end
     out = Dict{VariantKey, Dict{Int, Vector{UInt8}}}()
     for (i, vkey) in enumerate(m.input_shapes)
-        out[vkey] = _discover_batch_modules(dir, m, "model.v$(i - 1)")
+        out[vkey] = _discover_batch_modules(dir, m, "model.v$(i - 1)"; batch_sizes)
     end
     return out
 end
 
 """
-    load_bundle_entry(dir; validator=NullSignatureValidator()) -> ModelEntry
+    load_bundle_entry(dir; validator=NullSignatureValidator(), batch_sizes=BATCH_SIZES_ALL) -> ModelEntry
 
 Parse and validate the bundle directory `dir` into an uncompiled `ModelEntry` (its `executable`
 and `sched` slots are `nothing`). The model's name is the directory's basename: renaming the
 directory renames the model. A `name` declared in the manifest is informational and ignored (the
 directory name is injected before parsing so every downstream consumer, including error messages
 and the metadata RPC, agrees on the served name). Used by both `load_bundles` and the directory
-watcher (see watcher.jl) to load a single bundle.
+watcher (see watcher.jl) to load a single bundle. `batch_sizes` selects which compiled batch
+sizes are read (see [`BatchSizeMode`](@ref)).
 """
-function load_bundle_entry(dir::AbstractString; validator::SignatureValidator = NullSignatureValidator())
+function load_bundle_entry(
+        dir::AbstractString; validator::SignatureValidator = NullSignatureValidator(),
+        batch_sizes::BatchSizeMode = BATCH_SIZES_ALL
+    )
     manifest_path = joinpath(dir, "manifest.yaml")
     raw = YAML.load_file(manifest_path; dicttype = Dict{String, Any})
     raw isa AbstractDict || throw(BundleError("manifest in $dir is not a mapping"))
@@ -108,7 +124,7 @@ function load_bundle_entry(dir::AbstractString; validator::SignatureValidator = 
         return MetaEntry(m.name, m, m.meta_calls, mreg.run)
     end
 
-    mlir_bytes = _discover_modules(dir, m)
+    mlir_bytes = _discover_modules(dir, m; batch_sizes)
 
     weights_path = joinpath(dir, "weights.safetensors")
     isfile(weights_path) || throw(BundleError("bundle '$(m.name)' missing weights.safetensors"))
@@ -126,8 +142,11 @@ function load_bundle_entry(dir::AbstractString; validator::SignatureValidator = 
     return ModelEntry(m.name, m, mlir_bytes, weights_path, weights, nothing, nothing, pre, post)
 end
 
-function _load_one_bundle!(reg::ModelRegistry, dir::AbstractString, validator::SignatureValidator)
-    entry = load_bundle_entry(dir; validator = validator)
+function _load_one_bundle!(
+        reg::ModelRegistry, dir::AbstractString, validator::SignatureValidator,
+        batch_sizes::BatchSizeMode
+    )
+    entry = load_bundle_entry(dir; validator, batch_sizes)
     (haskey(reg.by_name, entry.name) || haskey(reg.meta, entry.name)) &&
         throw(BundleError("duplicate model name '$(entry.name)'"))
     if entry isa MetaEntry
@@ -139,7 +158,7 @@ function _load_one_bundle!(reg::ModelRegistry, dir::AbstractString, validator::S
 end
 
 """
-    load_bundles(model_dirs; validator=NullSignatureValidator(), include=nothing) -> ModelRegistry
+    load_bundles(model_dirs; validator=NullSignatureValidator(), include=nothing, batch_sizes=BATCH_SIZES_ALL) -> ModelRegistry
 
 Discover every subdirectory containing a manifest.yaml under each model dir, load and
 validate it, and register it. The runtime fills each entry's executable slot afterwards.
@@ -147,12 +166,13 @@ validate it, and register it. The runtime fills each entry's executable slot aft
 When `include` is a non-empty collection of model names, only bundles whose directory name
 is in the set are loaded. The directory name IS the model name (see `load_bundle_entry`), so
 filtering by directory avoids parsing skipped manifests. Names in `include` that are not found
-in any model dir produce a warning.
+in any model dir produce a warning. `batch_sizes` is passed to every [`load_bundle_entry`](@ref).
 """
 function load_bundles(
         model_dirs::AbstractVector{<:AbstractString};
         validator::SignatureValidator = NullSignatureValidator(),
-        include = nothing
+        include = nothing,
+        batch_sizes::BatchSizeMode = BATCH_SIZES_ALL
     )
     want = include === nothing ? nothing : Set{String}(String(x) for x in include)
     reg = ModelRegistry()
@@ -166,7 +186,7 @@ function load_bundles(
             if want !== nothing && !(name in want)
                 continue
             end
-            _load_one_bundle!(reg, child, validator)
+            _load_one_bundle!(reg, child, validator, batch_sizes)
             push!(found, name)
         end
     end

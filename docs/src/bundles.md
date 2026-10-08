@@ -51,8 +51,12 @@ a top-level `input_shapes` block (see `write_bundle` below); the
 [Object Detection](object_detection.md) example compiles one weight set for several image shapes
 this way.
 
-The per-input batch axis is derived from the position of `n`/`b`; at inference the request's size
-along that axis must equal one of `batching.compiled_batch_sizes`. Each tensor parses into a
+The per-input batch axis is derived from the position of `n`/`b`. When every executable input and
+output has a batch axis, the scheduler coalesces queued requests along it and pads the dispatch
+with zero rows up to the smallest compiled size that fits, so a request may carry any number of
+rows up to the largest of `batching.compiled_batch_sizes`; otherwise the request's size along that
+axis must equal one of them. `runtime.batch_sizes: largest` loads only the largest size (see
+[Node configuration](node_config.md)). Each tensor parses into a
 [`TensorSpec`](@ref) with a [`Dim`](@ref) per axis, and the compiled sizes form the
 [`BatchingSpec`](@ref). The writer stamps `format_version: "2.0"`; the loader accepts `2.0` or `2`.
 

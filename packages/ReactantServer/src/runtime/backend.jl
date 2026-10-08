@@ -21,6 +21,13 @@ function device_ordinal end              # (backend, device) -> Int
 # and load the compiled program from the bundle's `.cache/` when present instead of compiling.
 function compile_artifact end            # (backend, pool, mlir_bytes, num_parameters, num_outputs; numerics_stats, cache) -> executable
 
+# Check `runtime.xla_flags` (XLA DebugOptions field name => value) and convert it to the form
+# compile_artifact applies: name/value pairs sorted by name. A backend that compiles through XLA
+# rejects unknown names and values of the wrong type; this default only converts, since a backend
+# with no XLA (MockBackend) has nothing to check against.
+resolve_xla_flags(::AbstractBackend, flags::AbstractDict) =
+    sort!(Pair{Symbol, Any}[Symbol(k) => v for (k, v) in flags]; by = first)
+
 # Whether compile_artifact can serialize compiled programs into the per-bundle executable cache.
 # Default false (MockBackend has nothing to cache); the Reactant backend always can (see
 # xla_serialization.jl for where the bindings come from).

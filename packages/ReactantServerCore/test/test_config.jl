@@ -578,3 +578,68 @@ end
         @test c14.shared_host_weights_mode == 0o660 && c14.numerics == ReactantServer.NUMERICS_F32
     end
 end
+
+@testset "runtime.profile, batch_sizes, xla_flags" begin
+    mktempdir() do dir
+        modeldir = joinpath(dir, "models"); mkpath(modeldir)
+        rt(body) = load_single_worker(dir, body; model_repo = modeldir)[1].runtime
+
+        # Default profile: every batch size, no XLA flags.
+        d = rt("runtime:\n  backend: cuda")
+        @test d.profile == ReactantServer.PROFILE_DEFAULT
+        @test d.batch_sizes == ReactantServer.BATCH_SIZES_ALL
+        @test isempty(d.xla_flags)
+        @test rt("runtime:\n  backend: cuda\n  batch_sizes: largest").batch_sizes ==
+            ReactantServer.BATCH_SIZES_LARGEST
+
+        # The regulated profile supplies largest + the nondeterministic-ops exclusion, and leaves
+        # numerics alone.
+        r = rt("runtime:\n  backend: cuda\n  profile: regulated")
+        @test r.profile == ReactantServer.PROFILE_REGULATED
+        @test r.batch_sizes == ReactantServer.BATCH_SIZES_LARGEST
+        @test r.xla_flags == Dict{String, Any}("xla_gpu_exclude_nondeterministic_ops" => true)
+        @test r.numerics == ReactantServer.NUMERICS_AUTO
+
+        # Explicit settings win over the profile, piece by piece, and add to its flags.
+        o = rt(
+            """
+            runtime:
+              backend: cuda
+              profile: regulated
+              batch_sizes: all
+              xla_flags:
+                xla_gpu_exclude_nondeterministic_ops: false
+                xla_gpu_deterministic_ops: true
+                xla_gpu_autotune_level: 4
+            """
+        )
+        @test o.batch_sizes == ReactantServer.BATCH_SIZES_ALL
+        @test o.xla_flags == Dict{String, Any}(
+            "xla_gpu_exclude_nondeterministic_ops" => false,
+            "xla_gpu_deterministic_ops" => true, "xla_gpu_autotune_level" => 4,
+        )
+
+        # Shape errors are ConfigErrors at parse time (names/types are checked by the worker).
+        @test_throws ReactantServer.ConfigError rt("runtime:\n  profile: strict")
+        @test_throws ReactantServer.ConfigError rt("runtime:\n  batch_sizes: smallest")
+        @test_throws ReactantServer.ConfigError rt("runtime:\n  xla_flags: [a, b]")
+        @test_throws ReactantServer.ConfigError rt("runtime:\n  xla_flags:\n    --xla_gpu_deterministic_ops: true")
+        @test_throws ReactantServer.ConfigError rt("runtime:\n  xla_flags:\n    xla_gpu_foo: [1, 2]")
+
+        # Env overrides for the two scalar knobs.
+        withenv(
+            "INFERENCE_SERVER_RUNTIME_PROFILE" => "regulated",
+            "INFERENCE_SERVER_RUNTIME_BATCH_SIZES" => "all",
+        ) do
+            e = rt("runtime:\n  backend: cuda")
+            @test e.profile == ReactantServer.PROFILE_REGULATED
+            @test e.batch_sizes == ReactantServer.BATCH_SIZES_ALL
+            @test haskey(e.xla_flags, "xla_gpu_exclude_nondeterministic_ops")
+        end
+
+        # Positional constructors keep the defaults.
+        c5 = ReactantServer.RuntimeConfig(ReactantServer.CPU_BACKEND, 0, 0.9, true, true)
+        @test c5.profile == ReactantServer.PROFILE_DEFAULT && c5.batch_sizes == ReactantServer.BATCH_SIZES_ALL
+        @test isempty(c5.xla_flags)
+    end
+end

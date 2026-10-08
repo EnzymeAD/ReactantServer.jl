@@ -133,6 +133,60 @@ function _warn_unenforced_config(cfg::ServerConfig)
     return nothing
 end
 
+# The regulated profile deliberately leaves `numerics` alone, so it states the precision actually in
+# effect instead, prominently, for the deployment record. `f32` and `tf32` are both attested at
+# startup (tf32_probe throws otherwise), so they get a bannered info line naming the precision. Under
+# `auto` nothing is guaranteed: the same bundle computes f32 matmuls/convolutions in TF32 on Ampere
+# and newer GPUs and in full f32 on older ones, so that case is a bannered warning.
+function _report_regulated_precision(rt::RuntimeConfig, backend::AbstractBackend, pool::MemoryPool, probe)
+    flags = isempty(pool.xla_flags) ? "none" : join([string(k, "=", v) for (k, v) in pool.xla_flags], ", ")
+    banner = "*"^100
+    if rt.numerics == NUMERICS_F32
+        @info """
+        $banner
+        REGULATED PROFILE: runtime.numerics = f32
+        f32 matmul/convolution precision is pinned to full f32 and was attested bit-exact at startup.
+        $banner""" platform = pool.platform batch_sizes = rt.batch_sizes xla_flags = flags
+        return nothing
+    elseif rt.numerics == NUMERICS_TF32
+        @info """
+        $banner
+        REGULATED PROFILE: runtime.numerics = tf32
+        TF32 is required and the startup probe confirmed it is active on this worker. XLA and cuBLAS
+        still choose the kernel per op (StableHLO cannot force TF32 for convolutions), so results
+        match the validation only on the same GPU class and software stack.
+        $banner""" platform = pool.platform batch_sizes = rt.batch_sizes xla_flags = flags
+        return nothing
+    end
+    tf32 = probe === nothing ? backend_tf32_capable(backend, pool) : something(probe.tf32_active, backend_tf32_capable(backend, pool))
+    effective = tf32 ?
+        "TF32 (10-bit mantissa inputs, f32 accumulate)" :
+        "full f32 on this device only; a TF32-capable GPU would use TF32"
+    @warn """
+    $banner
+    REGULATED PROFILE WITHOUT PINNED NUMERICS: runtime.numerics = auto
+    f32 matmul/convolution precision in effect on this worker: $effective
+    Results depend on the GPU generation. Set runtime.numerics to f32 or tf32 to make the precision
+    a startup requirement.
+    $banner""" platform = pool.platform batch_sizes = rt.batch_sizes xla_flags = flags
+    return nothing
+end
+
+# numerics=tf32: NVIDIA_TF32_OVERRIDE=0 disables TF32 inside cuBLAS/cuDNN for the whole process, so
+# a worker started with it would compute in a precision the deployment was not validated on. The
+# probe would catch it too; checking the environment first gives the operator the actual cause.
+function _assert_tf32_not_overridden(env = ENV)
+    v = get(env, "NVIDIA_TF32_OVERRIDE", nothing)
+    (v !== nothing && strip(v) == "0") &&
+        throw(
+        ErrorException(
+            "runtime.numerics 'tf32' requested but NVIDIA_TF32_OVERRIDE=0 is set in the " *
+                "environment, which disables TF32 in cuBLAS/cuDNN; unset it or use 'f32'"
+        )
+    )
+    return nothing
+end
+
 function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     _warn_unenforced_config(cfg)
     # numerics=f32 defense in depth: NVIDIA_TF32_OVERRIDE must be in the environment before the
@@ -140,6 +194,7 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     # the op-level precision pin cannot see; it does NOT govern XLA's Triton GEMMs, which the pin
     # does, so the two mechanisms cover each other's gaps.
     cfg.runtime.numerics == NUMERICS_F32 && (ENV["NVIDIA_TF32_OVERRIDE"] = "0")
+    cfg.runtime.numerics == NUMERICS_TF32 && _assert_tf32_not_overridden()
     pool = resolve_client(backend, cfg.runtime)
     backend = pool.backend                      # the CPU fallback may have swapped the backend
     use_exec_cache = cfg.runtime.executable_cache && supports_executable_cache(backend)
@@ -158,12 +213,13 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
             )
         )
     end
-    # Numerics attestation, GPU only: report whether TF32 is actually in use (auto/tf32) and, under
-    # f32, prove the precision pin bit-exactly. Runs before any model compile and before the scratch
+    # Numerics attestation, GPU only: report whether TF32 is actually in use (auto), require it
+    # (tf32), or prove the f32 precision pin bit-exactly (f32). Runs before any model compile and before the scratch
     # high-water probe; see tf32_probe for why its transient ~3 MB cannot perturb that measurement.
-    pool.platform == "cuda" && tf32_probe(backend, pool)
+    probe = pool.platform == "cuda" ? tf32_probe(backend, pool) : nothing
+    cfg.runtime.profile == PROFILE_REGULATED && _report_regulated_precision(cfg.runtime, backend, pool, probe)
     include = isempty(cfg.models_include) ? nothing : cfg.models_include
-    registry = load_bundles(cfg.model_dirs; include = include)
+    registry = load_bundles(cfg.model_dirs; include = include, batch_sizes = cfg.runtime.batch_sizes)
     isempty(registry.by_name) && @warn "no model bundles found" model_dirs = cfg.model_dirs models_include = cfg.models_include
     # On-demand weight residency is sized as a fraction of the BFC arena (`mem_fraction * device`),
     # resolved now that the device pool exists. The cache is GPU-only: `arena` is 0 when the device
