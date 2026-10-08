@@ -19,9 +19,14 @@ jobs:
       matrix:
         # One run per registered monorepo subpackage; each job only tags when the
         # JuliaTagBot notification names its package. Tags are PkgName-vX.Y.Z
-        # (e.g. ReactantServerCore-v1.0.0). Add ReactantServer, ReactantServerGateway,
-        # and ReactantServerNode here when they are registered.
-        subdir: [packages/ReactantServerCore, packages/ReactantServerClient, packages/ReactantServerExport]
+        # (e.g. ReactantServerCore-v1.0.0).
+        subdir:
+          - packages/ReactantServerCore
+          - packages/ReactantServerClient
+          - packages/ReactantServerExport
+          - packages/ReactantServer
+          - packages/ReactantServerGateway
+          - packages/ReactantServerNode
     steps:
       - uses: JuliaRegistries/TagBot@cded32665b34ca0496d3ac10a67d08ddfc726963 # v1.25.11
         with:
