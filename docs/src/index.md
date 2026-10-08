@@ -69,8 +69,10 @@ is the multi-GPU reverse proxy; `ReactantServerClient` is a Reactant-free client
 
 ## Why ReactantServer?
 
-The target is static-graph workloads, computer vision and scientific computing, where many models
-share a GPU and one model executes at a time. That shape rewards a server that is compiled rather
+The server is built for compiled models, such as computer vision and scientific computing
+workloads, where many models share a GPU and one model executes at a time. Local serving of large
+language models, by splitting a model into compiled stages and streaming their weights from
+storage, is a goal of the project. That shape rewards a server that is compiled rather
 than interpreted: models are compiled ahead of time into device executables through Reactant's
 PJRT bindings, so inference is a single batched kernel launch rather than an interpreter loop, and
 the runtime is device-agnostic, CUDA today with CPU for development and fallback.

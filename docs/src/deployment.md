@@ -26,27 +26,30 @@ inside their systems; the project gives them tools rather than hiding the system
 convenient defaults. Larger organizations can use the project too, as a component of a larger
 system; the difference is what ships in the box, not what is possible.
 
-The mission is to make serving compiled (non-LLM) models elegant: a hackable, Julia-first
-inference stack that maximizes the economic efficiency of GPU-based inference. GPU memory is
-roughly two thirds of GPU cost, so serving infrastructure that wastes memory wastes money; the
-concrete goal is serving the largest number of models per GPU at a given quality of service. The
+The mission is to make serving compiled models elegant: a hackable, Julia-first inference stack
+that maximizes the economic efficiency of GPU-based inference. GPU memory is roughly two thirds of
+GPU cost, so serving infrastructure that wastes memory wastes money; the concrete goal is serving
+the largest number of models per GPU at a given quality of service, and serving models larger than
+a GPU's memory. Local serving of large language models is a goal of the project, built on splitting
+a model into compiled stages and streaming their weights from storage; see
+[Philosophy](design/philosophy.md). The
 whole stack is plain Julia, legible end to end, adoptable off the shelf, and open to being bent
 toward a workload nobody anticipated.
 
-The project's explicit non-goals, from its design:
+Where other tools fit better:
 
 - **Hyperscale platform requirements.** Multi-tenant isolation, complex traffic shaping, and deep
-  integration with bespoke internal platforms are not built into the core, where every smaller
-  deployment would pay for them. Large deployments are supported through the control-plane seam
+  integration with bespoke internal platforms stay out of the core, where every smaller deployment
+  would pay for them. Large deployments bring that machinery through the control-plane seam
   described under [Multi-node](#multi-node-bring-your-own-control-plane).
-- **LLM serving at scale.** vLLM, TGI, TensorRT-LLM, and similar projects are purpose-built for
-  that domain and do it well; this project does not compete there.
-- **A packaged, managed solution.** This is infrastructure for builders, not a hosted service.
-  Users who do not want to think about the underlying architecture should choose a managed
-  inference service.
-- **Multi-framework serving.** A model must be lowered by Reactant to a device executable first
-  (today via StableHLO/XLA). Teams that need to serve PyTorch, TensorFlow, and ONNX models side by
-  side without converting them are better served by Triton or similar.
+- **Hosted, high-concurrency LLM services.** Engines such as vLLM, TGI, and TensorRT-LLM are
+  purpose-built for many concurrent users across many GPUs; the project's LLM focus is local
+  serving.
+- **A managed service.** The project is infrastructure for builders who run their own stack.
+  Teams that would rather not operate one are better served by a managed inference service.
+- **Serving models without converting them.** Every model is lowered by Reactant to a device
+  executable (today via StableHLO/XLA). Teams that need to serve PyTorch, TensorFlow, and ONNX
+  models side by side unconverted are better served by Triton or similar.
 
 ## Deployment shapes
 

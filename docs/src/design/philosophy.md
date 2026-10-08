@@ -1,12 +1,12 @@
 # Project Philosophy
 
-This document describes who the project is for, what it optimizes for, and what it will not become. It exists to set expectations for users and contributors, and to serve as a reference when evaluating proposed changes.
+This document describes who the project is for, what it optimizes for, and where it is headed. It exists to set expectations for users and contributors, and to serve as a reference when evaluating proposed changes.
 
 ## Mission
 
-Make serving compiled (non-LLM) models elegant: a hackable, Julia-first inference stack that maximizes the economic efficiency of GPU-based inference, built first for small and mid-size labs.
+Make serving compiled models elegant: a hackable, Julia-first inference stack that maximizes the economic efficiency of GPU-based inference, built first for small and mid-size labs.
 
-The efficiency half is concrete. GPU memory accounts for roughly two thirds of GPU cost; serving infrastructure that wastes memory wastes money. For the foreseeable future that means serving the largest number of models per GPU at a given quality of service. The elegance half is what makes that power usable by a small team: the whole stack is plain Julia, legible end to end, adoptable off the shelf, and open to being bent toward a workload nobody anticipated. The project's purpose is to give the people who care about both arguments the tools to act on them.
+The efficiency half is concrete. GPU memory accounts for roughly two thirds of GPU cost; serving infrastructure that wastes memory wastes money. For the foreseeable future that means serving the largest number of models per GPU at a given quality of service, and serving models larger than a GPU's memory on the hardware a lab already has. The elegance half is what makes that power usable by a small team: the whole stack is plain Julia, legible end to end, adoptable off the shelf, and open to being bent toward a workload nobody anticipated. The project's purpose is to give the people who care about both arguments the tools to act on them.
 
 ## Who this is for
 
@@ -16,6 +16,7 @@ Small and mid-size labs and engineering organizations who need big-tech-level ef
 - Scientific computing and research groups operating within bounded compute budgets.
 - On-premise deployments where hardware is already purchased and underutilization is wasted capacity.
 - Cloud deployments where GPU-hours are the dominant cost line.
+- Teams running large language models locally, on hardware they own or rent, next to the rest of their model catalog.
 
 The common thread is that these organizations measure their bottlenecks, optimize their stacks, and cannot solve serving problems by spending their way out. They benefit from compiler-grade optimization but lack the headcount to build it themselves.
 
@@ -33,23 +34,35 @@ The mission is served at three deployment scales, and the project treats each as
 
 The principle that binds the tiers is non-interference: the project tries to serve these different use cases, but one use case must not crowd out, degrade, or overcomplicate the others. Each tier is strictly additive. A single-GPU deployment never pays for the gateway in dependencies, configuration, or runtime cost; a gateway deployment never requires a control plane; each step up is selected by a configuration value, not a different architecture. A feature that helps one tier is welcome in the form that leaves the other tiers untouched, and suspect in any form that does not.
 
-## Who this is not for
+## Local LLM serving
 
-Some user populations are better served by other tools. The project does not try to serve them, and being clear about this protects both the project and the users who would otherwise be disappointed.
+Serving large language models on local hardware is a goal of the project. The pressure that drives many models onto one GPU applies equally to one model that does not fit on it: device memory is the binding cost, and the answer in both cases is to treat device memory as a working set over a larger store rather than a permanent home for every weight.
 
-- **Hyperscale platform requirements.** Organizations operating at the scale of thousands of GPUs need multi-tenant isolation, complex traffic shaping, and deep integration with bespoke internal platforms. Large deployments are a supported use case through the control-plane seam described above, which lets an organization bring exactly that machinery; what the project will not do is build it into the core, where every smaller deployment would pay for it.
-- **LLM serving at scale.** vLLM, TGI, TensorRT-LLM, and similar projects are purpose-built for that domain and do it well. This project does not compete in that market.
-- **Users who want a packaged solution.** This is infrastructure for builders, not a hosted service. Users who do not want to think about the underlying architecture should choose a managed inference service.
-- **Multi-framework deployments.** This project is Reactant-centric: a model must be lowered by Reactant to a device executable first (today via StableHLO/XLA). Teams that need to serve PyTorch, TensorFlow, and ONNX models side by side without converting them are better served by Triton or similar.
-- **Research and rapid prototyping workflows.** The project is for production serving. Eager-mode debugging, dynamic graphs, and interactive iteration are not what it optimizes for.
+The direction builds on mechanisms the server already has. The on-demand weight cache keeps weights in host RAM and moves them onto the GPU when a model runs, and a bundle can already carry several compiled programs that share one set of weights. From there, the project aims to:
 
-If you fall into any of these categories, the project is not aimed at you, and that is a feature rather than a deficiency.
+- **Split one model into several compiled programs.** A model too large for device memory is partitioned into stages, each an ahead-of-time compiled executable holding its own slice of the weights, run in sequence.
+- **Stream weights from storage.** Each stage's weights are loaded as the stage is about to run and released after, with the next transfer overlapping the current stage's compute, so the size of a servable model is bounded by storage rather than by host RAM or device memory.
+- **Move weights directly from storage into device memory.** Where the hardware supports it, weights travel from local storage to the GPU without a copy through host memory.
+
+The machinery specific to generation, such as the state carried between decoding steps, follows the non-interference principle above: it is added in the form that leaves the serving path for every other model untouched.
+
+Local means the deployments the project already serves: one GPU or a few, operated by the team that uses them. Hosted LLM services with large numbers of concurrent users across many GPUs have different bottlenecks, and engines such as vLLM, TGI, and TensorRT-LLM are purpose-built for them.
+
+## Where other tools fit better
+
+The project is built for a specific design point. Naming where its edges are helps users choose quickly.
+
+- **Hyperscale platform requirements.** Organizations operating at the scale of thousands of GPUs need multi-tenant isolation, complex traffic shaping, and deep integration with bespoke internal platforms. The project supports large deployments through the control-plane seam described above, which lets an organization bring exactly that machinery, and keeps it out of the core, where every smaller deployment would pay for it.
+- **Hosted, high-concurrency LLM services.** As described above, the project's LLM focus is local serving.
+- **A managed service.** The project is infrastructure for builders who run their own stack. Teams that would rather not operate one are better served by a managed inference service.
+- **Serving models without converting them.** Every model is lowered by Reactant to a device executable (today via StableHLO/XLA). Teams that need to serve PyTorch, TensorFlow, and ONNX models side by side unconverted are better served by Triton or similar.
+- **Eager-mode experimentation.** The project serves compiled programs in production. Interactive iteration with dynamic graphs belongs in the training framework.
 
 ## What the project optimizes for
 
 In approximate priority order:
 
-1. **Economic efficiency per GPU.** Models served per GPU, watts per inference, dollars per million requests. These are the metrics that matter for the target audience.
+1. **Economic efficiency per GPU.** Models served per GPU, the largest model a GPU can serve, watts per inference, dollars per million requests. These are the metrics that matter for the target audience.
 2. **Predictable, deterministic resource use.** Pre-allocated memory pools, static buffer assignment, no surprise allocations. Predictability matters for regulated deployments and for operators who need to size their hardware confidently.
 3. **Compiler-grade optimization.** Whole-program compiler optimization (XLA today), kernel fusion across operations, layout planning. This is the leverage that lets small teams approach big-tech efficiency.
 4. **A hackable, Julia-first stack.** The serving path, scheduler, gateway, client, and export tooling are plain Julia. There is no opaque core wrapped in scripting glue: the code a lab reads is the code that runs, so behavior can be inspected with the language's own tools and modified without a second toolchain. Elegance here is not aesthetics; it is the property that makes the system adoptable off the shelf and bendable when the shelf does not fit.
@@ -82,6 +95,7 @@ Some categories of changes are off the table, regardless of who proposes them. S
 Proposals are evaluated against the mission, not against the proposer's preferences. A few categories of contributions are particularly welcome:
 
 - Improvements to economic efficiency: better memory packing, lower-overhead scheduling, faster startup, smaller binaries.
+- Local LLM serving: partitioning a model into compiled stages, streaming weights from storage, direct storage-to-device transfer, and the generation support built on them.
 - New conversion paths from upstream frameworks to StableHLO, especially for model architectures the project does not yet handle well.
 - Documentation and tooling that make the project easier to evaluate and adopt for the target audience.
 - Benchmarks against alternative inference servers on realistic workloads.
