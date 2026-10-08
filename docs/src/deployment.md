@@ -223,7 +223,8 @@ covered on the [Multi-GPU Gateway](gateway.md) page.
 
 ## Running the container
 
-The image is published as `ghcr.io/enzymead/reactantserver:latest`. Its entrypoint is the node
+The image is published as `ghcr.io/enzymead/reactantserver`, tagged with each ReactantServer
+release (`:0.1.0`, the moving `:0.1`, and `:latest` for the newest). Its entrypoint is the node
 supervisor, so one container runs the whole node: one worker per GPU it is given, plus the
 embedded gateway when there are two or more. Mount a model repository and publish the two ports:
 
@@ -254,9 +255,10 @@ logged in):
 gh attestation verify oci://ghcr.io/enzymead/reactantserver:latest --repo EnzymeAD/ReactantServer.jl
 ```
 
-Pin a deployment by digest (`ghcr.io/enzymead/reactantserver@sha256:...`) rather than `:latest`,
-which moves with every publish; `deploy/README.md` describes how the image is published and
-attested.
+Pin a deployment to a release tag such as `:0.1.0`, or by digest
+(`ghcr.io/enzymead/reactantserver@sha256:...`) for an image that can never change, rather than
+`:latest`, which moves with every release; `deploy/README.md` describes how the image is published
+and attested.
 
 Every model compiles to a device executable on every worker before the gRPC plane accepts
 traffic, so the first start is slow (minutes to hours for a large model set). Compiled programs
