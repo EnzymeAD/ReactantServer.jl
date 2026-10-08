@@ -168,3 +168,44 @@ end
     res2 = RS.tf32_probe(backend, pool_f32)
     @test res2.pinned_exact === true
 end
+
+@testset "tf32 probe enforces numerics=tf32" begin
+    backend = RS.ReactantBackend()
+    pool = RS.resolve_client(backend, RS.RuntimeConfig(RS.CPU_BACKEND, 0, 0.9, true, true))
+    # The CPU computes the probe in plain f32, so a tf32 requirement must fail, naming what it saw.
+    pool_tf32 = RS.MemoryPool(
+        pool.backend, pool.client, pool.device, pool.platform, pool.ctx,
+        pool.autotune, RS.NUMERICS_TF32
+    )
+    err = try
+        RS.tf32_probe(backend, pool_tf32)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test occursin("numerics=tf32 attestation failed", err.msg) && occursin("full f32", err.msg)
+
+    # NVIDIA_TF32_OVERRIDE=0 is refused up front; any other value (or none) is fine.
+    @test_throws ErrorException RS._assert_tf32_not_overridden(Dict("NVIDIA_TF32_OVERRIDE" => "0"))
+    @test RS._assert_tf32_not_overridden(Dict("NVIDIA_TF32_OVERRIDE" => "1")) === nothing
+    @test RS._assert_tf32_not_overridden(Dict{String, String}()) === nothing
+end
+
+@testset "regulated profile precision report" begin
+    backend = RS.MockBackend()
+    pool = RS.MemoryPool(backend, RS.MockClient(), RS.MockDevice(0), "mock", nothing)
+    base = RS.RuntimeConfig(RS.CPU_BACKEND, 0, 0.9, true, true)
+    rt(numerics) = RS.RuntimeConfig(
+        (getfield(base, f) for f in fieldnames(RS.RuntimeConfig)[1:13])..., numerics,
+        base.executable_cache, RS.PROFILE_REGULATED, RS.BATCH_SIZES_LARGEST, Dict{String, Any}()
+    )
+    # Attested modes are a bannered info line naming the precision; auto is a warning.
+    @test_logs (:info, r"numerics = tf32\n.*confirmed it is active") RS._report_regulated_precision(
+        rt(RS.NUMERICS_TF32), backend, pool, (; tf32_active = true, pinned_exact = nothing)
+    )
+    @test_logs (:info, r"numerics = f32\n") RS._report_regulated_precision(rt(RS.NUMERICS_F32), backend, pool, nothing)
+    @test_logs (:warn, r"WITHOUT PINNED NUMERICS: runtime.numerics = auto") RS._report_regulated_precision(
+        rt(RS.NUMERICS_AUTO), backend, pool, nothing
+    )
+end

@@ -355,23 +355,42 @@ end
 """
     tf32_probe(backend, pool) -> (; tf32_active, pinned_exact)
 
-Startup numerics attestation. Leg 1 (informational) compiles the probe matmul at DEFAULT
-precision (`auto` semantics) and reports whether TF32 arithmetic was actually used by this
-worker's hardware+stack. Leg 2 runs only under `numerics = f32`: it compiles through the
-as-configured pool (the real `pin_f32!` production path) and **throws** unless the result is
-bitwise-exact f32; a pin that does not hold is a bug, not a tolerance. Results are logged; the
-returned fields are `true`/`false`, or `nothing` for a leg that did not run or was indeterminate.
+Startup numerics attestation. Leg 1 compiles the probe matmul at DEFAULT precision and reports
+whether TF32 arithmetic was actually used by this worker's hardware+stack. Under `auto` it is
+informational. Under `numerics = tf32` it compiles through the as-configured pool and **throws**
+unless TF32 was observed, so a worker that is capable of TF32 but not using it (for example with
+`NVIDIA_TF32_OVERRIDE=0` in its environment) cannot serve a deployment validated on TF32. Leg 2
+runs only under `numerics = f32`: it compiles through the as-configured pool (the real `pin_f32!`
+production path) and **throws** unless the result is bitwise-exact f32; a pin that does not hold is
+a bug, not a tolerance. Results are logged; the returned fields are `true`/`false`, or `nothing`
+for a leg that did not run or was indeterminate.
 """
 function tf32_probe(backend, pool::MemoryPool)
     A = _probe_sentinel_matrix()
+    required = pool.numerics == NUMERICS_TF32
     tf32_active = nothing
     try
-        C = _run_probe_leg(backend, pool, NUMERICS_AUTO)
+        C = _run_probe_leg(backend, pool, required ? NUMERICS_TF32 : NUMERICS_AUTO)
         tf32_active = C == A ? false : (all(==(1.0f0), C) ? true : nothing)
-        tf32_active === nothing &&
+        tf32_active === nothing && !required &&
             @warn "TF32 probe: DEFAULT-precision leg returned neither exact-f32 nor the TF32 signature" platform = pool.platform
     catch err
+        required && throw(
+            ErrorException(
+                "numerics=tf32 attestation failed: the TF32 probe matmul could not run on " *
+                    "this device ($(pool.platform)): $(sprint(showerror, err))"
+            )
+        )
         @warn "TF32 probe: DEFAULT-precision leg failed; skipping detection" exception = (err, catch_backtrace())
+    end
+    if required && tf32_active !== true
+        observed = tf32_active === false ? "full f32" : "neither exact f32 nor the TF32 signature"
+        throw(
+            ErrorException(
+                "numerics=tf32 attestation failed: the probe matmul ran in $observed on this " *
+                    "device ($(pool.platform)), not TF32; check NVIDIA_TF32_OVERRIDE and the XLA flags"
+            )
+        )
     end
     pinned_exact = nothing
     if pool.numerics == NUMERICS_F32

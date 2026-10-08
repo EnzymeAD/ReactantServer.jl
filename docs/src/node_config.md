@@ -114,7 +114,9 @@ change model outputs; the cost is tensor-core throughput for f32 matmuls on TF32
 `tf32` compiles exactly like `auto` (TF32 is permitted and XLA/cuBLAS pick the kernels; StableHLO
 has no way to force TF32 for convolutions) but turns the hardware requirement into a guarantee:
 startup fails on hardware that cannot run TF32, so a mixed fleet cannot silently serve divergent
-numerics. On CUDA workers a startup probe logs whether TF32 arithmetic is actually in use and,
+numerics. Startup also fails if `NVIDIA_TF32_OVERRIDE=0` is set, or if the startup probe matmul does
+not actually run in TF32, so a capable worker that is not using TF32 cannot serve a deployment
+validated on it. On CUDA workers a startup probe logs whether TF32 arithmetic is actually in use and,
 under `f32`, proves the pin bit-exactly; the per-model outcome (ops pinned, algorithms rewritten
 or stripped) is recorded in each "model loaded" log line.
 
@@ -147,10 +149,11 @@ executable cache key. An explicit `xla_gpu_autotune_level` here wins over `autot
 `runtime.profile` applies a named set of defaults. `regulated` defaults `batch_sizes` to
 `largest` and adds `xla_gpu_exclude_nondeterministic_ops: true` to `xla_flags`; anything set
 explicitly wins, so `batch_sizes: all` or `xla_gpu_exclude_nondeterministic_ops: false` turns a
-piece back off. The profile does not change `numerics`. Instead, unless `numerics` is `f32`, the
-worker logs a prominent startup warning naming the f32 matmul/convolution precision actually in
-effect on its device (TF32 on Ampere and newer under `auto`), because only `f32` is invariant
-across GPU generations.
+piece back off. The profile does not change `numerics`; set `f32` or `tf32` to match what the
+deployment was validated on. The worker states the precision prominently at startup: a bannered
+info line under `f32` or `tf32`, both of which are attested by the startup probe, and a bannered
+warning under `auto`, naming the precision actually in effect on its device (TF32 on Ampere and
+newer, full f32 on older GPUs), because `auto` guarantees neither.
 
 `model_control_mode` sets how the loaded model set evolves: `dynamic` (the default) watches the
 repository and loads, unloads, reloads, and renames bundles online as files change (a renamed
