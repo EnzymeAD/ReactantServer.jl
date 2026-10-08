@@ -20,7 +20,7 @@ package(default_visibility = ["//visibility:public"])
 #   bazel test  //deploy:image_precompile_test  # the image starts without precompiling (no podman)
 #   bazel run   //deploy:image_load             # loads it into podman as reactantserver:bazel
 #   bazel run   //deploy:image_check            # the loaded image: caches, tini, curl, entrypoints
-#   bazel run   //deploy:image_push -- --repository ghcr.io/<owner>/reactantserver   # pushes :latest
+#   bazel run   //deploy:image_push -- --repository ghcr.io/<owner>/reactantserver --tag <tag>
 #   bazel test  //deploy:manifest_current       # the manifest still matches the workspace
 #   bazel run   //deploy:relock                 # re-resolve deploy/Manifest.toml after a Project change
 #   bazel run   //deploy:relock_debs            # re-resolve deploy/debs.lock.json (curl, tini)
@@ -367,17 +367,17 @@ oci_load(
     repo_tags = ["reactantserver:bazel"],
 )
 
-# Push the image as :latest. The repository is given at run time, so this file names no registry
-# account; credentials come from the docker config (`docker login`, `podman login --authfile
-# ~/.docker/config.json`, or docker/login-action in CI):
+# Push the image by digest, plus any tags given at run time. The repository and tags are both
+# arguments, so this file names no registry account and no version; credentials come from the docker
+# config (`docker login`, `podman login --authfile ~/.docker/config.json`, or docker/login-action in
+# CI):
 #
-#   bazel run //deploy:image_push -- --repository ghcr.io/<owner>/reactantserver
+#   bazel run //deploy:image_push -- --repository ghcr.io/<owner>/reactantserver --tag 0.1.0 --tag latest
 #
-# .github/workflows/image.yml runs exactly this.
+# .github/workflows/image.yml chooses the tags (see there) and runs exactly this.
 oci_push(
     name = "image_push",
     image = ":image",
-    remote_tags = ["latest"],
 )
 
 # Check a loaded image: every entry project loads from the baked caches without precompiling, and

@@ -153,7 +153,8 @@ piece back off. The profile does not change `numerics`; set `f32` or `tf32` to m
 deployment was validated on. The worker states the precision prominently at startup: a bannered
 info line under `f32` or `tf32`, both of which are attested by the startup probe, and a bannered
 warning under `auto`, naming the precision actually in effect on its device (TF32 on Ampere and
-newer, full f32 on older GPUs), because `auto` guarantees neither.
+newer, full f32 on older GPUs), because `auto` guarantees neither. [Reproducibility & Regulated Use](reproducibility.md)
+explains what each of these settings controls and how to validate a deployment around them.
 
 `model_control_mode` sets how the loaded model set evolves: `dynamic` (the default) watches the
 repository and loads, unloads, reloads, and renames bundles online as files change (a renamed

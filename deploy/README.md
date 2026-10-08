@@ -13,7 +13,7 @@ bazel build //deploy:image
 bazel test  //deploy:image_precompile_test  # the image starts without precompiling (no podman)
 bazel run   //deploy:image_load          # loads it into podman as localhost/reactantserver:bazel
 bazel run   //deploy:image_check         # the loaded image: caches, tini, curl, entrypoints
-bazel run   //deploy:image_push -- --repository ghcr.io/<owner>/reactantserver   # push as :latest
+bazel run   //deploy:image_push -- --repository ghcr.io/<owner>/reactantserver --tag <tag>
 bazel test  //deploy:manifest_current    # the Julia lock still matches the workspace Project.toml files
 bazel run   //deploy:relock              # re-resolve the Julia lock after a [deps] or [compat] change
 bazel run   //deploy:relock_debs         # re-resolve the Ubuntu package lock (curl, tini)
@@ -157,13 +157,20 @@ podman run ... --health-cmd /usr/local/bin/healthcheck.node.sh --health-interval
 
 `.github/workflows/image.yml` builds the image, runs `//deploy:manifest_current` and
 `//deploy:image_precompile_test`, pushes it to the GitHub Container Registry as
-`ghcr.io/enzymead/reactantserver:latest`, and attests its build provenance. It runs only when
-triggered by hand (Actions, Image, Run workflow). It needs no secrets: the run's own
-`GITHUB_TOKEN` pushes the image, and the owner in the path is the repository's, lowercased, so a
-fork publishes to its own namespace. The first push creates the package, which an organization
-owner then makes public once in the package's settings. Releases are not named, so each run
-replaces `:latest`; the run summary records the pushed digest and commit, so pull by digest to pin
-a deployment.
+`ghcr.io/enzymead/reactantserver`, and attests its build provenance. It needs no secrets: the
+run's own `GITHUB_TOKEN` pushes the image, and the owner in the path is the repository's,
+lowercased, so a fork publishes to its own namespace. The first push creates the package, which an
+organization owner then makes public once in the package's settings.
+
+Images are versioned by ReactantServer releases. Each round of releases registers
+ReactantServer last, so its version names the whole image: worker, gateway, and node, built from
+the tagged tree and its `deploy/Manifest.toml`. When the General registry merges a ReactantServer
+version, TagBot pushes `ReactantServer-vX.Y.Z` on the registered commit, and that push runs the
+workflow, which publishes `:X.Y.Z`, plus `:X.Y` and `:latest` when no higher release exists in
+those lines (a patch to an older line moves neither). Run by hand (Actions, Image, Run workflow) on
+a branch, it publishes `:sha-<commit>` only, so `:latest` always means the newest release; run by
+hand on a `ReactantServer-vX.Y.Z` tag, it publishes that release. The run summary records the
+tags, the pushed digest, and the commit.
 
 The attestation is [SLSA build provenance](https://slsa.dev/spec/v1.0/provenance), produced by
 `actions/attest`: a statement that this repository's `image.yml`, at a given commit and run, built
@@ -178,7 +185,7 @@ gh attestation verify oci://ghcr.io/enzymead/reactantserver:latest --repo Enzyme
 ```
 
 `gh` needs to be logged in (`gh auth login`), and verifies the digest the tag currently resolves
-to; pass `@sha256:<digest>` instead of `:latest` to check a pinned image.
+to; pass `@sha256:<digest>` instead of a tag to check a pinned image.
 
 ## Consuming from another module
 

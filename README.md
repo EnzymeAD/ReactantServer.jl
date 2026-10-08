@@ -17,7 +17,7 @@ models share a GPU and one model executes at a time. Local serving of large lang
 goal of the project: splitting a model into compiled stages and streaming their weights from
 storage, so a GPU can serve models larger than its memory.
 
-Not sure which setup fits you? The [deployment shapes](https://enzymead.github.io/ReactantServer.jl/dev/deployment/#Deployment-shapes)
+Not sure which setup fits you? The [deployment shapes](https://enzymead.github.io/ReactantServer.jl/dev/deployment_shapes/)
 section walks through the options (single GPU, multi-GPU distributed or replicated, multi-node)
 and what each one optimizes for.
 
@@ -92,7 +92,7 @@ ReactantServerNode.supervise("config/node.yaml")   # one worker per GPU (+ gatew
 Clients speak KServe V2 gRPC to `:8001`; health and metrics are on `:8002`. Walk through exporting
 a model, configuring a node, and querying it in the [Tutorial](https://enzymead.github.io/ReactantServer.jl/dev/tutorial/).
 ReactantServer is designed for a trusted network; read
-[Security](https://enzymead.github.io/ReactantServer.jl/dev/deployment/#Security) before exposing an endpoint.
+[Security](https://enzymead.github.io/ReactantServer.jl/dev/security/) before exposing an endpoint.
 
 ## Status
 

@@ -60,22 +60,41 @@ makedocs(;
         LandingPage(),
         CodeBlocks(),
     ],
+    # Sections nest in the sidebar; the files stay flat under docs/src so page URLs do not move.
     pages = [
         "Home" => "index.md",
-        "Tutorial" => "tutorial.md",
-        "Bundles" => "bundles.md",
-        "Node Configuration" => "node_config.md",
-        "Scheduling" => "scheduling.md",
-        "On-demand Weights" => "on_demand_weights.md",
-        "Multi-GPU Gateway" => "gateway.md",
-        "Client Usage" => "client.md",
-        "Meta Models" => "meta_models.md",
-        "Object Detection" => "object_detection.md",
-        "Transformer Text Models" => "transformers.md",
-        "Deployment" => "deployment.md",
-        "Architecture" => "design/architecture.md",
-        "Philosophy" => "design/philosophy.md",
-        "API" => "api.md",
+        "Getting Started" => [
+            "Tutorial" => "tutorial.md",
+            "Deployment Shapes" => "deployment_shapes.md",
+        ],
+        "Building Models" => [
+            "Bundles" => "bundles.md",
+            "Meta Models" => "meta_models.md",
+            "Worked Examples" => [
+                "Object Detection" => "object_detection.md",
+                "Transformer Text Models" => "transformers.md",
+            ],
+        ],
+        "Running in Production" => [
+            "Deployment" => "deployment.md",
+            "Node Configuration" => "node_config.md",
+            "Multi-GPU Gateway" => "gateway.md",
+            "Reproducibility & Regulated Use" => "reproducibility.md",
+            "Monitoring" => "monitoring.md",
+            "Security" => "security.md",
+        ],
+        "Clients" => [
+            "Client Usage" => "client.md",
+        ],
+        "How It Works" => [
+            "Architecture" => "design/architecture.md",
+            "Scheduling" => "scheduling.md",
+            "On-demand Weights" => "on_demand_weights.md",
+        ],
+        "Project" => [
+            "Philosophy" => "design/philosophy.md",
+        ],
+        "API Reference" => "api.md",
     ],
 )
 

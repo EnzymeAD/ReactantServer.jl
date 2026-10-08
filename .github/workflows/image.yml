@@ -1,9 +1,16 @@
 # Build the locked CUDA node image with Bazel (//deploy:image), push it to the GitHub Container
-# Registry as ghcr.io/<owner>/reactantserver:latest, and attest its build provenance.
-# Triggered by hand only: Actions > Image > Run workflow, or `gh workflow run image.yml --ref <branch>`.
+# Registry as ghcr.io/<owner>/reactantserver, and attest its build provenance.
 #
-# Releases are not named yet, so every run overwrites :latest. The image digest is printed in the
-# run summary; pull by that digest to pin a deployment.
+# Releases: TagBot pushes ReactantServer-vX.Y.Z on the commit the General registry records, and that
+# push runs this workflow. The image is published as :X.Y.Z, :X.Y and :latest. ReactantServer is
+# released last in each round, so its version names the whole image (worker, gateway and node, all
+# built from the tagged tree and its deploy/Manifest.toml). :X.Y and :latest move only when this is
+# the highest release in that line, so a patch to an older line never moves them backwards.
+# TagBot pushes tags with an SSH deploy key; a tag pushed with GITHUB_TOKEN would not start this run.
+#
+# By hand (Actions > Image > Run workflow, or `gh workflow run image.yml --ref <branch>`): the image
+# is published as :sha-<commit> only, so :latest always means the newest release. Run on a
+# ReactantServer-vX.Y.Z tag ref, it publishes that release as if TagBot had pushed it.
 #
 # No secrets: the run's own GITHUB_TOKEN pushes the image, and its OIDC identity signs the
 # attestation through Sigstore. The owner is the repository's (lowercased, as registry paths must
@@ -13,15 +20,18 @@
 #
 # The attestation is SLSA build provenance binding the pushed digest to this repository, commit,
 # workflow and run. It is stored with GitHub and next to the image in the registry. Verify with:
-#   gh attestation verify oci://ghcr.io/enzymead/reactantserver:latest --repo EnzymeAD/ReactantServer.jl
+#   gh attestation verify oci://ghcr.io/enzymead/reactantserver:0.1.0 --repo EnzymeAD/ReactantServer.jl
 name: Image
 
 on:
+  push:
+    tags:
+      - "ReactantServer-v*"
   workflow_dispatch:
 
-# Two runs pushing :latest at once would race; the later one waits instead.
+# Two runs moving the same tags at once would race; the later one waits instead.
 concurrency:
-  group: image-latest
+  group: image-publish
   cancel-in-progress: false
 
 permissions:
@@ -73,18 +83,38 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # A ReactantServer-vX.Y.Z ref is a release: :X.Y.Z always, and :X.Y and :latest only when no
+      # higher release exists in that line. Anything else is a build of a commit, :sha-<commit>.
+      - name: Choose the tags
+        id: tags
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" =~ ^ReactantServer-v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+            line="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+            released="$(git ls-remote --tags --refs origin 'refs/tags/ReactantServer-v*' |
+              sed -nE 's|.*refs/tags/ReactantServer-v([0-9]+\.[0-9]+\.[0-9]+)$|\1|p' | sort -V)"
+            tags=("$version")
+            [[ "$(grep -E "^${line//./\\.}\\." <<<"$released" | tail -n1)" == "$version" ]] && tags+=("$line")
+            [[ "$(tail -n1 <<<"$released")" == "$version" ]] && tags+=(latest)
+          else
+            tags=("sha-${GITHUB_SHA::12}")
+          fi
+          echo "list=${tags[*]}" >> "$GITHUB_OUTPUT"
+
       # The digest comes from the OCI layout that was pushed, so it is what a pull by digest
       # returns and what the attestation is bound to.
-      - name: Push :latest
+      - name: Push
         id: push
         run: |
           repository="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/reactantserver"
-          bazel run //deploy:image_push -- --repository "$repository"
+          args=()
+          for t in ${{ steps.tags.outputs.list }}; do args+=(--tag "$t"); done
+          bazel run //deploy:image_push -- --repository "$repository" "${args[@]}"
           digest="$(jq -r '.manifests[0].digest' bazel-bin/deploy/image/index.json)"
           echo "repository=$repository" >> "$GITHUB_OUTPUT"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           {
-            echo "Pushed \`$repository:latest\`"
+            echo "Pushed \`$repository\` as: ${{ steps.tags.outputs.list }}"
             echo
             echo "Digest: \`$digest\` (commit \`$GITHUB_SHA\`)"
           } >> "$GITHUB_STEP_SUMMARY"
