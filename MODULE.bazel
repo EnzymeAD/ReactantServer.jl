@@ -49,7 +49,16 @@ use_repo(debs, "reactantserver_debs")
 
 # Julia itself, and the image rules (julia/image.bzl): the distribution, depot and
 # precompile-cache layers, the image environment, and the precompile test.
-bazel_dep(name = "julia_depot", version = "0.1.1")
+#
+# 0.2.0 has not reached the Bazel Central Registry, so it is pinned to the commit that adds
+# julia.depot's `project`, which the image's lock needs (see reactantserver_depot below). Drop the
+# override once the registry has 0.2.0.
+bazel_dep(name = "julia_depot", version = "0.2.0")
+git_override(
+    module_name = "julia_depot",
+    commit = "3f92730fb582833869bfb5168cd9a6e5b3924a4a",
+    remote = "https://github.com/csvance/julia_depot.git",
+)
 
 # Julia, fetched and pinned by sha256, so no build host needs it installed. It must match
 # deploy/Manifest.toml's julia_version; //deploy:manifest_current fails when they disagree. The
@@ -60,7 +69,34 @@ julia.dist(
     name = "reactantserver_julia",
     version = "1.12.7",
 )
-use_repo(julia, "reactantserver_julia")
+
+# The image's environment: the root workspace pinned by the committed production lock,
+# deploy/Manifest.toml (see deploy/BUILD.bazel for why the lock lives there). The lock is not
+# beside the Project.toml it locks, so `project` names it, and the depot is instantiated from a
+# copy of the project staged inside the repository. That copy holds only Project.tomls, never
+# sources, so nothing is precompiled at fetch: the image's caches come from //deploy:compiled_layer.
+# `project_srcs` must list every workspace member (the root Project.toml's [workspace] projects);
+# the fetch fails, naming it, when one is missing. `env` selects the same Reactant artifact the
+# image ships (see _REACTANT_GPU_ENV in deploy/BUILD.bazel), so the fetch downloads no other.
+julia.depot(
+    name = "reactantserver_depot",
+    env = {
+        "REACTANT_GPU": "cuda",
+        "REACTANT_GPU_VERSION": "13.1",
+    },
+    julia = "@reactantserver_julia",
+    manifest = "//deploy:Manifest.toml",
+    precompile = False,
+    project = "//:Project.toml",
+    project_srcs = [
+        "//:packages/ReactantServerCore/Project.toml",
+        "//:packages/ReactantServer/Project.toml",
+        "//:packages/ReactantServerGateway/Project.toml",
+        "//:packages/ReactantServerClient/Project.toml",
+        "//:packages/ReactantServerNode/Project.toml",
+    ],
+)
+use_repo(julia, "reactantserver_depot", "reactantserver_julia")
 
 oci = use_extension("@rules_oci//oci:extensions.bzl", "oci")
 oci.pull(

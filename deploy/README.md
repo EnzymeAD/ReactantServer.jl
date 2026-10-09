@@ -35,9 +35,11 @@ re-resolve the Ubuntu lock.
 
 The workspace root `Manifest.toml` stays gitignored so development and CI resolve fresh and pick up
 compat bumps. The image must not, so `deploy/Manifest.toml` is the production lock for the root
-`Project.toml`: every build action stages the root project, the member `Project.toml` files, and
-this manifest in a temporary tree and instantiates from it, with no `Pkg.resolve` anywhere in the
-build. It lives under `deploy/` only so the root gitignore can stay as it is; a symlinked
+`Project.toml`. `julia.depot(name = "reactantserver_depot")` in `MODULE.bazel` names both (`manifest`
+and `project`, with the member `Project.toml` files as `project_srcs`), and the fetch and every
+build action stage the root project, the member `Project.toml` files, and this manifest in a tree of
+their own and instantiate from it, with no `Pkg.resolve` anywhere in the build. Adding a workspace
+member means adding its `Project.toml` to `project_srcs`; the fetch fails, naming it, until then. It lives under `deploy/` only so the root gitignore can stay as it is; a symlinked
 `deploy/Project.toml` does not work, because Pkg resolves the real path of the project and would
 read the root manifest instead.
 
@@ -78,7 +80,8 @@ layers:
 - `debs_layer`: `curl`, `tini`, and their libraries, from the Ubuntu lock.
 - `julia_layer`: Julia at `/opt/julia`, its relative symlinks kept.
 - `depot_layer`: the Julia depot at `/opt/julia-depot`, instantiated from the Julia lock into an
-  empty depot (the General registry is fetched fresh; the lock pins every package by tree hash, so
+  empty depot (the General registry is copied from `@reactantserver_depot`, which already
+  instantiated the lock against it, and is not shipped; the lock pins every package by tree hash, so
   the registry state cannot change what is installed). Set `JULIA_PKG_SERVER` through
   `--action_env` in an untracked `user.bazelrc` to go through a mirror.
 - `compiled_layer`: the precompile caches for every project the image starts Julia in (the
