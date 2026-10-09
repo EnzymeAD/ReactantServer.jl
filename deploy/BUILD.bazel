@@ -40,7 +40,8 @@ package(default_visibility = ["//visibility:public"])
 # CUDA userspace the Reactant_jll artifact is selected for. Must agree with the base image
 # (@reactantserver_cuda_base, MODULE.bazel): Reactant_jll's platform augmentation reads these at
 # instantiate time to pick the artifact and at run time to load it, and a mismatch loads the wrong
-# library.
+# library. reactantserver_depot's `env` in MODULE.bazel repeats these, since MODULE.bazel cannot
+# load them from here; change both together.
 _REACTANT_GPU_ENV = {
     "REACTANT_GPU": "cuda",
     "REACTANT_GPU_VERSION": "13.1",
@@ -229,19 +230,17 @@ julia_dist_layer(
 # FULL, not artifacts-only: the image loads its packages from source (with the caches of
 # //deploy:compiled_layer), not from a sysimage, so the packages themselves are the code.
 #
-# No `depot`, so the General registry is fetched into the clean depot rather than copied from
-# whatever this host has; the manifest pins every package by tree hash, so the registry's state
-# cannot change what is installed. Set JULIA_PKG_SERVER in user.bazelrc (--action_env) to go
-# through a mirror.
+# @reactantserver_depot (MODULE.bazel) brings Julia, the root Project.toml, this manifest and the
+# member Project.tomls, so the layer cannot be given a manifest the depot was not fetched for. Its
+# General registry is copied in for the instantiate (and not shipped) rather than fetched again: the
+# fetch already instantiated this manifest against it, and the manifest pins every package by tree
+# hash, so the registry's state cannot change what is installed. Set JULIA_PKG_SERVER in
+# user.bazelrc (--action_env) to go through a mirror.
 julia_depot_layer(
     name = "depot_layer",
     contents = "full",
+    depot = "@reactantserver_depot",
     env = _REACTANT_GPU_ENV,
-    julia = "@reactantserver_julia",
-    manifest = "Manifest.toml",
-    project = "//:Project.toml",
-    # The member Project.tomls, which the workspace's [workspace] table needs to instantiate.
-    srcs = ["//:workspace_projects"],
 )
 
 # The container's entrypoints and healthchecks (see runtime/README.md).

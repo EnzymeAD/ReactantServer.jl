@@ -52,7 +52,9 @@ jobs:
 
       # The CUDA base, the depot (Reactant's CUDA artifact included) and the layers built from them
       # need tens of gigabytes. The runner's root disk is too small for that once its preinstalled
-      # toolchains are counted, so those are removed and Bazel keeps everything on /mnt.
+      # toolchains are counted, so those are removed and Bazel keeps everything on /mnt. That
+      # includes the depot @reactantserver_depot instantiates into at fetch, which declares no
+      # `dir` and so would otherwise fill ~/.julia on the root disk.
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
@@ -62,6 +64,7 @@ jobs:
           printf '%s\n' \
             'startup --output_user_root=/mnt/bazel/root' \
             'common --repository_cache=/mnt/bazel/repository-cache' \
+            'common --repo_env=JULIA_DEPOT_PATH=/mnt/bazel/julia-depot' \
             > user.bazelrc
           df -h / /mnt
 
