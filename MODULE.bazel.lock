@@ -78,6 +78,8 @@
     "https://bcr.bazel.build/modules/jsoncpp/1.9.5/MODULE.bazel": "31271aedc59e815656f5736f282bb7509a97c7ecb43e927ac1a37966e0578075",
     "https://bcr.bazel.build/modules/jsoncpp/1.9.6/MODULE.bazel": "2f8d20d3b7d54143213c4dfc3d98225c42de7d666011528dc8fe91591e2e17b0",
     "https://bcr.bazel.build/modules/jsoncpp/1.9.6/source.json": "a04756d367a2126c3541682864ecec52f92cdee80a35735a3cb249ce015ca000",
+    "https://bcr.bazel.build/modules/julia_depot/0.1.1/MODULE.bazel": "2d4a24aa1938f513980ac273c782b1ac65fb5070142d422dc6ee04c3487a1e2d",
+    "https://bcr.bazel.build/modules/julia_depot/0.1.1/source.json": "3468b4d2a53b67af5d1f468886cbbdb8e8b38e8aaa39d504dc4074396ac8b92c",
     "https://bcr.bazel.build/modules/libpfm/4.11.0/MODULE.bazel": "45061ff025b301940f1e30d2c16bea596c25b176c8b6b3087e92615adbd52902",
     "https://bcr.bazel.build/modules/nlohmann_json/3.6.1/MODULE.bazel": "6f7b417dcc794d9add9e556673ad25cb3ba835224290f4f848f8e2db1e1fca74",
     "https://bcr.bazel.build/modules/nlohmann_json/3.6.1/source.json": "f448c6e8963fdfa7eb831457df83ad63d3d6355018f6574fb017e8169deb43a9",
@@ -227,7 +229,7 @@
   "moduleExtensions": {
     "@@julia_depot+//julia:extensions.bzl%julia": {
       "general": {
-        "bzlTransitiveDigest": "t0C7/eh7dFhvfV0fS0A39Elaqee9+kxUUqu2AEW6hZs=",
+        "bzlTransitiveDigest": "Q8z3KlkA1yw3GJYp4jJQ/ZE9vbiNAMCr28oh2hze7tw=",
         "usagesDigest": "PTsZm6Jg5HquePleXP48biPA/GphSvs7jOXg3taJySQ=",
         "recordedInputs": [],
         "generatedRepoSpecs": {
