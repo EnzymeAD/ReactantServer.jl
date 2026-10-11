@@ -273,3 +273,26 @@ repository (colon-separated). Unlike the image, a checkout resolves its dependen
 does not get the image's locked versions or its precompiled caches, and the host needs the CUDA
 libraries Reactant loads by name (`libnvJitLink.so.13`, `libnvrtc.so.13`, `libcupti.so`). Use
 the container for anything long-running.
+
+## Where the children load from
+
+The supervisor never loads Reactant itself; each worker is a `julia` subprocess that loads
+`ReactantServer`, and the gateway one that loads `ReactantServerGateway`. Before spawning
+anything, the supervisor decides where those come from, first match wins:
+
+1. **A workspace named by `REACTANT_WORKSPACE_ROOT`.** Each child runs from its own member project
+   (`<root>/packages/ReactantServer`, `<root>/packages/ReactantServerGateway`). The image sets
+   the variable to `/opt/reactantserver`.
+2. **The supervisor's own environment**, when it lists `ReactantServer` (and
+   `ReactantServerGateway`, if a gateway will run) as dependencies. This is the Pkg workflow: add
+   the three packages to one environment and every child runs in it, with `JULIA_LOAD_PATH`
+   limited to that environment and the standard library so a different copy in your default
+   environment cannot be picked up instead. ReactantServerNode declares the other two as weak
+   dependencies with compat bounds, so Pkg keeps the three on versions that work together.
+3. **A checkout around the active project**: `--project=packages/ReactantServerNode` or
+   `--project=.` in a clone of this repository.
+
+What is needed depends on the role: `all` needs both packages, `workers` only `ReactantServer`,
+and `gateway` only `ReactantServerGateway`. When nothing provides them, the supervisor stops with
+a `ConfigError` naming the packages to add, rather than starting children that cannot load and
+restarting them indefinitely.

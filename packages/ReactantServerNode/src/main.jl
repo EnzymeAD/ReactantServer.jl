@@ -107,12 +107,18 @@ end
 
 """
     build_supervisor(node_path; role=nothing, gateway_path=nothing, sink=stdout, env=ENV,
-                     workspace_root=nothing, runtime_dir=nothing, max_restarts=nothing)
+                     workspace_root=nothing, runtime_dir=nothing, max_restarts=nothing,
+                     active_project=Base.active_project())
         -> Supervisor
 
 Assemble the node's children without running them. Role precedence: keyword, `REACTANT_ROLE`
 env, `role:` in the node file, then `all`. Tests and the in-process e2e use this directly
 (`run_supervisor!` + `request_shutdown!`); `supervise` is the blocking wrapper.
+
+Where the children load ReactantServer and ReactantServerGateway from is resolved by
+`ReactantServerNode.child_environment` from `workspace_root`, `REACTANT_WORKSPACE_ROOT`,
+and `active_project`: the `all` role needs both packages, `workers` only ReactantServer, and
+`gateway` only ReactantServerGateway.
 """
 function build_supervisor(
         node_path::AbstractString;
@@ -121,13 +127,18 @@ function build_supervisor(
         sink::IO = stdout, env::AbstractDict = ENV,
         workspace_root::Union{AbstractString, Nothing} = nothing,
         runtime_dir::Union{AbstractString, Nothing} = nothing,
-        max_restarts::Union{Integer, Nothing} = nothing
+        max_restarts::Union{Integer, Nothing} = nothing,
+        active_project::Union{AbstractString, Nothing} = Base.active_project()
     )
-    root = workspace_root !== nothing ? String(workspace_root) : default_workspace_root(env)
     node = isfile(node_path) ? load_node_raw(node_path) : nothing
     r = _resolve_role(role, env, node)
     r === :gateway || node !== nothing ||
         throw(ConfigError("node config file not found: $node_path"))
+    # Resolved before anything is spawned, so a missing package is one clear error rather than a
+    # child that dies on startup and is restarted indefinitely.
+    needs = r === :all ? ["ReactantServer", "ReactantServerGateway"] :
+        r === :workers ? ["ReactantServer"] : ["ReactantServerGateway"]
+    children = child_environment(needs; env = env, workspace_root = workspace_root, active_project = active_project)
 
     mr = max_restarts !== nothing ? Int(max_restarts) :
         parse(Int, get(env, "REACTANT_SUPERVISOR_MAX_RESTARTS", "0"))
@@ -137,7 +148,7 @@ function build_supervisor(
     gw_path = _resolve_gateway_path(gateway_path, env)
 
     if r === :gateway
-        push!(specs, gateway_spec(root; gateway_path = gw_path))
+        push!(specs, gateway_spec(children; gateway_path = gw_path))
     else
         devices = detect_gpus(env; node = node)
         if isempty(devices) && _node_backend(node) != "cpu"
@@ -197,11 +208,11 @@ function build_supervisor(
             push!(
                 specs, sole_public ?
                     worker_spec(
-                        _worker_name(w), node_file, selectors[i], root;
+                        _worker_name(w), node_file, selectors[i], children;
                         compute_threads = worker_threads, grpc_port = gpub, metrics_port = mpub
                     ) :
                     worker_spec(
-                        _worker_name(w), node_file, selectors[i], root;
+                        _worker_name(w), node_file, selectors[i], children;
                         compute_threads = worker_threads
                     )
             )
@@ -214,7 +225,7 @@ function build_supervisor(
                 push!(notes, "WARNING: worker port(s) $(sort!(collect(overlap))) collide with the gateway listen ports; adjust base_port / metrics_base_port")
             push!(
                 specs, gateway_spec(
-                    root; gateway_path = gw_path,
+                    children; gateway_path = gw_path,
                     endpoints = gw_path === nothing ? worker_endpoints(node) : nothing,
                     metrics_endpoints = gw_path === nothing ? worker_metrics_endpoints(node) : nothing,
                     worker_names = gw_path === nothing ? String[_worker_name(w) for w in ws] : nothing,
