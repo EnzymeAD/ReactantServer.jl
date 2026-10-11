@@ -1,0 +1,40 @@
+# Codecov configuration.
+#
+# Informational, deliberately: coverage is a number to look at on a pull request, not a gate. The
+# suites already decide pass or fail, and a status that fails on a fraction of a percent teaches
+# people to merge past a red mark.
+#
+# Each package suite uploads under its own flag (the suite's cache-name in ci.yml), restricted to
+# that package's sources. The suites are path-filtered, so most runs skip most of them;
+# carryforward keeps a skipped package's last report instead of dropping it from the total.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+flag_management:
+  default_rules:
+    carryforward: true
+
+flags:
+  core:
+    paths: [packages/ReactantServerCore/src/]
+  client:
+    paths: [packages/ReactantServerClient/src/]
+  gateway:
+    paths: [packages/ReactantServerGateway/src/]
+  server:
+    paths: [packages/ReactantServer/src/, packages/ReactantServer/ext/]
+  node:
+    paths: [packages/ReactantServerNode/src/]
+
+ignore:
+  - "**/test/**"
+  - "docs/**"
+  - "examples/**"
+  - "tools/**"
+  - "lib/**"
