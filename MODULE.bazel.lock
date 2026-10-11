@@ -227,7 +227,7 @@
   "moduleExtensions": {
     "@@julia_depot+//julia:extensions.bzl%julia": {
       "general": {
-        "bzlTransitiveDigest": "82T2b3JZrFlxIJ9y8XRHI1B4m9xaRNT3PUWREBsE4BE=",
+        "bzlTransitiveDigest": "ZWcghTuTj3JCf4OQ8sGqMHZgJvfdLFeDcP74t4k9TXw=",
         "usagesDigest": "8+fN+VDdq348lMBX7hbn9NpvkRCxIm+ZlC+TXBv/AJI=",
         "recordedInputs": [
           "REPO_MAPPING:,reactantserver_julia julia_depot++julia+reactantserver_julia"
