@@ -143,7 +143,9 @@ end
         kserve_init(; pool_bytes = 1 << 20, n_slots = 8, shm_reprobe_interval = 0.0)
         m = KServeModel(
             "127.0.0.1", port, "m"; shared_memory = :on, max_batch_size = 1,
-            deadline = 10.0, retry = _noretry()
+            # Generous: the first call to a fresh mock server compiles its whole request path, and
+            # under coverage on a slow runner that alone has taken more than 10 s.
+            deadline = 60.0, retry = _noretry()
         )
         key = (m.host, m.port, m.shared_memory)
 
