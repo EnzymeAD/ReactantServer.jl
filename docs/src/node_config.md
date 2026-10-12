@@ -65,7 +65,7 @@ global:
     executable_cache: true     # cache compiled programs under each bundle's .cache/; see below
     profile: default           # default | regulated; see below
     batch_sizes: all           # all | largest compiled batch size per model (profile default)
-    xla_flags: {}              # XLA DebugOptions overrides, e.g. xla_gpu_deterministic_ops: true
+    xla_flags: {}              # XLA DebugOptions overrides, e.g. xla_gpu_exclude_nondeterministic_ops: true
     weight_cache_fraction: 1.0 # arena fraction for all weights (pinned + on-demand); 0 disables
     weight_cache_wiggle_fraction: 0.1  # arena fraction kept free; drives startup auto-sizing
     autotune: true             # XLA GPU compile autotuner; false = default kernels, no trials
@@ -93,28 +93,26 @@ Each sub-block corresponds to a typed config struct ([`RuntimeConfig`](@ref),
 [`GrpcConfig`](@ref)); the whole resolved `global:` is the [`ServerConfig`](@ref) a worker
 serves from. The [API](api.md) page lists every field and its default.
 
-`runtime.numerics` sets the f32 matmul/convolution precision policy. `auto` (the default) is
-hardware-adaptive: TF32 is used on GPUs that support it (NVIDIA compute capability 8.0 and up)
-and stripped where it would not compile, so one bundle runs everywhere but its numerics follow
-the hardware. `f32` pins full f32 on every target: TF32 `DotAlgorithm`s are rewritten to f32,
-every algorithm-free f32 `dot_general`/`convolution` gets `precision_config = HIGHEST`, and
-`NVIDIA_TF32_OVERRIDE=0` is set as defense in depth. This makes numerics identical across GPU
-generations, which is the mode for validated deployments where a hardware refresh must not
-change model outputs; the cost is tensor-core throughput for f32 matmuls on TF32-capable GPUs.
-`tf32` compiles exactly like `auto` (TF32 is permitted and XLA/cuBLAS pick the kernels; StableHLO
-has no way to force TF32 for convolutions) but turns the hardware requirement into a guarantee:
-startup fails on hardware that cannot run TF32, so a mixed fleet cannot silently serve divergent
-numerics. Startup also fails if `NVIDIA_TF32_OVERRIDE=0` is set, or if the startup probe matmul does
-not actually run in TF32, so a capable worker that is not using TF32 cannot serve a deployment
-validated on it. On CUDA workers a startup probe logs whether TF32 arithmetic is actually in use and,
-under `f32`, proves the pin bit-exactly; the per-model outcome (ops pinned, algorithms rewritten
-or stripped) is recorded in each "model loaded" log line.
+`runtime.numerics` sets the precision of f32 matrix multiplications and convolutions:
+
+- `auto` (the default) uses TF32 on GPUs that support it (NVIDIA compute capability 8.0 and up)
+  and strips it where it would not compile.
+- `f32` pins full f32 on every target: TF32 `DotAlgorithm`s are rewritten to f32, every
+  algorithm-free f32 `dot_general` and `convolution` gets `precision_config = HIGHEST`, and
+  `NVIDIA_TF32_OVERRIDE=0` is set as well.
+- `tf32` compiles like `auto`, but startup fails unless TF32 is in effect: on hardware without
+  it, with `NVIDIA_TF32_OVERRIDE=0` set, or when the startup probe matmul does not run in TF32.
+
+On CUDA workers a startup probe logs whether TF32 arithmetic is in use, and under `f32` proves the
+pin bit-exact. Each "model loaded" log line records the outcome per model: operations pinned, and
+algorithms rewritten or stripped.
 
 `runtime.executable_cache` (default `true`) stores every compiled program under the bundle's
 `.cache/` directory and loads it on later starts, turning a 5 to 30 second compile per program into
 a load of well under 100 ms. Entries are partitioned by the Reactant_jll build, the platform, and
 the device kind and compute capability, none of which XLA checks on load, and named by the MLIR
-source's content hash. `.cache/mlir_hashes.json` records the hash of every `model*.mlir`; a module
+source's content hash and a hash of the compile options (including `xla_flags` and `autotune`) and
+the numerics policy, so changing any of those compiles fresh. `.cache/mlir_hashes.json` records the hash of every `model*.mlir`; a module
 whose content changes has its programs dropped on the next load, while a weights-only update keeps
 them. The directory watcher never reacts to anything under `.cache/`, so cache writes cannot reload
 the model that produced them. The bundle directory must be writable by the worker; when it is not,
@@ -123,28 +121,23 @@ the cache logs a warning and every program is compiled as before.
 `runtime.batch_sizes` selects which of a bundle's compiled batch sizes are loaded. `all` (the
 default) loads every `model.b{N}.mlir` the manifest declares, and the scheduler picks the largest
 size a dispatch can fill. `largest` loads only the largest declared size, per input-shape variant,
-and never reads the others (they need not even be present). Every dispatch then runs that one
-program, padded with zero rows when fewer requests are queued and sliced back per request, so a
-row's result no longer depends on how many other requests were coalesced with it; the cost is the
-full batch's compute on every dispatch, including a lone one-row request. Unbatched bundles are
-unaffected. Workers with different settings can share a bundle directory: a `largest` worker keeps
-the cached programs of the sizes it skipped.
+and never reads the others (they need not be present); every dispatch runs that program, padded
+with zero rows and sliced back per request. Unbatched bundles are unaffected. Workers with
+different settings can share a bundle directory.
 
 `runtime.xla_flags` is a mapping of XLA `DebugOptions` field names (no leading `--`) to values,
 applied to every compile. At startup each name is checked against the XLA linked into the worker
 and each value against the field's type (booleans, integers, numbers, strings, and enum fields by
-enumerator name), so a typo fails startup instead of being ignored. The flags are part of the
-executable cache key. An explicit `xla_gpu_autotune_level` here wins over `autotune: false`.
+enumerator name), so a typo fails startup instead of being ignored. An explicit
+`xla_gpu_autotune_level` here wins over `autotune: false`.
 
 `runtime.profile` applies a named set of defaults. `regulated` defaults `batch_sizes` to
 `largest` and adds `xla_gpu_exclude_nondeterministic_ops: true` to `xla_flags`; anything set
-explicitly wins, so `batch_sizes: all` or `xla_gpu_exclude_nondeterministic_ops: false` turns a
-piece back off. The profile does not change `numerics`; set `f32` or `tf32` to match what the
-deployment was validated on. The worker states the precision prominently at startup: a bannered
-info line under `f32` or `tf32`, both of which are attested by the startup probe, and a bannered
-warning under `auto`, naming the precision actually in effect on its device (TF32 on Ampere and
-newer, full f32 on older GPUs), because `auto` guarantees neither. [Reproducibility & Regulated Use](reproducibility.md)
-explains what each of these settings controls and how to validate a deployment around them.
+explicitly wins. It does not change `numerics`.
+
+[Reproducibility & Regulated Use](reproducibility.md) explains how `numerics`, `batch_sizes`,
+`executable_cache`, `xla_flags`, and `profile` affect a model's outputs, and which values a
+validated deployment should use.
 
 `model_control_mode` sets how the loaded model set evolves:
 

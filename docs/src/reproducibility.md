@@ -16,8 +16,7 @@ largest source of difference between deployments.
 
 - **`tf32`:** TF32 tensor cores, which keep 10 mantissa bits of each operand instead of f32's 23.
   Faster on NVIDIA Ampere and newer, with results that differ from full f32 in the low digits.
-  Startup fails unless TF32 is confirmed active: on a GPU without TF32, with
-  `NVIDIA_TF32_OVERRIDE=0` set, or if the startup probe matmul does not show TF32 arithmetic.
+  Startup fails unless TF32 is confirmed active, so a worker cannot silently serve in f32.
 - **`f32`:** full f32 everywhere, on every GPU generation, attested bit-exact by the startup probe.
   The choice when a hardware refresh must not change outputs, at the cost of tensor-core
   throughput.
@@ -27,7 +26,7 @@ largest source of difference between deployments.
 
 Pin the mode the deployment was validated with. Even within one mode, XLA and cuBLAS choose kernels
 per GPU model, so results match a validation only on the same GPU class; validate again when the
-class changes. [Node Configuration](node_config.md) has the full reference.
+class changes. [Node Configuration](node_config.md) describes how each mode is enforced.
 
 ## Batch size
 
@@ -40,10 +39,9 @@ Under `runtime.batch_sizes: all` (the default) the scheduler picks the program f
 requests are queued at the moment of dispatch, so a request's output can depend on unrelated
 traffic: the same input returns slightly different values at night and at peak load.
 
-`runtime.batch_sizes: largest` removes that dependence. Only the largest compiled size is loaded,
-and every dispatch runs that one program: a partial batch is padded with zero rows and each
-request's rows are sliced back out. The cost is the full batch's compute on every dispatch,
-including a lone single-row request.
+`runtime.batch_sizes: largest` removes that dependence: every dispatch runs the largest compiled
+program, padded to a full batch. The cost is the full batch's compute on every dispatch, including
+a lone single-row request.
 
 One program removes the batch-size dependence, but whether a row's output is also independent of
 its position in the batch, and of the other rows beside it, depends on the model. Models whose
@@ -67,11 +65,9 @@ differently, and different kernels can give different low bits.
 
 Three settings hold the choice fixed:
 
-- **The executable cache** (`runtime.executable_cache`, on by default) stores each compiled program
-  in the bundle's `.cache/` directory and loads it on later starts. A loaded program is the exact
-  program that was compiled, with its kernel choices included, so a restart cannot change them.
-  Entries are keyed by the Reactant_jll build, the device kind and compute capability, the
-  numerics mode, the autotune setting, and the XLA flags; changing any of those compiles fresh.
+- **The executable cache** (`runtime.executable_cache`, on by default) loads each program exactly
+  as it was compiled, kernel choices included, so a restart cannot change them. A change to the
+  software stack, the device, or the compile settings compiles fresh.
 - **Cached autotune results** (`runtime.autotune_cache`, `runtime.autotune_cache_dir`) make a
   fresh compile reuse earlier timing decisions instead of measuring again.
 - **`runtime.autotune: false`** skips autotuning and uses XLA's default kernels. Selection no
