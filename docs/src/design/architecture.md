@@ -9,11 +9,9 @@ has its own page for the detail, linked from the section that introduces it.
 The project is a Julia workspace of packages, split so that talking to a server never requires
 the Reactant and XLA stack:
 
-- **ReactantServerCore**: the shared, Reactant-free substrate. It holds the dtype vocabulary, the
-  KServe V2 protobuf messages, the manifest parser, the node file parser, the wire codec, the
-  shared-memory registry, and the staging `BufferPool`. The other packages build on it.
-- **ReactantServer**: the worker. It owns the model registry, the runtime, the scheduler, and the
-  KServe V2 gRPC server, and it is the only package that loads Reactant.
+- **ReactantServerCore**: the shared, Reactant-free code the other packages build on: the KServe
+  V2 messages and wire format, and the manifest and node file formats.
+- **ReactantServer**: the worker, and the only package that loads Reactant.
 - **ReactantServerGateway**: the reverse proxy that puts several workers behind one endpoint.
 - **ReactantServerClient**: the client. It is Reactant-free, so it installs on any machine that
   sends requests.

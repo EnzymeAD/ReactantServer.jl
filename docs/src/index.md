@@ -59,13 +59,8 @@ against **compute** to squeeze the most models out of each GPU. It is Julia-firs
 custom pre and postprocessing is plain Julia in a bundle's `model.jl`, and every convention
 follows Julia's, column-major with the batch axis last.
 
-The system is a workspace of packages, split so that talking to a server never pulls in the heavy
-Reactant/XLA stack: `ReactantServerCore` is the shared, Reactant-free substrate (dtypes,
-protobufs, the manifest parser, node config, the codec, shared memory, the staging `BufferPool`);
-`ReactantServer` is the worker, the only package that depends on Reactant; `ReactantServerGateway`
-is the multi-GPU reverse proxy; `ReactantServerClient` is a Reactant-free client;
-`ReactantServerNode` is the one-container supervisor. Offline export lives in
-`ReactantServerExport`. Every package is on the [API](api.md) page.
+The server is a set of packages, split so that only the worker loads Reactant and XLA; a client
+installs without them. [Architecture](design/architecture.md) describes each package.
 
 ## Why ReactantServer?
 

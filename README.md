@@ -72,23 +72,17 @@ endpoint.
 
 ## Repository layout
 
-A Julia 1.12+ workspace of five packages under `packages/`, split so that talking to a server never
-pulls in the heavy Reactant/XLA stack:
+A Julia 1.12+ workspace of five packages under `packages/`, split so that only the worker loads
+Reactant and XLA:
 
-- **`ReactantServerCore`** — shared, Reactant-free substrate: dtypes, the KServe V2 protobuf
-  messages, boundary types, the manifest parser, node config, the wire codec, the shared-memory
-  registry, and the staging `BufferPool`.
-- **`ReactantServer`** — the inference worker (registry, runtime, scheduler, KServe V2 gRPC server);
-  the **only** package that depends on Reactant. Exports `serve`, `stop!`, `register_model`.
-- **`ReactantServerGateway`** — the multi-GPU KServe gRPC reverse proxy (`serve_gateway`). No Reactant.
-- **`ReactantServerClient`** — a Reactant-free inference client (`KServeModel`, `infer_sync`,
-  `infer_async`, `InferInput`, `InferOutput`).
-- **`ReactantServerNode`** — the single-container node supervisor (`supervise`): detects GPUs, runs
-  one worker per device, embeds the gateway when there is more than one, and multiplexes their logs.
+- **`ReactantServerCore`**: the shared, Reactant-free code the other packages build on.
+- **`ReactantServer`**: the worker, and the only package that depends on Reactant.
+- **`ReactantServerGateway`**: the reverse proxy that puts several workers behind one endpoint.
+- **`ReactantServerClient`**: the client.
+- **`ReactantServerNode`**: the node supervisor.
 
-Offline model export lives in `packages/ReactantServerExport` (a Reactant tracing frontend plus a
-PythonCall-triggered PyTorch extension); it is deliberately **not** a workspace member, so its
-Lux/PythonCall weakdeps stay out of the server images. All dependencies, including
+Offline model export lives in `packages/ReactantServerExport`. It is not a workspace member, so
+its export dependencies stay out of the server image. All dependencies, including
 `gRPCServer`, resolve from the package registries; there are no git submodules.
 
 ## Acknowledgments
