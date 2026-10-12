@@ -31,6 +31,18 @@ filegroup(
     ),
 )
 
+# The image packages' projects on their own, for the versions and authors //deploy:image_labels
+# reads.
+exports_files(
+    [
+        "packages/ReactantServer/Project.toml",
+        "packages/ReactantServerCore/Project.toml",
+        "packages/ReactantServerGateway/Project.toml",
+        "packages/ReactantServerNode/Project.toml",
+    ],
+    visibility = ["//deploy:__pkg__"],
+)
+
 # The default node config the image runs with, and its commented template.
 filegroup(
     name = "node_config",

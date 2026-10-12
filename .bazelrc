@@ -2,6 +2,10 @@
 
 test --test_output=errors
 
+# The commit a --stamp build records in the image's revision label (deploy/workspace_status.sh).
+# Unstamped builds never read it, so it costs a `git` call per build and nothing else.
+build --workspace_status_command="/bin/sh deploy/workspace_status.sh"
+
 # Per-user settings (output base, a remote cache, --config choices) live in an untracked
 # user.bazelrc. Nothing site-specific belongs in this file.
 try-import %workspace%/user.bazelrc
