@@ -97,7 +97,7 @@ maximum(abs, y .- y_local)                                  # ≈ 0
 
 @test y ≈ y_local #src
 
-# This one-shot form suits occasional requests. [Query a Server](../basics/client.md) covers batched inference
+# This one-shot form suits occasional requests. [Run Inference](../basics/inference.md) covers batched inference
 # over a dataset and the shared-memory transport.
 #
 # ## Stop

@@ -58,7 +58,7 @@ models share a GPU and one model executes at a time.
 ## Get started
 
 The [tutorials](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/) start with what every deployment shares, [exporting a model](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/basics/export/)
-and [querying a server](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/basics/client/), and then cover the two ways to serve:
+and [running inference](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/basics/inference/), and then cover the two ways to serve:
 
 - **From Julia**, on any machine with or without a GPU: add the packages to an environment and
   [serve a model](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/julia/serve/) from a Julia session. These tutorials run in CI exactly

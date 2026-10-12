@@ -8,7 +8,7 @@ machine. (The same KServe V2 wire protocol means any Triton or KServe gRPC clien
 this package is the convenient Julia option.) The server-side handling of the wire and
 shared-memory data planes is covered on the [Bundles](bundles.md) page.
 
-[Query a Server](tutorials/basics/client.md) walks through using it: one-shot requests, batched
+[Run Inference](tutorials/basics/inference.md) walks through using it: one-shot requests, batched
 inference over a dataset, and the shared-memory transport. This page is the reference for how the
 client behaves.
 
@@ -61,7 +61,7 @@ n_slots, shm_reprobe_interval)` sizes the staging pool (256 MiB by default) and 
 slots (8 by default), which bounds how many chunks can be in flight against one pool;
 `kserve_shutdown()` tears the pool and the gRPC subsystem down.
 
-[Query a Server](tutorials/basics/client.md) builds a complete IO for a small model.
+[Run Inference](tutorials/basics/inference.md) builds a complete IO for a small model.
 
 `scratch` is the same buffer-request interface meta models use through `call.scratch`; see the
 [Meta Models](meta_models.md) page. The lower-level path is still supported: carve a

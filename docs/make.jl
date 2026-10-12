@@ -30,7 +30,7 @@ using ReactantServerNode
 # dropped, and the fences become plain `julia` blocks so Documenter does not try to run them.
 # Each renders into its tutorial section's directory beside the hand-written pages; the rendered
 # files are gitignored, and EditURL points the "Edit on GitHub" link at the script.
-const BASICS_TUTORIALS = ["Export a Model" => "export", "Query a Server" => "client"]
+const BASICS_TUTORIALS = ["Export a Model" => "export", "Run Inference" => "inference"]
 const JULIA_TUTORIALS = [
     "Serve a Model" => "serve",
     "Run a Node" => "node",

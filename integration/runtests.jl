@@ -10,7 +10,7 @@
 using Test
 
 # Run order matters only for readability of the log; every script is self-contained.
-const TUTORIALS = ["export", "serve", "client", "node", "gateway"]
+const TUTORIALS = ["export", "serve", "inference", "node", "gateway"]
 
 selected = isempty(ARGS) ? TUTORIALS : ARGS
 for name in selected

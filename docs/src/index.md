@@ -85,7 +85,7 @@ through a gRPC control plane, without a restart.
 ## Get started
 
 The [Tutorials](tutorials/index.md) start with what every deployment shares, exporting a model
-and querying a server, and then cover the two ways to serve:
+and running inference against a server, and then cover the two ways to serve:
 
 - **From Julia.** Every package is in the General registry, so a Julia environment is all you
   need, on any machine, with or without a GPU. Start with [Serve a Model](tutorials/julia/serve.md).

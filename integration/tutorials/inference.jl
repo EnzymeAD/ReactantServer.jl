@@ -1,4 +1,4 @@
-# # Query a Server
+# # Run Inference
 #
 # `ReactantServerClient` is a KServe V2 gRPC client with no Reactant or XLA dependency, so it
 # installs quickly on any machine that needs to talk to a server. This page runs inference over a

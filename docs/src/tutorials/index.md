@@ -11,7 +11,7 @@ itself, so you can open any page directly.
 
 - [Export a Model](basics/export.md): turn a Lux model into a bundle, the directory of compiled
   program, weights, and manifest that every server loads.
-- [Query a Server](basics/client.md): send a dataset through `ReactantServerClient`, with
+- [Run Inference](basics/inference.md): send a dataset through `ReactantServerClient`, with
   concurrent batched requests and shared memory when the client shares a host with the server.
 
 ## Serve from Julia

@@ -79,7 +79,7 @@ y = InferOutput("output", infer_sync(mlp, [InferInput("input", x)]), Float32)
 kserve_shutdown()
 ```
 
-[Query a Server](../basics/client.md) covers batched inference over a dataset and the shared-memory
+[Run Inference](../basics/inference.md) covers batched inference over a dataset and the shared-memory
 transport.
 
 ## Configure the node

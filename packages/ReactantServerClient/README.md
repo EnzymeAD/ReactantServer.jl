@@ -13,6 +13,6 @@ namespace (or that lack the probe) use inline transport instead. The `shared_mem
 `KServeModel` (`:auto`/`:on`/`:off`) overrides this per model.
 
 Part of the [ReactantServer.jl](../../README.md) workspace. The
-[Query a Server](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/basics/client/) tutorial walks through one-shot and
+[Run Inference](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/basics/inference/) tutorial walks through one-shot and
 batched inference; [Client Usage](https://enzymead.github.io/ReactantServer.jl/dev/client/) is the reference for IO validation, retries, and the
 shared-memory data path.
