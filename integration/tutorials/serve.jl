@@ -34,8 +34,10 @@ export_bundle(
 
 # ## Describe the node
 #
-# A server is configured by a *node file*: the model repository, the ports, the runtime backend,
-# and the workers. A single worker on the CPU needs only this:
+# A server is configured by a *node file*, a YAML file that describes one machine: its model
+# repository, ports, runtime backend, and workers. It is only configuration; nothing here uses the
+# `ReactantServerNode` package, which [Run a Node](node.md) introduces. A single worker on the CPU
+# needs only this:
 
 write(
     "node.yaml", """
@@ -57,8 +59,9 @@ write(
 #
 # ## Start the server
 #
-# `serve` loads the node file, compiles every bundle in the repository, and then starts the gRPC
-# server, so it accepts traffic only once its models are ready. With `blocking = false` it returns
+# `serve` runs one worker from the node file in this Julia process: it compiles every bundle in the
+# repository, and then starts the gRPC server, so it accepts traffic only once its models are
+# ready. With `blocking = false` it returns
 # a handle instead of serving until interrupted:
 
 using ReactantServer

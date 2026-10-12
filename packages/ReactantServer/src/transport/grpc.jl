@@ -1,4 +1,5 @@
-# The KServe V2 gRPC control plane. This is the only file that imports gRPCServer.
+# The worker's gRPC server: the KServe V2 inference API and the control service. This is the only
+# file that imports gRPCServer.
 #
 # gRPCServer hands each handler the already-decoded request message and serializes the
 # message the handler returns, so the codec, scheduler, and runtime are untouched: the codec

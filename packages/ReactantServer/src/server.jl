@@ -300,10 +300,13 @@ end
 """
     serve(node_path; worker=nothing, backend=ReactantBackend(), blocking=true) -> nothing | RunningServer
 
-Load the node config at `node_path`, resolve this process's worker, bring up the runtime and its
-assigned models, and start the gRPC control plane. `worker` selects which worker entry to serve;
-it may be omitted when the node has exactly one worker. When `blocking` is false the server runs
+Run one worker from the node file at `node_path`, in this process: load the file, resolve the
+worker entry, bring up the runtime and its models, and start the gRPC server (the KServe V2
+inference API and the worker control service). `worker` selects which worker entry to serve; it
+may be omitted when the node file has exactly one worker. When `blocking` is false the server runs
 in the background and a `RunningServer` is returned (stop it with `stop!`).
+
+To run every worker in a node file, one process per device, use `ReactantServerNode.supervise`.
 """
 function serve(
         node_path::AbstractString; worker::Union{AbstractString, Nothing} = nothing,
@@ -394,7 +397,7 @@ function serve(
             ready_fn = ready_fn, worker_name = worker_name, gpu = _gpu_identity(cfg)
         )
     end
-    @info "Starting gRPC control plane" host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests models = model_names(registry)
+    @info "Starting gRPC server" host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests models = model_names(registry)
     if blocking
         _beat(:up, cfg)
         try
