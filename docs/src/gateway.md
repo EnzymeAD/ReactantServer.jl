@@ -1,50 +1,14 @@
 # Multi-GPU Gateway
 
-The gateway is a gRPC reverse proxy that fronts several ReactantServer.jl workers behind one
-KServe V2 gRPC endpoint. It is pure Julia, lives in its own package `ReactantServerGateway`
-([`serve_gateway`](@ref)), and reuses `ReactantServerCore`'s node and config parsing plus the
-generated KServe protobuf. Because it builds only on `ReactantServerCore` and the gRPC layer,
-the gateway carries no Reactant dependency. The documented surface, [`serve_gateway`](@ref) and
-[`probe_worker_ready`](@ref) plus the `ReactantServerGateway.RunningGateway` handle
-`serve_gateway(blocking=false)` returns, is collected on the [API](api.md) page.
+The gateway is a gRPC reverse proxy that puts several workers behind one KServe V2 endpoint. It
+lives in `ReactantServerGateway` and does not load Reactant. A node with two or more workers runs
+one in front of them on the public ports, configured from the node file
+([Deployment](deployment.md)); it can also run on its own over workers you start yourself
+([Front Workers with a Gateway](tutorials/julia/gateway.md)).
 
-You do not start the gateway yourself. When a node has two or more workers, the supervisor
-([`ReactantServerNode.supervise`](@ref), the node's default entry point) runs the gateway as an
-embedded child and synthesizes its worker endpoint list from the node file; a single-worker node
-skips it entirely, because one worker already serves the full KServe V2 API. See
-[Deployment](deployment.md) for the node; this page describes what its embedded gateway does.
-
-Clients connect to a single gRPC endpoint. The gateway extracts the model name from each
-`ModelInferRequest` and forwards the raw protobuf bytes over gRPC to the worker that hosts that
-model. The KServe V2 protobuf wire format is identical end to end, so the gateway is a
-gRPC-to-gRPC pass-through that never re-marshals the body.
-
-## One endpoint whether you run 1 GPU or 8
-
-The key scaling fact: nothing about your model, client, or external interface changes as you add
-GPUs. You run the same launcher (or the same `supervise` call), the supervisor puts one worker
-on each GPU, and it fronts them with the embedded gateway, so clients still send one request to
-one endpoint and it is routed to a worker that serves the model. `gpus: auto` in the node file
-already means "one worker per visible GPU", so the single-GPU node file scales as-is; you only
-edit it to do something non-default (see [Node Configuration](node_config.md)).
-
-The supervisor decides whether a gateway exists at all: a single-worker node serves the full
-KServe V2 API directly on the public ports with no gateway, and a node with two or more workers
-embeds the gateway in front of them, each worker binding `base_port + i` and the gateway binding
-the public 8001/8002. The supervisor synthesizes the gateway's worker list from the node file,
-so the gateway needs no configuration of its own; [Deployment](deployment.md) owns that decision.
-The external interface (8001 for gRPC, 8002 for metrics/health) is therefore identical whether
-you run 1 GPU or 8, which is why your client and the public ports never change as you scale; see
-[Client Usage](client.md) for the client side. The `REACTANT_ROLE` environment variable can
-split the default `all` role into `workers` only or `gateway` only for deployments that span
-machines; that topology is beyond the scope of these guides.
-
-One scrape on 8002 still covers the whole node: the embedded gateway serves its own `gateway_*`
-series and merges in every worker's `/metrics`. Each worker tags its series with `worker` and
-`gpu` labels itself (the `gpu` value is the physical device behind its `CUDA_VISIBLE_DEVICES`),
-so per-GPU and per-worker breakdowns need no Prometheus relabeling, for example
-`sum by (gpu) (rate(worker_dispatch_total[1m]))`. See [Deployment](deployment.md) for the scrape
-config.
+The gateway reads each request's model name and forwards the request bytes unchanged to a worker
+that serves the model. On a multi-worker node it also serves the node's merged metrics
+([Monitoring](monitoring.md)).
 
 ## What the gateway does
 
@@ -57,7 +21,7 @@ config.
 - **Replica scheduling:** a model served by more than one worker is load-balanced across those
   workers, either uniformly (`round_robin`, the default) or by packing each model onto a fixed,
   operator-configured number of GPUs with coalescing-aware routing (`lpt_packing`); see
-  [Scheduling modes](#scheduling-modes) below. A third mode, `least_outstanding`, spreads by
+  [Scheduling modes](#Scheduling-modes) below. A third mode, `least_outstanding`, spreads by
   live occupancy. Either way, a request fails over to the remaining replicas when a worker
   returns `NotFound` or `Unavailable`.
 - **Readiness probe:** a background loop calls each worker's KServe `ServerReady` RPC; `/readyz`
@@ -92,7 +56,7 @@ The gateway routes each model's requests across its replicas according to `sched
 on few GPUs for deep coalescing batches and is the mode whose placement the gateway manages.
 Every setting in the block below except `mode` can also be changed while the gateway runs,
 through its own gRPC control plane; see
-[Runtime scheduling control](#runtime-scheduling-control).
+[Runtime scheduling control](#Runtime-scheduling-control).
 
 ```yaml
 scheduling:
@@ -144,10 +108,9 @@ there is one answer to "what does this fleet call busy".
   sent. Correct without any cost measurement when a fleet's models cost about the same per item.
   Weakest under `fill_least`, which compares one worker's load across *all* models, so dropping
   the cost weighting makes a cheap model's items look as expensive as a costly model's.
-- **`requests`** is the per-request denominator each mechanism used before this knob existed: a
-  raw count for `least_outstanding`, and the model's measured cost per *request* for `fill_least`
-  (which keeps its cross-model cost weighting). Blind to batch size either way, so a pre-batching
-  client defeats the balancing. Set this to pin the pre-knob behavior exactly.
+- **`requests`** counts requests: a raw count for `least_outstanding`, and the model's measured
+  cost per *request* for `fill_least` (which keeps its cross-model cost weighting). Blind to batch
+  size either way, so a pre-batching client defeats the balancing.
 
 `compute` and `items` need to know where each model's batch axis is and what an item costs, which
 the gateway learns from a `ModelControlStatus` poll on each health-probe round. Under
@@ -227,8 +190,8 @@ halflife is measured in fleet compute-seconds (`ema_halflife_compute_seconds`, d
 how busy the fleet is rather than with wall-clock). `hysteresis` adds an optional dead band on
 top: a single-replica model moves only when the move improves its resulting pressure by more than
 `hysteresis` (default `0.0`, i.e. move on any improvement), because batching depends on traffic
-staying where the queues are. (`max_worker_share` is accepted but advisory only; load no longer
-determines a model's GPU count.)
+staying where the queues are. (`max_worker_share` is accepted but does not affect a model's GPU
+count.)
 
 Repacks are driven by accumulated compute, not wall-clock: the gateway polls the workers every
 probe round and recomputes the placement once the fleet has consumed `rebalance_compute_seconds`
@@ -286,7 +249,7 @@ names an axis rather than a count.
   also what promotion means for a latency-bound model whose client concurrency sits well below
   its max batch; the cost is coalescing depth, since each GPU now batches roughly `1/k` as many
   requests. Prefer it per model rather than fleet-wide.
-- **`inflight`** is the legacy basis: `Q` counts requests **in flight**, so a replica keeps
+- **`inflight`**: `Q` counts requests **in flight**, so a replica keeps
   receiving the model's traffic until it holds a full quantum at once.
 
 !!! warning "`inflight` can park a model on one GPU indefinitely"
@@ -301,8 +264,7 @@ names an axis rather than a count.
 
     Diagnose it with `gateway_replica_routed_total`: a flat series on one replica of a
     multi-replica model is the signature (`gateway_replica_outstanding` cannot show it, because
-    a starved replica reads 0 either way). Use `inflight` only to reproduce the behavior that
-    predated `run`.
+    a starved replica reads 0 either way). Use `run` instead.
 
 `routing_fill_factor` is the direct trade between the two concerns: a model's share is even to
 within one quantum, so a smaller factor balances more finely at the cost of splitting more
@@ -412,7 +374,7 @@ installed.
     bumped by each accepted change, so you can tell a tuned gateway from a fresh one, and each
     accepted change is logged with its before and after values, which is the only durable record
     of it. Like the rest of the control plane these RPCs are unauthenticated (see
-    [Deployment](deployment.md)), so the gateway's gRPC port must not be exposed outside the
+    [Security](security.md)), so the gateway's gRPC port must not be exposed outside the
     trusted network.
 
 ## What the gateway does not do
@@ -423,7 +385,7 @@ installed.
   data plane only `ModelInfer`, the two SHM register/unregister RPCs, and `IsSameIPCNamespace`
   are proxied; everything else returns `UNIMPLEMENTED`. On the control plane the gateway answers
   `ControlService/CompactMemory` (fanned out to every worker) and all four
-  `GatewayControlService` RPCs itself (see [Runtime scheduling control](#runtime-scheduling-control));
+  `GatewayControlService` RPCs itself (see [Runtime scheduling control](#Runtime-scheduling-control));
   the other `ControlService` RPCs are worker-only.
 - TLS: parsed but not yet enforced; the listener and the worker back-hop are cleartext h2c.
 - CUDA shared memory.
@@ -433,11 +395,9 @@ installed.
 
 ## Configuration
 
-The supervisor configures the embedded gateway for you: it synthesizes the worker endpoint list
-(and the worker metrics list) from the node file into `REACTANT_GATEWAY_WORKERS` /
-`REACTANT_GATEWAY_WORKER_METRICS`, and binds the gateway to the public ports (8001/8002). Nothing
-about model placement is configured on the gateway; it autodiscovers which models each worker
-serves via `RepositoryIndex` and refreshes its routing table periodically.
+On a node, the supervisor passes the embedded gateway its worker endpoints and metrics endpoints
+as `REACTANT_GATEWAY_WORKERS` and `REACTANT_GATEWAY_WORKER_METRICS`. Which models each worker
+serves is never configured; the gateway discovers it.
 
 To tune the gateway, provide a `gateway.yml` and point `REACTANT_GATEWAY_FILE` at it (or leave
 it at the conventional `/etc/reactantserver/gateway.yml`, which the supervisor picks up
@@ -458,7 +418,7 @@ carries the gateway's own settings (listen addresses, message limits, logging, a
     lpt_packing node still waits for its workers to finish compiling rather than crash-looping.
 
 For a standalone deployment, the package also ships [`probe_worker_ready`](@ref), the worker
-container's healthcheck (a Julia replacement for the former Go `reactant-healthprobe`): it
+container's healthcheck: it
 resolves a worker's port from the node file and calls its KServe `ServerReady` on localhost,
 returning whether it reported ready.
 

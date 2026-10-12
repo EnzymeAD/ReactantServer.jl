@@ -129,8 +129,9 @@ the entrypoints.
 
 ## Running it
 
-The docs' Deployment page ("Running the container") is the guide to running the image, including
-the shared-memory, process-limit and thread settings a container needs. What follows are the
+The docs' "Serve on One GPU" tutorial is the guide to running the image, and the Deployment page's
+"Container settings" section explains the shared-memory, process-limit and thread settings a
+container needs. What follows are the
 details specific to how this image is built.
 
 The image expects the host driver to be provided at run time, like any CUDA image. With the NVIDIA

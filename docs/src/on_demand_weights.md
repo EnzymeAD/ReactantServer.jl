@@ -32,7 +32,7 @@ inference.
 
 ## Enabling it
 
-There is one knob: `runtime.weight_cache_fraction`, the fraction of the BFC arena
+The main setting is `runtime.weight_cache_fraction`, the fraction of the BFC arena
 (`mem_fraction * device memory`) devoted to all weights, pinned plus on-demand. It
 defaults to **1.0** (use the whole arena, GPU only), and `0` disables the cache so every
 model's weights stay resident. You normally do not set it at all.

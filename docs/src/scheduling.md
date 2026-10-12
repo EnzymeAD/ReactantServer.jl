@@ -55,8 +55,7 @@ A single `Threads.Condition` guards all mutable scheduler state (the per-model q
 EMA/cost fields) and signals the dispatch loop when work arrives. The loop holds the lock only
 to select and dequeue; the actual execution runs outside the lock, so producers keep enqueuing
 during GPU work, and the lock is re-taken briefly afterwards to record the dispatch. Only one
-execution runs at a time by design, which keeps memory and concurrency reasoning simple and is
-what makes the single-resident-model weight strategy safe.
+execution runs at a time by design, which keeps memory and concurrency reasoning simple.
 
 ### The dispatch loop runs on its own thread
 
@@ -272,10 +271,9 @@ worker.
 
 The control plane can adjust scheduling policy on a running worker. `ReactantServer.set_policy!`
 updates
-a model's live `weight` (consulted by the fair discipline; available in both residency modes, and
-it raises on an unknown model). `ReactantServer.set_residency!` moves a model to a target
+a model's live `weight` (consulted by the fair discipline; it raises on an unknown model). `ReactantServer.set_residency!` moves a model to a target
 residency
-floor; it is only meaningful in externally-managed mode and the worker rejects it otherwise. Both
+floor; the worker accepts it only under `model_control_mode: explicit`. Both
 run on the dispatch thread, the sole mutator of residency, and block until applied; control
 commands are drained ahead of dispatch selection, so a residency transition takes effect before
 the dispatch that may depend on it. `ReactantServer.compact!` frees the resident non-pinned
@@ -298,7 +296,7 @@ The worker exports these as Prometheus series (`worker_dispatch_total`,
 `worker_compute_seconds_total`, `worker_queue_depth`, `worker_queue_wait_seconds`,
 `worker_requests_served_total`, `worker_rows_served_total`, `worker_model_max_batch_size`, and
 the residency gauges), tagged per model and per GPU, and the node's metrics endpoint aggregates
-them. See [Deployment](deployment.md) for the scrape configuration.
+them. See [Monitoring](monitoring.md) for scraping them.
 
 `ReactantServer.control_status` is the control-plane view a gateway reads: the worker's
 residency mode

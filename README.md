@@ -14,13 +14,7 @@ container; and it squeezes the most models out of each GPU by balancing model **
 convention follows Julia's (column-major, batch-last axes).
 
 It serves compiled models, such as computer vision and scientific computing workloads, where many
-models share a GPU and one model executes at a time. Local serving of large language models is a
-goal of the project: splitting a model into compiled stages and streaming their weights from
-storage, so a GPU can serve models larger than its memory.
-
-Not sure which setup fits you? The [deployment shapes](https://enzymead.github.io/ReactantServer.jl/dev/deployment_shapes/)
-section walks through the options (single GPU, multi-GPU distributed or replicated, multi-node)
-and what each one optimizes for.
+models share a GPU and one model executes at a time.
 
 ## Highlights
 
@@ -31,26 +25,26 @@ and what each one optimizes for.
   hooks in plain Julia; they run per request, in parallel and overlapped with GPU execution. → [Bundles & model.jl](https://enzymead.github.io/ReactantServer.jl/dev/bundles/)
 - **Julia-aligned conventions.** Shapes are column-major with the batch axis last, the way Julia
   and Lux write them; the codec converts to KServe's row-major wire at the boundary, so Triton
-  clients are unchanged and you never reason about row-major order. → [Tutorial](https://enzymead.github.io/ReactantServer.jl/dev/tutorial/)
+  clients are unchanged and you never reason about row-major order. → [Export a Model](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/export/)
 - **Elegant configuration.** One typed YAML node file (with environment-variable overrides)
   describes a machine; manifests declare tensors with an einsum-style named-axis notation. → [Node Configuration](https://enzymead.github.io/ReactantServer.jl/dev/node_config/), [Bundles & model.jl](https://enzymead.github.io/ReactantServer.jl/dev/bundles/)
 - **Standard inference protocol.** KServe V2 over gRPC. Tensor data travels inline
   (`raw_input_contents` / `raw_output_contents`) or through the
   Triton-compatible system-shared-memory extension for zero-copy local clients. → [Client Usage](https://enzymead.github.io/ReactantServer.jl/dev/client/)
-- **One process, single or multi-GPU.** A node supervisor runs one worker per visible GPU: a
-  single worker serves the public ports directly; two or more get an embedded gateway behind one
-  endpoint. The external interface (`:8001` gRPC, `:8002` metrics/health) is identical either way.
+- **One container, one GPU or many.** A node supervisor runs one worker per visible GPU, behind
+  one endpoint that stays the same as the node grows.
   → [Deployment](https://enzymead.github.io/ReactantServer.jl/dev/deployment/), [Multi-GPU Gateway](https://enzymead.github.io/ReactantServer.jl/dev/gateway/)
 - **Balances memory and compute.** Every model's weights stay resident in host RAM and stream
   onto the GPU on demand, evicted LRU under a byte budget — so a card serves far more models than
   fit in VRAM, paying a single host-to-device transfer on a cold call. → [On-demand Weights](https://enzymead.github.io/ReactantServer.jl/dev/on_demand_weights/)
 - **Batch coalescing.** Concurrent same-model requests are merged into one execution at a compiled
   batch size, amortizing per-launch overhead and the one-time weight transfer across the batch.
-  → [Architecture](https://enzymead.github.io/ReactantServer.jl/dev/design/architecture/)
+  → [Scheduling](https://enzymead.github.io/ReactantServer.jl/dev/scheduling/)
 - **Scheduling modes for single and multi-GPU.** On a worker, `fair` (deficit-weighted,
-  cost-aware) or `fifo`; across GPUs, the gateway offers `round_robin` or memory-aware
-  `lpt_packing` that concentrates each model's traffic to fill batches, with a gRPC control plane for
-  retuning placement without a restart. → [Architecture](https://enzymead.github.io/ReactantServer.jl/dev/design/architecture/), [Multi-GPU Gateway](https://enzymead.github.io/ReactantServer.jl/dev/gateway/)
+  cost-aware), `fifo`, or `edf`; across GPUs, the gateway offers `round_robin`,
+  `least_outstanding`, or memory-aware `lpt_packing` that concentrates each model's traffic to fill
+  batches, with a gRPC control plane for retuning placement without a restart.
+  → [Scheduling](https://enzymead.github.io/ReactantServer.jl/dev/scheduling/), [Multi-GPU Gateway](https://enzymead.github.io/ReactantServer.jl/dev/gateway/)
 - **Fast iteration.** In `dynamic` mode the server watches the model repository and hot-loads,
   unloads, and reloads bundles online — weights, MLIR, manifest, and `model.jl` alike — with no
   restart (`static` and `explicit` control modes are also available). A model is named by its
@@ -61,70 +55,34 @@ and what each one optimizes for.
   GPU dispatch loop, and re-enters the scheduler for each sub-call. The design is subject to change;
   do not build production pipelines on it. → [Meta Models](https://enzymead.github.io/ReactantServer.jl/dev/meta_models/)
 
-## Quick start
+## Get started
 
-ReactantServer is deployed as a container image. All a host needs is the NVIDIA driver and a
-container runtime with the NVIDIA Container Toolkit; the image carries Julia, every package
-(precompiled), and the CUDA libraries. Run it over a directory of model bundles and it serves on
-every GPU you give it:
+The [tutorials](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/) follow a model from [export](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/export/) to
+[inference](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/inference/), with two ways to serve it in between:
 
-```
-podman run -d --name reactantserver --device nvidia.com/gpu=all --ipc=host --pids-limit=-1 \
-  -p 8001:8001 -p 8002:8002 -v /path/to/bundles:/var/lib/reactantserver/models \
-  ghcr.io/enzymead/reactantserver:latest
-```
+- **From Julia**, on any machine with or without a GPU: add the packages to an environment and
+  [serve a model](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/julia/serve/) from a Julia session. These tutorials run in CI exactly
+  as written.
+- **With the container image**, the supported deployment: a host needs only the NVIDIA driver and
+  a container runtime. [Serve on one GPU](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/container/single_gpu/), then
+  [scale to many](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/container/multi_gpu/).
 
-With Docker, use `--gpus all` in place of `--device nvidia.com/gpu=all`, or run the repository's
-`docker-compose.yml`. The first start is slow, since every model compiles before the gRPC plane
-accepts traffic; compiled programs are then cached inside each bundle. See
-[Deployment](https://enzymead.github.io/ReactantServer.jl/dev/deployment/#Running-the-container)
-for the container settings (shared memory, thread limits, health), and `deploy/` to build the
-image yourself with Bazel.
-
-For a quick try from a source checkout, without a container, instantiate the workspace once
-(`REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1 julia --project=. -e 'using Pkg; Pkg.instantiate()'`)
-and run the supervisor from Julia:
-
-```julia
-using ReactantServerNode
-ReactantServerNode.supervise("config/node.yaml")   # one worker per GPU (+ gateway if >1)
-```
-
-Clients speak KServe V2 gRPC to `:8001`; health and metrics are on `:8002`. Walk through exporting
-a model, configuring a node, and querying it in the [Tutorial](https://enzymead.github.io/ReactantServer.jl/dev/tutorial/).
-ReactantServer is designed for a trusted network; read
-[Security](https://enzymead.github.io/ReactantServer.jl/dev/security/) before exposing an endpoint.
-
-## Status
-
-The full serving path is implemented end to end: export a bundle, compile it through Reactant/PJRT,
-schedule and coalesce requests, and serve over the KServe V2 gRPC control plane. The cost-aware
-scheduler, the on-demand GPU weight cache, dynamic model lifecycle, meta-model orchestration (with
-a worked object detection example), and the single- and multi-GPU deployment paths all work today
-on CUDA (with CPU for development and fallback); broader accelerator support is intended to follow. Deferred to later milestones: dynamic-batch export with server-side
-`stablehlo-refine` specialization, the compiled-executable disk cache, multi-model orchestrators,
-and full StableHLO-signature validation of manifests. See
-[Architecture](https://enzymead.github.io/ReactantServer.jl/dev/design/architecture/) for the full picture.
+ReactantServer is designed for a trusted network; read [Security](https://enzymead.github.io/ReactantServer.jl/dev/security/) before exposing an
+endpoint.
 
 ## Repository layout
 
-A Julia 1.12+ workspace of five packages under `packages/`, split so that talking to a server never
-pulls in the heavy Reactant/XLA stack:
+A Julia 1.12+ workspace of five packages under `packages/`, split so that only the worker loads
+Reactant and XLA:
 
-- **`ReactantServerCore`** — shared, Reactant-free substrate: dtypes, the KServe V2 protobuf
-  messages, boundary types, the manifest parser, node config, the wire codec, the shared-memory
-  registry, and the staging `BufferPool`.
-- **`ReactantServer`** — the inference worker (registry, runtime, scheduler, KServe V2 gRPC server);
-  the **only** package that depends on Reactant. Exports `serve`, `stop!`, `register_model`.
-- **`ReactantServerGateway`** — the multi-GPU KServe gRPC reverse proxy (`serve_gateway`). No Reactant.
-- **`ReactantServerClient`** — a Reactant-free inference client (`KServeModel`, `infer_sync`,
-  `infer_async`, `InferInput`, `InferOutput`).
-- **`ReactantServerNode`** — the single-container node supervisor (`supervise`): detects GPUs, runs
-  one worker per device, embeds the gateway when there is more than one, and multiplexes their logs.
+- **`ReactantServerCore`**: the shared, Reactant-free code the other packages build on.
+- **`ReactantServer`**: the worker, and the only package that depends on Reactant.
+- **`ReactantServerGateway`**: the reverse proxy that puts several workers behind one endpoint.
+- **`ReactantServerClient`**: the client.
+- **`ReactantServerNode`**: the node supervisor.
 
-Offline model export lives in `packages/ReactantServerExport` (a Reactant tracing frontend plus a
-PythonCall-triggered PyTorch extension); it is deliberately **not** a workspace member, so its
-Lux/PythonCall weakdeps stay out of the server images. All dependencies, including
+Offline model export lives in `packages/ReactantServerExport`. It is not a workspace member, so
+its export dependencies stay out of the server image. All dependencies, including
 `gRPCServer`, resolve from the package registries; there are no git submodules.
 
 ## Acknowledgments

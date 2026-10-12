@@ -9,8 +9,8 @@ hero:
   tagline: KServe V2 over gRPC from one GPU to many, with compiled XLA models, Julia-first pre and postprocessing, and the most models per card.
   actions:
     - theme: brand
-      text: Tutorial
-      link: /tutorial/
+      text: Tutorials
+      link: /tutorials/
     - theme: alt
       text: API Reference
       link: /api/
@@ -29,7 +29,7 @@ features:
   - icon: 🚀
     title: XLA under the hood
     details: Models compile ahead of time through Reactant and XLA into device executables; the runtime is device agnostic, CUDA today with CPU for development.
-    link: /tutorial/
+    link: /tutorials/export/
   - icon: 🧩
     title: Julia-first
     details: A bundle's model.jl registers pre and postprocessing in plain Julia, and every convention follows Julia's, column-major with the batch axis last.
@@ -59,70 +59,37 @@ against **compute** to squeeze the most models out of each GPU. It is Julia-firs
 custom pre and postprocessing is plain Julia in a bundle's `model.jl`, and every convention
 follows Julia's, column-major with the batch axis last.
 
-The system is a workspace of packages, split so that talking to a server never pulls in the heavy
-Reactant/XLA stack: `ReactantServerCore` is the shared, Reactant-free substrate (dtypes,
-protobufs, the manifest parser, node config, the codec, shared memory, the staging `BufferPool`);
-`ReactantServer` is the worker, the only package that depends on Reactant; `ReactantServerGateway`
-is the multi-GPU reverse proxy; `ReactantServerClient` is a Reactant-free client;
-`ReactantServerNode` is the one-container supervisor. Offline export lives in
-`ReactantServerExport`. Every package is on the [API](api.md) page.
+The server is a set of packages, split so that only the worker loads Reactant and XLA; a client
+installs without them. [Architecture](design/architecture.md) describes each package.
 
 ## Why ReactantServer?
 
-The server is built for compiled models, such as computer vision and scientific computing
-workloads, where many models share a GPU and one model executes at a time. Local serving of large
-language models, by splitting a model into compiled stages and streaming their weights from
-storage, is a goal of the project. That shape rewards a server that is compiled rather
-than interpreted: models are compiled ahead of time into device executables through Reactant's
-PJRT bindings, so inference is a single batched kernel launch rather than an interpreter loop, and
-the runtime is device-agnostic, CUDA today with CPU for development and fallback.
+The server is built for workloads where many models share a GPU, such as computer vision and
+scientific computing. Every model is compiled ahead of time through Reactant and XLA into an
+optimized executable for the target device, and compiled models are fast. The runtime is
+device-agnostic: CUDA today, with CPU for development.
 
 The design balances two resources that pull against each other. Compute is managed by a
-deficit-weighted, cost-aware [scheduler](scheduling.md) that coalesces concurrent same-model
-requests into one execution at a compiled batch size. Memory is managed by the
-[on-demand weights](on_demand_weights.md) cache, which keeps weights in host RAM and streams them
-onto the GPU under an LRU byte budget. Both are retunable at runtime, on a worker or across GPUs,
-through a gRPC control plane, without a restart.
+cost-aware [scheduler](scheduling.md) that coalesces concurrent requests for the same model into
+one execution. Memory is managed by the [on-demand weights](on_demand_weights.md) cache, which
+keeps weights in host RAM and moves them onto the GPU within a byte budget. Scheduling policy,
+pinned models, and multi-GPU placement can all be changed at runtime, without a restart.
 
-## Install
+## Get started
 
-ReactantServer is deployed as a container image. A host needs only the NVIDIA driver and a
-container runtime with the NVIDIA Container Toolkit; the image carries Julia, every package
-(precompiled), and the CUDA libraries. Run it over a directory of model bundles and it serves on
-every GPU you give it:
+The [Tutorials](tutorials/index.md) follow a model from [export](tutorials/export.md) to
+[inference](tutorials/inference.md), with two ways to serve it in between:
 
-```
-podman run -d --name reactantserver --device nvidia.com/gpu=all --ipc=host --pids-limit=-1 \
-  -p 8001:8001 -p 8002:8002 -v /path/to/bundles:/var/lib/reactantserver/models \
-  ghcr.io/enzymead/reactantserver:latest
-```
+- **From Julia.** Every package is in the General registry, so a Julia environment is all you
+  need, on any machine, with or without a GPU. Start with [Serve a Model](tutorials/julia/serve.md).
+- **With the container image.** The supported deployment: a host needs only the NVIDIA driver and
+  a container runtime. Start with [Serve on One GPU](tutorials/container/single_gpu.md).
 
-With Docker, use `--gpus all` in place of `--device nvidia.com/gpu=all`. See
-[Running the container](@ref) for the settings and [Building the image](@ref) to build your own.
+The server is designed for a trusted network, so read [Security](security.md) before exposing an
+endpoint.
 
-For development, or a quick try without a container, clone the repository (it is not yet in the
-General registry) and run the supervisor from pure Julia:
+## Reference
 
-```
-git clone https://github.com/EnzymeAD/ReactantServer.jl
-cd ReactantServer.jl
-REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1 julia --project=. -e 'using Pkg; Pkg.instantiate()'
-```
-
-```julia
-using ReactantServerNode
-ReactantServerNode.supervise("config/node.yaml")   # one worker per GPU (+ gateway if >1)
-```
-
-Clients speak KServe V2 gRPC to `:8001`; health and metrics are on `:8002`. The first server
-startup is slow, because every model compiles before the gRPC plane accepts traffic. The server is
-designed for a trusted network, so read the [Deployment](deployment.md) page's security notes
-before exposing an endpoint.
-
-## Start here
-
-- The [Tutorial](tutorial.md): export a Lux model to a bundle, configure a node, serve it, and
-  query it from a client, end to end.
 - [Bundles](bundles.md): the bundle format, the manifest's named-axis notation, and the export
   frontends.
 - [Node Configuration](node_config.md): the one typed YAML file that describes a machine.
@@ -132,8 +99,6 @@ before exposing an endpoint.
 - [Client Usage](client.md): the Reactant-free client and its shared-memory transport.
 - [Meta Models](meta_models.md) (experimental): chaining models with data-dependent Julia between
   stages.
-- The worked examples, [Object Detection](object_detection.md) and
-  [Transformer Text Models](transformers.md), end to end.
-- [Deployment](deployment.md): running the container image, its settings, monitoring, and the
-  deployment shapes.
+- [Deployment](deployment.md): how a node behaves, the container image and its settings, and the
+  multi-node contract.
 - The [API](api.md): every documented name, collected automatically.

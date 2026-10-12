@@ -1,19 +1,11 @@
 # Node Configuration
 
-A deployment is described by a single node file. It is the only supported config format for
-workers. The file describes one or more single-GPU workers on one machine and, optionally, the
-gateway that fronts them. Each worker reads this same file, resolves its own entry by name, and
-loads (and can serve) every bundle in the shared model repository.
-
-A single GPU is just a one-worker node: keep one entry under `workers:` (or omit `workers:`
-entirely under the supervisor, below). Growing to more GPUs means adding workers, not changing
-the config format.
-
-Under the node supervisor (the supervisor default, see [Deployment](deployment.md)) the
-`workers:` list is optional: omit it and add `gpus: auto` (or an integer count, or an explicit
-device list) and the supervisor synthesizes one worker per detected GPU, assigning each its
-device. An explicit `workers:` list still wins when present. The keys below describe that
-explicit form, which the supervisor also honors.
+A node file describes one machine: its model repository and its workers, one per device. Each
+worker reads the same file, resolves its own entry by name, and serves every bundle in the
+repository. Under the node supervisor the `workers:` list is optional, and the supervisor creates
+one worker per detected device ([Deployment](deployment.md)). The gateway in front of a
+multi-worker node is configured separately, by its own `gateway.yml`
+([Gateway configuration](#Gateway-configuration)).
 
 ## Top-level keys
 
@@ -37,7 +29,6 @@ metrics_base_port: 9100
 global:    # defaults merged into every worker (any block may be overridden per worker)
 workers:   # optional under the supervisor; one entry per GPU
 models:    # optional; pins the named models to device memory on the listed workers
-gateway:   # optional; read only by the gateway, never by a worker
 ```
 
 - `model_repo` (required) is the shared bundle repository. Each immediate subdirectory that
@@ -54,7 +45,6 @@ gateway:   # optional; read only by the gateway, never by a worker
 - `global` holds the defaults merged into every worker; any block may be overridden per worker.
 - `workers` lists the worker entries (optional under the supervisor).
 - `models` optionally pins the named models to device memory on the listed workers.
-- `gateway` is read only by the gateway, never by a worker.
 
 ## Global settings
 
@@ -75,7 +65,7 @@ global:
     executable_cache: true     # cache compiled programs under each bundle's .cache/; see below
     profile: default           # default | regulated; see below
     batch_sizes: all           # all | largest compiled batch size per model (profile default)
-    xla_flags: {}              # XLA DebugOptions overrides, e.g. xla_gpu_deterministic_ops: true
+    xla_flags: {}              # XLA DebugOptions overrides, e.g. xla_gpu_exclude_nondeterministic_ops: true
     weight_cache_fraction: 1.0 # arena fraction for all weights (pinned + on-demand); 0 disables
     weight_cache_wiggle_fraction: 0.1  # arena fraction kept free; drives startup auto-sizing
     autotune: true             # XLA GPU compile autotuner; false = default kernels, no trials
@@ -103,28 +93,26 @@ Each sub-block corresponds to a typed config struct ([`RuntimeConfig`](@ref),
 [`GrpcConfig`](@ref)); the whole resolved `global:` is the [`ServerConfig`](@ref) a worker
 serves from. The [API](api.md) page lists every field and its default.
 
-`runtime.numerics` sets the f32 matmul/convolution precision policy. `auto` (the default) is
-hardware-adaptive: TF32 is used on GPUs that support it (NVIDIA compute capability 8.0 and up)
-and stripped where it would not compile, so one bundle runs everywhere but its numerics follow
-the hardware. `f32` pins full f32 on every target: TF32 `DotAlgorithm`s are rewritten to f32,
-every algorithm-free f32 `dot_general`/`convolution` gets `precision_config = HIGHEST`, and
-`NVIDIA_TF32_OVERRIDE=0` is set as defense in depth. This makes numerics identical across GPU
-generations, which is the mode for validated deployments where a hardware refresh must not
-change model outputs; the cost is tensor-core throughput for f32 matmuls on TF32-capable GPUs.
-`tf32` compiles exactly like `auto` (TF32 is permitted and XLA/cuBLAS pick the kernels; StableHLO
-has no way to force TF32 for convolutions) but turns the hardware requirement into a guarantee:
-startup fails on hardware that cannot run TF32, so a mixed fleet cannot silently serve divergent
-numerics. Startup also fails if `NVIDIA_TF32_OVERRIDE=0` is set, or if the startup probe matmul does
-not actually run in TF32, so a capable worker that is not using TF32 cannot serve a deployment
-validated on it. On CUDA workers a startup probe logs whether TF32 arithmetic is actually in use and,
-under `f32`, proves the pin bit-exactly; the per-model outcome (ops pinned, algorithms rewritten
-or stripped) is recorded in each "model loaded" log line.
+`runtime.numerics` sets the precision of f32 matrix multiplications and convolutions:
+
+- `auto` (the default) uses TF32 on GPUs that support it (NVIDIA compute capability 8.0 and up)
+  and strips it where it would not compile.
+- `f32` pins full f32 on every target: TF32 `DotAlgorithm`s are rewritten to f32, every
+  algorithm-free f32 `dot_general` and `convolution` gets `precision_config = HIGHEST`, and
+  `NVIDIA_TF32_OVERRIDE=0` is set as well.
+- `tf32` compiles like `auto`, but startup fails unless TF32 is in effect: on hardware without
+  it, with `NVIDIA_TF32_OVERRIDE=0` set, or when the startup probe matmul does not run in TF32.
+
+On CUDA workers a startup probe logs whether TF32 arithmetic is in use, and under `f32` proves the
+pin bit-exact. Each "model loaded" log line records the outcome per model: operations pinned, and
+algorithms rewritten or stripped.
 
 `runtime.executable_cache` (default `true`) stores every compiled program under the bundle's
 `.cache/` directory and loads it on later starts, turning a 5 to 30 second compile per program into
 a load of well under 100 ms. Entries are partitioned by the Reactant_jll build, the platform, and
 the device kind and compute capability, none of which XLA checks on load, and named by the MLIR
-source's content hash. `.cache/mlir_hashes.json` records the hash of every `model*.mlir`; a module
+source's content hash and a hash of the compile options (including `xla_flags` and `autotune`) and
+the numerics policy, so changing any of those compiles fresh. `.cache/mlir_hashes.json` records the hash of every `model*.mlir`; a module
 whose content changes has its programs dropped on the next load, while a weights-only update keeps
 them. The directory watcher never reacts to anything under `.cache/`, so cache writes cannot reload
 the model that produced them. The bundle directory must be writable by the worker; when it is not,
@@ -133,34 +121,37 @@ the cache logs a warning and every program is compiled as before.
 `runtime.batch_sizes` selects which of a bundle's compiled batch sizes are loaded. `all` (the
 default) loads every `model.b{N}.mlir` the manifest declares, and the scheduler picks the largest
 size a dispatch can fill. `largest` loads only the largest declared size, per input-shape variant,
-and never reads the others (they need not even be present). Every dispatch then runs that one
-program, padded with zero rows when fewer requests are queued and sliced back per request, so a
-row's result no longer depends on how many other requests were coalesced with it; the cost is the
-full batch's compute on every dispatch, including a lone one-row request. Unbatched bundles are
-unaffected. Workers with different settings can share a bundle directory: a `largest` worker keeps
-the cached programs of the sizes it skipped.
+and never reads the others (they need not be present); every dispatch runs that program, padded
+with zero rows and sliced back per request. Unbatched bundles are unaffected. Workers with
+different settings can share a bundle directory.
 
 `runtime.xla_flags` is a mapping of XLA `DebugOptions` field names (no leading `--`) to values,
 applied to every compile. At startup each name is checked against the XLA linked into the worker
 and each value against the field's type (booleans, integers, numbers, strings, and enum fields by
-enumerator name), so a typo fails startup instead of being ignored. The flags are part of the
-executable cache key. An explicit `xla_gpu_autotune_level` here wins over `autotune: false`.
+enumerator name), so a typo fails startup instead of being ignored. An explicit
+`xla_gpu_autotune_level` here wins over `autotune: false`.
 
 `runtime.profile` applies a named set of defaults. `regulated` defaults `batch_sizes` to
 `largest` and adds `xla_gpu_exclude_nondeterministic_ops: true` to `xla_flags`; anything set
-explicitly wins, so `batch_sizes: all` or `xla_gpu_exclude_nondeterministic_ops: false` turns a
-piece back off. The profile does not change `numerics`; set `f32` or `tf32` to match what the
-deployment was validated on. The worker states the precision prominently at startup: a bannered
-info line under `f32` or `tf32`, both of which are attested by the startup probe, and a bannered
-warning under `auto`, naming the precision actually in effect on its device (TF32 on Ampere and
-newer, full f32 on older GPUs), because `auto` guarantees neither. [Reproducibility & Regulated Use](reproducibility.md)
-explains what each of these settings controls and how to validate a deployment around them.
+explicitly wins. It does not change `numerics`.
 
-`model_control_mode` sets how the loaded model set evolves: `dynamic` (the default) watches the
-repository and loads, unloads, reloads, and renames bundles online as files change (a renamed
-directory with unchanged contents renames the model in place, no recompile); `static` fixes the
-startup set; `explicit` cedes the lifecycle to an external control plane via the worker control
-RPCs. `model_poll_seconds` is the repository poll interval in `dynamic` mode.
+[Reproducibility & Regulated Use](reproducibility.md) explains how `numerics`, `batch_sizes`,
+`executable_cache`, `xla_flags`, and `profile` affect a model's outputs, and which values a
+validated deployment should use.
+
+`model_control_mode` sets how the loaded model set evolves:
+
+- `dynamic` (the default) watches the repository and loads, unloads, and reloads bundles online as
+  their files change, including the weights, the MLIR, the manifest, and `model.jl`. A bundle must
+  look the same on two consecutive polls before it loads, so a half-written bundle never does, and
+  a reload swaps one model while every other model keeps serving. A renamed directory with
+  unchanged contents renames the live model in place, without recompiling.
+- `static` loads the startup set once and never changes it.
+- `explicit` cedes the lifecycle to an external control plane: the worker takes no action of its
+  own, and a model serves only while the control plane holds it resident through the worker
+  control RPCs (`ModelControlStatus`, `SetModelResidency`, `SetModelPolicy`).
+
+`model_poll_seconds` is the repository poll interval in `dynamic` mode.
 
 `runtime.device_ordinal` is not something you normally set here: the node resolution derives it
 from the worker's `gpu:` key (defaulting to 0), and under the supervisor each worker sees a
@@ -200,18 +191,13 @@ workers:
   - { name: worker1 }
 ```
 
-`name` is the routing identity (and, under Docker, the compose service name). The listen port is
+`name` is the worker's identity in logs, metrics, and the `models:` map. The listen port is
 `base_port + index` unless the worker sets an explicit `port:`. A worker entry may also carry
 override blocks (for example a `runtime:` block) that deep-merge over `global:`.
 
-Under the supervisor you do not assign GPUs yourself: it detects the visible devices, gives each
-worker one of them, and sets that worker's own `CUDA_VISIBLE_DEVICES`, so every worker sees a
-single GPU at ordinal 0. Influence the assignment with the top-level `gpus:` key (`auto`, a
-count, or an explicit device list), the `REACTANT_GPUS` environment variable, or by adding
-`gpu: N` to a worker entry to pin it to a specific visible device. A host-level
-`CUDA_VISIBLE_DEVICES` acts as a coarse filter on which physical GPUs the supervisor sees (see
-[Deployment](deployment.md)). Running a single worker by hand without the supervisor (a bare
-`serve`), the worker uses device ordinal 0, or `gpu: N` to pick another.
+`gpu: N` pins a worker to a specific visible device. Under the supervisor, devices are otherwise
+assigned in order ([Deployment](deployment.md) describes how they are detected); a worker run by
+hand with `serve` uses device 0 unless it sets `gpu:`.
 
 ## Device pinning (the `models:` map)
 
@@ -291,8 +277,8 @@ scheduling:
   default_replicas: 1             # GPUs per model (a number, or "all")
   routing_fill_mode: run          # run (default) | spread | inflight
 endpoints:                        # worker host:port addresses, across any number of nodes
-  - "worker0:8080"
-  - "worker1:8081"
+  - "10.0.0.1:8080"
+  - "10.0.0.2:8080"
 ```
 
 The gateway is also configured by `REACTANT_GATEWAY_*` environment overrides
@@ -354,9 +340,3 @@ overrides were applied, is logged at startup.
 | `INFERENCE_SERVER_ENDPOINTS_MAX_CONCURRENT_REQUESTS` | `endpoints.max_concurrent_requests` | integer |
 | `INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES` | `grpc.max_recv_msg_bytes` | bytes |
 | `INFERENCE_SERVER_GRPC_MAX_SEND_MSG_BYTES` | `grpc.max_send_msg_bytes` | bytes |
-
-Removed keys fail loudly rather than being silently ignored: a `batch_policy` block or a
-`runtime.residency_mode` key is rejected at startup with a migration error naming the
-replacement (`scheduler.models.<name>.max_batch_size` and the top-level `model_control_mode`,
-respectively), and the same applies to their `INFERENCE_SERVER_BATCH_POLICY_*` and
-`INFERENCE_SERVER_RUNTIME_RESIDENCY_MODE` environment overrides.

@@ -15,12 +15,42 @@ using Documenter
 using DocumenterCodeBlocks
 using DocumenterLandingPage
 using Dates
+using Literate
 using ReactantServer
 using ReactantServerClient
 using ReactantServerCore
 using ReactantServerExport
 using ReactantServerGateway
 using ReactantServerNode
+
+# The Julia tutorials are Literate scripts under integration/tutorials/, which the integration
+# suite (integration/runtests.jl) runs in CI, so every page shows code that is tested as written.
+# They are rendered to markdown here without being executed (running them starts servers and
+# compiles XLA programs). `#src` lines (the scripts' test assertions and process cleanup) are
+# dropped, and the fences become plain `julia` blocks so Documenter does not try to run them.
+# Export and Run Inference render into docs/src/tutorials/, the serving tutorials into
+# docs/src/tutorials/julia/ beside the hand-written pages; the rendered files are gitignored, and
+# EditURL points the "Edit on GitHub" link at the script.
+const TOP_TUTORIALS = ["export", "inference"]
+const JULIA_TUTORIALS = [
+    "Serve a Model" => "serve",
+    "Run a Node" => "node",
+    "Front Workers with a Gateway" => "gateway",
+]
+let src = joinpath(@__DIR__, "..", "integration", "tutorials")
+    for (out, names) in (
+            joinpath(@__DIR__, "src", "tutorials") => TOP_TUTORIALS,
+            joinpath(@__DIR__, "src", "tutorials", "julia") => last.(JULIA_TUTORIALS),
+        )
+        for name in names
+            Literate.markdown(
+                joinpath(src, "$name.jl"), out;
+                flavor = Literate.DocumenterFlavor(), execute = false, credit = false,
+                codefence = "```julia" => "```"
+            )
+        end
+    end
+end
 
 makedocs(;
     sitename = "ReactantServer.jl",
@@ -63,9 +93,19 @@ makedocs(;
     # Sections nest in the sidebar; the files stay flat under docs/src so page URLs do not move.
     pages = [
         "Home" => "index.md",
-        "Getting Started" => [
-            "Tutorial" => "tutorial.md",
-            "Deployment Shapes" => "deployment_shapes.md",
+        "Tutorials" => [
+            "Overview" => "tutorials/index.md",
+            "Export a Model" => "tutorials/export.md",
+            "Serve from Julia" => [
+                [title => "tutorials/julia/$name.md" for (title, name) in JULIA_TUTORIALS]...,
+                "Serve an Object Detector" => "tutorials/julia/object_detection.md",
+                "Serve Transformer Text Models" => "tutorials/julia/transformers.md",
+            ],
+            "Serve with the Container" => [
+                "Serve on One GPU" => "tutorials/container/single_gpu.md",
+                "Scale to Many GPUs" => "tutorials/container/multi_gpu.md",
+            ],
+            "Run Inference" => "tutorials/inference.md",
         ],
         "Building Models" => [
             "Bundles" => "bundles.md",

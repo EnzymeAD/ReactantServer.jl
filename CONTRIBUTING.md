@@ -1,7 +1,7 @@
 # Contributing
 
 Developer notes for working on ReactantServer.jl. For using the server, start with
-the [Tutorial](docs/src/tutorial.md).
+the [tutorials](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/).
 
 After cloning, instantiate the workspace (dependencies resolve from the package registries,
 plus the tree-internal path sources):
@@ -44,6 +44,31 @@ shutdown:
 bash packages/ReactantServer/test/e2e/run_e2e_cpu.sh
 ```
 
+### Integration tests are the tutorials
+
+The Julia tutorials (Basics and Serve from Julia) are Literate scripts under
+`integration/tutorials/`, and the
+`integration/` environment holds every package a user installs (path-sourced from this tree). Each
+script is both a docs page (rendered by `docs/make.jl`) and an integration test: `runtests.jl` runs
+each one top to bottom in a fresh process and working directory, on CPU, and CI runs it on Linux
+and macOS whenever a package it composes changes.
+
+```
+julia --project=integration -e 'using Pkg; Pkg.instantiate()'
+julia --project=integration integration/runtests.jl          # every tutorial
+julia --project=integration integration/runtests.jl gateway  # one of them
+```
+
+A line ending in `#src` runs in the test but is left out of the rendered page; that is where the
+assertions (`@test`) and test-only cleanup go. Everything else is what the reader sees and runs,
+so keep it as a user would write it.
+
+The two worked-example tutorials (Object Detection and Transformers) run their scripts under
+`examples/` and need torch and network access, so they are not part of `runtests.jl`.
+`bash integration/run_example.sh object_detection` (or `transformers`) runs one end to end on the
+CPU, exactly as its tutorial page describes; CI runs both only when a PR carries the
+`ci:tutorials-full` label.
+
 ## Formatting
 
 [Runic.jl](https://github.com/fredrikekre/Runic.jl) is the formatter. Runic has **no
@@ -75,8 +100,8 @@ useful for CI):
 runic --check .
 ```
 
-A pre-commit hook runs `runic --inplace packages docs examples tools deploy` and re-stages the formatted
-files, so commits never ship unformatted code. `.git/hooks/` is machine-local and not versioned;
+A pre-commit hook runs `runic --inplace packages docs examples integration tools deploy` and
+re-stages the formatted files, so commits never ship unformatted code. `.git/hooks/` is machine-local and not versioned;
 (re)install the hook in a fresh clone with:
 
 ```
@@ -207,6 +232,12 @@ julia --project=docs docs/make.jl
 ```
 
 Output lands in `docs/build/`.
+
+Usage lives in the tutorials, and only there: the Julia ones under `integration/tutorials/` (run
+in CI), and the worked examples and container ones under `docs/src/tutorials/`. Reference pages document configuration
+keys, API contracts, and behavior, and link to the tutorial that shows how to use them, so there
+is one maintained copy of every walkthrough. Package READMEs describe the package and link to the
+docs, with no code.
 
 The landing page's `@raw html` frontmatter in `docs/src/index.md` is the single
 source of truth for the hero and tile copy; it is the same VitePress `home`

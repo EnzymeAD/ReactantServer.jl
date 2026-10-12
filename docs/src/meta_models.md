@@ -109,7 +109,7 @@ Client --infer(two_stage)--> Gateway
 
 ## How it interacts with batch scheduling
 
-A meta no longer holds the GPU for its whole run. Each stage is an ordinary dispatch on the loop,
+A meta does not hold the GPU for its whole run. Each stage is an ordinary dispatch on the loop,
 so the GPU is occupied only while a stage actually computes and is free during the meta's CPU glue,
 when the loop serves other models. The trade is the gate: while a meta holds its permit, a second
 meta on the same worker waits (its stages cannot start), though the GPU is not wasted because

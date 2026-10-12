@@ -163,113 +163,35 @@ implementation, for both convention sets, on synthetic stage outputs.
 
 ## Runnable example
 
-`examples/object_detection/` in the repository is a complete, runnable version of this walkthrough:
-export a torchvision Faster R-CNN pretrained on COCO into one StableHLO bundle, serve it on a single
-GPU, send an image, and draw the predicted boxes + COCO labels back onto it with CairoMakie
-(`detections.jpg`). The demo model is named `object_detector`, configured by
-`examples/object_detection/detector.convert.yaml`:
-
-```yaml
-output_root: bundles
-report_path: bundles/conversion_report.md
-
-handlers:
-  - file: ../../tools/handlers/torchvision_frcnn_detector.jl
-    models: [object_detector]
-    options:
-      weights: DEFAULT     # pretrained COCO weights (downloaded by torchvision on first export)
-      num_classes: 91      # COCO classes including background
-      image_size: 640      # canonical square input edge (divisible by 64)
-      input_dtype: u8      # client sends a uint8 image; stage1 bakes /255 + ImageNet normalize
-      output_cols: 6       # per detection: [x1, y1, x2, y2, score, class]
-```
-
-The example is split into three single-purpose Julia environments so each loads only what it needs
-(and they stop invalidating each other's precompilation): **export** is the only one with PythonCall
-+ torch, **server** is the only one with Reactant, and **client** has CairoMakie but no Reactant.
-Each environment resolves independently the first time you use it:
-
-```text
-for env in export server client; do
-  julia --project=examples/object_detection/$env -e 'using Pkg; Pkg.instantiate()'
-done
-```
-
-Then run the three steps in order (the server stays running; drive it from a second terminal):
-
-```text
-# 1. Export the bundle (first time only; writes ./bundles/). Needs network for the COCO weights.
-julia --project=examples/object_detection/export \
-    examples/object_detection/export/export.jl
-
-# 2. Serve on a single GPU (blocks; Ctrl-C to stop). Add --cpu for a GPU-free smoke test.
-CUDA_VISIBLE_DEVICES=0 julia --project=examples/object_detection/server \
-    examples/object_detection/server/serve.jl
-
-# 3. In another terminal: send an image and draw the result -> ./detections.jpg
-julia --project=examples/object_detection/client \
-    examples/object_detection/client/detect.jl
-```
-
-Pass your own image to step 3 as the first argument (a local path). The server port defaults to
-8080; set `OD_PORT` (and `OD_HOST` for the client) to change it on both step 2 and step 3.
-
-### Export
-
-`export/export.jl` drives the shared converter in-process, so torch imports before Reactant (the
-converter's required order), and writes the `object_detector` bundle under
-`examples/object_detection/bundles/`. It skips conversion when the bundle already exists (delete the
-`bundles/` dir to re-export). The pretrained COCO weights are downloaded by torchvision on the first
-run, so export needs network. On corporate networks `export.jl` points Python's TLS at the OS CA
-bundle (`SSL_CERT_FILE`, defaulting from `REQUESTS_CA_BUNDLE`/`CURL_CA_BUNDLE`/
-`JULIA_SSL_CA_ROOTS_PATH` or `/etc/ssl/certs/ca-certificates.crt`) so the weight download trusts a
-MitM proxy's CA. The Python dependencies are export-only: torch/torchax/jax come from
-`ReactantServerExport`'s CondaPkg and `torchvision` from `export/CondaPkg.toml`; CondaPkg resolves
-and installs them on the first export.
-
-### Serve
-
-`server/serve.jl` serves the `object_detector` bundle on `127.0.0.1:$OD_PORT` (default 8080) and
-blocks until Ctrl-C. Pass `--cpu` to use `ReactantServer.CPU_BACKEND` for a GPU-free smoke test;
-otherwise it uses `ReactantServer.CUDA_BACKEND`.
-
-### Client
-
-`client/detect.jl` connects to the running server with the ReactantServerClient library (no Reactant
-and no PythonCall, so it loads fast). It resizes the image to 640x640 (matching the export
-`image_size`), sends it as `INPUT__0` through `infer_sync`, reads `OUTPUT__0` as Float32, draws the
-boxes and labels with CairoMakie, and writes `examples/object_detection/detections.jpg`. With no
-image argument it downloads a default object-rich test photo
-(`https://ultralytics.com/images/bus.jpg`). Each output row is `[x1, y1, x2, y2, score, class]`,
-boxes in the 640x640 input pixel space, `class` a COCO id mapped to a name through the COCO
-`categories` table in `detect.jl`. The model bakes a 0.05 score threshold; the client
-additionally only draws detections scoring at least 0.5.
+`examples/object_detection/` in the repository exports a torchvision Faster R-CNN pretrained on
+COCO into one bundle this way, serves it, and draws its detections on an image.
+[Serve an Object Detector](tutorials/julia/object_detection.md) walks through running it.
 
 ## Reactant tracing pitfalls
 
-Each of these cost an iteration while building the traced glue, and applies to any hand-written
-traced export:
+These apply to any hand-written traced export:
 
 - **A returned `reshape` wrapper is emitted with its parent's shape.** `reshape(x, 2, 4, 6, 1)` as a
-  function result produced an `(8, 6)` program output, and the server trusts the executable's shape,
+  function result produces an `(8, 6)` program output, and the server trusts the executable's shape,
   not the manifest. Materialize outputs with `Reactant.ReactantCore.materialize_traced_array`.
 - **`@trace while` bodies.** Loop-carried values must be distinct arrays (`copy` before the loop),
   and captured values must be materialized traced arrays, not `reshape` wrappers. Referencing a type
   parameter such as `T(0.5)` inside the body breaks the macro; hoist constants out of the loop.
-- **`map(1:n) do ... end` inside a trace failed;** plain `for` loops work.
-- **Matrix products.** A traced `A * B` fell back to generic LinearAlgebra in one context; use
+- **`map(1:n) do ... end` inside a trace fails;** plain `for` loops work.
+- **Matrix products.** A traced `A * B` can fall back to generic LinearAlgebra; use
   `Ops.dot_general`. Number constructors on traced scalars (`Float32(x)`, `Int64(x)`, `sign(x)`) are
   not traceable; use `Ops.convert(TracedRArray{Int64, N}, x)` and `ifelse`.
 - **Sorting.** `Base.sortperm` on traced arrays is not stable; use `Ops.sort(...; is_stable=true)`
   with an index operand where tie order matters.
 - **Gathers.** `A[:, idx]` needs `idx` to be a materialized traced `Int64` vector.
-- **Per-shape constants add up.** Baking anchor grids as Float64 constants added about 200 MB to a
-  15-variant bundle; build such grids in the program from iotas instead.
+- **Per-shape constants add up.** A constant is baked into every shape variant's program; build
+  large ones, such as anchor grids, inside the program from iotas instead.
 
 ## See also
 
 - [Bundles & model.jl](bundles.md) for the plain bundle path, the manifest encoding, and the
   fixed-size buffer + trim pattern
+- [Serve an Object Detector](tutorials/julia/object_detection.md) to run the example end to end
 - [Client Usage](client.md) for the client library the demo uses
 - `export_two_stage_detector`, `DetectorConfig`, and `read_stage_bundle` in the
   [API reference](api.md)

@@ -1,271 +1,72 @@
-# ReactantServer: Project Overview
+# Architecture
 
-## What it is
+This page describes how the pieces of ReactantServer fit together: the packages, the processes
+they run as, the path a request takes, and how weights reach a compiled program. Each component
+has its own page for the detail, linked from the section that introduces it.
 
-ReactantServer is a production inference server that serves many models compiled through
-Reactant.jl from a single Julia process on one GPU. Models are delivered as self-contained
-bundles (an MLIR module, its weights, and a manifest), compiled once through Reactant's PJRT
-bindings, and served over the KServe V2 inference API via gRPC, so standard Triton and KServe
-clients connect without changes. It serves compiled models, such as computer vision and
-scientific computing workloads, where many models share a GPU and one model executes at a time.
-Local serving of large language models, including models larger than device memory, is a goal of
-the project (see [Philosophy](philosophy.md)).
+## Packages
 
-The server is Reactant-centric, not XLA-specific: it runs whatever Reactant can lower to a device
-executable. Today that means StableHLO compiled by XLA — the only dialect and backend currently
-wired up, so in practice the focus is XLA — but the architecture is not bound to XLA, and any MLIR
-dialect Reactant exposes would serve the same way.
+The project is a Julia workspace of packages, split so that talking to a server never requires
+the Reactant and XLA stack:
 
-## Package layout
+- **ReactantServerCore**: the shared, Reactant-free code the other packages build on: the KServe
+  V2 messages and wire format, and the manifest and node file formats.
+- **ReactantServer**: the worker, and the only package that loads Reactant.
+- **ReactantServerGateway**: the reverse proxy that puts several workers behind one endpoint.
+- **ReactantServerClient**: the client. It is Reactant-free, so it installs on any machine that
+  sends requests.
+- **ReactantServerNode**: the node supervisor, which runs a machine's workers and gateway as
+  subprocesses.
+- **ReactantServerExport**: offline export of Lux and PyTorch models into bundles. It is not a
+  workspace member; the worker reads the bundles it writes, never the package.
 
-The project is a Julia workspace of five packages (plus the non-member `ReactantServerExport`
-for offline bundle export), split so that talking to a server never requires the heavy
-Reactant/XLA stack:
+The [API](../api.md) page lists every package's documented names.
 
-- **ReactantServerCore** — the shared, Reactant-free substrate: the dtype vocabulary, the
-  KServe V2 protobuf messages, the transport-agnostic boundary types, the manifest parser,
-  server/node config, the wire codec, the shared-memory registry, and the
-  concurrency-safe staging `BufferPool`. The other packages all build on it.
-- **ReactantServer** — the inference worker. It owns the model registry, the runtime, the
-  scheduler, and the KServe V2 gRPC server, and is the **only** package that loads Reactant.
-  Exports `serve`, `serve_worker`, `stop!`, `register_model`, `register_meta_model`.
-- **ReactantServerGateway** — the multi-GPU reverse proxy (`serve_gateway`,
-  `probe_worker_ready`). Builds only on Core and the gRPC layer; no Reactant.
-- **ReactantServerClient** — the inference client (`KServeModel`, `infer_sync`,
-  `infer_async`, `InferInput`, `InferOutput`). Also Reactant-free, so it installs on a plain
-  client machine. See [Client Usage](../client.md).
-- **ReactantServerNode** — the node supervisor (`supervise`). It detects the
-  visible GPUs and runs one worker subprocess per device, plus the embedded gateway when there
-  is more than one worker. Reactant-free (it only orchestrates subprocesses).
+## Processes
 
-The offline model-export tooling (`packages/ReactantServerExport`, with a PythonCall-triggered
-PyTorch extension) is not a workspace member; it produces bundles the worker consumes.
+A worker drives one device. It serves the full KServe V2 surface on its own, so a single worker
+needs nothing else.
 
-## What it aims to achieve
+A node with several devices runs one worker process per device, started and restarted by the node
+supervisor. With two or more workers the supervisor also starts a gateway process, which gives
+clients one endpoint and routes each model's requests to the workers that serve it. The gateway
+forwards inference requests as raw bytes and never decodes a tensor.
+[Deployment](../deployment.md) describes the supervisor, and [Multi-GPU Gateway](../gateway.md)
+describes how the gateway places models and routes requests.
 
-The project has one economic goal: serve the largest possible number of models per GPU at a
-given quality of service, while running each model as fast as the hardware allows. GPU memory
-is the dominant cost in inference infrastructure, so serving more models per card directly
-lowers cost per inference. Two technical levers deliver this:
+## A request's path
 
-1. **Fit more models on a GPU.** Weights do not all have to live on the GPU at once. The server
-   keeps every model's weights resident in host RAM and moves a model's weights onto the GPU
-   only when it is needed, evicting cold models to stay within a memory budget. This decouples
-   the number of servable models from GPU memory capacity.
-2. **Run each model faster with an ahead-of-time compiler.** Each model is compiled once into an
-   optimized executable (XLA today). The compiler performs whole-program optimization, fuses
-   kernels across operations, and plans memory layout, which makes execution significantly faster
-   than running the equivalent eager-mode graph. Small teams get compiler-grade performance
-   without building it themselves.
+1. A client sends a KServe V2 `ModelInfer` request. Tensors travel inline in the request or, when
+   client and worker share a host, in a shared-memory region the client registered beforehand
+   ([Client Usage](../client.md)).
+2. On a multi-worker node, the gateway picks a worker for the model and forwards the request.
+3. The worker decodes the request on the request's own task and runs the bundle's `preprocess`
+   hook there, if it has one, then queues the request with the scheduler.
+4. A single dispatch loop picks the next model to run, coalesces that model's queued requests into
+   one execution at a compiled batch size, and runs it on the device. The device runs one
+   execution at a time ([Scheduling](../scheduling.md)).
+5. Each request's task receives its slice of the output, runs the bundle's `postprocess` hook,
+   and encodes the response.
 
-The broader mission, the target audience, and the explicit non-goals are on the
-[Philosophy](philosophy.md) page. Operational and format details are in the
-[Tutorial](../tutorial.md) and
-[Node Configuration](../node_config.md) guides.
+Pre and postprocessing run on the request tasks rather than in the dispatch loop, so the CPU work
+of many requests runs in parallel with the device execution.
 
-## How it fits together
+A meta model replaces steps 3 to 5 with a Julia `run` hook that calls other models; each call
+re-enters the scheduler as an ordinary request ([Meta Models](../meta_models.md)).
 
-- **Bundles.** A model is a directory with `manifest.yaml`, one or more StableHLO modules
-  (`model.b{N}.mlir`, one per compiled batch size), a shared `weights.safetensors`, and an
-  optional `model.jl` for pre/post-processing. Bundles are produced by offline conversion
-  tooling from Lux or PyTorch models and loaded at server startup.
-- **One process per GPU, one supervisor per node.** Each worker drives a single GPU, holds a
-  single shared memory pool, and serves the full KServe V2 gRPC surface on its own. A node
-  supervisor (`ReactantServerNode`) runs the whole node from one process: it detects the
-  visible GPUs and starts one worker process per device. With a single worker it binds that
-  worker to the public ports directly (no gateway); with two or more it also starts a thin
-  embedded gateway that gives clients one endpoint and routes each model's traffic across
-  workers, either uniformly (round robin) or by packing each model onto a fixed,
-  operator-configured number of GPUs with coalescing-aware routing (`lpt_packing`).
-  See the [Multi-GPU Gateway](../gateway.md) and
-  [Deployment](../deployment.md) guides.
-- **Weights as explicit arguments.** Weights are passed to the compiled executable as arguments
-  rather than baked into it. This is what makes on-demand loading and weight sharing across
-  batch sizes possible: compilation is independent of where the weights currently live.
+## Weights as arguments
 
-## Fitting more models on the GPU
-
-Because only one model executes at a time, the GPU does not need every model's weights resident
-simultaneously. The server organizes weights in two tiers:
-
-- **Host RAM (resident by default).** With the on-demand cache enabled, every model's weights
-  default to system-pinned: materialized once from disk into host RAM at startup and kept
-  there (`residency: unpinned` opts a model out). Host memory is plentiful and cheap relative
-  to GPU memory, so this costs little and removes disk from the hot path.
-- **GPU (managed working set).** Models marked as pinned keep their weights on the GPU for the
-  server's lifetime. Every other model is loaded onto the GPU on demand when a request arrives,
-  kept resident afterward so repeat requests are free, and evicted under a configured GPU byte
-  budget using a least-recently-used policy. Eviction frees the device memory immediately
-  through an explicit PJRT buffer release.
-
-Because the weights are already in RAM, an on-demand GPU load is a single host-to-device
-transfer rather than a reload from disk. In practice this is tens of milliseconds even for the
-largest models, which is the same order of magnitude as a single inference. The effect is that a
-GPU sized for a handful of models can serve a much larger catalog, paying a small transfer cost
-only when a cold model is first called.
+A bundle holds one compiled program per batch size and one set of weights
+([Bundles](../bundles.md)). The weights are passed to each program as arguments rather than
+compiled into it. That is what lets every batch size share one copy of the weights, and lets a
+worker move a model's weights onto the device when the model is needed and evict them when it is
+not, without recompiling ([On-demand Weights](../on_demand_weights.md)).
 
 ## Model lifecycle
 
-How the set of loaded models changes over a worker's lifetime is set by `model_control_mode`
-(mirroring Triton's model control modes):
+The set of models a worker serves can change while it runs. By default the worker watches the
+model repository and loads, reloads, and unloads bundles as they change; the `model_control_mode`
+key in [Node Configuration](../node_config.md) chooses between that, a fixed startup set, and
+control by an external system over gRPC.
 
-- **`dynamic`** (the default) watches the model repository and reconciles continuously: new
-  bundles are loaded, removed bundles are unloaded, and changed bundles are reloaded. Change
-  detection covers the weights, the MLIR, the manifest, and the bundle's `model.jl`, so
-  updating a model's weights or its Julia pre/post-processing is just writing the files. A
-  two-poll debounce keeps half-written bundles from loading, and a reload swaps one model
-  atomically while every other model keeps serving. A renamed bundle directory (same inode,
-  unchanged contents, e.g. a registry promotion from `model-staging` to `model-production`)
-  is recognized as a rename and applied in place: the live model is rekeyed under the new
-  name with its compiled executables and resident weights intact, so only new or changed
-  bundles ever compile.
-- **`static`** loads the startup set once and never changes it.
-- **`explicit`** cedes the lifecycle to an external control plane: the worker takes no
-  autonomous action, and model residency is driven entirely over a small gRPC control surface
-  (`ModelControlStatus` to observe, `SetModelResidency` to pin and unpin, `SetModelPolicy` to
-  adjust scheduling weight). A model serves only while the control plane holds it resident.
-  This is the integration seam for organizations that run their own placement logic. The gateway
-  exposes a separate service for its own placement decisions (`GatewayControlService`: read the
-  scheduling state, change a model's replica count or fill mode, retune the knobs, force a repack),
-  so worker residency and gateway placement stay independently controllable.
-
-## The scheduler
-
-The scheduler is the component that decides, each time the GPU is free, which model to run next
-and how many queued requests to serve in one execution. It coalesces queued requests and
-dispatches one model at a time under a configurable inter-model `discipline`, runs on top of the
-language task scheduler, and adds no threading of its own. Exactly one GPU execution runs at a
-time by design, which keeps memory and concurrency reasoning simple and is what makes the
-single-resident-model strategy above safe.
-
-Three disciplines are supported. `fair` (the default) is a deficit-weighted, cost-aware share that
-balances GPU time across models on the worker. `fifo` ignores per-model weights and serves in
-global arrival order; it is the right choice when the worker sits behind a gateway running
-`lpt_packing`, which moves the placement decisions upstream (the two would otherwise
-fight). `edf` (earliest-deadline-first) serves the model whose most urgent queued request has the
-soonest deadline, so latency-bounded work, notably meta sub-calls, is not starved under load; with
-equal deadlines it reduces to `fifo`. Coalescing applies under all three.
-
-### Structure
-
-Requests arrive concurrently over gRPC, each on its own task. A request's `preprocess` hook runs
-on that task before the request is queued, so it is queued already executable-ready; the request
-becomes visible to the dispatch loop only after preprocess has returned. A single dispatch loop
-then selects the next model, coalesces that model's queued requests into one execution at a
-compiled batch size, runs it, and hands each caller back its raw output slice; the caller's task
-runs the `postprocess` hook on that slice. One lock guards the queues and the per-model statistics
-and wakes the loop when work arrives. The loop holds the lock only to select and dequeue; the GPU
-execution runs outside the lock, so new requests keep arriving during a running inference.
-
-Because the hooks run on the per-request tasks rather than on the dispatch loop, the CPU-side
-pre/post work of many requests proceeds in parallel and overlaps the single, serialized GPU
-execution: while the loop runs one model on the GPU, other requests are being pre/post-processed
-on other threads, and the loop runs no `model.jl` code itself. The GPU still executes exactly one
-model at a time (that is solely a property of the single loop). Realizing the overlap needs more
-than one OS thread; the supervisor starts each worker with a bounded share of the host
-(`min(cores ÷ workers, 16)` compute threads plus one interactive thread, overridable via
-`REACTANT_WORKER_THREADS`, so co-located workers do not oversubscribe the CPU) and the loop runs
-on the lone interactive thread so a blocking GPU call never starves it of CPU. (A bare
-`ReactantServer.serve` uses whatever `--threads` you pass.)
-
-### Decision order
-
-Each time the GPU frees up, the scheduler decides in this order:
-
-1. **Dispatch a committed meta sub-call first, if one is pending.** A meta model's orchestration
-   (see [Meta models](#meta-models) below) runs off the dispatch loop and re-enters the scheduler
-   for each sub-call; those continuations are *committed* and jump ahead of the discipline scan, at
-   most one per in-flight meta, so a meta already in progress is not stalled behind newly arrived
-   work.
-2. **Otherwise select the next model**, according to the configured `discipline`. Under `fair` (the
-   default), each model has a relative weight that defines its share of compute; the scheduler
-   tracks a decaying exponential moving average of how much GPU time each model has recently
-   consumed, and scores every model with a non-empty queue by how far below its share it is,
-   divided by its estimated cost. A model that has used less than its share recently scores
-   higher, and dividing by cost stops an expensive model from blocking cheaper ones on a marginal
-   edge; a clamp bounds both lockout and domination. Under `fifo`, weights are ignored and the
-   model with the oldest queued request wins (chosen behind an `lpt_packing` gateway, as above).
-   Under `edf`, the model whose most urgent queued request has the soonest deadline wins.
-3. **Coalesce the winner.** The selected model's queued requests are taken in FIFO order and
-   packed into the largest compiled batch size that fits, padding a partial batch up to the
-   smallest size when needed and always making forward progress on at least the oldest request.
-   The remainder stays queued for the next round.
-
-Requests may carry a latency deadline. Expired requests are dropped at admission, before any GPU
-work and never interrupting a running execution; under `edf` a laxity margin also sheds requests
-predicted to miss, so the GPU is not spent on work that will be late anyway (committed meta
-sub-calls honor the hard deadline but skip the predictive drop). See [Meta models](#meta-models)
-for how a meta propagates its remaining budget to the sub-calls it issues.
-
-### Cost learning and coalescing
-
-The scheduler measures the real GPU time of each execution and refines a per-batch-size cost
-estimate with an exponential moving average, seeded by a warmup pass at startup so the first
-real requests are scheduled sensibly. Coalescing concatenates the inputs of several same-model
-requests along the batch axis into one execution, then slices the outputs back per caller. Only
-models whose inputs and outputs carry a batch axis are coalesced; others serve one request per
-dispatch. A model compiled for several input shapes (aspect-ratio variants) keeps one executable
-set per variant over a single shared set of weights, and only requests resolving to the same
-variant coalesce together, since different input shapes cannot be concatenated along the batch
-axis.
-
-Coalescing has an inverse for requests that are individually too large: a request whose batch
-exceeds the largest compiled size for its shape variant is split into pieces the model can run
-before it is queued, the pieces are submitted as separate requests (so they coalesce with each
-other and with other traffic exactly as separate requests would, under the whole request's
-deadline), and the outputs are joined back along each output's batch axis and post-processed
-once. Splitting requires the `preprocess` hook to keep one client row per executable row and
-every executable output to carry a batch axis; a request that cannot be split soundly runs whole
-as before.
-
-Coalescing is the throughput lever. Packing many requests into one execution amortizes the fixed
-per-launch overhead and, for a model that had to be loaded on demand, the one-time weight
-transfer, across every image in the batch. On a representative compute-heavy model, per-image
-latency drops by roughly three times from batch 1 to batch 32 while images per second more than
-triples.
-
-### Configuration and observability
-
-Per model, operators set a relative weight (used by the `fair` discipline), the residency floor,
-and whether the model is pinned to the GPU. Globally they set the `discipline`, the
-recent-compute half-life and a coalescing cost discount (both `fair`-only), the cost estimate
-smoothing, a per-model maximum queue depth, and the GPU weight-cache byte budget. Configuration
-is typed YAML with environment-variable overrides. The scheduler exposes per-model metrics:
-dispatch count, total compute, current recent-compute load, queue depth, queue-wait percentiles,
-and the histogram of coalesced batch sizes, plus weight cache residency and load/evict counters.
-
-### Meta models
-
-Meta models are experimental and their design is subject to change. A `kind: meta` bundle does not
-wrap a single executable. Its `model.jl` registers a `run` hook that chains several ordinary models
-with data-dependent Julia between the stages, for logic with no fixed-shape form. The
-orchestration runs on the request task, off the dispatch loop, under a gate that admits one meta at
-a time by default so meta glue never blocks the GPU; each sub-call it makes re-enters the scheduler
-as a committed request (step 1 of the decision order above) and is dispatched and coalesced like
-any other work. The meta's remaining deadline budget rides along to those sub-calls. Two-stage
-detectors, the original motivating case, no longer need it: their proposal selection, NMS, and
-ROIAlign have fixed-shape forms and compile into one program (see
-[Object Detection](../object_detection.md)). See [Meta Models](../meta_models.md) for the full
-model.
-
-## The compiler advantage
-
-Serving static graphs through an ahead-of-time compiler is the project's second source of
-leverage. Reactant lowers each model to an MLIR module that is compiled once into a device
-executable; today that is StableHLO compiled by XLA. The compiler optimizes the whole program
-rather than one operation at a time: it fuses adjacent operations into single kernels, eliminates
-redundant work, and plans tensor layouts for the target device. The result
-executes substantially faster than the same model run eagerly, and the cost is paid once at
-startup rather than on every request. A bundle may carry several compiled batch sizes that share
-one set of weights, so the scheduler can pick the executable that matches each coalesced batch
-without duplicating parameters.
-
-## Scope
-
-ReactantServer is opinionated about its design point. It is for small and mid-size engineering
-organizations that need efficient inference on compiled models and that measure their own systems:
-many models per GPU today, and, as the project's LLM direction, models larger than a GPU served
-locally by splitting them into compiled stages and streaming their weights from storage. It is
-Reactant-centric, currently focused on StableHLO/XLA, and it is infrastructure that its users
-operate themselves. The reasoning behind these choices is on the [Philosophy](philosophy.md)
-page.
+The project's goals, audience, and non-goals are on the [Philosophy](philosophy.md) page.

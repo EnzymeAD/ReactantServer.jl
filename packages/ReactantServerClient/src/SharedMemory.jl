@@ -217,8 +217,9 @@ end
 # Send the IsSameIPCNamespace probe and classify the answer. :yes / :no are the server's boolean;
 # :unknown means the server does not implement the RPC (UNIMPLEMENTED, e.g. stock Triton). Any
 # other gRPC error propagates: a probe that fails for an unrelated reason must not be silently
-# read as "no shared memory".
-function query_same_ipc_namespace(model::KServeModel, name::AbstractString; deadline = 10)
+# read as "no shared memory". The probe gets the model's own deadline, like every other call the
+# model makes; the background re-probe passes a shorter one.
+function query_same_ipc_namespace(model::KServeModel, name::AbstractString; deadline = model.deadline)
     client = grpc_is_same_ipc_namespace_client(model; deadline = deadline)
     try
         resp = grpc_sync_request(client, IsSameIPCNamespaceRequest(name = name))

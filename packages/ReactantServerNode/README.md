@@ -24,8 +24,9 @@ starting children that cannot load.
 
 Public entry point: `supervise`.
 
-Part of the [ReactantServer.jl](../../README.md) workspace. See
-[Deployment](https://enzymead.github.io/ReactantServer.jl/dev/deployment/) for how the supervisor
+Part of the [ReactantServer.jl](../../README.md) workspace. The
+[Run a Node](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/julia/node/) tutorial runs a two-worker node in one
+Julia environment. See [Deployment](https://enzymead.github.io/ReactantServer.jl/dev/deployment/) for how the supervisor
 turns a host and a node file into workers, and
 [Node Configuration](https://enzymead.github.io/ReactantServer.jl/dev/node_config/) for the node
 file itself.
