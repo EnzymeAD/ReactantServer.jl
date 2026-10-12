@@ -110,9 +110,8 @@ scheduling:
       replicas: 2          # this model on two GPUs
 ```
 
-Size replica counts against GPU memory: each replica puts the model's full weights on its GPU,
-and a GPU whose placed weights exceed its budget reloads weights on nearly every request. The
-gateway logs a warning at each repack when a placement does not fit.
+Each replica puts the model's full weights on its GPU, so size replica counts against GPU memory;
+the gateway warns at each repack when a placement does not fit.
 
 A running gateway can also be retuned without a restart, including a model's replica count, over
 its control plane. [Multi-GPU Gateway](../../gateway.md) documents every scheduling setting, the
