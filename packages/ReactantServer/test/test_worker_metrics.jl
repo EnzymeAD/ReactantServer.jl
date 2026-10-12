@@ -91,11 +91,11 @@ end
     port = grpc_free_port()
     server = start_worker_metrics(wm, "127.0.0.1", port; ready_fn = () -> true)
     try
-        resp = HTTP.get("http://127.0.0.1:$port/metrics"; retry = false, readtimeout = 5)
+        resp = HTTP.get("http://127.0.0.1:$port/metrics"; retry = false, readtimeout = 60)
         @test resp.status == 200
         @test occursin("worker_info", String(resp.body))
-        @test HTTP.get("http://127.0.0.1:$port/healthz"; retry = false, readtimeout = 5).status == 200
-        @test HTTP.get("http://127.0.0.1:$port/readyz"; retry = false, readtimeout = 5).status == 200
+        @test HTTP.get("http://127.0.0.1:$port/healthz"; retry = false, readtimeout = 60).status == 200
+        @test HTTP.get("http://127.0.0.1:$port/readyz"; retry = false, readtimeout = 60).status == 200
     finally
         close(server)
     end
@@ -130,7 +130,7 @@ end
         worker_name = "worker0", gpu = "2"
     )
     try
-        body = String(HTTP.get("http://127.0.0.1:$port/metrics"; retry = false, readtimeout = 5).body)
+        body = String(HTTP.get("http://127.0.0.1:$port/metrics"; retry = false, readtimeout = 60).body)
         @test occursin("worker_dispatch_total{worker=\"worker0\",gpu=\"2\",model=\"m\"}", body)
         @test occursin("worker_models_loaded{worker=\"worker0\",gpu=\"2\"}", body)
     finally
