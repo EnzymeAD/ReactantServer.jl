@@ -6,7 +6,7 @@ This document describes who the project is for, what it optimizes for, and where
 
 Make serving compiled models elegant: a hackable, Julia-first inference stack that maximizes the economic efficiency of GPU-based inference, built first for small and mid-size labs.
 
-The efficiency half is concrete. GPU memory accounts for roughly two thirds of GPU cost; serving infrastructure that wastes memory wastes money. For the foreseeable future that means serving the largest number of models per GPU at a given quality of service, and serving models larger than a GPU's memory on the hardware a lab already has. The elegance half is what makes that power usable by a small team: the whole stack is plain Julia, legible end to end, adoptable off the shelf, and open to being bent toward a workload nobody anticipated. The project's purpose is to give the people who care about both arguments the tools to act on them.
+The efficiency half is concrete. GPU memory is what limits how many models a GPU can serve, so serving infrastructure that wastes memory wastes money. For the foreseeable future that means serving the largest number of models per GPU at a given quality of service, and serving models larger than a GPU's memory on the hardware a lab already has. The elegance half is what makes that power usable by a small team: the whole stack is plain Julia, legible end to end, adoptable off the shelf, and open to being bent toward a workload nobody anticipated. The project's purpose is to give the people who care about both arguments the tools to act on them.
 
 ## Who this is for
 

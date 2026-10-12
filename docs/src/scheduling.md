@@ -212,11 +212,11 @@ whole and fails at execution with the shape error, as before. This mechanism is 
 ### Why coalescing is the throughput lever
 
 Packing many requests into one execution amortizes the fixed per-launch overhead and, for a model
-that had to be loaded on demand, the one-time weight transfer, across every item in the batch. On
-a representative compute-heavy model, per-image latency drops by roughly three times from batch 1
-to batch 32 while images per second more than triples. Coalescing is therefore the reason a
-worker can absorb bursts: concurrent requests pile onto a model's queue and the loop converts
-them into a small number of full dispatches instead of paying launch cost once per request.
+that had to be loaded on demand, the one-time weight transfer, across every item in the batch, so
+a full batch costs less per item than the same items run one at a time. Coalescing is therefore
+the reason a worker can absorb bursts: concurrent requests pile onto a model's queue and the loop
+converts them into a small number of full dispatches instead of paying launch cost once per
+request.
 
 ## Cost learning
 

@@ -135,19 +135,11 @@ on zeros:
 - **A model the gateway has not polled yet** counts as one item until the first successful poll,
   and under `compute` borrows the fleet-mean cost per item, so a cold model weighs like an
   average one instead of looking free and attracting every request.
-- **A meta** (`kind: meta`) deliberately reports no batch axis and counts one row per request,
-  even when its own `client_inputs` declare a batch axis. The two halves go together: rows equal
-  requests, so a meta's cost per item equals its cost per request, and a work-routing gateway
-  charges a meta its whole measured cost. Reporting an axis without also counting rows would
-  charge N times the per-request cost; counting rows without reporting an axis would divide the
-  cost by N and then charge one of them.
-
-A meta is also the clearest argument for `compute` over `items`. Its work is data-dependent (the
-glue between stages can vary per request, and it is not GPU time at all), so no
-item count predicts it, while under `items` the most expensive thing on the fleet would charge
-one unit and a cheap batched model would charge 32. Note that a meta's `total_compute` counts its
-sub-call GPU time only, and its sub-models are folded into it and hidden from the gateway, so
-that time is counted once rather than double counted.
+- **A meta** (`kind: meta`) reports no batch axis and counts one row per request, even when its
+  own `client_inputs` declare a batch axis, so a work-routing gateway charges each request the
+  meta's whole measured cost. That cost is the GPU time of its sub-calls, which are hidden from
+  the gateway, so it is counted once. Under `items` a meta charges one unit however expensive it
+  is, so fleets that serve metas should use `compute`.
 
 ### lpt_packing
 

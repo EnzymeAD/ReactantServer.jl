@@ -26,9 +26,8 @@ policy live on [Multi-GPU Gateway](gateway.md).
   (`ReactantServer.free_weights!`).
 
 Because the weights are already in RAM, an on-demand GPU load is a single host-to-device
-transfer (`ReactantServer.transfer_to_device`) rather than a reload from disk: tens of
-milliseconds even for the largest models, the same order of magnitude as a single
-inference.
+transfer (`ReactantServer.transfer_to_device`) rather than a reload from disk, so its cost is the
+model's weight size over the host-to-device bandwidth.
 
 ## Enabling it
 
