@@ -39,6 +39,14 @@ on:
         required: false
         type: string
         default: ''
+      coverage-flag:
+        description: >-
+          Codecov flag to upload the coverage under (declared in codecov.yml). Defaults to the
+          cache-name; set it when one suite runs as several jobs (an OS matrix) that should report
+          as one.
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -68,12 +76,12 @@ jobs:
         if: ${{ inputs.coverage-directories != '' }}
         with:
           directories: ${{ inputs.coverage-directories }}
-      # The suite name is the Codecov flag, so each package's coverage is tracked on its own and,
-      # with carryforward in codecov.yml, survives runs where its path filter skipped the suite.
+      # The suite name (or coverage-flag) is the Codecov flag, so each suite's coverage is tracked on
+      # its own and, with carryforward in codecov.yml, survives runs where its filter skipped it.
       - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         if: ${{ inputs.coverage-directories != '' }}
         with:
           files: lcov.info
-          flags: ${{ inputs.cache-name }}
+          flags: ${{ inputs.coverage-flag || inputs.cache-name }}
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false

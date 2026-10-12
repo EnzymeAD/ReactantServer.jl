@@ -27,6 +27,13 @@ case "$EXAMPLE" in
         exit 2 ;;
 esac
 
+# EXAMPLE_COVERAGE=true (set by CI) records line coverage of this tree's packages in the export,
+# serve, and client steps; a reader running the tutorial leaves it unset.
+COVERAGE=()
+if [[ "${EXAMPLE_COVERAGE:-}" == "true" ]]; then
+    COVERAGE=("--code-coverage=@$REPO_ROOT/packages")
+fi
+
 PORT="${!PORT_VAR:-8080}"
 export "$PORT_VAR=$PORT"
 READY_TIMEOUT="${EXAMPLE_READY_TIMEOUT:-3600}"
@@ -51,10 +58,10 @@ for env in export server client; do
 done
 
 echo "== [2/4] exporting =="
-julia --project="$DIR/export" "$EXPORT"
+julia ${COVERAGE[@]+"${COVERAGE[@]}"} --project="$DIR/export" "$EXPORT"
 
 echo "== [3/4] serving on the CPU (port $PORT) =="
-julia --project="$DIR/server" "$SERVE" --cpu > "$LOG" 2>&1 &
+julia ${COVERAGE[@]+"${COVERAGE[@]}"} --project="$DIR/server" "$SERVE" --cpu > "$LOG" 2>&1 &
 SERVER_PID=$!
 # The server opens its gRPC port only after every model has compiled, so an accepted connection
 # means it is ready.
@@ -75,7 +82,7 @@ done
 echo "   ready after ${SECONDS}s."
 
 echo "== [4/4] running the client =="
-if ! julia --project="$DIR/client" "$CLIENT"; then
+if ! julia ${COVERAGE[@]+"${COVERAGE[@]}"} --project="$DIR/client" "$CLIENT"; then
     echo "ERROR: the client failed; server log:"
     tail -80 "$LOG"
     exit 1
