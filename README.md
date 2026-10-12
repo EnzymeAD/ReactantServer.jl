@@ -2,6 +2,7 @@
 
 [![Documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://enzymead.github.io/ReactantServer.jl/dev/)
 [![CI](https://github.com/EnzymeAD/ReactantServer.jl/actions/workflows/ci.yml/badge.svg)](https://github.com/EnzymeAD/ReactantServer.jl/commits/main)
+[![Coverage](https://codecov.io/gh/EnzymeAD/ReactantServer.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/EnzymeAD/ReactantServer.jl)
 [![Julia 1.12](https://img.shields.io/badge/Julia-1.12-9558b2)](https://julialang.org)
 [![code style: runic](https://img.shields.io/badge/code_style-%E1%9A%B1%E1%9A%A2%E1%9A%BE%E1%9B%81%E1%9A%B2-black)](https://github.com/fredrikekre/Runic.jl)
 

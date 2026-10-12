@@ -12,6 +12,7 @@ module ReactantServerNode
 
 using ReactantServerCore
 import ReactantServerCore: ConfigError, _node_workers, _worker_name, _worker_port
+import TOML
 import YAML
 
 include("gpus.jl")

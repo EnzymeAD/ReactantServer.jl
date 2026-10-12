@@ -81,5 +81,5 @@ traced graph because they define the model's numeric output, not a presentation 
 - **CPU smoke test cache dir:** running the export or `serve.jl --cpu` outside Docker can hit an
   `EACCES` on Reactant's default compile cache; set a writable `REACTANT_CACHE_DIR` if so.
 - **This bundle contract** (manifest, `model.jl`, `client_inputs`/`client_outputs`) is documented
-  in the [Bundles & model.jl](../../docs/src/manual/bundles.md) manual page; the walkthrough is
-  [Transformer Text Models](../../docs/src/manual/transformers.md).
+  in the [Bundles & model.jl](https://enzymead.github.io/ReactantServer.jl/dev/bundles/) manual page; the walkthrough is
+  [Transformer Text Models](https://enzymead.github.io/ReactantServer.jl/dev/transformers/).

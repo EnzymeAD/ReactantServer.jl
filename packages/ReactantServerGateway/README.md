@@ -11,10 +11,6 @@ carries **no Reactant dependency** and deploys as a small, fast-starting image.
 
 Public entry points: `serve_gateway`, `probe_worker_ready`.
 
-```julia
-using ReactantServerGateway
-ReactantServerGateway.serve_gateway("examples/gateway.yml")
-```
-
-Part of the [ReactantServer.jl](../../README.md) workspace. See
-[Multi-GPU Gateway](../../docs/src/manual/multi_gpu_gateway.md).
+Part of the [ReactantServer.jl](../../README.md) workspace. See [Multi-GPU
+Gateway](https://enzymead.github.io/ReactantServer.jl/dev/gateway/) for what the gateway does, its
+scheduling modes, and its `gateway.yml` configuration.

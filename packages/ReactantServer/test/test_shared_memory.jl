@@ -9,10 +9,14 @@ const _ShmInf = ReactantServer.inference
 _sp(s) = _ShmInf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:string_param, String(s)))
 _ip(i) = _ShmInf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:int64_param, Int64(i)))
 
+# A unique POSIX shm name for this test process. macOS rejects names longer than PSHMNAMLEN
+# (31 bytes), so the PID and the random suffix are base-36: at most 18 bytes including the slash.
+_test_shm_key() = string("/rst-", string(getpid(); base = 36), "-", string(rand(UInt32); base = 36))
+
 # Create a POSIX shm region; returns (handle, key, byte-view). volatile=true so the handle
 # unlinks the object when finalized at the end of the test.
 function _make_region(nbytes::Int)
-    key = "/reactantserver-test-$(getpid())-$(rand(UInt32))"
+    key = _test_shm_key()
     shm = IPC.SharedMemory(key, nbytes)
     view = unsafe_wrap(Array, convert(Ptr{UInt8}, pointer(shm)), nbytes; own = false)
     fill!(view, 0x00)
@@ -83,7 +87,7 @@ end
         # The helper sees an object we created in this (the server's) own namespace.
         @test same_ipc_namespace(key) == true
         # Absent objects and empty names are "not same", never an error.
-        @test same_ipc_namespace("/reactantserver-test-no-such-object-$(getpid())") == false
+        @test same_ipc_namespace(string("/rst-none-", string(getpid(); base = 36))) == false
         @test same_ipc_namespace("") == false
 
         # The worker handler wraps the helper and returns an IsSameIPCNamespaceResponse.

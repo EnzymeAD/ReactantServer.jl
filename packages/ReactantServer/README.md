@@ -8,11 +8,8 @@ Public entry points: `serve`, `serve_worker`, `stop!`, `register_model`. It re-e
 shared API from [`ReactantServerCore`](../ReactantServerCore), so the substrate is reachable as
 `ReactantServer.X`.
 
-```julia
-using ReactantServer
-ReactantServer.serve("examples/node.yaml")                    # single worker
-ReactantServer.serve("examples/node.yaml"; worker="worker0")  # multi-worker
-```
-
-Part of the [ReactantServer.jl](../../README.md) workspace. See the docs for
-[Getting Started](../../docs/src/manual/getting_started.md).
+Part of the [ReactantServer.jl](../../README.md) workspace. To get started, follow the
+[Tutorial](https://enzymead.github.io/ReactantServer.jl/dev/tutorial/); the [Node
+Configuration](https://enzymead.github.io/ReactantServer.jl/dev/node_config/) and
+[Deployment](https://enzymead.github.io/ReactantServer.jl/dev/deployment/) pages cover how a worker
+is configured and run.

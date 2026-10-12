@@ -25,9 +25,132 @@ _node_yaml(dir; extra = "") = begin
     path
 end
 
-@testset "workspace root and child specs" begin
-    @test RSN.default_workspace_root(Dict("REACTANT_WORKSPACE_ROOT" => "/opt/rs")) == "/opt/rs"
+# A workspace root with just the member Project.toml files the supervisor launches children from,
+# which is all child_environment looks at; no child is ever spawned from it here.
+const STUB_ROOT = let root = mktempdir()
+    for pkg in ("ReactantServer", "ReactantServerGateway")
+        mkpath(joinpath(root, "packages", pkg))
+        touch(joinpath(root, "packages", pkg, "Project.toml"))
+    end
+    root
+end
 
+# A Pkg-style environment: a Project.toml declaring ReactantServerNode plus `packages`.
+function _pkg_env(packages)
+    dir = mktempdir()
+    deps = ["ReactantServerNode = \"49f09047-4fb9-4260-828b-8494ed8e9881\""]
+    for p in packages
+        push!(deps, "$p = \"$(RSN._CHILD_PACKAGE_UUIDS[p])\"")
+    end
+    file = joinpath(dir, "Project.toml")
+    write(file, "[deps]\n" * join(deps, "\n") * "\n")
+    return file
+end
+
+const BOTH = ["ReactantServer", "ReactantServerGateway"]
+
+@testset "child environment" begin
+    nowhere = joinpath(mktempdir(), "Project.toml")   # an active project with nothing around it
+
+    # Workspace shape: an explicit root, else REACTANT_WORKSPACE_ROOT, runs each child from its
+    # member project and leaves the load path alone (the container image).
+    ce = RSN.child_environment(BOTH; env = Dict("REACTANT_WORKSPACE_ROOT" => STUB_ROOT), active_project = nowhere)
+    @test ce.worker_project == joinpath(STUB_ROOT, "packages", "ReactantServer")
+    @test ce.gateway_project == joinpath(STUB_ROOT, "packages", "ReactantServerGateway")
+    @test ce.load_path === nothing
+    @test RSN.child_environment(BOTH; env = Dict{String, String}(), workspace_root = STUB_ROOT) ==
+        RSN.workspace_environment(STUB_ROOT)
+    # A root that is not a workspace is an error naming the variable, not a restart loop.
+    err = try
+        RSN.child_environment(BOTH; env = Dict("REACTANT_WORKSPACE_ROOT" => dirname(nowhere)))
+    catch e
+        e
+    end
+    @test err isa ReactantServerCore.ConfigError
+    @test occursin("REACTANT_WORKSPACE_ROOT", sprint(showerror, err))
+
+    # Environment shape: the supervisor's own environment declares the packages (the Pkg
+    # workflow), so every child runs in it, pinned to it plus the standard library.
+    env_file = _pkg_env(BOTH)
+    ce = RSN.child_environment(BOTH; env = Dict{String, String}(), active_project = env_file)
+    @test ce.worker_project == ce.gateway_project == dirname(env_file)
+    @test ce.load_path == (Sys.iswindows() ? "@;@stdlib" : "@:@stdlib")
+    # Only what the role needs is required.
+    server_only = _pkg_env(["ReactantServer"])
+    @test RSN.child_environment(["ReactantServer"]; env = Dict{String, String}(), active_project = server_only).load_path !== nothing
+    err = try
+        RSN.child_environment(BOTH; env = Dict{String, String}(), active_project = server_only)
+    catch e
+        e
+    end
+    @test err isa ReactantServerCore.ConfigError
+    @test occursin("add ReactantServer and ReactantServerGateway", sprint(showerror, err))
+    # A dependency is matched by UUID, not just by name.
+    wrong = joinpath(mktempdir(), "Project.toml")
+    write(wrong, "[deps]\nReactantServer = \"00000000-0000-0000-0000-000000000000\"\n")
+    @test_throws ReactantServerCore.ConfigError RSN.child_environment(
+        ["ReactantServer"]; env = Dict{String, String}(), active_project = wrong
+    )
+    # An explicit workspace still wins over a declaring environment.
+    @test RSN.child_environment(
+        BOTH; env = Dict("REACTANT_WORKSPACE_ROOT" => STUB_ROOT), active_project = env_file
+    ).load_path === nothing
+
+    # Checkout shape: the active project is the member project or the workspace root itself.
+    for proj in (joinpath(STUB_ROOT, "packages", "ReactantServerNode", "Project.toml"), joinpath(STUB_ROOT, "Project.toml"))
+        @test RSN.child_environment(BOTH; env = Dict{String, String}(), active_project = proj) ==
+            RSN.workspace_environment(STUB_ROOT)
+    end
+
+    # Nothing provides the packages: one error naming all three fixes.
+    err = try
+        RSN.child_environment(BOTH; env = Dict{String, String}(), active_project = nowhere)
+    catch e
+        e
+    end
+    @test err isa ReactantServerCore.ConfigError
+    msg = sprint(showerror, err)
+    @test occursin("add ReactantServer and ReactantServerGateway", msg)
+    @test occursin("checkout", msg)
+    @test occursin("REACTANT_WORKSPACE_ROOT", msg)
+
+    # The specs carry the environment shape: its project and the pinned load path.
+    ce = RSN.child_environment(BOTH; env = Dict{String, String}(), active_project = env_file)
+    w = RSN.worker_spec("worker0", "/run/node.yaml", nothing, ce)
+    @test any(==("--project=$(dirname(env_file))"), w.cmd.exec)
+    @test _envval(w.cmd, "JULIA_LOAD_PATH") == ce.load_path
+    g = RSN.gateway_spec(ce; endpoints = ["127.0.0.1:8080"])
+    @test any(==("--project=$(dirname(env_file))"), g.cmd.exec)
+    @test _envval(g.cmd, "JULIA_LOAD_PATH") == ce.load_path
+    # The workspace shape inherits the load path (addenv carries the parent's ENV, so it is whatever
+    # this process has, which under Pkg.test is set).
+    @test _envval(RSN.worker_spec("worker0", "/run/node.yaml", nothing, STUB_ROOT).cmd, "JULIA_LOAD_PATH") ==
+        get(ENV, "JULIA_LOAD_PATH", nothing)
+
+    # build_supervisor resolves by role and hands the result to every child.
+    mktempdir() do dir
+        path = _node_yaml(dir)
+        sup = RSN.build_supervisor(
+            path; env = Dict("REACTANT_GPUS" => "2"), sink = IOBuffer(),
+            active_project = env_file, runtime_dir = joinpath(dir, "run")
+        )
+        @test [c.spec.name for c in sup.children] == ["worker0", "worker1", "gateway"]
+        @test all(c -> _envval(c.spec.cmd, "JULIA_LOAD_PATH") == ce.load_path, sup.children)
+        @test all(c -> any(==("--project=$(dirname(env_file))"), c.spec.cmd.exec), sup.children)
+        # The workers role needs no gateway package; all does.
+        sup = RSN.build_supervisor(
+            path; role = :workers, env = Dict("REACTANT_GPUS" => "1"), sink = IOBuffer(),
+            active_project = server_only, runtime_dir = joinpath(dir, "runw")
+        )
+        @test [c.spec.name for c in sup.children] == ["worker0"]
+        @test_throws ReactantServerCore.ConfigError RSN.build_supervisor(
+            path; env = Dict("REACTANT_GPUS" => "1"), sink = IOBuffer(),
+            active_project = server_only, runtime_dir = joinpath(dir, "runa")
+        )
+    end
+end
+
+@testset "workspace root and child specs" begin
     spec = RSN.worker_spec("worker1", "/run/node.yaml", "1", "/opt/rs"; compute_threads = 8)
     @test spec.name == "worker1"
     @test _envval(spec.cmd, "REACTANT_WORKER_NAME") == "worker1"
@@ -110,7 +233,7 @@ end
         sink = IOBuffer()
         sup = RSN.build_supervisor(
             path; env = Dict("REACTANT_GPUS" => "2"), sink = sink,
-            workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "run")
+            workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "run")
         )
         names = [c.spec.name for c in sup.children]
         @test names == ["worker0", "worker1", "gateway"]
@@ -143,7 +266,7 @@ end
         sink = IOBuffer()
         sup = RSN.build_supervisor(
             path; env = Dict("REACTANT_GPUS" => "1"), sink = sink,
-            workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "run")
+            workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "run")
         )
         # No gateway child: the sole worker is the node's public endpoint.
         @test [c.spec.name for c in sup.children] == ["worker0"]
@@ -160,7 +283,7 @@ end
                 "REACTANT_GPUS" => "1", "REACTANT_GATEWAY_LISTEN_GRPC" => "0.0.0.0:7001",
                 "REACTANT_GATEWAY_LISTEN_METRICS" => "0.0.0.0:7002"
             ),
-            sink = IOBuffer(), workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "run2")
+            sink = IOBuffer(), workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "run2")
         )
         @test _envval(sup.children[1].spec.cmd, "INFERENCE_SERVER_ENDPOINTS_PORT") == "7001"
         @test _envval(sup.children[1].spec.cmd, "INFERENCE_SERVER_ENDPOINTS_METRICS_PORT") == "7002"
@@ -175,21 +298,21 @@ end
         sup = RSN.build_supervisor(
             path;
             env = Dict("REACTANT_GPUS" => "1", "REACTANT_ROLE" => "workers"),
-            sink = IOBuffer(), workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "runw")
+            sink = IOBuffer(), workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "runw")
         )
         @test [c.spec.name for c in sup.children] == ["worker0"]
 
         # gateway role: just the gateway, no node materialization (works without GPUs).
         sup = RSN.build_supervisor(
             path; role = :gateway, env = Dict{String, String}(),
-            sink = IOBuffer(), workspace_root = "/opt/rs"
+            sink = IOBuffer(), workspace_root = STUB_ROOT
         )
         @test [c.spec.name for c in sup.children] == ["gateway"]
 
         # CUDA node with zero devices is a hard error with guidance.
         @test_throws ReactantServerCore.ConfigError RSN.build_supervisor(
             path;
-            env = Dict("REACTANT_GPUS" => "0"), sink = IOBuffer(), workspace_root = "/opt/rs",
+            env = Dict("REACTANT_GPUS" => "0"), sink = IOBuffer(), workspace_root = STUB_ROOT,
             runtime_dir = joinpath(dir, "rune")
         )
 
@@ -197,14 +320,14 @@ end
         @test_throws ReactantServerCore.ConfigError RSN.build_supervisor(
             path;
             role = :everything, env = Dict{String, String}(), sink = IOBuffer(),
-            workspace_root = "/opt/rs"
+            workspace_root = STUB_ROOT
         )
 
         # max_restarts from the environment.
         sup = RSN.build_supervisor(
             path;
             env = Dict("REACTANT_GPUS" => "1", "REACTANT_SUPERVISOR_MAX_RESTARTS" => "4"),
-            sink = IOBuffer(), workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "runm")
+            sink = IOBuffer(), workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "runm")
         )
         @test sup.max_restarts == 4
     end
@@ -225,7 +348,7 @@ end
         sink = IOBuffer()
         RSN.build_supervisor(
             path; env = Dict("REACTANT_GPUS" => "2"), sink = sink,
-            workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "run")
+            workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "run")
         )
         out = String(take!(sink))
         @test occursin("WARNING", out)
@@ -257,7 +380,7 @@ end
         sink = IOBuffer()
         RSN.build_supervisor(
             ondemand_node(dir; shared = false); env = Dict("REACTANT_GPUS" => "2"),
-            sink = sink, workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "run")
+            sink = sink, workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "run")
         )
         out = String(take!(sink))
         @test occursin("shared_host_weights", out)
@@ -269,7 +392,7 @@ end
         sink = IOBuffer()
         RSN.build_supervisor(
             ondemand_node(dir; shared = true); env = Dict("REACTANT_GPUS" => "2"),
-            sink = sink, workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "run")
+            sink = sink, workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "run")
         )
         @test !occursin("private host copy", String(take!(sink)))
     end
@@ -279,7 +402,7 @@ end
         sink = IOBuffer()
         RSN.build_supervisor(
             ondemand_node(dir; shared = false); env = Dict("REACTANT_GPUS" => "1"),
-            sink = sink, workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "run")
+            sink = sink, workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "run")
         )
         @test !occursin("private host copy", String(take!(sink)))
     end
@@ -300,7 +423,7 @@ end
         sup = RSN.build_supervisor(
             path;
             env = Dict("REACTANT_GPUS" => "0", "REACTANT_CPU_WORKERS" => "2"),
-            sink = IOBuffer(), workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "run")
+            sink = IOBuffer(), workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "run")
         )
         @test [c.spec.name for c in sup.children] == ["worker0", "worker1", "gateway"]
         @test _envval(sup.children[1].spec.cmd, "CUDA_VISIBLE_DEVICES") == ""
@@ -358,7 +481,7 @@ end
         ) do
             sup = RSN.build_supervisor(
                 path; env = Dict("REACTANT_GPUS" => "2"),
-                sink = IOBuffer(), workspace_root = "/opt/rs", runtime_dir = joinpath(dir, "run")
+                sink = IOBuffer(), workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "run")
             )
             gw = sup.children[end].spec.cmd   # the gateway is the last child
             @test _envval(gw, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES") == "111"

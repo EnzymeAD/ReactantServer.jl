@@ -56,7 +56,7 @@ use_repo(debs, "reactantserver_debs")
 bazel_dep(name = "julia_depot", version = "0.2.0")
 git_override(
     module_name = "julia_depot",
-    commit = "3f92730fb582833869bfb5168cd9a6e5b3924a4a",
+    commit = "faa3fc5cbe6c0be5ee47bdca641fa952250ea7cc",
     remote = "https://github.com/csvance/julia_depot.git",
 )
 

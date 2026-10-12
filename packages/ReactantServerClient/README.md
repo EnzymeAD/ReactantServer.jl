@@ -12,14 +12,6 @@ tensors through the shared-memory `BufferPool`. Each server is probed once with 
 namespace (or that lack the probe) use inline transport instead. The `shared_memory` keyword on
 `KServeModel` (`:auto`/`:on`/`:off`) overrides this per model.
 
-```julia
-using ReactantServerClient
-kserve_init()
-model = KServeModel("grpc://127.0.0.1:8080", "scale4"; max_batch_size = 1)
-resp  = infer_sync(model, [InferInput("INPUT__0", Float32[1, 2, 3, 4])])
-y     = InferOutput("OUTPUT__0", resp, Float32)
-kserve_shutdown()
-```
-
-Part of the [ReactantServer.jl](../../README.md) workspace. See
-[Client Usage](../../docs/src/manual/client_usage.md).
+Part of the [ReactantServer.jl](../../README.md) workspace. See [Client
+Usage](https://enzymead.github.io/ReactantServer.jl/dev/client/) for one-shot and batched inference,
+IO validation, and the shared-memory data path.
