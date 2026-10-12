@@ -17,7 +17,7 @@ A bundle is a directory containing:
 - `model.jl` - optional; registers custom pre/post-processing (see below).
 - `.cache/` - written by the worker, never by you: the serialized-executable cache (compiled
   programs keyed by MLIR content, Reactant_jll build and device) plus `mlir_hashes.json`. Safe to
-  delete at any time; the watcher ignores it. See `runtime.executable_cache` in [Node config](node_config.md).
+  delete at any time; the watcher ignores it. See `runtime.executable_cache` in [Node Configuration](node_config.md).
 
 The directory name is the model name: renaming the directory renames the model, with no edits to
 the manifest or `model.jl` (a `name` declared in either is informational and ignored). Each
@@ -56,7 +56,7 @@ output has a batch axis, the scheduler coalesces queued requests along it and pa
 with zero rows up to the smallest compiled size that fits, so a request may carry any number of
 rows up to the largest of `batching.compiled_batch_sizes`; otherwise the request's size along that
 axis must equal one of them. `runtime.batch_sizes: largest` loads only the largest size (see
-[Node configuration](node_config.md)). Each tensor parses into a
+[Node Configuration](node_config.md)). Each tensor parses into a
 [`TensorSpec`](@ref) with a [`Dim`](@ref) per axis, and the compiled sizes form the
 [`BatchingSpec`](@ref). The writer stamps `format_version: "2.0"`; the loader accepts `2.0` or `2`.
 

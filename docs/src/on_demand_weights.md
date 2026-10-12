@@ -6,12 +6,12 @@ larger catalog, paying a small transfer cost only when a cold model is first cal
 page is the operational guide to the weight memory system: the two memory tiers, the
 self-sizing probe that budgets them, residency control, node-shared host weights, BFC
 fragmentation and compaction, and the observability that confirms it all. Dispatch and
-batching are the [Scheduler](scheduling.md)'s job; the reverse proxy and its placement
+batching are the job of [Scheduling](scheduling.md); the reverse proxy and its placement
 policy live on [Multi-GPU Gateway](gateway.md).
 
 ## Two tiers of weight memory
 
-- **Host RAM (resident by default).** With the on-demand cache enabled, every model's
+- **Host RAM (resident by default).** With the weight cache enabled, every model's
   weights default to system-pinned (`residency: system`): materialized once from disk into
   host RAM at startup and kept there. Host memory is plentiful and cheap relative to GPU
   memory, which removes disk from the hot path. A model can opt out with
@@ -63,7 +63,7 @@ on_demand_budget = min(fraction*arena, (1-wiggle)*arena - max_scratch) - pinned_
 ```
 
 so pinned weights reserve their share, the measured scratch and the wiggle slack are held
-back, and the rest is the on-demand cache. When everything fits, the cache simply holds all
+back, and the rest is the weight cache. When everything fits, the cache simply holds all
 weights resident (no eviction); when it does not, it is memory-safe. The probe is bounded
 one-time startup work and doubles as an execution smoke test; the resolved budget is
 logged. Pinned weights or scratch large enough to leave no room are logged as a warning,
@@ -121,7 +121,7 @@ warns at startup when the shared store runs with the `666` default). Both fields
 
 When you size a GPU to squeeze the largest possible working set onto it, fragmentation
 becomes a real constraint. The device pool is one BFC (best-fit-with-coalescing) arena,
-claimed up front when `runtime.preallocate: true`. As the on-demand cache loads and evicts
+claimed up front when `runtime.preallocate: true`. As the weight cache loads and evicts
 models of different sizes over time, the freed regions return to the arena's free list but
 do not always sit next to each other, so the arena can hold plenty of free bytes in total
 yet have no single gap large enough for the next model's weights. The load then fails or
@@ -202,7 +202,7 @@ a one-off fleet defragment.
 
 ### Cost and when to enable
 
-With the on-demand cache disabled (`weight_cache_fraction: 0`) every model is permanently
+With the weight cache disabled (`weight_cache_fraction: 0`) every model is permanently
 resident from startup and nothing churns, so compaction has no working set to defragment
 and is a no-op. When it does run it has a cost: freeing the on-demand region drops models
 that were warm, so they pay a host-to-device reload (lazily on next request for `eager`,

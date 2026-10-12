@@ -6,7 +6,7 @@ dispatch engine: concurrent requests land on per-model queues, a single dispatch
 exactly one GPU execution at a time, same-model requests are merged into one batched execution
 at a compiled size, and GPU time is shared by relative model weight and a learned per-batch-size
 cost estimate. It holds the model registry, the backend, the device memory pool, the
-[`SchedulerConfig`](@ref), per-model dispatch state, and the optional on-demand `WeightCache`.
+[`SchedulerConfig`](@ref), per-model dispatch state, and the optional weight cache.
 Submit work with `ReactantServer.infer` and read observability counters with
 `ReactantServer.scheduler_metrics`.
 
@@ -14,7 +14,7 @@ Because it serializes the GPU, the scheduler is the component that turns a burst
 requests into a steady stream of full batches. This page covers that worker-side engine and the
 coalescing it performs. Routing a model's requests across several workers, including the gateway
 scheduling modes (`round_robin`, `least_outstanding`, `lpt_packing`), is the gateway's job; see
-[Gateway](gateway.md). Where model weights live and how on-demand loading works is covered in
+[Multi-GPU Gateway](gateway.md). Where model weights live and how on-demand loading works is covered in
 [On-demand Weights](on_demand_weights.md).
 
 ## How a request flows through the worker
@@ -145,7 +145,7 @@ clients; keep deadlines uniform to retain `fifo`-like fairness.
 `fair` is for workers with no upstream placement authority: a single-GPU worker, or a fleet
 behind the round-robin gateway, where the worker itself must stop one model from crowding out
 the rest. Behind a gateway running `lpt_packing`, the gateway is the fairness and placement
-authority (see [Gateway](gateway.md)), and the worker must run `fifo` or `edf` so the two do not
+authority (see [Multi-GPU Gateway](gateway.md)), and the worker must run `fifo` or `edf` so the two do not
 fight; `fair` would double-book GPU time against the gateway's placement decisions. `edf` is for
 deadline-sensitive serving, and it degrades gracefully to `fifo` when clients use uniform
 deadlines.
@@ -232,7 +232,7 @@ Two things keep the estimate honest:
   zero-filled inputs and the measured time becomes the estimate. Failures are non-fatal: the
   default cost covers any unseeded (model, batch size) pair until the first real dispatch
   measures it. While every candidate is unseeded they all share the default, so the deficit term
-  decides. When the on-demand weight cache is enabled with auto-sizing, the startup isolation
+  decides. When the weight cache is enabled with auto-sizing, the startup isolation
   probe doubles as this warmup.
 - **Weight load time is excluded.** The measured `compute_time` covers only the model execution,
   not the on-demand weight load that preceded it, so the estimate reflects steady-state
@@ -304,7 +304,7 @@ and discipline, and for each model its weight, queue depth, cumulative serving c
 effective max batch, and the wire-facing batch axis (the input name and 1-based axis a gateway
 can count items on without decoding a request). A meta is reported as a single unit whose
 footprint is the sum of its sub-models, so the gateway packs and routes the group as one. See
-[Meta Models](meta_models.md) and [Gateway](gateway.md).
+[Meta Models](meta_models.md) and [Multi-GPU Gateway](gateway.md).
 
 ## Configuration reference
 

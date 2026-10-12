@@ -225,7 +225,7 @@ scheduler:
 
 `weight` sets the model's fair share (consulted only by the `fair` discipline). `residency` sets
 the model's residency floor: `unpinned`, `system`, or `device` (`pin_to_gpu: true` is a
-back-compat alias for `residency: device`). When the on-demand weight cache is enabled, models
+back-compat alias for `residency: device`). When the weight cache is enabled, models
 without an explicit `residency` default to `system` (weights pinned in host RAM); see
 [On-demand Weights](on_demand_weights.md).
 
@@ -288,7 +288,7 @@ INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_FRACTION=0.8
 
 Booleans parse as `1`, `true`, `yes`, or `on` (case-insensitive). List-valued overrides
 (`INFERENCE_SERVER_MODEL_DIRS`, `INFERENCE_SERVER_MODELS_INCLUDE`) are colon-separated. Overrides
-are applied on top of the resolved node config, and the effective configuration, including which
+are applied on top of the resolved node file, and the effective configuration, including which
 overrides were applied, is logged at startup.
 
 | Variable | Overrides | Values |

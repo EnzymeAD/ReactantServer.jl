@@ -6,7 +6,7 @@ model's output on ReactantServer, what controls each source, and how the `regula
 profile and the release images fit together into a deployment you can validate once and rely on.
 
 The short version: the same bundle, served from the same image digest, on the same GPU class, with
-the same node configuration, gives the same outputs. Each section below covers one thing that can
+the same node file, gives the same outputs. Each section below covers one thing that can
 break that, and how to hold it fixed.
 
 ## Numerics
