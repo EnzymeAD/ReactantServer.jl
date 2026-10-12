@@ -69,18 +69,16 @@ is the multi-GPU reverse proxy; `ReactantServerClient` is a Reactant-free client
 
 ## Why ReactantServer?
 
-The server is built for compiled models, such as computer vision and scientific computing
-workloads, where many models share a GPU and one model executes at a time. That shape rewards a
-server that is compiled rather than interpreted: models are compiled ahead of time into device executables through Reactant's
-PJRT bindings, so inference is a single batched kernel launch rather than an interpreter loop, and
-the runtime is device-agnostic, CUDA today with CPU for development and fallback.
+The server is built for workloads where many models share a GPU, such as computer vision and
+scientific computing. Every model is compiled ahead of time through Reactant and XLA into an
+optimized executable for the target device, and compiled models are fast. The runtime is
+device-agnostic: CUDA today, with CPU for development.
 
 The design balances two resources that pull against each other. Compute is managed by a
-deficit-weighted, cost-aware [scheduler](scheduling.md) that coalesces concurrent same-model
-requests into one execution at a compiled batch size. Memory is managed by the
-[on-demand weights](on_demand_weights.md) cache, which keeps weights in host RAM and streams them
-onto the GPU under an LRU byte budget. Both are retunable at runtime, on a worker or across GPUs,
-through a gRPC control plane, without a restart.
+cost-aware [scheduler](scheduling.md) that coalesces concurrent requests for the same model into
+one execution. Memory is managed by the [on-demand weights](on_demand_weights.md) cache, which
+keeps weights in host RAM and moves them onto the GPU within a byte budget. Scheduling policy,
+pinned models, and multi-GPU placement can all be changed at runtime, without a restart.
 
 ## Get started
 
