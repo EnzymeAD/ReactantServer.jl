@@ -105,14 +105,20 @@ jobs:
           echo "list=${tags[*]}" >> "$GITHUB_OUTPUT"
 
       # The digest comes from the OCI layout that was pushed, so it is what a pull by digest
-      # returns and what the attestation is bound to.
+      # returns and what the attestation is bound to. --stamp records the commit in the image's
+      # org.opencontainers.image.revision label (deploy/workspace_status.sh); it changes only the
+      # image config, so every layer the test step built is reused.
       - name: Push
         id: push
         run: |
           repository="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/reactantserver"
           args=()
           for t in ${{ steps.tags.outputs.list }}; do args+=(--tag "$t"); done
-          bazel run //deploy:image_push -- --repository "$repository" "${args[@]}"
+          bazel build --stamp //deploy:image_labels
+          labels="$(cat bazel-bin/deploy/image_labels.txt)"
+          grep -qx "org.opencontainers.image.revision=$GITHUB_SHA" <<<"$labels" ||
+            { echo "::error::the image would not record revision $GITHUB_SHA:"; echo "$labels"; exit 1; }
+          bazel run --stamp //deploy:image_push -- --repository "$repository" "${args[@]}"
           digest="$(jq -r '.manifests[0].digest' bazel-bin/deploy/image/index.json)"
           echo "repository=$repository" >> "$GITHUB_OUTPUT"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
@@ -120,6 +126,8 @@ jobs:
             echo "Pushed \`$repository\` as: ${{ steps.tags.outputs.list }}"
             echo
             echo "Digest: \`$digest\` (commit \`$GITHUB_SHA\`)"
+            echo
+            echo "Labels: $(paste -sd' ' bazel-bin/deploy/image_labels.txt)"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # SLSA build provenance for the pushed digest (no predicate given, so provenance is the

@@ -3,7 +3,8 @@
 #
 #   1. every entry project loads its packages from the baked caches, with nothing precompiled and
 #      no cache rejected, which is what makes a container's first start fast;
-#   2. the programs the entrypoint and healthcheck call are present and runnable.
+#   2. the programs the entrypoint and healthcheck call are present and runnable;
+#   3. the image carries its version label (and, from a --stamp build, its revision).
 #
 # Runs without a GPU: the CUDA base's driver stub stands in for libcuda.so.1, which the CUDA build
 # of libReactantExtra.so needs merely to load.
@@ -61,5 +62,15 @@ tools="$(podman run --rm --entrypoint bash "$image" -c '
     test -f /etc/reactantserver/node.yaml || { echo "missing /etc/reactantserver/node.yaml"; exit 1; }
     echo "entrypoints, healthchecks and /etc/reactantserver/node.yaml present"
 ' 2>&1)" && printf '%s\n' "$tools" | sed 's/^/ok: /' || { echo "FAILED: tools: $tools"; fail=1; }
+
+# The version label is always set (//deploy:image_labels); the revision only in a --stamp build.
+version="$(podman image inspect --format '{{ index .Labels "org.opencontainers.image.version" }}' "$image" 2>&1)"
+revision="$(podman image inspect --format '{{ index .Labels "org.opencontainers.image.revision" }}' "$image" 2>&1)"
+if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    echo "ok: labels: version $version, revision ${revision:-(unstamped build)}"
+else
+    echo "FAILED: labels: org.opencontainers.image.version is '$version'"
+    fail=1
+fi
 
 [ "$fail" -eq 0 ] && echo "==> $image passed" || { echo "==> $image FAILED" >&2; exit 1; }

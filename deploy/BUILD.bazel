@@ -319,6 +319,45 @@ _IMAGE_LAYERS = [
     ":app_layer",
 ]
 
+# True in a --stamp build. Selected on rather than detected in the genrule's command, because an
+# unsandboxed action can find a stale bazel-out/stable-status.txt left by an earlier stamped build.
+config_setting(
+    name = "stamped",
+    values = {"stamp": "1"},
+)
+
+# The image's OCI labels (https://github.com/opencontainers/image-spec/blob/main/annotations.md),
+# so an image or a running container reports what it is: `podman inspect` shows them under Labels.
+#
+#   org.opencontainers.image.version   ReactantServer's version, from its Project.toml. Each round
+#                                      of releases registers ReactantServer last, so its version
+#                                      names the whole image (worker, gateway and node).
+#   org.opencontainers.image.revision  the commit, in a --stamp build only (image.yml pushes with
+#                                      one), and only from a checkout with no uncommitted changes;
+#                                      see deploy/workspace_status.sh.
+#
+# An unstamped build's labels depend on the sources alone, so it stays cacheable. Stamping changes
+# this file and the image config, never a layer.
+_LABELS_VERSION = """
+set -euo pipefail
+version="$$(sed -n 's/^version = "\\(.*\\)"$$/\\1/p' $(location //:packages/ReactantServer/Project.toml))"
+[ -n "$$version" ] || { echo "FAILED: no version in packages/ReactantServer/Project.toml" >&2; exit 1; }
+echo "org.opencontainers.image.version=$$version" > "$@"
+"""
+
+genrule(
+    name = "image_labels",
+    srcs = ["//:packages/ReactantServer/Project.toml"],
+    outs = ["image_labels.txt"],
+    cmd = select({
+        ":stamped": _LABELS_VERSION + """
+sed -n 's/^STABLE_REACTANTSERVER_COMMIT /org.opencontainers.image.revision=/p' bazel-out/stable-status.txt >> "$@"
+""",
+        "//conditions:default": _LABELS_VERSION,
+    }),
+    stamp = -1,
+)
+
 # Root, and not by oversight: the entrypoint's GPU-reclaim gate and the supervisor expect it, and a
 # stale cache (a mounted, edited package) must still be able to precompile into the depot.
 oci_image(
@@ -339,6 +378,7 @@ oci_image(
         "8001/tcp",
         "8002/tcp",
     ],
+    labels = ":image_labels",
     tars = _IMAGE_LAYERS,
     workdir = _APP,
 )

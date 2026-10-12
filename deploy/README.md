@@ -174,7 +174,24 @@ workflow, which publishes `:X.Y.Z`, plus `:X.Y` and `:latest` when no higher rel
 those lines (a patch to an older line moves neither). Run by hand (Actions, Image, Run workflow) on
 a branch, it publishes `:sha-<commit>` only, so `:latest` always means the newest release; run by
 hand on a `ReactantServer-vX.Y.Z` tag, it publishes that release. The run summary records the
-tags, the pushed digest, and the commit.
+tags, the pushed digest, the commit, and the image's labels.
+
+The image reports what it is through the standard OCI labels, which `podman inspect` (or
+`docker inspect`) shows for an image or a running container:
+
+- `org.opencontainers.image.version`: ReactantServer's version, from
+  `packages/ReactantServer/Project.toml`, in every build
+- `org.opencontainers.image.revision`: the commit, in a `--stamp` build only, and only from a
+  checkout with no uncommitted changes, so a label never names a commit the image was not built
+  from; the workflow pushes with `--stamp` and fails before pushing if the label does not match
+  the commit it checked out
+
+Stamping touches only the image config, never a layer. To stamp a local build:
+
+```
+bazel run --stamp //deploy:image_load
+podman inspect --format '{{json .Config.Labels}}' localhost/reactantserver:bazel
+```
 
 The attestation is [SLSA build provenance](https://slsa.dev/spec/v1.0/provenance), produced by
 `actions/attest`: a statement that this repository's `image.yml`, at a given commit and run, built
@@ -198,3 +215,8 @@ The image and its layers are public. A deployment repository can take a `bazel_d
 `@reactant_server//deploy:image` instead of rebuilding it. The repository names this module
 declares (`reactantserver_julia`, `reactantserver_cuda_base`, `reactantserver_debs`) are prefixed so
 they cannot collide with a consumer's own.
+
+A consumer's build runs the consumer's workspace status command, not this repository's, so its
+image carries the version label but no revision. To record one, have that command print
+`STABLE_REACTANTSERVER_COMMIT <commit>` (the commit the `git_override` pins) and build with
+`--stamp`.
