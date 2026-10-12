@@ -15,9 +15,8 @@ text-serving shapes. For the bundle/manifest/`model.jl` contract itself see
 
 !!! tip "Runnable example"
     `examples/transformers/` in the repository is a complete, runnable version of this
-    walkthrough. It is split into three copy-pasteable commands, each with its own environment:
-    **export** the four bundles, **serve** them on a single GPU, and a **client** that queries
-    all four over KServe V2. See `examples/transformers/README.md`.
+    walkthrough: [Serve Transformer Text Models](tutorials/transformers.md) exports the four
+    bundles, serves them, and queries all four over KServe V2.
 
 ## The four models
 
@@ -172,72 +171,12 @@ filling the padded matrices.
 
 ## Running the example
 
-`examples/transformers/` is split into three single-purpose Julia environments so each loads only
-what it needs (and they stop invalidating each other's precompilation): **export** is the only
-one with PythonCall + torch, **server** is the only one with Reactant, and **client** has
-neither. Each environment resolves independently the first time you use it:
-
-```text
-for env in export server client; do
-  julia --project=examples/transformers/$env -e 'using Pkg; Pkg.instantiate()'
-done
-```
-
-Then run the three steps in order (the server stays running; drive it from a second terminal):
-
-```text
-# 1. Export the bundles (first time only; writes ./bundles/). Needs network for the checkpoints.
-julia --project=examples/transformers/export examples/transformers/export/export_stablehlo.jl
-
-# 2. Serve on a single GPU (blocks; Ctrl-C to stop). Add --cpu for a GPU-free smoke test.
-CUDA_VISIBLE_DEVICES=0 julia --project=examples/transformers/server examples/transformers/server/serve.jl
-
-# 3. In another terminal: query all four models.
-julia --project=examples/transformers/client examples/transformers/client/query.jl
-```
-
-The server port defaults to 8080; set `TX_PORT` (and `TX_HOST` for the client) to change it on
-both step 2 and step 3.
-
-### Export (`export_stablehlo.jl`)
-
-The driver imports torch/torchax through PythonCall **before** `ReactantServerExport` pulls in
-Reactant; that init order is critical, because Triton's static LLVM/MLIR registration
-SIGSEGVs if Reactant loads first. Each of the four builders wraps its checkpoint (torch class
-per the table above, plus the in-graph head for `splade`/`embedding`), traces it with
-`export_bundle(:pytorch, ...)`, and stages the per-bundle `model.jl` plus the shared
-`vocab.txt` into `./bundles/<name>/` (the tokenizer code itself lives in
-`ReactantServer.BertText`, so it is not staged). Bundles that already exist are skipped; delete
-`./bundles/` to re-export.
-
-Python dependencies come from `ReactantServerExport`'s CondaPkg (torch, torchax, jax) plus
-`transformers` from `export/CondaPkg.toml`; CondaPkg resolves and installs them on the first
-export, and the first run downloads the four checkpoints from HuggingFace, so both need network.
-For corporate proxies, the driver points Python's TLS at the OS CA bundle (`SSL_CERT_FILE`,
-defaulting from `REQUESTS_CA_BUNDLE`/`CURL_CA_BUNDLE`/`JULIA_SSL_CA_ROOTS_PATH` or
-`/etc/ssl/certs/ca-certificates.crt`) so the checkpoint downloads trust a MitM proxy's CA.
-
-### Serve (`serve.jl`)
-
-The server validates that all four bundles exist under `examples/transformers/bundles`, picks
-`ReactantServer.CPU_BACKEND` or `CUDA_BACKEND` from `--cpu`, and builds a
-`ReactantServer.ServerConfig` (runtime, scheduler, and endpoints on `127.0.0.1:$TX_PORT`) before
-calling `ReactantServer.serve(...; backend = ReactantServer.ReactantBackend())`, which blocks
-until Ctrl-C. Running the export or `serve.jl --cpu` outside Docker can hit an `EACCES` on
-Reactant's default compile cache; set a writable `REACTANT_CACHE_DIR` if so.
-
-### Client (`query.jl`)
-
-The client depends only on `ReactantServerClient` (no Reactant, no PythonCall), so it loads
-fast. It packs strings into the wire tensors itself (`pack_texts`: a `(max_bytes, batch)` UInt8
-matrix plus an Int32 byte-length vector) and sends raw UTF-8 to all four models, then decodes
-each response: cosine similarity between unit-norm embeddings, SPLADE's top expansion terms
-turned back into tokens via the shared vocab, cross-encoder reranking of candidate answers, and
-sentiment labels (0 NEGATIVE, 1 POSITIVE) with their probabilities.
+`examples/transformers/` in the repository exports all four models, serves them, and queries them;
+[Serve Transformer Text Models](tutorials/transformers.md) walks through running it.
 
 ## See also
 
-- `examples/transformers/` for the runnable end-to-end example (export, serve, client)
+- [Serve Transformer Text Models](tutorials/transformers.md) to run the example end to end
 - [Bundles & model.jl](bundles.md) for the bundle contract, `IOSpec`, and the manifest encoding
 - [Object Detection](object_detection.md) for exporting a detector's data-dependent middle as one
   static program

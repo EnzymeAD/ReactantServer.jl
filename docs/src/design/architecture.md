@@ -60,8 +60,8 @@ lowers cost per inference. Two technical levers deliver this:
 
 The broader mission, the target audience, and the explicit non-goals are on the
 [Philosophy](philosophy.md) page. Operational and format details are in the
-[Tutorial](../tutorial.md) and
-[Node Configuration](../node_config.md) guides.
+[tutorials](../tutorials/native/export.md) and the
+[Node Configuration](../node_config.md) guide.
 
 ## How it fits together
 

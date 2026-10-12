@@ -12,6 +12,7 @@ tensors through the shared-memory `BufferPool`. Each server is probed once with 
 namespace (or that lack the probe) use inline transport instead. The `shared_memory` keyword on
 `KServeModel` (`:auto`/`:on`/`:off`) overrides this per model.
 
-Part of the [ReactantServer.jl](../../README.md) workspace. See [Client
-Usage](https://enzymead.github.io/ReactantServer.jl/dev/client/) for one-shot and batched inference,
-IO validation, and the shared-memory data path.
+Part of the [ReactantServer.jl](../../README.md) workspace. The
+[Query a Server](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/native/client/) tutorial walks through one-shot and
+batched inference; [Client Usage](https://enzymead.github.io/ReactantServer.jl/dev/client/) is the reference for IO validation, retries, and the
+shared-memory data path.

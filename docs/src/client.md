@@ -8,48 +8,19 @@ machine. (The same KServe V2 wire protocol means any Triton or KServe gRPC clien
 this package is the convenient Julia option.) The server-side handling of the wire and
 shared-memory data planes is covered on the [Bundles](bundles.md) page.
 
-## Installation
+[Query a Server](tutorials/native/client.md) walks through using it: one-shot requests, batched
+inference over a dataset, and the shared-memory transport. This page is the reference for how the
+client behaves.
 
-The client is a workspace member. From this repository, activate its project:
-
-```text
-julia --project=packages/ReactantServerClient -e 'using Pkg; Pkg.instantiate()'
-```
-
-You can confirm it pulls no Reactant:
-
-```julia
-using ReactantServerClient
-@assert Base.identify_package(ReactantServerClient, "Reactant") === nothing
-```
-
-## One-shot inference
-
-Point a [`KServeModel`](@ref) at a running server (a worker, or the gateway for a multi-GPU
-node), build inputs with [`InferInput`](@ref), call the one-shot [`infer_sync`](@ref), and
-read outputs with [`InferOutput`](@ref):
-
-```julia
-using ReactantServerClient
-
-kserve_init()
-try
-    model = KServeModel("grpc://127.0.0.1:8080", "scale4"; max_batch_size = 1)
-    x = Float32[1, 2, 3, 4]
-    response = infer_sync(model, [InferInput("INPUT__0", x)])
-    y = InferOutput("OUTPUT__0", response, Float32)
-    @show vec(collect(y))
-finally
-    kserve_shutdown()
-end
-```
+## One-shot requests
 
 [`KServeModel`](@ref) takes either `(host, port, model_name)` or a `url` of the form
 `grpc://host:port` (or bare `host:port`); `grpcs`/`https` selects a secure channel.
 `max_batch_size` caps how many items the batched drivers coalesce per request, and `deadline`
-is the per-request timeout in seconds. Run the snippet under the client project against a
-server you have started, for example a worker on the e2e `scale4` bundle; the
-[Tutorial](tutorial.md) walks through the full setup end to end.
+is the per-request timeout in seconds (10 by default). [`infer_sync`](@ref)`(model, inputs)` sends
+one request built from [`InferInput`](@ref) tensors, and [`InferOutput`](@ref) reads a named output
+back. Tensors use Julia's column-major layout with the batch axis last on both ends; the wire codec
+converts to KServe's row-major shapes.
 
 The one-shot path encodes tensor data element by element as typed contents, so it emits a
 one-time performance warning (once per session) and suits small, occasional requests. For
@@ -90,47 +61,7 @@ n_slots, shm_reprobe_interval)` sizes the staging pool (256 MiB by default) and 
 slots (8 by default), which bounds how many chunks can be in flight against one pool;
 `kserve_shutdown()` tears the pool and the gRPC subsystem down.
 
-A concrete IO for a model with input `INPUT__0` and output `OUTPUT__0`, each a length-4
-Float32 vector per item:
-
-```julia
-using ReactantServerClient
-
-struct VectorIO <: AbstractInferenceIO
-    inputs::Vector{Vector{Float32}}    # each item: 4 Float32
-    outputs::Vector{Vector{Float32}}   # filled in by infer_decode_chunk!
-end
-
-Base.length(io::VectorIO) = length(io.inputs)
-
-# Bytes one item contributes to the request, summed over all inputs.
-ReactantServerClient.item_input_bytes(::VectorIO) = 4 * sizeof(Float32)
-
-function ReactantServerClient.infer_encode_chunk!(io::VectorIO, r::UnitRange, slot::PoolSlot)
-    n = length(r)
-    # Request all input buffers up front by name (Julia column-major: per-item dims, batch
-    # axis last). `scratch` carves them from the chunk's slot and returns wire descriptors;
-    # write into each with pool_view. The SHM-vs-inline transport is handled by the driver,
-    # so this is the same code either way.
-    input = scratch(slot, "INPUT__0", (4, n), Float32)  # scalar form: one descriptor
-    buf = pool_view(input)                    # multiple inputs: feats, mask = pool_view(inputs...)
-    @infer_inbounds for (k, i) in enumerate(r)  # elided normally, checked under validate_io
-        buf[:, k] .= io.inputs[i]
-    end
-    return input                              # a lone PoolInferInput is accepted directly
-end
-
-function ReactantServerClient.infer_decode_chunk!(io::VectorIO, r::UnitRange, response)
-    out = InferOutput("OUTPUT__0", response, Float32) # Julia column-major (4, n)
-    @infer_inbounds for (j, i) in enumerate(r)
-        io.outputs[i] = collect(out[:, j])
-    end
-    return nothing
-end
-
-io = VectorIO([Float32[i, i, i, i] for i in 1:100], [Float32[] for _ in 1:100])
-infer_async(model, io)                        # results land in io.outputs
-```
+[Query a Server](tutorials/native/client.md) builds a complete IO for a small model.
 
 `scratch` is the same buffer-request interface meta models use through `call.scratch`; see the
 [Meta Models](meta_models.md) page. The lower-level path is still supported: carve a
@@ -164,18 +95,17 @@ validate_io(manifest_io_spec("manifest.yaml"), io)  # offline: no server needed
 ```
 
 The harness runs your real methods, so call it on a representative or dummy IO (it may write
-into the IO's buffers at positions `1:items`). For example, validating the `VectorIO` above
-against a model whose `OUTPUT__0` is actually a length-3 vector reports the shape mismatch, and
-an `infer_decode_chunk!` that indexed `out[:, j]` past the real batch size surfaces as an
-indexing error, both without sending a request.
+into the IO's buffers at positions `1:items`). For example, validating an IO that writes a length-4
+output against a model whose output is actually length 3 reports the shape mismatch, and an
+`infer_decode_chunk!` that indexed `out[:, j]` past the real batch size surfaces as an indexing
+error, both without sending a request.
 
 ### Bounds checks in hot paths
 
 `validate_io` can only catch an out-of-range index if the access is bounds-checked. Julia's
 built-in `@inbounds` elides the check unconditionally, so an `@inbounds` access stays unchecked
 even inside the dry run. If you want `@inbounds` performance in production but a robust check
-during validation, write the access with [`@infer_inbounds`](@ref) instead, as the `VectorIO`
-example does. It elides the check in normal use, but because `validate_io` runs your methods
+during validation, write the access with [`@infer_inbounds`](@ref) instead. It elides the check in normal use, but because `validate_io` runs your methods
 inside [`with_bounds_checks`](@ref), an `@infer_inbounds` access is bounds-checked during the
 dry run and an out-of-range index is caught rather than silently read. This is opt-in: using
 `@infer_inbounds` is the user's responsibility, and bare `@inbounds` remains unchecked unless

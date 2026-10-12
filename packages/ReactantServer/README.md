@@ -9,7 +9,7 @@ shared API from [`ReactantServerCore`](../ReactantServerCore), so the substrate 
 `ReactantServer.X`.
 
 Part of the [ReactantServer.jl](../../README.md) workspace. To get started, follow the
-[Tutorial](https://enzymead.github.io/ReactantServer.jl/dev/tutorial/); the [Node
+[Serve a Model](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/native/serve/) tutorial; the [Node
 Configuration](https://enzymead.github.io/ReactantServer.jl/dev/node_config/) and
 [Deployment](https://enzymead.github.io/ReactantServer.jl/dev/deployment/) pages cover how a worker
 is configured and run.

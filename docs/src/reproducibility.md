@@ -86,7 +86,7 @@ CUDA libraries, and the driver. The release image pins all of them except the ho
   Reactant and Reactant_jll by version and content hash, together with the CUDA userspace.
 - Deploy by digest (`ghcr.io/enzymead/reactantserver@sha256:...`) or by release tag (`:0.1.0`),
   never by `:latest`, and verify the image's build attestation before deploying it. See
-  [Running the container](@ref).
+  [The container image](@ref).
 - Keep the host's NVIDIA driver fixed across the validated fleet, and treat a driver upgrade as a
   change to validate.
 

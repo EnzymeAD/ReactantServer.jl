@@ -31,3 +31,5 @@ PLAN.md
 # Bazel's convenience symlinks and per-user settings.
 /bazel-*
 /user.bazelrc
+# The native tutorials, rendered from integration/tutorials/*.jl by docs/make.jl.
+/docs/src/tutorials/native/

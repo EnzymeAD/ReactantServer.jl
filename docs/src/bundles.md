@@ -133,16 +133,12 @@ over fixed-size arrays rather than `findall`; the two-stage detectors are the wo
 It is not part of the server runtime.
 
 A project that owns a Lux model (or any Reactant-traceable function) uses `ReactantServerExport`;
-Lux itself is not a dependency of the package:
+Lux itself is not a dependency of the package. [Export a Model](tutorials/native/export.md) walks
+through exporting a Lux model end to end.
 
-```julia
-using ReactantServerExport
-export_bundle(:lux, model, ps, st, example_input;
-    dir="bundles/mlp", name="mlp", batch_sizes=[1, 8])
-```
-
-The `:lux` frontend traces `model(x, ps, st)` at each requested batch size, taking the first return
-as the output; the batch dimension is the last Julia axis (the Lux convention) and the leading
+The `:lux` frontend, `export_bundle(:lux, model, ps, st, example_input; dir, name, batch_sizes)`,
+traces `model(x, ps, st)` at each requested batch size, taking the first return as the output; the
+batch dimension is the last Julia axis (the Lux convention) and the leading
 network axis. A multi-input / multi-output variant takes `example_inputs::Tuple` and `output_select`
 mapping the raw model output to the ordered tuple of arrays to export; per-tensor batch axes default
 to each array's last Julia axis, overridable with `input_batch_axes` / `output_batch_axes` (1-based
@@ -239,6 +235,6 @@ The manifest and boundary types are documented on the [API](api.md) page: [`Mani
 [`DType`](@ref), and [`NamedTensor`](@ref). `export_bundle`, `write_bundle`, `IOSpec`,
 `collect_provenance`, `assert_bundle_arity`, `bundle_arity_report`, and `bundle_entry_arity` are
 documented in the `ReactantServerExport` docstrings. The
-[Tutorial](tutorial.md) walks the full export-to-serve path, and
+[tutorials](tutorials/native/export.md) walk the full export-to-serve path, and
 [Node Configuration](node_config.md) covers how the server loads and watches a repository of
 bundles.

@@ -18,9 +18,8 @@ models share a GPU and one model executes at a time. Local serving of large lang
 goal of the project: splitting a model into compiled stages and streaming their weights from
 storage, so a GPU can serve models larger than its memory.
 
-Not sure which setup fits you? The [deployment shapes](https://enzymead.github.io/ReactantServer.jl/dev/deployment_shapes/)
-section walks through the options (single GPU, multi-GPU distributed or replicated, multi-node)
-and what each one optimizes for.
+Not sure which setup fits you? [Scale to Many GPUs](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/container_multi_gpu/)
+walks through the multi-GPU options (replicated or distributed) and what each one optimizes for.
 
 ## Highlights
 
@@ -31,7 +30,7 @@ and what each one optimizes for.
   hooks in plain Julia; they run per request, in parallel and overlapped with GPU execution. → [Bundles & model.jl](https://enzymead.github.io/ReactantServer.jl/dev/bundles/)
 - **Julia-aligned conventions.** Shapes are column-major with the batch axis last, the way Julia
   and Lux write them; the codec converts to KServe's row-major wire at the boundary, so Triton
-  clients are unchanged and you never reason about row-major order. → [Tutorial](https://enzymead.github.io/ReactantServer.jl/dev/tutorial/)
+  clients are unchanged and you never reason about row-major order. → [Export a Model](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/native/export/)
 - **Elegant configuration.** One typed YAML node file (with environment-variable overrides)
   describes a machine; manifests declare tensors with an einsum-style named-axis notation. → [Node Configuration](https://enzymead.github.io/ReactantServer.jl/dev/node_config/), [Bundles & model.jl](https://enzymead.github.io/ReactantServer.jl/dev/bundles/)
 - **Standard inference protocol.** KServe V2 over gRPC. Tensor data travels inline
@@ -61,39 +60,21 @@ and what each one optimizes for.
   GPU dispatch loop, and re-enters the scheduler for each sub-call. The design is subject to change;
   do not build production pipelines on it. → [Meta Models](https://enzymead.github.io/ReactantServer.jl/dev/meta_models/)
 
-## Quick start
+## Get started
 
-ReactantServer is deployed as a container image. All a host needs is the NVIDIA driver and a
-container runtime with the NVIDIA Container Toolkit; the image carries Julia, every package
-(precompiled), and the CUDA libraries. Run it over a directory of model bundles and it serves on
-every GPU you give it:
+Two tracks of tutorials, one for each way in:
 
-```
-podman run -d --name reactantserver --device nvidia.com/gpu=all --ipc=host --pids-limit=-1 \
-  -p 8001:8001 -p 8002:8002 -v /path/to/bundles:/var/lib/reactantserver/models \
-  ghcr.io/enzymead/reactantserver:latest
-```
+- **From Julia**, on any machine with or without a GPU: add the packages to an environment, then
+  [export a model](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/native/export/), [serve it](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/native/serve/),
+  [query it](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/native/client/), and [run a whole node](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/native/node/).
+  These tutorials run in CI exactly as written.
+- **The container image**, the supported deployment: a host needs only the NVIDIA driver and a
+  container runtime, and the image carries Julia, every package (precompiled), and the CUDA
+  libraries. [Serve on one GPU](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/container_single_gpu/), then
+  [scale to many](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/container_multi_gpu/).
 
-With Docker, use `--gpus all` in place of `--device nvidia.com/gpu=all`, or run the repository's
-`docker-compose.yml`. The first start is slow, since every model compiles before the gRPC plane
-accepts traffic; compiled programs are then cached inside each bundle. See
-[Deployment](https://enzymead.github.io/ReactantServer.jl/dev/deployment/#Running-the-container)
-for the container settings (shared memory, thread limits, health), and `deploy/` to build the
-image yourself with Bazel.
-
-For a quick try from a source checkout, without a container, instantiate the workspace once
-(`REACTANT_GPU=cuda REACTANT_GPU_VERSION=13.1 julia --project=. -e 'using Pkg; Pkg.instantiate()'`)
-and run the supervisor from Julia:
-
-```julia
-using ReactantServerNode
-ReactantServerNode.supervise("config/node.yaml")   # one worker per GPU (+ gateway if >1)
-```
-
-Clients speak KServe V2 gRPC to `:8001`; health and metrics are on `:8002`. Walk through exporting
-a model, configuring a node, and querying it in the [Tutorial](https://enzymead.github.io/ReactantServer.jl/dev/tutorial/).
-ReactantServer is designed for a trusted network; read
-[Security](https://enzymead.github.io/ReactantServer.jl/dev/security/) before exposing an endpoint.
+Clients speak KServe V2 gRPC to `:8001`; health and metrics are on `:8002`. ReactantServer is
+designed for a trusted network; read [Security](https://enzymead.github.io/ReactantServer.jl/dev/security/) before exposing an endpoint.
 
 ## Status
 
