@@ -156,11 +156,19 @@ warning under `auto`, naming the precision actually in effect on its device (TF3
 newer, full f32 on older GPUs), because `auto` guarantees neither. [Reproducibility & Regulated Use](reproducibility.md)
 explains what each of these settings controls and how to validate a deployment around them.
 
-`model_control_mode` sets how the loaded model set evolves: `dynamic` (the default) watches the
-repository and loads, unloads, reloads, and renames bundles online as files change (a renamed
-directory with unchanged contents renames the model in place, no recompile); `static` fixes the
-startup set; `explicit` cedes the lifecycle to an external control plane via the worker control
-RPCs. `model_poll_seconds` is the repository poll interval in `dynamic` mode.
+`model_control_mode` sets how the loaded model set evolves:
+
+- `dynamic` (the default) watches the repository and loads, unloads, and reloads bundles online as
+  their files change, including the weights, the MLIR, the manifest, and `model.jl`. A bundle must
+  look the same on two consecutive polls before it loads, so a half-written bundle never does, and
+  a reload swaps one model while every other model keeps serving. A renamed directory with
+  unchanged contents renames the live model in place, without recompiling.
+- `static` loads the startup set once and never changes it.
+- `explicit` cedes the lifecycle to an external control plane: the worker takes no action of its
+  own, and a model serves only while the control plane holds it resident through the worker
+  control RPCs (`ModelControlStatus`, `SetModelResidency`, `SetModelPolicy`).
+
+`model_poll_seconds` is the repository poll interval in `dynamic` mode.
 
 `runtime.device_ordinal` is not something you normally set here: the node resolution derives it
 from the worker's `gpu:` key (defaulting to 0), and under the supervisor each worker sees a
