@@ -76,6 +76,10 @@ The [Tutorials](tutorials/index.md) follow a model from [export](tutorials/expor
 - **With the container image.** The supported deployment: a host needs only the NVIDIA driver and
   a container runtime. Start with [Serve on One GPU](tutorials/container/single_gpu.md).
 
+To see real models, [Serve an Object Detector](tutorials/examples/object_detection.md) and
+[Serve Transformer Text Models](tutorials/examples/transformers.md) take PyTorch models through
+export, serving, and inference.
+
 The server is designed for a trusted network, so read [Security](security.md) before exposing an
 endpoint.
 

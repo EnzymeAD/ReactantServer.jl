@@ -29,8 +29,8 @@ using ReactantServerNode
 # compiles XLA programs). `#src` lines (the scripts' test assertions and process cleanup) are
 # dropped, and the fences become plain `julia` blocks so Documenter does not try to run them.
 # Export and Run Inference render into docs/src/tutorials/, the serving tutorials into
-# docs/src/tutorials/julia/ beside the hand-written pages; the rendered files are gitignored, and
-# EditURL points the "Edit on GitHub" link at the script.
+# docs/src/tutorials/julia/; the rendered files are gitignored, and EditURL points the
+# "Edit on GitHub" link at the script.
 const TOP_TUTORIALS = ["export", "inference"]
 const JULIA_TUTORIALS = [
     "Serve a Model" => "serve",
@@ -98,14 +98,16 @@ makedocs(;
             "Export a Model" => "tutorials/export.md",
             "Serve from Julia" => [
                 [title => "tutorials/julia/$name.md" for (title, name) in JULIA_TUTORIALS]...,
-                "Serve an Object Detector" => "tutorials/julia/object_detection.md",
-                "Serve Transformer Text Models" => "tutorials/julia/transformers.md",
             ],
             "Serve with the Container" => [
                 "Serve on One GPU" => "tutorials/container/single_gpu.md",
                 "Scale to Many GPUs" => "tutorials/container/multi_gpu.md",
             ],
             "Run Inference" => "tutorials/inference.md",
+            "End-to-End Examples" => [
+                "Serve an Object Detector" => "tutorials/examples/object_detection.md",
+                "Serve Transformer Text Models" => "tutorials/examples/transformers.md",
+            ],
         ],
         "Building Models" => [
             "Bundles" => "bundles.md",
