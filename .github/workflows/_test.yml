@@ -26,6 +26,11 @@ on:
         required: false
         type: string
         default: 'ubuntu-latest'
+      timeout-minutes:
+        description: Job timeout. The default covers a first run's Reactant download and compile.
+        required: false
+        type: number
+        default: 60
       coverage-directories:
         description: >-
           Comma-separated source directories to collect coverage for (for example
@@ -42,7 +47,7 @@ permissions:
 jobs:
   run:
     runs-on: ${{ inputs.os }}
-    timeout-minutes: 60   # generous for the first run's Reactant CPU artifact download + compile
+    timeout-minutes: ${{ inputs.timeout-minutes }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: julia-actions/setup-julia@fa02766e078afaaf09b14210362cee14137e6a32 # v3.0.2
