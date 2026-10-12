@@ -32,7 +32,8 @@ PLAN.md
 /bazel-*
 /user.bazelrc
 # The Julia tutorials, rendered from integration/tutorials/*.jl by docs/make.jl.
-/docs/src/tutorials/basics/
+/docs/src/tutorials/export.md
+/docs/src/tutorials/inference.md
 /docs/src/tutorials/julia/serve.md
 /docs/src/tutorials/julia/node.md
 /docs/src/tutorials/julia/gateway.md

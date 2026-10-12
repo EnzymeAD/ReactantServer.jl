@@ -25,7 +25,7 @@ models share a GPU and one model executes at a time.
   hooks in plain Julia; they run per request, in parallel and overlapped with GPU execution. → [Bundles & model.jl](https://enzymead.github.io/ReactantServer.jl/dev/bundles/)
 - **Julia-aligned conventions.** Shapes are column-major with the batch axis last, the way Julia
   and Lux write them; the codec converts to KServe's row-major wire at the boundary, so Triton
-  clients are unchanged and you never reason about row-major order. → [Export a Model](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/basics/export/)
+  clients are unchanged and you never reason about row-major order. → [Export a Model](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/export/)
 - **Elegant configuration.** One typed YAML node file (with environment-variable overrides)
   describes a machine; manifests declare tensors with an einsum-style named-axis notation. → [Node Configuration](https://enzymead.github.io/ReactantServer.jl/dev/node_config/), [Bundles & model.jl](https://enzymead.github.io/ReactantServer.jl/dev/bundles/)
 - **Standard inference protocol.** KServe V2 over gRPC. Tensor data travels inline
@@ -57,8 +57,8 @@ models share a GPU and one model executes at a time.
 
 ## Get started
 
-The [tutorials](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/) start with what every deployment shares, [exporting a model](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/basics/export/)
-and [running inference](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/basics/inference/), and then cover the two ways to serve:
+The [tutorials](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/) follow a model from [export](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/export/) to
+[inference](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/inference/), with two ways to serve it in between:
 
 - **From Julia**, on any machine with or without a GPU: add the packages to an environment and
   [serve a model](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/julia/serve/) from a Julia session. These tutorials run in CI exactly

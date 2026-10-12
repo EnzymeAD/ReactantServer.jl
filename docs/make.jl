@@ -28,18 +28,21 @@ using ReactantServerNode
 # They are rendered to markdown here without being executed (running them starts servers and
 # compiles XLA programs). `#src` lines (the scripts' test assertions and process cleanup) are
 # dropped, and the fences become plain `julia` blocks so Documenter does not try to run them.
-# Each renders into its tutorial section's directory beside the hand-written pages; the rendered
-# files are gitignored, and EditURL points the "Edit on GitHub" link at the script.
-const BASICS_TUTORIALS = ["Export a Model" => "export", "Run Inference" => "inference"]
+# Export and Run Inference render into docs/src/tutorials/, the serving tutorials into
+# docs/src/tutorials/julia/ beside the hand-written pages; the rendered files are gitignored, and
+# EditURL points the "Edit on GitHub" link at the script.
+const TOP_TUTORIALS = ["export", "inference"]
 const JULIA_TUTORIALS = [
     "Serve a Model" => "serve",
     "Run a Node" => "node",
     "Front Workers with a Gateway" => "gateway",
 ]
 let src = joinpath(@__DIR__, "..", "integration", "tutorials")
-    for (section, tutorials) in ("basics" => BASICS_TUTORIALS, "julia" => JULIA_TUTORIALS)
-        out = joinpath(@__DIR__, "src", "tutorials", section)
-        for (_, name) in tutorials
+    for (out, names) in (
+            joinpath(@__DIR__, "src", "tutorials") => TOP_TUTORIALS,
+            joinpath(@__DIR__, "src", "tutorials", "julia") => last.(JULIA_TUTORIALS),
+        )
+        for name in names
             Literate.markdown(
                 joinpath(src, "$name.jl"), out;
                 flavor = Literate.DocumenterFlavor(), execute = false, credit = false,
@@ -92,7 +95,7 @@ makedocs(;
         "Home" => "index.md",
         "Tutorials" => [
             "Overview" => "tutorials/index.md",
-            "Basics" => [title => "tutorials/basics/$name.md" for (title, name) in BASICS_TUTORIALS],
+            "Export a Model" => "tutorials/export.md",
             "Serve from Julia" => [
                 [title => "tutorials/julia/$name.md" for (title, name) in JULIA_TUTORIALS]...,
                 "Serve an Object Detector" => "tutorials/julia/object_detection.md",
@@ -102,6 +105,7 @@ makedocs(;
                 "Serve on One GPU" => "tutorials/container/single_gpu.md",
                 "Scale to Many GPUs" => "tutorials/container/multi_gpu.md",
             ],
+            "Run Inference" => "tutorials/inference.md",
         ],
         "Building Models" => [
             "Bundles" => "bundles.md",

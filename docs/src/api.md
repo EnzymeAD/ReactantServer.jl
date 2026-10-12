@@ -4,7 +4,7 @@ Every exported name that carries a docstring across the five documented packages
 collected automatically. `ReactantServer` re-exports the whole `ReactantServerCore` substrate, so
 the shared API (dtypes, protobuf messages, boundary types, manifest, config, codec, shared memory,
 the staging `BufferPool`) is documented under its original bindings once. The guide pages give the
-worked context: [Tutorials](tutorials/basics/export.md), [Bundles](bundles.md),
+worked context: [Tutorials](tutorials/export.md), [Bundles](bundles.md),
 [Node Configuration](node_config.md), [Scheduling](scheduling.md),
 [On-demand Weights](on_demand_weights.md), [Multi-GPU Gateway](gateway.md),
 [Client Usage](client.md), [Meta Models](meta_models.md),

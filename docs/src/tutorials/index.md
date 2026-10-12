@@ -1,23 +1,19 @@
 # Tutorials
 
-The Basics show how to export a model and how to run inference against a server. Both work the
-same however the server is run. The other two sections show how to run it: from a Julia session,
-or with the container image.
+The tutorials follow a model from export to inference: export it into a bundle, serve the bundle
+from a Julia session or with the container image, then send it requests from a client. Each page
+stands on its own, so you can start with any of them.
 
-Each page stands on its own, so you can start with any of them.
+## Export
 
-## Basics
-
-- [Export a Model](basics/export.md): turn a Lux model into a bundle, the directory of compiled
-  program, weights, and manifest that every server loads.
-- [Run Inference](basics/inference.md): send a dataset through `ReactantServerClient`, with
-  concurrent batched requests and shared memory when the client shares a host with the server.
+- [Export a Model](export.md): turn a Lux model into a bundle, the directory of compiled program,
+  weights, and manifest that a server loads.
 
 ## Serve from Julia
 
 Add the packages to a Julia environment and run the server from a Julia session, on any machine,
-with or without a GPU. This is the quickest way to try the server and the natural way to develop
-against it. These pages run on the CPU; a GPU needs one line of configuration changed.
+with or without a GPU. This is the natural way to develop against the server. These pages run on
+the CPU; a GPU needs one line of configuration changed.
 
 - [Serve a Model](julia/serve.md): one worker serving a model repository.
 - [Run a Node](julia/node.md): the node supervisor, running one worker per device behind an
@@ -38,6 +34,12 @@ and the CUDA libraries.
 - [Scale to Many GPUs](container/multi_gpu.md): one worker per GPU behind the embedded gateway,
   with models replicated on every GPU or distributed across them.
 
-The basics and the first three Julia serving pages run in CI on Linux and macOS exactly as
-written. The two worked examples run in CI on request, since they download PyTorch and pretrained
-weights, and the container pages need a GPU.
+## Inference
+
+- [Run Inference](inference.md): send a dataset through `ReactantServerClient`, with concurrent
+  batched requests and shared memory when the client shares a host with the server. The client
+  works the same against either way of serving.
+
+Export, Run Inference, and the first three Julia serving pages run in CI on Linux and macOS
+exactly as written. The two worked examples run in CI on request, since they download PyTorch and
+pretrained weights, and the container pages need a GPU.

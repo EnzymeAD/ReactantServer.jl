@@ -63,7 +63,7 @@ report.servable                                    # true
 @test report.servable #src
 
 # `models/` is now a model repository: every subdirectory with a `manifest.yaml` is a servable
-# model. Either serving path takes it as is: [Serve a Model](../julia/serve.md) from a Julia
-# session, or [Serve on One GPU](../container/single_gpu.md) with the container image.
-# [Bundles](../../bundles.md) documents the manifest, custom pre- and postprocessing through a
+# model. Either serving path takes it as is: [Serve a Model](julia/serve.md) from a Julia
+# session, or [Serve on One GPU](container/single_gpu.md) with the container image.
+# [Bundles](../bundles.md) documents the manifest, custom pre- and postprocessing through a
 # bundle's `model.jl`, and the multi-input and PyTorch frontends.

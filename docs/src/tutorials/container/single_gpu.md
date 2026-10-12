@@ -13,7 +13,7 @@ an NVIDIA driver and a container runtime.
   so containers can see the GPU. Podman reads GPUs through CDI: generate the spec once with
   `sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`.
 - A model repository: a directory whose subdirectories are bundles.
-  [Export a Model](../basics/export.md) writes one, `models/mlp`, in a few lines of Julia on any
+  [Export a Model](../export.md) writes one, `models/mlp`, in a few lines of Julia on any
   machine; copy `models/` to the GPU host.
 
 ## Run the container
@@ -74,7 +74,7 @@ y = InferOutput("output", infer_sync(mlp, [InferInput("input", x)]), Float32)
 kserve_shutdown()
 ```
 
-[Run Inference](../basics/inference.md) covers batched inference over a dataset and the shared-memory
+[Run Inference](../inference.md) covers batched inference over a dataset and the shared-memory
 transport.
 
 ## Configure the node

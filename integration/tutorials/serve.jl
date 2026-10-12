@@ -20,7 +20,7 @@
 # ## Setup: a bundle
 #
 # The server needs a model repository: a directory whose subdirectories are bundles. This exports
-# the small MLP from [Export a Model to a Bundle](../basics/export.md) into `models/mlp`:
+# the small MLP from [Export a Model to a Bundle](../export.md) into `models/mlp`:
 
 using Lux, Random, ReactantServerExport
 using Test #src
@@ -97,7 +97,7 @@ maximum(abs, y .- y_local)                                  # ≈ 0
 
 @test y ≈ y_local #src
 
-# This one-shot form suits occasional requests. [Run Inference](../basics/inference.md) covers batched inference
+# This one-shot form suits occasional requests. [Run Inference](../inference.md) covers batched inference
 # over a dataset and the shared-memory transport.
 #
 # ## Stop

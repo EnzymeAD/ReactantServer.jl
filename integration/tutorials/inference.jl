@@ -24,9 +24,9 @@
 #
 # The client talks to any server, whichever way it was started. To keep this page self-contained,
 # it exports the MLP from [Export a Model to a Bundle](export.md) and serves it from Julia as in
-# [Serve a Model](../julia/serve.md). It takes 4 features and returns 3, and is compiled for
+# [Serve a Model](julia/serve.md). It takes 4 features and returns 3, and is compiled for
 # batches of 1 and 8. If you already run the container from
-# [Serve on One GPU](../container/single_gpu.md) with this bundle, skip this step: it listens on
+# [Serve on One GPU](container/single_gpu.md) with this bundle, skip this step: it listens on
 # the same address.
 
 using Lux, Random, ReactantServerExport, ReactantServer
@@ -144,6 +144,6 @@ validate_io(
 kserve_shutdown()
 stop!(server)
 
-# [Client Usage](../../client.md) is the reference for the rest: output tensors read back through shared
+# [Client Usage](../client.md) is the reference for the rest: output tensors read back through shared
 # memory, retries when a server sheds load, bounds checks under `validate_io`, and the lower-level
 # buffer interface.
