@@ -22,9 +22,12 @@
 #
 # ## Setup: a server
 #
-# Export the MLP from [Export a Model to a Bundle](export.md) and serve it as in
-# [Serve a Model](serve.md). It takes 4 features and returns 3, and is compiled for batches of 1
-# and 8:
+# The client talks to any server, whichever way it was started. To keep this page self-contained,
+# it exports the MLP from [Export a Model to a Bundle](export.md) and serves it from Julia as in
+# [Serve a Model](../julia/serve.md). It takes 4 features and returns 3, and is compiled for
+# batches of 1 and 8. If you already run the container from
+# [Serve on One GPU](../container/single_gpu.md) with this bundle, skip this step: it listens on
+# the same address.
 
 using Lux, Random, ReactantServerExport, ReactantServer
 using Test #src
@@ -135,6 +138,8 @@ validate_io(
 )
 
 # ## Stop
+#
+# Close the client's connections, and stop the server if this page started it:
 
 kserve_shutdown()
 stop!(server)

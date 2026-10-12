@@ -11,8 +11,8 @@
 # entry yet); CI's Pkg.instantiate() resolves it like any other package.
 # No Node is involved anywhere in the build anymore.
 #
-# Literate renders the native tutorials from integration/tutorials/*.jl (the same scripts the
-# integration suite runs) into docs/src/tutorials/native/ before makedocs; see docs/make.jl.
+# Literate renders the Julia tutorials from integration/tutorials/*.jl (the same scripts the
+# integration suite runs) into docs/src/tutorials/{basics,julia}/ before makedocs; see docs/make.jl.
 [deps]
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
 DocumenterCodeBlocks = "b6400b83-267f-4b55-9fd8-bffc853bdfd8"

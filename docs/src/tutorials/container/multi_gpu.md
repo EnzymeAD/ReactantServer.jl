@@ -1,6 +1,6 @@
 # Scale to Many GPUs
 
-The container from [Serve on One GPU](container_single_gpu.md) scales to a multi-GPU host
+The container from [Serve on One GPU](single_gpu.md) scales to a multi-GPU host
 unchanged: grant it more GPUs and the supervisor inside runs one worker per GPU, puts the embedded
 gateway in front of them, and keeps the same public ports. Clients do not change. What you choose
 is how models are spread across the GPUs, and that depends on whether your constraint is compute
@@ -53,7 +53,7 @@ global:
 
 `shared_host_weights` keeps one copy of each model's weights in `/dev/shm` for all of the node's
 workers, which is another reason for `--ipc=host` (or a `--shm-size` larger than the weights). See
-[On-demand Weights](../on_demand_weights.md).
+[On-demand Weights](../../on_demand_weights.md).
 
 ## Distributed: each model on a few GPUs
 
@@ -115,7 +115,7 @@ and a GPU whose placed weights exceed its budget reloads weights on nearly every
 gateway logs a warning at each repack when a placement does not fit.
 
 A running gateway can also be retuned without a restart, including a model's replica count, over
-its control plane. [Multi-GPU Gateway](../gateway.md) documents every scheduling setting, the
+its control plane. [Multi-GPU Gateway](../../gateway.md) documents every scheduling setting, the
 routing policies, and the runtime control RPCs.
 
 ## Beyond one host
@@ -123,5 +123,5 @@ routing policies, and the runtime control RPCs.
 Each node exposes the interfaces a multi-node control plane needs: the KServe V2 data plane, the
 worker control RPCs, and health and metrics over HTTP. The project does not ship a multi-node
 control plane. The simplest multi-node setup is a standalone gateway pointed at every node's
-workers, as in [Front Workers with a Gateway](native/gateway.md); [Deployment](../deployment.md)
+workers, as in [Front Workers with a Gateway](../julia/gateway.md); [Deployment](../../deployment.md)
 describes the endpoint contract.

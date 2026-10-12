@@ -13,7 +13,7 @@ an NVIDIA driver and a container runtime.
   so containers can see the GPU. Podman reads GPUs through CDI: generate the spec once with
   `sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`.
 - A model repository: a directory whose subdirectories are bundles.
-  [Export a Model](native/export.md) writes one, `models/mlp`, in a few lines of Julia on any
+  [Export a Model](../basics/export.md) writes one, `models/mlp`, in a few lines of Julia on any
   machine; copy `models/` to the GPU host.
 
 ## Run the container
@@ -47,7 +47,7 @@ same. In order:
   recreation.
 - `--stop-timeout 30` gives the supervisor time to drain its workers on stop.
 
-[Deployment](../deployment.md) explains each setting in more depth, and lists the alternatives
+[Deployment](../../deployment.md) explains each setting in more depth, and lists the alternatives
 when `--ipc=host` is not an option.
 
 ## Wait for it to be ready
@@ -79,7 +79,7 @@ y = InferOutput("output", infer_sync(mlp, [InferInput("input", x)]), Float32)
 kserve_shutdown()
 ```
 
-[Query a Server](native/client.md) covers batched inference over a dataset and the shared-memory
+[Query a Server](../basics/client.md) covers batched inference over a dataset and the shared-memory
 transport.
 
 ## Configure the node
@@ -106,7 +106,7 @@ podman run ... -v $PWD/node.yaml:/etc/reactantserver/node.yaml:ro ghcr.io/enzyme
 ```
 
 Any key can also be overridden from the environment with `-e`, for example
-`-e INFERENCE_SERVER_SCHEDULER_DISCIPLINE=fifo`. [Node Configuration](../node_config.md) covers
+`-e INFERENCE_SERVER_SCHEDULER_DISCIPLINE=fifo`. [Node Configuration](../../node_config.md) covers
 every key and its environment variable.
 
 ## Stop
@@ -119,8 +119,8 @@ The supervisor drains its workers on SIGTERM before exiting.
 
 ## Next
 
-- [Scale to Many GPUs](container_multi_gpu.md): the same image and node file on a multi-GPU host.
-- [Deployment](../deployment.md): the image's tags and provenance, every container setting,
+- [Scale to Many GPUs](multi_gpu.md): the same image and node file on a multi-GPU host.
+- [Deployment](../../deployment.md): the image's tags and provenance, every container setting,
   health checks, and building the image yourself.
-- [Monitoring](../monitoring.md): scraping the node's metrics.
-- [Security](../security.md): what to know before exposing an endpoint.
+- [Monitoring](../../monitoring.md): scraping the node's metrics.
+- [Security](../../security.md): what to know before exposing an endpoint.

@@ -21,7 +21,7 @@
 #
 # ## Setup: two models
 #
-# Export two small MLPs from [Export a Model to a Bundle](export.md), differing only in their
+# Export two small MLPs from [Export a Model to a Bundle](../basics/export.md), differing only in their
 # random initialization, into one model repository:
 
 using Lux, Random, ReactantServerExport

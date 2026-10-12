@@ -14,12 +14,7 @@ container; and it squeezes the most models out of each GPU by balancing model **
 convention follows Julia's (column-major, batch-last axes).
 
 It serves compiled models, such as computer vision and scientific computing workloads, where many
-models share a GPU and one model executes at a time. Local serving of large language models is a
-goal of the project: splitting a model into compiled stages and streaming their weights from
-storage, so a GPU can serve models larger than its memory.
-
-Not sure which setup fits you? [Scale to Many GPUs](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/container_multi_gpu/)
-walks through the multi-GPU options (replicated or distributed) and what each one optimizes for.
+models share a GPU and one model executes at a time.
 
 ## Highlights
 
@@ -30,7 +25,7 @@ walks through the multi-GPU options (replicated or distributed) and what each on
   hooks in plain Julia; they run per request, in parallel and overlapped with GPU execution. → [Bundles & model.jl](https://enzymead.github.io/ReactantServer.jl/dev/bundles/)
 - **Julia-aligned conventions.** Shapes are column-major with the batch axis last, the way Julia
   and Lux write them; the codec converts to KServe's row-major wire at the boundary, so Triton
-  clients are unchanged and you never reason about row-major order. → [Export a Model](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/native/export/)
+  clients are unchanged and you never reason about row-major order. → [Export a Model](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/basics/export/)
 - **Elegant configuration.** One typed YAML node file (with environment-variable overrides)
   describes a machine; manifests declare tensors with an einsum-style named-axis notation. → [Node Configuration](https://enzymead.github.io/ReactantServer.jl/dev/node_config/), [Bundles & model.jl](https://enzymead.github.io/ReactantServer.jl/dev/bundles/)
 - **Standard inference protocol.** KServe V2 over gRPC. Tensor data travels inline
@@ -62,19 +57,18 @@ walks through the multi-GPU options (replicated or distributed) and what each on
 
 ## Get started
 
-Two tracks of tutorials, one for each way in:
+The [tutorials](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/) start with what every deployment shares, [exporting a model](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/basics/export/)
+and [querying a server](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/basics/client/), and then cover the two ways to serve:
 
-- **From Julia**, on any machine with or without a GPU: add the packages to an environment, then
-  [export a model](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/native/export/), [serve it](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/native/serve/),
-  [query it](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/native/client/), and [run a whole node](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/native/node/).
-  These tutorials run in CI exactly as written.
-- **The container image**, the supported deployment: a host needs only the NVIDIA driver and a
-  container runtime, and the image carries Julia, every package (precompiled), and the CUDA
-  libraries. [Serve on one GPU](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/container_single_gpu/), then
-  [scale to many](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/container_multi_gpu/).
+- **From Julia**, on any machine with or without a GPU: add the packages to an environment and
+  [serve a model](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/julia/serve/) from a Julia session. These tutorials run in CI exactly
+  as written.
+- **With the container image**, the supported deployment: a host needs only the NVIDIA driver and
+  a container runtime. [Serve on one GPU](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/container/single_gpu/), then
+  [scale to many](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/container/multi_gpu/).
 
-Clients speak KServe V2 gRPC to `:8001`; health and metrics are on `:8002`. ReactantServer is
-designed for a trusted network; read [Security](https://enzymead.github.io/ReactantServer.jl/dev/security/) before exposing an endpoint.
+ReactantServer is designed for a trusted network; read [Security](https://enzymead.github.io/ReactantServer.jl/dev/security/) before exposing an
+endpoint.
 
 ## Status
 

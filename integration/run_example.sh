@@ -4,7 +4,7 @@
 #     bash integration/run_example.sh object_detection
 #     bash integration/run_example.sh transformers
 #
-# Steps, matching docs/src/tutorials/<example>.md: instantiate the example's three environments,
+# Steps, matching docs/src/tutorials/julia/<example>.md: instantiate the example's three environments,
 # export its bundles, serve them with --cpu in the background, run its client, and stop the server.
 # The export downloads pretrained weights and provisions torch through CondaPkg, so this needs
 # network and several GB of disk; CI runs it only under the `ci:tutorials-full` label.

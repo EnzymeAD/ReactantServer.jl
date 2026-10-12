@@ -133,7 +133,7 @@ over fixed-size arrays rather than `findall`; the two-stage detectors are the wo
 It is not part of the server runtime.
 
 A project that owns a Lux model (or any Reactant-traceable function) uses `ReactantServerExport`;
-Lux itself is not a dependency of the package. [Export a Model](tutorials/native/export.md) walks
+Lux itself is not a dependency of the package. [Export a Model](tutorials/basics/export.md) walks
 through exporting a Lux model end to end.
 
 The `:lux` frontend, `export_bundle(:lux, model, ps, st, example_input; dir, name, batch_sizes)`,
@@ -235,6 +235,6 @@ The manifest and boundary types are documented on the [API](api.md) page: [`Mani
 [`DType`](@ref), and [`NamedTensor`](@ref). `export_bundle`, `write_bundle`, `IOSpec`,
 `collect_provenance`, `assert_bundle_arity`, `bundle_arity_report`, and `bundle_entry_arity` are
 documented in the `ReactantServerExport` docstrings. The
-[tutorials](tutorials/native/export.md) walk the full export-to-serve path, and
+[tutorials](tutorials/basics/export.md) walk the full export-to-serve path, and
 [Node Configuration](node_config.md) covers how the server loads and watches a repository of
 bundles.

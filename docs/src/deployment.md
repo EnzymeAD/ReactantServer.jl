@@ -14,9 +14,9 @@ and a container runtime with the NVIDIA Container Toolkit. The supervisor also r
 Julia environment that holds ReactantServerNode, ReactantServer, and ReactantServerGateway.
 
 This page is the reference for how a node behaves and how the image is configured. To run one,
-follow a tutorial: [Serve on One GPU](tutorials/container_single_gpu.md) and
-[Scale to Many GPUs](tutorials/container_multi_gpu.md) for the container, or
-[Run a Node](tutorials/native/node.md) for the supervisor from a Julia environment. Scraping the
+follow a tutorial: [Serve on One GPU](tutorials/container/single_gpu.md) and
+[Scale to Many GPUs](tutorials/container/multi_gpu.md) for the container, or
+[Run a Node](tutorials/julia/node.md) for the supervisor from a Julia environment. Scraping the
 node's metrics is covered under [Monitoring](monitoring.md), and what to know before exposing an
 endpoint under [Security](security.md).
 
@@ -74,7 +74,7 @@ fan-out, for one GPU or many: the single parent process spawns one [`ReactantSer
 worker subprocess per device and the gateway as another subprocess, multiplexes their logs onto
 its stdout with `[worker0]` / `[gateway]` prefixes, and restarts any child that dies. (Each worker
 and the gateway can also run by hand, as separate `serve` / `serve_gateway` processes; see
-[Front Workers with a Gateway](tutorials/native/gateway.md).) `ReactantServerNode.main()` is the
+[Front Workers with a Gateway](tutorials/julia/gateway.md).) `ReactantServerNode.main()` is the
 container entrypoint: it reads `REACTANT_NODE_FILE` for the node config and runs the supervisor to
 completion. On a host without GPUs, `REACTANT_GPUS=0` with `backend: cpu` makes a CPU node, and
 `REACTANT_CPU_WORKERS` sets its worker count, so the multi-worker shape can be exercised anywhere.
@@ -109,7 +109,7 @@ covered on the [Multi-GPU Gateway](gateway.md) page.
 The image is published as `ghcr.io/enzymead/reactantserver`, tagged with each ReactantServer
 release (`:0.1.0`, the moving `:0.1`, and `:latest` for the newest). Its entrypoint is the node
 supervisor, so one container runs the whole node: one worker per GPU it is given, plus the
-embedded gateway when there are two or more. [Serve on One GPU](tutorials/container_single_gpu.md)
+embedded gateway when there are two or more. [Serve on One GPU](tutorials/container/single_gpu.md)
 walks through running it; the repository's `docker-compose.yml` is the same deployment as a
 compose file (`REACTANTSERVER_MODELS=/path/to/bundles docker compose up -d`).
 
@@ -214,7 +214,7 @@ and healthcheck scripts.
 
 ## Outside the image
 
-The supervisor runs the same way from a Julia environment, as in [Run a Node](tutorials/native/node.md).
+The supervisor runs the same way from a Julia environment, as in [Run a Node](tutorials/julia/node.md).
 Start it with `julia --handle-signals=no` so its own handler runs and it shuts its workers down on
 SIGTERM. Unlike the image, such an environment resolves its dependencies itself, so it does not get
 the image's locked versions or its precompiled caches. On a GPU host, select the Reactant CUDA build
@@ -260,7 +260,7 @@ node serves via `RepositoryIndex` and routes `ModelInfer` to a node that reports
 The `workers` and `gateway` values of `REACTANT_ROLE` split a node's roles across machines.
 
 The simplest multi-node setup reuses the standalone gateway pointed at every node's worker
-endpoints (see [Front Workers with a Gateway](tutorials/native/gateway.md)); a larger deployment
+endpoints (see [Front Workers with a Gateway](tutorials/julia/gateway.md)); a larger deployment
 replaces it with its own control plane speaking the same gRPC interface. Who the project is built
 for, and how each deployment shape serves that mission, is on the
 [Philosophy](design/philosophy.md) page.

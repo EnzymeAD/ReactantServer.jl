@@ -26,7 +26,7 @@
 #
 # ## Setup: a bundle
 #
-# Export the MLP from [Export a Model to a Bundle](export.md) into `models/mlp`:
+# Export the MLP from [Export a Model to a Bundle](../basics/export.md) into `models/mlp`:
 
 using Lux, Random, ReactantServerExport
 using Test #src

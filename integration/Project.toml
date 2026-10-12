@@ -1,5 +1,5 @@
 # The integration suite: one environment holding every package a user installs, exercised the way
-# the native Julia tutorials tell users to run them. Each script under tutorials/ is both a test
+# the Julia tutorials tell users to run them. Each script under tutorials/ is both a test
 # (runtests.jl runs it in a fresh process) and the source of a docs page (docs/make.jl renders it
 # with Literate), so CI executes exactly what the tutorials show.
 #

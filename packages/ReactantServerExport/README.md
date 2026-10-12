@@ -15,4 +15,4 @@ runtime, and compare against the native forward pass.
 Part of the [ReactantServer.jl](../../README.md) repository, though not a member of the serving
 workspace. See [Bundles](https://enzymead.github.io/ReactantServer.jl/dev/bundles/) for the bundle
 format and the export frontends, and the
-[Export a Model](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/native/export/) tutorial for exporting a model end to end.
+[Export a Model](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/basics/export/) tutorial for exporting a model end to end.

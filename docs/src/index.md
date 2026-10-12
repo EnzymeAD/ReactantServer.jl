@@ -10,7 +10,7 @@ hero:
   actions:
     - theme: brand
       text: Tutorials
-      link: /tutorials/native/export/
+      link: /tutorials/
     - theme: alt
       text: API Reference
       link: /api/
@@ -29,7 +29,7 @@ features:
   - icon: 🚀
     title: XLA under the hood
     details: Models compile ahead of time through Reactant and XLA into device executables; the runtime is device agnostic, CUDA today with CPU for development.
-    link: /tutorials/native/export/
+    link: /tutorials/basics/export/
   - icon: 🧩
     title: Julia-first
     details: A bundle's model.jl registers pre and postprocessing in plain Julia, and every convention follows Julia's, column-major with the batch axis last.
@@ -70,10 +70,8 @@ is the multi-GPU reverse proxy; `ReactantServerClient` is a Reactant-free client
 ## Why ReactantServer?
 
 The server is built for compiled models, such as computer vision and scientific computing
-workloads, where many models share a GPU and one model executes at a time. Local serving of large
-language models, by splitting a model into compiled stages and streaming their weights from
-storage, is a goal of the project. That shape rewards a server that is compiled rather
-than interpreted: models are compiled ahead of time into device executables through Reactant's
+workloads, where many models share a GPU and one model executes at a time. That shape rewards a
+server that is compiled rather than interpreted: models are compiled ahead of time into device executables through Reactant's
 PJRT bindings, so inference is a single batched kernel launch rather than an interpreter loop, and
 the runtime is device-agnostic, CUDA today with CPU for development and fallback.
 
@@ -86,28 +84,19 @@ through a gRPC control plane, without a restart.
 
 ## Get started
 
-There are two ways in, and two tracks of tutorials to match:
+The [Tutorials](tutorials/index.md) start with what every deployment shares, exporting a model
+and querying a server, and then cover the two ways to serve:
 
 - **From Julia.** Every package is in the General registry, so a Julia environment is all you
-  need: add the packages, export a model, serve it, and query it, on any machine, with or without a
-  GPU. Start with [Export a Model](tutorials/native/export.md).
-- **The container image.** The supported deployment: a host needs only the NVIDIA driver and a
-  container runtime, and the image carries Julia, every package (precompiled), and the CUDA
-  libraries. Start with [Serve on One GPU](tutorials/container_single_gpu.md).
+  need, on any machine, with or without a GPU. Start with [Serve a Model](tutorials/julia/serve.md).
+- **With the container image.** The supported deployment: a host needs only the NVIDIA driver and
+  a container runtime. Start with [Serve on One GPU](tutorials/container/single_gpu.md).
 
-Clients speak KServe V2 gRPC to `:8001`; health and metrics are on `:8002`. The first server
-startup is slow, because every model compiles before the gRPC plane accepts traffic. The server is
-designed for a trusted network, so read [Security](security.md) before exposing an endpoint.
+The server is designed for a trusted network, so read [Security](security.md) before exposing an
+endpoint.
 
-## Start here
+## Reference
 
-- Tutorials, native Julia: [Export a Model](tutorials/native/export.md),
-  [Serve a Model](tutorials/native/serve.md), [Query a Server](tutorials/native/client.md),
-  [Run a Node](tutorials/native/node.md), [Front Workers with a Gateway](tutorials/native/gateway.md),
-  and the worked examples [Serve an Object Detector](tutorials/object_detection.md) and
-  [Serve Transformer Text Models](tutorials/transformers.md).
-- Tutorials, container: [Serve on One GPU](tutorials/container_single_gpu.md) and
-  [Scale to Many GPUs](tutorials/container_multi_gpu.md).
 - [Bundles](bundles.md): the bundle format, the manifest's named-axis notation, and the export
   frontends.
 - [Node Configuration](node_config.md): the one typed YAML file that describes a machine.

@@ -4,7 +4,7 @@ This tutorial runs a real model end to end: it exports a torchvision Faster R-CN
 COCO, into one ReactantServer bundle, serves it, sends it a photo, and draws the detected objects
 back onto the image. It runs on the CPU, so it needs no GPU, and the same steps serve on a GPU by
 dropping one flag. How the detector's data-dependent middle becomes one static program is covered
-in the [Object Detection](../object_detection.md) reference.
+in the [Object Detection](../../object_detection.md) reference.
 
 You need a clone of the repository (the example's scripts live in `examples/object_detection/`)
 and network access for the first export, which downloads the pretrained weights and the Python

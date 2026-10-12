@@ -1,4 +1,4 @@
-# Run the native tutorials as integration tests.
+# Run the Julia tutorials as integration tests.
 #
 #     julia --project=integration integration/runtests.jl            # every tutorial
 #     julia --project=integration integration/runtests.jl node       # just tutorials/node.jl

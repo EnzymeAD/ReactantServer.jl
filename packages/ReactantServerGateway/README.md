@@ -12,6 +12,6 @@ carries **no Reactant dependency** and deploys as a small, fast-starting image.
 Public entry points: `serve_gateway`, `probe_worker_ready`.
 
 Part of the [ReactantServer.jl](../../README.md) workspace. The
-[Front Workers with a Gateway](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/native/gateway/) tutorial runs it in
+[Front Workers with a Gateway](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/julia/gateway/) tutorial runs it in
 front of two workers; [Multi-GPU Gateway](https://enzymead.github.io/ReactantServer.jl/dev/gateway/) is the reference for what the gateway does,
 its scheduling modes, and its `gateway.yml` configuration.

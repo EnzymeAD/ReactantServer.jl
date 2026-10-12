@@ -9,6 +9,6 @@ The example is three single-purpose Julia environments, each loading only what i
 `export/` is the only one with PythonCall and torch, `server/` the only one with Reactant, and
 `client/` has CairoMakie but no Reactant. `detector.convert.yaml` configures the conversion.
 
-- [Serve an Object Detector](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/object_detection/) walks through running it.
+- [Serve an Object Detector](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/julia/object_detection/) walks through running it.
 - [Object Detection](https://enzymead.github.io/ReactantServer.jl/dev/object_detection/) explains how the detector's data-dependent middle
   becomes one static program, and the tracing pitfalls met along the way.

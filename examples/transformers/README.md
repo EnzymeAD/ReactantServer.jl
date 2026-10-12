@@ -15,6 +15,6 @@ Tokenization runs in Julia inside each bundle's `model.jl`, so clients send raw 
 never token ids. The example is three single-purpose Julia environments: `export/` is the only
 one with PythonCall and torch, `server/` the only one with Reactant, and `client/` has neither.
 
-- [Serve Transformer Text Models](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/transformers/) walks through running it.
+- [Serve Transformer Text Models](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/julia/transformers/) walks through running it.
 - [Transformer Text Models](https://enzymead.github.io/ReactantServer.jl/dev/transformers/) is the reference: the four models, tokenization in
   the bundle, the raw-logits rule, the wire contract, and sequence-length batching.

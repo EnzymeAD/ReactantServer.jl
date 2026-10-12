@@ -1,9 +1,7 @@
 # Contributing
 
 Developer notes for working on ReactantServer.jl. For using the server, start with
-the tutorials: [native Julia](integration/tutorials/export.jl) (rendered at
-https://enzymead.github.io/ReactantServer.jl/dev/tutorials/native/export/) or the
-[container](docs/src/tutorials/container_single_gpu.md).
+the [tutorials](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/).
 
 After cloning, instantiate the workspace (dependencies resolve from the package registries,
 plus the tree-internal path sources):
@@ -48,7 +46,8 @@ bash packages/ReactantServer/test/e2e/run_e2e_cpu.sh
 
 ### Integration tests are the tutorials
 
-The native Julia tutorials are Literate scripts under `integration/tutorials/`, and the
+The Julia tutorials (Basics and Serve from Julia) are Literate scripts under
+`integration/tutorials/`, and the
 `integration/` environment holds every package a user installs (path-sourced from this tree). Each
 script is both a docs page (rendered by `docs/make.jl`) and an integration test: `runtests.jl` runs
 each one top to bottom in a fresh process and working directory, on CPU, and CI runs it on Linux
@@ -234,8 +233,8 @@ julia --project=docs docs/make.jl
 
 Output lands in `docs/build/`.
 
-Usage lives in the tutorials, and only there: the native ones under `integration/tutorials/` (run
-in CI) and the container ones under `docs/src/tutorials/`. Reference pages document configuration
+Usage lives in the tutorials, and only there: the Julia ones under `integration/tutorials/` (run
+in CI), and the worked examples and container ones under `docs/src/tutorials/`. Reference pages document configuration
 keys, API contracts, and behavior, and link to the tutorial that shows how to use them, so there
 is one maintained copy of every walkthrough. Package READMEs describe the package and link to the
 docs, with no code.

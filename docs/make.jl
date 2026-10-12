@@ -23,28 +23,29 @@ using ReactantServerExport
 using ReactantServerGateway
 using ReactantServerNode
 
-# The native tutorials are Literate scripts under integration/tutorials/, which the integration
+# The Julia tutorials are Literate scripts under integration/tutorials/, which the integration
 # suite (integration/runtests.jl) runs in CI, so every page shows code that is tested as written.
 # They are rendered to markdown here without being executed (running them starts servers and
 # compiles XLA programs). `#src` lines (the scripts' test assertions and process cleanup) are
-# dropped, and the fences become plain `julia` blocks so Documenter does not try to run them. The
-# output directory is gitignored; EditURL points the "Edit on GitHub" link at the script.
-const NATIVE_TUTORIALS = [
-    "Export a Model" => "export",
+# dropped, and the fences become plain `julia` blocks so Documenter does not try to run them.
+# Each renders into its tutorial section's directory beside the hand-written pages; the rendered
+# files are gitignored, and EditURL points the "Edit on GitHub" link at the script.
+const BASICS_TUTORIALS = ["Export a Model" => "export", "Query a Server" => "client"]
+const JULIA_TUTORIALS = [
     "Serve a Model" => "serve",
-    "Query a Server" => "client",
     "Run a Node" => "node",
     "Front Workers with a Gateway" => "gateway",
 ]
-let src = joinpath(@__DIR__, "..", "integration", "tutorials"),
-        out = joinpath(@__DIR__, "src", "tutorials", "native")
-    rm(out; force = true, recursive = true)
-    for (_, name) in NATIVE_TUTORIALS
-        Literate.markdown(
-            joinpath(src, "$name.jl"), out;
-            flavor = Literate.DocumenterFlavor(), execute = false, credit = false,
-            codefence = "```julia" => "```"
-        )
+let src = joinpath(@__DIR__, "..", "integration", "tutorials")
+    for (section, tutorials) in ("basics" => BASICS_TUTORIALS, "julia" => JULIA_TUTORIALS)
+        out = joinpath(@__DIR__, "src", "tutorials", section)
+        for (_, name) in tutorials
+            Literate.markdown(
+                joinpath(src, "$name.jl"), out;
+                flavor = Literate.DocumenterFlavor(), execute = false, credit = false,
+                codefence = "```julia" => "```"
+            )
+        end
     end
 end
 
@@ -90,14 +91,16 @@ makedocs(;
     pages = [
         "Home" => "index.md",
         "Tutorials" => [
-            "Native Julia" => [
-                [title => "tutorials/native/$name.md" for (title, name) in NATIVE_TUTORIALS]...,
-                "Serve an Object Detector" => "tutorials/object_detection.md",
-                "Serve Transformer Text Models" => "tutorials/transformers.md",
+            "Overview" => "tutorials/index.md",
+            "Basics" => [title => "tutorials/basics/$name.md" for (title, name) in BASICS_TUTORIALS],
+            "Serve from Julia" => [
+                [title => "tutorials/julia/$name.md" for (title, name) in JULIA_TUTORIALS]...,
+                "Serve an Object Detector" => "tutorials/julia/object_detection.md",
+                "Serve Transformer Text Models" => "tutorials/julia/transformers.md",
             ],
-            "Container" => [
-                "Serve on One GPU" => "tutorials/container_single_gpu.md",
-                "Scale to Many GPUs" => "tutorials/container_multi_gpu.md",
+            "Serve with the Container" => [
+                "Serve on One GPU" => "tutorials/container/single_gpu.md",
+                "Scale to Many GPUs" => "tutorials/container/multi_gpu.md",
             ],
         ],
         "Building Models" => [

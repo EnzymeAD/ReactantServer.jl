@@ -5,7 +5,7 @@ sentence embedder, a cross-encoder reranker, and a sentiment classifier) into Re
 bundles, serves all four, and queries them with raw text. It runs on the CPU, so it needs no GPU,
 and the same steps serve on a GPU by dropping one flag. Why tokenization lives in each bundle's
 `model.jl`, and the wire contract the client follows, are covered in the
-[Transformer Text Models](../transformers.md) reference.
+[Transformer Text Models](../../transformers.md) reference.
 
 You need a clone of the repository (the example's scripts live in `examples/transformers/`) and
 network access for the first export, which downloads the checkpoints and the Python packages the
