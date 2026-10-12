@@ -185,6 +185,10 @@ The image reports what it is through the standard OCI labels, which `podman insp
   checkout with no uncommitted changes, so a label never names a commit the image was not built
   from; the workflow pushes with `--stamp` and fails before pushing if the label does not match
   the commit it checked out
+- `org.opencontainers.image.authors`, and `maintainer` (the older Docker convention, which would
+  otherwise keep the CUDA base's NVIDIA value): ReactantServer's `authors`
+- `org.enzymead.reactantserver.<package>.version`, for `server`, `gateway`, `node` and `core`: each
+  package the image runs, from its `Project.toml`
 
 Stamping touches only the image config, never a layer. To stamp a local build:
 
@@ -217,6 +221,6 @@ declares (`reactantserver_julia`, `reactantserver_cuda_base`, `reactantserver_de
 they cannot collide with a consumer's own.
 
 A consumer's build runs the consumer's workspace status command, not this repository's, so its
-image carries the version label but no revision. To record one, have that command print
+image carries every label but the revision. To record one, have that command print
 `STABLE_REACTANTSERVER_COMMIT <commit>` (the commit the `git_override` pins) and build with
 `--stamp`.

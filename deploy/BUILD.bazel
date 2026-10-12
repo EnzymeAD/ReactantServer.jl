@@ -328,32 +328,63 @@ config_setting(
 
 # The image's OCI labels (https://github.com/opencontainers/image-spec/blob/main/annotations.md),
 # so an image or a running container reports what it is: `podman inspect` shows them under Labels.
+# They are merged over the CUDA base's, and a key set here replaces the base's value.
 #
-#   org.opencontainers.image.version   ReactantServer's version, from its Project.toml. Each round
-#                                      of releases registers ReactantServer last, so its version
-#                                      names the whole image (worker, gateway and node).
+#   org.opencontainers.image.version   ReactantServer's version. Each round of releases registers
+#                                      ReactantServer last, so its version names the whole image.
 #   org.opencontainers.image.revision  the commit, in a --stamp build only (image.yml pushes with
 #                                      one), and only from a checkout with no uncommitted changes;
 #                                      see deploy/workspace_status.sh.
+#   org.opencontainers.image.authors   ReactantServer's authors.
+#   maintainer                         the same, replacing the base's NVIDIA value. The pre-OCI
+#                                      Docker convention, which some tools still read.
+#   org.enzymead.reactantserver.<package>.version
+#                                      each package the image runs, for a fleet that needs to know
+#                                      which gateway or node a container carries, not only which
+#                                      ReactantServer.
 #
-# An unstamped build's labels depend on the sources alone, so it stays cacheable. Stamping changes
-# this file and the image config, never a layer.
-_LABELS_VERSION = """
+# Everything but the revision comes from the packages' Project.toml files, so nothing is restated
+# here. An unstamped build's labels depend on the sources alone, so it stays cacheable. Stamping
+# changes this file and the image config, never a layer.
+_LABELED_PACKAGES = {
+    "core": "ReactantServerCore",
+    "gateway": "ReactantServerGateway",
+    "node": "ReactantServerNode",
+    "server": "ReactantServer",
+}
+
+_LABELS = """
 set -euo pipefail
-version="$$(sed -n 's/^version = "\\(.*\\)"$$/\\1/p' $(location //:packages/ReactantServer/Project.toml))"
-[ -n "$$version" ] || { echo "FAILED: no version in packages/ReactantServer/Project.toml" >&2; exit 1; }
-echo "org.opencontainers.image.version=$$version" > "$@"
-"""
+field() {
+    # field <key> <Project.toml>: a top-level string, or a string array joined with ", ".
+    v="$$(sed -n "s/^$$1 = //p" "$$2" | head -1 | sed -e 's/^\\[//' -e 's/\\]$$//' -e 's/", *"/, /g' -e 's/^"//' -e 's/"$$//')"
+    [ -n "$$v" ] || { echo "FAILED: no $$1 in $$2" >&2; exit 1; }
+    echo "$$v"
+}
+server="$(location //:packages/ReactantServer/Project.toml)"
+version="$$(field version "$$server")"
+authors="$$(field authors "$$server")"
+{
+    echo "org.opencontainers.image.version=$$version"
+    echo "org.opencontainers.image.authors=$$authors"
+    echo "maintainer=$$authors"
+} > "$@"
+""" + "".join([
+    """v="$$(field version $(location //:packages/{pkg}/Project.toml))"
+echo "org.enzymead.reactantserver.{key}.version=$$v" >> "$@"
+""".format(key = key, pkg = pkg)
+    for key, pkg in sorted(_LABELED_PACKAGES.items())
+])
 
 genrule(
     name = "image_labels",
-    srcs = ["//:packages/ReactantServer/Project.toml"],
+    srcs = ["//:packages/{}/Project.toml".format(pkg) for pkg in sorted(_LABELED_PACKAGES.values())],
     outs = ["image_labels.txt"],
     cmd = select({
-        ":stamped": _LABELS_VERSION + """
+        ":stamped": _LABELS + """
 sed -n 's/^STABLE_REACTANTSERVER_COMMIT /org.opencontainers.image.revision=/p' bazel-out/stable-status.txt >> "$@"
 """,
-        "//conditions:default": _LABELS_VERSION,
+        "//conditions:default": _LABELS,
     }),
     stamp = -1,
 )

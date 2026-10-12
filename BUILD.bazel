@@ -31,9 +31,15 @@ filegroup(
     ),
 )
 
-# ReactantServer's project on its own: its version names the image (//deploy:image_labels).
+# The image packages' projects on their own, for the versions and authors //deploy:image_labels
+# reads.
 exports_files(
-    ["packages/ReactantServer/Project.toml"],
+    [
+        "packages/ReactantServer/Project.toml",
+        "packages/ReactantServerCore/Project.toml",
+        "packages/ReactantServerGateway/Project.toml",
+        "packages/ReactantServerNode/Project.toml",
+    ],
     visibility = ["//deploy:__pkg__"],
 )
 
