@@ -39,11 +39,12 @@ models share a GPU and one model executes at a time.
   fit in VRAM, paying a single host-to-device transfer on a cold call. → [On-demand Weights](https://enzymead.github.io/ReactantServer.jl/dev/on_demand_weights/)
 - **Batch coalescing.** Concurrent same-model requests are merged into one execution at a compiled
   batch size, amortizing per-launch overhead and the one-time weight transfer across the batch.
-  → [Architecture](https://enzymead.github.io/ReactantServer.jl/dev/design/architecture/)
+  → [Scheduling](https://enzymead.github.io/ReactantServer.jl/dev/scheduling/)
 - **Scheduling modes for single and multi-GPU.** On a worker, `fair` (deficit-weighted,
-  cost-aware) or `fifo`; across GPUs, the gateway offers `round_robin` or memory-aware
-  `lpt_packing` that concentrates each model's traffic to fill batches, with a gRPC control plane for
-  retuning placement without a restart. → [Architecture](https://enzymead.github.io/ReactantServer.jl/dev/design/architecture/), [Multi-GPU Gateway](https://enzymead.github.io/ReactantServer.jl/dev/gateway/)
+  cost-aware), `fifo`, or `edf`; across GPUs, the gateway offers `round_robin`,
+  `least_outstanding`, or memory-aware `lpt_packing` that concentrates each model's traffic to fill
+  batches, with a gRPC control plane for retuning placement without a restart.
+  → [Scheduling](https://enzymead.github.io/ReactantServer.jl/dev/scheduling/), [Multi-GPU Gateway](https://enzymead.github.io/ReactantServer.jl/dev/gateway/)
 - **Fast iteration.** In `dynamic` mode the server watches the model repository and hot-loads,
   unloads, and reloads bundles online — weights, MLIR, manifest, and `model.jl` alike — with no
   restart (`static` and `explicit` control modes are also available). A model is named by its

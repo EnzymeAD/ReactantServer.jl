@@ -11,8 +11,8 @@ or memory.
 | Models fit on every GPU, and you need throughput | Replicated | Spreading each model's load across GPUs |
 | Models do not all fit on every GPU | Distributed | Serving more models than any one GPU holds |
 
-Both shapes are the same image and the same node file; they differ only in the gateway's
-scheduling mode.
+Both shapes are the same image and the same node file; they differ in the gateway's scheduling
+mode and the workers' scheduling discipline.
 
 ## Grant every GPU
 
@@ -62,8 +62,8 @@ concentrate on few GPUs so they coalesce into full batches, use the gateway's `l
 It places each model on a fixed number of GPUs, balancing measured compute against each GPU's
 weight memory, and repacks as the load changes.
 
-`lpt_packing` needs the workers on the `fifo` discipline, since placement decisions move to the
-gateway. Both settings can be passed as environment variables:
+`lpt_packing` needs the workers on the `fifo` or `edf` discipline, since placement decisions move
+to the gateway; this example uses `fifo`. Both settings can be passed as environment variables:
 
 ```sh
 podman run -d --name reactantserver \

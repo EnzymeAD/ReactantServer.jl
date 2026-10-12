@@ -277,8 +277,8 @@ scheduling:
   default_replicas: 1             # GPUs per model (a number, or "all")
   routing_fill_mode: run          # run (default) | spread | inflight
 endpoints:                        # worker host:port addresses, across any number of nodes
-  - "worker0:8080"
-  - "worker1:8081"
+  - "10.0.0.1:8080"
+  - "10.0.0.2:8080"
 ```
 
 The gateway is also configured by `REACTANT_GATEWAY_*` environment overrides

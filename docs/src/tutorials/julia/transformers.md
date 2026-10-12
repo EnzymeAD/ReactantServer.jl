@@ -44,7 +44,7 @@ both step 2 and step 3.
 The driver imports torch/torchax through PythonCall **before** `ReactantServerExport` pulls in
 Reactant; that init order is critical, because Triton's static LLVM/MLIR registration
 SIGSEGVs if Reactant loads first. Each of the four builders wraps its checkpoint (torch class
-per the table above, plus the in-graph head for `splade`/`embedding`), traces it with
+per the table in the [Transformer Text Models](../../transformers.md) reference, plus the in-graph head for `splade`/`embedding`), traces it with
 `export_bundle(:pytorch, ...)`, and stages the per-bundle `model.jl` plus the shared
 `vocab.txt` into `./bundles/<name>/` (the tokenizer code itself lives in
 `ReactantServer.BertText`, so it is not staged). Bundles that already exist are skipped; delete

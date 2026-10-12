@@ -376,7 +376,7 @@ installed.
     bumped by each accepted change, so you can tell a tuned gateway from a fresh one, and each
     accepted change is logged with its before and after values, which is the only durable record
     of it. Like the rest of the control plane these RPCs are unauthenticated (see
-    [Deployment](deployment.md)), so the gateway's gRPC port must not be exposed outside the
+    [Security](security.md)), so the gateway's gRPC port must not be exposed outside the
     trusted network.
 
 ## What the gateway does not do

@@ -3,7 +3,8 @@
 The pure-Julia KServe V2 gRPC **reverse proxy** that fronts a multi-GPU cluster of
 [`ReactantServer`](../ReactantServer) workers behind one endpoint. It reads model name from each
 `ModelInferRequest` and forwards the raw protobuf bytes to the worker that hosts the model, with
-round-robin load balancing and failover, and fans shared-memory register/unregister out to all
+placement and load balancing across the workers that serve it (`round_robin`,
+`least_outstanding`, or `lpt_packing`), failover, and fans shared-memory register/unregister out to all
 workers.
 
 It builds only on [`ReactantServerCore`](../ReactantServerCore) and the gRPC/HTTP layer, so it

@@ -5,8 +5,7 @@
 messages and forwards them over gRPC. It depends only on `ReactantServerCore` and the gRPC
 layer, so it carries **no Reactant/XLA dependency** and installs quickly on a plain client
 machine. (The same KServe V2 wire protocol means any Triton or KServe gRPC client also works;
-this package is the convenient Julia option.) The server-side handling of the wire and
-shared-memory data planes is covered on the [Bundles](bundles.md) page.
+this package is the convenient Julia option.)
 
 [Run Inference](tutorials/basics/inference.md) walks through using it: one-shot requests, batched
 inference over a dataset, and the shared-memory transport. This page is the reference for how the
@@ -84,7 +83,8 @@ from the served model. [`validate_io`](@ref) dry-runs an IO against the model's 
 without sending an inference request: it runs `infer_encode_chunk!` and `infer_decode_chunk!`
 once over synthetic, spec-shaped data and surfaces name, dtype, shape, and indexing mismatches
 as errors. Get the spec from [`model_io_spec`](@ref)`(model)` against a running server (the
-ModelMetadata RPC; it throws if the server is unreachable or does not implement metadata), or
+ModelMetadata RPC; it throws if the server is unreachable or does not implement metadata, as a
+gateway does not, so point it at a worker), or
 from [`manifest_io_spec`](@ref)`(path)` offline against a model's `manifest.yaml`, suitable for
 a build-time check. Reported shapes are Julia column-major (batch axis last), matching the
 axis order you build arrays in.

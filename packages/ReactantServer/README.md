@@ -1,7 +1,7 @@
 # ReactantServer.jl
 
 The inference **worker**: it loads StableHLO model bundles, compiles them through Reactant/PJRT,
-schedules and batches requests, and serves the KServe V2 gRPC control plane for one GPU. This is
+schedules and batches requests, and serves the KServe V2 gRPC inference API for one GPU. This is
 the **only** package in the workspace that depends on Reactant.
 
 Public entry points: `serve`, `serve_worker`, `stop!`, `register_model`. It re-exports the
