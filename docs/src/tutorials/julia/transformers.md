@@ -39,38 +39,23 @@ julia --project=examples/transformers/client examples/transformers/client/query.
 The server port defaults to 8080; set `TX_PORT` (and `TX_HOST` for the client) to change it on
 both step 2 and step 3.
 
-### Export (`export_stablehlo.jl`)
+### Export
 
-The driver imports torch/torchax through PythonCall **before** `ReactantServerExport` pulls in
-Reactant; that init order is critical, because Triton's static LLVM/MLIR registration
-SIGSEGVs if Reactant loads first. Each of the four builders wraps its checkpoint (torch class
-per the table in the [Transformer Text Models](../../transformers.md) reference, plus the in-graph head for `splade`/`embedding`), traces it with
-`export_bundle(:pytorch, ...)`, and stages the per-bundle `model.jl` plus the shared
-`vocab.txt` into `./bundles/<name>/` (the tokenizer code itself lives in
-`ReactantServer.BertText`, so it is not staged). Bundles that already exist are skipped; delete
-`./bundles/` to re-export.
+The export writes one bundle per model to `examples/transformers/bundles/`, and skips any bundle
+that already exists; delete `bundles/` to export again. The first run downloads the four
+checkpoints from HuggingFace and, through CondaPkg, the Python packages the export uses. Behind a
+proxy that intercepts TLS, set `SSL_CERT_FILE` to a CA bundle that trusts it; by default the
+script uses the system bundle.
 
-Python dependencies come from `ReactantServerExport`'s CondaPkg (torch, torchax, jax) plus
-`transformers` from `export/CondaPkg.toml`; CondaPkg resolves and installs them on the first
-export, and the first run downloads the four checkpoints from HuggingFace, so both need network.
-For corporate proxies, the driver points Python's TLS at the OS CA bundle (`SSL_CERT_FILE`,
-defaulting from `REQUESTS_CA_BUNDLE`/`CURL_CA_BUNDLE`/`JULIA_SSL_CA_ROOTS_PATH` or
-`/etc/ssl/certs/ca-certificates.crt`) so the checkpoint downloads trust a MitM proxy's CA.
+### Serve
 
-### Serve (`serve.jl`)
+The server compiles all four models before it accepts requests. If it fails with `EACCES` on
+Reactant's compile cache, set `REACTANT_CACHE_DIR` to a writable directory.
 
-The server validates that all four bundles exist under `examples/transformers/bundles`, picks
-`ReactantServer.CPU_BACKEND` or `CUDA_BACKEND` from `--cpu`, and builds a
-`ReactantServer.ServerConfig` (runtime, scheduler, and endpoints on `127.0.0.1:$TX_PORT`) before
-calling `ReactantServer.serve(...; backend = ReactantServer.ReactantBackend())`, which blocks
-until Ctrl-C. Running the export or `serve.jl --cpu` outside Docker can hit an `EACCES` on
-Reactant's default compile cache; set a writable `REACTANT_CACHE_DIR` if so.
+### Client
 
-### Client (`query.jl`)
-
-The client depends only on `ReactantServerClient` (no Reactant, no PythonCall), so it loads
-fast. It packs strings into the wire tensors itself (`pack_texts`: a `(max_bytes, batch)` UInt8
-matrix plus an Int32 byte-length vector) and sends raw UTF-8 to all four models, then decodes
-each response: cosine similarity between unit-norm embeddings, SPLADE's top expansion terms
-turned back into tokens via the shared vocab, cross-encoder reranking of candidate answers, and
-sentiment labels (0 NEGATIVE, 1 POSITIVE) with their probabilities.
+The client sends raw UTF-8 text to all four models and prints what each returns: cosine similarity
+between sentence embeddings, SPLADE's top expansion terms, the cross-encoder's ranking of
+candidate answers, and sentiment labels with their probabilities. The
+[Transformer Text Models](../../transformers.md) reference describes the wire format the client
+uses.
