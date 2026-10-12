@@ -135,8 +135,7 @@ retry storm, and `min_budget` (seconds) is the smallest remaining budget worth a
 attempt. `retry_unavailable` also retries `UNAVAILABLE` (no replica reachable). Deadline,
 `NOT_FOUND`, and `INVALID_ARGUMENT` errors always fail fast. Pass a `RetryPolicy(...)` as the
 `retry` keyword to [`KServeModel`](@ref); `ReactantServerClient.RetryPolicy(enabled = false)`
-restores the old
-fail-fast behavior.
+turns retries off, so every failure is returned to the caller.
 
 Every documented name in `ReactantServerClient`, including the signatures covered here, is
 collected on the [API](api.md) page.

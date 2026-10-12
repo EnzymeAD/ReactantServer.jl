@@ -70,17 +70,6 @@ and [running inference](https://enzymead.github.io/ReactantServer.jl/dev/tutoria
 ReactantServer is designed for a trusted network; read [Security](https://enzymead.github.io/ReactantServer.jl/dev/security/) before exposing an
 endpoint.
 
-## Status
-
-The full serving path is implemented end to end: export a bundle, compile it through Reactant/PJRT,
-schedule and coalesce requests, and serve over the KServe V2 gRPC control plane. The cost-aware
-scheduler, the on-demand GPU weight cache, dynamic model lifecycle, meta-model orchestration (with
-a worked object detection example), and the single- and multi-GPU deployment paths all work today
-on CUDA (with CPU for development and fallback); broader accelerator support is intended to follow. Deferred to later milestones: dynamic-batch export with server-side
-`stablehlo-refine` specialization, the compiled-executable disk cache, multi-model orchestrators,
-and full StableHLO-signature validation of manifests. See
-[Architecture](https://enzymead.github.io/ReactantServer.jl/dev/design/architecture/) for the full picture.
-
 ## Repository layout
 
 A Julia 1.12+ workspace of five packages under `packages/`, split so that talking to a server never

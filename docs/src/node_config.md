@@ -340,9 +340,3 @@ overrides were applied, is logged at startup.
 | `INFERENCE_SERVER_ENDPOINTS_MAX_CONCURRENT_REQUESTS` | `endpoints.max_concurrent_requests` | integer |
 | `INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES` | `grpc.max_recv_msg_bytes` | bytes |
 | `INFERENCE_SERVER_GRPC_MAX_SEND_MSG_BYTES` | `grpc.max_send_msg_bytes` | bytes |
-
-Removed keys fail loudly rather than being silently ignored: a `batch_policy` block or a
-`runtime.residency_mode` key is rejected at startup with a migration error naming the
-replacement (`scheduler.models.<name>.max_batch_size` and the top-level `model_control_mode`,
-respectively), and the same applies to their `INFERENCE_SERVER_BATCH_POLICY_*` and
-`INFERENCE_SERVER_RUNTIME_RESIDENCY_MODE` environment overrides.

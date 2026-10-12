@@ -206,15 +206,15 @@ model registers and serves and then fails every inference with
 INVALID_ARGUMENT: Execution supplied 216 arguments but compiled program expected 217
 ```
 
-`export_bundle` now checks this itself and refuses to write a bundle whose graph disagrees with it,
+`export_bundle` checks this itself and refuses to write a bundle whose graph disagrees with it,
 naming both numbers and the usual cause. The usual cause is a device-resident value reachable from
 the traced closure: Reactant lifts every one of those into an argument whether the program reads it
 or not, so an RNG in layer state (which appears as a leading `tensor<2xui64>`) or a device-resident
 configuration value captured by the model becomes an argument no client can supply. Reading such
 values back to the host before tracing bakes them into the graph as constants instead.
 
-For bundles that were written before that check existed, `assert_bundle_arity` reads the same three
-numbers back out of the artifact:
+For a bundle written by other tooling, `assert_bundle_arity` reads the same three numbers back out
+of the artifact:
 
 ```julia
 using ReactantServerExport

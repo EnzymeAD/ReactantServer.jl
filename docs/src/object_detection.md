@@ -169,24 +169,23 @@ COCO into one bundle this way, serves it, and draws its detections on an image.
 
 ## Reactant tracing pitfalls
 
-Each of these cost an iteration while building the traced glue, and applies to any hand-written
-traced export:
+These apply to any hand-written traced export:
 
 - **A returned `reshape` wrapper is emitted with its parent's shape.** `reshape(x, 2, 4, 6, 1)` as a
-  function result produced an `(8, 6)` program output, and the server trusts the executable's shape,
+  function result produces an `(8, 6)` program output, and the server trusts the executable's shape,
   not the manifest. Materialize outputs with `Reactant.ReactantCore.materialize_traced_array`.
 - **`@trace while` bodies.** Loop-carried values must be distinct arrays (`copy` before the loop),
   and captured values must be materialized traced arrays, not `reshape` wrappers. Referencing a type
   parameter such as `T(0.5)` inside the body breaks the macro; hoist constants out of the loop.
-- **`map(1:n) do ... end` inside a trace failed;** plain `for` loops work.
-- **Matrix products.** A traced `A * B` fell back to generic LinearAlgebra in one context; use
+- **`map(1:n) do ... end` inside a trace fails;** plain `for` loops work.
+- **Matrix products.** A traced `A * B` can fall back to generic LinearAlgebra; use
   `Ops.dot_general`. Number constructors on traced scalars (`Float32(x)`, `Int64(x)`, `sign(x)`) are
   not traceable; use `Ops.convert(TracedRArray{Int64, N}, x)` and `ifelse`.
 - **Sorting.** `Base.sortperm` on traced arrays is not stable; use `Ops.sort(...; is_stable=true)`
   with an index operand where tie order matters.
 - **Gathers.** `A[:, idx]` needs `idx` to be a materialized traced `Int64` vector.
-- **Per-shape constants add up.** Baking anchor grids as Float64 constants added about 200 MB to a
-  15-variant bundle; build such grids in the program from iotas instead.
+- **Per-shape constants add up.** A constant is baked into every shape variant's program; build
+  large ones, such as anchor grids, inside the program from iotas instead.
 
 ## See also
 

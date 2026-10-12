@@ -21,7 +21,7 @@ that serves the model. On a multi-worker node it also serves the node's merged m
 - **Replica scheduling:** a model served by more than one worker is load-balanced across those
   workers, either uniformly (`round_robin`, the default) or by packing each model onto a fixed,
   operator-configured number of GPUs with coalescing-aware routing (`lpt_packing`); see
-  [Scheduling modes](#scheduling-modes) below. A third mode, `least_outstanding`, spreads by
+  [Scheduling modes](#Scheduling-modes) below. A third mode, `least_outstanding`, spreads by
   live occupancy. Either way, a request fails over to the remaining replicas when a worker
   returns `NotFound` or `Unavailable`.
 - **Readiness probe:** a background loop calls each worker's KServe `ServerReady` RPC; `/readyz`
@@ -56,7 +56,7 @@ The gateway routes each model's requests across its replicas according to `sched
 on few GPUs for deep coalescing batches and is the mode whose placement the gateway manages.
 Every setting in the block below except `mode` can also be changed while the gateway runs,
 through its own gRPC control plane; see
-[Runtime scheduling control](#runtime-scheduling-control).
+[Runtime scheduling control](#Runtime-scheduling-control).
 
 ```yaml
 scheduling:
@@ -108,10 +108,9 @@ there is one answer to "what does this fleet call busy".
   sent. Correct without any cost measurement when a fleet's models cost about the same per item.
   Weakest under `fill_least`, which compares one worker's load across *all* models, so dropping
   the cost weighting makes a cheap model's items look as expensive as a costly model's.
-- **`requests`** is the per-request denominator each mechanism used before this knob existed: a
-  raw count for `least_outstanding`, and the model's measured cost per *request* for `fill_least`
-  (which keeps its cross-model cost weighting). Blind to batch size either way, so a pre-batching
-  client defeats the balancing. Set this to pin the pre-knob behavior exactly.
+- **`requests`** counts requests: a raw count for `least_outstanding`, and the model's measured
+  cost per *request* for `fill_least` (which keeps its cross-model cost weighting). Blind to batch
+  size either way, so a pre-batching client defeats the balancing.
 
 `compute` and `items` need to know where each model's batch axis is and what an item costs, which
 the gateway learns from a `ModelControlStatus` poll on each health-probe round. Under
@@ -191,8 +190,8 @@ halflife is measured in fleet compute-seconds (`ema_halflife_compute_seconds`, d
 how busy the fleet is rather than with wall-clock). `hysteresis` adds an optional dead band on
 top: a single-replica model moves only when the move improves its resulting pressure by more than
 `hysteresis` (default `0.0`, i.e. move on any improvement), because batching depends on traffic
-staying where the queues are. (`max_worker_share` is accepted but advisory only; load no longer
-determines a model's GPU count.)
+staying where the queues are. (`max_worker_share` is accepted but does not affect a model's GPU
+count.)
 
 Repacks are driven by accumulated compute, not wall-clock: the gateway polls the workers every
 probe round and recomputes the placement once the fleet has consumed `rebalance_compute_seconds`
@@ -250,7 +249,7 @@ names an axis rather than a count.
   also what promotion means for a latency-bound model whose client concurrency sits well below
   its max batch; the cost is coalescing depth, since each GPU now batches roughly `1/k` as many
   requests. Prefer it per model rather than fleet-wide.
-- **`inflight`** is the legacy basis: `Q` counts requests **in flight**, so a replica keeps
+- **`inflight`**: `Q` counts requests **in flight**, so a replica keeps
   receiving the model's traffic until it holds a full quantum at once.
 
 !!! warning "`inflight` can park a model on one GPU indefinitely"
@@ -265,8 +264,7 @@ names an axis rather than a count.
 
     Diagnose it with `gateway_replica_routed_total`: a flat series on one replica of a
     multi-replica model is the signature (`gateway_replica_outstanding` cannot show it, because
-    a starved replica reads 0 either way). Use `inflight` only to reproduce the behavior that
-    predated `run`.
+    a starved replica reads 0 either way). Use `run` instead.
 
 `routing_fill_factor` is the direct trade between the two concerns: a model's share is even to
 within one quantum, so a smaller factor balances more finely at the cost of splitting more
@@ -387,7 +385,7 @@ installed.
   data plane only `ModelInfer`, the two SHM register/unregister RPCs, and `IsSameIPCNamespace`
   are proxied; everything else returns `UNIMPLEMENTED`. On the control plane the gateway answers
   `ControlService/CompactMemory` (fanned out to every worker) and all four
-  `GatewayControlService` RPCs itself (see [Runtime scheduling control](#runtime-scheduling-control));
+  `GatewayControlService` RPCs itself (see [Runtime scheduling control](#Runtime-scheduling-control));
   the other `ControlService` RPCs are worker-only.
 - TLS: parsed but not yet enforced; the listener and the worker back-hop are cleartext h2c.
 - CUDA shared memory.
@@ -420,7 +418,7 @@ carries the gateway's own settings (listen addresses, message limits, logging, a
     lpt_packing node still waits for its workers to finish compiling rather than crash-looping.
 
 For a standalone deployment, the package also ships [`probe_worker_ready`](@ref), the worker
-container's healthcheck (a Julia replacement for the former Go `reactant-healthprobe`): it
+container's healthcheck: it
 resolves a worker's port from the node file and calls its KServe `ServerReady` on localhost,
 returning whether it reported ready.
 
