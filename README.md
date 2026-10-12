@@ -31,9 +31,8 @@ models share a GPU and one model executes at a time.
 - **Standard inference protocol.** KServe V2 over gRPC. Tensor data travels inline
   (`raw_input_contents` / `raw_output_contents`) or through the
   Triton-compatible system-shared-memory extension for zero-copy local clients. → [Client Usage](https://enzymead.github.io/ReactantServer.jl/dev/client/)
-- **One process, single or multi-GPU.** A node supervisor runs one worker per visible GPU: a
-  single worker serves the public ports directly; two or more get an embedded gateway behind one
-  endpoint. The external interface (`:8001` gRPC, `:8002` metrics/health) is identical either way.
+- **One container, one GPU or many.** A node supervisor runs one worker per visible GPU, behind
+  one endpoint that stays the same as the node grows.
   → [Deployment](https://enzymead.github.io/ReactantServer.jl/dev/deployment/), [Multi-GPU Gateway](https://enzymead.github.io/ReactantServer.jl/dev/gateway/)
 - **Balances memory and compute.** Every model's weights stay resident in host RAM and stream
   onto the GPU on demand, evicted LRU under a byte budget — so a card serves far more models than

@@ -63,46 +63,18 @@ verbatim, bypassing the split and the cap.
   synthesizes the gateway's worker list (and worker metrics list) from the node file, so the
   gateway needs no config of its own.
 
-The external interface is therefore identical whether you run 1 GPU or 8, which is why your client
-and the public ports never change as you scale. `REACTANT_ROLE` selects what the supervisor runs;
-the default `all` (workers plus the embedded gateway on one host) is the documented deployment.
-The `workers` and `gateway` roles exist in the code to split a deployment across machines, but
-multi-node is not a shipped example.
+Clients and the public ports therefore stay the same as a node grows from one GPU to many, and
+because `gpus: auto` (the default) means one worker per visible device, so does the node file.
+By default every worker serves every model in the repository, so on a multi-worker node each model is
+replicated on every GPU unless the gateway's `lpt_packing` mode places it on fewer
+([Multi-GPU Gateway](gateway.md)).
 
-One [`ReactantServerNode.supervise`](@ref ReactantServerNode.supervise) call does the whole
-fan-out, for one GPU or many: the single parent process spawns one [`ReactantServer.serve`](@ref)
-worker subprocess per device and the gateway as another subprocess, multiplexes their logs onto
-its stdout with `[worker0]` / `[gateway]` prefixes, and restarts any child that dies. (Each worker
-and the gateway can also run by hand, as separate `serve` / `serve_gateway` processes; see
-[Front Workers with a Gateway](tutorials/julia/gateway.md).) `ReactantServerNode.main()` is the
-container entrypoint: it reads `REACTANT_NODE_FILE` for the node config and runs the supervisor to
-completion. On a host without GPUs, `REACTANT_GPUS=0` with `backend: cpu` makes a CPU node, and
-`REACTANT_CPU_WORKERS` sets its worker count, so the multi-worker shape can be exercised anywhere.
-
-### The node file is unchanged when you scale
-
-`gpus: auto` already means "one worker per visible GPU", so a single-GPU node file scales as-is: give the host more GPUs and the supervisor runs more
-workers. You only edit the node file to do something non-default:
-
-```yaml
-model_repo: /var/lib/reactantserver/models
-base_port: 8080           # worker i listens on base_port + i (8080, 8081, ...)
-metrics_base_port: 9100   # and metrics on metrics_base_port + i (9100, 9101, ...)
-gpus: auto                # or an integer count, or an explicit device list
-
-global:
-  runtime:
-    backend: cuda
-  endpoints:
-    host: 0.0.0.0
-```
-
-A model listed on more than one worker is replicated, and the gateway load-balances requests for
-it across those workers. See [Node Configuration](node_config.md) for the `models:` map and
-[On-demand Weights](on_demand_weights.md) for fitting more models than GPU memory holds. The node
-is described by one YAML node file; the commented templates under `config/` (`node.default.yaml`,
-`node.yaml`) are reference configs, and gateway scheduling (`round_robin` or `lpt_packing`) is
-covered on the [Multi-GPU Gateway](gateway.md) page.
+[`ReactantServerNode.supervise`](@ref ReactantServerNode.supervise) runs the supervisor, and
+`ReactantServerNode.main()`, the container entrypoint, runs it on the node file named by
+`REACTANT_NODE_FILE`. On a host without GPUs, `REACTANT_GPUS=0` with `backend: cpu` makes a CPU
+node, and `REACTANT_CPU_WORKERS` sets its worker count. `REACTANT_ROLE` selects what the
+supervisor runs: the default `all`, or only the `workers` or only the `gateway`, for splitting a
+node across machines.
 
 ## The container image
 
@@ -126,10 +98,9 @@ Pin a deployment to a release tag such as `:0.1.0`, or by digest
 `:latest`, which moves with every release; `deploy/README.md` describes how the image is published
 and attested.
 
-Every model compiles to a device executable on every worker before the gRPC plane accepts
-traffic, so the first start is slow (minutes to hours for a large model set). Compiled programs
-are cached inside each bundle (`<bundle>/.cache/`), so later starts load them in milliseconds.
-Watch readiness with `curl -sf http://127.0.0.1:8002/readyz` or the container's health status,
+Every model compiles on every worker before the gRPC port accepts traffic, so the first start
+is slow; later starts load the compiled programs from each bundle's cache
+(`runtime.executable_cache` in [Node Configuration](node_config.md)). Watch readiness with `curl -sf http://127.0.0.1:8002/readyz` or the container's health status,
 not the container state. On stop, the supervisor drains its workers on SIGTERM; give it room
 before the runtime escalates to SIGKILL (`--stop-timeout`, or `stop_grace_period` in compose).
 
@@ -172,11 +143,10 @@ Pass `--pids-limit=-1` (compose: `pids_limit: -1`) to defer to the host's limits
 large enough for your worker count. Docker sets no limit by default unless its daemon is
 configured with one.
 
-Each worker's compute pool is sized to its share of the CPUs Julia detects, `min(CPUs ÷ workers,
-16)` plus one interactive thread (see [The node supervisor](@ref)); the startup
-log prints the result as `worker compute threads: ...`. If you limit the container's CPUs (for
-example with `--cpus`), check that line and set `REACTANT_WORKER_THREADS` to the number of
-compute threads each worker should run.
+If you limit the container's CPUs (for example with `--cpus`), the worker thread pools are still
+sized from the CPUs Julia detects ([The node supervisor](@ref)). Check the
+`worker compute threads: ...` startup line, and set `REACTANT_WORKER_THREADS` to the number each
+worker should run.
 
 **Model repository.** Mount it at `/var/lib/reactantserver/models`, writable: the compiled
 executable cache lives inside each bundle, so a read-only mount recompiles every program on every
@@ -248,19 +218,19 @@ restarting them indefinitely.
 
 ## Beyond one host
 
-The project deliberately does not ship a multi-node control plane: anyone who needs multi-node
-coordination is usually at a scale where a generic one would not fit. Instead, each node exposes
-the interface a control plane integrates against. The endpoint contract is the KServe V2 gRPC data
-plane (`ModelInfer`, `RepositoryIndex`, `ServerReady`) plus the worker control RPCs
-(`ModelControlStatus`, `SetModelResidency`, `SetModelPolicy` for residency and policy,
-`CompactMemory` to defragment device memory), and an admin HTTP port serving `/healthz`,
-`/readyz`, and Prometheus `/metrics`. A node's embedded gateway additionally answers
-`GatewayControlService` for its own scheduling state. A control plane discovers which models a
-node serves via `RepositoryIndex` and routes `ModelInfer` to a node that reports the model ready.
-The `workers` and `gateway` values of `REACTANT_ROLE` split a node's roles across machines.
+The project does not ship a multi-node control plane. Each node exposes the interfaces one
+integrates against, and what answers depends on the port:
 
-The simplest multi-node setup reuses the standalone gateway pointed at every node's worker
-endpoints (see [Front Workers with a Gateway](tutorials/julia/gateway.md)); a larger deployment
-replaces it with its own control plane speaking the same gRPC interface. Who the project is built
-for, and how each deployment shape serves that mission, is on the
-[Philosophy](design/philosophy.md) page.
+- **Each worker's own port** serves the full KServe V2 data plane, including `ModelInfer`,
+  `RepositoryIndex`, `ServerReady`, and `ModelMetadata`, plus the worker control RPCs
+  (`ModelControlStatus`, `SetModelResidency`, `SetModelPolicy`, `CompactMemory`). A control plane
+  discovers which models a worker serves with `RepositoryIndex`.
+- **A multi-worker node's public port** is the gateway, which forwards only `ModelInfer` and the
+  shared-memory RPCs, answers `CompactMemory` and its own `GatewayControlService`, and returns
+  `UNIMPLEMENTED` for the rest ([Multi-GPU Gateway](gateway.md)). Discovery and metadata go to the
+  workers.
+- **The HTTP admin port** serves `/healthz`, `/readyz`, and Prometheus `/metrics`.
+
+The simplest multi-node setup is a standalone gateway pointed at every node's worker endpoints
+([Front Workers with a Gateway](tutorials/julia/gateway.md)); a larger deployment replaces it with
+its own control plane speaking the same interfaces.

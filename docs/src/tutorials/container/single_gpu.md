@@ -35,20 +35,15 @@ podman run -d --name reactantserver \
 With Docker, replace `--device nvidia.com/gpu=0` with `--gpus device=0`; the other flags are the
 same. In order:
 
-- `--device nvidia.com/gpu=0` gives the container one GPU. The supervisor inside runs one worker
-  per GPU it can see, so the GPUs you grant are the node's topology.
-- `--ipc=host` shares the host's `/dev/shm`, so a client on the host can send tensors through
-  shared memory instead of the network. A container's own `/dev/shm` is 64 MiB, too small for it.
-- `--pids-limit=-1` lifts podman's default 2048-thread limit, which a worker's thread pools can
-  cross while loading models.
-- The model repository is mounted writable: each bundle caches its compiled programs in its own
-  `.cache/` directory, so later starts load them in milliseconds instead of compiling again.
-- The `reactant-compile-cache` volume keeps XLA's autotuning results across container
-  recreation.
-- `--stop-timeout 30` gives the supervisor time to drain its workers on stop.
+- `--device nvidia.com/gpu=0` grants one GPU; the node runs one worker per GPU it is granted.
+- `--ipc=host` shares the host's `/dev/shm`, so a client on the host can use shared memory.
+- `--pids-limit=-1` lifts podman's thread limit, which a worker can cross while loading models.
+- The model repository is mounted writable, because each bundle caches its compiled programs.
+- The `reactant-compile-cache` volume keeps XLA's autotuning results across restarts.
+- `--stop-timeout 30` gives the workers time to drain on stop.
 
-[Deployment](../../deployment.md) explains each setting in more depth, and lists the alternatives
-when `--ipc=host` is not an option.
+[Container settings](../../deployment.md#Container-settings) in Deployment explains each one and
+the alternatives when `--ipc=host` is not an option.
 
 ## Wait for it to be ready
 

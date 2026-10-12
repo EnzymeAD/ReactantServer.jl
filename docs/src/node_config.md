@@ -1,19 +1,11 @@
 # Node Configuration
 
-A deployment is described by a single node file. It is the only supported config format for
-workers. The file describes one or more single-GPU workers on one machine and, optionally, the
-gateway that fronts them. Each worker reads this same file, resolves its own entry by name, and
-loads (and can serve) every bundle in the shared model repository.
-
-A single GPU is just a one-worker node: keep one entry under `workers:` (or omit `workers:`
-entirely under the supervisor, below). Growing to more GPUs means adding workers, not changing
-the config format.
-
-Under the node supervisor (the supervisor default, see [Deployment](deployment.md)) the
-`workers:` list is optional: omit it and add `gpus: auto` (or an integer count, or an explicit
-device list) and the supervisor synthesizes one worker per detected GPU, assigning each its
-device. An explicit `workers:` list still wins when present. The keys below describe that
-explicit form, which the supervisor also honors.
+A node file describes one machine: its model repository and its workers, one per device. Each
+worker reads the same file, resolves its own entry by name, and serves every bundle in the
+repository. Under the node supervisor the `workers:` list is optional, and the supervisor creates
+one worker per detected device ([Deployment](deployment.md)). The gateway in front of a
+multi-worker node is configured separately, by its own `gateway.yml`
+([Gateway configuration](#Gateway-configuration)).
 
 ## Top-level keys
 
@@ -37,7 +29,6 @@ metrics_base_port: 9100
 global:    # defaults merged into every worker (any block may be overridden per worker)
 workers:   # optional under the supervisor; one entry per GPU
 models:    # optional; pins the named models to device memory on the listed workers
-gateway:   # optional; read only by the gateway, never by a worker
 ```
 
 - `model_repo` (required) is the shared bundle repository. Each immediate subdirectory that
@@ -54,7 +45,6 @@ gateway:   # optional; read only by the gateway, never by a worker
 - `global` holds the defaults merged into every worker; any block may be overridden per worker.
 - `workers` lists the worker entries (optional under the supervisor).
 - `models` optionally pins the named models to device memory on the listed workers.
-- `gateway` is read only by the gateway, never by a worker.
 
 ## Global settings
 
@@ -208,18 +198,13 @@ workers:
   - { name: worker1 }
 ```
 
-`name` is the routing identity (and, under Docker, the compose service name). The listen port is
+`name` is the worker's identity in logs, metrics, and the `models:` map. The listen port is
 `base_port + index` unless the worker sets an explicit `port:`. A worker entry may also carry
 override blocks (for example a `runtime:` block) that deep-merge over `global:`.
 
-Under the supervisor you do not assign GPUs yourself: it detects the visible devices, gives each
-worker one of them, and sets that worker's own `CUDA_VISIBLE_DEVICES`, so every worker sees a
-single GPU at ordinal 0. Influence the assignment with the top-level `gpus:` key (`auto`, a
-count, or an explicit device list), the `REACTANT_GPUS` environment variable, or by adding
-`gpu: N` to a worker entry to pin it to a specific visible device. A host-level
-`CUDA_VISIBLE_DEVICES` acts as a coarse filter on which physical GPUs the supervisor sees (see
-[Deployment](deployment.md)). Running a single worker by hand without the supervisor (a bare
-`serve`), the worker uses device ordinal 0, or `gpu: N` to pick another.
+`gpu: N` pins a worker to a specific visible device. Under the supervisor, devices are otherwise
+assigned in order ([Deployment](deployment.md) describes how they are detected); a worker run by
+hand with `serve` uses device 0 unless it sets `gpu:`.
 
 ## Device pinning (the `models:` map)
 
