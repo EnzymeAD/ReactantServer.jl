@@ -1,9 +1,10 @@
 # # Run a Node
 #
-# A *node* is one machine running ReactantServer. The node supervisor, `ReactantServerNode`, runs a
-# whole node from one node file: it starts one worker process per device, restarts workers that
-# die, and when there are two or more workers it puts an embedded gateway in front of them, so
-# clients always talk to a single endpoint. The container image runs exactly this supervisor.
+# A *node* is one machine running ReactantServer. [Serve a Model](serve.md) runs one worker of a
+# node file inside a Julia session; the node supervisor, `ReactantServerNode`, runs the whole node
+# file instead: it starts one worker process per device, restarts workers that die, and when there
+# are two or more workers it puts an embedded gateway in front of them, so clients always talk to
+# a single endpoint. The container image runs exactly this supervisor.
 #
 # This page runs a node with two CPU workers, which takes the same shape as a two-GPU machine: two
 # workers behind the embedded gateway.

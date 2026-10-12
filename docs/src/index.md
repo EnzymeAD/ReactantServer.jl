@@ -49,19 +49,6 @@ features:
 ---
 ```
 
-## What it is
-
-ReactantServer.jl is a production inference server for XLA-accelerated models, compiled through
-[Reactant.jl](https://github.com/EnzymeAD/Reactant.jl) (StableHLO via XLA today). It speaks the
-KServe V2 inference API natively over gRPC, so standard Triton and KServe clients connect
-unchanged; it scales from a single GPU to many from one container; and it balances model **memory**
-against **compute** to squeeze the most models out of each GPU. It is Julia-first throughout:
-custom pre and postprocessing is plain Julia in a bundle's `model.jl`, and every convention
-follows Julia's, column-major with the batch axis last.
-
-The server is a set of packages, split so that only the worker loads Reactant and XLA; a client
-installs without them. [Architecture](design/architecture.md) describes each package.
-
 ## Why ReactantServer?
 
 The server is built for workloads where many models share a GPU, such as computer vision and
@@ -74,6 +61,10 @@ cost-aware [scheduler](scheduling.md) that coalesces concurrent requests for the
 one execution. Memory is managed by the [on-demand weights](on_demand_weights.md) cache, which
 keeps weights in host RAM and moves them onto the GPU within a byte budget. Scheduling policy,
 pinned models, and multi-GPU placement can all be changed at runtime, without a restart.
+
+The server is a set of packages, split so that only the worker and the export tooling load Reactant
+and XLA; the client, the gateway, and the supervisor install without them.
+[Architecture](design/architecture.md) describes each package.
 
 ## Get started
 

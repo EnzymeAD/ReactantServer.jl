@@ -6,19 +6,20 @@ has its own page for the detail, linked from the section that introduces it.
 
 ## Packages
 
-The project is a Julia workspace of packages, split so that talking to a server never requires
-the Reactant and XLA stack:
+The project is a set of packages, split so that only the worker and the export tooling load
+Reactant and XLA; the client, the gateway, and the supervisor install without them:
 
 - **ReactantServerCore**: the shared, Reactant-free code the other packages build on: the KServe
   V2 messages and wire format, and the manifest and node file formats.
-- **ReactantServer**: the worker, and the only package that loads Reactant.
+- **ReactantServer**: the worker, which runs models through Reactant.
 - **ReactantServerGateway**: the reverse proxy that puts several workers behind one endpoint.
 - **ReactantServerClient**: the client. It is Reactant-free, so it installs on any machine that
   sends requests.
 - **ReactantServerNode**: the node supervisor, which runs a machine's workers and gateway as
   subprocesses.
-- **ReactantServerExport**: offline export of Lux and PyTorch models into bundles. It is not a
-  workspace member; the worker reads the bundles it writes, never the package.
+- **ReactantServerExport**: offline export of Lux and PyTorch models into bundles, tracing them
+  with Reactant. It is not a workspace member; the worker reads the bundles it writes, never the
+  package.
 
 The [API](../api.md) page lists every package's documented names.
 

@@ -6,15 +6,11 @@
 [![Julia 1.12](https://img.shields.io/badge/Julia-1.12-9558b2)](https://julialang.org)
 [![code style: runic](https://img.shields.io/badge/code_style-%E1%9A%B1%E1%9A%A2%E1%9A%BE%E1%9B%81%E1%9A%B2-black)](https://github.com/fredrikekre/Runic.jl)
 
-A production inference server for XLA-accelerated models, compiled through Reactant.jl
-(StableHLO via XLA today). It speaks the KServe V2 inference API natively over gRPC, so standard
-Triton and KServe clients connect unchanged; it scales from a single GPU to many from one
-container; and it squeezes the most models out of each GPU by balancing model **memory** against
-**compute**. It is Julia-first throughout — custom pre/postprocessing is plain Julia, and every
-convention follows Julia's (column-major, batch-last axes).
-
-It serves compiled models, such as computer vision and scientific computing workloads, where many
-models share a GPU and one model executes at a time.
+A production inference server for models compiled through Reactant.jl (StableHLO via XLA today).
+It speaks the KServe V2 inference API over gRPC, so standard Triton and KServe clients connect
+unchanged; it scales from one GPU to many from one container; and it fits more models on each GPU
+by balancing model **memory** against **compute**. It is built for workloads where many models
+share a GPU, such as computer vision and scientific computing.
 
 ## Highlights
 
@@ -26,7 +22,7 @@ models share a GPU and one model executes at a time.
 - **Julia-aligned conventions.** Shapes are column-major with the batch axis last, the way Julia
   and Lux write them; the codec converts to KServe's row-major wire at the boundary, so Triton
   clients are unchanged and you never reason about row-major order. → [Export a Model](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/export/)
-- **Elegant configuration.** One typed YAML node file (with environment-variable overrides)
+- **One configuration file.** One typed YAML node file (with environment-variable overrides)
   describes a machine; manifests declare tensors with an einsum-style named-axis notation. → [Node Configuration](https://enzymead.github.io/ReactantServer.jl/dev/node_config/), [Bundles & model.jl](https://enzymead.github.io/ReactantServer.jl/dev/bundles/)
 - **Standard inference protocol.** KServe V2 over gRPC. Tensor data travels inline
   (`raw_input_contents` / `raw_output_contents`) or through the
@@ -73,16 +69,16 @@ endpoint.
 ## Repository layout
 
 A Julia 1.12+ workspace of five packages under `packages/`, split so that only the worker loads
-Reactant and XLA:
+Reactant and XLA among them:
 
 - **`ReactantServerCore`**: the shared, Reactant-free code the other packages build on.
-- **`ReactantServer`**: the worker, and the only package that depends on Reactant.
+- **`ReactantServer`**: the worker, which runs models through Reactant.
 - **`ReactantServerGateway`**: the reverse proxy that puts several workers behind one endpoint.
 - **`ReactantServerClient`**: the client.
 - **`ReactantServerNode`**: the node supervisor.
 
-Offline model export lives in `packages/ReactantServerExport`. It is not a workspace member, so
-its export dependencies stay out of the server image. All dependencies, including
+Offline model export lives in `packages/ReactantServerExport`, which also uses Reactant, to trace
+models. It is not a workspace member, so its export dependencies stay out of the server image. All dependencies, including
 `gRPCServer`, resolve from the package registries; there are no git submodules.
 
 ## Acknowledgments

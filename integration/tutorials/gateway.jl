@@ -166,10 +166,7 @@ foreach(println, filter(startswith("gateway_model_replicas"), split(metrics, "\n
 @test occursin("gateway_model_replicas{model=\"mlp_a\"} 1", metrics) #src
 @test occursin("gateway_model_replicas{model=\"mlp_b\"} 1", metrics) #src
 
-# Placement follows measured load: the gateway accumulates each model's compute time and repacks
-# periodically, moving models between workers to even out the load. A model with more traffic
-# than one device can serve gets more replicas through `scheduling.models.<name>.replicas`, and
-# every setting can be changed at runtime over the gateway's control plane.
+# As load changes, the gateway repacks and may move models between workers.
 #
 # ## Stop
 
@@ -178,4 +175,5 @@ foreach(kill, processes)
 foreach(wait, processes)
 
 # [Multi-GPU Gateway](../../gateway.md) is the reference for the gateway's configuration, its
-# routing and scheduling modes, its runtime control RPCs, and its metrics.
+# routing and scheduling modes, giving a busy model more replicas, its runtime control RPCs, and its
+# metrics.

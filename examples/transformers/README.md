@@ -12,8 +12,9 @@ runs on the CPU or a GPU.
 | `sentiment` | `distilbert-base-uncased-finetuned-sst-2-english` | binary sentiment classification |
 
 Tokenization runs in Julia inside each bundle's `model.jl`, so clients send raw UTF-8 bytes,
-never token ids. The example is three single-purpose Julia environments: `export/` is the only
-one with PythonCall and torch, `server/` the only one with Reactant, and `client/` has neither.
+never token ids. The example is three single-purpose Julia environments: `export/` holds the
+export tooling with PythonCall and torch, `server/` holds the server, and `client/` holds only the
+client, with neither Reactant nor torch.
 
 - [Serve Transformer Text Models](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/julia/transformers/) walks through running it.
 - [Transformer Text Models](https://enzymead.github.io/ReactantServer.jl/dev/transformers/) is the reference: the four models, tokenization in

@@ -167,21 +167,9 @@ Per-component environment overrides still apply, with the gateway's own
 `INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES` for a worker, `REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES`
 for the gateway.
 
-`scheduler.discipline` selects the dispatch policy: `fair` shares GPU time across models by
-weighted deficit and learned cost, `fifo` serves the oldest queued request first, and `edf`
-(earliest-deadline-first) serves the model whose most-urgent queued request has the soonest
-deadline, where the deadline comes from the request's remaining-budget timeout. Workers fronted
-by a gateway in `lpt_packing` mode must run `fifo` or `edf` (not `fair`), so the gateway stays
-the placement and fairness authority (see [Multi-GPU Gateway](gateway.md)).
-
-Under `edf`, a meta model is not scheduled itself (it runs on the request task), but each of its
-in-flight sub-calls inherits the meta's deadline, so its continuation is ordered ahead of fresher
-regular work. `edf` also sheds work it cannot finish within its learned compute cost (laxity),
-trading some throughput (batch fragmentation, no per-model weighting) for meeting more deadlines
-under load. Note that `edf` derives urgency solely from the deadline: issuing different
-per-client deadlines for the same model reorders that model's service and therefore affects
-fairness across clients, so keep deadlines uniform to retain `fifo`-like fairness. See
-[Scheduling](scheduling.md) for how the disciplines and coalescing work internally.
+`scheduler.discipline` selects the dispatch policy: `fair` (the default), `fifo`, or `edf`. Workers
+behind a gateway in `lpt_packing` mode must run `fifo` or `edf`. [Scheduling](scheduling.md)
+describes each discipline and when to use it.
 
 ## Workers
 
@@ -237,7 +225,7 @@ scheduler:
 
 `weight` sets the model's fair share (consulted only by the `fair` discipline). `residency` sets
 the model's residency floor: `unpinned`, `system`, or `device` (`pin_to_gpu: true` is a
-back-compat alias for `residency: device`). When the on-demand weight cache is enabled, models
+back-compat alias for `residency: device`). When the weight cache is enabled, models
 without an explicit `residency` default to `system` (weights pinned in host RAM); see
 [On-demand Weights](on_demand_weights.md).
 
@@ -300,7 +288,7 @@ INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_FRACTION=0.8
 
 Booleans parse as `1`, `true`, `yes`, or `on` (case-insensitive). List-valued overrides
 (`INFERENCE_SERVER_MODEL_DIRS`, `INFERENCE_SERVER_MODELS_INCLUDE`) are colon-separated. Overrides
-are applied on top of the resolved node config, and the effective configuration, including which
+are applied on top of the resolved node file, and the effective configuration, including which
 overrides were applied, is logged at startup.
 
 | Variable | Overrides | Values |

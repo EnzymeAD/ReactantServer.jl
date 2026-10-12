@@ -88,7 +88,7 @@ include("preprocess/bert_text.jl")
 # wraps it) and before grpc.jl (InferContext holds a ModelCaller and _handle_infer dispatches meta).
 include("meta.jl")
 
-# Transport assembly: the gRPC control plane (the codec and shared-memory registry come from
+# Transport assembly: the gRPC server (the codec and shared-memory registry come from
 # ReactantServerCore) and top-level server. Worker Prometheus metrics are defined before grpc.jl
 # (InferContext holds a WorkerMetrics) and reuse the scheduler/observe snapshot functions above.
 include("transport/metrics.jl")

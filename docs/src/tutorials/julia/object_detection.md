@@ -29,8 +29,9 @@ handlers:
 ```
 
 The example is split into three single-purpose Julia environments so each loads only what it needs
-(and they stop invalidating each other's precompilation): **export** is the only one with PythonCall
-+ torch, **server** is the only one with Reactant, and **client** has CairoMakie but no Reactant.
+(and they stop invalidating each other's precompilation): **export** holds the export tooling with
+PythonCall and torch, **server** holds `ReactantServer`, and **client** holds
+`ReactantServerClient` and CairoMakie, with neither Reactant nor torch.
 Each environment resolves independently the first time you use it:
 
 ```sh
@@ -61,32 +62,23 @@ Pass your own image to step 3 as the first argument (a local path). The server p
 
 ### Export
 
-`export/export.jl` drives the shared converter in-process, so torch imports before Reactant (the
-converter's required order), and writes the `object_detector` bundle under
-`examples/object_detection/bundles/`. It skips conversion when the bundle already exists (delete the
-`bundles/` dir to re-export). The pretrained COCO weights are downloaded by torchvision on the first
-run, so export needs network. On corporate networks `export.jl` points Python's TLS at the OS CA
-bundle (`SSL_CERT_FILE`, defaulting from `REQUESTS_CA_BUNDLE`/`CURL_CA_BUNDLE`/
-`JULIA_SSL_CA_ROOTS_PATH` or `/etc/ssl/certs/ca-certificates.crt`) so the weight download trusts a
-MitM proxy's CA. The Python dependencies are export-only: torch/torchax/jax come from
-`ReactantServerExport`'s CondaPkg and `torchvision` from `export/CondaPkg.toml`; CondaPkg resolves
-and installs them on the first export.
+The export writes the `object_detector` bundle to `examples/object_detection/bundles/`, and skips
+the work when the bundle already exists; delete `bundles/` to export again. The first run
+downloads the pretrained COCO weights and, through CondaPkg, the Python packages the export uses.
+Behind a proxy that intercepts TLS, set `SSL_CERT_FILE` to a CA bundle that trusts it; by default
+the script uses the system bundle.
 
 ### Serve
 
-`server/serve.jl` serves the `object_detector` bundle on `127.0.0.1:$OD_PORT` (default 8080) and
-blocks until Ctrl-C. `--cpu` selects `ReactantServer.CPU_BACKEND`; without it the server uses
-`ReactantServer.CUDA_BACKEND`. The server compiles the detector before it accepts requests: on the
-CPU of a large workstation that took about half a minute, and longer on a laptop.
+The server compiles the detector before it accepts requests: about half a minute on the CPU of a
+large workstation, and longer on a laptop.
 
 ### Client
 
-`client/detect.jl` connects to the running server with the ReactantServerClient library (no Reactant
-and no PythonCall, so it loads fast). It resizes the image to 640x640 (matching the export
-`image_size`), sends it as `INPUT__0` through `infer_sync`, reads `OUTPUT__0` as Float32, draws the
-boxes and labels with CairoMakie, and writes `examples/object_detection/detections.jpg`. With no
-image argument it downloads a default object-rich test photo
-(`https://ultralytics.com/images/bus.jpg`). Each output row is `[x1, y1, x2, y2, score, class]`,
-boxes in the 640x640 input pixel space, `class` a COCO id mapped to a name through the COCO
-`categories` table in `detect.jl`. The model bakes a 0.05 score threshold; the client
-additionally only draws detections scoring at least 0.5.
+The client resizes the image to 640x640, sends it, and writes
+`examples/object_detection/detections.jpg` with the boxes and labels drawn. Without an image
+argument it downloads a test photo (`https://ultralytics.com/images/bus.jpg`).
+
+Each output row is `[x1, y1, x2, y2, score, class]`, with boxes in the 640x640 input's pixels and
+`class` a COCO category id. The model drops detections scoring below 0.05, and the client draws
+those scoring 0.5 or more.
