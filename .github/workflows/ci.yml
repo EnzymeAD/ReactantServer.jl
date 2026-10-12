@@ -216,7 +216,7 @@ jobs:
           julia --color=yes --project=packages/ReactantServerExport/test/pytorch -e 'using Pkg; Pkg.instantiate()'
           julia --color=yes --project=packages/ReactantServerExport/test/pytorch packages/ReactantServerExport/test/runtests.jl
 
-  # The two worked-example tutorials (docs/src/tutorials/julia/object_detection.md and transformers.md),
+  # The two worked-example tutorials (docs/src/tutorials/examples/object_detection.md and transformers.md),
   # run end to end on the CPU by integration/run_example.sh: export (torch through CondaPkg, plus
   # pretrained weights from the network), serve with --cpu, and run the example's client. That costs
   # several GB of downloads, so it runs only under the `ci:tutorials-full` label. Like

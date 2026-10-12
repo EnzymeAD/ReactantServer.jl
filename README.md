@@ -63,6 +63,10 @@ The [tutorials](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/) fol
   a container runtime. [Serve on one GPU](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/container/single_gpu/), then
   [scale to many](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/container/multi_gpu/).
 
+To see real models, [serve an object detector](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/examples/object_detection/) or
+[transformer text models](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/examples/transformers/), each taken from PyTorch through export,
+serving, and inference.
+
 ReactantServer is designed for a trusted network; read [Security](https://enzymead.github.io/ReactantServer.jl/dev/security/) before exposing an
 endpoint.
 

@@ -20,9 +20,6 @@ the CPU; a GPU needs one line of configuration changed.
   embedded gateway.
 - [Front Workers with a Gateway](julia/gateway.md): a standalone gateway over workers you start
   yourself, placing models with `lpt_packing`.
-- [Serve an Object Detector](julia/object_detection.md) and
-  [Serve Transformer Text Models](julia/transformers.md): real models end to end, exported from
-  PyTorch.
 
 ## Serve with the Container
 
@@ -40,6 +37,16 @@ and the CUDA libraries.
   batched requests and shared memory when the client shares a host with the server. The client
   works the same against either way of serving.
 
-Export, Run Inference, and the first three Julia serving pages run in CI on Linux and macOS
-exactly as written. The two worked examples run in CI on request, since they download PyTorch and
+## End-to-End Examples
+
+Real models exported from PyTorch, served, and queried, using the scripts in the repository's
+`examples/` directory. Each runs on the CPU, and serves on a GPU by dropping one flag.
+
+- [Serve an Object Detector](examples/object_detection.md): a pretrained Faster R-CNN that finds
+  and labels the objects in a photo.
+- [Serve Transformer Text Models](examples/transformers.md): four HuggingFace BERT-family models,
+  queried with raw text, for sparse and dense embeddings, reranking, and sentiment.
+
+Export, Run Inference, and the Julia serving pages run in CI on Linux and macOS
+exactly as written. The end-to-end examples run in CI on request, since they download PyTorch and
 pretrained weights, and the container pages need a GPU.

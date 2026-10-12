@@ -16,6 +16,6 @@ never token ids. The example is three single-purpose Julia environments: `export
 export tooling with PythonCall and torch, `server/` holds the server, and `client/` holds only the
 client, with neither Reactant nor torch.
 
-- [Serve Transformer Text Models](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/julia/transformers/) walks through running it.
+- [Serve Transformer Text Models](https://enzymead.github.io/ReactantServer.jl/dev/tutorials/examples/transformers/) walks through running it.
 - [Transformer Text Models](https://enzymead.github.io/ReactantServer.jl/dev/transformers/) is the reference: the four models, tokenization in
   the bundle, the raw-logits rule, the wire contract, and sequence-length batching.

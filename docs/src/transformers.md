@@ -15,7 +15,7 @@ text-serving shapes. For the bundle/manifest/`model.jl` contract itself see
 
 !!! tip "Runnable example"
     `examples/transformers/` in the repository is a complete, runnable version of this
-    walkthrough: [Serve Transformer Text Models](tutorials/julia/transformers.md) exports the four
+    walkthrough: [Serve Transformer Text Models](tutorials/examples/transformers.md) exports the four
     bundles, serves them, and queries all four over KServe V2.
 
 ## The four models
@@ -172,11 +172,11 @@ filling the padded matrices.
 ## Running the example
 
 `examples/transformers/` in the repository exports all four models, serves them, and queries them;
-[Serve Transformer Text Models](tutorials/julia/transformers.md) walks through running it.
+[Serve Transformer Text Models](tutorials/examples/transformers.md) walks through running it.
 
 ## See also
 
-- [Serve Transformer Text Models](tutorials/julia/transformers.md) to run the example end to end
+- [Serve Transformer Text Models](tutorials/examples/transformers.md) to run the example end to end
 - [Bundles & model.jl](bundles.md) for the bundle contract, `IOSpec`, and the manifest encoding
 - [Object Detection](object_detection.md) for exporting a detector's data-dependent middle as one
   static program

@@ -165,7 +165,7 @@ implementation, for both convention sets, on synthetic stage outputs.
 
 `examples/object_detection/` in the repository exports a torchvision Faster R-CNN pretrained on
 COCO into one bundle this way, serves it, and draws its detections on an image.
-[Serve an Object Detector](tutorials/julia/object_detection.md) walks through running it.
+[Serve an Object Detector](tutorials/examples/object_detection.md) walks through running it.
 
 ## Reactant tracing pitfalls
 
@@ -191,7 +191,7 @@ These apply to any hand-written traced export:
 
 - [Bundles & model.jl](bundles.md) for the plain bundle path, the manifest encoding, and the
   fixed-size buffer + trim pattern
-- [Serve an Object Detector](tutorials/julia/object_detection.md) to run the example end to end
+- [Serve an Object Detector](tutorials/examples/object_detection.md) to run the example end to end
 - [Client Usage](client.md) for the client library the demo uses
 - `export_two_stage_detector`, `DetectorConfig`, and `read_stage_bundle` in the
   [API reference](api.md)
