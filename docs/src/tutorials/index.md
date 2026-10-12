@@ -1,11 +1,10 @@
 # Tutorials
 
-Every deployment has the same two ends: a model exported into a *bundle*, and a client that sends
-it requests. Between them is the server, which you run one of two ways. The tutorials follow that
-shape: the basics cover the two ends, and each way of serving has its own section.
+The Basics show how to export a model and how to run inference against a server. Both work the
+same however the server is run. The other two sections show how to run it: from a Julia session,
+or with the container image.
 
-Every page is self-contained. It starts from nothing, sets up what it needs, and cleans up after
-itself, so you can open any page directly.
+Each page stands on its own, so you can start with any of them.
 
 ## Basics
 
