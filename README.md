@@ -73,16 +73,16 @@ endpoint.
 ## Repository layout
 
 A Julia 1.12+ workspace of five packages under `packages/`, split so that only the worker loads
-Reactant and XLA:
+Reactant and XLA among them:
 
 - **`ReactantServerCore`**: the shared, Reactant-free code the other packages build on.
-- **`ReactantServer`**: the worker, and the only package that depends on Reactant.
+- **`ReactantServer`**: the worker, which runs models through Reactant.
 - **`ReactantServerGateway`**: the reverse proxy that puts several workers behind one endpoint.
 - **`ReactantServerClient`**: the client.
 - **`ReactantServerNode`**: the node supervisor.
 
-Offline model export lives in `packages/ReactantServerExport`. It is not a workspace member, so
-its export dependencies stay out of the server image. All dependencies, including
+Offline model export lives in `packages/ReactantServerExport`, which also uses Reactant, to trace
+models. It is not a workspace member, so its export dependencies stay out of the server image. All dependencies, including
 `gRPCServer`, resolve from the package registries; there are no git submodules.
 
 ## Acknowledgments

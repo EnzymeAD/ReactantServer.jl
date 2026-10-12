@@ -29,8 +29,9 @@ handlers:
 ```
 
 The example is split into three single-purpose Julia environments so each loads only what it needs
-(and they stop invalidating each other's precompilation): **export** is the only one with PythonCall
-+ torch, **server** is the only one with Reactant, and **client** has CairoMakie but no Reactant.
+(and they stop invalidating each other's precompilation): **export** holds the export tooling with
+PythonCall and torch, **server** holds `ReactantServer`, and **client** holds
+`ReactantServerClient` and CairoMakie, with neither Reactant nor torch.
 Each environment resolves independently the first time you use it:
 
 ```sh

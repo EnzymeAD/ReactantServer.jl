@@ -59,8 +59,8 @@ against **compute** to squeeze the most models out of each GPU. It is Julia-firs
 custom pre and postprocessing is plain Julia in a bundle's `model.jl`, and every convention
 follows Julia's, column-major with the batch axis last.
 
-The server is a set of packages, split so that only the worker loads Reactant and XLA; a client
-installs without them. [Architecture](design/architecture.md) describes each package.
+The server is a set of packages, split so that only the worker and the export tooling load Reactant
+and XLA; the client, the gateway, and the supervisor install without them. [Architecture](design/architecture.md) describes each package.
 
 ## Why ReactantServer?
 

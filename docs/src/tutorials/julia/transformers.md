@@ -12,9 +12,9 @@ network access for the first export, which downloads the checkpoints and the Pyt
 PyTorch export uses.
 
 `examples/transformers/` is split into three single-purpose Julia environments so each loads only
-what it needs (and they stop invalidating each other's precompilation): **export** is the only
-one with PythonCall + torch, **server** is the only one with Reactant, and **client** has
-neither. Each environment resolves independently the first time you use it:
+what it needs (and they stop invalidating each other's precompilation): **export** holds the
+export tooling with PythonCall and torch, **server** holds `ReactantServer`, and **client** holds
+only `ReactantServerClient`, with neither Reactant nor torch. Each environment resolves independently the first time you use it:
 
 ```sh
 for env in export server client; do
