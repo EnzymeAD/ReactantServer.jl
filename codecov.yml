@@ -4,9 +4,15 @@
 # suites already decide pass or fail, and a status that fails on a fraction of a percent teaches
 # people to merge past a red mark.
 #
-# Each package suite uploads under its own flag (the suite's cache-name in ci.yml), restricted to
-# that package's sources. The suites are path-filtered, so most runs skip most of them;
-# carryforward keeps a skipped package's last report instead of dropping it from the total.
+# Every suite CI runs uploads under its own flag. A package suite's flag is restricted to that
+# package's sources; the cross-package suites (integration, the export round-trips, the worked
+# examples) run the packages together, so their flags span every package they can reach. The
+# suites are path-filtered, so most runs skip most of them; carryforward keeps a skipped suite's
+# last report instead of dropping it from the total.
+#
+# Generated protobuf bindings (*_pb.jl, ProtoBuf.jl output) are ignored everywhere: they are
+# regenerated rather than edited, and most of each file is message types and codecs for RPCs a
+# given package never serves, which would otherwise read as untested code.
 coverage:
   status:
     project:
@@ -31,8 +37,17 @@ flags:
     paths: [packages/ReactantServer/src/, packages/ReactantServer/ext/]
   node:
     paths: [packages/ReactantServerNode/src/]
+  export-lux:
+    paths: [packages/]
+  export-pytorch:
+    paths: [packages/]
+  integration:
+    paths: [packages/]
+  examples:
+    paths: [packages/]
 
 ignore:
+  - "**/*_pb.jl"
   - "**/test/**"
   - "docs/**"
   - "examples/**"
