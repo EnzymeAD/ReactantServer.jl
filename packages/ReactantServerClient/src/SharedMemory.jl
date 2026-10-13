@@ -352,6 +352,12 @@ end
 function _decide_pool!(model::KServeModel)
     mode = model.shared_memory
     mode === :off && return _get_inline_pool!()
+    reason = _shm_unsupported[]
+    if reason !== nothing
+        # :on was refused when the model was built, so only :auto reaches here.
+        @warn "$reason; sending tensors inline" maxlog = 1
+        return _get_inline_pool!()
+    end
 
     shm_pool = _get_shm_pool!()
     verdict = query_same_ipc_namespace(model, shmid(shm_pool.pool.backing))

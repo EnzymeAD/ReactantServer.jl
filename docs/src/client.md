@@ -46,6 +46,10 @@ The `shared_memory` keyword on [`KServeModel`](@ref) controls this choice:
 - `:on` forces it, and errors loudly if the server is in a different namespace.
 - `:off` always sends inline; the probe is not sent.
 
+Shared memory is not supported on macOS yet: the server cannot reopen a region the client
+creates. There `:auto` sends inline without probing and warns once per process, and `:on` throws
+an `ArgumentError` when the model is constructed.
+
 There is no silent runtime fallback once shared memory is chosen. A stale registration (the
 server restarted and no longer knows the region) is re-registered and retried once in-band; if
 that fails, the client latches that endpoint to inline transport and a background task

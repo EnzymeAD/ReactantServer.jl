@@ -774,7 +774,11 @@ end
 @testset "shared_memory mode: validation and :off routing" begin
     # Default is :auto; :on / :off accepted; anything else rejected at construction.
     @test KServeModel("grpc://h:1", "x").shared_memory == :auto
-    @test KServeModel("grpc://h:1", "x"; shared_memory = :on).shared_memory == :on
+    if ReactantServerClient._shm_unsupported[] === nothing
+        @test KServeModel("grpc://h:1", "x"; shared_memory = :on).shared_memory == :on
+    else
+        @test_throws ArgumentError KServeModel("grpc://h:1", "x"; shared_memory = :on)
+    end
     @test KServeModel("grpc://h:1", "x"; shared_memory = :off).shared_memory == :off
     @test_throws ArgumentError KServeModel("grpc://h:1", "x"; shared_memory = :sometimes)
 
@@ -787,6 +791,25 @@ end
         @test !ReactantServerClient.is_shm_backed(pool)
     finally
         kserve_shutdown()
+    end
+end
+
+@testset "shared_memory where the platform lacks it (macOS)" begin
+    # Force the unsupported path so it runs on every platform, not only on a Mac.
+    saved = ReactantServerClient._shm_unsupported[]
+    ReactantServerClient._shm_unsupported[] = "shared memory unsupported in this test"
+    kserve_init(; pool_bytes = 4096, n_slots = 4)
+    try
+        @test_throws ArgumentError KServeModel("grpc://h:1", "x"; shared_memory = :on)
+        # :auto routes inline without probing (nothing listens on port 1, so a probe would throw)
+        # and without creating a shared-memory region.
+        m = KServeModel("grpc://127.0.0.1:1", "x")
+        pool = @test_logs (:warn, r"unsupported in this test") ReactantServerClient._decide_pool!(m)
+        @test !ReactantServerClient.is_shm_backed(pool)
+        @test ReactantServerClient._shm_pool[] === nothing
+    finally
+        kserve_shutdown()
+        ReactantServerClient._shm_unsupported[] = saved
     end
 end
 

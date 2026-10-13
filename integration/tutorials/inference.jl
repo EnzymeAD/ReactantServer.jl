@@ -112,10 +112,11 @@ maximum(abs, io.outputs .- first(model(data, ps, st)))      # ≈ 0
 # When it can, as here with both in one process or a server on the same host, inputs travel through
 # POSIX shared memory and only small descriptors cross the network. Otherwise they are sent inline.
 # The `shared_memory` keyword of [`KServeModel`](@ref) picks: `:auto` (the default) probes, `:on`
-# requires shared memory and fails loudly without it, and `:off` always sends inline. Both paths
+# requires shared memory and fails loudly without it, and `:off` always sends inline. Shared memory
+# is not supported on macOS yet, so there `:auto` sends inline and `:on` is refused. Both paths
 # give the same results:
 
-@test ReactantServerClient.is_shm_backed(ReactantServerClient.get_or_create_pool!(mlp)) #src
+@test ReactantServerClient.is_shm_backed(ReactantServerClient.get_or_create_pool!(mlp)) == !Sys.isapple() #src
 
 inline = KServeModel("grpc://127.0.0.1:8001", "mlp"; max_batch_size = 8, shared_memory = :off)
 io_inline = FeatureIO(data, zeros(Float32, 3, 100))

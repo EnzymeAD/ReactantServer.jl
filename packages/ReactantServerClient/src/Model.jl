@@ -147,6 +147,9 @@ variable when set and the kwarg is omitted.
   Triton), shared memory is still attempted via `SystemSharedMemoryRegister`; making that work
   is then the caller's responsibility.
 - `:off`: never use shared memory; always send inline. The probe is not sent.
+
+On macOS system shared memory is not supported yet: `:auto` sends inline without probing (and
+warns once per process), and `:on` throws an `ArgumentError` when the model is constructed.
 """
 struct KServeModel <: AbstractInferenceModel
     host::String
@@ -181,6 +184,9 @@ struct KServeModel <: AbstractInferenceModel
         )
         shared_memory in (:auto, :on, :off) ||
             throw(ArgumentError("shared_memory must be :auto, :on, or :off, got $(repr(shared_memory))"))
+        reason = _shm_unsupported[]
+        (shared_memory === :on && reason !== nothing) &&
+            throw(ArgumentError("shared_memory=:on: $reason. Use shared_memory=:auto or :off."))
         return new(
             host,
             port,

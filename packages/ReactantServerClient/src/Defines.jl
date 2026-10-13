@@ -19,3 +19,15 @@ end
 
 Base.IteratorSize(::Type{BatchIterator}) = Base.SizeUnknown()
 Base.eltype(::Type{BatchIterator}) = UnitRange{Int}
+
+# Why system shared memory is unavailable on this platform, or `nothing` when it is available.
+# On macOS the server cannot reopen a region the client created (shm_open fails with EACCES, even
+# within one process), so the IsSameIPCNamespace probe can never succeed there; the regions it would
+# create are not trustworthy either. `:auto` falls back to inline and `:on` is refused. A Ref so the
+# tests can exercise the unsupported path on Linux.
+const _shm_unsupported = Ref{Union{Nothing, String}}(
+    Sys.isapple() ?
+        "system shared memory is not supported on macOS yet (the server cannot reopen a region " *
+        "the client creates)" :
+        nothing
+)
