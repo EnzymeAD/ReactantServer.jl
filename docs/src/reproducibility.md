@@ -46,8 +46,30 @@ a lone single-row request.
 One program removes the batch-size dependence, but whether a row's output is also independent of
 its position in the batch, and of the other rows beside it, depends on the model. Models whose
 rows are computed independently behave this way in practice; an operation that mixes values across
-the batch axis does not. Check it for each model as part of validation: send the same input alone,
-and again alongside other requests, and compare the outputs bit for bit.
+the batch axis does not. Turning coalescing off, described next, removes that dependence on other
+traffic.
+
+## Coalescing
+
+By default the scheduler coalesces: requests to the same model that are queued together are packed
+into one dispatch, so where a request's rows land in the batch, and which other requests' rows sit
+beside them, depends on traffic. Even with one compiled program, a kernel is not guaranteed to give
+bit-identical results for a row in every slot.
+
+`scheduler.coalescing: false` serves exactly one request per dispatch. With `batch_sizes: largest`
+as well, a request always runs the same program with its rows in the same slots, followed by the
+same zero padding, so its result no longer depends on anything another client sends. The cost is
+throughput: each request pays for a full padded batch on its own.
+
+What remains is set by the request itself. A client's pre-batched request runs as one dispatch, so
+whether one of its rows is affected by the other rows the client put beside it still depends on the
+model; the same request always gives the same result. A request larger than the largest compiled
+size is split into the same pieces every time, and each piece runs alone.
+
+The gateway does not yet know whether its workers coalesce: under `lpt_packing` its default
+`routing_fill_mode: run` still concentrates a model's requests on one replica at a time. That
+changes no outputs, but it can queue requests on one GPU while another sits idle; prefer
+`routing_fill_mode: spread` for a fleet with coalescing off.
 
 ## Nondeterministic kernels
 
@@ -92,6 +114,7 @@ CUDA libraries, and the driver. The release image pins all of them except the ho
 
 - `runtime.batch_sizes: largest`
 - `runtime.xla_flags: {xla_gpu_exclude_nondeterministic_ops: true}`
+- `scheduler.coalescing: false`
 
 Anything set explicitly wins, so either piece can be turned back off. The profile does not set
 `runtime.numerics`, because the right mode is the one the deployment was validated with. Set it as
@@ -117,11 +140,12 @@ Each worker records its effective settings at startup. Keep these log lines with
 record:
 
 - **`Effective configuration`:** every resolved setting, including `numerics`, `profile`,
-  `batch_sizes`, `xla_flags`, and `autotune`.
+  `batch_sizes`, `coalescing`, `xla_flags`, and `autotune`.
 - **`TF32 probe`:** whether TF32 arithmetic is in use on the device, and under `f32`, that the pin
   is bit-exact.
 - **The `REGULATED PROFILE` banner:** the precision in effect under the regulated profile, as an
-  info line under `f32` or `tf32` and as a warning under `auto`.
+  info line under `f32` or `tf32` and as a warning under `auto`, together with `batch_sizes`,
+  `coalescing`, and the XLA flags.
 - **`model loaded`:** per model, the compiled batch sizes actually loaded and the numerics outcome
   (operations pinned, algorithms rewritten or stripped).
 
@@ -131,6 +155,7 @@ record:
 - Set `runtime.profile: regulated` and pin `runtime.numerics` to the validated mode.
 - Run every worker on the validated GPU class and driver version.
 - Keep the executable cache on, and cache autotune results or turn autotuning off.
-- For each model, confirm a request's output is bit-identical alone and inside a full batch.
+- Leave coalescing off, as the profile sets it. If it is turned back on, confirm for each model
+  that a request's output is bit-identical alone and inside a full batch.
 - Archive each worker's startup evidence lines.
 - Revalidate when the image, the GPU class, the driver, the numerics mode, or a bundle changes.

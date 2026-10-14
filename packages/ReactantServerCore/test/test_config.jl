@@ -643,3 +643,35 @@ end
         @test isempty(c5.xla_flags)
     end
 end
+
+@testset "scheduler.coalescing: on by default, off under the regulated profile" begin
+    mktempdir() do dir
+        modeldir = joinpath(dir, "models"); mkpath(modeldir)
+        sc(body) = load_single_worker(dir, body; model_repo = modeldir)[1].scheduler
+
+        @test sc("").coalescing
+        @test !sc("scheduler:\n  coalescing: false").coalescing
+        @test !sc("runtime:\n  profile: regulated").coalescing
+        # An explicit setting wins over the profile.
+        @test sc("runtime:\n  profile: regulated\nscheduler:\n  coalescing: true").coalescing
+        @test_throws ReactantServer.ConfigError sc("scheduler:\n  coalescing: sometimes")
+
+        withenv("INFERENCE_SERVER_SCHEDULER_COALESCING" => "false") do
+            @test !sc("").coalescing
+        end
+        withenv(
+            "INFERENCE_SERVER_RUNTIME_PROFILE" => "regulated",
+            "INFERENCE_SERVER_SCHEDULER_COALESCING" => "true",
+        ) do
+            @test sc("").coalescing
+        end
+
+        # Positional and keyword constructors keep coalescing on unless asked.
+        @test ReactantServer.SchedulerConfig(30.0, 64, 30.0).coalescing
+        @test !ReactantServer.SchedulerConfig(30.0, 64, 30.0; coalescing = false).coalescing
+        c9 = ReactantServer.SchedulerConfig(
+            30.0, 0.25, 0.1, 0.2, 64, 30.0, ReactantServer.FAIR, 0, Dict{String, ReactantServer.ModelSchedConfig}()
+        )
+        @test c9.coalescing
+    end
+end

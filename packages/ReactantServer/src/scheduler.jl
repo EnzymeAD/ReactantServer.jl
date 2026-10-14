@@ -232,8 +232,10 @@ _smallest_ge(sizes::Vector{Int}, n::Int) = (i = findfirst(>=(n), sizes); i === n
 # queued. For a partial fill the chosen compiled size exceeds the queued rows and the dispatch
 # is padded. A per-model max_batch_size caps the rows coalesced into one dispatch (the compiled
 # shape may still be larger and padded); a single request over the cap is never split, so it
-# dispatches alone. For non-coalescable models exactly one request is taken at its own size.
-function plan_batch(entry::ModelEntry, st::ModelSchedState)
+# dispatches alone. For non-coalescable models exactly one request is taken at its own size, and so
+# is it for every model when `coalesce` is false (`scheduler.coalescing`), so a request's rows always
+# occupy the same slots of the same program whatever else is queued.
+function plan_batch(entry::ModelEntry, st::ModelSchedState; coalesce::Bool = true)
     isempty(st.queue) && return nothing
     front = st.queue[1]
     execs = entry.executable.execs
@@ -246,7 +248,7 @@ function plan_batch(entry::ModelEntry, st::ModelSchedState)
     inner = execs[variant]
     sizes = sort!(collect(keys(inner)))
 
-    if !_coalescable(entry) || haskey(inner, 0)
+    if !coalesce || !_coalescable(entry) || haskey(inner, 0)
         key = haskey(inner, 0) ? 0 :
             (
                 _smallest_ge(sizes, _request_rows(entry, front.req)) === nothing ? maximum(sizes) :
@@ -330,7 +332,7 @@ function select_dispatch!(s::Scheduler, now::Float64)
         (entry === nothing || !_schedulable(entry)) && continue
         # `===` does not curry (it is a builtin, not a Fix2), so test identity with an explicit closure.
         any(x -> x === qr, entry.sched.queue) || continue
-        return _finalize(entry, plan_batch(entry, entry.sched))
+        return _finalize(entry, plan_batch(entry, entry.sched; coalesce = s.cfg.coalescing))
     end
     s.cfg.discipline == FIFO && return _select_fifo!(s)
     s.cfg.discipline == EDF && return _select_edf!(s)
@@ -351,7 +353,7 @@ function _select_fifo!(s::Scheduler)
         end
     end
     chosen === nothing && return nothing
-    return _finalize(chosen, plan_batch(chosen, chosen.sched))
+    return _finalize(chosen, plan_batch(chosen, chosen.sched; coalesce = s.cfg.coalescing))
 end
 
 # The soonest deadline among a model's queued requests, or typemax (least urgent) when none carries
@@ -390,7 +392,7 @@ function _select_edf!(s::Scheduler)
         end
     end
     chosen === nothing && return nothing
-    return _finalize(chosen, plan_batch(chosen, chosen.sched))
+    return _finalize(chosen, plan_batch(chosen, chosen.sched; coalesce = s.cfg.coalescing))
 end
 
 # Fair: deficit-weighted, cost-aware priority. Decay every EMA to now before reading, then normalize.
@@ -409,7 +411,7 @@ function _select_fair!(s::Scheduler, now::Float64)
     for entry in values(s.registry.by_name)
         _schedulable(entry) || continue
         st = entry.sched
-        plan = plan_batch(entry, st)
+        plan = plan_batch(entry, st; coalesce = s.cfg.coalescing)
         plan === nothing && continue
         B = plan[1]
         share = total_w == 0 ? 0.0 : st.weight / total_w

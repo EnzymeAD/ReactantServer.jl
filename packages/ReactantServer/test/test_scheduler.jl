@@ -181,6 +181,47 @@ end
     @test length(taken3) == 1
 end
 
+@testset "plan_batch with coalescing off takes only the front request" begin
+    # Queued rows that would fill B=4 (see the coalescing rules above) dispatch one request at a
+    # time, each at the smallest compiled size that fits it.
+    e = _sched_entry("c", [1, 4, 8]; coalescable = true)
+    st = ModelSchedState("c", ModelSchedConfig(1.0), 0.0)
+    front = _qr("c"; rows = 2)
+    push!(st.queue, front, _qr("c"; rows = 2), _qr("c"; rows = 2))
+    B, taken = plan_batch(e, st; coalesce = false)
+    @test B == 4
+    @test taken == [front]
+
+    # One row on [1, 4, 8] runs the batch-1 program; under `largest` only [8] exists and it pads.
+    st1 = ModelSchedState("c", ModelSchedConfig(1.0), 0.0)
+    push!(st1.queue, _qr("c"), _qr("c"))
+    @test plan_batch(e, st1; coalesce = false)[1] == 1
+    e8 = _sched_entry("l", [8]; coalescable = true)
+    st8 = ModelSchedState("l", ModelSchedConfig(1.0), 0.0)
+    push!(st8.queue, _qr("l"), _qr("l"))
+    B8, taken8 = plan_batch(e8, st8; coalesce = false)
+    @test B8 == 8
+    @test length(taken8) == 1
+end
+
+@testset "scheduler.coalescing reaches every discipline" begin
+    for discipline in (ReactantServer.FAIR, ReactantServer.FIFO, ReactantServer.EDF)
+        backend = MockBackend()
+        pool = MemoryPool(backend, MockClient(), MockDevice(0), "mock", nothing)
+        s = Scheduler(
+            ModelRegistry(), backend, pool,
+            SchedulerConfig(30.0, 1024, 30.0; discipline = discipline, coalescing = false)
+        )
+        st = ModelSchedState("c", ModelSchedConfig(1.0), 0.0)
+        push!(st.queue, _qr("c"), _qr("c"), _qr("c"))
+        _install!(s, _sched_entry("c", [1, 4]; coalescable = true), st)
+        d = select_dispatch!(s, 0.0)
+        @test length(d.taken) == 1
+        @test d.size == 1
+        @test length(st.queue) == 2
+    end
+end
+
 @testset "select_dispatch! picks the fair winner (worked example)" begin
     s = _empty_sched()
     now = 1000.0

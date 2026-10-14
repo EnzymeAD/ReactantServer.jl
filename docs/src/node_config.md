@@ -79,6 +79,7 @@ global:
     max_queue_depth: 1024      # per-model queue cap; a full model rejects new requests
     dispatch_timeout_seconds: 30.0
     compaction_interval: 0     # defragment device memory every N on-demand weight loads; 0 disables
+    coalescing: true           # merge queued requests into one dispatch (profile default)
     models: {}                 # per-model overrides -> ModelSchedConfig (see below)
   endpoints:                   # -> EndpointsConfig
     host: 0.0.0.0              # bind all interfaces so the gateway and clients can reach the worker
@@ -132,11 +133,15 @@ enumerator name), so a typo fails startup instead of being ignored. An explicit
 `xla_gpu_autotune_level` here wins over `autotune: false`.
 
 `runtime.profile` applies a named set of defaults. `regulated` defaults `batch_sizes` to
-`largest` and adds `xla_gpu_exclude_nondeterministic_ops: true` to `xla_flags`; anything set
-explicitly wins. It does not change `numerics`.
+`largest`, adds `xla_gpu_exclude_nondeterministic_ops: true` to `xla_flags`, and defaults
+`scheduler.coalescing` to `false`; anything set explicitly wins. It does not change `numerics`.
+
+`scheduler.coalescing` (default `true`) lets the scheduler merge queued requests to the same model
+into one dispatch. With `false`, each dispatch serves exactly one request; see
+[Scheduling & Coalescing](scheduling.md).
 
 [Reproducibility & Regulated Use](reproducibility.md) explains how `numerics`, `batch_sizes`,
-`executable_cache`, `xla_flags`, and `profile` affect a model's outputs, and which values a
+`coalescing`, `executable_cache`, `xla_flags`, and `profile` affect a model's outputs, and which values a
 validated deployment should use.
 
 `model_control_mode` sets how the loaded model set evolves:
@@ -322,6 +327,7 @@ overrides were applied, is logged at startup.
 | `INFERENCE_SERVER_SCHEDULER_MAX_QUEUE_DEPTH` | `scheduler.max_queue_depth` | integer |
 | `INFERENCE_SERVER_SCHEDULER_DISPATCH_TIMEOUT_SECONDS` | `scheduler.dispatch_timeout_seconds` | seconds |
 | `INFERENCE_SERVER_SCHEDULER_COMPACTION_INTERVAL` | `scheduler.compaction_interval` | integer |
+| `INFERENCE_SERVER_SCHEDULER_COALESCING` | `scheduler.coalescing` | bool |
 | `INFERENCE_SERVER_ENDPOINTS_HOST` | `endpoints.host` | address |
 | `INFERENCE_SERVER_ENDPOINTS_PORT` | `endpoints.port` | port |
 | `INFERENCE_SERVER_ENDPOINTS_METRICS_PORT` | `endpoints.metrics_port` | port |

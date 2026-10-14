@@ -109,7 +109,8 @@ unaffected.
 
 A named set of runtime defaults (the `runtime.profile` knob). `PROFILE_DEFAULT` changes nothing.
 `PROFILE_REGULATED` is for validated deployments that need reproducible results: it defaults
-`batch_sizes` to `largest` and adds `xla_gpu_exclude_nondeterministic_ops: true` to `xla_flags`.
+`batch_sizes` to `largest`, adds `xla_gpu_exclude_nondeterministic_ops: true` to `xla_flags`, and
+turns `scheduler.coalescing` off.
 Anything set explicitly in the config wins over the profile, so each piece can be turned back off.
 The profile does not change `numerics`; instead the worker logs a prominent warning at startup
 naming the f32 matmul/convolution precision actually in effect unless `numerics` is `f32`.
@@ -121,6 +122,7 @@ _profile_xla_flags(p::RuntimeProfile) =
     p == PROFILE_REGULATED ? Dict{String, Any}("xla_gpu_exclude_nondeterministic_ops" => true) :
     Dict{String, Any}()
 _profile_batch_sizes(p::RuntimeProfile) = p == PROFILE_REGULATED ? BATCH_SIZES_LARGEST : BATCH_SIZES_ALL
+_profile_coalescing(p::RuntimeProfile) = p != PROFILE_REGULATED
 
 """
     RuntimeConfig
@@ -282,7 +284,10 @@ execution timeout; `discipline` selects the inter-model ordering (see
 [`SchedulingDiscipline`](@ref)); `compaction_interval` runs worker-local memory compaction every N
 on-demand weight-cache loads (0 disables), the standalone (no-gateway) trigger, off by default so a
 gateway-fronted worker never self-compacts; and `models` holds the per-model
-[`ModelSchedConfig`](@ref) overrides.
+[`ModelSchedConfig`](@ref) overrides. `coalescing` (default `true`, `false` under the regulated
+profile) lets the scheduler merge several queued requests to one model into a single dispatch; when
+it is `false` every dispatch serves exactly one request, padded to its compiled batch size, so a
+request's rows always occupy the same batch slots whatever else is queued.
 """
 struct SchedulerConfig
     ema_halflife_seconds::Float64
@@ -294,20 +299,36 @@ struct SchedulerConfig
     discipline::SchedulingDiscipline
     compaction_interval::Int
     models::Dict{String, ModelSchedConfig}
+    coalescing::Bool                       # merge queued same-model requests into one dispatch
 end
 
+# Nine-argument form: the previous full positional layout (through `models`), with coalescing on.
+SchedulerConfig(
+    ema_halflife_seconds::Real, recency_penalty_cap::Real, coalescing_discount::Real,
+    cost_ema_alpha::Real, max_queue_depth::Integer, dispatch_timeout_seconds::Real,
+    discipline::SchedulingDiscipline, compaction_interval::Integer,
+    models::Dict{String, ModelSchedConfig}
+) =
+    SchedulerConfig(
+    Float64(ema_halflife_seconds), Float64(recency_penalty_cap), Float64(coalescing_discount),
+    Float64(cost_ema_alpha), Int(max_queue_depth), Float64(dispatch_timeout_seconds), discipline,
+    Int(compaction_interval), models, true
+)
+
 # Convenience constructor preserving the original three-argument form. The cost-aware knobs,
-# discipline, compaction interval, and per-model overrides take their defaults unless passed as keywords.
+# discipline, compaction interval, per-model overrides, and coalescing take their defaults unless
+# passed as keywords.
 SchedulerConfig(
     ema_halflife_seconds::Real, max_queue_depth::Integer, dispatch_timeout_seconds::Real;
     recency_penalty_cap::Real = 0.25, coalescing_discount::Real = 0.1, cost_ema_alpha::Real = 0.2,
     discipline::SchedulingDiscipline = FAIR, compaction_interval::Integer = 0,
-    models::Dict{String, ModelSchedConfig} = Dict{String, ModelSchedConfig}()
+    models::Dict{String, ModelSchedConfig} = Dict{String, ModelSchedConfig}(),
+    coalescing::Bool = true
 ) =
     SchedulerConfig(
     Float64(ema_halflife_seconds), Float64(recency_penalty_cap),
     Float64(coalescing_discount), Float64(cost_ema_alpha), Int(max_queue_depth),
-    Float64(dispatch_timeout_seconds), discipline, Int(compaction_interval), models
+    Float64(dispatch_timeout_seconds), discipline, Int(compaction_interval), models, coalescing
 )
 
 """
@@ -442,6 +463,7 @@ const ENV_PATHS = Tuple{String, Vector{String}, DataType}[
     ("SCHEDULER_MAX_QUEUE_DEPTH", ["scheduler", "max_queue_depth"], Int),
     ("SCHEDULER_DISPATCH_TIMEOUT_SECONDS", ["scheduler", "dispatch_timeout_seconds"], Float64),
     ("SCHEDULER_COMPACTION_INTERVAL", ["scheduler", "compaction_interval"], Int),
+    ("SCHEDULER_COALESCING", ["scheduler", "coalescing"], Bool),
     ("ENDPOINTS_HOST", ["endpoints", "host"], String),
     ("ENDPOINTS_PORT", ["endpoints", "port"], Int),
     ("ENDPOINTS_METRICS_PORT", ["endpoints", "metrics_port"], Int),
@@ -698,6 +720,7 @@ function build_config(raw::AbstractDict)
             _parse_discipline(_coerce(String, sc["discipline"], "scheduler.discipline")) : FAIR,
         _opt(sc, "compaction_interval", Int, 0),
         _parse_sched_models(sc),
+        _opt(sc, "coalescing", Bool, _profile_coalescing(profile)),
     )
 
     haskey(raw, "batch_policy") && throw(ConfigError(_BATCH_POLICY_REMOVED_MSG))
@@ -774,7 +797,7 @@ end
 # `apply_env_overrides!` is applied on top by `node_server_config`.
 
 function log_effective_config(cfg::ServerConfig, applied)
-    @info "Effective configuration" model_dirs = cfg.model_dirs models_include = cfg.models_include model_control_mode = cfg.model_control_mode model_poll_seconds = cfg.model_poll_seconds cache_dir = cfg.cache_dir backend = cfg.runtime.backend device_ordinal = cfg.runtime.device_ordinal mem_fraction = cfg.runtime.mem_fraction preallocate = cfg.runtime.preallocate allow_cpu_fallback = cfg.runtime.allow_cpu_fallback weight_cache_fraction = cfg.runtime.weight_cache_fraction weight_cache_wiggle_fraction = cfg.runtime.weight_cache_wiggle_fraction autotune = cfg.runtime.autotune autotune_cache = cfg.runtime.autotune_cache autotune_cache_dir = cfg.runtime.autotune_cache_dir numerics = cfg.runtime.numerics executable_cache = cfg.runtime.executable_cache profile = cfg.runtime.profile batch_sizes = cfg.runtime.batch_sizes xla_flags = sort!(["$k=$v" for (k, v) in cfg.runtime.xla_flags]) residency_mode = cfg.runtime.residency_mode shared_host_weights = cfg.runtime.shared_host_weights shared_host_weights_mode = string(cfg.runtime.shared_host_weights_mode; base = 8) host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests discipline = cfg.scheduler.discipline ema_halflife_seconds = cfg.scheduler.ema_halflife_seconds recency_penalty_cap = cfg.scheduler.recency_penalty_cap coalescing_discount = cfg.scheduler.coalescing_discount cost_ema_alpha = cfg.scheduler.cost_ema_alpha max_queue_depth = cfg.scheduler.max_queue_depth compaction_interval = cfg.scheduler.compaction_interval scheduler_models = collect(keys(cfg.scheduler.models))
+    @info "Effective configuration" model_dirs = cfg.model_dirs models_include = cfg.models_include model_control_mode = cfg.model_control_mode model_poll_seconds = cfg.model_poll_seconds cache_dir = cfg.cache_dir backend = cfg.runtime.backend device_ordinal = cfg.runtime.device_ordinal mem_fraction = cfg.runtime.mem_fraction preallocate = cfg.runtime.preallocate allow_cpu_fallback = cfg.runtime.allow_cpu_fallback weight_cache_fraction = cfg.runtime.weight_cache_fraction weight_cache_wiggle_fraction = cfg.runtime.weight_cache_wiggle_fraction autotune = cfg.runtime.autotune autotune_cache = cfg.runtime.autotune_cache autotune_cache_dir = cfg.runtime.autotune_cache_dir numerics = cfg.runtime.numerics executable_cache = cfg.runtime.executable_cache profile = cfg.runtime.profile batch_sizes = cfg.runtime.batch_sizes xla_flags = sort!(["$k=$v" for (k, v) in cfg.runtime.xla_flags]) residency_mode = cfg.runtime.residency_mode shared_host_weights = cfg.runtime.shared_host_weights shared_host_weights_mode = string(cfg.runtime.shared_host_weights_mode; base = 8) host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests discipline = cfg.scheduler.discipline ema_halflife_seconds = cfg.scheduler.ema_halflife_seconds recency_penalty_cap = cfg.scheduler.recency_penalty_cap coalescing = cfg.scheduler.coalescing coalescing_discount = cfg.scheduler.coalescing_discount cost_ema_alpha = cfg.scheduler.cost_ema_alpha max_queue_depth = cfg.scheduler.max_queue_depth compaction_interval = cfg.scheduler.compaction_interval scheduler_models = collect(keys(cfg.scheduler.models))
     isempty(applied) || @info "Configuration overridden by environment" overrides = ["$k=$v" for (k, v) in applied]
     return nothing
 end

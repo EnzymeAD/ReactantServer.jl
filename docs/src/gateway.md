@@ -240,7 +240,10 @@ names an axis rather than a count.
   because then the worker has nothing left to coalesce and concentration only idles GPUs. It is
   also what promotion means for a latency-bound model whose client concurrency sits well below
   its max batch; the cost is coalescing depth, since each GPU now batches roughly `1/k` as many
-  requests. Prefer it per model rather than fleet-wide.
+  requests. Prefer it per model rather than fleet-wide. The exception is a fleet whose workers
+  run with `scheduler.coalescing: false` (the `regulated` profile): no worker coalesces, so
+  concentration buys nothing, and `spread` is the right fleet-wide choice. The gateway does not
+  detect this on its own; set it explicitly.
 - **`inflight`**: `Q` counts requests **in flight**, so a replica keeps
   receiving the model's traffic until it holds a full quantum at once.
 
