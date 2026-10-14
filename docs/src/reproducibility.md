@@ -81,19 +81,38 @@ the `regulated` profile sets it for you.
 
 ## Compilation and autotuning
 
-When XLA compiles a program for a GPU it can autotune: time several candidate kernels and keep the
-fastest. Timing is noisy, so two compiles of the same model on the same GPU class can choose
-differently, and different kernels can give different low bits.
+When XLA compiles a program for a GPU it autotunes by default (`runtime.autotune: true`): it times
+several candidate kernels for each matrix multiplication and convolution and keeps the fastest.
+Autotuning improves performance greatly, but it is also a source of non-determinism. Timing is
+noisy, so even with everything else held constant (the same image, bundle, GPU, driver, and
+settings), two compiles of the same model can choose different algorithms, and different algorithms
+can give different low bits.
 
-Three settings hold the choice fixed:
+A choice, once made, is held by two caches:
 
-- **The executable cache** (`runtime.executable_cache`, on by default) loads each program exactly
-  as it was compiled, kernel choices included, so a restart cannot change them. A change to the
-  software stack, the device, or the compile settings compiles fresh.
-- **Cached autotune results** (`runtime.autotune_cache`, `runtime.autotune_cache_dir`) make a
-  fresh compile reuse earlier timing decisions instead of measuring again.
-- **`runtime.autotune: false`** skips autotuning and uses XLA's default kernels. Selection no
-  longer depends on timing at all, at some cost in speed.
+- **The executable cache** (`runtime.executable_cache`, on by default) stores each compiled program,
+  kernel choices included, in the bundle's `.cache/` directory and loads it on later starts, so a
+  restart does not autotune again. A program is compiled fresh whenever its entry is missing: on the
+  first start, for a new bundle directory (each model version has its own), for a bundle copied
+  without its `.cache/`, on a new host or volume, and after an image upgrade or a change to the
+  compile settings.
+- **The autotune cache** (`runtime.autotune_cache`, `runtime.autotune_cache_dir`;
+  `/var/cache/reactant-compile` in the image) stores the timing decisions themselves, so a fresh
+  compile reuses earlier choices instead of measuring again.
+
+With autotuning on, make both caches persistent and back them up. Neither failure is visible: a
+lost cache does not stop a worker, it only autotunes again and may choose differently, which is a
+change to revalidate. In practice:
+
+- Mount the autotune cache directory on a persistent volume, and keep each bundle directory
+  writable and persistent (see [Container settings](@ref) for the mounts).
+- Back up the autotune cache and the bundles' `.cache/` directories as part of the validation
+  record, and restore them, rather than letting a new or rebuilt host autotune from scratch.
+- After a restart, check that every program loaded from the executable cache: the worker logs
+  `executable cache: hit` for each, and `worker_executable_cache_misses_total` stays at zero.
+
+**`runtime.autotune: false`** removes the dependence on timing altogether: XLA uses its default
+kernels, the same on every compile, at some cost in speed.
 
 ## The software stack
 
@@ -154,7 +173,9 @@ record:
 - Serve from a release image pinned by digest or release tag, with its build attestation verified.
 - Set `runtime.profile: regulated` and pin `runtime.numerics` to the validated mode.
 - Run every worker on the validated GPU class and driver version.
-- Keep the executable cache on, and cache autotune results or turn autotuning off.
+- With autotuning on, keep the executable cache and the autotune cache on persistent storage,
+  back both up with the validation record, and confirm a restart loads every program from the cache.
+  Otherwise set `runtime.autotune: false`.
 - Leave coalescing off, as the profile sets it. If it is turned back on, confirm for each model
   that a request's output is bit-identical alone and inside a full batch.
 - Archive each worker's startup evidence lines.
