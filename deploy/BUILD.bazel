@@ -109,7 +109,8 @@ stage_workspace() {
 _TAR = "LC_ALL=C tar --create --file \"$@\" --format=gnu --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --mode='u=rwX,go=rX'"
 
 # The Ubuntu packages the image adds to the base (curl, tini and the libraries curl needs), from
-# the pinned downloads in deploy/debs.lock.json, unpacked the way dpkg would lay them out.
+# the checked-in files under deploy/debs/ pinned by deploy/debs.lock.json, unpacked the way dpkg
+# would lay them out.
 #
 # The control stanza of each package lands in /var/lib/dpkg/status.d/<name>, where image scanners
 # (Trivy, Grype, Syft) inventory packages installed without dpkg, so the added packages stay

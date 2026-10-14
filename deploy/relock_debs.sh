@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Re-resolve deploy/debs.lock.json: the Ubuntu packages the image adds on top of the CUDA base.
+# Re-resolve deploy/debs.lock.json and deploy/debs/: the Ubuntu packages the image adds on top of
+# the CUDA base. The lock pins each package by sha256; the .deb files themselves are checked in
+# (Git LFS) and are what the build reads, so only this script talks to the snapshot server.
 #
 #   bazel run //deploy:relock_debs                       # resolve against today's snapshot
 #   bazel run //deploy:relock_debs -- 20260928T000000Z   # resolve against a given snapshot
@@ -12,6 +14,7 @@
 # WHY SNAPSHOT URLS. archive.ubuntu.com drops a -updates version from the pool once it is
 # superseded, so a lock of archive URLs breaks within weeks. snapshot.ubuntu.com serves the archive
 # as it was at a timestamp, forever, so the lock stays fetchable and the sha256 stays meaningful.
+# The URL is kept in the lock as the record of where each checked-in file came from.
 #
 # Needs podman (the base image is pulled by the digest in MODULE.bazel). Review the diff like code.
 set -euo pipefail
@@ -29,8 +32,9 @@ base="${image#index.}@$digest"
 echo "==> resolving ${packages[*]} against $base at snapshot $snapshot"
 
 out="$(mktemp)"
-trap 'rm -f "$out"' EXIT
-podman run --rm --pull=missing --entrypoint bash "$base" -c '
+fetched="$(mktemp -d)"
+trap 'rm -rf "$out" "$fetched"' EXIT
+podman run --rm --pull=missing -v "$fetched:/out:Z" --entrypoint bash "$base" -c '
 set -euo pipefail
 snapshot="$1"; shift
 # Every Ubuntu source, the security pocket included, read from the snapshot.
@@ -45,7 +49,8 @@ while read -r name version; do
     url="$(apt-get download --print-uris "$name=$version" | cut -d"'\''" -f2)"
     apt-get download -qq "$name=$version"
     sha="$(sha256sum ./*.deb | cut -d" " -f1)"
-    rm -f ./*.deb
+    # Named after the URL, with apt'"'"'s escaped "+" restored, as deploy/debs.bzl expects.
+    mv ./*.deb "/out/$(basename "$url" | sed "s/%2b/+/g")"
     printf "%s %s %s %s\n" "$name" "$version" "$url" "$sha"
 done
 ' bash "$snapshot" "${packages[@]}" > "$out"
@@ -70,5 +75,9 @@ done
     printf '  ]\n'
     printf '}\n'
 } > "$root/deploy/debs.lock.json"
+# Replace the checked-in packages wholesale, so a package the new lock no longer lists is removed.
+rm -f "$root"/deploy/debs/*.deb
+mkdir -p "$root/deploy/debs"
+cp "$fetched"/*.deb "$root/deploy/debs/"
 cat "$out" | awk '{print "   ", $1, $2}'
-echo "wrote $root/deploy/debs.lock.json"
+echo "wrote $root/deploy/debs.lock.json and $(ls "$fetched" | wc -l) packages under $root/deploy/debs/"

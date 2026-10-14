@@ -52,15 +52,21 @@ bazel run //deploy:relock                           # keep every version that st
 bazel run //deploy:relock -- Reactant Reactant_jll  # also move the named packages forward
 ```
 
-## The Ubuntu lock: `deploy/debs.lock.json`
+## The Ubuntu lock: `deploy/debs.lock.json` and `deploy/debs/`
 
 `curl` (the healthcheck) and `tini` (PID 1) are not in the CUDA base, so the image adds them and the
 libraries `curl` needs as pinned `.deb` files. `//deploy:relock_debs` resolves them by running apt
 inside the pinned base image, so the lock holds exactly what the base lacks: a layer that re-shipped
 a package the base already has (`libc6`, `libssl3t64`) would overwrite the base's copy. Each package
-is pinned by a `snapshot.ubuntu.com` URL, which serves the archive as it was at the lock's timestamp
-indefinitely, and by sha256. The build downloads them through `deploy/debs.bzl` and unpacks them
-with the `bsdtar` toolchain, so neither `apt` nor `dpkg` runs during the build. Each package's
+is pinned by sha256 and recorded with the `snapshot.ubuntu.com` URL it was resolved from, which
+serves the archive as it was at the lock's timestamp indefinitely.
+
+The `.deb` files themselves are checked in under `deploy/debs/` with Git LFS, and the build reads
+them from there: `deploy/debs.bzl` checks each against the lock's sha256, so an image build never
+contacts the snapshot server, whose timeouts used to fail cold builds. A checkout without the LFS
+objects holds small pointer files instead, and the build stops with an error naming the file; run
+`git lfs pull` (or check out with `lfs: true` in GitHub Actions). The packages are unpacked with the
+`bsdtar` toolchain, so neither `apt` nor `dpkg` runs during the build. Each package's
 control stanza is written to `/var/lib/dpkg/status.d/`, so image scanners (Trivy, Grype, Syft) still
 see what was added.
 
@@ -69,6 +75,7 @@ bazel run //deploy:relock_debs                      # resolve against today's sn
 bazel run //deploy:relock_debs -- 20260928T000000Z  # resolve against a given snapshot
 ```
 
+A relock rewrites the lock and replaces the files under `deploy/debs/` together; commit both.
 Moving the base image digest in `MODULE.bazel` calls for a relock, since the delta is computed
 against the base.
 

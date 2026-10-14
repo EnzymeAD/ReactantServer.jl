@@ -49,6 +49,8 @@ jobs:
       artifact-metadata: write  # record where the attested image is stored
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          lfs: true             # deploy/debs/*.deb, the Ubuntu packages the image adds
 
       # The CUDA base, the depot (Reactant's CUDA artifact included) and the layers built from them
       # need tens of gigabytes. The runner's root disk is too small for that once its preinstalled
