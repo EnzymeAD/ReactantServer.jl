@@ -160,15 +160,16 @@ function _batched_manifest(name)
     )
 end
 
-function _batched_scheduler(name, sizes)
+function _batched_scheduler(name, sizes; coalescing = true, model = _batched_scale_model(sizes))
     backend = ReactantServer.MockBackend()
     pool = ReactantServer.MemoryPool(backend, ReactantServer.MockClient(), ReactantServer.MockDevice(0), "mock", nothing)
     reg = ReactantServer.ModelRegistry()
     reg.by_name[name] = ReactantServer.ModelEntry(
         name, _batched_manifest(name), Dict{Int, Vector{UInt8}}(),
-        "", nothing, _batched_scale_model(sizes), nothing, identity, identity
+        "", nothing, model, nothing, identity, identity
     )
-    sched = ReactantServer.Scheduler(reg, backend, pool, ReactantServer.SchedulerConfig(30.0, 1024, 30.0))
+    cfg = ReactantServer.SchedulerConfig(30.0, 1024, 30.0; coalescing = coalescing)
+    sched = ReactantServer.Scheduler(reg, backend, pool, cfg)
     reg.by_name[name].sched = ReactantServer.ModelSchedState(name, ReactantServer.ModelSchedConfig(1.0), 0.0)
     return sched
 end
@@ -243,6 +244,47 @@ end
     end
     @test sched.registry.by_name["bscale"].sched.dispatch_count == 1             # one execution served all four
     @test sched.registry.by_name["bscale"].sched.batch_size_hist[4] == 1
+end
+
+@testset "coalescing off: one request per dispatch, always in the same slots" begin
+    # The regulated shape: only the largest program (batch 4) and no coalescing. The executable records
+    # the batch it was handed, so the test can see where each request's row sat.
+    seen = Matrix{Float32}[]
+    sig = ReactantServer.ModelSignature(["x"], DataType[Float32], ["w"], 1, ["y"], DataType[Float32], 1)
+    exec = ReactantServer.MockExecutable(args -> (push!(seen, copy(args[1])); [args[1] .* args[2]]), 1)
+    model = ReactantServer.LoadedModel(sig, Dict{Int, Any}(4 => exec), Any[ReactantServer.MockBuffer(Float32[10, 100])])
+    sched = _batched_scheduler("solo", [4]; coalescing = false, model = model)
+    st = sched.registry.by_name["solo"].sched
+    qrs = [
+        let req = ReactantServer.InferRequest("solo", ["y"], [ReactantServer.NamedTensor("x", reshape(Float32[k, k], 2, 1))])
+            ReactantServer.QueuedRequest(req, req.inputs, 0.0, Channel{Any}(1))
+        end for k in 1:4
+    ]
+    append!(st.queue, qrs)
+
+    for k in 1:4
+        d = ReactantServer.select_dispatch!(sched, 0.0)
+        @test d.size == 4
+        @test d.taken == [qrs[k]]               # FIFO, one at a time; the rest stay queued
+        ReactantServer.execute_and_record!(sched, d)
+        @test take!(qrs[k].reply)[1].data == reshape(Float32[10k, 100k], 2, 1)
+    end
+    @test ReactantServer.select_dispatch!(sched, 0.0) === nothing
+    # Every request ran in slot 1 of a zero-padded batch, exactly as it would have alone.
+    @test seen == [hcat(Float32[k, k], zeros(Float32, 2, 3)) for k in 1:4]
+    @test st.dispatch_count == 4
+    @test st.requests_served == 4
+    @test st.batch_size_hist[4] == 4
+
+    # A client's own pre-batch is not broken up: its rows dispatch together, in its order.
+    two = ReactantServer.InferRequest("solo", ["y"], [ReactantServer.NamedTensor("x", Float32[1 2; 1 2])])
+    qr2 = ReactantServer.QueuedRequest(two, two.inputs, 0.0, Channel{Any}(1))
+    push!(st.queue, qr2, qrs[1])
+    d = ReactantServer.select_dispatch!(sched, 0.0)
+    @test d.taken == [qr2]
+    ReactantServer.execute_and_record!(sched, d)
+    @test take!(qr2.reply)[1].data == Float32[10 20; 100 200]
+    @test seen[end] == hcat(Float32[1 2; 1 2], zeros(Float32, 2, 2))
 end
 
 @testset "mock scheduler pads a partial-fill coalesced dispatch" begin

@@ -218,6 +218,21 @@ the reason a worker can absorb bursts: concurrent requests pile onto a model's q
 converts them into a small number of full dispatches instead of paying launch cost once per
 request.
 
+### Turning coalescing off
+
+`scheduler.coalescing: false` (the default under the `regulated` profile) makes every dispatch serve
+exactly one request: the front of the queue, at the smallest compiled size that fits it, padded with
+zero rows. A request's rows then occupy the same slots of the same program no matter what else is
+queued, which is what a validated deployment needs; see
+[Reproducibility & Regulated Use](reproducibility.md). A client's own pre-batched request still runs
+as one dispatch, and an oversize request is still split into pieces, each of which runs alone.
+
+The cost is the throughput lever above: concurrent requests to a model are served one dispatch each,
+and `coalescing_discount` has no effect. The gateway does not yet know whether its workers coalesce,
+so under `lpt_packing` it still concentrates a model's requests on one replica at a time to feed
+coalescing that no longer happens. A fleet with coalescing off should prefer
+`routing_fill_mode: spread`; see [Multi-GPU Gateway](gateway.md).
+
 ## Cost learning
 
 The scheduler measures the real GPU time of each execution and refines a per-batch-size cost
@@ -323,6 +338,7 @@ global:
     max_queue_depth: 1024          # per-model queue cap; a full model rejects new requests
     dispatch_timeout_seconds: 30.0 # per-request execution timeout
     compaction_interval: 0         # worker-local memory compaction every N on-demand loads
+    coalescing: true               # merge queued requests per dispatch (false under regulated)
     models: {}                     # per-model overrides (weight, residency, max_batch_size)
 ```
 
