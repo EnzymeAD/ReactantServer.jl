@@ -292,8 +292,10 @@ every worker must serve the identical model set. Because a worker compiles and w
 model before its control plane answers, the workers are usually not up when the gateway starts,
 so the gateway waits for all of them before serving rather than failing, logging which workers
 are still pending. Under the node supervisor (the embedded gateway) this wait is enabled
-automatically; for a standalone gateway set `REACTANT_GATEWAY_STARTUP_WAIT_SECONDS` (a number of
-seconds, or `inf` to wait indefinitely; the default `0` fails fast). Each poll is
+automatically; a standalone gateway waits 60 seconds by default, which covers a worker's first
+control-plane call after it reports ready (that call compiles the worker's gRPC request path).
+Set `REACTANT_GATEWAY_STARTUP_WAIT_SECONDS` to a number of seconds, `inf` to wait indefinitely, or
+`0` to check once and fail fast. Each poll is
 watchdog-bounded, and if the gRPC client stack wedges during the long warmup (a known libcurl
 failure mode) the gateway exits so the supervisor restarts it with a fresh stack; this self-heals
 and you may see one such restart before it serves. Once all workers are up, a wrong discipline

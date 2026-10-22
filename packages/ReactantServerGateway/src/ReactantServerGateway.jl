@@ -91,13 +91,19 @@ const _H2_INITIAL_WINDOW_BYTES = 32 * 1024 * 1024     # per-stream receive windo
 const _H2_CONNECTION_WINDOW_BYTES = 32 * 1024 * 1024  # connection-level receive window
 
 # How long lpt_packing startup waits for all workers to come up over the control plane before
-# serving (REACTANT_GATEWAY_STARTUP_WAIT_SECONDS). Default 0 fails fast; "inf"/"forever"/"-1" waits
-# indefinitely. The node supervisor sets this to wait for the workers it co-launches (workers
-# compile before they answer), so the embedded gateway gates on them instead of crash-looping.
+# serving (REACTANT_GATEWAY_STARTUP_WAIT_SECONDS). "inf"/"forever"/"-1" waits indefinitely and 0
+# checks once. The default is a short grace rather than a single check: a worker that already
+# answers /readyz still compiles its gRPC request path on its first call (about 4s on a fast
+# machine, past the 5s probe deadline on a slow or cold one), so one check can reject a healthy
+# worker. The node supervisor sets "inf" to wait for the workers it co-launches (workers compile
+# before they answer), so the embedded gateway gates on them instead of crash-looping.
+const _DEFAULT_STARTUP_WAIT_SECONDS = 60.0
+
 function _startup_wait_seconds()
-    s = lowercase(strip(get(ENV, "REACTANT_GATEWAY_STARTUP_WAIT_SECONDS", "0")))
+    s = lowercase(strip(get(ENV, "REACTANT_GATEWAY_STARTUP_WAIT_SECONDS", "")))
+    isempty(s) && return _DEFAULT_STARTUP_WAIT_SECONDS
     s in ("inf", "forever", "-1") && return Inf
-    return something(tryparse(Float64, s), 0.0)
+    return something(tryparse(Float64, s), _DEFAULT_STARTUP_WAIT_SECONDS)
 end
 
 """

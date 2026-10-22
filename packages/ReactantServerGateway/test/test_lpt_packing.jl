@@ -138,6 +138,16 @@ end
     @test time() - t0 >= 0.25
 end
 
+@testset "startup wait: REACTANT_GATEWAY_STARTUP_WAIT_SECONDS" begin
+    wait_for(v) = withenv(GW._startup_wait_seconds, "REACTANT_GATEWAY_STARTUP_WAIT_SECONDS" => v)
+    # Unset is a short grace, not a single check: a ready worker's first gRPC call still compiles.
+    @test wait_for(nothing) == GW._DEFAULT_STARTUP_WAIT_SECONDS > 0
+    @test wait_for("0") == 0.0                                          # explicit fail-fast
+    @test wait_for("12.5") == 12.5
+    @test wait_for("inf") == wait_for("Forever") == wait_for("-1") == Inf
+    @test wait_for("soon") == GW._DEFAULT_STARTUP_WAIT_SECONDS          # unparseable keeps the default
+end
+
 @testset "_bounded: timeout log level is controllable (quiet startup wait)" begin
     slow() = (sleep(5); 1)   # never finishes within the watchdog, forcing the timeout branch
     # Default :warn (the runtime health prober) warns on a timeout.
