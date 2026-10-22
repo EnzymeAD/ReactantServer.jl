@@ -591,7 +591,9 @@ end
     @testset "@infer_inbounds elides in auto mode, checks in context (subprocess)" begin
         # Pkg.test forces --check-bounds=yes, so the elision can only be observed in a fresh process
         # under --check-bounds=auto. A probe array records whether its @boundscheck ran (no OOB).
-        proj = dirname(dirname(pathof(ReactantServerClient)))
+        # The test environment, not the package directory: an installed package has no manifest
+        # beside it, so `--project=<package dir>` could not load its dependencies.
+        proj = Base.active_project()
         # The accesses go through functions so getindex inlines and @inbounds can actually elide.
         code = raw"""
         using ReactantServerClient

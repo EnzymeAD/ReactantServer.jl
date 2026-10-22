@@ -6,6 +6,7 @@ Luximm = "dd5ee4bc-caca-4b0e-b38f-82888d7e6786"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 ReactantServer = "faa8a0e4-1926-4c6b-a0e2-e70699715ecf"
+ReactantServerCore = "387a5f05-f7b4-4d57-bca9-cd3358e52bdc"
 ReactantServerExport = "90fa0446-f028-4638-8833-e223884d9b4d"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 gRPCClient = "aaca4a50-36af-4a1d-b878-4c443f2061ad"
@@ -14,8 +15,10 @@ gRPCServer = "608c6337-0d7d-447f-bb69-0f5674ee3959"
 [sources]
 # A standalone environment does not inherit a path-dependency's own [sources], so this env
 # declares the full vendored path-source closure itself (same pattern as docs/Project.toml):
-# the path-sourced packages under test (ReactantServer and ReactantServerExport).
+# the path-sourced packages under test (ReactantServer and ReactantServerExport) and the
+# ReactantServerCore they build on, which would otherwise resolve from the registry.
 ReactantServer = {path = "../.."}
+ReactantServerCore = {path = "../../../ReactantServerCore"}
 # Offline bundle export, used by gen_bit_resnet50.jl to trace the Luximm model into the
 # bit_resnet50 bundle the stack serves.
 ReactantServerExport = {path = "../../../ReactantServerExport"}

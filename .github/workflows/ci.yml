@@ -154,12 +154,11 @@ jobs:
   # client tutorial sends tensors through shared memory. Windows is deliberately not covered:
   # InterProcessCommunication.jl is POSIX-only, so the client cannot load there.
   #
-  # Not a Pkg.test target, so the environment is instantiated and precompiled explicitly first
-  # (JULIA_PKG_PRECOMPILE_AUTO=0 in _test.yml skips the automatic pass). Coverage is scoped with
-  # --code-coverage=@<repo>/packages, so only this tree's packages lose their package images;
-  # Reactant and every other dependency still load precompiled. Base.julia_cmd() forwards the flag,
-  # so the tutorial processes and the node's worker and gateway children are all counted. Both OSes
-  # upload under the one `integration` flag.
+  # Not a Pkg.test target, so the environment is instantiated and precompiled explicitly first.
+  # Coverage is scoped with --code-coverage=@<repo>/packages, so only this tree's packages lose their
+  # package images; Reactant and every other dependency still load precompiled. Base.julia_cmd()
+  # forwards the flag, so the tutorial processes and the node's worker and gateway children are all
+  # counted. Both OSes upload under the one `integration` flag.
   integration:
     needs: changes
     if: ${{ needs.changes.outputs.integration == 'true' }}

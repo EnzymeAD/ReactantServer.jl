@@ -66,12 +66,11 @@ jobs:
           cache-name: julia-${{ inputs.cache-name }}
       # No REACTANT_GPU env => Reactant selects the CPU artifact; threads come from the command.
       - name: Run tests
+        # Leave automatic precompilation on. Pkg.test's parallel pass for the test flags
+        # (check-bounds, coverage) is gated on it, and without that pass a cold cache compiles every
+        # dependency serially at load time, nested inside other packages' precompiles; ZMQ failed
+        # that way under KaimonGate.
         run: ${{ inputs.command }}
-        env:
-          # Pkg.test runs the suite with different flags (check-bounds, coverage) than an ordinary
-          # session, and on Julia 1.12 that recompiles every package anyway, so the automatic
-          # precompile during resolution and instantiation would be paid twice for nothing.
-          JULIA_PKG_PRECOMPILE_AUTO: '0'
       - uses: julia-actions/julia-processcoverage@03114f09f119417c3242a9fb6e0b722676aedf38 # v1.2.2
         if: ${{ inputs.coverage-directories != '' }}
         with:
