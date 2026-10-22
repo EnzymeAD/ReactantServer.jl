@@ -50,6 +50,7 @@ cannot trace JIT graphs.
 """
 module ReactantServerExportPythonCallExt
 
+using BFloat16s: BFloat16
 using PythonCall
 import ReactantServerExport
 import ReactantServerExport: export_bundle, _pyimports,
@@ -276,7 +277,7 @@ end
 # reports for a JAX bf16 array.
 const JULIA_TO_NUMPY = Dict{DataType, String}(
     Float16 => "float16", Float32 => "float32", Float64 => "float64",
-    ReactantServerExport.BFloat16 => "bfloat16",
+    BFloat16 => "bfloat16",
     Int8 => "int8", Int16 => "int16", Int32 => "int32", Int64 => "int64",
     UInt8 => "uint8", UInt16 => "uint16", UInt32 => "uint32", UInt64 => "uint64",
     Bool => "bool",
