@@ -1,0 +1,37 @@
+# The components container releases are built from, keyed the way a release record names
+# them (see docs/releases.jl). Add an entry when a release first uses a new Julia, base image, or
+# accelerator provider version; the docs build names the entry it is missing.
+
+# Julia, by version. `llvm` is Julia's own LLVM (Base.libllvm_version).
+[julia."1.12.7"]
+llvm = "18.1.7"
+
+# The base image, by the index digest MODULE.bazel pins. `amd64` is that index's linux/amd64 image.
+# `require_cuda` is its NVIDIA_REQUIRE_CUDA, which the NVIDIA Container Toolkit checks when a
+# container starts; it is what sets the CUDA accelerator's `min_driver` below.
+[base_image."sha256:08d6facb6a72f918beb3ffe5b57cff72402a203f44428831262e95c7466d4188"]
+tag = "nvidia/cuda:13.1.2-cudnn-devel-ubuntu24.04"
+amd64 = "sha256:c8365d2cde6d16aad4e9981ebfaff1b8556152b85f51082316a9667f87a49604"
+os = "Ubuntu 24.04"
+cuda = "13.1.2"
+require_cuda = "cuda>=13.1"
+
+# An accelerator, as accelerator.<name>."<provider version>"."<selection>": what the provider
+# package bundles for it and what it requires of the host.
+#
+# CUDA: the provider is Reactant_jll and the selection its REACTANT_GPU_VERSION. `artifact` is the
+# tree hash in the jll's Artifacts.toml (x86_64, opt); `source_commit` is the Reactant.jl revision
+# its README names. The CUDA versions are the HERMETIC_*_VERSION pins in
+# deps/ReactantExtra/.bazelrc at that commit (its cuda13 config), and `compute_capabilities` is
+# HERMETIC_CUDA_COMPUTE_CAPABILITIES there. `min_driver` is the Linux driver NVIDIA's release notes
+# give for the base image's CUDA release.
+[accelerator.cuda."0.0.410+0"."13.1"]
+artifact = "12ec5519bfb17608aa57b3cd1c9167d460275962"
+source_commit = "a9df0cede5cf5745b685909f542f31a4b68d985b"
+cuda = "13.1.1"
+cudnn = "9.21.0"
+nccl = "2.28.9"
+nvshmem = "3.3.20"
+compute_capabilities = ["sm_75", "sm_80", "sm_90", "sm_100", "compute_120"]
+min_compute_capability = "7.5"
+min_driver = "590.44.01"

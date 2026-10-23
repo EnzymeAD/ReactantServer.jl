@@ -37,3 +37,5 @@ PLAN.md
 /docs/src/tutorials/julia/serve.md
 /docs/src/tutorials/julia/node.md
 /docs/src/tutorials/julia/gateway.md
+# The container release pages, rendered from docs/releases/ by docs/make.jl.
+/docs/src/releases/

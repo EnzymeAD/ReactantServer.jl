@@ -1,0 +1,30 @@
+# Container release 0.1.0, written by `julia docs/releases.jl record 0.1.0`.
+version = "0.1.0"
+published = 2026-10-11
+commit = "8a2c1eefbea0087f08d99a030b007019d50ed527"
+image_digest = "sha256:d9a0178657d47330b08613a9f4888cc3aa933957bbd2e16d21322cc576cc0405"
+labels = false
+platform = "linux/amd64"
+julia = "1.12.7"
+base_image = "sha256:08d6facb6a72f918beb3ffe5b57cff72402a203f44428831262e95c7466d4188"
+
+[accelerators.cuda]
+provider = "Reactant_jll"
+version = "13.1"
+
+[packages]
+Reactant = "0.2.287"
+ReactantCore = "0.1.23"
+Reactant_jll = "0.0.410+0"
+Enzyme = "0.13.205"
+EnzymeCore = "0.8.21"
+Enzyme_jll = "0.0.294+0"
+LLVM = "9.13.2"
+LLVMExtra_jll = "0.0.47+0"
+GPUCompiler = "1.23.0"
+
+[server_packages]
+ReactantServer = "0.1.0"
+ReactantServerCore = "1.2.0"
+ReactantServerGateway = "0.1.0"
+ReactantServerNode = "0.1.0"

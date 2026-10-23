@@ -126,6 +126,10 @@ CUDA libraries, and the driver. The release image pins all of them except the ho
   [The container image](@ref).
 - Keep the host's NVIDIA driver fixed across the validated fleet, and treat a driver upgrade as a
   change to validate.
+- Before moving to a new release, read its page under [Container Releases](releases/index.md),
+  which lists what changed from the release before it. A release that changes Julia, the base
+  image, CUDA, or the compiler and runtime packages calls for revalidation; one that changes only
+  ReactantServer's own packages does not change the numerics stack.
 
 ## The regulated profile
 
