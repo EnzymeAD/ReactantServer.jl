@@ -238,21 +238,25 @@ _smallest_ge(sizes::Vector{Int}, n::Int) = (i = findfirst(>=(n), sizes); i === n
 function plan_batch(entry::ModelEntry, st::ModelSchedState; coalesce::Bool = true)
     isempty(st.queue) && return nothing
     front = st.queue[1]
+    # Size dispatches by the rows each request will occupy in the program, read from its preprocessed
+    # inputs (preprocess runs before a request is queued). A hook can change the row count (a long text
+    # split into several windows), and the client-facing count would then under- or overfill the batch.
+    rows(qr) = _executable_rows(entry, qr.prepared)
     execs = entry.executable.execs
 
     # Pick the variant from the front request and only ever coalesce requests sharing it: different
     # input shapes cannot be concatenated along the batch axis. An uncompiled shape dispatches alone
     # so run_model raises the precise "no compiled program for input shape" error for that caller.
     variant = _request_variant(entry, front.prepared)
-    haskey(execs, variant) || return (_request_rows(entry, front.req), QueuedRequest[front])
+    haskey(execs, variant) || return (rows(front), QueuedRequest[front])
     inner = execs[variant]
     sizes = sort!(collect(keys(inner)))
 
     if !coalesce || !_coalescable(entry) || haskey(inner, 0)
         key = haskey(inner, 0) ? 0 :
             (
-                _smallest_ge(sizes, _request_rows(entry, front.req)) === nothing ? maximum(sizes) :
-                _smallest_ge(sizes, _request_rows(entry, front.req))
+                _smallest_ge(sizes, rows(front)) === nothing ? maximum(sizes) :
+                _smallest_ge(sizes, rows(front))
             )
         return (key, QueuedRequest[front])
     end
@@ -268,7 +272,7 @@ function plan_batch(entry::ModelEntry, st::ModelSchedState; coalesce::Bool = tru
 
     cap = st.max_batch_size === nothing ? typemax(Int) : st.max_batch_size
     minB, maxB = minimum(sizes), maximum(sizes)
-    R = min(sum(_request_rows(entry, qr.req) for qr in prefix), cap)
+    R = min(sum(rows(qr) for qr in prefix), cap)
     # Largest compiled size that can be filled, else the smallest size for a partial fill.
     B = if R >= minB
         candidates = filter(<=(min(R, maxB)), sizes)
@@ -277,7 +281,7 @@ function plan_batch(entry::ModelEntry, st::ModelSchedState; coalesce::Bool = tru
         minB
     end
     # A single request may itself exceed B; grow B to the smallest size that fits it.
-    front_rows = _request_rows(entry, front.req)
+    front_rows = rows(front)
     if B < front_rows
         grown = _smallest_ge(sizes, front_rows)
         B = grown === nothing ? maxB : grown
@@ -286,7 +290,7 @@ function plan_batch(entry::ModelEntry, st::ModelSchedState; coalesce::Bool = tru
     taken = QueuedRequest[]
     acc = 0
     for qr in prefix
-        r = _request_rows(entry, qr.req)
+        r = rows(qr)
         # B may exceed the cap on the partial-fill and front-oversize paths; bound by both.
         acc + r > min(B, cap) && break
         push!(taken, qr)
