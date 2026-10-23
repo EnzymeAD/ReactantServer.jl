@@ -24,4 +24,11 @@ ReactantServerCore = {path = "../../ReactantServerCore"}
 ReactantServerExport = {path = ".."}
 
 [compat]
+HTTP = "2.11.0"
+Lux = "1.31.4"
+Random = "<0.0.1, 1"
+Reactant = "0.2.295"
+Test = "<0.0.1, 1"
+YAML = "0.4.17"
 gRPCClient = "1.1.0"
+gRPCServer = "0.1.1"
