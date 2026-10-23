@@ -99,7 +99,8 @@ all_clients(p::ClientPool) = [p.clients[u] for u in p.order]
 # connection: when a worker is caught mid-stall (TCP accepted but HTTP/2 not yet negotiated),
 # libcurl keeps the half-open connection pooled and every later request reuses (PIPEWAITs on) it
 # and hangs forever; only dropping the connection recovers it (the per-worker equivalent of a
-# process restart). Call this when a probe to the worker *hangs* (times out), not on a fast refuse.
+# process restart). Call this when a probe to the worker *hangs* (times out or hits its deadline),
+# not on a fast refuse.
 function reset_clients!(wc::WorkerClients)
     try
         gRPCClient.grpc_shutdown(wc.grpc)
@@ -141,33 +142,41 @@ invoke_compact(wc::WorkerClients, req::CompactMemoryRequest) = gRPCClient.grpc_s
 invoke_is_same_ipc_namespace(wc::WorkerClients, req::IsSameIPCNamespaceRequest) =
     gRPCClient.grpc_sync_request(wc.is_same_ns, req)
 
-# Returns the worker's ServerReadyResponse.ready, or false on any transport error.
+# A call that failed at its gRPC deadline: the connection stalled rather than refused. The probe
+# helpers below rethrow it so `_bounded` can reset the worker's connection (see there).
+_deadline_exceeded(e) =
+    e isa gRPCClient.gRPCServiceCallException && e.grpc_status == gRPCClient.GRPC_DEADLINE_EXCEEDED
+
+# Returns the worker's ServerReadyResponse.ready, or false on any other transport error.
 function probe_ready(wc::WorkerClients)
     try
         resp = gRPCClient.grpc_sync_request(wc.ready, ServerReadyRequest())
         return resp.ready
-    catch
+    catch e
+        _deadline_exceeded(e) && rethrow()
         return false
     end
 end
 
 # Poll the worker's ModelControlStatus (discipline, residency mode, per-model serving counters).
-# Returns the response, or `nothing` on any transport error.
+# Returns the response, or `nothing` on any other transport error.
 function fetch_control_status(wc::WorkerClients)
     try
         return gRPCClient.grpc_sync_request(wc.control_status, ModelControlStatusRequest())
-    catch
+    catch e
+        _deadline_exceeded(e) && rethrow()
         return nothing
     end
 end
 
 # Query the worker's ready models for discovery. Returns the names this worker reports READY, or
-# `nothing` on any transport error (so the caller can leave the worker's routes untouched).
+# `nothing` on any other transport error (so the caller can leave the worker's routes untouched).
 function discover_models(wc::WorkerClients)
     try
         resp = gRPCClient.grpc_sync_request(wc.repo_index, RepositoryIndexRequest(; ready = true))
         return String[m.name for m in resp.models if m.state == "READY"]
-    catch
+    catch e
+        _deadline_exceeded(e) && rethrow()
         return nothing
     end
 end
