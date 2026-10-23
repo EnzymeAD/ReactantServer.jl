@@ -50,6 +50,7 @@ cannot trace JIT graphs.
 """
 module ReactantServerExportPythonCallExt
 
+using BFloat16s: BFloat16
 using PythonCall
 import ReactantServerExport
 import ReactantServerExport: export_bundle, _pyimports,
@@ -272,9 +273,11 @@ function _pyimports_torchscript()
 end
 
 # Julia dtype <-> numpy dtype name. The set is exactly what ReactantServerExport.DTYPE_TOKENS
-# covers today; extend both together when adding bf16/f8/etc.
+# covers today; extend both together when adding f8/etc. "bfloat16" is the ml_dtypes name numpy
+# reports for a JAX bf16 array.
 const JULIA_TO_NUMPY = Dict{DataType, String}(
     Float16 => "float16", Float32 => "float32", Float64 => "float64",
+    BFloat16 => "bfloat16",
     Int8 => "int8", Int16 => "int16", Int32 => "int32", Int64 => "int64",
     UInt8 => "uint8", UInt16 => "uint16", UInt32 => "uint32", UInt64 => "uint64",
     Bool => "bool",

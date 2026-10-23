@@ -15,6 +15,7 @@ enables it.
 """
 module ReactantServerExport
 
+using BFloat16s: BFloat16
 using Reactant
 using SafeTensors
 using YAML
@@ -117,10 +118,12 @@ _reactant_base_provenance() = Dict{String, Any}(
 # Bundle writer (the former BundleWriter)
 # ============================================================================
 
-# Manifest dtype tokens, mirroring the server's dtypes. bf16 and the f8 types are intentionally
-# omitted here until a frontend needs them (they require extra deps).
+# Manifest dtype tokens, mirroring the server's dtypes. The f8 types are intentionally omitted
+# until a frontend needs them (they require extra deps). bf16 is here for checkpoints whose weights
+# ship in bf16 and are stored that way, so the bundle keeps the checkpoint's exact values at half
+# the f32 footprint.
 const DTYPE_TOKENS = Dict{DataType, String}(
-    Float16 => "f16", Float32 => "f32", Float64 => "f64",
+    Float16 => "f16", Float32 => "f32", Float64 => "f64", BFloat16 => "bf16",
     Int8 => "i8", Int16 => "i16", Int32 => "i32", Int64 => "i64",
     UInt8 => "u8", UInt16 => "u16", UInt32 => "u32", UInt64 => "u64",
     Bool => "bool",

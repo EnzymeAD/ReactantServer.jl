@@ -4,6 +4,7 @@ version = "1.2.0"
 authors = ["Carroll Vance <cvance@medicalmetrics.com>"]
 
 [deps]
+BFloat16s = "ab4f0b2a-ad5b-11e8-123f-65d77653426b"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
@@ -17,6 +18,7 @@ PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
 ReactantServerExportPythonCallExt = "PythonCall"
 
 [compat]
+BFloat16s = "0.6.1"
 Dates = "1"
 JSON3 = "1.14.3"
 PythonCall = "0.9"
