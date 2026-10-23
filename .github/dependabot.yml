@@ -1,0 +1,36 @@
+# Dependabot keeps the workflow actions and the Julia [compat] bounds current.
+#
+# Julia: Dependabot opens a PR only when a new release falls outside a [compat] bound, and it
+# widens the bound rather than raising the floor. It does not touch deploy/Manifest.toml, the
+# Bazel-built image lock, so a compat change on a workspace member fails
+# //deploy:manifest_current until the PR is relocked (`bazel run //deploy:relock`, see
+# CONTRIBUTING.md). Examples are left out: they path-source this tree and track it.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "julia"
+    directories:
+      - "/"
+      - "/packages/ReactantServerCore"
+      - "/packages/ReactantServer"
+      - "/packages/ReactantServerGateway"
+      - "/packages/ReactantServerClient"
+      - "/packages/ReactantServerNode"
+      - "/packages/ReactantServerExport"
+      - "/packages/ReactantServerExport/test"
+      - "/integration"
+      - "/docs"
+    schedule:
+      interval: "weekly"
+    groups:
+      julia:
+        patterns:
+          - "*"
