@@ -94,7 +94,7 @@ function export_splade(; name = "splade")
         batch_sizes = BATCH_SIZES,
         matmul_precision = "highest",
         client_inputs = [
-            IOSpec("texts", UInt8, [1, -1]; batch_axis = 0, letters = ['c']),
+            IOSpec("texts", UInt8, [-1, 1]; batch_axis = 1, letters = ['c']),
             IOSpec("text_lens", Int32, [1]; batch_axis = 0),
         ],
         client_outputs = [
@@ -133,11 +133,11 @@ function export_embedding(; name = "embedding")
         batch_sizes = BATCH_SIZES,
         matmul_precision = "highest",
         client_inputs = [
-            IOSpec("texts", UInt8, [1, -1]; batch_axis = 0, letters = ['c']),
+            IOSpec("texts", UInt8, [-1, 1]; batch_axis = 1, letters = ['c']),
             IOSpec("text_lens", Int32, [1]; batch_axis = 0),
         ],
         client_outputs = [
-            IOSpec("embedding", Float32, [1, 384]; batch_axis = 0, letters = ['d']),
+            IOSpec("embedding", Float32, [384, 1]; batch_axis = 1, letters = ['d']),
         ],
         provenance = _prov(
             (
@@ -171,7 +171,7 @@ function export_cross(; name = "cross_encoder")
         matmul_precision = "highest",
         client_inputs = [
             IOSpec("query", UInt8, [-1]; letters = ['q']),
-            IOSpec("keys", UInt8, [1, -1]; batch_axis = 0, letters = ['c']),
+            IOSpec("keys", UInt8, [-1, 1]; batch_axis = 1, letters = ['c']),
             IOSpec("key_lens", Int32, [1]; batch_axis = 0),
         ],
         client_outputs = [
@@ -209,12 +209,12 @@ function export_sentiment(; name = "sentiment")
         batch_sizes = BATCH_SIZES,
         matmul_precision = "highest",
         client_inputs = [
-            IOSpec("texts", UInt8, [1, -1]; batch_axis = 0, letters = ['c']),
+            IOSpec("texts", UInt8, [-1, 1]; batch_axis = 1, letters = ['c']),
             IOSpec("text_lens", Int32, [1]; batch_axis = 0),
         ],
         client_outputs = [
-            IOSpec("logits", Float32, [1, 2]; batch_axis = 0, letters = ['c']),
-            IOSpec("probs", Float32, [1, 2]; batch_axis = 0, letters = ['c']),
+            IOSpec("logits", Float32, [2, 1]; batch_axis = 1, letters = ['c']),
+            IOSpec("probs", Float32, [2, 1]; batch_axis = 1, letters = ['c']),
             IOSpec("label_id", Int32, [1]; batch_axis = 0),
         ],
         provenance = _prov(

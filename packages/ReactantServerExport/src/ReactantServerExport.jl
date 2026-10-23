@@ -134,11 +134,16 @@ dtype_token(::Type{T}) where {T} =
 """
     IOSpec(name, dtype, shape; batch_axis=nothing, letters=nothing)
 
-A tensor's client-facing spec. `shape` is the network (row-major) shape with a concrete
-value at the batch axis; `batch_axis` is the 0-based network axis that carries the batch
-dimension, or `nothing`. The manifest serialization encodes the shape as an einsum-style
-letter string (`"chwn"`) plus a `dims` map of letter→size; the batch axis is emitted as
-`n`. Non-batch letters are auto-allocated from `_AXIS_LETTERS` and carry no semantic
+A tensor's spec. `shape` is the Julia (column-major) shape, the reverse of the row-major
+shape a KServe client sends, with a concrete value at the batch axis; `batch_axis` is the
+0-based Julia axis that carries the batch dimension, or `nothing`. By convention the batch
+axis is the last one: a client's `[batch, max_bytes]` wire tensor is
+`IOSpec(name, UInt8, [-1, 1]; batch_axis = 1)`. The server reads the batch count of each
+request at this axis, so a spec written in row-major order makes it count the wrong axis
+and breaks coalescing and request splitting.
+
+The manifest serialization encodes the shape as an einsum-style letter string (`"chwn"`)
+plus a `dims` map of letter→size; the batch axis is emitted as `n`. Non-batch letters are auto-allocated from `_AXIS_LETTERS` and carry no semantic
 meaning across tensors.
 
 `letters` optionally overrides that auto-allocation with explicit non-batch axis letters,

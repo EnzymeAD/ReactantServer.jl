@@ -172,8 +172,8 @@ and `:torchscript` calls fail with a message directing you to load it.
 `write_bundle` is the low-level writer: it takes the executable `IOSpec`s, the StableHLO modules
 (one per batch size, or text or serialized bytes), and an ordered `weights` collection whose order
 becomes the safetensors `argument_order`, and emits `manifest.yaml`, the `model[.b{N}].mlir` files,
-and `weights.safetensors`. An `IOSpec` names a tensor, its network (row-major) shape, its dtype,
-the 0-based `batch_axis`, and optional explicit `letters` for the non-batch axes (the reserved
+and `weights.safetensors`. An `IOSpec` names a tensor, its Julia (column-major) shape, its dtype,
+the 0-based `batch_axis` in that Julia shape (by convention the last axis), and optional explicit `letters` for the non-batch axes (the reserved
 markers `n`/`b` are rejected); a `-1` axis size encodes a variable axis. The bundle directory's
 basename must equal `name` (the identity rule above).
 
