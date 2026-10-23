@@ -895,6 +895,46 @@ end
     close(srv)
 end
 
+@testset "_bounded: a probe that hits its deadline counts as hung, a refuse does not" begin
+    # Since gRPCClient 1.1 a call on a stalled connection fails at its deadline instead of hanging
+    # past the watchdog. If only the watchdog counted as a hang, the poisoned connection would never
+    # be reset and every startup poll would fail the same way until the wait ran out (the intermittent
+    # integration failure: workers ready, gateway still "unreachable over the control plane").
+    srv = Sockets.listen(Sockets.localhost, 0)
+    port = Int(Sockets.getsockname(srv)[2])
+    acceptor = @async try
+        while isopen(srv)
+            Sockets.accept(srv)   # accept and hold; never respond
+        end
+    catch
+    end
+    workers(p) = begin
+        grpc = gRPCClient.gRPCCURL(; sticky = true)
+        ctl = GW.ControlService_ModelControlStatus_Client("127.0.0.1", p; grpc = grpc, deadline = 0.5)
+        GW.WorkerClients("127.0.0.1:$p", grpc, ctl, ctl, ctl, ctl, ctl, ctl, ctl, ctl)
+    end
+    poll(wc) = GW._bounded(() -> GW.fetch_control_status(wc), 3.0, nothing, "ModelControlStatus poll", wc.url; level = :debug)
+
+    stalled = workers(port)
+    t0 = time()
+    resp, hung = poll(stalled)
+    @test resp === nothing
+    @test hung                       # the deadline, well under the 3s watchdog, still reads as hung
+    @test time() - t0 < 3.0
+
+    closed = Sockets.listen(Sockets.localhost, 0)
+    refused_port = Int(Sockets.getsockname(closed)[2])
+    close(closed)                    # nothing listens: the connect is refused at once
+    refused = workers(refused_port)
+    resp, hung = poll(refused)
+    @test resp === nothing
+    @test !hung
+
+    gRPCClient.grpc_shutdown(stalled.grpc)
+    gRPCClient.grpc_shutdown(refused.grpc)
+    close(srv)
+end
+
 # --- Integration: mock workers serving inference + control ------------------------------------
 
 mutable struct AffMockWorker

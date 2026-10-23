@@ -30,22 +30,34 @@ const WEDGE_EXIT_ROUNDS = 3
 # suits the runtime prober (a worker that was ready and stops answering is a real event), while the
 # startup precondition wait passes `:debug` because timeouts there are the expected warmup window
 # (workers compiling before their control plane answers) and are already summarized by the caller.
+#
+# A call that fails at its own gRPC deadline also counts as timed out. Since gRPCClient 1.1 a call
+# on a stalled connection no longer hangs past the watchdog: the client's deadline watchdog fails it
+# at the deadline (5s for the probes, under this 8s ceiling). Treating only the watchdog as a hang
+# would then never reset the poisoned connection, and every later call would reuse it and fail the
+# same way. `f` must let a deadline error escape (see `_deadline_exceeded`); other errors are a
+# fast refuse and return `default` with timed_out false.
 function _bounded(f, secs, default, what::String, url::String; level::Symbol = :warn)
     t = @async f()
     if timedwait(() -> istaskdone(t), secs) !== :ok
-        msg = "health: $what timed out; treating as unavailable"
-        level === :debug ? (@debug msg worker = url timeout_s = secs) :
-            level === :info ? (@info msg worker = url timeout_s = secs) :
-            (@warn msg worker = url timeout_s = secs)
+        _log_hung("health: $what timed out; treating as unavailable", level, url, secs)
         return default, true
     end
-    v = try
-        fetch(t)
-    catch
-        default
+    try
+        return fetch(t), false
+    catch e
+        if _deadline_exceeded(e isa TaskFailedException ? e.task.exception : e)
+            _log_hung("health: $what hit its deadline; treating as unavailable", level, url, secs)
+            return default, true
+        end
+        return default, false
     end
-    return v, false
 end
+
+_log_hung(msg, level, url, secs) =
+    level === :debug ? (@debug msg worker = url timeout_s = secs) :
+    level === :info ? (@info msg worker = url timeout_s = secs) :
+    (@warn msg worker = url timeout_s = secs)
 
 mutable struct HealthProber
     pool::ClientPool
