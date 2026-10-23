@@ -52,6 +52,12 @@ let src = joinpath(@__DIR__, "..", "integration", "tutorials")
     end
 end
 
+# The container release pages are rendered from the records under docs/releases/ into
+# docs/src/releases/ (gitignored): an overview, then one page per release, newest first. See
+# docs/releases.jl for the records and how a release is added.
+include("releases.jl")
+const RELEASE_PAGES = ContainerReleases.render()
+
 makedocs(;
     sitename = "ReactantServer.jl",
     modules = [
@@ -119,6 +125,7 @@ makedocs(;
         ],
         "Running in Production" => [
             "Deployment" => "deployment.md",
+            "Container Releases" => RELEASE_PAGES,
             "Node Configuration" => "node_config.md",
             "Multi-GPU Gateway" => "gateway.md",
             "Reproducibility & Regulated Use" => "reproducibility.md",

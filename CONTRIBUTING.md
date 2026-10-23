@@ -181,6 +181,19 @@ bazel run //deploy:image_load
 bazel run //deploy:image_check
 ```
 
+The docs' Container Releases pages record what each release's image ships, rendered from
+`docs/releases/`. After the image for a release is published, record it from the repository root
+and commit the file it writes:
+
+```
+julia docs/releases.jl record X.Y.Z
+```
+
+This reads the tag's `deploy/Manifest.toml` and `MODULE.bazel` and the image digest from the
+registry. When the release is the first to use a new Julia, base image, or Reactant_jll version,
+also describe that component in `docs/releases/components.toml`; the docs build fails, naming the
+missing entry, until it is there.
+
 The image is published to the GitHub Container Registry as `ghcr.io/enzymead/reactantserver`,
 tagged with each ReactantServer release and with signed build provenance, by
 `.github/workflows/image.yml`, which the release's TagBot tag starts; see

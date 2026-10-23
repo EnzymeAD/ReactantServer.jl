@@ -96,7 +96,8 @@ gh attestation verify oci://ghcr.io/enzymead/reactantserver:latest --repo Enzyme
 Pin a deployment to a release tag such as `:0.1.0`, or by digest
 (`ghcr.io/enzymead/reactantserver@sha256:...`) for an image that can never change, rather than
 `:latest`, which moves with every release; `deploy/README.md` describes how the image is published
-and attested.
+and attested. [Container Releases](releases/index.md) lists what each release ships (Julia,
+Reactant, CUDA) and the driver it requires.
 
 Every model compiles on every worker before the gRPC port accepts traffic, so the first start
 is slow; later starts load the compiled programs from each bundle's cache
