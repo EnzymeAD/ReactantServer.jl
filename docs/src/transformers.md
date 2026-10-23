@@ -114,7 +114,10 @@ the embedding `postprocess` is a passthrough.
 Because `model.jl` reshapes the wire I/O, the manifest declares `client_inputs`/`client_outputs`
 (what the caller sends and receives) distinct from `executable_inputs`/`executable_outputs` (the
 token tensors and raw logits the traced program sees). The export driver states this with
-`IOSpec`s passed to `export_bundle(:pytorch, ...)`; for example the sentiment bundle:
+`IOSpec`s passed to `export_bundle(:pytorch, ...)`. Their shapes are in Julia (column-major)
+order with the batch axis last, the reverse of the wire shapes in the table below: `texts` is
+`[-1, 1]` with `batch_axis=1`, the Julia `(max_bytes, batch)` matrix `model.jl` reads. For
+example the sentiment bundle:
 
 ```julia
 export_bundle(:pytorch, model, (input_ids, attention_mask);
@@ -125,12 +128,12 @@ export_bundle(:pytorch, model, (input_ids, attention_mask);
     batch_sizes = [1, 8],
     matmul_precision = "highest",
     client_inputs = [
-        IOSpec("texts", UInt8, [1, -1]; batch_axis=0, letters=['c']),
+        IOSpec("texts", UInt8, [-1, 1]; batch_axis=1, letters=['c']),
         IOSpec("text_lens", Int32, [1]; batch_axis=0),
     ],
     client_outputs = [
-        IOSpec("logits", Float32, [1, 2]; batch_axis=0, letters=['c']),
-        IOSpec("probs", Float32, [1, 2]; batch_axis=0, letters=['c']),
+        IOSpec("logits", Float32, [2, 1]; batch_axis=1, letters=['c']),
+        IOSpec("probs", Float32, [2, 1]; batch_axis=1, letters=['c']),
         IOSpec("label_id", Int32, [1]; batch_axis=0),
     ],
     provenance = _prov(...))
