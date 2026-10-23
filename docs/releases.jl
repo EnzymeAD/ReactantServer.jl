@@ -70,7 +70,7 @@ module ContainerReleases
             ],
             summary = a -> "CUDA $(a["cuda"]), driver $(a["min_driver"]) or newer",
             digests = a -> [
-                "CUDA artifact (Reactant_jll tree hash)" => code(a["artifact"]),
+                "CUDA artifact (`Reactant_jll` tree hash)" => code(a["artifact"]),
                 "CUDA artifact built from Reactant.jl" => code(a["source_commit"]),
             ],
         ),

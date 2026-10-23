@@ -20,10 +20,10 @@ bundles for it and what it requires of the host. Released images support CUDA on
 
 ### CUDA
 
-The CUDA that runs a model comes from Reactant_jll, not from the base image. The image ships the
-Reactant_jll artifact selected for `REACTANT_GPU=cuda` and the release's `REACTANT_GPU_VERSION`,
-which carries `ptxas`, `fatbinary`, `libdevice` and `libnccl.so.2`, and links cuDNN, cuBLAS and
-cuBLASLt, and NVSHMEM into `libReactantExtra.so`. A release page's CUDA rows are the versions that
+The CUDA that runs a model comes from `Reactant_jll`, not from the base image. The image ships the
+`Reactant_jll` artifact selected for `REACTANT_GPU=cuda` and the release's `REACTANT_GPU_VERSION`,
+which carries `ptxas`, `fatbinary`, `libdevice` and `libnccl.so.2` and links cuDNN, cuBLAS,
+cuBLASLt and NVSHMEM into `libReactantExtra.so`. A release page's CUDA rows are the versions that
 artifact was built against. Reactant loads `libnvJitLink.so.13`, `libnvrtc.so.13` and `libcupti.so`
 at run time, and those come from the base image's CUDA. The base also carries its own cuDNN and
 cuBLAS packages, which Reactant does not load.
@@ -32,5 +32,5 @@ cuBLAS packages, which Reactant does not load.
 checks when the container starts, so the host driver must support the base image's CUDA release.
 The toolkit itself is required as described in [Deployment](../deployment.md).
 
-**GPU.** The minimum compute capability is the oldest target the Reactant_jll artifact is built
+**GPU.** The minimum compute capability is the oldest target the `Reactant_jll` artifact is built
 for.
