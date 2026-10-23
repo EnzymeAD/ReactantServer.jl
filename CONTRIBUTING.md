@@ -190,9 +190,9 @@ julia docs/releases.jl record X.Y.Z
 ```
 
 This reads the tag's `deploy/Manifest.toml` and `MODULE.bazel` and the image digest from the
-registry. When the release is the first to use a new Julia, base image, or Reactant_jll version,
-also describe that component in `docs/releases/components.toml`; the docs build fails, naming the
-missing entry, until it is there.
+registry. When the release is the first to use a new Julia, base image, or accelerator provider
+version (for CUDA, a new Reactant_jll), also describe that component in
+`docs/releases/components.toml`; the docs build fails, naming the missing entry, until it is there.
 
 The image is published to the GitHub Container Registry as `ghcr.io/enzymead/reactantserver`,
 tagged with each ReactantServer release and with signed build provenance, by

@@ -13,7 +13,12 @@ consecutive releases often share them. **Changes from previous** names what move
 changes only ReactantServer's own packages keeps the numerics stack; any other change is a change to
 revalidate (see [Reproducibility & Regulated Use](../reproducibility.md)).
 
-## Where CUDA comes from
+## Accelerators
+
+Each release page has a section for every accelerator its image supports, listing what the image
+bundles for it and what it requires of the host. Released images support CUDA only.
+
+### CUDA
 
 The CUDA that runs a model comes from Reactant_jll, not from the base image. The image ships the
 Reactant_jll artifact selected for `REACTANT_GPU=cuda` and the release's `REACTANT_GPU_VERSION`,
@@ -22,8 +27,6 @@ cuBLASLt, and NVSHMEM into `libReactantExtra.so`. A release page's CUDA rows are
 artifact was built against. Reactant loads `libnvJitLink.so.13`, `libnvrtc.so.13` and `libcupti.so`
 at run time, and those come from the base image's CUDA. The base also carries its own cuDNN and
 cuBLAS packages, which Reactant does not load.
-
-## Requirements
 
 **NVIDIA driver.** The base image sets `NVIDIA_REQUIRE_CUDA`, which the NVIDIA Container Toolkit
 checks when the container starts, so the host driver must support the base image's CUDA release.
