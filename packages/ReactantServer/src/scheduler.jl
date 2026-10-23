@@ -173,18 +173,6 @@ priority(share::Float64, normalized_ema::Float64, cap::Float64, eff_cost::Float6
 # Batch contribution and coalescing plan
 # ---------------------------------------------------------------------------------------------
 
-# Rows a request contributes along its batch axis, read from the client-facing input spec
-# (what the caller sent). Models with no batch axis contribute a single row.
-function _request_rows(entry::ModelEntry, req::InferRequest)
-    for sp in client_input_spec(entry.manifest)
-        sp.batch_axis === nothing && continue
-        for t in req.inputs
-            t.name == sp.name && return size(t.data, sp.batch_axis)
-        end
-    end
-    return 1
-end
-
 # Rows present along the executable batch axis after preprocessing. Used to size output slices.
 # Each executable input carries its OWN batch axis (per-input, batch-last), so read the count at
 # each matched input's own `sp.batch_axis` rather than one shared position. The batch size comes
@@ -1362,10 +1350,12 @@ function infer(s::Scheduler, req::InferRequest; committed::Bool = false)
     # A request larger than the largest compiled batch is split into pieces the model can run and
     # the pieces' outputs are joined back, so a client that batches 32 against a bundle compiled for
     # `[1]` gets an answer rather than an INTERNAL error. The inverse of coalescing: the same batch
-    # axes, the same slicing, run in the other direction.
+    # axes, the same slicing, run in the other direction. The split cuts the preprocessed inputs and
+    # postprocess sees the joined outputs once, so a hook that changes the row count (one long text
+    # into several windows) splits like any other request.
     maxB = _max_compiled_rows(entry, prepared)
     rows = _executable_rows(entry, prepared)
-    if maxB !== nothing && rows > maxB && _splittable(entry, req, prepared, rows)
+    if maxB !== nothing && rows > maxB
         return _infer_split(s, entry, req, prepared, rows, maxB; committed)
     end
     qr = QueuedRequest(req, prepared; committed = committed)
@@ -1381,6 +1371,8 @@ end
 #
 # The largest compiled batch for this request's shape variant, or `nothing` when the variant is
 # uncompiled (then the ordinary path raises the precise error) or the model is unbatched (key 0).
+# Only a coalescable model splits: every executable output then carries a batch axis, so the join
+# has an axis to join along rather than silently taking an unbatched output from the first piece.
 function _max_compiled_rows(entry::ModelEntry, prepared::Vector{NamedTensor})
     _coalescable(entry) || return nothing
     execs = entry.executable.execs
@@ -1390,17 +1382,6 @@ function _max_compiled_rows(entry::ModelEntry, prepared::Vector{NamedTensor})
     haskey(inner, 0) && return nothing
     isempty(inner) && return nothing
     return maximum(keys(inner))
-end
-
-# Splitting is only sound when the preprocess hook kept one client row per executable row: then a
-# slice of the client inputs preprocesses to the same slice of the prepared inputs, and the outputs
-# can be joined along the executable output batch axes in order. A hook that changes the row count
-# (crops per image, say) has no such correspondence, and that request runs whole as before.
-function _splittable(entry::ModelEntry, req::InferRequest, prepared::Vector{NamedTensor}, rows::Int)
-    _request_rows(entry, req) == rows || return false
-    # Every executable output must carry a batch axis, or a join has nothing to join along; an
-    # output without one would silently be taken from the first piece.
-    return all(sp -> sp.batch_axis !== nothing, entry.manifest.executable_outputs)
 end
 
 # `[1:B, B+1:2B, ...]` covering `rows`, each piece at most `maxB` rows.
