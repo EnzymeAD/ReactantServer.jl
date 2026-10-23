@@ -31,4 +31,8 @@ ReactantServerGateway = {path = "../packages/ReactantServerGateway"}
 ReactantServerNode = {path = "../packages/ReactantServerNode"}
 
 [compat]
+Downloads = "1"
+Lux = "1"
+Random = "1"
+Test = "1"
 julia = "1.12"
