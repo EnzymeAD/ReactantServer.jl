@@ -135,7 +135,6 @@ end
     prepared = req.inputs
     @test ReactantServer._max_compiled_rows(e, prepared) == 4
     @test ReactantServer._executable_rows(e, prepared) == 10
-    @test ReactantServer._splittable(e, req, prepared, 10)
     @test ReactantServer._split_ranges(10, 4) == [1:4, 5:8, 9:10]
     @test ReactantServer._split_ranges(4, 4) == [1:4]
     pieces = [
@@ -148,10 +147,42 @@ end
     outs = [NamedTensor[NamedTensor("y", only(pc).data .* 2)] for pc in pieces]
     joined = ReactantServer._join_outputs(e, outs)
     @test only(joined).data == x.data .* 2
-    # Unbatched (key 0) and uncompiled variants are never split; a row-changing preprocess is not either.
+    # Unbatched (key 0) and uncompiled variants are never split.
     e0 = _sched_entry("u", [0]; coalescable = true)
     @test ReactantServer._max_compiled_rows(e0, prepared) === nothing
-    @test !ReactantServer._splittable(e, req, [NamedTensor("x", zeros(Float32, 2, 3))], 3)
+end
+
+@testset "a preprocess that changes the row count still splits an oversize request" begin
+    # One client row becomes two executable rows (a text cut into two windows, say). Three client
+    # rows are six executable rows against a bundle compiled for [1, 4]: before the split read the
+    # preprocessed rows it refused (3 != 6), dispatched all six whole, and found no program for 6.
+    backend = MockBackend()
+    pool = MemoryPool(backend, MockClient(), MockDevice(0), "mock", nothing)
+    reg = ModelRegistry()
+    sizes_run = Int[]
+    run_lock = ReentrantLock()
+    double(args) = (lock(() -> push!(sizes_run, size(args[1], 2)), run_lock); [args[1] .* 2])
+    sig = ModelSignature(["x"], DataType[Float32], String[], 1, ["y"], DataType[Float32], 1)
+    execs = Dict{Int, Any}(1 => ReactantServer.MockExecutable(double, 1), 4 => ReactantServer.MockExecutable(double, 1))
+    pre(inputs) = [NamedTensor("x", repeat(inputs[1].data; inner = (1, 2)))]
+    post(outputs) = (y = outputs[1].data; [NamedTensor("y", y[:, 1:2:end] .+ y[:, 2:2:end])])
+    reg.by_name["w"] = ModelEntry(
+        "w", _sched_batched_manifest("w"), Dict{Int, Vector{UInt8}}(), "", nothing,
+        LoadedModel(sig, execs, Any[]), nothing, pre, post
+    )
+    s = Scheduler(reg, backend, pool, SchedulerConfig(30.0, 64, 30.0))
+    ReactantServer.start!(s)
+    lock(() -> empty!(sizes_run), run_lock)    # start! warms each compiled size; count only the request
+    try
+        x = reshape(Float32.(1:6), 2, 3)
+        out = ReactantServer.infer(s, InferRequest("w", ["y"], [NamedTensor("x", x)], Int64(0)))
+        # Each window doubles, and postprocess sums a row's two windows back together: 4x.
+        @test only(out).data == x .* 4
+        # The six rows ran as a full b4 piece and a two-row piece padded to b4; no b6 was asked for.
+        @test sort(sizes_run) == [4, 4]
+    finally
+        ReactantServer.shutdown!(s)
+    end
 end
 
 @testset "plan_batch respects per-model max_batch_size" begin
