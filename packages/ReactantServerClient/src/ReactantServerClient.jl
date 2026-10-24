@@ -9,7 +9,6 @@ module ReactantServerClient
 
 using Base.Threads
 using ProtoBuf
-using ResumableFunctions
 using InterProcessCommunication
 using FixedSizeArrays
 using gRPCClient

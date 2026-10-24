@@ -2,9 +2,7 @@
 # its reverse) is shared from ReactantServerCore; only the batch iterator lives here.
 
 # For batched inference: yield successive UnitRanges of at most `max_batch_size` items covering
-# 1:n. A plain iterator rather than a ResumableFunctions @resumable coroutine: the behavior is a
-# handful of lines and the generated-function machinery @resumable relies on is fragile across
-# Julia versions (it mis-dispatches on Julia 1.12), while this is stable and allocation-free.
+# 1:n. Allocation-free.
 struct BatchIterator
     n::Int
     max_batch_size::Int
