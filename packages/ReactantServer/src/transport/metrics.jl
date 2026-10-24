@@ -40,6 +40,8 @@ Prometheus.metric_names(::WorkerSnapshotCollector) = (
     "worker_weight_cache_max_scratch_bytes", "worker_weight_pool_bytes",
     "worker_weight_loads_total", "worker_weight_evicts_total",
     "worker_weight_load_seconds_total", "worker_weight_load_bytes_total",
+    "worker_weight_compactions_total", "worker_weight_fallback_compactions_total",
+    "worker_weight_admission_failures_total",
     "worker_model_scratch_bytes", "worker_model_load_seconds",
     "worker_device_memory_in_use_bytes",
     "worker_device_memory_limit_bytes", "worker_device_memory_free_bytes",
@@ -200,6 +202,16 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
                 "worker_weight_load_bytes_total", "counter",
                 "Weight bytes transferred by on-demand loads (over load seconds: the host-to-device bandwidth).",
                 wc.load_bytes
+            ),
+            _scalar("worker_weight_compactions_total", "counter", "Memory compactions, from any trigger.", wc.compactions),
+            _scalar(
+                "worker_weight_fallback_compactions_total", "counter",
+                "Compactions admission ran because evicting alone could not make a model fit.",
+                wc.fallback_compactions
+            ),
+            _scalar(
+                "worker_weight_admission_failures_total", "counter",
+                "Models that could not be placed on the device even after compacting.", wc.admission_failures
             ),
         )
         # Per-model footprint, for the models measured or loaded so far.

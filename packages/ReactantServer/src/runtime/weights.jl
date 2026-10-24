@@ -23,12 +23,26 @@ end
 
 function load_pinned_weights(backend::AbstractBackend, pool::MemoryPool, st, names::Vector{String})
     bufs = Vector{Any}(undef, length(names))
-    for (i, name) in enumerate(names)
-        haskey(st, name) || throw(ErrorException("weight '$name' missing from safetensors"))
-        host = collect(st[name])                 # materialize the lazy mmap view to a contiguous Array
-        bufs[i] = to_device(backend, pool.client, host, pool.device)
+    try
+        for (i, name) in enumerate(names)
+            haskey(st, name) || throw(ErrorException("weight '$name' missing from safetensors"))
+            host = collect(st[name])                 # materialize the lazy mmap view to a contiguous Array
+            bufs[i] = to_device(backend, pool.client, host, pool.device)
+        end
+    catch
+        _free_partial!(backend, bufs)
+        rethrow()
     end
     return bufs
+end
+
+# Free the buffers a failed multi-tensor upload had already created, so an allocation failure
+# midway (the likely one: out of device memory) does not strand them until GC.
+function _free_partial!(backend::AbstractBackend, bufs::Vector{Any})
+    for i in eachindex(bufs)
+        isassigned(bufs, i) && free_buffer!(backend, bufs[i])
+    end
+    return nothing
 end
 
 """
@@ -104,8 +118,13 @@ cost paid on an on-demand load when weights are pinned in host RAM.
 """
 function transfer_to_device(backend::AbstractBackend, pool::MemoryPool, hosts::Vector{Any})
     bufs = Vector{Any}(undef, length(hosts))
-    for (i, h) in enumerate(hosts)
-        bufs[i] = to_device(backend, pool.client, h, pool.device)
+    try
+        for (i, h) in enumerate(hosts)
+            bufs[i] = to_device(backend, pool.client, h, pool.device)
+        end
+    catch
+        _free_partial!(backend, bufs)
+        rethrow()
     end
     return bufs
 end

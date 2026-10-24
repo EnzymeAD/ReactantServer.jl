@@ -36,7 +36,7 @@ features:
     link: /bundles/
   - icon: 💾
     title: On-demand weights
-    details: Weights stay in host RAM and stream to the GPU under an LRU byte budget, so a card serves more models than fit in VRAM.
+    details: Weights stay in host RAM and stream to the GPU under a byte budget with cost-aware eviction, so a card serves more models than fit in VRAM.
     link: /on_demand_weights/
   - icon: 🔀
     title: A coalescing scheduler
@@ -89,7 +89,7 @@ endpoint.
   frontends.
 - [Node Configuration](node_config.md): the one typed YAML file that describes a machine.
 - [Scheduling](scheduling.md): the cost-aware worker scheduler and batch coalescing.
-- [On-demand Weights](on_demand_weights.md): host-RAM weights and the LRU byte budget.
+- [On-demand Weights](on_demand_weights.md): host-RAM weights, the byte budget, and fragmentation-aware admission.
 - [Multi-GPU Gateway](gateway.md): the reverse proxy and its scheduling modes.
 - [Client Usage](client.md): the Reactant-free client and its shared-memory transport.
 - [Meta Models](meta_models.md) (experimental): chaining models with data-dependent Julia between

@@ -248,7 +248,7 @@ end
     @test cfg.first_rebalance_compute_seconds == 60.0
     @test cfg.hysteresis == 0.0
     @test cfg.ema_halflife_compute_seconds == 0.0
-    @test cfg.compaction_mode == :eager
+    @test cfg.compaction_mode == :on_demand
     @test cfg.compaction_interval == 1
     @test cfg.forbid_memory_oversubscription == true
     # 0 resolves to the rebalance interval (~50% decay per rebalance); a set value is honored.
@@ -330,6 +330,12 @@ end
     s_off = GW.LptPackingState(mk(:off, 2))
     GW._maybe_compact_fleet!(s_off, GW.ClientPool(mk(:off, 2)), nothing, moved)
     @test s_off.repacks_since_compact == 0
+
+    # mode :on_demand (the default) leaves compaction to each worker's admission: no fan-out.
+    s_od = GW.LptPackingState(mk(:on_demand, 1))
+    GW._maybe_compact_fleet!(s_od, GW.ClientPool(mk(:on_demand, 1)), nothing, moved)
+    @test s_od.repacks_since_compact == 0
+    @test GW._parse_gateway_compaction_mode("on_demand") == :on_demand
 end
 
 # Build a packing state directly for routing unit tests. Defaults to a single two-replica model
