@@ -40,6 +40,8 @@ ReactantServer.set_residency!
 ReactantServer.control_status
 ReactantServer.compact!
 ReactantServer.acquire!
+ReactantServer.admit_weights!
+ReactantServer.AdmissionError
 ReactantServer.NotResidentError
 ReactantServer.RunningServer
 ReactantServer.weight_budget
