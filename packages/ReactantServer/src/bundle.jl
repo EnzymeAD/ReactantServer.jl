@@ -1,8 +1,8 @@
 # Discovery and loading of model bundles from the configured model directories.
 #
-# A bundle is a directory containing manifest.yaml, model.mlir, weights.safetensors, and
-# an optional model.jl. This module turns each into a registered ModelEntry. The runtime
-# compiles the StableHLO and fills the executable slot afterwards.
+# A bundle is a directory containing manifest.yaml, model.mlir, weights.safetensors (or the file the
+# manifest's `weights_file` names), and an optional model.jl. This module turns each into a
+# registered ModelEntry. The runtime compiles the StableHLO and fills the executable slot afterwards.
 
 struct BundleError <: Exception
     msg::String
@@ -93,7 +93,8 @@ function _discover_modules(dir::AbstractString, m::Manifest; batch_sizes::BatchS
 end
 
 """
-    load_bundle_entry(dir; validator=NullSignatureValidator(), batch_sizes=BATCH_SIZES_ALL) -> ModelEntry
+    load_bundle_entry(dir; validator=NullSignatureValidator(), batch_sizes=BATCH_SIZES_ALL,
+                      weights_migration=MIGRATE_OFF) -> ModelEntry
 
 Parse and validate the bundle directory `dir` into an uncompiled `ModelEntry` (its `executable`
 and `sched` slots are `nothing`). The model's name is the directory's basename: renaming the
@@ -101,12 +102,16 @@ directory renames the model. A `name` declared in the manifest is informational 
 directory name is injected before parsing so every downstream consumer, including error messages
 and the metadata RPC, agrees on the served name). Used by both `load_bundles` and the directory
 watcher (see watcher.jl) to load a single bundle. `batch_sizes` selects which compiled batch
-sizes are read (see [`BatchSizeMode`](@ref)).
+sizes are read (see [`BatchSizeMode`](@ref)). `weights_migration` converts a legacy-order weights
+file first (see [`migrate_bundle_weights!`](@ref)); a failed migration is logged and the bundle
+loads as it was.
 """
 function load_bundle_entry(
         dir::AbstractString; validator::SignatureValidator = NullSignatureValidator(),
-        batch_sizes::BatchSizeMode = BATCH_SIZES_ALL
+        batch_sizes::BatchSizeMode = BATCH_SIZES_ALL,
+        weights_migration::WeightsMigration = MIGRATE_OFF
     )
+    migrate_bundle_weights!(dir, weights_migration)
     manifest_path = joinpath(dir, "manifest.yaml")
     raw = YAML.load_file(manifest_path; dicttype = Dict{String, Any})
     raw isa AbstractDict || throw(BundleError("manifest in $dir is not a mapping"))
@@ -126,8 +131,8 @@ function load_bundle_entry(
 
     mlir_bytes = _discover_modules(dir, m; batch_sizes)
 
-    weights_path = joinpath(dir, "weights.safetensors")
-    isfile(weights_path) || throw(BundleError("bundle '$(m.name)' missing weights.safetensors"))
+    weights_path = resolve_weights_path(dir, m)
+    isfile(weights_path) || throw(BundleError("bundle '$(m.name)' missing $(basename(weights_path))"))
 
     # Every variant/batch module shares one signature; validate against any one of them.
     validate_against_signature(validator, m, first(values(first(values(mlir_bytes)))))
@@ -148,9 +153,9 @@ end
 
 function _load_one_bundle!(
         reg::ModelRegistry, dir::AbstractString, validator::SignatureValidator,
-        batch_sizes::BatchSizeMode
+        batch_sizes::BatchSizeMode, weights_migration::WeightsMigration = MIGRATE_OFF
     )
-    entry = load_bundle_entry(dir; validator, batch_sizes)
+    entry = load_bundle_entry(dir; validator, batch_sizes, weights_migration)
     (haskey(reg.by_name, entry.name) || haskey(reg.meta, entry.name)) &&
         throw(BundleError("duplicate model name '$(entry.name)'"))
     if entry isa MetaEntry
@@ -170,13 +175,15 @@ validate it, and register it. The runtime fills each entry's executable slot aft
 When `include` is a non-empty collection of model names, only bundles whose directory name
 is in the set are loaded. The directory name IS the model name (see `load_bundle_entry`), so
 filtering by directory avoids parsing skipped manifests. Names in `include` that are not found
-in any model dir produce a warning. `batch_sizes` is passed to every [`load_bundle_entry`](@ref).
+in any model dir produce a warning. `batch_sizes` and `weights_migration` are passed to every
+[`load_bundle_entry`](@ref).
 """
 function load_bundles(
         model_dirs::AbstractVector{<:AbstractString};
         validator::SignatureValidator = NullSignatureValidator(),
         include = nothing,
-        batch_sizes::BatchSizeMode = BATCH_SIZES_ALL
+        batch_sizes::BatchSizeMode = BATCH_SIZES_ALL,
+        weights_migration::WeightsMigration = MIGRATE_OFF
     )
     want = include === nothing ? nothing : Set{String}(String(x) for x in include)
     reg = ModelRegistry()
@@ -190,7 +197,7 @@ function load_bundles(
             if want !== nothing && !(name in want)
                 continue
             end
-            _load_one_bundle!(reg, child, validator, batch_sizes)
+            _load_one_bundle!(reg, child, validator, batch_sizes, weights_migration)
             push!(found, name)
         end
     end

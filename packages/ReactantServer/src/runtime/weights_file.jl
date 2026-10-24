@@ -11,9 +11,16 @@
 # renamed over the old one) keeps reading the version that was loaded, consistent with the compiled
 # programs and with `entry.weights_id`, until the watcher reloads the model.
 #
-# Tensors come back exactly as SafeTensors.jl returns them: a Julia array of the header's `shape`,
-# rearranged from the file's row-major order (SafeTensors views the bytes reshaped to the reversed
-# shape and permutes the dimensions back; `read_weight` materializes the same array).
+# Two layouts, told apart by the file's own metadata (never by the manifest or the file name):
+#
+# - legacy (no `axis_order` key): each header `shape` is the Julia shape and the data is that array
+#   permuted to row-major, as SafeTensors.jl writes it. Reading permutes it back, which costs a
+#   second full copy of every tensor.
+# - `axis_order: xla`: each header `shape` is the StableHLO program's shape and the data is row-major
+#   in it, which is byte for byte the Julia array of the reversed shape. Reading is one pread into
+#   the destination. (This is also how numpy and PyTorch read the file.)
+#
+# Either way a tensor comes back as the same Julia array, the one the executable takes.
 
 ENDIAN_BOM == 0x04030201 || error("ReactantServer reads safetensors (little-endian) only on little-endian hosts")
 
@@ -28,7 +35,8 @@ mutable struct WeightsFile
     path::String
     io::IOStream                # kept open (and referenced) so the loaded inode stays readable
     metadata::Union{Dict{String, String}, Nothing}
-    tensors::Dict{String, WeightTensorInfo}
+    tensors::Dict{String, WeightTensorInfo}     # shapes are Julia shapes in both layouts
+    xla_order::Bool                             # `axis_order: xla`: data is the Julia array's memory
 end
 
 Base.haskey(w::WeightsFile, name) = haskey(w.tensors, name)
@@ -41,6 +49,18 @@ _fd(w::WeightsFile) = reinterpret(Cint, fd(w.io))
 
 const _ST_MAX_HEADER = 100_000_000          # the bound SafeTensors.jl enforces
 const _PREAD_CHUNK = 1 << 26                # 64 MiB per pread call
+
+const AXIS_ORDER_KEY = "axis_order"
+const AXIS_ORDER_XLA = "xla"
+
+# The layout a file's metadata declares: true for `axis_order: xla`, false when the key is absent.
+# Any other value is refused, so a future layout is never read as one of these two.
+function _xla_axis_order(metadata, path)
+    (metadata === nothing || !haskey(metadata, AXIS_ORDER_KEY)) && return false
+    v = metadata[AXIS_ORDER_KEY]
+    v == AXIS_ORDER_XLA && return true
+    throw(BundleError("$(path): unsupported weights axis_order $(repr(v)) (supported: \"$(AXIS_ORDER_XLA)\")"))
+end
 
 # Read exactly `nbytes` at `offset` into `ptr`, in chunks. gc_safe: a disk read can take a while, and
 # no Julia object crosses the call (the caller roots the destination).
@@ -73,7 +93,7 @@ function open_weights_file(path::AbstractString)
     io = open(String(path), "r")
     try
         id = weights_file_id(stat(io))
-        w = WeightsFile(String(path), io, nothing, Dict{String, WeightTensorInfo}())
+        w = WeightsFile(String(path), io, nothing, Dict{String, WeightTensorInfo}(), false)
         fsize = Int(stat(io).size)
         fsize >= 8 || throw(BundleError("$(path): not a safetensors file (shorter than its header)"))
         hdr = Vector{UInt8}(undef, 8)
@@ -99,6 +119,12 @@ function open_weights_file(path::AbstractString)
             (s >= 0 && nbytes == prod(shape; init = 1) * sizeof(T) && data_start + e <= fsize) ||
                 throw(BundleError("$(path): tensor '$key' has inconsistent offsets or size"))
             w.tensors[key] = WeightTensorInfo(T, shape, data_start + s, nbytes)
+        end
+        w.xla_order = _xla_axis_order(w.metadata, path)
+        if w.xla_order                   # header shapes are program shapes; keep Julia shapes
+            for (k, info) in w.tensors
+                w.tensors[k] = WeightTensorInfo(info.eltype, reverse(info.shape), info.offset, info.nbytes)
+            end
         end
         return w, id
     catch
@@ -146,7 +172,7 @@ function read_weight(w::WeightsFile, name)
     info = w.tensors[name]
     raw = _read_raw(w, info)
     N = length(info.shape)
-    N <= 1 && return reshape(raw, Tuple(info.shape))
+    (w.xla_order || N <= 1) && return reshape(raw, Tuple(info.shape))
     return permutedims(reshape(raw, Tuple(reverse(info.shape))), _perm(N))
 end
 read_weight(st, name) = collect(st[name])
@@ -161,11 +187,11 @@ function read_weight!(dest::AbstractArray, w::WeightsFile, name)
     (eltype(dest) == info.eltype && size(dest) == Tuple(info.shape)) ||
         throw(DimensionMismatch("destination does not match tensor '$name'"))
     N = length(info.shape)
-    if N <= 1 && dest isa Array
+    if (w.xla_order || N <= 1) && dest isa Array
         GC.@preserve dest _pread_full!(w, Ptr{UInt8}(pointer(dest)), info.nbytes, info.offset)
     else
         raw = _read_raw(w, info)
-        N <= 1 ? copyto!(dest, raw) : permutedims!(dest, reshape(raw, Tuple(reverse(info.shape))), _perm(N))
+        (w.xla_order || N <= 1) ? copyto!(dest, reshape(raw, size(dest))) : permutedims!(dest, reshape(raw, Tuple(reverse(info.shape))), _perm(N))
     end
     return dest
 end
