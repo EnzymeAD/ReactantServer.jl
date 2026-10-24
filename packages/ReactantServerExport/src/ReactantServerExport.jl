@@ -115,6 +115,39 @@ _reactant_base_provenance() = Dict{String, Any}(
     "reactant_version" => string(pkgversion(Reactant)),
 )
 
+# `compile_options` on the Reactant frontends: the keywords `Reactant.@compile` takes (for example
+# `(; raise = true)`), or a `Reactant.CompileOptions`. The exporter sets `client` and
+# `drop_unsupported_attributes` itself. Names are checked here because Reactant reports an unknown
+# one as a MethodError deep in tracing.
+const _EXPORTER_COMPILE_KEYS = (:client, :drop_unsupported_attributes)
+
+function _known_compile_keys()
+    m = only(methods(Compiler.__get_compile_options_and_kwargs))
+    return Set{Symbol}(k for k in Base.kwarg_decl(m) if !endswith(String(k), "..."))
+end
+
+function _compile_kwargs(o::NamedTuple)
+    known = _known_compile_keys()
+    for k in keys(o)
+        k in _EXPORTER_COMPILE_KEYS &&
+            error("ReactantServerExport: compile option `$k` is set by the exporter and cannot be overridden")
+        k in known ||
+            error("ReactantServerExport: unknown compile option `$k`; supported: $(join(sort!(collect(known)), ", "))")
+    end
+    return o
+end
+_compile_kwargs(o::Reactant.CompileOptions) = (; compile_options = o)
+_compile_kwargs(o) =
+    error("ReactantServerExport: compile_options must be a NamedTuple of @compile keywords or a Reactant.CompileOptions, got $(typeof(o))")
+
+# Record non-default compile options in the manifest provenance, so a bundle says how it was built.
+function _with_compile_provenance(prov::Dict{String, Any}, o)
+    o isa NamedTuple && isempty(o) && return prov
+    prov["compile_options"] = o isa NamedTuple ?
+        Dict{String, Any}(String(k) => repr(v) for (k, v) in pairs(o)) : repr(o)
+    return prov
+end
+
 # ============================================================================
 # Bundle writer (the former BundleWriter)
 # ============================================================================
@@ -440,6 +473,36 @@ function _entry_arity(fn_res)
     return nothing
 end
 
+# Ops of Reactant's internal `enzyme` dialect (batching, autodiff) exist only until Reactant's
+# optimization passes lower them, and XLA cannot compile them. A traced program that still holds one
+# (for example with `compile_options = (; optimize = false)`) would fail to load on every server, so
+# it is refused here, before anything is written.
+function _internal_ops(mod)
+    found = Set{String}()
+    walk(op) = begin
+        n = Reactant.MLIR.IR.name(op)
+        startswith(n, "enzyme.") && push!(found, n)
+        for region in op, block in region, inner in block
+            walk(inner)
+        end
+    end
+    for op in Reactant.MLIR.IR.body(mod)
+        walk(op)
+    end
+    return sort!(collect(found))
+end
+
+function _check_exportable_ops(mod, label::AbstractString)
+    ops = _internal_ops(mod)
+    isempty(ops) && return nothing
+    return error(
+        "ReactantServerExport: the compiled program is UNSERVABLE and has not been written ($label): " *
+            "it still contains Reactant-internal $(join(("`" * o * "`" for o in ops), ", ")), which XLA cannot " *
+            "compile. Reactant's optimization passes lower these ops; check `compile_options` (for example " *
+            "`optimize = false` skips them)."
+    )
+end
+
 function _check_entry_arity(fn_res, n_inputs::Integer, n_weights::Integer, label::AbstractString)
     got = _entry_arity(fn_res)
     got === nothing && return nothing
@@ -642,6 +705,14 @@ Export a model to a bundle, naming the frontend explicitly so the call site is u
 
 Every frontend takes `layout` (default `:xla`), passed to [`write_bundle`](@ref): `:legacy` writes
 weights that servers older than ReactantServer 0.2 can load.
+
+The Reactant frontends (`:lux`, `:reactant`, and [`export_two_stage_detector`](@ref)) also take
+`compile_options`: the keywords `Reactant.@compile` accepts, as a `NamedTuple` (for example
+`compile_options = (; raise = true)` to raise kernels such as KernelAbstractions or CUDA.jl code
+to StableHLO, or `(; optimize = :all, no_nan = true)`), or a `Reactant.CompileOptions`. They apply
+when the model is traced to StableHLO; the exporter sets `client` and `drop_unsupported_attributes`
+itself. Non-default options are recorded under `compile_options` in the manifest's provenance. The
+PyTorch frontends lower through JAX and do not take them.
 """
 export_bundle(frontend::Symbol, args...; kwargs...) = export_bundle(Val(frontend), args...; kwargs...)
 
@@ -654,7 +725,8 @@ export_bundle(::Val{:torchscript}, args...; kwargs...) =
 
 """
     export_bundle(:lux, model, ps, st, example_input; dir, name, input_name="input",
-                  output_name="output", batch_sizes=[1], provenance=Dict(), layout=:xla) -> dir
+                  output_name="output", batch_sizes=[1], provenance=Dict(), layout=:xla,
+                  compile_options=(;)) -> dir
 
 Trace `model(x, ps, st)` (taking the first return as the output) at each batch size and
 write a bundle. The batch dimension is the last Julia axis (Lux convention) and the leading
@@ -664,8 +736,10 @@ function export_bundle(
         ::Val{:lux}, model, ps, st, example_input::AbstractArray;
         dir::AbstractString, name::AbstractString,
         input_name::AbstractString = "input", output_name::AbstractString = "output",
-        batch_sizes::AbstractVector{<:Integer} = [1], provenance = Dict{String, Any}(), layout::Symbol = :xla
+        batch_sizes::AbstractVector{<:Integer} = [1], provenance = Dict{String, Any}(), layout::Symbol = :xla,
+        compile_options = (;)
     )
+    copts = _compile_kwargs(compile_options)
     leaves = _named_leaves(ps)
     isempty(leaves) && error("ReactantServerExport: model has no array parameters to export")
     wnames = String[p[1] for p in leaves]
@@ -685,8 +759,9 @@ function export_bundle(
         ctx = Reactant.ReactantContext()
         push!(ctxs, ctx)
         args = (Reactant.to_rarray(x), map(Reactant.to_rarray, warrays)...)
-        mod, fn_res = Compiler.compile_mlir(ctx, g, args; drop_unsupported_attributes = true)
+        mod, fn_res = Compiler.compile_mlir(ctx, g, args; drop_unsupported_attributes = true, copts...)
         _check_entry_arity(fn_res, 1, length(warrays), "batch size $s")
+        _check_exportable_ops(mod, "batch size $s")
         modules[Int(s)] = mod
         in_shape_julia = collect(Int, size(x))
     end
@@ -696,7 +771,7 @@ function export_bundle(
     out_batch_axis = ndims(y0) - 1
     inputs = [IOSpec(input_name, in_T, in_shape_julia; batch_axis = in_batch_axis)]
     outputs = [IOSpec(output_name, eltype(y0), collect(Int, size(y0)); batch_axis = out_batch_axis)]
-    prov = merge(_reactant_base_provenance(), Dict{String, Any}(provenance))
+    prov = _with_compile_provenance(merge(_reactant_base_provenance(), Dict{String, Any}(provenance)), compile_options)
 
     GC.@preserve ctxs begin
         write_bundle(
@@ -714,7 +789,7 @@ end
                   output_select = y -> (y isa Tuple ? y : (y,)),
                   input_batch_axes=nothing, output_batch_axes=nothing,
                   client_inputs=nothing, client_outputs=nothing,
-                  batch_sizes=[1], provenance=Dict(), layout=:xla) -> dir
+                  batch_sizes=[1], provenance=Dict(), layout=:xla, compile_options=(;)) -> dir
 
 Multi-input / multi-output Lux export. `client_inputs`/`client_outputs` (each `nothing` or a
 `Vector{IOSpec}`) declare the wire-facing spec when a shipped `model.jl` postprocess transforms
@@ -741,8 +816,10 @@ function export_bundle(
         output_batch_axes::Union{Nothing, AbstractVector} = nothing,
         client_inputs::Union{Nothing, AbstractVector{IOSpec}} = nothing,
         client_outputs::Union{Nothing, AbstractVector{IOSpec}} = nothing,
-        batch_sizes::AbstractVector{<:Integer} = [1], provenance = Dict{String, Any}(), layout::Symbol = :xla
+        batch_sizes::AbstractVector{<:Integer} = [1], provenance = Dict{String, Any}(), layout::Symbol = :xla,
+        compile_options = (;)
     )
+    copts = _compile_kwargs(compile_options)
     leaves = _named_leaves(ps)
     isempty(leaves) && error("ReactantServerExport: model has no array parameters to export")
     wnames = String[p[1] for p in leaves]
@@ -795,8 +872,9 @@ function export_bundle(
         ctx = Reactant.ReactantContext()
         push!(ctxs, ctx)
         args = (_modelarg(map(Reactant.to_rarray, xs)), map(Reactant.to_rarray, warrays)...)
-        mod, fn_res = Compiler.compile_mlir(ctx, g, args; drop_unsupported_attributes = true)
+        mod, fn_res = Compiler.compile_mlir(ctx, g, args; drop_unsupported_attributes = true, copts...)
         _check_entry_arity(fn_res, nin, length(warrays), "batch size $s")
+        _check_exportable_ops(mod, "batch size $s")
         modules[Int(s)] = mod
         for i in 1:nin
             in_shapes[i] = collect(Int, size(xs[i]))
@@ -816,7 +894,7 @@ function export_bundle(
             batch_axis = out_axes[i] === nothing ? nothing : out_axes[i] - 1
         ) for i in 1:nout
     ]
-    prov = merge(_reactant_base_provenance(), Dict{String, Any}(provenance))
+    prov = _with_compile_provenance(merge(_reactant_base_provenance(), Dict{String, Any}(provenance)), compile_options)
 
     GC.@preserve ctxs begin
         write_bundle(
@@ -830,7 +908,7 @@ end
 
 """
     export_bundle(:reactant, f, inputs::Tuple, weights; dir, name, input_names=nothing,
-                  output_name="output", provenance=Dict(), layout=:xla) -> dir
+                  output_name="output", provenance=Dict(), layout=:xla, compile_options=(;)) -> dir
 
 Generic single-size export for any Reactant-traceable `f(inputs..., weights...)`. `weights`
 is an ordered collection of `name => array` pairs. Produces one unbatched `model.mlir`.
@@ -839,8 +917,9 @@ function export_bundle(
         ::Val{:reactant}, f, inputs::Tuple, weights::AbstractVector{<:Pair};
         dir::AbstractString, name::AbstractString,
         input_names = nothing, output_name::AbstractString = "output",
-        provenance = Dict{String, Any}(), layout::Symbol = :xla
+        provenance = Dict{String, Any}(), layout::Symbol = :xla, compile_options = (;)
     )
+    copts = _compile_kwargs(compile_options)
     wnames = String[String(first(p)) for p in weights]
     warrays = Any[last(p) for p in weights]
     innames = input_names === nothing ? ["input_$(i - 1)" for i in 1:length(inputs)] : collect(String, input_names)
@@ -850,15 +929,16 @@ function export_bundle(
 
     ctx = Reactant.ReactantContext()
     args = (map(Reactant.to_rarray, inputs)..., map(Reactant.to_rarray, warrays)...)
-    mod, fn_res = Compiler.compile_mlir(ctx, f, args; drop_unsupported_attributes = true)
+    mod, fn_res = Compiler.compile_mlir(ctx, f, args; drop_unsupported_attributes = true, copts...)
     _check_entry_arity(fn_res, length(inputs), length(warrays), "unbatched")
+    _check_exportable_ops(mod, "unbatched")
 
     in_specs = [
         IOSpec(innames[i], eltype(inputs[i]), collect(Int, size(inputs[i])))
             for i in 1:length(inputs)
     ]
     out_specs = [IOSpec(output_name, eltype(yarr), collect(Int, size(yarr)))]
-    prov = merge(_reactant_base_provenance(), Dict{String, Any}(provenance))
+    prov = _with_compile_provenance(merge(_reactant_base_provenance(), Dict{String, Any}(provenance)), compile_options)
 
     GC.@preserve ctx begin
         write_bundle(

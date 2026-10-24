@@ -224,6 +224,42 @@ _load_manifest(dir) = ReactantServer.parse_manifest(
     end
 
 
+    @testset "compile options reach the traced program" begin
+        g(x, W, b) = tanh.(W * x .+ b) .* 2
+        W = Float32[1 0 0; 0 1 0]
+        bvec = Float32[10, 20]
+        x0 = reshape(collect(Float32, 1:3), 3, 1)
+        x = reshape(Float32[2, 3, 4], 3, 1)
+        mktempdir() do root
+            export_with(name, opts) = export_bundle(
+                :reactant, g, (x0,), ["W" => W, "b" => bvec];
+                dir = joinpath(root, name), name, input_names = ["x"], compile_options = opts
+            )
+            mlir(name) = read(joinpath(root, name, "model.mlir"))
+            export_with("dflt", (;))
+            export_with("raised", (; raise = true))
+            export_with("raised_obj", Reactant.CompileOptions(; raise = true))
+            # Skipping Reactant's passes leaves its internal ops in the program: refused at export,
+            # which also shows the option reached tracing, by keywords or as an object.
+            @test_throws "UNSERVABLE" export_with("noopt", (; optimize = false))
+            @test_throws "enzyme." export_with("noopt", Reactant.CompileOptions(; optimization_passes = false))
+            @test !isdir(joinpath(root, "noopt"))
+            @test mlir("raised_obj") == mlir("raised")              # an object means the same thing
+            for name in ("dflt", "raised", "raised_obj")
+                out = run_bundle(root, name, ["x" => x])
+                @test isapprox(vec(out[1].data), vec(tanh.(W * x .+ bvec) .* 2); rtol = 1.0e-5)
+            end
+            prov(name) = get(_load_manifest(joinpath(root, name)).provenance.fields, "compile_options", nothing)
+            @test prov("dflt") === nothing                          # defaults are not recorded
+            @test prov("raised") == Dict("raise" => "true")
+            @test prov("raised_obj") isa AbstractString
+            @test_throws "unknown compile option `bogus`" export_with("bad", (; bogus = 1))
+            @test_throws "set by the exporter" export_with("bad", (; client = nothing))
+            @test_throws "compile_options must be" export_with("bad", Dict(:raise => true))
+            @test !isdir(joinpath(root, "bad"))                     # refused before anything is written
+        end
+    end
+
     @testset "entry-arity gate refuses an unservable bundle before writing it" begin
         # THE 2026-08-11 AND 2026-08-19 DEFECT, reproduced. `export_bundle(:lux, ...)` CAPTURES `st`
         # in the closure it compiles rather than passing it, and Reactant lifts every device-resident
