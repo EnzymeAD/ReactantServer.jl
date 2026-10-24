@@ -132,8 +132,10 @@ struct GatewayConfig
     # weight region. `compaction_mode` selects what each worker reloads eagerly afterward: `:off`
     # disables it, `:eager` reloads nothing (the region refills lazily as traffic arrives), and
     # `:scheduled` reloads the set of models the repack just assigned to that worker (warming the new
-    # placement). `compaction_interval` is the cadence in repacks: the first placement-changing repack
-    # at or after this many repacks fires it (so it can land later than exactly N).
+    # placement). `:on_demand` (the default) sends nothing on a repack: each worker's admission
+    # evicts only what a load needs and compacts by itself only when eviction cannot make a model
+    # fit. `compaction_interval` is the cadence in repacks: the first placement-changing repack at or
+    # after this many repacks fires it (so it can land later than exactly N).
     compaction_mode::Symbol
     compaction_interval::Int
     # No-eviction guarantee (lpt_packing only). When true, the packer treats each worker's weight
@@ -282,7 +284,7 @@ function _build_gateway_config(raw::Dict{String, Any})
     work_basis = String(_parse_work_basis(_opt(sched, "work_basis", String, "compute")))
     routing_policy = String(_parse_routing_policy(_opt(sched, "routing_policy", String, "fill_least")))
     routing_fill_mode = String(_parse_fill_mode(_opt(sched, "routing_fill_mode", String, "run")))
-    compaction_mode = _parse_gateway_compaction_mode(_opt(sched, "compaction_mode", String, "eager"))
+    compaction_mode = _parse_gateway_compaction_mode(_opt(sched, "compaction_mode", String, "on_demand"))
 
     cfg = GatewayConfig(
         _opt(listen, "grpc", String, "0.0.0.0:8001"),
@@ -384,7 +386,8 @@ function _parse_gateway_compaction_mode(s)
     ls == "off" && return :off
     ls == "eager" && return :eager
     ls == "scheduled" && return :scheduled
-    throw(ConfigError("scheduling.compaction_mode must be 'off', 'eager', or 'scheduled', got '$s'"))
+    ls == "on_demand" && return :on_demand
+    throw(ConfigError("scheduling.compaction_mode must be 'on_demand', 'off', 'eager', or 'scheduled', got '$s'"))
 end
 
 # Where a fresh batch opens within a model's replica set. Returns a Symbol; `GatewayConfig` keeps the

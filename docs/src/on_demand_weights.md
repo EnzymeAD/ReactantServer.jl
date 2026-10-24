@@ -15,13 +15,14 @@ policy live on [Multi-GPU Gateway](gateway.md).
   weights default to system-pinned (`residency: system`): materialized once from disk into
   host RAM at startup and kept there. Host memory is plentiful and cheap relative to GPU
   memory, which removes disk from the hot path. A model can opt out with
-  `residency: unpinned`, paying an mmap re-materialization on each on-demand load instead.
+  `residency: unpinned`, paying a read from the weights file on each on-demand load instead.
   Materializing the host floor is the expensive step, a layout copy at host-memory speed
   ([`materialize_host_weights!`](@ref)), and it happens exactly once at startup.
 - **GPU (managed working set).** Pinned models keep their weights on the GPU for the
   server's lifetime. Every other model is loaded onto the GPU on demand when a request
   arrives, kept resident afterward so repeat requests are free, and evicted under a
-  configured GPU byte budget using a least-recently-used policy. Eviction frees the device
+  configured GPU byte budget by the cost-aware admission described in
+  [Memory fragmentation and compaction](#Memory-fragmentation-and-compaction). Eviction frees the device
   memory immediately through an explicit PJRT buffer release
   (`ReactantServer.free_weights!`).
 
@@ -110,6 +111,17 @@ attach one copy and each transfers it to its own device. `host_materialize` rout
 the configured store, which is what makes this a configuration decision rather than a code
 change.
 
+Each shared copy is labeled with the version of the weights file the worker actually opened (its
+device, inode, size and modification time), so workers never share a copy of one version under
+another version's label. Deploy new weights by writing a new file and renaming it over the old
+one: a worker that already loaded the model keeps serving the old bytes until it reloads, and its
+shared copy stays labeled as the old version. Writing into a loaded weights file in place (for
+example `cp` onto it, which truncates it first) is detected and fails that model's load instead of
+copying mixed bytes; weights are read with ordinary file reads rather than a memory mapping, so a
+truncated file is an error rather than a crashed worker. When the node cannot back
+a new shared copy (`/dev/shm` full, or the container's memory limit reached), the worker logs a
+warning and gives that model a private copy instead of failing.
+
 The regions and their lock files are created with mode `666` by default so containers
 running as unrelated UIDs can share them; that is world-writable, so set
 `runtime.shared_host_weights_mode: "660"` on production and multi-user systems (the server
@@ -138,6 +150,41 @@ models are left in place: they are never freed and never re-read from disk. Host
 it is a fast host-to-device transfer rather than a disk re-materialization
 (`ReactantServer.compact!` implements this on the worker).
 
+### Admission: evicting only what a load needs
+
+Before a worker loads a model it checks, from the allocator's own statistics, that the
+model's weights and the scratch of the heaviest resident execution will both fit, in bytes
+and contiguously, and evicts only what is needed to make that true. It decides before it
+uploads because a refused device allocation is slow to discover: XLA's allocator waits about
+10 seconds for memory to be released before it reports one.
+
+1. **Feasibility.** A model that cannot fit even with every evictable model gone (weights
+   plus the device-pinned models plus scratch exceed the device) is rejected at once,
+   without evicting anything.
+2. **Room for the weights.** Free memory must hold the weights plus the largest scratch any
+   resident model needs, the largest free block must hold all of the weights, and the
+   on-demand byte budget must allow them. A byte shortfall evicts the cheapest *set* of
+   models that covers it; a contiguity shortfall evicts the cheapest single model at a time.
+3. **Upload**, then **the scratch guarantee**: the largest free block must still hold the
+   largest scratch of every resident model, the new one included, so every resident model
+   can run. Admission evicts until it does.
+
+Which models to evict is a cost decision. Each model's priority is its expected reload time
+per byte, scaled by how often it has been dispatched since it was loaded and aged by how
+long ago it was last used (GreedyDual-Size-Frequency). A costly, frequently used model
+stays; one nobody has called in a while goes, and among equals the least recently used goes
+first, as with LRU. Choosing a set rather than evicting one model at a time means one large
+idle model is evicted in place of two smaller busy ones. Models with requests already queued
+are evicted only when nothing else frees enough. The search is allocation-free and bounded:
+measured at 64 resident models it takes about 6 to 22 microseconds.
+
+Compaction (below) is the fallback when eviction alone cannot make room: the worker frees
+every evictable model, reloads the most valuable of them largest first together with the
+new model, and retries once; if that fails too the request fails with an admission error
+naming the reason. Device-pinned models never move, so a pinned model that splits the
+device can make a large model unplaceable; place pinned models with that in mind. Without
+device statistics (the CPU backend) only the byte budget applies.
+
 Whatever drives compaction frees the on-demand region the same way; what differs is *when*
 it fires and *what* gets reloaded eagerly. Underneath, compaction is a worker control RPC,
 `CompactMemory` on the `ControlService`, that frees the on-demand region and reloads a list
@@ -165,25 +212,29 @@ authority on compaction in a gateway deployment (next section). It is the
 
 ### Behind a gateway
 
-In a gateway deployment the gateway owns compaction; workers leave
-`scheduler.compaction_interval` at `0`. The gateway ties compaction to **placement
-changes**, the fleet-level event that churns worker memory: when the `lpt_packing`
-scheduler repacks and moves a model from one worker to another, the new worker loads it and
-the old worker's copy goes cold. Two settings under the gateway's `scheduling:` block
-control it:
+In a gateway deployment workers leave `scheduler.compaction_interval` at `0`. By default
+the gateway leaves compaction to each worker's admission as well. It can instead tie
+compaction to **placement changes**, the fleet-level event that churns worker memory: when
+the `lpt_packing` scheduler repacks and moves a model from one worker to another, the new
+worker loads it and the old worker's copy goes cold. Two settings under the gateway's
+`scheduling:` block control it:
 
 ```yaml
 scheduling:
   mode: lpt_packing
-  compaction_mode: eager       # eager (default) | off | scheduled
+  compaction_mode: on_demand   # on_demand (default) | eager | off | scheduled
   compaction_interval: 1       # every placement-changing repack (see below)
 ```
 
-`compaction_mode` selects what each affected worker reloads eagerly after the free:
+`compaction_mode` selects whether a repack compacts and what each affected worker reloads
+eagerly after the free:
 
-- **`eager`** (the default) frees the on-demand region on each worker whose placement
-  changed and lets it refill with live traffic. Models the worker no longer serves are
-  dropped immediately; the ones it still serves reload on their next request.
+- **`on_demand`** (the default) sends nothing on a repack. Each worker's admission evicts
+  only what a load needs and compacts by itself only when eviction cannot make a model fit.
+- **`eager`** frees the on-demand region on each worker whose placement changed and lets it
+  refill with live traffic. Models the worker no longer serves are dropped immediately; the
+  ones it still serves reload on their next request. This was the default before admission
+  existed, and stays available for one release.
 - **`off`** disables gateway-driven compaction.
 - **`scheduled`** also reloads the set of models the repack just assigned to that worker,
   so the worker's new placement is warm right away instead of cold-loading on first
@@ -208,15 +259,14 @@ and is a no-op. When it does run it has a cost: freeing the on-demand region dro
 that were warm, so they pay a host-to-device reload (lazily on next request for `eager`,
 or up front for `scheduled`).
 
-The default is `eager` on every placement-changing repack (`compaction_interval: 1`),
-which keeps fragmentation from ever accumulating: whenever placement shifts, the affected
-workers defragment and refill from live traffic. The trade is a one-time reload on the
-first request per moved model, which the relatively infrequent repack cadence
-(`rebalance_compute_seconds`, 300 GPU-seconds by default) keeps modest. To cut reloads
-further, raise `compaction_interval` so it fires less often, switch to `scheduled` to warm
-the new placement up front instead of lazily, or set `compaction_mode: off` to disable it
-and watch for allocation failures under memory pressure (the signal that fragmentation has
-become the bottleneck).
+The default, `on_demand`, compacts only when admission cannot otherwise place a model, so
+models that are still warm are not dropped on every placement change. Watch
+`worker_weight_fallback_compactions_total` for how often that happens and
+`worker_weight_admission_failures_total` for models that could not be placed at all. The
+older `eager` mode compacts every affected worker on every placement-changing repack
+(`compaction_interval: 1`), which pays a one-time reload on the first request per moved
+model; raise `compaction_interval` to fire it less often, or use `scheduled` to warm the
+new placement up front instead of lazily.
 
 ## Observability
 
@@ -228,10 +278,19 @@ models stay resident and that the eviction rate is acceptable for your budget. C
 every item in the batch, so on-demand loading and batching reinforce each other.
 
 Each compaction also logs a `memory compacted` line with the device free space and
-on-demand budget before and after, and the weight cache tracks a `compactions` counter.
-Compare the before/after device free figures to confirm that compaction actually recovered
-contiguous space on your hardware: it relies on the allocator returning freed buffers to
-the arena and coalescing them, which the log lets you verify rather than assume.
+on-demand budget before and after, plus the largest free block and fragmentation before and
+after, and the weight cache tracks a `compactions` counter. Compare the before/after
+largest free block to confirm that compaction actually recovered contiguous space on your
+hardware: it relies on the allocator returning freed buffers to the arena and coalescing
+them, which the log lets you verify rather than assume. Models named for an eager reload
+are reloaded largest first, so the refill packs tightly instead of leaving gaps.
+
+With `JULIA_DEBUG=ReactantServer`, every on-demand load and eviction also logs a
+`memory: weight load` or `memory: weight evict` line with raw byte counts: the model's
+allocator-rounded weight footprint, its largest single weight tensor, its measured
+scratch, its average load time, and the device's bytes in use, largest free block and
+fragmentation before and after. These lines are meant to be parsed into a
+fragmentation-over-time series.
 
 The worker also exports the BFC allocator's live numbers as Prometheus gauges (aggregated
 through the gateway's `/metrics`): `worker_device_memory_in_use_bytes`,
@@ -239,7 +298,18 @@ through the gateway's `/metrics`): `worker_device_memory_in_use_bytes`,
 high-water, your empirical scratch + resident ceiling), and
 `worker_device_memory_pool_bytes`. The peak gauge is reset once compilation finishes and again
 before each probed model, so after startup it tracks execution only; a rising peak over a long
-uptime is the signal to revisit the budget. Note the GPU BFC
-allocator does not report a largest-contiguous-free-block figure, so fragmentation is not
-directly observable here; in practice it surfaces as an allocation failing despite ample
-reported free bytes, which is what compaction (above) addresses.
+uptime is the signal to revisit the budget.
+
+Fragmentation is observable directly: `worker_device_memory_largest_free_block_bytes` is the
+largest single allocation the allocator can satisfy right now, and
+`worker_device_memory_fragmentation` is `1 - largest_free_block / free_bytes` (0 when the
+free memory is one block, approaching 1 as it splinters). A model whose largest weight tensor
+or execution scratch exceeds the largest free block cannot be placed even when the free byte
+count looks ample, which is the condition compaction (above) repairs. Allocation failures
+are expensive to discover: XLA's allocator waits about 10 seconds for memory to be released
+before it reports one.
+
+Per model, `worker_model_scratch_bytes` is the scratch measured at startup and
+`worker_model_load_seconds` the moving average of its on-demand load time.
+`worker_weight_load_bytes_total` divided by `worker_weight_load_seconds_total` gives the
+effective host-to-device bandwidth of weight loads.

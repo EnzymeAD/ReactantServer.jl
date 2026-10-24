@@ -30,14 +30,55 @@ mutable struct WeightCache
     pinned_bytes::Int              # observability: device-pinned footprint reserved (set at startup)
     max_scratch::Int               # observability: measured worst-case execution scratch (set at startup)
     weight_pool::Int               # observability: arena bytes allotted to all weights (pinned + on-demand)
+    load_bytes::Int                # observability: weight bytes transferred by on-demand loads
+    footprints::Dict{String, ModelFootprint}   # per-model W / wmax / S / load time, by model name
+    # Admission (admission.jl).
+    inflation::Float64             # GreedyDual-Size-Frequency L: raised to each evicted model's priority
+    min_residency_seconds::Float64 # a model loaded more recently than this is evicted only as a last resort
+    search::VictimSearch           # reusable victim-search arrays (dispatch thread only)
+    fallback_compactions::Int      # observability: compactions admission ran because eviction alone could not fit
+    admission_failures::Int        # observability: models admission could not fit even after compacting
     lock::ReentrantLock
 end
 
 WeightCache(
     backend::AbstractBackend, pool::MemoryPool, registry::ModelRegistry, max_bytes::Integer;
-    mode::ResidencyMode = SELF_MANAGED, store::WeightStore = PrivateWeightStore()
+    mode::ResidencyMode = SELF_MANAGED, store::WeightStore = PrivateWeightStore(),
+    min_residency_seconds::Real = 0.0
 ) =
-    WeightCache(backend, pool, registry, mode, store, Int(max_bytes), 0, String[], 0, 0, 0.0, 0, 0, 0, 0, ReentrantLock())
+    WeightCache(
+    backend, pool, registry, mode, store, Int(max_bytes), 0, String[], 0, 0, 0.0, 0, 0, 0, 0, 0,
+    Dict{String, ModelFootprint}(), 0.0, Float64(min_residency_seconds), VictimSearch(), 0, 0,
+    ReentrantLock()
+)
+
+"""
+    model_footprint(cache, entry) -> ModelFootprint
+
+The model's device footprint (`W`, `wmax`, `S`, load time), computed on first use and cached. A
+model rebuilt under the same name (a reload) gets a fresh footprint, since its weights and
+compiled programs may differ. Runs on the dispatch thread, the sole residency mutator; the lock
+covers the dictionary against the metrics snapshot.
+"""
+function model_footprint(cache::WeightCache, entry::ModelEntry)
+    model = entry.executable::LoadedModel
+    return lock(cache.lock) do
+        fp = get(cache.footprints, entry.name, nothing)
+        if fp === nothing || fp.owner !== model
+            fp = _new_footprint(entry, model)
+            cache.footprints[entry.name] = fp
+        end
+        return fp
+    end
+end
+
+# A numeric device-memory snapshot for the load / evict / compact logs, or `nothing` without
+# device stats. One allocator query (well under a microsecond on CUDA).
+function _memory_point(cache::WeightCache)
+    dm = device_memory_stats(cache.backend, cache.pool)
+    dm === nothing && return nothing
+    return (in_use = dm.in_use, largest_free = largest_free_bytes(dm), fragmentation = fragmentation(dm))
+end
 
 """
     weight_budget(; arena, fraction, wiggle, max_scratch, pinned_bytes) -> (; on_demand_budget, weight_pool, scratch_ceiling, pinned_over_commit)
@@ -102,7 +143,7 @@ end
 
 # Transfer a model's weights to GPU buffers. When the weights are pinned in host RAM
 # (host_weights set, the normal on-demand case) this is a pure host->device transfer; otherwise
-# it falls back to materializing from the mmap (used by tests that do not pin in RAM).
+# it falls back to reading from the weights file (used by tests that do not pin in RAM).
 function _device_buffers(cache::WeightCache, entry::ModelEntry, model::LoadedModel)
     if model.host_weights !== nothing
         return transfer_to_device(cache.backend, cache.pool, model.host_weights)
@@ -143,11 +184,14 @@ Base.showerror(io::IO, e::NotResidentError) =
     acquire!(cache, entry) -> nothing
 
 Guarantee `entry.executable.weights` is resident before the model runs. Device-pinned and
-already-resident models return immediately (the latter is bumped to most-recently-used). In
-self-managed mode an evicted model is loaded autonomously, evicting LRU victims until it fits
-the budget (a model larger than the whole budget is loaded anyway after evicting everything,
-with a warning, since it cannot run otherwise). In externally-managed mode the worker does not
-autonomously load: an evicted model raises [`NotResidentError`](@ref).
+already-resident models return immediately (the latter is bumped to most-recently-used and its
+eviction priority raised). In self-managed mode an evicted model is admitted autonomously by
+[`admit_weights!`](@ref): it evicts the cheapest set of resident models that makes the weights
+and the execution scratch fit, compacting only as a fallback. Without device memory statistics
+(CPU, mocks) admission falls back to the byte budget alone, and a model larger than the whole
+budget is loaded anyway after evicting everything, with a warning, since it cannot run
+otherwise. In externally-managed mode the worker does not autonomously load: an evicted model
+raises [`NotResidentError`](@ref).
 """
 function acquire!(cache::WeightCache, entry::ModelEntry)
     model = entry.executable
@@ -156,46 +200,24 @@ function acquire!(cache::WeightCache, entry::ModelEntry)
         lock(cache.lock) do
             _touch_mru!(cache, entry.name)
         end
+        record_hit!(cache, entry)
         return nothing
     end
 
     cache.mode == EXTERNALLY_MANAGED && throw(NotResidentError(entry.name))
+    admit_weights!(cache, entry)
+    return nothing
+end
 
-    need = model.nbytes
-    # Select LRU victims (front first) until the target would fit.
-    victims = String[]
-    projected = cache.resident_bytes
-    for name in cache.lru
-        projected + need <= cache.max_bytes && break
-        push!(victims, name)
-        projected -= cache.registry.by_name[name].executable.nbytes
-    end
-    if projected + need > cache.max_bytes
-        @warn "weight cache: model exceeds budget even after evicting all unpinned models; loading anyway" model = entry.name nbytes = need budget = cache.max_bytes
-    end
-
-    # Evict victims first so loading the target does not transiently exceed the budget. Commit
-    # the residency bookkeeping under the lock, then release the device buffers outside it.
-    if !isempty(victims)
-        to_free = Any[]
-        lock(cache.lock) do
-            for name in victims
-                vm = cache.registry.by_name[name].executable
-                push!(to_free, vm.weights)
-                vm.weights = nothing
-                _remove_lru!(cache, name)
-                cache.resident_bytes -= vm.nbytes
-                cache.evicts += 1
-            end
-        end
-        for fb in to_free
-            free_weights!(cache.backend, fb)
-        end
-        @debug "residency: evicted for headroom" loading = entry.name evicted = victims
-    end
-
-    # Transfer the target's weights to the GPU (outside the lock), then commit residency. With
-    # weights pinned in host RAM this is a pure host->device copy, not a re-materialization.
+# Upload a model's weights and commit residency. Used by admission for both a fresh admission
+# (`fresh = true`: its eviction priority starts over) and a fallback-compaction reload (`fresh =
+# false`: it keeps the priority it had earned). On a failed transfer the partial upload has
+# already been freed (see `transfer_to_device`) and the error propagates.
+function _upload_commit!(cache::WeightCache, entry::ModelEntry; fresh::Bool = true)
+    model = entry.executable
+    fp = model_footprint(cache, entry)
+    before = _memory_point(cache)
+    # With weights pinned in host RAM this is a pure host->device copy, not a re-materialization.
     t0 = time()
     bufs = _device_buffers(cache, entry, model)
     dt = time() - t0
@@ -205,12 +227,50 @@ function acquire!(cache::WeightCache, entry::ModelEntry)
         cache.resident_bytes += model.nbytes
         cache.loads += 1
         cache.load_seconds += dt
+        cache.load_bytes += fp.weight_bytes
+        record_load!(fp, dt)
+        fp.loaded_at = time()
+        if fresh
+            fp.hits = 1
+            fp.priority = cache.inflation + _priority_gain(cache, fp)
+        end
     end
+    log_memory_event(:load, entry.name, fp, before, _memory_point(cache))
     log_residency_change(
         entry.name, :system, :device, model.nbytes;
         memory = memory_report(cache.backend, cache.pool; registry = cache.registry, weight_cache = cache)
     )
     return nothing
+end
+
+# Evict resident non-pinned models by name: commit the bookkeeping under the lock, then release the
+# device buffers outside it. Raises the policy's inflation to the highest evicted priority, which
+# is what ages every model that was not touched since (GreedyDual). Returns the weight bytes freed.
+function _evict!(cache::WeightCache, names)
+    to_free = Any[]
+    freed = 0
+    lock(cache.lock) do
+        for name in names
+            entry = cache.registry.by_name[name]
+            vm = entry.executable
+            push!(to_free, vm.weights)
+            vm.weights = nothing
+            _remove_lru!(cache, name)
+            cache.resident_bytes -= vm.nbytes
+            cache.evicts += 1
+            fp = get(cache.footprints, name, nothing)
+            if fp !== nothing
+                cache.inflation = max(cache.inflation, fp.priority)
+                freed += fp.weight_bytes
+            end
+        end
+    end
+    for (name, fb) in zip(names, to_free)
+        before = _memory_point(cache)
+        free_weights!(cache.backend, fb)
+        log_memory_event(:evict, name, model_footprint(cache, cache.registry.by_name[name]), before, _memory_point(cache))
+    end
+    return freed
 end
 
 """
@@ -233,10 +293,7 @@ function set_residency_state!(cache::WeightCache, entry::ModelEntry, target::Res
     new_host = model.host_weights
     drop_host = false
     if target == PINNED_SYSTEM && model.host_weights === nothing
-        new_host = host_materialize(
-            cache.store, entry.name, entry.weights, model.sig.weight_names;
-            content = weights_file_token(entry.weights_path)
-        )
+        new_host = host_materialize(cache.store, entry, model.sig.weight_names)
     elseif target == UNPINNED && model.host_weights !== nothing
         new_host = nothing        # drop the host floor
         drop_host = true
@@ -296,6 +353,7 @@ function release_all!(cache::WeightCache, entry::ModelEntry)
         end
         to_free = model.weights
         model.weights = nothing
+        delete!(cache.footprints, entry.name)
     end
     to_free === nothing || free_weights!(cache.backend, to_free)
     if model.host_weights !== nothing
@@ -317,6 +375,8 @@ function rename!(cache::WeightCache, old::AbstractString, new::AbstractString)
     lock(cache.lock) do
         i = findfirst(==(String(old)), cache.lru)
         i === nothing || (cache.lru[i] = String(new))
+        fp = pop!(cache.footprints, String(old), nothing)
+        fp === nothing || (cache.footprints[String(new)] = fp)
     end
     host_rename!(cache.store, old, new)
     return nothing
@@ -342,6 +402,7 @@ models reloaded.
 """
 function compact!(cache::WeightCache, registry::ModelRegistry; reload::Vector{String} = String[])
     before = memory_report(cache.backend, cache.pool; registry = registry, weight_cache = cache)
+    before_point = _memory_point(cache)
 
     # Phase A: free every resident non-pinned device buffer. Reset the on-demand budget bookkeeping
     # (which counts only non-pinned residency, so this is exact); keep the host floors. The slow
@@ -363,11 +424,13 @@ function compact!(cache::WeightCache, registry::ModelRegistry; reload::Vector{St
     end
 
     # Phase B: reload the requested non-pinned models into the coalesced region, through `acquire!`
-    # so its budget/LRU bookkeeping (and `loads`/`load_seconds`) is restored. Skipped in
+    # so its budget/LRU bookkeeping (and `loads`/`load_seconds`) is restored. Largest first: on an
+    # empty region a descending-size fill packs each model against the last and cannot fragment,
+    # whereas small models placed first leave gaps a later large model may not fit. Skipped in
     # externally-managed mode, where `acquire!` does not autonomously load.
     reloaded = 0
     if cache.mode != EXTERNALLY_MANAGED
-        for name in reload
+        for name in _largest_first(cache, registry, reload)
             entry = get(registry.by_name, name, nothing)
             entry === nothing && continue
             model = entry.executable
@@ -378,8 +441,22 @@ function compact!(cache::WeightCache, registry::ModelRegistry; reload::Vector{St
     end
 
     after = memory_report(cache.backend, cache.pool; registry = registry, weight_cache = cache)
-    @info "memory compacted" reloaded = reloaded requested = length(reload) before = before after = after
+    after_point = _memory_point(cache)
+    @info "memory compacted" reloaded = reloaded requested = length(reload) before = before after = after largest_free_before = _point_field(before_point, :largest_free) largest_free_after = _point_field(after_point, :largest_free) fragmentation_before = _point_field(before_point, :fragmentation) fragmentation_after = _point_field(after_point, :fragmentation)
     return reloaded
+end
+
+_point_field(p, k::Symbol) = p === nothing ? nothing : getfield(p, k)
+
+# `names` ordered by descending weight footprint; names that are not loaded models keep their
+# relative order at the end (the reload loop skips them).
+function _largest_first(cache::WeightCache, registry::ModelRegistry, names::Vector{String})
+    function wbytes(name)
+        entry = get(registry.by_name, name, nothing)
+        (entry === nothing || entry.executable === nothing) && return -1
+        return model_footprint(cache, entry).weight_bytes
+    end
+    return sort(names; by = wbytes, rev = true)
 end
 
 """
@@ -394,7 +471,15 @@ function weight_cache_stats(cache::WeightCache)
             resident_models = copy(cache.lru), loads = cache.loads, evicts = cache.evicts,
             load_seconds = cache.load_seconds, compactions = cache.compactions,
             pinned_bytes = cache.pinned_bytes, max_scratch = cache.max_scratch,
-            weight_pool = cache.weight_pool,
+            weight_pool = cache.weight_pool, load_bytes = cache.load_bytes,
+            fallback_compactions = cache.fallback_compactions,
+            admission_failures = cache.admission_failures,
+            footprints = Dict(
+                name => (
+                    weight_bytes = fp.weight_bytes, max_weight_bytes = fp.max_weight_bytes,
+                    scratch_bytes = fp.scratch_bytes, load_seconds = fp.load_seconds, loads = fp.loads,
+                ) for (name, fp) in cache.footprints
+            ),
         )
     end
 end

@@ -258,6 +258,10 @@ end
     got = _probe_max_scratch!(sched, ReactantServer.pinned_weight_bytes(sched.registry))
     # Exactly the run transient: scratch plus the output buffer (8 bytes) that is live at the peak.
     @test got == scratch + 8
+    # Each model's own S is kept for admission, not only the maximum.
+    for name in ("light", "heavy", "pinned")
+        @test sched.weight_cache.footprints[name].scratch_bytes == scratch + 8
+    end
     # Pinned models are probed too under the resettable regime (their cost estimate got seeded).
     @test haskey(sched.registry.by_name["pinned"].sched.cost_estimate, 1)
 end

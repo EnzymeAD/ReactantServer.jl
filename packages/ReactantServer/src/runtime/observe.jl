@@ -121,6 +121,9 @@ function memory_report(
         push!(parts, "device n/a")
     else
         push!(parts, "device $(Base.format_bytes(stats.free)) free / $(Base.format_bytes(stats.limit)) ($(_pct(stats.free, stats.limit))% free), peak $(Base.format_bytes(stats.peak_in_use))")
+        lf = largest_free_bytes(stats)
+        lf === nothing ||
+            push!(parts, "largest free block $(Base.format_bytes(lf)) ($(round(Int, 100 * fragmentation(stats)))% fragmented)")
     end
     if registry !== nothing
         rw = resident_weight_bytes(registry)
@@ -159,3 +162,13 @@ log_model_renamed(old::AbstractString, new::AbstractString) =
 # is far too chatty for the default log surface. Enable with JULIA_DEBUG=ReactantServer.
 log_residency_change(name::AbstractString, from, to, nbytes::Integer; memory::AbstractString) =
     (@debug "residency: model moved" name = name from = from to = to bytes = Base.format_bytes(nbytes) memory = memory; nothing)
+
+# One on-demand load or eviction with the numbers admission reasons with: the model's footprint
+# (`W`, `S`, its moving-average load time) and the allocator before and after. Raw byte counts,
+# so the lines can be parsed into a fragmentation-over-time series. `before`/`after` are
+# `_memory_point` snapshots (`nothing` without device stats). Debug level for the same reason as
+# `log_residency_change`: this fires on the request path.
+function log_memory_event(kind::Symbol, name::AbstractString, fp::ModelFootprint, before, after)
+    @debug "memory: weight $(kind)" model = name weight_bytes = fp.weight_bytes max_weight_bytes = fp.max_weight_bytes scratch_bytes = fp.scratch_bytes load_seconds = fp.load_seconds in_use_before = _point_field(before, :in_use) in_use_after = _point_field(after, :in_use) largest_free_before = _point_field(before, :largest_free) largest_free_after = _point_field(after, :largest_free) fragmentation_before = _point_field(before, :fragmentation) fragmentation_after = _point_field(after, :fragmentation)
+    return nothing
+end

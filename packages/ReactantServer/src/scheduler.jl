@@ -671,6 +671,9 @@ function _probe_max_scratch!(s::Scheduler, pinned_bytes::Int)
         max_weight = max(max_weight, model.nbytes)               # == model.nbytes given ascending order
         scratch = _probe_entry_scratch!(s, entry, resettable, pinned_bytes + max_weight)
         max_scratch = max(max_scratch, scratch)
+        # Per-model S for admission (exact with a resettable peak, an upper bound otherwise, since
+        # the monotone peak can carry an earlier model's transient).
+        model_footprint(s.weight_cache, entry).scratch_bytes = scratch
     end
     return max(0, max_scratch)
 end
@@ -1115,6 +1118,9 @@ function _evict_entry!(sch::Scheduler, name::AbstractString)
     entry === nothing && return nothing
     # Release residency outside the lock (device frees can be slow).
     sch.weight_cache === nothing || release_all!(sch.weight_cache, entry)
+    # Close the weights file: it holds the loaded version's inode, which a replaced file keeps alive
+    # (and keeps on disk) until then.
+    close_weights!(entry.weights)
     # Eagerly free every compiled executable (all variants and batch sizes). Waiting for GC would
     # leave the executables' command buffers resident on the device indefinitely (they live outside
     # the BFC arena and only the finalizer reclaims them). Safe here: this runs on the dispatch
@@ -1206,6 +1212,7 @@ function _reprobe_after_load!(sch::Scheduler, entry::ModelEntry)
     end
     pinned = pinned_weight_bytes(sch.registry)
     scratch = _probe_entry_scratch!(sch, entry, resettable, pinned + entry.executable.nbytes)
+    model_footprint(sch.weight_cache, entry).scratch_bytes = scratch
     a = sch.autosize
     lock(sch.weight_cache.lock) do
         max_scratch = max(sch.weight_cache.max_scratch, scratch)

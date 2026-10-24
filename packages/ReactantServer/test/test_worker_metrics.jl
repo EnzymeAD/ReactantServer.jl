@@ -65,6 +65,29 @@ end
     @test occursin("worker_weight_evicts_total", s)
 end
 
+# A backend whose allocator reports a largest free block, to exercise the fragmentation series.
+struct FragStatsBackend <: ReactantServer.AbstractBackend end
+ReactantServer.device_memory_stats(::FragStatsBackend, pool) = (
+    in_use = 600, limit = 1000, free = 400, peak_in_use = 700, pool_bytes = 1000,
+    peak_pool_bytes = 1000, largest_free = 100,
+)
+
+@testset "worker metrics: fragmentation and footprint series" begin
+    sched, _, pool, cfg = _wm_sched()
+    backend = FragStatsBackend()
+    sched.weight_cache = WeightCache(backend, pool, sched.registry, 1 << 20)
+    fp = ReactantServer.model_footprint(sched.weight_cache, sched.registry.by_name["m"])
+    fp.scratch_bytes = 12345
+    ReactantServer.record_load!(fp, 0.5)
+    wm = WorkerMetrics(sched, backend, pool, cfg)
+    s = _expose(wm)
+    @test occursin("worker_device_memory_largest_free_block_bytes 100", s)
+    @test occursin("worker_device_memory_fragmentation 0.75", s)
+    @test occursin("worker_model_scratch_bytes{model=\"m\"} 12345", s)
+    @test occursin("worker_model_load_seconds{model=\"m\"} 0.5", s)
+    @test occursin("worker_weight_load_bytes_total", s)
+end
+
 @testset "worker metrics: request counters" begin
     sched, backend, pool, cfg = _wm_sched()
     wm = WorkerMetrics(sched, backend, pool, cfg)

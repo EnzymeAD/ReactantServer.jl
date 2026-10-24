@@ -52,14 +52,21 @@ include("bundle.jl")
 include("runtime/backend.jl")
 include("runtime/mock_backend.jl")
 include("runtime/memory_pool.jl")
+# Reading weights.safetensors with pread (a file truncated mid-read is an error, not SIGBUS).
+include("runtime/weights_file.jl")
 include("runtime/weights.jl")
 include("runtime/model.jl")
+include("runtime/footprint.jl")
+include("runtime/victim_search.jl")
 include("runtime/weight_cache.jl")
+include("runtime/admission.jl")
 include("runtime/execution.jl")
 # Per-bundle serialized-executable cache (backend-agnostic policy: layout, hashes, invalidation).
 include("runtime/executable_cache.jl")
 # Executable serialization and allocator-statistics bindings, vendored until a Reactant release has them.
 include("runtime/xla_serialization.jl")
+# The hot path's libReactantExtra calls, declared gc_safe so a collection need not wait for them.
+include("runtime/gc_safe_calls.jl")
 include("runtime/reactant_backend.jl")
 # Load-time TF32 stripping for portable artifacts; uses the backend's _RMLIR/_RXLA aliases.
 include("runtime/tf32.jl")

@@ -75,22 +75,20 @@ end
 
 device_ordinal(::ReactantBackend, device) = Int(_RXLA.device_ordinal(device))
 
-to_device(::ReactantBackend, client, array::Array, device) = _RXLA.PJRT.Buffer(client, array, device)
+# The transfers, frees and executions below go through GcSafeXLA (gc_safe_calls.jl): the same C
+# functions Reactant's wrappers call, declared gc_safe, so a garbage collection requested by any
+# thread does not have to wait for a multi-gigabyte upload or a running program to finish.
+to_device(::ReactantBackend, client, array::Array, device) = GcSafeXLA.upload(client, array, device)
 
 buffer_eltype(::ReactantBackend, buffer) = eltype(buffer)
 buffer_size(::ReactantBackend, buffer) = size(buffer)
 
-function to_host!(::ReactantBackend, buffer, dest::Array)
-    _RXLA.to_host(buffer, dest, Reactant.Sharding.NoSharding())
-    return dest
-end
+to_host!(::ReactantBackend, buffer, dest::Array) = GcSafeXLA.to_host!(buffer, dest)
 
-# Eager device-buffer release: run the buffer's registered finalizer now and unregister it so
-# GC will not double-free it later. This reclaims GPU memory immediately on eviction instead of
-# waiting for a stop-the-world GC.gc(). Reactant's XLA.free_buffer is itself the finalizer and
-# does not null the pointer after PjRtBufferFree, so Base.finalize (run-once-and-unregister) is
-# the safe way to trigger it without reaching into Reactant's field layout.
-free_buffer!(::ReactantBackend, buffer) = (Base.finalize(buffer); nothing)
+# Eager device-buffer release, reclaiming GPU memory immediately on eviction instead of waiting for
+# a stop-the-world GC.gc(). GcSafeXLA.free! frees the buffer (gc_safe), nulls its pointer and runs
+# Reactant's finalizer once, which then finds nothing to free, so GC can never double-free it.
+free_buffer!(::ReactantBackend, buffer) = GcSafeXLA.free!(buffer)
 
 # Eager executable release, same rationale and mechanism as free_buffer!. Reactant's
 # PJRT.LoadedExecutable frees the underlying PjRtLoadedExecutable in its GC finalizer
@@ -100,27 +98,15 @@ free_buffer!(::ReactantBackend, buffer) = (Base.finalize(buffer); nothing)
 # command buffers when the executable is destroyed, so finalizing now reclaims them now.
 free_executable!(::ReactantBackend, exec) = (Base.finalize(exec); nothing)
 
-function _flatten_buffers!(acc, x)
-    if x isa _RXLA.AbstractBuffer
-        push!(acc, x)
-    elseif x isa Tuple || x isa AbstractArray
-        for e in x
-            _flatten_buffers!(acc, e)
-        end
-    end
-    return acc
-end
-
 function execute_single_device(
         ::ReactantBackend, exec, device, buffers::AbstractVector,
         donated::AbstractVector{Bool}, num_outputs::Int
     )
-    in_ptrs = (Ptr{Cvoid}[b.buffer for b in buffers]...,)
-    don = (UInt8[d ? 0x01 : 0x00 for d in donated]...,)
-    outs = _RXLA.execute_sharded(exec, device, in_ptrs, don, Val(num_outputs))
-    async = Any[]
-    _flatten_buffers!(async, outs)
-    return Any[_RXLA.synced_buffer(a) for a in async]
+    in_ptrs = Ptr{Cvoid}[b.buffer for b in buffers]
+    don = UInt8[d ? 0x01 : 0x00 for d in donated]
+    # The input buffers own the pointers in `in_ptrs`; keep them alive across the call.
+    outs = GC.@preserve buffers GcSafeXLA.execute(exec, device, in_ptrs, don, num_outputs)
+    return Any[outs...]
 end
 
 # Query the device allocator for memory usage. Only the CUDA client reports this; the CPU client
@@ -135,13 +121,19 @@ function device_memory_stats(::ReactantBackend, pool::MemoryPool)
         limit = (limit === nothing || limit <= 0) ?
             Int(_RXLA.device_properties(pool.device).totalGlobalMem) : Int(limit)
         _orz(x) = x === nothing ? 0 : Int(x)   # the BFC reports pool sizes only once it has allocated
+        pool_bytes = _orz(stats.pool_bytes)
         # `peak_in_use` is the allocator's session high-water mark (the empirical scratch + resident
-        # ceiling). The GPU BFC allocator does not populate `largest_free_block_bytes` (it is left 0),
-        # so we do not surface it; fragmentation is not directly observable from this allocator.
+        # ceiling). `largest_free_block_bytes` is the largest free chunk inside the pool, exact and
+        # cheap (measured on an A6000: it matches the allocator's own dump, about 0.5 us a query).
+        # It counts only memory the pool already holds, so it reads 0 before the first allocation,
+        # and without preallocation the not-yet-claimed remainder is free too: one fresh region can
+        # serve an allocation of up to `limit - pool_bytes`.
+        largest_free = max(Int(stats.largest_free_block_bytes), max(limit - pool_bytes, 0))
         return (
             in_use = in_use, limit = limit, free = max(limit - in_use, 0),
             peak_in_use = Int(stats.peak_bytes_in_use),
-            pool_bytes = _orz(stats.pool_bytes), peak_pool_bytes = _orz(stats.peak_pool_bytes),
+            pool_bytes = pool_bytes, peak_pool_bytes = _orz(stats.peak_pool_bytes),
+            largest_free = min(largest_free, max(limit - in_use, 0)),
         )
     catch
         return nothing

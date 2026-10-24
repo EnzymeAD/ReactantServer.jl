@@ -39,9 +39,14 @@ Prometheus.metric_names(::WorkerSnapshotCollector) = (
     "worker_weight_cache_max_bytes", "worker_weight_cache_pinned_bytes",
     "worker_weight_cache_max_scratch_bytes", "worker_weight_pool_bytes",
     "worker_weight_loads_total", "worker_weight_evicts_total",
-    "worker_weight_load_seconds_total", "worker_device_memory_in_use_bytes",
+    "worker_weight_load_seconds_total", "worker_weight_load_bytes_total",
+    "worker_weight_compactions_total", "worker_weight_fallback_compactions_total",
+    "worker_weight_admission_failures_total",
+    "worker_model_scratch_bytes", "worker_model_load_seconds",
+    "worker_device_memory_in_use_bytes",
     "worker_device_memory_limit_bytes", "worker_device_memory_free_bytes",
     "worker_device_memory_peak_in_use_bytes", "worker_device_memory_pool_bytes",
+    "worker_device_memory_largest_free_block_bytes", "worker_device_memory_fragmentation",
     "worker_device_memory_process_used_bytes", "worker_device_memory_out_of_pool_bytes",
     "worker_models_loaded", "worker_models_resident", "worker_resident_weight_bytes",
     "worker_executable_cache_hits_total", "worker_executable_cache_misses_total",
@@ -193,6 +198,39 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
                 "worker_weight_load_seconds_total", "counter",
                 "Cumulative time spent loading weights (seconds).", wc.load_seconds
             ),
+            _scalar(
+                "worker_weight_load_bytes_total", "counter",
+                "Weight bytes transferred by on-demand loads (over load seconds: the host-to-device bandwidth).",
+                wc.load_bytes
+            ),
+            _scalar("worker_weight_compactions_total", "counter", "Memory compactions, from any trigger.", wc.compactions),
+            _scalar(
+                "worker_weight_fallback_compactions_total", "counter",
+                "Compactions admission ran because evicting alone could not make a model fit.",
+                wc.fallback_compactions
+            ),
+            _scalar(
+                "worker_weight_admission_failures_total", "counter",
+                "Models that could not be placed on the device even after compacting.", wc.admission_failures
+            ),
+        )
+        # Per-model footprint, for the models measured or loaded so far.
+        fpsamples(f) = Prometheus.Sample[
+            Prometheus.Sample(nothing, model_ln, Prometheus.LabelValues((name,)), Float64(f(fp)))
+                for (name, fp) in wc.footprints
+        ]
+        push!(
+            metrics,
+            Prometheus.Metric(
+                "gauge", "worker_model_scratch_bytes",
+                "Measured transient bytes of one execution at the largest compiled batch (0 = unmeasured).",
+                fpsamples(fp -> fp.scratch_bytes)
+            ),
+            Prometheus.Metric(
+                "gauge", "worker_model_load_seconds",
+                "Moving average of the model's on-demand weight load time (seconds; 0 = never loaded).",
+                fpsamples(fp -> fp.load_seconds)
+            ),
         )
     end
 
@@ -230,6 +268,21 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
                 "Bytes the allocator has claimed from the device for its pool.", dm.pool_bytes
             ),
         )
+        lf = largest_free_bytes(dm)
+        if lf !== nothing
+            push!(
+                metrics,
+                _scalar(
+                    "worker_device_memory_largest_free_block_bytes", "gauge",
+                    "Largest single allocation the device allocator can satisfy now (bytes).", lf
+                ),
+                _scalar(
+                    "worker_device_memory_fragmentation", "gauge",
+                    "1 - largest free block / free bytes: 0 = free memory is contiguous, near 1 = splintered.",
+                    fragmentation(dm)
+                ),
+            )
+        end
         # Out-of-pool driver memory: what the driver says this process holds (nvidia-smi) minus the
         # BFC arena. The arena is preallocated, so the remainder is the CUDA context + loaded modules
         # + command buffers / CUDA graphs, i.e. the memory that lives OUTSIDE the pool and competes

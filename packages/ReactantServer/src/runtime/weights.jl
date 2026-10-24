@@ -23,18 +23,32 @@ end
 
 function load_pinned_weights(backend::AbstractBackend, pool::MemoryPool, st, names::Vector{String})
     bufs = Vector{Any}(undef, length(names))
-    for (i, name) in enumerate(names)
-        haskey(st, name) || throw(ErrorException("weight '$name' missing from safetensors"))
-        host = collect(st[name])                 # materialize the lazy mmap view to a contiguous Array
-        bufs[i] = to_device(backend, pool.client, host, pool.device)
+    try
+        for (i, name) in enumerate(names)
+            haskey(st, name) || throw(ErrorException("weight '$name' missing from safetensors"))
+            host = read_weight(st, name)             # a contiguous Array of the tensor's Julia shape
+            bufs[i] = to_device(backend, pool.client, host, pool.device)
+        end
+    catch
+        _free_partial!(backend, bufs)
+        rethrow()
     end
     return bufs
+end
+
+# Free the buffers a failed multi-tensor upload had already created, so an allocation failure
+# midway (the likely one: out of device memory) does not strand them until GC.
+function _free_partial!(backend::AbstractBackend, bufs::Vector{Any})
+    for i in eachindex(bufs)
+        isassigned(bufs, i) && free_buffer!(backend, bufs[i])
+    end
+    return nothing
 end
 
 """
     materialize_host_weights(st, names) -> Vector{Any}
 
-Materialize the named weights from the lazy mmap safetensors views into resident host Arrays,
+Read the named weights from the weights file into resident host Arrays,
 in weight_names order. This is the expensive step (a layout copy at host-memory speed); doing
 it once at startup and keeping the result resident in RAM lets an on-demand GPU load be a pure
 host->device transfer (see `transfer_to_device`) rather than a re-materialization.
@@ -43,7 +57,7 @@ function materialize_host_weights(st, names::Vector{String})
     hosts = Vector{Any}(undef, length(names))
     for (i, name) in enumerate(names)
         haskey(st, name) || throw(ErrorException("weight '$name' missing from safetensors"))
-        hosts[i] = collect(st[name])
+        hosts[i] = read_weight(st, name)
     end
     return hosts
 end
@@ -61,21 +75,71 @@ host_materialize(::PrivateWeightStore, key, st, names::Vector{String}; content::
 # `content` identifies the weights file's on-disk version (see `weights_file_token`); it keys the
 # shared region so a weights-only update materializes a NEW region instead of reusing the stale
 # one (which persists in /dev/shm across worker restarts by design).
+# `verify` runs after the copy and before the region is published; throwing there leaves it
+# unpublished.
 function host_materialize(
         store::SharedWeightStore, key, st, names::Vector{String};
-        content::UInt64 = UInt64(0)
+        content::UInt64 = UInt64(0), verify = () -> nothing
     )
-    specs = [(eltype(st[n]), size(st[n])) for n in names]
+    specs = [weight_spec(st, n) for n in names]
     fill! = function (arrays)
         for (i, n) in enumerate(names)
-            copyto!(arrays[i], st[n])
+            read_weight!(arrays[i], st, n)
         end
+        verify()
         return
     end
     return materialize_host_weights!(
         store, key, weights_digest(String(key), specs; content = content),
         specs, fill!
     )
+end
+
+"""
+    host_materialize(store, entry, names) -> Vector{Any}
+
+Materialize `entry`'s host weight floor, labeled with the version of the weights file `entry`
+actually opened (`entry.weights_id`), never with a fresh stat of the path: a deploy that replaces
+the file after the bundle loaded must not publish the old bytes under the new version's label for
+other workers to reuse. After copying, the file is checked for an in-place modification (same
+inode, different size or mtime), which would mean the bytes changed underneath the read; that
+fails the load rather than publishing mixed bytes. When the node cannot back a shared region
+([`SharedStoreFull`](@ref)), the model gets a private copy instead.
+"""
+function host_materialize(store::WeightStore, entry::ModelEntry, names::Vector{String})
+    st = entry.weights
+    if store isa SharedWeightStore
+        try
+            return host_materialize(
+                store, entry.name, st, names; content = weights_file_token(entry.weights_id),
+                verify = () -> _check_unmodified(entry)
+            )
+        catch err
+            err isa SharedStoreFull || rethrow()
+            @warn "shared host weights: the node cannot back this model's region; using a private copy" model = entry.name exception = err
+        end
+    end
+    arrays = materialize_host_weights(st, names)
+    _check_unmodified(entry)
+    return arrays
+end
+
+# A weights file must be replaced atomically (write a new file, rename it over the old one): the
+# open file then keeps the old version's bytes, consistent with `entry.weights_id`. Writing into
+# the loaded file in place changes the bytes mid-read, which nothing downstream could detect.
+function _check_unmodified(entry::ModelEntry)
+    id = entry.weights_id
+    id == NO_WEIGHTS_FILE && return nothing
+    now = weights_file_id(entry.weights_path)
+    if now.device == id.device && now.inode == id.inode && now != id
+        throw(
+            ErrorException(
+                "weights file $(entry.weights_path) was modified in place after it was loaded; " *
+                    "deploy weights by writing a new file and renaming it over the old one"
+            )
+        )
+    end
+    return nothing
 end
 
 """
@@ -104,8 +168,13 @@ cost paid on an on-demand load when weights are pinned in host RAM.
 """
 function transfer_to_device(backend::AbstractBackend, pool::MemoryPool, hosts::Vector{Any})
     bufs = Vector{Any}(undef, length(hosts))
-    for (i, h) in enumerate(hosts)
-        bufs[i] = to_device(backend, pool.client, h, pool.device)
+    try
+        for (i, h) in enumerate(hosts)
+            bufs[i] = to_device(backend, pool.client, h, pool.device)
+        end
+    catch
+        _free_partial!(backend, bufs)
+        rethrow()
     end
     return bufs
 end
@@ -121,8 +190,8 @@ function weights_nbytes(st, names::Vector{String})
     total = 0
     for name in names
         haskey(st, name) || throw(ErrorException("weight '$name' missing from safetensors"))
-        v = st[name]
-        total += prod(size(v)) * sizeof(eltype(v))
+        T, dims = weight_spec(st, name)
+        total += prod(dims; init = 1) * sizeof(T)
     end
     return total
 end
