@@ -28,6 +28,7 @@ const Compiler = Reactant.Compiler
 export IOSpec, write_bundle, export_bundle, collect_provenance
 export bundle_entry_arity, bundle_arity_report, assert_bundle_arity
 export DetectorConfig, export_two_stage_detector, read_stage_bundle, stablehlo_text
+export read_bundle_weights
 
 # ============================================================================
 # Provenance
@@ -267,10 +268,42 @@ function _write_variant_modules(dir::AbstractString, prefix::AbstractString, mod
     return sizes
 end
 
+# `axis_order: xla` in a weights file's metadata: each header shape is the program's shape and the
+# data is row-major in it, which is the Julia array of the reversed shape, unchanged. Without the
+# key, the header holds the Julia shape and the data is permuted (SafeTensors.jl's convention).
+const AXIS_ORDER_KEY = "axis_order"
+const AXIS_ORDER_XLA = "xla"
+
+# The array as the program sees it, a lazy view: SafeTensors.serialize records its size (the
+# reversed Julia shape) as the header shape and writes it permuted to row-major, which undoes the
+# view, so the file holds the array's own memory.
+_program_order(a::AbstractArray) = ndims(a) <= 1 ? a : PermutedDimsArray(a, ntuple(i -> ndims(a) + 1 - i, ndims(a)))
+
+"""
+    read_bundle_weights(dir) -> Vector{Pair{String, Array}}
+
+A bundle's weights as `name => array` in `argument_order`, each array in the axis order of the
+program's StableHLO signature (for a torch export, torch order), whichever layout the weights file
+uses. Reads the file the manifest's `weights_file` names (default `weights.safetensors`).
+"""
+function read_bundle_weights(dir::AbstractString)
+    manifest = YAML.load_file(joinpath(dir, "manifest.yaml"))
+    path = joinpath(dir, get(manifest, "weights_file", "weights.safetensors"))
+    st = SafeTensors.deserialize(path; mmap = false)
+    md = st.metadata
+    order = JSON3.read(md["argument_order"], Vector{String})
+    ax = get(md, AXIS_ORDER_KEY, nothing)
+    (ax === nothing || ax == AXIS_ORDER_XLA) || error("ReactantServerExport: $path has unsupported axis_order $(repr(ax))")
+    # SafeTensors returns each tensor in its header's shape: already the program's for an `xla`
+    # file; the Julia shape for a legacy one, which the program takes reversed.
+    prog(a) = (ax !== nothing || ndims(a) <= 1) ? collect(a) : permutedims(collect(a), ndims(a):-1:1)
+    return Pair{String, Array}[n => prog(st[n]) for n in order]
+end
+
 """
     write_bundle(dir; name, executable_inputs, executable_outputs, modules, weights,
                  client_inputs=nothing, client_outputs=nothing, input_shapes=nothing,
-                 provenance=Dict()) -> dir
+                 provenance=Dict(), layout=:xla) -> dir
 
 Write a bundle. With `input_shapes === nothing`, `modules` is a `Dict` keyed by batch size of
 StableHLO modules (or text or bytes); a single entry under key `0` writes `model.mlir`, otherwise
@@ -291,6 +324,14 @@ preprocess/postprocess transform between the two. They are emitted only when giv
 (non-batch) axis is encoded by passing `-1` for that axis size (e.g. the variable detection count
 of a postprocessed detector). The server requires these only when a `model.jl` is present, so the
 caller is responsible for also shipping `model.jl` into the bundle dir (see the converter handlers).
+
+`layout` chooses how `weights.safetensors` stores each array. `:xla` (the default) writes the
+array's memory unchanged under the program's shape (the reversed Julia shape) and marks the file
+`axis_order: xla`, so the server reads each tensor with no permute; the manifest's
+`format_version` is `"2.1"`, which ReactantServer 0.2 and later load and older servers refuse.
+`:legacy` writes the Julia shape with the data permuted to row-major and `format_version: "2.0"`,
+for servers older than 0.2 (ReactantServer 0.2 migrates such bundles with
+`runtime.weights_migration`).
 """
 function write_bundle(
         dir::AbstractString; name::AbstractString,
@@ -300,18 +341,23 @@ function write_bundle(
         client_inputs::Union{Nothing, AbstractVector{IOSpec}} = nothing,
         client_outputs::Union{Nothing, AbstractVector{IOSpec}} = nothing,
         input_shapes::Union{Nothing, AbstractVector} = nothing,
-        provenance = Dict{String, Any}()
+        provenance = Dict{String, Any}(),
+        layout::Symbol = :xla
     )
+    layout in (:xla, :legacy) || error("ReactantServerExport: layout must be :xla or :legacy, got :$layout")
     basename(normpath(dir)) == String(name) ||
         error("ReactantServerExport: bundle dir basename must equal name '$name' (got '$(basename(normpath(dir)))')")
     mkpath(dir)
 
     wnames = String[String(first(p)) for p in weights]
-    wdata = Dict{String, AbstractArray}(String(first(p)) => collect(last(p)) for p in weights)
-    SafeTensors.serialize(
-        joinpath(dir, "weights.safetensors"), wdata,
-        Dict("argument_order" => JSON3.write(wnames))
-    )
+    wmeta = Dict("argument_order" => JSON3.write(wnames))
+    if layout === :xla
+        wmeta[AXIS_ORDER_KEY] = AXIS_ORDER_XLA
+        wdata = Dict{String, AbstractArray}(String(first(p)) => _program_order(collect(last(p))) for p in weights)
+    else
+        wdata = Dict{String, AbstractArray}(String(first(p)) => collect(last(p)) for p in weights)
+    end
+    SafeTensors.serialize(joinpath(dir, "weights.safetensors"), wdata, wmeta)
 
     # A `git_diff` provenance entry (from `collect_provenance` on a dirty tree) is
     # materialized as a patch file in the bundle rather than embedded in the manifest;
@@ -324,7 +370,7 @@ function write_bundle(
     end
 
     manifest = Dict{String, Any}(
-        "format_version" => "2.0",
+        "format_version" => layout === :xla ? "2.1" : "2.0",
         "name" => String(name),
         "executable_inputs" => [_spec_dict(s) for s in executable_inputs],
         "executable_outputs" => [_spec_dict(s) for s in executable_outputs],
@@ -593,6 +639,9 @@ Export a model to a bundle, naming the frontend explicitly so the call site is u
   `f(inputs..., weights...)` with explicit `name => array` weight pairs.
 - `export_bundle(:pytorch, model, example_inputs::Tuple; ...)` — a `torch.nn.Module`; provided
   by the package extension, so it requires `using PythonCall`.
+
+Every frontend takes `layout` (default `:xla`), passed to [`write_bundle`](@ref): `:legacy` writes
+weights that servers older than ReactantServer 0.2 can load.
 """
 export_bundle(frontend::Symbol, args...; kwargs...) = export_bundle(Val(frontend), args...; kwargs...)
 
@@ -605,7 +654,7 @@ export_bundle(::Val{:torchscript}, args...; kwargs...) =
 
 """
     export_bundle(:lux, model, ps, st, example_input; dir, name, input_name="input",
-                  output_name="output", batch_sizes=[1], provenance=Dict()) -> dir
+                  output_name="output", batch_sizes=[1], provenance=Dict(), layout=:xla) -> dir
 
 Trace `model(x, ps, st)` (taking the first return as the output) at each batch size and
 write a bundle. The batch dimension is the last Julia axis (Lux convention) and the leading
@@ -615,7 +664,7 @@ function export_bundle(
         ::Val{:lux}, model, ps, st, example_input::AbstractArray;
         dir::AbstractString, name::AbstractString,
         input_name::AbstractString = "input", output_name::AbstractString = "output",
-        batch_sizes::AbstractVector{<:Integer} = [1], provenance = Dict{String, Any}()
+        batch_sizes::AbstractVector{<:Integer} = [1], provenance = Dict{String, Any}(), layout::Symbol = :xla
     )
     leaves = _named_leaves(ps)
     isempty(leaves) && error("ReactantServerExport: model has no array parameters to export")
@@ -653,7 +702,7 @@ function export_bundle(
         write_bundle(
             dir; name = name, executable_inputs = inputs, executable_outputs = outputs,
             modules = modules, weights = [wnames[i] => warrays[i] for i in eachindex(wnames)],
-            provenance = prov
+            provenance = prov, layout
         )
     end
     return dir
@@ -665,7 +714,7 @@ end
                   output_select = y -> (y isa Tuple ? y : (y,)),
                   input_batch_axes=nothing, output_batch_axes=nothing,
                   client_inputs=nothing, client_outputs=nothing,
-                  batch_sizes=[1], provenance=Dict()) -> dir
+                  batch_sizes=[1], provenance=Dict(), layout=:xla) -> dir
 
 Multi-input / multi-output Lux export. `client_inputs`/`client_outputs` (each `nothing` or a
 `Vector{IOSpec}`) declare the wire-facing spec when a shipped `model.jl` postprocess transforms
@@ -692,7 +741,7 @@ function export_bundle(
         output_batch_axes::Union{Nothing, AbstractVector} = nothing,
         client_inputs::Union{Nothing, AbstractVector{IOSpec}} = nothing,
         client_outputs::Union{Nothing, AbstractVector{IOSpec}} = nothing,
-        batch_sizes::AbstractVector{<:Integer} = [1], provenance = Dict{String, Any}()
+        batch_sizes::AbstractVector{<:Integer} = [1], provenance = Dict{String, Any}(), layout::Symbol = :xla
     )
     leaves = _named_leaves(ps)
     isempty(leaves) && error("ReactantServerExport: model has no array parameters to export")
@@ -773,7 +822,7 @@ function export_bundle(
         write_bundle(
             dir; name = name, executable_inputs = in_specs, executable_outputs = out_specs,
             modules = modules, weights = [wnames[i] => warrays[i] for i in eachindex(wnames)],
-            client_inputs = client_inputs, client_outputs = client_outputs, provenance = prov
+            client_inputs = client_inputs, client_outputs = client_outputs, provenance = prov, layout
         )
     end
     return dir
@@ -781,7 +830,7 @@ end
 
 """
     export_bundle(:reactant, f, inputs::Tuple, weights; dir, name, input_names=nothing,
-                  output_name="output", provenance=Dict()) -> dir
+                  output_name="output", provenance=Dict(), layout=:xla) -> dir
 
 Generic single-size export for any Reactant-traceable `f(inputs..., weights...)`. `weights`
 is an ordered collection of `name => array` pairs. Produces one unbatched `model.mlir`.
@@ -790,7 +839,7 @@ function export_bundle(
         ::Val{:reactant}, f, inputs::Tuple, weights::AbstractVector{<:Pair};
         dir::AbstractString, name::AbstractString,
         input_names = nothing, output_name::AbstractString = "output",
-        provenance = Dict{String, Any}()
+        provenance = Dict{String, Any}(), layout::Symbol = :xla
     )
     wnames = String[String(first(p)) for p in weights]
     warrays = Any[last(p) for p in weights]
@@ -815,7 +864,7 @@ function export_bundle(
         write_bundle(
             dir; name = name, executable_inputs = in_specs, executable_outputs = out_specs,
             modules = Dict(0 => mod), weights = [wnames[i] => warrays[i] for i in eachindex(wnames)],
-            provenance = prov
+            provenance = prov, layout
         )
     end
     return dir

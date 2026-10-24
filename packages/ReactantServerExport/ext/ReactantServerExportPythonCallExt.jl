@@ -335,7 +335,7 @@ end
 """
     export_bundle(:pytorch, model, example_inputs::Tuple; dir, name,
                   input_names=nothing, output_name="output", output_names=nothing,
-                  batch_sizes=[1], provenance=Dict()) -> dir
+                  batch_sizes=[1], provenance=Dict(), layout=:xla) -> dir
 
 Trace `model` (a `torch.nn.Module`) at each batch size and write a bundle.
 `example_inputs` is a tuple of Julia arrays whose trailing Julia axis is the
@@ -399,7 +399,7 @@ function export_bundle(
         matmul_precision::Union{Nothing, AbstractString} = nothing,
         client_inputs = nothing, client_outputs = nothing,
         axis_letters::Union{Nothing, AbstractDict} = nothing,
-        provenance = Dict{String, Any}()
+        provenance = Dict{String, Any}(), layout::Symbol = :xla
     )
     isempty(example_inputs) && error("PyTorchExport: at least one example input is required")
     isempty(batch_sizes) && error("PyTorchExport: batch_sizes cannot be empty")
@@ -574,7 +574,7 @@ function export_bundle(
             input_shapes = variant_keys,
             weights = [kept_names[i] => kept_weights[i] for i in eachindex(kept_names)],
             client_inputs = client_inputs, client_outputs = client_outputs,
-            provenance = prov
+            provenance = prov, layout
         )
     else
         ReactantServerExport.write_bundle(
@@ -585,7 +585,7 @@ function export_bundle(
             modules = modules_by_variant[variant_keys[1]],
             weights = [kept_names[i] => kept_weights[i] for i in eachindex(kept_names)],
             client_inputs = client_inputs, client_outputs = client_outputs,
-            provenance = prov
+            provenance = prov, layout
         )
     end
     return dir
@@ -709,7 +709,7 @@ function export_bundle(
         matmul_precision::Union{Nothing, AbstractString} = nothing,
         client_inputs = nothing, client_outputs = nothing,
         axis_letters::Union{Nothing, AbstractDict} = nothing,
-        provenance = Dict{String, Any}(),
+        provenance = Dict{String, Any}(), layout::Symbol = :xla,
         map_location = "cpu",
         wrap = nothing
     )
@@ -725,7 +725,7 @@ function export_bundle(
         output_name = output_name, output_names = output_names,
         batch_sizes = batch_sizes, shape_variants = shape_variants, matmul_precision = matmul_precision,
         client_inputs = client_inputs, client_outputs = client_outputs, axis_letters = axis_letters,
-        provenance = prov, wrap = wrap
+        provenance = prov, layout, wrap = wrap
     )
 end
 

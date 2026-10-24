@@ -57,13 +57,9 @@ function read_stage_bundle(dir::AbstractString)
             texts[v] = stablehlo_text(one_module(Regex("^model\\.v$(i - 1)(\\.b\\d+)?\\.mlir\$")))
         end
     end
-    st = SafeTensors.deserialize(joinpath(d, "weights.safetensors"); mmap = false)
-    order = JSON3.read(st.metadata["argument_order"], Vector{String})
-    # A bundle stores each weight as the Julia array the server hands to the executable, whose
-    # StableHLO entry signature lists the axes in reverse (row-major) order. `Ops.hlo_call` on the
-    # program text takes arrays in the signature's order, so reverse the axes.
-    unview(a) = ndims(a) <= 1 ? collect(a) : permutedims(collect(a), ndims(a):-1:1)
-    return (; texts, weights = Pair{String, Any}[n => unview(st[n]) for n in order], input_shapes = shapes)
+    # `Ops.hlo_call` on the program text takes arrays in the signature's axis order.
+    weights = Pair{String, Any}[n => a for (n, a) in read_bundle_weights(d)]
+    return (; texts, weights, input_shapes = shapes)
 end
 
 const _TRIM_MODEL_JL = """
@@ -85,7 +81,7 @@ register_model(basename(@__DIR__); postprocess = _trim)
 """
     export_two_stage_detector(dir; name, input, stage1, stage1_weights, stage2, stage2_weights, cfg,
                               input_shapes=nothing, output_columns=6, output_layout=:cn,
-                              glue_precision=Float64, provenance=Dict()) -> dir
+                              glue_precision=Float64, provenance=Dict(), layout=:xla) -> dir
 
 Export a two-stage detector as one plain bundle.
 
@@ -109,6 +105,7 @@ fixed-size detection buffer.
   arity is checked against them before anything is written.
 - `output_columns`: 6 for rows `[x1, y1, x2, y2, score, class]`, 5 for `[x1, y1, x2, y2, score]`.
 - `output_layout`: `:cn` returns `OUTPUT__0` as `(columns, N)`; `:cn1` as `(columns, N, 1)`.
+- `layout`: how `weights.safetensors` stores the weights, see [`write_bundle`](@ref).
 
 The executable returns `DETECTIONS` (`(columns, detections_per_img)` in the chosen layout, zero
 past the count) and `NUM_DETECTIONS` (`Int64`, length 1); `client_outputs` declares the trimmed
@@ -120,7 +117,7 @@ function export_two_stage_detector(
         stage1::AbstractDict, stage1_weights, stage2::AbstractString, stage2_weights,
         cfg::Detection.DetectorConfig, input_shapes::Union{Nothing, AbstractVector} = nothing,
         output_columns::Integer = 6, output_layout::Symbol = :cn,
-        glue_precision::Type = Float64, provenance = Dict{String, Any}()
+        glue_precision::Type = Float64, provenance = Dict{String, Any}(), layout::Symbol = :xla
     )
     output_columns in (5, 6) || error("ReactantServerExport: output_columns must be 5 or 6, got $output_columns")
     output_layout in (:cn, :cn1) || error("ReactantServerExport: output_layout must be :cn or :cn1, got $output_layout")
@@ -185,7 +182,7 @@ function export_two_stage_detector(
             ],
             modules = input_shapes === nothing ? modules[Int[]] : modules,
             weights, client_outputs = [IOSpec("OUTPUT__0", Float32, client_shape; letters)],
-            input_shapes, provenance = prov
+            input_shapes, provenance = prov, layout
         )
     end
     write(joinpath(dir, "model.jl"), _TRIM_MODEL_JL)
