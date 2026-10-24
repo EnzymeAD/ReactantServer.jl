@@ -75,21 +75,71 @@ host_materialize(::PrivateWeightStore, key, st, names::Vector{String}; content::
 # `content` identifies the weights file's on-disk version (see `weights_file_token`); it keys the
 # shared region so a weights-only update materializes a NEW region instead of reusing the stale
 # one (which persists in /dev/shm across worker restarts by design).
+# `verify` runs after the copy and before the region is published; throwing there leaves it
+# unpublished.
 function host_materialize(
         store::SharedWeightStore, key, st, names::Vector{String};
-        content::UInt64 = UInt64(0)
+        content::UInt64 = UInt64(0), verify = () -> nothing
     )
     specs = [(eltype(st[n]), size(st[n])) for n in names]
     fill! = function (arrays)
         for (i, n) in enumerate(names)
             copyto!(arrays[i], st[n])
         end
+        verify()
         return
     end
     return materialize_host_weights!(
         store, key, weights_digest(String(key), specs; content = content),
         specs, fill!
     )
+end
+
+"""
+    host_materialize(store, entry, names) -> Vector{Any}
+
+Materialize `entry`'s host weight floor, labeled with the version of the weights file `entry`
+actually mapped (`entry.weights_id`), never with a fresh stat of the path: a deploy that replaces
+the file after the bundle loaded must not publish the old bytes under the new version's label for
+other workers to reuse. After copying, the file is checked for an in-place modification (same
+inode, different size or mtime), which would mean the mapping changed underneath the copy; that
+fails the load rather than publishing mixed bytes. When the node cannot back a shared region
+([`SharedStoreFull`](@ref)), the model gets a private copy instead.
+"""
+function host_materialize(store::WeightStore, entry::ModelEntry, names::Vector{String})
+    st = entry.weights
+    if store isa SharedWeightStore
+        try
+            return host_materialize(
+                store, entry.name, st, names; content = weights_file_token(entry.weights_id),
+                verify = () -> _check_unmodified(entry)
+            )
+        catch err
+            err isa SharedStoreFull || rethrow()
+            @warn "shared host weights: the node cannot back this model's region; using a private copy" model = entry.name exception = err
+        end
+    end
+    arrays = materialize_host_weights(st, names)
+    _check_unmodified(entry)
+    return arrays
+end
+
+# A weights file must be replaced atomically (write a new file, rename it over the old one): the
+# mapping then keeps the old file's bytes, consistent with `entry.weights_id`. Writing into the
+# mapped file in place changes the mapped bytes mid-copy, which nothing downstream could detect.
+function _check_unmodified(entry::ModelEntry)
+    id = entry.weights_id
+    id == NO_WEIGHTS_FILE && return nothing
+    now = weights_file_id(entry.weights_path)
+    if now.device == id.device && now.inode == id.inode && now != id
+        throw(
+            ErrorException(
+                "weights file $(entry.weights_path) was modified in place after it was loaded; " *
+                    "deploy weights by writing a new file and renaming it over the old one"
+            )
+        )
+    end
+    return nothing
 end
 
 """

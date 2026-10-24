@@ -111,6 +111,15 @@ attach one copy and each transfers it to its own device. `host_materialize` rout
 the configured store, which is what makes this a configuration decision rather than a code
 change.
 
+Each shared copy is labeled with the version of the weights file the worker actually mapped (its
+device, inode, size and modification time), so workers never share a copy of one version under
+another version's label. Deploy new weights by writing a new file and renaming it over the old
+one: a worker that already loaded the model keeps serving the old bytes until it reloads, and its
+shared copy stays labeled as the old version. Writing into a loaded weights file in place is
+detected and fails that model's load instead of copying mixed bytes. When the node cannot back
+a new shared copy (`/dev/shm` full, or the container's memory limit reached), the worker logs a
+warning and gives that model a private copy instead of failing.
+
 The regions and their lock files are created with mode `666` by default so containers
 running as unrelated UIDs can share them; that is world-writable, so set
 `runtime.shared_host_weights_mode: "660"` on production and multi-user systems (the server

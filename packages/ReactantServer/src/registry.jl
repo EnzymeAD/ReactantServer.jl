@@ -70,7 +70,21 @@ mutable struct ModelEntry <: AbstractDispatchEntry
     sched::Union{ModelSchedState, Nothing}    # scheduling state; `nothing` until the scheduler prepares it
     preprocess::Function
     postprocess::Function
+    # Which on-disk version of the weights file `weights` maps, taken from the open file when it was
+    # mapped. Host copies are labeled with this (never with a fresh stat of the path, which can name
+    # a newer file than the bytes in `weights`).
+    weights_id::WeightsFileId
 end
+
+# Without an explicit file id (hand-built entries, tests) the path is stat'ed now.
+ModelEntry(
+    name, manifest, mlir_bytes::Dict{VariantKey, Dict{Int, Vector{UInt8}}}, weights_path, weights,
+    executable, sched, preprocess, postprocess
+) =
+    ModelEntry(
+    name, manifest, mlir_bytes, weights_path, weights, executable, sched, preprocess, postprocess,
+    weights_file_id(weights_path)
+)
 
 # Convenience constructor accepting a flat batch-size -> bytes map, wrapped as the single default
 # input-shape variant `Int[]`. Keeps hand-built entries (tests, fixtures) working while the field

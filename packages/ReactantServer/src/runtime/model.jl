@@ -66,10 +66,7 @@ function build_loaded_model(
         weights = transfer_to_device(backend, pool, host_weights)
         host_weights = nothing                       # device-pinned never evicts; no host floor needed
     elseif state == PINNED_SYSTEM
-        host_weights = host_materialize(
-            store, entry.name, entry.weights, wnames;
-            content = weights_file_token(entry.weights_path)
-        )
+        host_weights = host_materialize(store, entry, wnames)
     end
     np = num_parameters(sig)
     # One executable per (variant, batch size); all share the single weight set loaded above.

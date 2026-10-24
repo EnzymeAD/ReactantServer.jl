@@ -44,6 +44,85 @@ end
     rm(dir; recursive = true, force = true)
 end
 
+@testset "weights_file_id names the mapped file; an atomic replace is a new version" begin
+    dir = mktempdir()
+    p = joinpath(dir, "weights.safetensors")
+    write(p, rand(UInt8, 64))
+    mapped = open(io -> weights_file_id(stat(io)), p)       # taken from the open file, as at load
+    @test mapped == weights_file_id(p)
+    @test weights_file_token(mapped) == weights_file_token(p)
+    # Deploy a new file with the same size and the same mtime by writing it beside the old one and
+    # renaming it over: only the inode tells the versions apart, and it must.
+    q = joinpath(dir, "weights.new")
+    write(q, rand(UInt8, 64))
+    run(`touch -r $p $q`)
+    mv(q, p; force = true)
+    now = weights_file_id(p)
+    @test now.size == mapped.size && now.mtime == mapped.mtime
+    @test now.inode != mapped.inode
+    @test weights_file_token(now) != weights_file_token(mapped)
+    @test weights_file_id("") == NO_WEIGHTS_FILE && weights_file_token(NO_WEIGHTS_FILE) == 0
+    rm(dir; recursive = true, force = true)
+end
+
+@testset "SharedWeightStore: a region the node cannot back fails cleanly (no SIGBUS)" begin
+    if !(Sys.islinux() && isdir("/dev/shm"))
+        @test_skip "shared weight store requires Linux /dev/shm"
+    else
+        key = "wsfull_" * string(getpid())
+        specs = [(Float32, (4,))]
+        dg = weights_digest(key, specs)
+        region = "/dev/shm/rsw-" * key * "-" * string(dg; base = 16)
+        filled = Ref(false)
+        # Simulate a full /dev/shm (ENOSPC = 28): the reservation fails before any page is touched.
+        saved = ReactantServerCore._RESERVE_REGION[]
+        ReactantServerCore._RESERVE_REGION[] = (name, bytes) -> Cint(28)
+        try
+            err = try
+                materialize_host_weights!(SharedWeightStore(), key, dg, specs, a -> (filled[] = true))
+                nothing
+            catch e
+                e
+            end
+            @test err isa SharedStoreFull
+            @test !filled[]                                  # nothing was written
+            @test !isfile(region)                            # and nothing is left behind
+        finally
+            ReactantServerCore._RESERVE_REGION[] = saved
+        end
+        # The real reservation succeeds for a normal region.
+        store = SharedWeightStore()
+        arrs = materialize_host_weights!(store, key, dg, specs, a -> (a[1] .= 7.0f0))
+        @test arrs[1] == fill(7.0f0, 4)
+        arrs = nothing
+        release_host_weights!(store, key)
+        @test !isfile(region)
+    end
+end
+
+@testset "SharedWeightStore: waiting on a peer's lock does not block garbage collection" begin
+    if !(Sys.islinux() && isdir("/dev/shm")) || Threads.nthreads() < 2
+        @test_skip "needs Linux /dev/shm and at least two threads"
+    else
+        lockpath = "/dev/shm/rsw-gcwait_" * string(getpid()) * ".lock"
+        holder = ReactantServerCore._open_lock(lockpath)
+        waiter = ReactantServerCore._open_lock(lockpath)
+        # flock conflicts between separate open file descriptions, even within one process, so the
+        # waiter below blocks exactly as it would behind a peer worker filling the region.
+        @test ReactantServerCore._flock(holder, ReactantServerCore._LOCK_EX) == 0
+        t = Threads.@spawn ReactantServerCore._flock(waiter, ReactantServerCore._LOCK_SH)
+        sleep(0.2)                                           # let the waiter block in flock
+        @test !istaskdone(t)
+        gc_seconds = @elapsed GC.gc(false)
+        @test gc_seconds < 0.15                              # a plain ccall would hold it until release
+        ReactantServerCore._flock(holder, ReactantServerCore._LOCK_UN)
+        @test fetch(t) == 0
+        ReactantServerCore._flock(waiter, ReactantServerCore._LOCK_UN)
+        ReactantServerCore._close_fd(holder); ReactantServerCore._close_fd(waiter)
+        rm(lockpath; force = true)
+    end
+end
+
 @testset "SharedWeightStore: single-process create, reuse, and unlink" begin
     if !(Sys.islinux() && isdir("/dev/shm"))
         @test_skip "shared weight store requires Linux /dev/shm"

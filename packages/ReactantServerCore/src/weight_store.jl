@@ -77,7 +77,11 @@ const _O_RDWR = Cint(2)
 const _O_CREAT = Cint(0o100)
 const _MS_SYNC = Cint(4)
 
-_flock(fd::Cint, op::Cint) = ccall(:flock, Cint, (Cint, Cint), fd, op)
+# A blocking flock waits on another process (a peer filling a region holds the exclusive lock for
+# the whole fill). It is declared gc_safe so that, while it waits, a collection requested by any
+# other thread can proceed: a plain ccall would make every thread wait for the peer as well. No
+# Julia object crosses the call, so gc_safe is sound here.
+_flock(fd::Cint, op::Cint) = @ccall gc_safe = true flock(fd::Cint, op::Cint)::Cint
 _open_lock(path::AbstractString, mode::Integer = 0o666) =
     ccall(:open, Cint, (Cstring, Cint, Cint), path, _O_RDWR | _O_CREAT, Cint(mode))
 _close_fd(fd::Cint) = ccall(:close, Cint, (Cint,), fd)
@@ -119,22 +123,89 @@ function weights_digest(key::AbstractString, specs; content::UInt64 = UInt64(0))
 end
 
 """
-    weights_file_token(path) -> UInt64
+    WeightsFileId
 
-Identity token for a weights file's current on-disk version, folded into
-[`weights_digest`](@ref) via its `content` keyword. Derived from the file's size and mtime:
-cheap (no content read, so the shared store's zero-copy attach path stays zero-read) and
-identical across same-node workers stat'ing the same file. Returns 0 for an empty or missing
-path (hand-built test entries), which reproduces the layout-only digest.
+Which on-disk version of a weights file a process read: its device, inode, size and mtime. Take it
+from the open file (`weights_file_id(stat(io))`) at the moment the file is mapped, so it names the
+bytes actually mapped even if the path is replaced afterwards. [`NO_WEIGHTS_FILE`](@ref) stands for
+no file (hand-built entries).
 """
-function weights_file_token(path::AbstractString)
-    isempty(path) && return UInt64(0)
-    st = stat(String(path))               # a missing path stats as all-zeros, no throw
-    st.mtime == 0 && return UInt64(0)
+struct WeightsFileId
+    device::UInt64
+    inode::UInt64
+    size::Int64
+    mtime::Float64
+end
+
+"""
+    NO_WEIGHTS_FILE
+
+The [`WeightsFileId`](@ref) of an entry with no weights file; its token is 0.
+"""
+const NO_WEIGHTS_FILE = WeightsFileId(0, 0, 0, 0.0)
+
+weights_file_id(st::Base.Filesystem.StatStruct) =
+    st.mtime == 0 ? NO_WEIGHTS_FILE : WeightsFileId(UInt64(st.device), UInt64(st.inode), Int64(st.size), st.mtime)
+
+"""
+    weights_file_id(path) -> WeightsFileId
+
+The [`WeightsFileId`](@ref) of whatever the path names now; [`NO_WEIGHTS_FILE`](@ref) for an empty
+or missing path.
+"""
+weights_file_id(path::AbstractString) = isempty(path) ? NO_WEIGHTS_FILE : weights_file_id(stat(String(path)))
+
+"""
+    weights_file_token(id_or_path) -> UInt64
+
+Identity token for one on-disk version of a weights file, folded into [`weights_digest`](@ref) via
+its `content` keyword. Derived from the device, inode, size and mtime: cheap (no content read, so
+the shared store's zero-copy attach path stays zero-read) and identical across same-node workers
+that mapped the same file. The inode makes an atomic replacement (write a new file, rename it over
+the old one) a new version even when size and mtime match. Pass the [`WeightsFileId`](@ref) taken
+when the file was mapped; a path is stat'ed now, which can name a newer file than the one mapped.
+Returns 0 for no file (hand-built test entries), which reproduces the layout-only digest.
+"""
+function weights_file_token(id::WeightsFileId)
+    id == NO_WEIGHTS_FILE && return UInt64(0)
     io = IOBuffer()
-    print(io, st.size, ":", st.mtime)
+    print(io, id.device, ":", id.inode, ":", id.size, ":", id.mtime)
     return _fnv1a64(take!(io))
 end
+weights_file_token(path::AbstractString) = weights_file_token(weights_file_id(path))
+
+"""
+    SharedStoreFull
+
+Raised by `materialize_host_weights!` on a [`SharedWeightStore`](@ref) when the node cannot back a
+new region: `/dev/shm` is full or the memory limit refuses its pages. Nothing is left behind (the
+partial region is unlinked); the caller can fall back to a private copy.
+"""
+struct SharedStoreFull <: Exception
+    name::String
+    bytes::Int
+    errno::Cint
+end
+Base.showerror(io::IO, e::SharedStoreFull) = print(
+    io, "shared weight region ", e.name, " (", Base.format_bytes(e.bytes), ") could not be reserved: ",
+    Libc.strerror(e.errno)
+)
+
+# Back a freshly created region with real pages before writing to it. Sizing a POSIX shared memory
+# object only sets its length (ftruncate); its pages are allocated on first touch, and when
+# /dev/shm is full or the memory cgroup refuses a page, that touch kills the process with SIGBUS.
+# posix_fallocate allocates them up front and reports failure as an error number instead. Linux
+# only (/dev/shm is where the region's file lives); elsewhere it reports success. Returns 0 or an
+# errno. A Ref so tests can simulate a full /dev/shm.
+function _posix_fallocate(name::AbstractString, bytes::Int)
+    Sys.islinux() || return Cint(0)
+    fd = ccall(:open, Cint, (Cstring, Cint, Cint), "/dev/shm" * name, _O_RDWR, Cint(0))
+    fd < 0 && return Cint(Libc.errno())
+    rc = @ccall gc_safe = true posix_fallocate(fd::Cint, 0::Int64, Int64(bytes)::Int64)::Cint
+    _close_fd(fd)
+    return rc
+end
+const _RESERVE_REGION = Ref{Function}(_posix_fallocate)
 
 # (offsets per tensor, total region bytes) from the layout specs.
 function _layout(specs)
@@ -231,6 +302,7 @@ function materialize_host_weights!(store::SharedWeightStore, key, digest::UInt64
     fd < 0 && throw(SystemError("open weight-store lock $lockpath"))
     local shm::SharedMemory
     local arrays
+    created = false                 # true once this call created the region (and must clean it up on failure)
     try
         while true
             # Fast path: shared lock, reuse a published region (readers run concurrently).
@@ -262,6 +334,13 @@ function materialize_host_weights!(store::SharedWeightStore, key, digest::UInt64
                     _shm_unlink(name)
                 end
                 shm = SharedMemory(name, total; perms = store.mode, volatile = false)
+                rc = _RESERVE_REGION[](name, total)
+                if rc != 0
+                    finalize(shm)
+                    _shm_unlink(name)
+                    throw(SharedStoreFull(name, total, rc))
+                end
+                created = true
                 p = convert(Ptr{UInt8}, pointer(shm))
                 _hdr_write!(p, _RSW_MAGIC, 0)
                 _hdr_write!(p, UInt32(0), 4)        # ready = 0 until the data is durable
@@ -278,6 +357,12 @@ function materialize_host_weights!(store::SharedWeightStore, key, digest::UInt64
             sleep(0.005)
         end
     catch
+        # A region this call created but did not publish (the fill threw) is removed now, while the
+        # exclusive lock is still held, rather than left for the next creator to find.
+        if created
+            finalize(shm)
+            _shm_unlink(name)
+        end
         _flock(fd, _LOCK_UN)
         _close_fd(fd)
         rethrow()
