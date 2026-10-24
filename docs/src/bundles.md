@@ -204,6 +204,21 @@ export_bundle(:reactant, f, (x,), [("w1", w1), ("b1", b1)];
     dir="bundles/mlp", name="mlp")
 ```
 
+The Reactant frontends (`:lux`, `:reactant`, and `export_two_stage_detector`) take
+`compile_options`, the options `Reactant.@compile` accepts, applied when the model is traced to
+StableHLO. Pass them as a `NamedTuple` or a `Reactant.CompileOptions`:
+
+```julia
+export_bundle(:lux, model, ps, st, x; dir="bundles/net", name="net",
+    compile_options=(; raise=true))   # raise KernelAbstractions / CUDA.jl kernels to StableHLO
+```
+
+Non-default options are recorded under `compile_options` in the manifest's `provenance`. An unknown
+option name is an error, and the exporter keeps `client` and `drop_unsupported_attributes` for
+itself. A traced program that still contains Reactant-internal `enzyme.*` ops, which XLA cannot
+compile (for example with `optimize = false`), is refused before anything is written. The PyTorch
+frontends lower through JAX and do not take `compile_options`.
+
 A PyTorch project also loads `PythonCall`, which triggers the package extension driving
 `torch.export.export` and torchax:
 
