@@ -13,7 +13,9 @@ A bundle is a directory containing:
 - `model.mlir` - the MLIR module Reactant compiles, currently a serialized StableHLO portable
   artifact (single batch size), or one module per size as `model.b{N}.mlir` sharing a single
   `weights.safetensors`.
-- `weights.safetensors` - the model weights, memory-mapped at load time.
+- `weights.safetensors` - the model weights, read with `pread` at load time (see
+  [Weights file layout](#Weights-file-layout)). A manifest may name another file in the bundle with
+  `weights_file` (a migrated copy is `weights.T.safetensors`).
 - `model.jl` - optional; registers custom pre/post-processing (see below).
 - `.cache/` - written by the worker, never by you: the serialized-executable cache (compiled
   programs keyed by MLIR content, Reactant_jll build and device) plus `mlir_hashes.json`. Safe to
@@ -58,11 +60,61 @@ rows up to the largest of `batching.compiled_batch_sizes`; otherwise the request
 axis must equal one of them. `runtime.batch_sizes: largest` loads only the largest size (see
 [Node Configuration](node_config.md)). Each tensor parses into a
 [`TensorSpec`](@ref) with a [`Dim`](@ref) per axis, and the compiled sizes form the
-[`BatchingSpec`](@ref). The writer stamps `format_version: "2.0"`; the loader accepts `2.0` or `2`.
+[`BatchingSpec`](@ref). The writer stamps `format_version: "2.1"` (`"2.0"` with `layout = :legacy`);
+the loader accepts `2.1`, `2.0` or `2`. Version `2.1` exists so that servers older than 0.2, which
+would misread weights in the program's axis order, refuse such a bundle instead.
 
 Shapes use the Julia column-major convention (the batch dimension is the last axis), which is the
 reverse of the row-major form a Python/XLA exporter would write. The wire codec handles the
 conversion, so KServe clients see canonical row-major shapes.
+
+## Weights file layout
+
+`weights.safetensors` stores each weight as the Julia array the server passes to the program. A
+file has one of two layouts, declared in its own metadata, never inferred from the manifest or the
+file name:
+
+- **Program axis order** (`axis_order: xla` in the safetensors metadata, written by
+  ReactantServerExport 2.0). Each tensor's header shape is the program's shape (the reversed Julia
+  shape) and its data is row-major in that shape, which is byte for byte the Julia array. The
+  server reads each tensor straight into its destination with one `pread`. numpy, PyTorch and
+  SafeTensors.jl read these tensors in the program's shape.
+- **Legacy** (no `axis_order` key, written before ReactantServerExport 2.0). Each header shape is
+  the Julia shape and the data is permuted to row-major, so every load permutes it back, an extra
+  full copy of every tensor.
+
+Both layouts load to identical arrays. Any other `axis_order` value is refused.
+
+## Migrating older bundles
+
+`runtime.weights_migration` (see [Node Configuration](node_config.md)) converts legacy bundles at
+load. In `copy` mode the worker writes `weights.T.safetensors` beside the original and adds
+`weights_file: weights.T.safetensors` to the manifest, leaving `weights.safetensors` untouched,
+so rolling back to an older server needs nothing. In `replace` mode it first does the same, then
+sets `format_version: "2.1"`, renames the copy over `weights.safetensors` in one step, and removes
+the extra name and the `weights_file` line.
+
+Nothing is accepted without proof. A copy must hold the same tensor names, dtypes, byte counts and
+metadata as the original, each header shape reversed, and every tensor equal byte for byte (so NaN
+payloads and signed zeros count) to the array the legacy path reads, which is read twice, once by
+the server and once by SafeTensors.jl. The copy records the original's size, modification time and
+SHA-256. Before `replace` swaps it in, the copy is verified again against the original, and the
+file left under the original's name is verified once more against the original (still open, so
+its bytes remain readable) before anything else is removed.
+
+Files are written under temporary names, fsynced, verified from disk, and renamed into place, so a
+crash at any point leaves a bundle that loads correctly and the migration resumes on the next start.
+Workers on one node take turns on a lock in the bundle's `.cache/`, so a bundle is migrated once.
+A migration that cannot run (no free space, a read-only directory, an invalid copy) is logged and
+the bundle loads as it was.
+
+If you redeploy `weights.safetensors` after a `copy` migration, the copy is stale: the server
+notices that the original changed since the copy was made, loads the original, and, with migration
+on, rebuilds the copy. Comments and formatting in `manifest.yaml` are kept; only the
+`weights_file` and `format_version` lines change.
+
+`tools/migrate_weights.jl` runs the same migration offline, for model directories the workers
+cannot write or to convert ahead of a deploy.
 
 Datatypes are written as manifest tokens (`f32`, `bf16`, `i64`, `bool`, and so on); see
 [`DType`](@ref) for the full mapping between tokens, Julia types, and KServe wire strings.
@@ -172,7 +224,9 @@ and `:torchscript` calls fail with a message directing you to load it.
 `write_bundle` is the low-level writer: it takes the executable `IOSpec`s, the StableHLO modules
 (one per batch size, or text or serialized bytes), and an ordered `weights` collection whose order
 becomes the safetensors `argument_order`, and emits `manifest.yaml`, the `model[.b{N}].mlir` files,
-and `weights.safetensors`. An `IOSpec` names a tensor, its Julia (column-major) shape, its dtype,
+and `weights.safetensors` (in the program's axis order unless `layout = :legacy`; see
+[Weights file layout](#Weights-file-layout)). `read_bundle_weights` reads a bundle's weights back in
+the program's axis order, whichever layout they use. An `IOSpec` names a tensor, its Julia (column-major) shape, its dtype,
 the 0-based `batch_axis` in that Julia shape (by convention the last axis), and optional explicit `letters` for the non-batch axes (the reserved
 markers `n`/`b` are rejected); a `-1` axis size encodes a variable axis. The bundle directory's
 basename must equal `name` (the identity rule above).

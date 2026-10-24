@@ -42,6 +42,9 @@ ReactantServer.compact!
 ReactantServer.acquire!
 ReactantServer.admit_weights!
 ReactantServer.AdmissionError
+ReactantServer.migrate_bundle_weights!
+ReactantServer.verify_transposed
+ReactantServer.resolve_weights_path
 ReactantServer.NotResidentError
 ReactantServer.RunningServer
 ReactantServer.weight_budget

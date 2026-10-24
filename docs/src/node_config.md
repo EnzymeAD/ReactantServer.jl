@@ -73,6 +73,7 @@ global:
     # autotune_cache_dir: /cache/autotune  # cache directory; omit to inherit Reactant's defaults
     shared_host_weights: false # one shm-backed host copy of each model on this node's workers
     shared_host_weights_mode: "666"  # octal permissions for the shared regions; "660" preferred
+    weights_migration: off     # off | copy | replace legacy-order weights files at load; see below
   scheduler:                   # -> SchedulerConfig
     discipline: fair           # fair | fifo | edf; fifo or edf behind a gateway in lpt_packing
     ema_halflife_seconds: 30.0
@@ -125,6 +126,17 @@ size a dispatch can fill. `largest` loads only the largest declared size, per in
 and never reads the others (they need not be present); every dispatch runs that program, padded
 with zero rows and sliced back per request. Unbatched bundles are unaffected. Workers with
 different settings can share a bundle directory.
+
+`runtime.weights_migration` converts bundles whose `weights.safetensors` predates ReactantServer
+0.2 (legacy axis order, which costs an extra full copy of every tensor on each load) to the
+program's axis order. `off` (the default) loads them as they are. `copy` writes a verified
+`weights.T.safetensors` beside the original and points the manifest's `weights_file` at it; the
+original is untouched, and servers older than 0.2 ignore the new field and keep loading it.
+`replace` then swaps the copy in as `weights.safetensors` and marks the manifest
+`format_version: "2.1"`, which older servers refuse; use it once every server reading the
+directory runs 0.2 or later. The bundle directory must be writable. A migration never fails a model:
+on any error it is logged and the bundle loads as it was. See
+[Migrating older bundles](bundles.md#Migrating-older-bundles).
 
 `runtime.xla_flags` is a mapping of XLA `DebugOptions` field names (no leading `--`) to values,
 applied to every compile. At startup each name is checked against the XLA linked into the worker
@@ -319,6 +331,7 @@ overrides were applied, is logged at startup.
 | `INFERENCE_SERVER_RUNTIME_BATCH_SIZES` | `runtime.batch_sizes` | `all` \| `largest` |
 | `INFERENCE_SERVER_RUNTIME_SHARED_HOST_WEIGHTS` | `runtime.shared_host_weights` | bool |
 | `INFERENCE_SERVER_RUNTIME_SHARED_HOST_WEIGHTS_MODE` | `runtime.shared_host_weights_mode` | octal string |
+| `INFERENCE_SERVER_RUNTIME_WEIGHTS_MIGRATION` | `runtime.weights_migration` | `off` \| `copy` \| `replace` |
 | `INFERENCE_SERVER_SCHEDULER_DISCIPLINE` | `scheduler.discipline` | `fair` \| `fifo` \| `edf` |
 | `INFERENCE_SERVER_SCHEDULER_EMA_HALFLIFE_SECONDS` | `scheduler.ema_halflife_seconds` | seconds |
 | `INFERENCE_SERVER_SCHEDULER_RECENCY_PENALTY_CAP` | `scheduler.recency_penalty_cap` | `0..1` |
