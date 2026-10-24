@@ -61,6 +61,52 @@ const _GCX = ReactantServer.GcSafeXLA
         @test run(x, w) == x .* w                                 # and so does the runtime
     end
 
+    # A program can call back into Julia mid-execution (Reactant's julia_callback custom call, an XLA
+    # FFI handler calling a @cfunction). On the CPU client it runs on the calling thread, inside the
+    # gc_safe execute: the cfunction entry must return the thread to GC-unsafe, and a collection
+    # forced inside the callback, or on another thread meanwhile, must neither deadlock nor corrupt.
+    # It uses a Reactant internal, so it is skipped on a Reactant without it.
+    if isdefined(Reactant.Ops, :_make_c_callback)
+        @testset "a Julia callback during a gc_safe execute" begin
+            threads_seen = Int[]
+            function cbf(out, x)
+                garbage = [rand(256) for _ in 1:64]
+                GC.gc(false)
+                out .= 2 .* x
+                push!(threads_seen, Threads.threadid() + 0 * length(garbage))
+                return nothing
+            end
+            ptr = Reactant.Ops._make_c_callback(cbf, ((Float32, (1024,)),), ((Float32, (1024,)),))
+            cb_mlir = """
+            module {
+              func.func @main(%x: tensor<1024xf32>) -> tensor<1024xf32> {
+                %0 = stablehlo.custom_call @reactant_julia_callback(%x) {api_version = 4 : i32, backend_config = {callback_ptr = $(Int64(UInt(ptr))) : i64}, has_side_effect = true, operand_layouts = [dense<0> : tensor<1xindex>], result_layouts = [dense<0> : tensor<1xindex>]} : (tensor<1024xf32>) -> tensor<1024xf32>
+                return %0 : tensor<1024xf32>
+              }
+            }
+            """
+            cb_exec = ReactantServer.compile_artifact(backend, pool, stablehlo_artifact(cb_mlir), 1, 1)
+            stop = Threads.Atomic{Bool}(false)
+            churn = Threads.@spawn while !stop[]
+                GC.gc(false)
+                sleep(0.001)
+            end
+            correct = 0
+            for _ in 1:50
+                x = rand(Float32, 1024)
+                bx = _GCX.upload(client, x, device)
+                outs = _GCX.execute(cb_exec, device, Ptr{Cvoid}[bx.buffer], UInt8[0], 1)
+                y = _GCX.to_host!(outs[1], Vector{Float32}(undef, 1024))
+                _GCX.free!(bx); _GCX.free!(outs[1])
+                correct += y == 2 .* x
+            end
+            stop[] = true
+            wait(churn)
+            @test correct == 50
+            @test length(threads_seen) == 50
+        end
+    end
+
     @testset "collections on another thread while the calls run" begin
         stop = Threads.Atomic{Bool}(false)
         collections = Threads.Atomic{Int}(0)
@@ -76,14 +122,24 @@ const _GCX = ReactantServer.GcSafeXLA
                 yield()
             end
         end
+        # With threads, start once the churn task is collecting and keep going until at least ten
+        # collections have interleaved with the calls, so the test cannot pass without overlap.
+        if Threads.nthreads() > 1
+            t0 = time()
+            while collections[] == 0 && time() - t0 < 30
+                sleep(0.01)
+            end
+        end
         ok = true
-        for i in 1:300
+        rounds = 0
+        while rounds < 300 || (Threads.nthreads() > 1 && collections[] < 10 && rounds < 20_000)
             x, w = rand(Float32, 1024), rand(Float32, 1024)
             ok &= run(x, w) == x .* w
+            rounds += 1
         end
         stop[] = true
         wait(churn)
         @test ok
-        Threads.nthreads() > 1 && @test collections[] > 0         # collections really did interleave
+        Threads.nthreads() > 1 && @test collections[] >= 10       # collections really did interleave
     end
 end
