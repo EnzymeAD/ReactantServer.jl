@@ -26,7 +26,7 @@ function load_pinned_weights(backend::AbstractBackend, pool::MemoryPool, st, nam
     try
         for (i, name) in enumerate(names)
             haskey(st, name) || throw(ErrorException("weight '$name' missing from safetensors"))
-            host = collect(st[name])                 # materialize the lazy mmap view to a contiguous Array
+            host = read_weight(st, name)             # a contiguous Array of the tensor's Julia shape
             bufs[i] = to_device(backend, pool.client, host, pool.device)
         end
     catch
@@ -48,7 +48,7 @@ end
 """
     materialize_host_weights(st, names) -> Vector{Any}
 
-Materialize the named weights from the lazy mmap safetensors views into resident host Arrays,
+Read the named weights from the weights file into resident host Arrays,
 in weight_names order. This is the expensive step (a layout copy at host-memory speed); doing
 it once at startup and keeping the result resident in RAM lets an on-demand GPU load be a pure
 host->device transfer (see `transfer_to_device`) rather than a re-materialization.
@@ -57,7 +57,7 @@ function materialize_host_weights(st, names::Vector{String})
     hosts = Vector{Any}(undef, length(names))
     for (i, name) in enumerate(names)
         haskey(st, name) || throw(ErrorException("weight '$name' missing from safetensors"))
-        hosts[i] = collect(st[name])
+        hosts[i] = read_weight(st, name)
     end
     return hosts
 end
@@ -81,10 +81,10 @@ function host_materialize(
         store::SharedWeightStore, key, st, names::Vector{String};
         content::UInt64 = UInt64(0), verify = () -> nothing
     )
-    specs = [(eltype(st[n]), size(st[n])) for n in names]
+    specs = [weight_spec(st, n) for n in names]
     fill! = function (arrays)
         for (i, n) in enumerate(names)
-            copyto!(arrays[i], st[n])
+            read_weight!(arrays[i], st, n)
         end
         verify()
         return
@@ -99,10 +99,10 @@ end
     host_materialize(store, entry, names) -> Vector{Any}
 
 Materialize `entry`'s host weight floor, labeled with the version of the weights file `entry`
-actually mapped (`entry.weights_id`), never with a fresh stat of the path: a deploy that replaces
+actually opened (`entry.weights_id`), never with a fresh stat of the path: a deploy that replaces
 the file after the bundle loaded must not publish the old bytes under the new version's label for
 other workers to reuse. After copying, the file is checked for an in-place modification (same
-inode, different size or mtime), which would mean the mapping changed underneath the copy; that
+inode, different size or mtime), which would mean the bytes changed underneath the read; that
 fails the load rather than publishing mixed bytes. When the node cannot back a shared region
 ([`SharedStoreFull`](@ref)), the model gets a private copy instead.
 """
@@ -125,8 +125,8 @@ function host_materialize(store::WeightStore, entry::ModelEntry, names::Vector{S
 end
 
 # A weights file must be replaced atomically (write a new file, rename it over the old one): the
-# mapping then keeps the old file's bytes, consistent with `entry.weights_id`. Writing into the
-# mapped file in place changes the mapped bytes mid-copy, which nothing downstream could detect.
+# open file then keeps the old version's bytes, consistent with `entry.weights_id`. Writing into
+# the loaded file in place changes the bytes mid-read, which nothing downstream could detect.
 function _check_unmodified(entry::ModelEntry)
     id = entry.weights_id
     id == NO_WEIGHTS_FILE && return nothing
@@ -190,8 +190,8 @@ function weights_nbytes(st, names::Vector{String})
     total = 0
     for name in names
         haskey(st, name) || throw(ErrorException("weight '$name' missing from safetensors"))
-        v = st[name]
-        total += prod(size(v)) * sizeof(eltype(v))
+        T, dims = weight_spec(st, name)
+        total += prod(dims; init = 1) * sizeof(T)
     end
     return total
 end

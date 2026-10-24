@@ -65,14 +65,14 @@ mutable struct ModelEntry <: AbstractDispatchEntry
     manifest::Manifest
     mlir_bytes::Dict{VariantKey, Dict{Int, Vector{UInt8}}}  # variant -> (batch size -> StableHLO artifact); batch key 0 = single unbatched module
     weights_path::String
-    weights::Any                          # SafeTensors handle (mmap), kept lazy; backend-opaque
+    weights::Any                          # WeightsFile (open, read with pread on demand), or a test double
     executable::Union{LoadedModel, Nothing}   # compiled runtime + residency; `nothing` until compiled
     sched::Union{ModelSchedState, Nothing}    # scheduling state; `nothing` until the scheduler prepares it
     preprocess::Function
     postprocess::Function
-    # Which on-disk version of the weights file `weights` maps, taken from the open file when it was
-    # mapped. Host copies are labeled with this (never with a fresh stat of the path, which can name
-    # a newer file than the bytes in `weights`).
+    # Which on-disk version of the weights file `weights` has open, taken from the open file itself.
+    # Host copies are labeled with this (never with a fresh stat of the path, which can name a newer
+    # file than the one `weights` reads).
     weights_id::WeightsFileId
 end
 

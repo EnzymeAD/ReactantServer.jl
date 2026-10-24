@@ -10,7 +10,7 @@ runs at startup. When on-demand loading is disabled (`weight_cache_fraction == 0
 model's weights are loaded to the device and kept resident, the original behavior. When on-demand is
 enabled the initial residency follows `state`: `PINNED_DEVICE` loads to the device at startup;
 `PINNED_SYSTEM` materializes the host floor and starts evicted from the device; `UNPINNED`
-holds no floor and starts fully evicted (the weight cache loads it from the mmap on first
+holds no floor and starts fully evicted (the weight cache reads it from the file on first
 dispatch). With `executable_cache = true` on a backend that `supports_executable_cache`, each
 module's compiled program is loaded from, or stored into, the bundle's `.cache/` directory (see
 executable_cache.jl); MLIR hashes are synced first so a changed module never serves a stale
@@ -56,7 +56,7 @@ function build_loaded_model(
     # Initial residency. With on-demand off, every model is resident on the device and never
     # evicted (the original behavior), regardless of state. With on-demand on, the floor follows
     # `state`: PINNED_SYSTEM materializes the host floor and starts device-evicted; UNPINNED holds
-    # nothing and loads from the mmap on first dispatch; PINNED_DEVICE loads to the device.
+    # nothing and loads from the file on first dispatch; PINNED_DEVICE loads to the device.
     host_weights = nothing
     weights = nothing
     if !on_demand

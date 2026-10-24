@@ -1118,6 +1118,9 @@ function _evict_entry!(sch::Scheduler, name::AbstractString)
     entry === nothing && return nothing
     # Release residency outside the lock (device frees can be slow).
     sch.weight_cache === nothing || release_all!(sch.weight_cache, entry)
+    # Close the weights file: it holds the loaded version's inode, which a replaced file keeps alive
+    # (and keeps on disk) until then.
+    close_weights!(entry.weights)
     # Eagerly free every compiled executable (all variants and batch sizes). Waiting for GC would
     # leave the executables' command buffers resident on the device indefinitely (they live outside
     # the BFC arena and only the finalizer reclaims them). Safe here: this runs on the dispatch

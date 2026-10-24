@@ -46,15 +46,15 @@ function weight_footprint(sizes)
     return (weight_bytes = total, max_weight_bytes = largest)
 end
 
-# Raw per-tensor byte sizes, from the host floor when there is one (no mmap access) and otherwise
-# from the safetensors metadata. `nothing` when neither can be read; the caller then falls back to
+# Raw per-tensor byte sizes, from the host floor when there is one and otherwise from the
+# safetensors header (no data read). `nothing` when neither can be read; the caller then falls back to
 # `model.nbytes`.
 function _weight_tensor_sizes(entry::ModelEntry, model::LoadedModel)
     model.host_weights === nothing || return (sizeof(h) for h in model.host_weights)
     st = entry.weights
     names = model.sig.weight_names
     try
-        return [prod(size(st[n])) * sizeof(eltype(st[n])) for n in names]
+        return [(s = weight_spec(st, n); prod(s[2]; init = 1) * sizeof(s[1])) for n in names]
     catch
         return nothing
     end

@@ -52,6 +52,8 @@ include("bundle.jl")
 include("runtime/backend.jl")
 include("runtime/mock_backend.jl")
 include("runtime/memory_pool.jl")
+# Reading weights.safetensors with pread (a file truncated mid-read is an error, not SIGBUS).
+include("runtime/weights_file.jl")
 include("runtime/weights.jl")
 include("runtime/model.jl")
 include("runtime/footprint.jl")

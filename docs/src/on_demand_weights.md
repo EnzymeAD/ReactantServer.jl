@@ -15,7 +15,7 @@ policy live on [Multi-GPU Gateway](gateway.md).
   weights default to system-pinned (`residency: system`): materialized once from disk into
   host RAM at startup and kept there. Host memory is plentiful and cheap relative to GPU
   memory, which removes disk from the hot path. A model can opt out with
-  `residency: unpinned`, paying an mmap re-materialization on each on-demand load instead.
+  `residency: unpinned`, paying a read from the weights file on each on-demand load instead.
   Materializing the host floor is the expensive step, a layout copy at host-memory speed
   ([`materialize_host_weights!`](@ref)), and it happens exactly once at startup.
 - **GPU (managed working set).** Pinned models keep their weights on the GPU for the
@@ -111,12 +111,14 @@ attach one copy and each transfers it to its own device. `host_materialize` rout
 the configured store, which is what makes this a configuration decision rather than a code
 change.
 
-Each shared copy is labeled with the version of the weights file the worker actually mapped (its
+Each shared copy is labeled with the version of the weights file the worker actually opened (its
 device, inode, size and modification time), so workers never share a copy of one version under
 another version's label. Deploy new weights by writing a new file and renaming it over the old
 one: a worker that already loaded the model keeps serving the old bytes until it reloads, and its
-shared copy stays labeled as the old version. Writing into a loaded weights file in place is
-detected and fails that model's load instead of copying mixed bytes. When the node cannot back
+shared copy stays labeled as the old version. Writing into a loaded weights file in place (for
+example `cp` onto it, which truncates it first) is detected and fails that model's load instead of
+copying mixed bytes; weights are read with ordinary file reads rather than a memory mapping, so a
+truncated file is an error rather than a crashed worker. When the node cannot back
 a new shared copy (`/dev/shm` full, or the container's memory limit reached), the worker logs a
 warning and gives that model a private copy instead of failing.
 

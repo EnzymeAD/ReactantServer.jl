@@ -143,7 +143,7 @@ end
 
 # Transfer a model's weights to GPU buffers. When the weights are pinned in host RAM
 # (host_weights set, the normal on-demand case) this is a pure host->device transfer; otherwise
-# it falls back to materializing from the mmap (used by tests that do not pin in RAM).
+# it falls back to reading from the weights file (used by tests that do not pin in RAM).
 function _device_buffers(cache::WeightCache, entry::ModelEntry, model::LoadedModel)
     if model.host_weights !== nothing
         return transfer_to_device(cache.backend, cache.pool, model.host_weights)

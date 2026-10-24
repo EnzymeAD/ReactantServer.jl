@@ -128,12 +128,6 @@ function load_bundle_entry(
 
     weights_path = joinpath(dir, "weights.safetensors")
     isfile(weights_path) || throw(BundleError("bundle '$(m.name)' missing weights.safetensors"))
-    # Map the file and record which version was mapped, from the open file itself: if the path is
-    # replaced later, the mapping keeps the old bytes, and host copies must carry the old version.
-    weights, weights_id = open(weights_path) do io
-        id = weights_file_id(stat(io))
-        (SafeTensors.deserialize(SafeTensors.Mmap.mmap(io, Vector{UInt8})), id)
-    end
 
     # Every variant/batch module shares one signature; validate against any one of them.
     validate_against_signature(validator, m, first(values(first(values(mlir_bytes)))))
@@ -144,6 +138,11 @@ function load_bundle_entry(
         pre, post = r.preprocess, r.postprocess
     end
 
+    # Opened last, so nothing after it can fail and strand the descriptor. The file stays open until
+    # the model is unloaded, and `weights_id` records which version was opened (from the open file):
+    # if the path is replaced later, reads keep returning the loaded version, and host copies must
+    # carry that version's label.
+    weights, weights_id = open_weights_file(weights_path)
     return ModelEntry(m.name, m, mlir_bytes, weights_path, weights, nothing, nothing, pre, post, weights_id)
 end
 
