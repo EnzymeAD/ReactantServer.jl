@@ -89,6 +89,7 @@ export ModelControlMode, STATIC, DYNAMIC, EXPLICIT
 export SchedulingDiscipline, FAIR, FIFO, EDF
 export NumericsMode, NUMERICS_F32, NUMERICS_AUTO, NUMERICS_TF32
 export BatchSizeMode, BATCH_SIZES_ALL, BATCH_SIZES_LARGEST
+export WeightsMigration, MIGRATE_OFF, MIGRATE_COPY, MIGRATE_REPLACE
 export RuntimeProfile, PROFILE_DEFAULT, PROFILE_REGULATED
 export RuntimeConfig, ModelSchedConfig, SchedulerConfig, EndpointsConfig, GrpcConfig, ServerConfig
 export build_config, validate_config, apply_env_overrides!, log_effective_config

@@ -32,7 +32,11 @@
 #   into `Manifest.input_shapes`, a canonical list of the variable-axis sizes in
 #   (executable-input order, axis order). An empty list means the single fixed shape.
 
-const SUPPORTED_FORMAT_VERSIONS = ("2.0", "2")
+# "2.1" marks a bundle whose weights may be stored in the program's axis order (safetensors metadata
+# `axis_order: xla`); servers that predate it refuse the bundle rather than misread those weights.
+const SUPPORTED_FORMAT_VERSIONS = ("2.0", "2", "2.1")
+
+const DEFAULT_WEIGHTS_FILE = "weights.safetensors"
 
 # A bundle is either a regular "model" (a StableHLO executable + weights) or a "meta" model: a
 # user-authored Julia workflow (model.jl) that chains other models with data-dependent logic in
@@ -119,6 +123,7 @@ struct Manifest
     meta_calls::Vector{String}            # for kind=="meta": declared sub-model names; empty otherwise
     input_shapes::Vector{Vector{Int}}     # compiled input-shape variants: each is the variable-axis
     # sizes in (executable-input, axis) order; empty => single shape
+    weights_file::String                  # the bundle's weights file name (default weights.safetensors)
 end
 
 # Backward-compatible 10-arg constructor: a regular model with no meta metadata and a single fixed
@@ -130,6 +135,10 @@ Manifest(fv, name, desc, exin, exout, clin, clout, batching, prov, ibd) =
 # 12-arg constructor: kind/meta_calls supplied, single fixed input shape (no variants).
 Manifest(fv, name, desc, exin, exout, clin, clout, batching, prov, ibd, kind, meta_calls) =
     Manifest(fv, name, desc, exin, exout, clin, clout, batching, prov, ibd, kind, meta_calls, Vector{Int}[])
+
+# 13-arg constructor: through input_shapes, with the default weights file.
+Manifest(fv, name, desc, exin, exout, clin, clout, batching, prov, ibd, kind, meta_calls, input_shapes) =
+    Manifest(fv, name, desc, exin, exout, clin, clout, batching, prov, ibd, kind, meta_calls, input_shapes, DEFAULT_WEIGHTS_FILE)
 
 """
     is_meta(m::Manifest) -> Bool
@@ -379,12 +388,22 @@ function parse_manifest(d::AbstractDict)
     raw_inputs = get(d, "executable_inputs", Any[])
     raw_inputs isa AbstractVector || (raw_inputs = Any[])
     input_shapes = _parse_input_shapes(d, raw_inputs, exin, String(name))
+    weights_file = _parse_weights_file(d, String(name))
 
     return Manifest(
         string(fv), String(name), desc === nothing ? "" : string(desc),
         exin, exout, clin, clout, batching, prov, input_batch_dim, kind, meta_calls,
-        input_shapes
+        input_shapes, weights_file
     )
+end
+
+# `weights_file` names the weights inside the bundle directory: a bare file name of the form
+# `weights*.safetensors`, never a path, so a manifest cannot point a server outside its bundle.
+function _parse_weights_file(d::AbstractDict, name::String)
+    f = get(d, "weights_file", DEFAULT_WEIGHTS_FILE)
+    (f isa AbstractString && occursin(r"^weights[A-Za-z0-9_.-]*\.safetensors$", f) && !occursin("..", f)) ||
+        throw(ManifestError("manifest '$name' field 'weights_file' must be a file name like weights.safetensors, got $(repr(f))"))
+    return String(f)
 end
 
 function _check_unique_names(tensors::Vector{TensorSpec}, section::AbstractString)
