@@ -1,6 +1,6 @@
 name = "ReactantServerNode"
 uuid = "49f09047-4fb9-4260-828b-8494ed8e9881"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Carroll Vance <cvance@medicalmetrics.com>"]
 
 [deps]
@@ -16,7 +16,7 @@ ReactantServer = "faa8a0e4-1926-4c6b-a0e2-e70699715ecf"
 ReactantServerGateway = "b92f1031-7cb7-4fde-89de-b6dd50303018"
 
 [compat]
-ReactantServer = "0.1"
+ReactantServer = "0.1, 0.2"
 ReactantServerCore = "1.2.0"
 ReactantServerGateway = "0.1"
 TOML = "1"

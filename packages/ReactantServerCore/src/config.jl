@@ -117,6 +117,20 @@ naming the f32 matmul/convolution precision actually in effect unless `numerics`
 """
 @enum RuntimeProfile PROFILE_DEFAULT PROFILE_REGULATED
 
+"""
+    WeightsMigration
+
+What the worker does with a bundle whose `weights.safetensors` is in the legacy axis order (the
+`runtime.weights_migration` knob). `MIGRATE_OFF` (the default) loads it as it is, permuting every
+tensor on each load. `MIGRATE_COPY` writes a verified copy in the program's axis order,
+`weights.T.safetensors`, next to it and points the manifest's `weights_file` at the copy; the
+original is untouched and servers that predate the copy keep loading it. `MIGRATE_REPLACE` does the
+same, then, after proving the copy again, renames it over `weights.safetensors` and marks the
+manifest `format_version: "2.1"`. Use `replace` only once every server reading the directory
+understands that version. Migration never fails a model: on any error the bundle loads as it was.
+"""
+@enum WeightsMigration MIGRATE_OFF MIGRATE_COPY MIGRATE_REPLACE
+
 # The xla_flags a profile contributes underneath the user's own.
 _profile_xla_flags(p::RuntimeProfile) =
     p == PROFILE_REGULATED ? Dict{String, Any}("xla_gpu_exclude_nondeterministic_ops" => true) :
@@ -161,6 +175,8 @@ which compiled batch sizes are loaded; see [`BatchSizeMode`](@ref). `xla_flags` 
 plus the profile's) is a mapping of XLA `DebugOptions` field names to values, passed to every
 compile, for example `xla_gpu_exclude_nondeterministic_ops: true`; names and value types are
 checked against the linked XLA at startup, and the flags are part of the executable cache key.
+`weights_migration` (default `off`) converts legacy-order weights files at load; see
+[`WeightsMigration`](@ref).
 """
 struct RuntimeConfig
     backend::BackendKind
@@ -181,7 +197,27 @@ struct RuntimeConfig
     profile::RuntimeProfile               # named defaults for batch_sizes and xla_flags
     batch_sizes::BatchSizeMode            # which compiled batch sizes to load (resolved; profile applied)
     xla_flags::Dict{String, Any}          # XLA DebugOptions overrides (resolved; profile applied)
+    weights_migration::WeightsMigration   # convert legacy-order weights files at load
 end
+
+# Eighteen-argument form: the previous full positional layout (through `xla_flags`), with weights
+# migration off.
+RuntimeConfig(
+    backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
+    preallocate::Bool, allow_cpu_fallback::Bool, residency_mode::ResidencyMode,
+    shared_host_weights::Bool, shared_host_weights_mode::Integer,
+    weight_cache_fraction::Real, weight_cache_wiggle_fraction::Real, autotune::Bool,
+    autotune_cache::Union{Bool, Nothing}, autotune_cache_dir::AbstractString, numerics::NumericsMode,
+    executable_cache::Bool, profile::RuntimeProfile, batch_sizes::BatchSizeMode,
+    xla_flags::AbstractDict
+) =
+    RuntimeConfig(
+    backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
+    residency_mode, shared_host_weights, UInt16(shared_host_weights_mode),
+    Float64(weight_cache_fraction), Float64(weight_cache_wiggle_fraction), autotune,
+    autotune_cache, String(autotune_cache_dir), numerics, executable_cache,
+    profile, batch_sizes, Dict{String, Any}(xla_flags), MIGRATE_OFF
+)
 
 # Fifteen-argument form: the previous full positional layout (through `executable_cache`), with the
 # default profile, every batch size, and no XLA flags.
@@ -198,7 +234,7 @@ RuntimeConfig(
     residency_mode, shared_host_weights, UInt16(shared_host_weights_mode),
     Float64(weight_cache_fraction), Float64(weight_cache_wiggle_fraction), autotune,
     autotune_cache, String(autotune_cache_dir), numerics, executable_cache,
-    PROFILE_DEFAULT, BATCH_SIZES_ALL, Dict{String, Any}()
+    PROFILE_DEFAULT, BATCH_SIZES_ALL, Dict{String, Any}(), MIGRATE_OFF
 )
 
 # Five-argument form: device/backend only; residency self-managed, private host weights, and the
@@ -455,6 +491,7 @@ const ENV_PATHS = Tuple{String, Vector{String}, DataType}[
     ("RUNTIME_BATCH_SIZES", ["runtime", "batch_sizes"], String),
     ("RUNTIME_SHARED_HOST_WEIGHTS", ["runtime", "shared_host_weights"], Bool),
     ("RUNTIME_SHARED_HOST_WEIGHTS_MODE", ["runtime", "shared_host_weights_mode"], String),
+    ("RUNTIME_WEIGHTS_MIGRATION", ["runtime", "weights_migration"], String),
     ("SCHEDULER_DISCIPLINE", ["scheduler", "discipline"], String),
     ("SCHEDULER_EMA_HALFLIFE_SECONDS", ["scheduler", "ema_halflife_seconds"], Float64),
     ("SCHEDULER_RECENCY_PENALTY_CAP", ["scheduler", "recency_penalty_cap"], Float64),
@@ -624,6 +661,14 @@ function _parse_batch_sizes(s)
     throw(ConfigError("runtime.batch_sizes must be 'all' or 'largest', got '$s'"))
 end
 
+function _parse_weights_migration(s)
+    ls = lowercase(strip(s))
+    ls == "off" && return MIGRATE_OFF
+    ls == "copy" && return MIGRATE_COPY
+    ls == "replace" && return MIGRATE_REPLACE
+    throw(ConfigError("runtime.weights_migration must be 'off', 'copy' or 'replace', got '$s'"))
+end
+
 # runtime.xla_flags: a mapping of XLA DebugOptions field names to scalar values, layered over the
 # profile's flags (an explicit entry wins, so `false` turns a profile flag back off). Only the shape
 # is checked here; field names and value types are checked against the linked XLA at startup.
@@ -706,6 +751,7 @@ function build_config(raw::AbstractDict)
             _parse_batch_sizes(_coerce(String, rt["batch_sizes"], "runtime.batch_sizes")) :
             _profile_batch_sizes(profile),
         _parse_xla_flags(rt, profile),
+        _parse_weights_migration(_opt(rt, "weights_migration", String, "off")),
     )
 
     sc = _subdict(raw, "scheduler")
@@ -797,7 +843,7 @@ end
 # `apply_env_overrides!` is applied on top by `node_server_config`.
 
 function log_effective_config(cfg::ServerConfig, applied)
-    @info "Effective configuration" model_dirs = cfg.model_dirs models_include = cfg.models_include model_control_mode = cfg.model_control_mode model_poll_seconds = cfg.model_poll_seconds cache_dir = cfg.cache_dir backend = cfg.runtime.backend device_ordinal = cfg.runtime.device_ordinal mem_fraction = cfg.runtime.mem_fraction preallocate = cfg.runtime.preallocate allow_cpu_fallback = cfg.runtime.allow_cpu_fallback weight_cache_fraction = cfg.runtime.weight_cache_fraction weight_cache_wiggle_fraction = cfg.runtime.weight_cache_wiggle_fraction autotune = cfg.runtime.autotune autotune_cache = cfg.runtime.autotune_cache autotune_cache_dir = cfg.runtime.autotune_cache_dir numerics = cfg.runtime.numerics executable_cache = cfg.runtime.executable_cache profile = cfg.runtime.profile batch_sizes = cfg.runtime.batch_sizes xla_flags = sort!(["$k=$v" for (k, v) in cfg.runtime.xla_flags]) residency_mode = cfg.runtime.residency_mode shared_host_weights = cfg.runtime.shared_host_weights shared_host_weights_mode = string(cfg.runtime.shared_host_weights_mode; base = 8) host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests discipline = cfg.scheduler.discipline ema_halflife_seconds = cfg.scheduler.ema_halflife_seconds recency_penalty_cap = cfg.scheduler.recency_penalty_cap coalescing = cfg.scheduler.coalescing coalescing_discount = cfg.scheduler.coalescing_discount cost_ema_alpha = cfg.scheduler.cost_ema_alpha max_queue_depth = cfg.scheduler.max_queue_depth compaction_interval = cfg.scheduler.compaction_interval scheduler_models = collect(keys(cfg.scheduler.models))
+    @info "Effective configuration" model_dirs = cfg.model_dirs models_include = cfg.models_include model_control_mode = cfg.model_control_mode model_poll_seconds = cfg.model_poll_seconds cache_dir = cfg.cache_dir backend = cfg.runtime.backend device_ordinal = cfg.runtime.device_ordinal mem_fraction = cfg.runtime.mem_fraction preallocate = cfg.runtime.preallocate allow_cpu_fallback = cfg.runtime.allow_cpu_fallback weight_cache_fraction = cfg.runtime.weight_cache_fraction weight_cache_wiggle_fraction = cfg.runtime.weight_cache_wiggle_fraction autotune = cfg.runtime.autotune autotune_cache = cfg.runtime.autotune_cache autotune_cache_dir = cfg.runtime.autotune_cache_dir numerics = cfg.runtime.numerics executable_cache = cfg.runtime.executable_cache profile = cfg.runtime.profile batch_sizes = cfg.runtime.batch_sizes weights_migration = cfg.runtime.weights_migration xla_flags = sort!(["$k=$v" for (k, v) in cfg.runtime.xla_flags]) residency_mode = cfg.runtime.residency_mode shared_host_weights = cfg.runtime.shared_host_weights shared_host_weights_mode = string(cfg.runtime.shared_host_weights_mode; base = 8) host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests discipline = cfg.scheduler.discipline ema_halflife_seconds = cfg.scheduler.ema_halflife_seconds recency_penalty_cap = cfg.scheduler.recency_penalty_cap coalescing = cfg.scheduler.coalescing coalescing_discount = cfg.scheduler.coalescing_discount cost_ema_alpha = cfg.scheduler.cost_ema_alpha max_queue_depth = cfg.scheduler.max_queue_depth compaction_interval = cfg.scheduler.compaction_interval scheduler_models = collect(keys(cfg.scheduler.models))
     isempty(applied) || @info "Configuration overridden by environment" overrides = ["$k=$v" for (k, v) in applied]
     return nothing
 end

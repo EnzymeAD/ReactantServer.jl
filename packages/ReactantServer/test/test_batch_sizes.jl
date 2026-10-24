@@ -130,7 +130,7 @@ end
     backend = ReactantServer.ReactantBackend()
     base = ReactantServer.RuntimeConfig(ReactantServer.CPU_BACKEND, 0, 0.9, true, true)
     flagged = ReactantServer.RuntimeConfig(
-        (getfield(base, f) for f in fieldnames(ReactantServer.RuntimeConfig)[1:(end - 3)])...,
+        (getfield(base, f) for f in fieldnames(ReactantServer.RuntimeConfig)[1:15])...,
         ReactantServer.PROFILE_REGULATED, BATCH_SIZES_LARGEST,
         Dict{String, Any}("xla_gpu_exclude_nondeterministic_ops" => true),
     )

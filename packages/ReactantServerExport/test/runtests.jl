@@ -129,6 +129,38 @@ _load_manifest(dir) = ReactantServer.parse_manifest(
         @test collect_provenance(; extra = Dict("julia_version" => "override"))["julia_version"] == "override"
     end
 
+    @testset "weights layout" begin
+        W = Float32[1 2 3; 4 5 6]
+        V = reshape(Float32.(1:24), 2, 3, 4)
+        b = Float32[1, 2]
+        mlir = "module {\n  func.func @main(%x: tensor<2xf32>) -> tensor<2xf32> {\n    return %x : tensor<2xf32>\n  }\n}\n"
+        program = ["W" => permutedims(W), "V" => permutedims(V, (3, 2, 1)), "b" => b]
+        for layout in (:xla, :legacy)
+            mktempdir() do root
+                dir = joinpath(root, "lay")
+                write_bundle(
+                    dir; name = "lay", executable_inputs = [IOSpec("x", Float32, [2])],
+                    executable_outputs = [IOSpec("y", Float32, [2])], modules = Dict(0 => mlir),
+                    weights = ["W" => W, "V" => V, "b" => b], layout
+                )
+                @test ReactantServer.YAML.load_file(joinpath(dir, "manifest.yaml"))["format_version"] == (layout === :xla ? "2.1" : "2.0")
+                w, _ = ReactantServer.open_weights_file(joinpath(dir, "weights.safetensors"))
+                @test w.xla_order == (layout === :xla)
+                for (n, a) in ("W" => W, "V" => V, "b" => b)
+                    @test ReactantServer.read_weight(w, n) == a                 # what the server uploads
+                    layout === :xla &&                                          # stored unpermuted
+                        @test ReactantServer._read_raw(w, w.tensors[n]) == vec(a)
+                end
+                ReactantServer.close_weights!(w)
+                @test read_bundle_weights(dir) == program
+            end
+        end
+        @test_throws "layout must be" write_bundle(
+            mktempdir(); name = "x", executable_inputs = IOSpec[], executable_outputs = IOSpec[],
+            modules = Dict(0 => mlir), weights = Pair{String, Any}[], layout = :bogus
+        )
+    end
+
     @testset "Reactant model -> bundle -> server (multi-batch)" begin
         rng = Random.Xoshiro(0)
         model = Lux.Chain(Lux.Dense(4 => 8, tanh), Lux.Dense(8 => 3))
@@ -174,17 +206,20 @@ _load_manifest(dir) = ReactantServer.parse_manifest(
         g(x, W, b) = W * x .+ b
         W = Float32[1 0 0; 0 1 0]
         bvec = Float32[10, 20]
-        mktempdir() do root
-            x0 = reshape(collect(Float32, 1:3), 3, 1)
-            export_bundle(
-                :reactant, g, (x0,), ["W" => W, "b" => bvec];
-                dir = joinpath(root, "affine"), name = "affine", input_names = ["x"]
-            )
-            @test isfile(joinpath(root, "affine", "model.mlir"))
+        for layout in (:xla, :legacy)                  # the frontend passes `layout` through
+            mktempdir() do root
+                x0 = reshape(collect(Float32, 1:3), 3, 1)
+                export_bundle(
+                    :reactant, g, (x0,), ["W" => W, "b" => bvec];
+                    dir = joinpath(root, "affine"), name = "affine", input_names = ["x"], layout
+                )
+                @test isfile(joinpath(root, "affine", "model.mlir"))
+                @test _load_manifest(joinpath(root, "affine")).format_version == (layout === :xla ? "2.1" : "2.0")
 
-            x = reshape(Float32[2, 3, 4], 3, 1)
-            out = run_bundle(root, "affine", ["x" => x])
-            @test isapprox(vec(out[1].data), vec(W * x .+ bvec); rtol = 1.0e-5)
+                x = reshape(Float32[2, 3, 4], 3, 1)
+                out = run_bundle(root, "affine", ["x" => x])
+                @test isapprox(vec(out[1].data), vec(W * x .+ bvec); rtol = 1.0e-5)
+            end
         end
     end
 

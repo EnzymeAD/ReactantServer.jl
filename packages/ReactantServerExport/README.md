@@ -7,6 +7,10 @@ into a bundle; with `PythonCall` loaded, a package extension adds the PyTorch fr
 (`export_bundle(:pytorch, ...)` and `export_bundle(:torchscript, ...)`). `write_bundle` and
 `IOSpec` are the low-level writer underneath.
 
+Since 2.0, bundles store their weights in the program's axis order, which the server reads with no
+permute; such bundles need ReactantServer 0.2 or later. Pass `layout = :legacy` to any export
+function to target older servers.
+
 This package is the bundle-format authority for producers. The server never loads it: export
 happens offline in its own environment, and the worker reads only the bundle it writes. It is
 kept in sync with the server by round-trip tests that export a model, run it through the

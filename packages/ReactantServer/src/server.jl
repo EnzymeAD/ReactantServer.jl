@@ -219,7 +219,10 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     probe = pool.platform == "cuda" ? tf32_probe(backend, pool) : nothing
     cfg.runtime.profile == PROFILE_REGULATED && _report_regulated_precision(cfg.runtime, backend, pool, probe; coalescing = cfg.scheduler.coalescing)
     include = isempty(cfg.models_include) ? nothing : cfg.models_include
-    registry = load_bundles(cfg.model_dirs; include = include, batch_sizes = cfg.runtime.batch_sizes)
+    registry = load_bundles(
+        cfg.model_dirs; include = include, batch_sizes = cfg.runtime.batch_sizes,
+        weights_migration = cfg.runtime.weights_migration
+    )
     isempty(registry.by_name) && @warn "no model bundles found" model_dirs = cfg.model_dirs models_include = cfg.models_include
     # On-demand weight residency is sized as a fraction of the BFC arena (`mem_fraction * device`),
     # resolved now that the device pool exists. The cache is GPU-only: `arena` is 0 when the device

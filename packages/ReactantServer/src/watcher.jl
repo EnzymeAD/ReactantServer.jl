@@ -31,7 +31,7 @@ _dir_id(dir::AbstractString) = (st = stat(dir); (UInt64(st.device), UInt64(st.in
 # cache write can never cause the model that produced it to be reloaded. Multi-shape bundles carry
 # per-variant modules (`model.v{i}.b{N}.mlir`), which count as bundle files too.
 _is_bundle_file(f::AbstractString) =
-    f == "manifest.yaml" || f == "weights.safetensors" || f == "model.jl" ||
+    f == "manifest.yaml" || occursin(r"^weights[A-Za-z0-9_.-]*\.safetensors$", f) || f == "model.jl" ||
     occursin(r"^model(\.v\d+)?(\.b\d+)?\.mlir$", f)
 
 function bundle_signature(dir::AbstractString)::BundleSig
@@ -135,7 +135,10 @@ function _apply_change!(
             delete!(w.dir_ids, name)
         else
             # named by its directory basename, i.e. `name`
-            entry = load_bundle_entry(dir; batch_sizes = w.cfg.runtime.batch_sizes)
+            entry = load_bundle_entry(
+                dir; batch_sizes = w.cfg.runtime.batch_sizes,
+                weights_migration = w.cfg.runtime.weights_migration
+            )
             if entry isa MetaEntry
                 # Meta bundles need no compilation; register them straight into the meta map.
                 put_meta!(w.scheduler, entry)
