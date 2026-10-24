@@ -646,10 +646,10 @@ version = "0.1.1"
     KaimonGate = "5ee84a8c-75bd-412f-a7b8-4e6463aa635f"
 
 [[deps.ReactantServerClient]]
-deps = ["FixedSizeArrays", "InterProcessCommunication", "PrecompileTools", "ProtoBuf", "ReactantServerCore", "ResumableFunctions", "gRPCClient"]
+deps = ["FixedSizeArrays", "InterProcessCommunication", "PrecompileTools", "ProtoBuf", "ReactantServerCore", "gRPCClient"]
 path = "packages/ReactantServerClient"
 uuid = "df172679-9d9b-4a02-a92c-27cb5f9e1c5c"
-version = "1.0.2"
+version = "1.0.3"
 
 [[deps.ReactantServerCore]]
 deps = ["BFloat16s", "DLFP8Types", "Dates", "FixedSizeArrays", "InterProcessCommunication", "ProtoBuf", "YAML"]
@@ -692,12 +692,6 @@ deps = ["NetworkOptions", "OpenSSL_jll", "PrecompileTools", "Random", "SHA"]
 git-tree-sha1 = "1a152e648e0af6fdaa18c6379bd6debb712d64ea"
 uuid = "802f3686-a58f-41ce-bb0c-3c43c75bba36"
 version = "1.5.0"
-
-[[deps.ResumableFunctions]]
-deps = ["Logging", "MacroTools"]
-git-tree-sha1 = "425f9d353d88d19343f1e509052282f000a985a8"
-uuid = "c5292f4c-5179-55e1-98c5-05642aab7184"
-version = "1.0.8"
 
 [[deps.SHA]]
 uuid = "ea8e919c-243c-51af-8825-aaa63cd721ce"
