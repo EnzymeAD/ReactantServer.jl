@@ -148,6 +148,7 @@ function load_bundle_entry(
     # if the path is replaced later, reads keep returning the loaded version, and host copies must
     # carry that version's label.
     weights, weights_id = open_weights_file(weights_path)
+    warn_legacy_layout(weights, m.name)
     return ModelEntry(m.name, m, mlir_bytes, weights_path, weights, nothing, nothing, pre, post, weights_id)
 end
 

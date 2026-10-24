@@ -107,6 +107,25 @@ end
     end
 end
 
+@testset "a legacy layout warns once, naming the ways out" begin
+    mktempdir() do root
+        name = "warnlegacy_" * string(getpid())
+        dir = _mig_bundle(root, name)
+        delete!(_RSM._LEGACY_WARNED, name)
+        e = @test_logs (:warn, r"legacy axis order.*weights_migration.*migrate_weights.jl.*ReactantServerExport 2.0") match_mode = :any _RSM.load_bundle_entry(dir)
+        _RSM.close_weights!(e.weights)
+        e = @test_logs min_level = Base.CoreLogging.Warn _RSM.load_bundle_entry(dir)     # once per model
+        _RSM.close_weights!(e.weights)
+        @test _RSM.migrate_bundle_weights!(dir, _RSM.MIGRATE_REPLACE) == :replaced
+        delete!(_RSM._LEGACY_WARNED, name)
+        e = @test_logs min_level = Base.CoreLogging.Warn _RSM.load_bundle_entry(dir)     # converted: silent
+        _RSM.close_weights!(e.weights)
+        vec_only = _mig_bundle(root, name * "_1d"; weights = Dict{String, Array}("b" => Float32[1, 2, 3]))
+        e = @test_logs min_level = Base.CoreLogging.Warn _RSM.load_bundle_entry(vec_only)  # no extra copy
+        _RSM.close_weights!(e.weights)
+    end
+end
+
 @testset "manifest weights_file and format 2.1" begin
     base = Dict{String, Any}(
         "format_version" => "2.1", "name" => "m",

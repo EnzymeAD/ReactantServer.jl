@@ -373,7 +373,25 @@ function _drop_copy!(dir, lpath, tpath, result)
 end
 
 # ---------------------------------------------------------------------------------------------
-# Choosing the file to load
+# Choosing the file to load, and saying when it costs a copy
+
+const _LEGACY_WARNED = Set{String}()
+const _LEGACY_WARNED_LOCK = ReentrantLock()
+
+# Warn, once per model per process, that a model's weights are in the legacy axis order and so
+# cost an extra transposed copy of every tensor on each load. Files whose tensors are all 0- or
+# 1-dimensional cost nothing extra and are not mentioned.
+function warn_legacy_layout(w, name::AbstractString)
+    (w isa WeightsFile && !w.xla_order) || return nothing
+    any(i -> length(i.shape) >= 2, values(w.tensors)) || return nothing
+    first_time = @lock _LEGACY_WARNED_LOCK (name in _LEGACY_WARNED ? false : (push!(_LEGACY_WARNED, name); true))
+    first_time || return nothing
+    @warn "model '$name' stores its weights in the legacy axis order, so every load makes an extra " *
+        "transposed copy of each tensor. To convert it, set runtime.weights_migration to `copy` " *
+        "(keeps the original; older servers still load it) or `replace` (once every server is 0.2 " *
+        "or later), run tools/migrate_weights.jl, or re-export it with ReactantServerExport 2.0." path = w.path
+    return nothing
+end
 
 """
     resolve_weights_path(dir, m::Manifest) -> String
