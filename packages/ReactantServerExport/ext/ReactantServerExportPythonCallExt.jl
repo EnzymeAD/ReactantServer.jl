@@ -741,7 +741,7 @@ function export_bundle(
         matmul_precision::Union{Nothing, AbstractString} = nothing,
         client_inputs = nothing, client_outputs = nothing,
         axis_letters::Union{Nothing, AbstractDict} = nothing,
-        provenance = Dict{String, Any}(),
+        provenance = Dict{String, Any}(), layout::Symbol = :xla,
         wrap = nothing
     )
     _pyimports()
@@ -768,7 +768,7 @@ function export_bundle(
         strict = false,
         matmul_precision = matmul_precision,
         client_inputs = client_inputs, client_outputs = client_outputs, axis_letters = axis_letters,
-        provenance = prov
+        provenance = prov, layout
     )
 end
 
