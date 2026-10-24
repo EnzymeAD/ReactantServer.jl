@@ -30,6 +30,8 @@ mutable struct WeightCache
     pinned_bytes::Int              # observability: device-pinned footprint reserved (set at startup)
     max_scratch::Int               # observability: measured worst-case execution scratch (set at startup)
     weight_pool::Int               # observability: arena bytes allotted to all weights (pinned + on-demand)
+    load_bytes::Int                # observability: weight bytes transferred by on-demand loads
+    footprints::Dict{String, ModelFootprint}   # per-model W / wmax / S / load time, by model name
     lock::ReentrantLock
 end
 
@@ -37,7 +39,38 @@ WeightCache(
     backend::AbstractBackend, pool::MemoryPool, registry::ModelRegistry, max_bytes::Integer;
     mode::ResidencyMode = SELF_MANAGED, store::WeightStore = PrivateWeightStore()
 ) =
-    WeightCache(backend, pool, registry, mode, store, Int(max_bytes), 0, String[], 0, 0, 0.0, 0, 0, 0, 0, ReentrantLock())
+    WeightCache(
+    backend, pool, registry, mode, store, Int(max_bytes), 0, String[], 0, 0, 0.0, 0, 0, 0, 0, 0,
+    Dict{String, ModelFootprint}(), ReentrantLock()
+)
+
+"""
+    model_footprint(cache, entry) -> ModelFootprint
+
+The model's device footprint (`W`, `wmax`, `S`, load time), computed on first use and cached. A
+model rebuilt under the same name (a reload) gets a fresh footprint, since its weights and
+compiled programs may differ. Runs on the dispatch thread, the sole residency mutator; the lock
+covers the dictionary against the metrics snapshot.
+"""
+function model_footprint(cache::WeightCache, entry::ModelEntry)
+    model = entry.executable::LoadedModel
+    return lock(cache.lock) do
+        fp = get(cache.footprints, entry.name, nothing)
+        if fp === nothing || fp.owner !== model
+            fp = _new_footprint(entry, model)
+            cache.footprints[entry.name] = fp
+        end
+        return fp
+    end
+end
+
+# A numeric device-memory snapshot for the load / evict / compact logs, or `nothing` without
+# device stats. One allocator query (well under a microsecond on CUDA).
+function _memory_point(cache::WeightCache)
+    dm = device_memory_stats(cache.backend, cache.pool)
+    dm === nothing && return nothing
+    return (in_use = dm.in_use, largest_free = largest_free_bytes(dm), fragmentation = fragmentation(dm))
+end
 
 """
     weight_budget(; arena, fraction, wiggle, max_scratch, pinned_bytes) -> (; on_demand_budget, weight_pool, scratch_ceiling, pinned_over_commit)
@@ -188,14 +221,18 @@ function acquire!(cache::WeightCache, entry::ModelEntry)
                 cache.evicts += 1
             end
         end
-        for fb in to_free
+        for (name, fb) in zip(victims, to_free)
+            before = _memory_point(cache)
             free_weights!(cache.backend, fb)
+            log_memory_event(:evict, name, model_footprint(cache, cache.registry.by_name[name]), before, _memory_point(cache))
         end
         @debug "residency: evicted for headroom" loading = entry.name evicted = victims
     end
 
     # Transfer the target's weights to the GPU (outside the lock), then commit residency. With
     # weights pinned in host RAM this is a pure host->device copy, not a re-materialization.
+    fp = model_footprint(cache, entry)
+    before = _memory_point(cache)
     t0 = time()
     bufs = _device_buffers(cache, entry, model)
     dt = time() - t0
@@ -205,7 +242,10 @@ function acquire!(cache::WeightCache, entry::ModelEntry)
         cache.resident_bytes += model.nbytes
         cache.loads += 1
         cache.load_seconds += dt
+        cache.load_bytes += fp.weight_bytes
+        record_load!(fp, dt)
     end
+    log_memory_event(:load, entry.name, fp, before, _memory_point(cache))
     log_residency_change(
         entry.name, :system, :device, model.nbytes;
         memory = memory_report(cache.backend, cache.pool; registry = cache.registry, weight_cache = cache)
@@ -296,6 +336,7 @@ function release_all!(cache::WeightCache, entry::ModelEntry)
         end
         to_free = model.weights
         model.weights = nothing
+        delete!(cache.footprints, entry.name)
     end
     to_free === nothing || free_weights!(cache.backend, to_free)
     if model.host_weights !== nothing
@@ -317,6 +358,8 @@ function rename!(cache::WeightCache, old::AbstractString, new::AbstractString)
     lock(cache.lock) do
         i = findfirst(==(String(old)), cache.lru)
         i === nothing || (cache.lru[i] = String(new))
+        fp = pop!(cache.footprints, String(old), nothing)
+        fp === nothing || (cache.footprints[String(new)] = fp)
     end
     host_rename!(cache.store, old, new)
     return nothing
@@ -342,6 +385,7 @@ models reloaded.
 """
 function compact!(cache::WeightCache, registry::ModelRegistry; reload::Vector{String} = String[])
     before = memory_report(cache.backend, cache.pool; registry = registry, weight_cache = cache)
+    before_point = _memory_point(cache)
 
     # Phase A: free every resident non-pinned device buffer. Reset the on-demand budget bookkeeping
     # (which counts only non-pinned residency, so this is exact); keep the host floors. The slow
@@ -363,11 +407,13 @@ function compact!(cache::WeightCache, registry::ModelRegistry; reload::Vector{St
     end
 
     # Phase B: reload the requested non-pinned models into the coalesced region, through `acquire!`
-    # so its budget/LRU bookkeeping (and `loads`/`load_seconds`) is restored. Skipped in
+    # so its budget/LRU bookkeeping (and `loads`/`load_seconds`) is restored. Largest first: on an
+    # empty region a descending-size fill packs each model against the last and cannot fragment,
+    # whereas small models placed first leave gaps a later large model may not fit. Skipped in
     # externally-managed mode, where `acquire!` does not autonomously load.
     reloaded = 0
     if cache.mode != EXTERNALLY_MANAGED
-        for name in reload
+        for name in _largest_first(cache, registry, reload)
             entry = get(registry.by_name, name, nothing)
             entry === nothing && continue
             model = entry.executable
@@ -378,8 +424,22 @@ function compact!(cache::WeightCache, registry::ModelRegistry; reload::Vector{St
     end
 
     after = memory_report(cache.backend, cache.pool; registry = registry, weight_cache = cache)
-    @info "memory compacted" reloaded = reloaded requested = length(reload) before = before after = after
+    after_point = _memory_point(cache)
+    @info "memory compacted" reloaded = reloaded requested = length(reload) before = before after = after largest_free_before = _point_field(before_point, :largest_free) largest_free_after = _point_field(after_point, :largest_free) fragmentation_before = _point_field(before_point, :fragmentation) fragmentation_after = _point_field(after_point, :fragmentation)
     return reloaded
+end
+
+_point_field(p, k::Symbol) = p === nothing ? nothing : getfield(p, k)
+
+# `names` ordered by descending weight footprint; names that are not loaded models keep their
+# relative order at the end (the reload loop skips them).
+function _largest_first(cache::WeightCache, registry::ModelRegistry, names::Vector{String})
+    function wbytes(name)
+        entry = get(registry.by_name, name, nothing)
+        (entry === nothing || entry.executable === nothing) && return -1
+        return model_footprint(cache, entry).weight_bytes
+    end
+    return sort(names; by = wbytes, rev = true)
 end
 
 """
@@ -394,7 +454,13 @@ function weight_cache_stats(cache::WeightCache)
             resident_models = copy(cache.lru), loads = cache.loads, evicts = cache.evicts,
             load_seconds = cache.load_seconds, compactions = cache.compactions,
             pinned_bytes = cache.pinned_bytes, max_scratch = cache.max_scratch,
-            weight_pool = cache.weight_pool,
+            weight_pool = cache.weight_pool, load_bytes = cache.load_bytes,
+            footprints = Dict(
+                name => (
+                    weight_bytes = fp.weight_bytes, max_weight_bytes = fp.max_weight_bytes,
+                    scratch_bytes = fp.scratch_bytes, load_seconds = fp.load_seconds, loads = fp.loads,
+                ) for (name, fp) in cache.footprints
+            ),
         )
     end
 end

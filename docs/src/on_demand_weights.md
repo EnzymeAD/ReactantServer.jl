@@ -228,10 +228,19 @@ models stay resident and that the eviction rate is acceptable for your budget. C
 every item in the batch, so on-demand loading and batching reinforce each other.
 
 Each compaction also logs a `memory compacted` line with the device free space and
-on-demand budget before and after, and the weight cache tracks a `compactions` counter.
-Compare the before/after device free figures to confirm that compaction actually recovered
-contiguous space on your hardware: it relies on the allocator returning freed buffers to
-the arena and coalescing them, which the log lets you verify rather than assume.
+on-demand budget before and after, plus the largest free block and fragmentation before and
+after, and the weight cache tracks a `compactions` counter. Compare the before/after
+largest free block to confirm that compaction actually recovered contiguous space on your
+hardware: it relies on the allocator returning freed buffers to the arena and coalescing
+them, which the log lets you verify rather than assume. Models named for an eager reload
+are reloaded largest first, so the refill packs tightly instead of leaving gaps.
+
+With `JULIA_DEBUG=ReactantServer`, every on-demand load and eviction also logs a
+`memory: weight load` or `memory: weight evict` line with raw byte counts: the model's
+allocator-rounded weight footprint, its largest single weight tensor, its measured
+scratch, its average load time, and the device's bytes in use, largest free block and
+fragmentation before and after. These lines are meant to be parsed into a
+fragmentation-over-time series.
 
 The worker also exports the BFC allocator's live numbers as Prometheus gauges (aggregated
 through the gateway's `/metrics`): `worker_device_memory_in_use_bytes`,
@@ -239,7 +248,18 @@ through the gateway's `/metrics`): `worker_device_memory_in_use_bytes`,
 high-water, your empirical scratch + resident ceiling), and
 `worker_device_memory_pool_bytes`. The peak gauge is reset once compilation finishes and again
 before each probed model, so after startup it tracks execution only; a rising peak over a long
-uptime is the signal to revisit the budget. Note the GPU BFC
-allocator does not report a largest-contiguous-free-block figure, so fragmentation is not
-directly observable here; in practice it surfaces as an allocation failing despite ample
-reported free bytes, which is what compaction (above) addresses.
+uptime is the signal to revisit the budget.
+
+Fragmentation is observable directly: `worker_device_memory_largest_free_block_bytes` is the
+largest single allocation the allocator can satisfy right now, and
+`worker_device_memory_fragmentation` is `1 - largest_free_block / free_bytes` (0 when the
+free memory is one block, approaching 1 as it splinters). A model whose largest weight tensor
+or execution scratch exceeds the largest free block cannot be placed even when the free byte
+count looks ample, which is the condition compaction (above) repairs. Allocation failures
+are expensive to discover: XLA's allocator waits about 10 seconds for memory to be released
+before it reports one.
+
+Per model, `worker_model_scratch_bytes` is the scratch measured at startup and
+`worker_model_load_seconds` the moving average of its on-demand load time.
+`worker_weight_load_bytes_total` divided by `worker_weight_load_seconds_total` gives the
+effective host-to-device bandwidth of weight loads.

@@ -83,7 +83,9 @@ backend_tf32_capable(::AbstractBackend, pool) = false
 
 # Device memory introspection (optional, for observability). Returns a NamedTuple
 # `(in_use, limit, free)` of byte counts, or `nothing` when the backend/device cannot report it
-# (e.g. the CPU client or MockBackend). Callers degrade gracefully on `nothing`.
+# (e.g. the CPU client or MockBackend). Callers degrade gracefully on `nothing`. A backend that can
+# also report the largest single allocation it could satisfy right now adds `largest_free`; read it
+# through `largest_free_bytes`, which tolerates its absence.
 device_memory_stats(::AbstractBackend, pool) = nothing
 
 # Reset the device allocator's high-water mark (`peak_in_use`) to the current in-use bytes. Returns

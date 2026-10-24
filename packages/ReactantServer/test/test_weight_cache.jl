@@ -457,3 +457,64 @@ end
         ReactantServer.shutdown!(sched)
     end
 end
+
+@testset "footprint: allocator rounding, largest allocation, fragmentation" begin
+    fp = ReactantServer.weight_footprint([1, 256, 257])
+    @test fp.weight_bytes == 256 + 256 + 512            # every tensor rounds up to the 256-byte granule
+    @test fp.max_weight_bytes == 512
+    @test ReactantServer.weight_footprint(Int[]) == (weight_bytes = 0, max_weight_bytes = 0)
+
+    @test ReactantServer.fragmentation(nothing) === nothing
+    @test ReactantServer.fragmentation((in_use = 0, limit = 100, free = 100)) === nothing   # no largest_free
+    @test ReactantServer.fragmentation((in_use = 0, limit = 100, free = 100, largest_free = 100)) == 0.0
+    @test ReactantServer.fragmentation((in_use = 60, limit = 100, free = 40, largest_free = 10)) == 0.75
+    @test ReactantServer.fragmentation((in_use = 100, limit = 100, free = 0, largest_free = 0)) == 0.0
+    @test ReactantServer.largest_free_bytes((in_use = 1, limit = 2, free = 1, largest_free = 1)) == 1
+end
+
+@testset "footprint: loads record W and load time; rename rekeys, release drops" begin
+    sched = _od_scheduler(
+        _od_entry("A"; pinned = false, nbytes = _WBYTES),
+        _od_entry("B"; pinned = false, nbytes = _WBYTES); budget = _WBYTES
+    )
+    cache = sched.weight_cache
+    _dispatch1!(sched, "A")
+    fpA = cache.footprints["A"]
+    @test fpA.weight_bytes == 256                        # one 8-byte tensor, rounded to the granule
+    @test fpA.max_weight_bytes == 256
+    @test fpA.loads == 1 && fpA.load_seconds >= 0
+    @test cache.load_bytes == 256
+
+    _dispatch1!(sched, "B")                               # evicts A, loads B
+    _dispatch1!(sched, "A")                               # evicts B, reloads A
+    @test fpA.loads == 2                                  # the same footprint object accumulates
+    @test cache.footprints["A"] === fpA
+    @test cache.load_bytes == 3 * 256
+
+    st = ReactantServer.weight_cache_stats(cache)
+    @test st.load_bytes == 3 * 256
+    @test st.footprints["A"].loads == 2 && st.footprints["B"].loads == 1
+
+    # A model rebuilt under the same name gets a fresh footprint rather than the old one's numbers.
+    entryA = sched.registry.by_name["A"]
+    old = entryA.executable
+    entryA.executable = ReactantServer.LoadedModel(old.sig, old.execs, nothing, old.state, old.nbytes, nothing)
+    @test ReactantServer.model_footprint(cache, entryA) !== fpA
+    entryA.executable = old
+
+    ReactantServer.rename!(cache, "B", "B2")
+    @test !haskey(cache.footprints, "B") && haskey(cache.footprints, "B2")
+    sched.registry.by_name["B2"] = pop!(sched.registry.by_name, "B")
+    sched.registry.by_name["B2"].name = "B2"
+    ReactantServer.release_all!(cache, sched.registry.by_name["B2"])
+    @test !haskey(cache.footprints, "B2")
+end
+
+@testset "compaction reloads largest models first" begin
+    small = _od_entry("small"; pinned = false, nbytes = _WBYTES)
+    big = _od_entry("big"; pinned = false, nbytes = 4 * _WBYTES)
+    big.weights = FakeWeights(Dict{String, Array}("w" => zeros(Float32, 1000)))   # 4000 bytes -> 4096
+    sched = _od_scheduler(small, big; budget = 1 << 20)
+    @test ReactantServer._largest_first(sched.weight_cache, sched.registry, ["small", "missing", "big"]) ==
+        ["big", "small", "missing"]
+end

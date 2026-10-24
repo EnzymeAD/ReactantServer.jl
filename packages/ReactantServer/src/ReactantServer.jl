@@ -54,6 +54,7 @@ include("runtime/mock_backend.jl")
 include("runtime/memory_pool.jl")
 include("runtime/weights.jl")
 include("runtime/model.jl")
+include("runtime/footprint.jl")
 include("runtime/weight_cache.jl")
 include("runtime/execution.jl")
 # Per-bundle serialized-executable cache (backend-agnostic policy: layout, hashes, invalidation).

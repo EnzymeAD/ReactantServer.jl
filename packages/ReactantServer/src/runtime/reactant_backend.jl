@@ -135,13 +135,19 @@ function device_memory_stats(::ReactantBackend, pool::MemoryPool)
         limit = (limit === nothing || limit <= 0) ?
             Int(_RXLA.device_properties(pool.device).totalGlobalMem) : Int(limit)
         _orz(x) = x === nothing ? 0 : Int(x)   # the BFC reports pool sizes only once it has allocated
+        pool_bytes = _orz(stats.pool_bytes)
         # `peak_in_use` is the allocator's session high-water mark (the empirical scratch + resident
-        # ceiling). The GPU BFC allocator does not populate `largest_free_block_bytes` (it is left 0),
-        # so we do not surface it; fragmentation is not directly observable from this allocator.
+        # ceiling). `largest_free_block_bytes` is the largest free chunk inside the pool, exact and
+        # cheap (measured on an A6000: it matches the allocator's own dump, about 0.5 us a query).
+        # It counts only memory the pool already holds, so it reads 0 before the first allocation,
+        # and without preallocation the not-yet-claimed remainder is free too: one fresh region can
+        # serve an allocation of up to `limit - pool_bytes`.
+        largest_free = max(Int(stats.largest_free_block_bytes), max(limit - pool_bytes, 0))
         return (
             in_use = in_use, limit = limit, free = max(limit - in_use, 0),
             peak_in_use = Int(stats.peak_bytes_in_use),
-            pool_bytes = _orz(stats.pool_bytes), peak_pool_bytes = _orz(stats.peak_pool_bytes),
+            pool_bytes = pool_bytes, peak_pool_bytes = _orz(stats.peak_pool_bytes),
+            largest_free = min(largest_free, max(limit - in_use, 0)),
         )
     catch
         return nothing
