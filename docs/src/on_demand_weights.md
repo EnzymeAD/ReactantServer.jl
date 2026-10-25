@@ -31,10 +31,11 @@ model's weight size over the host-to-device bandwidth.
 ## Enabling it
 
 The main setting is `runtime.device_weight_fraction`, the share of the BFC arena
-(`mem_fraction * device memory`) that holds resident model weights, pinned plus on-demand. It
+(`device_memory_fraction * device memory`) that holds resident model weights, pinned plus on-demand. It
 defaults to **1.0** (use the whole arena, GPU only) and must be greater than 0: models that do not
-fit in it are swapped on and off the GPU. You normally do not set it at all. (In 0.1 it was called
-`weight_cache_fraction`, and `device_headroom_fraction` was `weight_cache_wiggle_fraction`; the old
+fit in it are swapped on and off the GPU. You normally do not set it at all. (In 0.1 the three device
+settings were `mem_fraction`, `weight_cache_fraction` and `weight_cache_wiggle_fraction`; they are
+now `device_memory_fraction`, `device_weight_fraction` and `device_headroom_fraction`, and the old
 names are rejected at startup.)
 
 ```yaml

@@ -65,7 +65,7 @@ const KGE = Base.get_extension(ReactantServer, :ReactantServerKaimonGateExt)
             base = (
                 model_dir = root, models = String[], accelerator = "cuda", device = 2,
                 host = "0.0.0.0", port = 8080, metrics_port = 9100, cache_dir = nothing,
-                mem_fraction = nothing, device_weight_fraction = nothing, numerics = nothing,
+                device_memory_fraction = nothing, device_weight_fraction = nothing, numerics = nothing,
                 poll_seconds = nothing,
             )
             cfg = KGE._build_config(; base...)
@@ -79,7 +79,7 @@ const KGE = Base.get_extension(ReactantServer, :ReactantServerKaimonGateExt)
             # No watcher unless a poll interval is asked for, and the YAML path's defaults are
             # inherited rather than restated here.
             @test cfg.model_control_mode == ReactantServer.STATIC
-            @test cfg.runtime.mem_fraction == 0.9
+            @test cfg.runtime.device_memory_fraction == 0.9
             @test cfg.runtime.preallocate
             @test cfg.runtime.device_weight_fraction == 1.0
 
@@ -89,11 +89,11 @@ const KGE = Base.get_extension(ReactantServer, :ReactantServerKaimonGateExt)
             @test dyn.models_include == ["a", "b"]
 
             tuned = KGE._build_config(;
-                base..., accelerator = "cpu", device = 0, mem_fraction = 0.5,
+                base..., accelerator = "cpu", device = 0, device_memory_fraction = 0.5,
                 device_weight_fraction = 0.5, numerics = "f32"
             )
             @test tuned.runtime.backend == ReactantServer.CPU_BACKEND
-            @test tuned.runtime.mem_fraction == 0.5
+            @test tuned.runtime.device_memory_fraction == 0.5
             @test tuned.runtime.device_weight_fraction == 0.5
             @test tuned.runtime.numerics == ReactantServer.NUMERICS_F32
 
@@ -113,7 +113,7 @@ const KGE = Base.get_extension(ReactantServer, :ReactantServerKaimonGateExt)
             mk(frac) = KGE._build_config(;
                 model_dir = root, models = String[], accelerator = "cuda", device = 0,
                 host = "127.0.0.1", port = 8080, metrics_port = 0, cache_dir = nothing,
-                mem_fraction = frac, device_weight_fraction = nothing, numerics = nothing,
+                device_memory_fraction = frac, device_weight_fraction = nothing, numerics = nothing,
                 poll_seconds = nothing
             )
             saved = KGE.CLIENT_COMMIT[]
@@ -121,7 +121,7 @@ const KGE = Base.get_extension(ReactantServer, :ReactantServerKaimonGateExt)
                 KGE.CLIENT_COMMIT[] = nothing
                 # The first CUDA start records what the session's XLA client is built with.
                 KGE._check_client_commit_locked(mk(0.8))
-                @test KGE.CLIENT_COMMIT[].mem_fraction == 0.8
+                @test KGE.CLIENT_COMMIT[].device_memory_fraction == 0.8
                 # A second one at the same settings is fine; one that disagrees is refused rather
                 # than silently inheriting the first arena.
                 KGE._check_client_commit_locked(mk(0.8))
@@ -131,7 +131,7 @@ const KGE = Base.get_extension(ReactantServer, :ReactantServerKaimonGateExt)
                 cpu = KGE._build_config(;
                     model_dir = root, models = String[], accelerator = "cpu", device = 0,
                     host = "127.0.0.1", port = 8080, metrics_port = 0, cache_dir = nothing,
-                    mem_fraction = 0.5, device_weight_fraction = nothing, numerics = nothing,
+                    device_memory_fraction = 0.5, device_weight_fraction = nothing, numerics = nothing,
                     poll_seconds = nothing
                 )
                 KGE._check_client_commit_locked(cpu)
@@ -159,7 +159,7 @@ const KGE = Base.get_extension(ReactantServer, :ReactantServerKaimonGateExt)
         @test args["models"]["type_meta"]["kind"] == "array"
         @test args["device"]["type_meta"]["kind"] == "integer"
         @test args["accelerator"]["type_meta"]["kind"] == "string"
-        for kw in ("port", "metrics_port", "host", "cache_dir", "mem_fraction", "numerics", "poll_seconds")
+        for kw in ("port", "metrics_port", "host", "cache_dir", "device_memory_fraction", "numerics", "poll_seconds")
             @test haskey(args, kw)
             @test !args[kw]["required"]
         end

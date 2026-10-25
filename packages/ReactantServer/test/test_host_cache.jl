@@ -183,6 +183,16 @@ end
     @test ReactantServer._fill_device!(sched) == 0              # the control plane decides there
 end
 
+@testset "the host weight budget startup line states each worker's share" begin
+    summary = ReactantServer._host_budget_summary
+    @test occursin("each worker may use 2.000 GiB", summary(8 << 30, false, 4))
+    @test occursin("split across 4 workers", summary(8 << 30, false, 4))
+    @test occursin("shared by every worker", summary(8 << 30, true, 4))
+    @test occursin("for this worker", summary(8 << 30, false, 1))
+    @test occursin("no host RAM copies", summary(0, false, 4))
+    @test occursin("unlimited", summary(nothing, false, 4))
+end
+
 @testset "a host weight budget resolves unspecified residency to cached, not pinned" begin
     cfg(budget) = ReactantServer.build_config(
         Dict{String, Any}(

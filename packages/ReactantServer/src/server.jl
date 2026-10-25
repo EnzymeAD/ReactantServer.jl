@@ -118,6 +118,17 @@ end
 # explicit per-model `residency` wins; otherwise PINNED_SYSTEM when the on-demand cache is enabled
 # (the host floor is materialized so an on-demand GPU load is a pure host-to-device transfer) and
 # UNPINNED otherwise.
+# The startup log line for the host weight budget, spelling out what each worker may use when the
+# budget is split (private host copies on a multi-worker node), since that is easy to misread.
+function _host_budget_summary(budget, shared::Bool, workers::Integer)
+    budget === nothing && return "host weight budget: unlimited (every model is kept in host RAM)"
+    budget == 0 && return "host weight budget: 0 (no host RAM copies; reloads read the weights file)"
+    total = Base.format_bytes(budget)
+    shared && return "host weight budget: $total shared by every worker on the node"
+    workers > 1 || return "host weight budget: $total for this worker"
+    return "host weight budget: $total split across $workers workers without shared host weights: each worker may use $(Base.format_bytes(budget ÷ workers)) of host RAM"
+end
+
 function _resolve_residency(cfg::ServerConfig, name::AbstractString, on_demand::Bool)
     declared = get(cfg.scheduler.models, name, ModelSchedConfig(1.0)).residency
     declared === nothing || return declared
@@ -226,7 +237,7 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
         weights_migration = cfg.runtime.weights_migration
     )
     isempty(registry.by_name) && @warn "no model bundles found" model_dirs = cfg.model_dirs models_include = cfg.models_include
-    # Resident weights are sized as a share of the BFC arena (`mem_fraction * device`), resolved now
+    # Resident weights are sized as a share of the BFC arena (`device_memory_fraction * device`), resolved now
     # that the device pool exists, and models that do not fit are swapped on demand. GPU only: `arena`
     # is 0 when the device cannot report its pool ceiling (CPU / mock), so every model's weights stay
     # resident there.
@@ -259,7 +270,7 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     if on_demand
         # A lowered budget, or regions a previous run left behind, are trimmed before anything loads.
         trimmed = trim_host_cache!(store)
-        @info "host weight budget" budget = budget === nothing ? "unlimited" : Base.format_bytes(budget) shared = store isa SharedWeightStore worker_share = worker_host_budget === nothing ? nothing : Base.format_bytes(worker_host_budget) trimmed_regions = trimmed
+        @info _host_budget_summary(budget, store isa SharedWeightStore, cfg.runtime.host_weight_budget_workers) budget = budget === nothing ? "unlimited" : Base.format_bytes(budget) shared = store isa SharedWeightStore worker_share = worker_host_budget === nothing ? nothing : Base.format_bytes(worker_host_budget) workers = cfg.runtime.host_weight_budget_workers trimmed_regions = trimmed
     end
     # Unspecified residency resolves to unpinned (swapped on demand, with host RAM copies within
     # runtime.host_weight_budget), or to system-pinned when that budget is unlimited. The same rule

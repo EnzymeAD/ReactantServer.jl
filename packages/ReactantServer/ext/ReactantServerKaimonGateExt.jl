@@ -19,7 +19,7 @@
 #
 # Reactant's XLA client is a process-global singleton, built on the first `client("cuda")` call and
 # cached from then on (`Reactant.XLA.global_backend_state`). The BFC knobs the worker sets right
-# before that first call (`runtime.mem_fraction`, `runtime.preallocate`) therefore bite exactly
+# before that first call (`runtime.device_memory_fraction`, `runtime.preallocate`) therefore bite exactly
 # once per session: a second GPU server in the same session inherits the arena the first one
 # created, whatever it asks for. Rather than let that pass silently, the first CUDA start records
 # what the session committed to and a later start that disagrees is refused with the reason. Two
@@ -144,7 +144,7 @@ end
 function _build_config(;
         model_dir::AbstractString, models::Vector{String}, accelerator::AbstractString,
         device::Int, host::AbstractString, port::Int, metrics_port::Int,
-        cache_dir::Union{AbstractString, Nothing}, mem_fraction::Union{Float64, Nothing},
+        cache_dir::Union{AbstractString, Nothing}, device_memory_fraction::Union{Float64, Nothing},
         device_weight_fraction::Union{Float64, Nothing}, numerics::Union{AbstractString, Nothing},
         poll_seconds::Union{Float64, Nothing}
     )
@@ -153,7 +153,7 @@ function _build_config(;
     poll >= 0 || error("ReactantServer ReactantServerKaimonGateExt: `poll_seconds` must be non-negative.")
 
     runtime = Dict{String, Any}("backend" => accelerator, "device_ordinal" => device)
-    mem_fraction === nothing || (runtime["mem_fraction"] = mem_fraction)
+    device_memory_fraction === nothing || (runtime["device_memory_fraction"] = device_memory_fraction)
     device_weight_fraction === nothing ||
         (runtime["device_weight_fraction"] = device_weight_fraction)
     numerics === nothing || (runtime["numerics"] = lowercase(strip(String(numerics))))
@@ -198,15 +198,15 @@ end
 # here; everything else in the config is per-server and can differ freely.
 function _check_client_commit_locked(cfg)
     cfg.runtime.backend == ReactantServer.CUDA_BACKEND || return nothing
-    want = (mem_fraction = cfg.runtime.mem_fraction, preallocate = cfg.runtime.preallocate)
+    want = (device_memory_fraction = cfg.runtime.device_memory_fraction, preallocate = cfg.runtime.preallocate)
     have = CLIENT_COMMIT[]
     if have !== nothing && have != want
         error(
             "ReactantServer ReactantServerKaimonGateExt: this session's XLA client was already created with \
-             mem_fraction=$(have.mem_fraction), preallocate=$(have.preallocate), and the client \
+             device_memory_fraction=$(have.device_memory_fraction), preallocate=$(have.preallocate), and the client \
              is process-global: a second server cannot change the BFC arena, it can only inherit \
              it. Either start this server with those settings, or restart the session. \
-             (Requested mem_fraction=$(want.mem_fraction), preallocate=$(want.preallocate).)"
+             (Requested device_memory_fraction=$(want.device_memory_fraction), preallocate=$(want.preallocate).)"
         )
     end
     CLIENT_COMMIT[] = want
@@ -353,7 +353,7 @@ end
 
 """
     rserver_start(model_dir; models, accelerator, device, port, metrics_port, host, cache_dir,
-                  mem_fraction, device_weight_fraction, numerics, poll_seconds) -> String
+                  device_memory_fraction, device_weight_fraction, numerics, poll_seconds) -> String
 
 Start a ReactantServer worker in this session and return its id immediately.
 
@@ -375,13 +375,13 @@ during bring-up lands in `rserver_status`.
 `poll_seconds` turns on the directory watcher, so a bundle dropped into `model_dir` later is
 picked up (and a removed one is unloaded). Omit it and the model set is fixed at startup.
 
-The remaining keywords take the same defaults a node file takes: `mem_fraction` (0.9 of the
+The remaining keywords take the same defaults a node file takes: `device_memory_fraction` (0.9 of the
 card for the BFC arena), `device_weight_fraction` (1.0, the self-sizing on-demand weight cache),
 `numerics` (`"auto"`, or `"f32"` to pin full f32 precision), `cache_dir`, `host`
 (127.0.0.1), `port` (8080) and `metrics_port` (0, meaning no Prometheus endpoint).
 
 One caveat worth knowing before starting a second GPU server in one session: Reactant's XLA
-client is process-global and is created by the first server, so `mem_fraction` and the
+client is process-global and is created by the first server, so `device_memory_fraction` and the
 preallocated arena are fixed for the whole session. A later start that disagrees is refused
 rather than silently ignored; two servers on two devices at the same settings are fine.
 
@@ -399,7 +399,7 @@ function rserver_start(
         metrics_port::Int = 0,
         host::String = "127.0.0.1",
         cache_dir::Union{String, Nothing} = nothing,
-        mem_fraction::Union{Float64, Nothing} = nothing,
+        device_memory_fraction::Union{Float64, Nothing} = nothing,
         device_weight_fraction::Union{Float64, Nothing} = nothing,
         numerics::Union{String, Nothing} = nothing,
         poll_seconds::Union{Float64, Nothing} = nothing,
@@ -412,7 +412,7 @@ function rserver_start(
     )
     cfg = _build_config(;
         model_dir, models = _model_names(models), accelerator = accel, device, host, port,
-        metrics_port, cache_dir, mem_fraction, device_weight_fraction, numerics, poll_seconds,
+        metrics_port, cache_dir, device_memory_fraction, device_weight_fraction, numerics, poll_seconds,
     )
 
     state = lock(SERVERS_LOCK) do

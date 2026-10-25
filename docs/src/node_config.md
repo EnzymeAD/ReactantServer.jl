@@ -58,7 +58,7 @@ global:
   model_poll_seconds: 15.0     # repository poll interval in dynamic mode
   runtime:                     # -> RuntimeConfig
     backend: cuda              # cpu or cuda
-    mem_fraction: 0.9          # fraction of device memory claimed for the pool (GPU only)
+    device_memory_fraction: 0.9  # share of GPU memory claimed for the pool (weights, scratch, I/O)
     preallocate: true          # claim the pool up front (GPU only)
     allow_cpu_fallback: false
     numerics: auto             # f32 | auto | tf32; see below
@@ -319,7 +319,7 @@ overrides were applied, is logged at startup.
 | `INFERENCE_SERVER_MODELS_INCLUDE` | `models_include` | colon-separated model names |
 | `INFERENCE_SERVER_RUNTIME_BACKEND` | `runtime.backend` | `cpu` \| `cuda` |
 | `INFERENCE_SERVER_RUNTIME_DEVICE_ORDINAL` | `runtime.device_ordinal` | device index |
-| `INFERENCE_SERVER_RUNTIME_MEM_FRACTION` | `runtime.mem_fraction` | `0..1` |
+| `INFERENCE_SERVER_RUNTIME_DEVICE_MEMORY_FRACTION` | `runtime.device_memory_fraction` | `(0, 1]` |
 | `INFERENCE_SERVER_RUNTIME_PREALLOCATE` | `runtime.preallocate` | bool |
 | `INFERENCE_SERVER_RUNTIME_ALLOW_CPU_FALLBACK` | `runtime.allow_cpu_fallback` | bool |
 | `INFERENCE_SERVER_RUNTIME_DEVICE_WEIGHT_FRACTION` | `runtime.device_weight_fraction` | `(0, 1]` |

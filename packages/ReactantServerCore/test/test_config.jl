@@ -69,7 +69,7 @@ end
             dir, """
             runtime:
               backend: cpu
-              mem_fraction: 0.8
+              device_memory_fraction: 0.8
             scheduler:
               ema_halflife_seconds: 60.0
               max_queue_depth: 256
@@ -82,7 +82,7 @@ end
         @test isempty(applied)
         @test cfg.model_dirs == [modeldir]
         @test cfg.runtime.backend == ReactantServer.CPU_BACKEND
-        @test cfg.runtime.mem_fraction == 0.8
+        @test cfg.runtime.device_memory_fraction == 0.8
         @test cfg.scheduler.ema_halflife_seconds == 60.0
         @test cfg.scheduler.max_queue_depth == 256
         @test cfg.endpoints.port == 9000          # derived from base_port
@@ -254,7 +254,11 @@ end
         @test_throws ReactantServer.ConfigError ReactantServer.validate_config(cfg0)
 
         # The 0.1 names fail loudly, in the file and in the environment.
-        for (old, new) in ("weight_cache_fraction" => "device_weight_fraction", "weight_cache_wiggle_fraction" => "device_headroom_fraction")
+        for (old, new) in (
+                "mem_fraction" => "device_memory_fraction",
+                "weight_cache_fraction" => "device_weight_fraction",
+                "weight_cache_wiggle_fraction" => "device_headroom_fraction",
+            )
             err = try
                 load_single_worker(dir, "runtime:\n  $old: 0.5"; model_repo = modeldir)
                 nothing
@@ -421,10 +425,10 @@ end
             model_repo: $modeldir
             base_port: 8080
             global:
-              runtime: { backend: cpu, mem_fraction: 0.9 }
+              runtime: { backend: cpu, device_memory_fraction: 0.9 }
               endpoints: { host: 0.0.0.0 }
             workers:
-              - { name: worker0, gpu: 0, runtime: { mem_fraction: 0.5 } }
+              - { name: worker0, gpu: 0, runtime: { device_memory_fraction: 0.5 } }
               - { name: worker1, gpu: 1 }
             models:
               resnet50: [worker0, worker1]
@@ -434,12 +438,12 @@ end
         )
         cluster = ReactantServer.load_node(path)
 
-        # worker0: port = base_port + 0, gpu 0, per-worker mem_fraction override, its slice.
+        # worker0: port = base_port + 0, gpu 0, per-worker device_memory_fraction override, its slice.
         cfg0, _, n0 = ReactantServer.node_server_config(cluster, "worker0")
         @test n0 == "worker0"
         @test cfg0.endpoints.port == 8080
         @test cfg0.runtime.device_ordinal == 0
-        @test cfg0.runtime.mem_fraction == 0.5
+        @test cfg0.runtime.device_memory_fraction == 0.5
         # The map no longer restricts loading: every worker loads all bundles (empty allowlist).
         @test isempty(cfg0.models_include)
         # Its assigned models are pinned to device on this worker; unassigned ones are not listed.
@@ -448,11 +452,11 @@ end
         @test !haskey(cfg0.scheduler.models, "spine")
         @test ReactantServer.validate_config(cfg0) === cfg0
 
-        # worker1: port = base_port + 1, gpu 1, inherits global mem_fraction; loads all, pins its slice.
+        # worker1: port = base_port + 1, gpu 1, inherits global device_memory_fraction; loads all, pins its slice.
         cfg1, _, _ = ReactantServer.node_server_config(cluster, "worker1")
         @test cfg1.endpoints.port == 8081
         @test cfg1.runtime.device_ordinal == 1
-        @test cfg1.runtime.mem_fraction == 0.9
+        @test cfg1.runtime.device_memory_fraction == 0.9
         @test isempty(cfg1.models_include)
         @test cfg1.scheduler.models["resnet50"].residency == ReactantServer.PINNED_DEVICE   # pinned on both
         @test cfg1.scheduler.models["spine"].residency == ReactantServer.PINNED_DEVICE

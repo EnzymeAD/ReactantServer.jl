@@ -607,7 +607,7 @@
     {
       "type": "timeseries",
       "title": "Out-of-pool driver memory (command buffers + context)",
-      "description": "Device memory each worker holds BEYOND the BFC arena: CUDA context + loaded modules + command buffers / CUDA graphs (process used per nvidia-smi minus the arena). It lives outside the preallocated pool and competes for the headroom between the arena and the card, so it is the quantity behind intermittent command-buffer startup OOMs (and the allocator stats above cannot see it). After warmup it should be flat, every program is instantiated at launch; a rising line, or a value near the card-minus-arena headroom, is the signal to lower mem_fraction.",
+      "description": "Device memory each worker holds BEYOND the BFC arena: CUDA context + loaded modules + command buffers / CUDA graphs (process used per nvidia-smi minus the arena). It lives outside the preallocated pool and competes for the headroom between the arena and the card, so it is the quantity behind intermittent command-buffer startup OOMs (and the allocator stats above cannot see it). After warmup it should be flat, every program is instantiated at launch; a rising line, or a value near the card-minus-arena headroom, is the signal to lower device_memory_fraction.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"

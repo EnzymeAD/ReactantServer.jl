@@ -214,7 +214,7 @@ Two properties are worth knowing before using it:
 - `device` is the ordinal among the devices VISIBLE to the process, the same numbering CUDA uses.
   Which physical card that is stays out of band (`CUDA_VISIBLE_DEVICES` or whatever the process
   prefers), exactly as it is for a worker under the supervisor.
-- Reactant's XLA client is process-global and is created by the first server, so `mem_fraction` and
+- Reactant's XLA client is process-global and is created by the first server, so `device_memory_fraction` and
   the preallocated arena are fixed for the whole session. The extension records what the first CUDA
   start committed to and refuses a later start that disagrees rather than letting it silently
   inherit the existing arena.

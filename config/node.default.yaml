@@ -31,10 +31,10 @@ global:
     # like 'auto' (TF32 permitted, kernels chosen by XLA/cuBLAS) but fails startup on hardware
     # that cannot run TF32, so a mixed fleet cannot silently serve divergent numerics.
     # numerics: auto
-    mem_fraction: 0.9
+    device_memory_fraction: 0.9
     # Preallocate one BFC arena up front so every sub-allocation (activations, autotune/recompile
     # scratch, weight-cache reloads) is served from it and never fragments the driver memory map.
-    # mem_fraction leaves the complement outside the pool for the CUDA context and command-buffer
+    # device_memory_fraction leaves the complement outside the pool for the CUDA context and command-buffer
     # (CUDA graph) instantiation.
     preallocate: true
     allow_cpu_fallback: false
