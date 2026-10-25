@@ -11,15 +11,11 @@ policy live on [Multi-GPU Gateway](gateway.md).
 
 ## Two tiers of weight memory
 
-- **Host RAM (resident by default).** With the weight cache enabled, every model's
-  weights default to system-pinned (`residency: system`): materialized once from disk into
-  host RAM at startup and kept there. Host memory is plentiful and cheap relative to GPU
-  memory, which removes disk from the hot path. A model can opt out with
-  `residency: unpinned`, paying a read from the weights file on each on-demand load instead.
-  Materializing the host floor is the expensive step, a layout copy at host-memory speed
-  ([`materialize_host_weights!`](@ref)), and it happens exactly once at startup. Host RAM
-  is unbounded by default; `runtime.host_weight_budget` caps it and turns the host tier into
-  a cache (see [Host RAM budget](#Host-RAM-budget)).
+- **Host RAM (a budgeted cache).** `runtime.host_weight_budget` sets how much host RAM may
+  hold copies of weights between GPU loads. The default is `0`: no copies, so a model reloaded
+  onto the GPU reads its weights file from disk. Give it a budget when models are swapped, so
+  reloads copy from RAM instead (see [Host RAM budget](#Host-RAM-budget) and
+  [Use Cases](use_cases.md)). A model with `residency: system` is always kept in host RAM.
 - **GPU (managed working set).** Pinned models keep their weights on the GPU for the
   server's lifetime. Every other model is loaded onto the GPU on demand when a request
   arrives, kept resident afterward so repeat requests are free, and evicted under a
@@ -28,7 +24,7 @@ policy live on [Multi-GPU Gateway](gateway.md).
   memory immediately through an explicit PJRT buffer release
   (`ReactantServer.free_weights!`).
 
-Because the weights are already in RAM, an on-demand GPU load is a single host-to-device
+When the weights are already in RAM, an on-demand GPU load is a single host-to-device
 transfer (`ReactantServer.transfer_to_device`) rather than a reload from disk, so its cost is the
 model's weight size over the host-to-device bandwidth.
 
@@ -98,14 +94,14 @@ scheduler:
 ```
 
 This is the `residency` field of [`ModelSchedConfig`](@ref) (`unpinned`, `system`, or
-`device`; unspecified models default to `system` when the cache is enabled, or to cached
-copies under a host RAM budget; see [`ResidencyState`](@ref)). Pin the latency-sensitive or highest-traffic models, and let the
+`device`; an unspecified model is swapped on demand with host copies governed by the host RAM
+budget, or pinned in RAM when that budget is `unlimited`; see [`ResidencyState`](@ref)). Pin the latency-sensitive or highest-traffic models, and let the
 long tail load on demand.
 
 ## Sharing host weights across same-node workers
 
 With several workers on one node, `runtime.shared_host_weights: true` backs each
-system-pinned model's host copy with a node-shared POSIX shared-memory region so the
+model's host copy (pinned or cached) with a node-shared POSIX shared-memory region so the
 workers share one copy. The default [`PrivateWeightStore`](@ref) gives each worker its own
 copy; [`SharedWeightStore`](@ref) places one content-addressed region per model in
 `/dev/shm`, coordinated peer-to-peer through an advisory `flock`, so same-node workers
@@ -133,24 +129,23 @@ warns at startup when the shared store runs with the `666` default). Both fields
 
 ## Host RAM budget
 
-By default every system-pinned model stays in host RAM for the life of the process, so host RAM
-grows with the model count (times the worker count without shared host weights). Setting
-`runtime.host_weight_budget` caps it:
+`runtime.host_weight_budget` caps the host RAM that holds copies of weights between GPU loads:
 
 ```yaml
 global:
   runtime:
-    host_weight_budget: 48g   # or 0b, 512m, 1.5t; omit for no budget
+    host_weight_budget: 48g   # default 0; or 512m, 1.5t, unlimited
 ```
 
 Sizes take an optional unit, case insensitive: `b`, `k`, `m`, `g`, `t`, or the long forms
-(`gb`, `gib`); every unit is binary, so `5g` and `5GB` are both 5 GiB. `0` keeps no copies:
-weights are in host RAM only while a load reads them and transfers them to the device.
+(`gb`, `gib`); every unit is binary, so `5g` and `5GB` are both 5 GiB. The default `0` keeps no
+copies: weights are in host RAM only while a load reads them and transfers them to the device,
+which suits a deployment whose models all stay on the GPU. `unlimited` keeps every model's copy
+with no cap (the behavior before 0.2).
 
-Under a budget the host tier becomes a cache. A model without an explicit `residency` is no longer
-pinned in RAM; a GPU load uses its cached host copy when there is one, and otherwise reads the
-weights file and keeps the copy if the budget has room, evicting the least recently *loaded*
-copies first. Only a load from the cache counts as use: requests served by a model already on the
+The host tier is a cache. A GPU load uses the model's cached host copy when there is one, and
+otherwise reads the weights file and keeps the copy if the budget has room, evicting the least
+recently *loaded* copies first. Only a load from the cache counts as use: requests served by a model already on the
 device do not, so a model that stays on a GPU for hours ages out of host RAM (nothing needs its
 host copy while it sits on the device), and the models the GPUs load most often stay cached.
 Being on a device gives no protection. A model with `residency: system` keeps its guarantee: it
@@ -173,8 +168,13 @@ How the budget is shared depends on `shared_host_weights`:
   `host_weight_budget_workers` defaults to 1; the node supervisor sets it to the node's worker
   count, so set it yourself only when running several workers without the supervisor.
 
+At startup, after measuring every model, the worker loads as many on-demand models onto the GPU as
+fit, largest first, so a deployment whose models all fit never reads a weights file after startup.
+After that, a model reloaded from disk because it had no host copy logs a
+`model weights reloaded from disk` warning, once per model, so slow swaps have a visible cause.
+
 The budget needs the on-demand weight cache (GPU, `weight_cache_fraction > 0`); without it every
-model's weights stay on the device and the setting is ignored with a warning.
+model's weights stay on the device and the setting is ignored (with a warning when it is not 0).
 
 ## Memory fragmentation and compaction
 

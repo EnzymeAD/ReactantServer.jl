@@ -285,15 +285,15 @@ end
     mktempdir() do dir
         modeldir = joinpath(dir, "models"); mkpath(modeldir)
         cfg, _, _ = load_single_worker(dir, ""; model_repo = modeldir)
-        @test cfg.runtime.host_weight_budget === nothing        # unbudgeted unless set
+        @test cfg.runtime.host_weight_budget == 0               # no host copies unless asked for
         @test cfg.runtime.host_weight_budget_workers == 1
 
         cfg, _, _ = load_single_worker(
             dir, "runtime:\n  host_weight_budget: 48g\n  host_weight_budget_workers: 4"; model_repo = modeldir
         )
         @test cfg.runtime.host_weight_budget == 48 << 30 && cfg.runtime.host_weight_budget_workers == 4
-        cfg0, _, _ = load_single_worker(dir, "runtime:\n  host_weight_budget: 0"; model_repo = modeldir)
-        @test cfg0.runtime.host_weight_budget == 0
+        cfgu, _, _ = load_single_worker(dir, "runtime:\n  host_weight_budget: Unlimited"; model_repo = modeldir)
+        @test cfgu.runtime.host_weight_budget === nothing
 
         withenv(
             "INFERENCE_SERVER_RUNTIME_HOST_WEIGHT_BUDGET" => "0b",

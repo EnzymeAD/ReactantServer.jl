@@ -154,6 +154,35 @@ end
     end
 end
 
+@testset "a reload from disk after startup warns once per model; startup loads do not" begin
+    sched = _hc_scheduler("A", "B"; host_budget = 0)
+    wc = sched.weight_cache
+    @test_logs _served(sched, "A")                              # startup (not serving): silent
+    wc.serving = true
+    @test_logs _served(sched, "B")                              # B's first load: expected, silent
+    @test_logs (:warn, r"reloaded from disk") _served(sched, "A")
+    @test_logs (:warn, r"reloaded from disk") _served(sched, "B")
+    @test_logs _served(sched, "A")                              # once per model
+    # A reload served from a host copy does not warn.
+    sched = _hc_scheduler("A", "B"; host_budget = 2 * sizeof(_W))
+    sched.weight_cache.serving = true
+    _served(sched, "A")
+    _served(sched, "B")
+    @test_logs _served(sched, "A")
+end
+
+@testset "startup fills the device with the on-demand models that fit, largest first" begin
+    sched = _hc_scheduler("A", "B", "C"; device_models = 2, host_budget = 0)
+    wc = sched.weight_cache
+    @test ReactantServer._fill_device!(sched) == 2
+    @test wc.resident_bytes == 2 * _WBYTES
+    @test count(n -> sched.registry.by_name[n].executable.weights !== nothing, ("A", "B", "C")) == 2
+    @test ReactantServer._fill_device!(sched) == 0              # nothing more fits
+    sched = _hc_scheduler("A"; host_budget = 0)
+    sched.weight_cache.mode = ReactantServer.EXTERNALLY_MANAGED
+    @test ReactantServer._fill_device!(sched) == 0              # the control plane decides there
+end
+
 @testset "a host weight budget resolves unspecified residency to cached, not pinned" begin
     cfg(budget) = ReactantServer.build_config(
         Dict{String, Any}(
@@ -162,7 +191,8 @@ end
             "scheduler" => Dict{String, Any}("models" => Dict{String, Any}("P" => Dict{String, Any}("residency" => "system"))),
         )
     )
-    @test ReactantServer._resolve_residency(cfg(nothing), "M", true) == ReactantServer.PINNED_SYSTEM
+    @test ReactantServer._resolve_residency(cfg(nothing), "M", true) == ReactantServer.UNPINNED   # default 0
+    @test ReactantServer._resolve_residency(cfg("unlimited"), "M", true) == ReactantServer.PINNED_SYSTEM
     @test ReactantServer._resolve_residency(cfg("4g"), "M", true) == ReactantServer.UNPINNED
     @test ReactantServer._resolve_residency(cfg("4g"), "P", true) == ReactantServer.PINNED_SYSTEM
     @test ReactantServer._resolve_residency(cfg("0b"), "M", false) == ReactantServer.UNPINNED

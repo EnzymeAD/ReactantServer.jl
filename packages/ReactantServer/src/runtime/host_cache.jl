@@ -82,12 +82,14 @@ function _load_via_host_cache(cache::WeightCache, store::SharedWeightStore, entr
     end
     if r === nothing                        # no room in the budget: load without caching
         lock(() -> cache.host_misses += 1, cache.lock)
+        _note_disk_load!(cache, entry)
         return load_pinned_weights(cache.backend, cache.pool, st, names)
     end
     hit, bufs = r
     lock(cache.lock) do
         hit ? (cache.host_hits += 1) : (cache.host_misses += 1)
     end
+    hit || _note_disk_load!(cache, entry)
     return bufs
 end
 
@@ -102,6 +104,7 @@ function _load_via_host_cache(cache::WeightCache, ::WeightStore, entry::ModelEnt
         end
         return bufs
     end
+    _note_disk_load!(cache, entry)
     arrays = materialize_host_weights(entry.weights, model.sig.weight_names)
     _check_unmodified(entry)
     bufs = transfer_to_device(cache.backend, cache.pool, arrays)
@@ -170,6 +173,24 @@ function _fit_floors!(cache::WeightCache)
     return nothing
 end
 
+# Warn, once per model per process, when a model that has been on the device before is reloaded
+# from its weights file after startup: with no host copy, every reload reads the disk, far slower
+# than a copy from RAM, and an operator seeing slow hot swaps should learn why from the log. A
+# model's first load (startup, or a model the watcher just added) is expected and not warned.
+function _note_disk_load!(cache::WeightCache, entry::ModelEntry)
+    cache.serving || return nothing
+    model_footprint(cache, entry).loads > 0 || return nothing
+    fresh = lock(cache.lock) do
+        entry.name in cache.disk_warned && return false
+        push!(cache.disk_warned, entry.name)
+        return true
+    end
+    fresh || return nothing
+    budget = host_budget(cache)
+    @warn "model weights reloaded from disk: no host RAM copy was available, so this reload reads the weights file, which is much slower than a copy from RAM. If models are swapped on and off the GPU, give host copies room with runtime.host_weight_budget or pin this model with residency: system (see Use cases in the docs). Logged once per model." model = entry.name weights = Base.format_bytes(entry.executable.nbytes) host_weight_budget = budget === nothing ? "unlimited" : Base.format_bytes(budget)
+    return nothing
+end
+
 """
     check_host_budget(cache) -> nothing
 
@@ -179,7 +200,8 @@ admitted.
 """
 function check_host_budget(cache::WeightCache)
     budget = host_budget(cache)
-    budget === nothing && return nothing
+    # No budget, or the default 0, where pinning anything is a deliberate exception.
+    (budget === nothing || budget == 0) && return nothing
     held = cache.store isa SharedWeightStore ? host_cache_bytes(cache.store) : _host_floor_bytes(cache)
     held > budget &&
         @warn "host weight budget overcommitted: pinned (residency: system) weights exceed it, so no other model's weights stay cached in host RAM" budget = Base.format_bytes(budget) pinned = Base.format_bytes(held)

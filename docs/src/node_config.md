@@ -74,7 +74,7 @@ global:
     shared_host_weights: false # one shm-backed host copy of each model on this node's workers
     shared_host_weights_mode: "666"  # octal permissions for the shared regions; "660" preferred
     weights_migration: off     # off | copy | replace legacy-order weights files at load; see below
-    # host_weight_budget: 48g  # cap host RAM for weight copies (0b, 512m, 5g...); omit = unbudgeted
+    host_weight_budget: 0      # host RAM for weight copies (0b, 512m, 5g... or unlimited); see Use Cases
     # host_weight_budget_workers: 1  # private copies: workers splitting the budget (set by the supervisor)
   scheduler:                   # -> SchedulerConfig
     discipline: fair           # fair | fifo | edf; fifo or edf behind a gateway in lpt_packing
@@ -219,8 +219,8 @@ each worker serves and schedules requests across them. The optional top-level `m
 per-model override that pins the named models to device memory on the listed workers for the
 lowest latency. It translates into `scheduler.models.<name>.residency: device` on those
 workers, merging into any per-model block already set under `global:` (an explicit `residency`
-wins; the map only fills an unspecified one). Unlisted models stay system-pinned in host RAM and
-load to the device on demand. Omit the block entirely to keep every model on-demand.
+wins; the map only fills an unspecified one). Unlisted models load to the device on demand, from
+a host RAM copy when `runtime.host_weight_budget` keeps one ([Use Cases](use_cases.md)). Omit the block entirely to keep every model on-demand.
 
 To load only a subset of the repository on a worker, the resolved config also supports a
 `models_include` allowlist (empty means load all); set it with the
@@ -244,9 +244,9 @@ scheduler:
 
 `weight` sets the model's fair share (consulted only by the `fair` discipline). `residency` sets
 the model's residency floor: `unpinned`, `system`, or `device` (`pin_to_gpu: true` is a
-back-compat alias for `residency: device`). When the weight cache is enabled, models
-without an explicit `residency` default to `system` (weights pinned in host RAM); see
-[On-demand Weights](on_demand_weights.md).
+back-compat alias for `residency: device`). Models without an explicit `residency` are
+swapped on demand, keeping host RAM copies within `runtime.host_weight_budget`, or pinned in host
+RAM when that budget is `unlimited`; see [Use Cases](use_cases.md).
 
 `max_batch_size` caps how many rows the scheduler coalesces into one dispatch of the model. It
 does not change compiled shapes: the dispatch sizes come from the batch sizes the bundle was

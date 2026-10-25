@@ -481,7 +481,8 @@ function _acquire_region(store::SharedWeightStore, key, digest::UInt64, specs, f
                             _close_fd(fd)
                             return nothing
                         end
-                        @warn "host weight budget overcommitted: pinned (residency: system) weights exceed it" model = String(key) budget = Base.format_bytes(store.budget) cached = Base.format_bytes(host_cache_bytes(store)) adding = Base.format_bytes(total)
+                        # A zero budget (the default) with an explicit pin is a deliberate choice.
+                        store.budget > 0 && @warn "host weight budget overcommitted: pinned (residency: system) weights exceed it" model = String(key) budget = Base.format_bytes(store.budget) cached = Base.format_bytes(host_cache_bytes(store)) adding = Base.format_bytes(total)
                     end
                 end
                 shm = SharedMemory(name, total; perms = store.mode, volatile = false)

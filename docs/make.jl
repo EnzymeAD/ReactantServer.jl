@@ -124,6 +124,7 @@ makedocs(;
             ],
         ],
         "Running in Production" => [
+            "Use Cases" => "use_cases.md",
             "Deployment" => "deployment.md",
             "Container Releases" => RELEASE_PAGES,
             "Node Configuration" => "node_config.md",

@@ -46,6 +46,8 @@ mutable struct WeightCache
     host_cached_bytes::Int                 # private store: bytes in host_cached
     host_hits::Int                         # observability: loads served from a cached host copy
     host_misses::Int                       # observability: loads that read the weights file
+    serving::Bool                          # startup is over: a reload from disk now warns (once per model)
+    disk_warned::Set{String}               # models whose reload from disk has been warned about
     lock::ReentrantLock
 end
 
@@ -58,7 +60,7 @@ WeightCache(
     backend, pool, registry, mode, store, Int(max_bytes), 0, String[], 0, 0, 0.0, 0, 0, 0, 0, 0,
     Dict{String, ModelFootprint}(), 0.0, Float64(min_residency_seconds), VictimSearch(), 0, 0,
     host_budget === nothing ? nothing : Int(host_budget), Dict{String, Vector{Any}}(), String[], 0, 0, 0,
-    ReentrantLock()
+    false, Set{String}(), ReentrantLock()
 )
 
 """
@@ -158,6 +160,7 @@ function _device_buffers(cache::WeightCache, entry::ModelEntry, model::LoadedMod
         return transfer_to_device(cache.backend, cache.pool, model.host_weights)
     end
     host_budgeted(cache) && return _load_via_host_cache(cache, cache.store, entry, model)
+    _note_disk_load!(cache, entry)
     return load_pinned_weights(cache.backend, cache.pool, entry.weights, model.sig.weight_names)
 end
 

@@ -121,8 +121,8 @@ end
 function _resolve_residency(cfg::ServerConfig, name::AbstractString, on_demand::Bool)
     declared = get(cfg.scheduler.models, name, ModelSchedConfig(1.0)).residency
     declared === nothing || return declared
-    # Under a host weight budget an unspecified model is cached (evictable) rather than pinned, so
-    # the budget governs it.
+    # Under a host weight budget (the default is 0) an unspecified model is cached, evictably, rather
+    # than pinned in RAM, so the budget governs it; only `unlimited` pins every model in RAM.
     return on_demand && cfg.runtime.host_weight_budget === nothing ? PINNED_SYSTEM : UNPINNED
 end
 
@@ -241,8 +241,9 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     # weight budget is one node-wide pool with the shared store, and an even per-worker share with
     # the private one; it only matters with the on-demand cache, the sole user of host copies.
     budget = cfg.runtime.host_weight_budget
-    if budget !== nothing && !on_demand
-        @warn "runtime.host_weight_budget has no effect without the on-demand weight cache (GPU, weight_cache_fraction > 0): every model's weights stay on the device"
+    if !on_demand
+        budget !== nothing && budget > 0 &&
+            @warn "runtime.host_weight_budget has no effect without the on-demand weight cache (GPU, weight_cache_fraction > 0): every model's weights stay on the device"
         budget = nothing
     end
     store = if cfg.runtime.shared_host_weights
@@ -254,10 +255,10 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     end
     worker_host_budget = (budget === nothing || store isa SharedWeightStore) ? nothing :
         budget ÷ cfg.runtime.host_weight_budget_workers
-    if budget !== nothing
+    if on_demand
         # A lowered budget, or regions a previous run left behind, are trimmed before anything loads.
         trimmed = trim_host_cache!(store)
-        @info "host weight budget" budget = Base.format_bytes(budget) shared = store isa SharedWeightStore worker_share = worker_host_budget === nothing ? nothing : Base.format_bytes(worker_host_budget) trimmed_regions = trimmed
+        @info "host weight budget" budget = budget === nothing ? "unlimited" : Base.format_bytes(budget) shared = store isa SharedWeightStore worker_share = worker_host_budget === nothing ? nothing : Base.format_bytes(worker_host_budget) trimmed_regions = trimmed
     end
     # Unspecified residency resolves to system-pinned under the on-demand cache (so every
     # model's weights are materialized into host RAM at startup and an on-demand GPU load is a

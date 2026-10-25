@@ -176,9 +176,9 @@ plus the profile's) is a mapping of XLA `DebugOptions` field names to values, pa
 compile, for example `xla_gpu_exclude_nondeterministic_ops: true`; names and value types are
 checked against the linked XLA at startup, and the flags are part of the executable cache key.
 `weights_migration` (default `off`) converts legacy-order weights files at load; see
-[`WeightsMigration`](@ref). `host_weight_budget` (default `nothing`, unbudgeted) caps the host RAM
-held by weight copies kept between GPU loads, in bytes (see [`parse_byte_size`](@ref) for the
-accepted spellings); `0` keeps no copies. With `shared_host_weights` the budget is one node-wide
+[`WeightsMigration`](@ref). `host_weight_budget` caps the host RAM held by weight copies kept
+between GPU loads, in bytes (see [`parse_byte_size`](@ref) for the accepted spellings). The default
+`0` keeps no copies; `nothing` (`unlimited` in YAML) keeps every model's copy with no cap. With `shared_host_weights` the budget is one node-wide
 pool shared by every worker; without it each worker gets `budget ÷ host_weight_budget_workers`
 (default 1, which the node supervisor sets to its worker count).
 """
@@ -202,12 +202,12 @@ struct RuntimeConfig
     batch_sizes::BatchSizeMode            # which compiled batch sizes to load (resolved; profile applied)
     xla_flags::Dict{String, Any}          # XLA DebugOptions overrides (resolved; profile applied)
     weights_migration::WeightsMigration   # convert legacy-order weights files at load
-    host_weight_budget::Union{Int, Nothing}  # bytes of host weight copies kept between loads; nothing = unbudgeted
+    host_weight_budget::Union{Int, Nothing}  # bytes of host weight copies kept between loads (default 0); nothing = unlimited
     host_weight_budget_workers::Int       # workers splitting the budget when host copies are private
 end
 
 # Nineteen-argument form: the previous full positional layout (through `weights_migration`), with
-# no host weight budget.
+# the default host weight budget (0: no host copies between loads).
 RuntimeConfig(
     backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
     preallocate::Bool, allow_cpu_fallback::Bool, residency_mode::ResidencyMode,
@@ -222,7 +222,7 @@ RuntimeConfig(
     residency_mode, shared_host_weights, UInt16(shared_host_weights_mode),
     Float64(weight_cache_fraction), Float64(weight_cache_wiggle_fraction), autotune,
     autotune_cache, String(autotune_cache_dir), numerics, executable_cache,
-    profile, batch_sizes, Dict{String, Any}(xla_flags), weights_migration, nothing, 1
+    profile, batch_sizes, Dict{String, Any}(xla_flags), weights_migration, 0, 1
 )
 
 # Eighteen-argument form: the previous full positional layout (through `xla_flags`), with weights
@@ -241,7 +241,7 @@ RuntimeConfig(
     residency_mode, shared_host_weights, UInt16(shared_host_weights_mode),
     Float64(weight_cache_fraction), Float64(weight_cache_wiggle_fraction), autotune,
     autotune_cache, String(autotune_cache_dir), numerics, executable_cache,
-    profile, batch_sizes, Dict{String, Any}(xla_flags), MIGRATE_OFF, nothing, 1
+    profile, batch_sizes, Dict{String, Any}(xla_flags), MIGRATE_OFF, 0, 1
 )
 
 # Fifteen-argument form: the previous full positional layout (through `executable_cache`), with the
@@ -259,7 +259,7 @@ RuntimeConfig(
     residency_mode, shared_host_weights, UInt16(shared_host_weights_mode),
     Float64(weight_cache_fraction), Float64(weight_cache_wiggle_fraction), autotune,
     autotune_cache, String(autotune_cache_dir), numerics, executable_cache,
-    PROFILE_DEFAULT, BATCH_SIZES_ALL, Dict{String, Any}(), MIGRATE_OFF, nothing, 1
+    PROFILE_DEFAULT, BATCH_SIZES_ALL, Dict{String, Any}(), MIGRATE_OFF, 0, 1
 )
 
 # Five-argument form: device/backend only; residency self-managed, private host weights, and the
@@ -309,9 +309,8 @@ Per-model scheduler overrides (an entry under `scheduler.models`). `weight` is t
 relative compute share (default `1.0`, so all-default weights yield uniform shares; consulted
 only by the fair discipline). `residency` is the model's initial residency floor (see
 [`ResidencyState`](@ref)); `nothing` means unspecified, which the server resolves at startup
-to `PINNED_SYSTEM` when the on-demand weight cache is enabled (so every model's weights are
-materialized into host RAM and an on-demand GPU load is a pure host-to-device transfer) and
-`UNPINNED` otherwise. `max_batch_size` caps how many rows the scheduler coalesces into one
+to `UNPINNED` (swapped on demand, with host RAM copies within `runtime.host_weight_budget`), or to
+`PINNED_SYSTEM` when the on-demand weight cache is enabled and the budget is unlimited. `max_batch_size` caps how many rows the scheduler coalesces into one
 dispatch of this model; `nothing` means uncapped. The cap does not change compiled shapes:
 a partial fill still pads up to the smallest compiled batch size, and a single request larger
 than the cap is still served (requests are never split).
@@ -726,10 +725,11 @@ function _parse_budget_workers(n::Int)
     return n
 end
 
-# runtime.host_weight_budget: absent or null leaves host copies unbudgeted (today's behavior).
+# runtime.host_weight_budget: 0 (the default) keeps no host copies between loads; `unlimited`
+# keeps every model's copy with no cap (unspecified residency then pins it in RAM).
 function _parse_host_weight_budget(rt)
-    v = get(rt, "host_weight_budget", nothing)
-    v === nothing && return nothing
+    v = get(rt, "host_weight_budget", 0)
+    v isa AbstractString && lowercase(strip(v)) == "unlimited" && return nothing
     v isa Union{Integer, AbstractString} ||
         throw(ConfigError("runtime.host_weight_budget must be a byte size like \"0b\" or \"5g\", got $(repr(v))"))
     try
