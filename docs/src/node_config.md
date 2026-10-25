@@ -74,6 +74,8 @@ global:
     shared_host_weights: false # one shm-backed host copy of each model on this node's workers
     shared_host_weights_mode: "666"  # octal permissions for the shared regions; "660" preferred
     weights_migration: off     # off | copy | replace legacy-order weights files at load; see below
+    # host_weight_budget: 48g  # cap host RAM for weight copies (0b, 512m, 5g...); omit = unbudgeted
+    # host_weight_budget_workers: 1  # private copies: workers splitting the budget (set by the supervisor)
   scheduler:                   # -> SchedulerConfig
     discipline: fair           # fair | fifo | edf; fifo or edf behind a gateway in lpt_packing
     ema_halflife_seconds: 30.0
@@ -332,6 +334,8 @@ overrides were applied, is logged at startup.
 | `INFERENCE_SERVER_RUNTIME_SHARED_HOST_WEIGHTS` | `runtime.shared_host_weights` | bool |
 | `INFERENCE_SERVER_RUNTIME_SHARED_HOST_WEIGHTS_MODE` | `runtime.shared_host_weights_mode` | octal string |
 | `INFERENCE_SERVER_RUNTIME_WEIGHTS_MIGRATION` | `runtime.weights_migration` | `off` \| `copy` \| `replace` |
+| `INFERENCE_SERVER_RUNTIME_HOST_WEIGHT_BUDGET` | `runtime.host_weight_budget` | byte size, e.g. `0b`, `5g` |
+| `INFERENCE_SERVER_RUNTIME_HOST_WEIGHT_BUDGET_WORKERS` | `runtime.host_weight_budget_workers` | worker count |
 | `INFERENCE_SERVER_SCHEDULER_DISCIPLINE` | `scheduler.discipline` | `fair` \| `fifo` \| `edf` |
 | `INFERENCE_SERVER_SCHEDULER_EMA_HALFLIFE_SECONDS` | `scheduler.ema_halflife_seconds` | seconds |
 | `INFERENCE_SERVER_SCHEDULER_RECENCY_PENALTY_CAP` | `scheduler.recency_penalty_cap` | `0..1` |

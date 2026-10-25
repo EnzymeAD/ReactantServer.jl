@@ -120,8 +120,10 @@ end
 # UNPINNED otherwise.
 function _resolve_residency(cfg::ServerConfig, name::AbstractString, on_demand::Bool)
     declared = get(cfg.scheduler.models, name, ModelSchedConfig(1.0)).residency
-    declared === nothing && return on_demand ? PINNED_SYSTEM : UNPINNED
-    return declared
+    declared === nothing || return declared
+    # Under a host weight budget an unspecified model is cached (evictable) rather than pinned, so
+    # the budget governs it.
+    return on_demand && cfg.runtime.host_weight_budget === nothing ? PINNED_SYSTEM : UNPINNED
 end
 
 # The per-request execution timeout is parsed and validated but not enforced by the dispatch
@@ -235,13 +237,27 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     if cfg.runtime.residency_mode == EXTERNALLY_MANAGED && !on_demand
         @warn "externally-managed residency has no effect without the on-demand weight cache; set runtime.weight_cache_fraction > 0 (GPU only) to enable residency control"
     end
-    # One host-weight store for the worker: node-shared SHM when opted in, otherwise private.
+    # One host-weight store for the worker: node-shared SHM when opted in, otherwise private. A host
+    # weight budget is one node-wide pool with the shared store, and an even per-worker share with
+    # the private one; it only matters with the on-demand cache, the sole user of host copies.
+    budget = cfg.runtime.host_weight_budget
+    if budget !== nothing && !on_demand
+        @warn "runtime.host_weight_budget has no effect without the on-demand weight cache (GPU, weight_cache_fraction > 0): every model's weights stay on the device"
+        budget = nothing
+    end
     store = if cfg.runtime.shared_host_weights
         cfg.runtime.shared_host_weights_mode == 0o666 &&
             @warn "shared host-weight regions are created world-writable (mode 666); set runtime.shared_host_weights_mode: \"660\" for production / multi-user systems"
-        SharedWeightStore(mode = cfg.runtime.shared_host_weights_mode)
+        SharedWeightStore(mode = cfg.runtime.shared_host_weights_mode, budget = budget)
     else
         PrivateWeightStore()
+    end
+    worker_host_budget = (budget === nothing || store isa SharedWeightStore) ? nothing :
+        budget ÷ cfg.runtime.host_weight_budget_workers
+    if budget !== nothing
+        # A lowered budget, or regions a previous run left behind, are trimmed before anything loads.
+        trimmed = trim_host_cache!(store)
+        @info "host weight budget" budget = Base.format_bytes(budget) shared = store isa SharedWeightStore worker_share = worker_host_budget === nothing ? nothing : Base.format_bytes(worker_host_budget) trimmed_regions = trimmed
     end
     # Unspecified residency resolves to system-pinned under the on-demand cache (so every
     # model's weights are materialized into host RAM at startup and an on-demand GPU load is a
@@ -268,8 +284,9 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
         provisional = floor(Int, frac * arena)
         sched.weight_cache = WeightCache(
             backend, pool, registry, provisional;
-            mode = cfg.runtime.residency_mode, store = store
+            mode = cfg.runtime.residency_mode, store = store, host_budget = worker_host_budget
         )
+        check_host_budget(sched.weight_cache)
     end
     # On-demand enabled => probe every model at startup and size the cache so pinned weights +
     # measured scratch + the wiggle slack fit the arena.

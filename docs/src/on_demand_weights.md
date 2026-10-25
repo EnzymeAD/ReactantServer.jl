@@ -17,7 +17,9 @@ policy live on [Multi-GPU Gateway](gateway.md).
   memory, which removes disk from the hot path. A model can opt out with
   `residency: unpinned`, paying a read from the weights file on each on-demand load instead.
   Materializing the host floor is the expensive step, a layout copy at host-memory speed
-  ([`materialize_host_weights!`](@ref)), and it happens exactly once at startup.
+  ([`materialize_host_weights!`](@ref)), and it happens exactly once at startup. Host RAM
+  is unbounded by default; `runtime.host_weight_budget` caps it and turns the host tier into
+  a cache (see [Host RAM budget](#Host-RAM-budget)).
 - **GPU (managed working set).** Pinned models keep their weights on the GPU for the
   server's lifetime. Every other model is loaded onto the GPU on demand when a request
   arrives, kept resident afterward so repeat requests are free, and evicted under a
@@ -96,8 +98,8 @@ scheduler:
 ```
 
 This is the `residency` field of [`ModelSchedConfig`](@ref) (`unpinned`, `system`, or
-`device`; unspecified models default to `system` when the cache is enabled, see
-[`ResidencyState`](@ref)). Pin the latency-sensitive or highest-traffic models, and let the
+`device`; unspecified models default to `system` when the cache is enabled, or to cached
+copies under a host RAM budget; see [`ResidencyState`](@ref)). Pin the latency-sensitive or highest-traffic models, and let the
 long tail load on demand.
 
 ## Sharing host weights across same-node workers
@@ -128,6 +130,51 @@ running as unrelated UIDs can share them; that is world-writable, so set
 warns at startup when the shared store runs with the `666` default). Both fields belong to
 [`RuntimeConfig`](@ref), with `INFERENCE_SERVER_RUNTIME_SHARED_HOST_WEIGHTS` and
 `INFERENCE_SERVER_RUNTIME_SHARED_HOST_WEIGHTS_MODE` environment overrides.
+
+## Host RAM budget
+
+By default every system-pinned model stays in host RAM for the life of the process, so host RAM
+grows with the model count (times the worker count without shared host weights). Setting
+`runtime.host_weight_budget` caps it:
+
+```yaml
+global:
+  runtime:
+    host_weight_budget: 48g   # or 0b, 512m, 1.5t; omit for no budget
+```
+
+Sizes take an optional unit, case insensitive: `b`, `k`, `m`, `g`, `t`, or the long forms
+(`gb`, `gib`); every unit is binary, so `5g` and `5GB` are both 5 GiB. `0` keeps no copies:
+weights are in host RAM only while a load reads them and transfers them to the device.
+
+Under a budget the host tier becomes a cache. A model without an explicit `residency` is no longer
+pinned in RAM; a GPU load uses its cached host copy when there is one, and otherwise reads the
+weights file and keeps the copy if the budget has room, evicting the least recently *loaded*
+copies first. Only a load from the cache counts as use: requests served by a model already on the
+device do not, so a model that stays on a GPU for hours ages out of host RAM (nothing needs its
+host copy while it sits on the device), and the models the GPUs load most often stay cached.
+Being on a device gives no protection. A model with `residency: system` keeps its guarantee: it
+stays in RAM, is never evicted, and counts against the budget. When pinned models alone exceed the
+budget they load anyway and the worker warns that it is overcommitted. A load that misses the cache
+reads the whole model and queues every transfer at once, the same as an unbudgeted load; those
+temporary arrays are freed by the GC and are not counted.
+
+How the budget is shared depends on `shared_host_weights`:
+
+- **Shared** (`true`): one budget for the whole node. Every worker may use all of it, each copy
+  lives once in `/dev/shm` however many workers load from it, and the copies are the ledger: a
+  worker sums the regions under a node-wide lock (`/dev/shm/rsw-budget.lock`, held only for that
+  bookkeeping, never across a disk read) and evicts copies no worker is using. A worker holds a
+  copy only while transferring from it, so a copy in use is never evicted. Copies survive worker
+  restarts, so the cache is warm after a restart, and each worker trims the node to the budget at
+  startup.
+- **Private** (`false`): each worker keeps its own copies and gets an even share,
+  `host_weight_budget ÷ host_weight_budget_workers`, with no coordination.
+  `host_weight_budget_workers` defaults to 1; the node supervisor sets it to the node's worker
+  count, so set it yourself only when running several workers without the supervisor.
+
+The budget needs the on-demand weight cache (GPU, `weight_cache_fraction > 0`); without it every
+model's weights stay on the device and the setting is ignored with a warning.
 
 ## Memory fragmentation and compaction
 
@@ -308,6 +355,11 @@ or execution scratch exceeds the largest free block cannot be placed even when t
 count looks ample, which is the condition compaction (above) repairs. Allocation failures
 are expensive to discover: XLA's allocator waits about 10 seconds for memory to be released
 before it reports one.
+
+Under a host RAM budget, `worker_host_weight_budget_bytes` is the budget the worker enforces (the
+node's with shared host weights, its share otherwise), `worker_host_weight_cached_bytes` the host
+RAM it counts, and `worker_host_weight_hits_total` and `worker_host_weight_misses_total` how many
+loads came from a cached copy or read the weights file.
 
 Per model, `worker_model_scratch_bytes` is the scratch measured at startup and
 `worker_model_load_seconds` the moving average of its on-demand load time.

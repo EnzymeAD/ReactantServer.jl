@@ -159,6 +159,10 @@ end
     # Sized to the worker's share of the host, plus one interactive thread for the GPU dispatch loop.
     @test any(a -> a == "--threads=8,1", spec.cmd.exec)
     @test any(a -> occursin("packages/ReactantServer", a), spec.cmd.exec)
+    # The host weight budget's per-worker split: the node's worker count, 1 by default.
+    @test _envval(spec.cmd, "INFERENCE_SERVER_RUNTIME_HOST_WEIGHT_BUDGET_WORKERS") == "1"
+    spec4 = RSN.worker_spec("worker1", "/run/node.yaml", "1", "/opt/rs"; node_workers = 4)
+    @test _envval(spec4.cmd, "INFERENCE_SERVER_RUNTIME_HOST_WEIGHT_BUDGET_WORKERS") == "4"
 
     # Per-worker thread share: cores ÷ workers, floored at 1 and capped (default 16).
     @test RSN._worker_thread_count(32, 2) == 16

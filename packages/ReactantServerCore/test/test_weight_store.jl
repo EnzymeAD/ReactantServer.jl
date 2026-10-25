@@ -243,3 +243,130 @@ end
         rm(dir; recursive = true, force = true)
     end
 end
+
+# The node budget counts every region under a store's prefix, so these tests use a prefix of their
+# own: they neither see nor evict the regions of other runs on the machine.
+_budget_cleanup(prefix) = for f in readdir("/dev/shm"; join = true)
+    startswith(basename(f), prefix * "-") && rm(f; force = true)
+end
+
+@testset "SharedWeightStore node budget: admit, evict least recently loaded, keep held regions" begin
+    if !(Sys.islinux() && isdir("/dev/shm"))
+        @test_skip "shared weight store requires Linux /dev/shm"
+    else
+        prefix = "tb" * string(getpid())
+        specs = [(Float32, (1024,))]
+        R = ReactantServerCore._layout(specs)[2]               # bytes per region
+        region(k) = "/dev/shm/" * prefix * "-" * k * "-" * string(weights_digest(k, specs); base = 16)
+        store = SharedWeightStore(; budget = 2R, prefix = prefix)
+        fills = String[]
+        load(k) = with_cached_host_weights(
+            a -> copy(a[1]), store, k, weights_digest(k, specs), specs,
+            a -> (push!(fills, k); a[1] .= length(k))
+        )
+        try
+            @test trim_host_cache!(store) == 0 && host_cache_bytes(store) == 0
+
+            hit, v = load("m1")
+            @test !hit && v == fill(2.0f0, 1024) && isfile(region("m1"))
+            sleep(0.02)
+            @test load("m22")[1] == false
+            @test host_cache_bytes(store) == 2R
+            sleep(0.02)
+            @test load("m1")[1] == true                    # a hit: m1 is now the most recently loaded
+            @test fills == ["m1", "m22"]                   # the hit did not refill
+            sleep(0.02)
+            @test load("m333")[1] == false                 # evicts m22, the least recently loaded
+            @test !isfile(region("m22")) && isfile(region("m1")) && isfile(region("m333"))
+            @test host_cache_bytes(store) == 2R
+
+            # A pinned floor is admitted like any region but held, so it is never evicted.
+            sleep(0.02)
+            p1 = materialize_host_weights!(store, "p1", weights_digest("p1", specs), specs, a -> (a[1] .= 7))
+            @test p1[1][1] == 7 && !isfile(region("m1")) && isfile(region("m333"))
+            sleep(0.02)
+            materialize_host_weights!(store, "p2", weights_digest("p2", specs), specs, a -> (a[1] .= 8))
+            @test !isfile(region("m333")) && host_cache_bytes(store) == 2R
+            # Pinned floors past the budget still load (a guarantee), with a warning.
+            @test_logs (:warn, r"overcommitted") match_mode = :any materialize_host_weights!(
+                store, "p3", weights_digest("p3", specs), specs, a -> (a[1] .= 9)
+            )
+            @test host_cache_bytes(store) == 3R
+            # Nothing evictable: an unpinned load is not cached and its fill never runs.
+            n = length(fills)
+            @test load("m4") === nothing && length(fills) == n && !isfile(region("m4"))
+            # Room is made only when it suffices: a region too large for what can be evicted leaves
+            # the evictable regions cached.
+            store.budget = 3R
+            release_host_weights!(store, "p3")             # p3 becomes evictable, p2 stays held
+            big = [(Float32, (4096,))]
+            @test with_cached_host_weights(a -> 0, store, "big", weights_digest("big", big), big, a -> nothing) === nothing
+            @test isfile(region("p3"))
+            materialize_host_weights!(store, "p3", weights_digest("p3", specs), specs, a -> (a[1] .= 9))
+            store.budget = 2R
+
+            # Under a budget a released floor stays cached; trimming to a lower budget reclaims it.
+            release_host_weights!(store, "p1")
+            @test isfile(region("p1"))
+            store.budget = 0
+            @test trim_host_cache!(store) == 1
+            @test !isfile(region("p1")) && isfile(region("p2")) && isfile(region("p3"))
+            release_host_weights!(store, "p2")
+            release_host_weights!(store, "p3")
+            @test trim_host_cache!(store) == 2 && host_cache_bytes(store) == 0
+            # A zero budget caches nothing.
+            @test load("m1") === nothing && host_cache_bytes(store) == 0
+        finally
+            for k in collect(keys(store.attached))
+                release_host_weights!(store, k)
+            end
+            _budget_cleanup(prefix)
+        end
+    end
+end
+
+@testset "SharedWeightStore node budget: a region another process is uploading from is not evicted" begin
+    if !(Sys.islinux() && isdir("/dev/shm"))
+        @test_skip "shared weight store requires Linux /dev/shm"
+    else
+        prefix = "tx" * string(getpid())
+        specs = [(Float32, (1024,))]
+        R = ReactantServerCore._layout(specs)[2]
+        dir = mktempdir()
+        readyf = joinpath(dir, "ready")
+        stopf = joinpath(dir, "stop")
+        script = joinpath(dir, "uploader.jl")
+        write(
+            script, """
+            using ReactantServerCore
+            prefix, readyf, stopf, R = ARGS[1], ARGS[2], ARGS[3], parse(Int, ARGS[4])
+            specs = [(Float32, (1024,))]
+            store = SharedWeightStore(; budget = R, prefix = prefix)
+            with_cached_host_weights(store, "held", weights_digest("held", specs), specs, a -> (a[1] .= 1)) do arrays
+                write(readyf, "ok")         # mid-upload: the region is held until this returns
+                t0 = time(); while !isfile(stopf) && time() - t0 < 30; sleep(0.05); end
+            end
+            """
+        )
+        proc = run(`$(Base.julia_cmd()) --project=$(Base.active_project()) $script $prefix $readyf $stopf $R`; wait = false)
+        store = SharedWeightStore(; budget = R, prefix = prefix)
+        other(k) = with_cached_host_weights(a -> a[1][1], store, k, weights_digest(k, specs), specs, a -> (a[1] .= 2))
+        try
+            t0 = time()
+            while !isfile(readyf) && time() - t0 < 90
+                sleep(0.1)
+            end
+            @test isfile(readyf)
+            @test other("mine") === nothing                # the only region is in use: no room
+            touch(stopf)
+            wait(proc)
+            @test other("mine") == (false, 2.0f0)          # released, so now it can be evicted
+            @test host_cache_bytes(store) == R
+        finally
+            touch(stopf)
+            wait(proc)
+            _budget_cleanup(prefix)
+            rm(dir; recursive = true, force = true)
+        end
+    end
+end

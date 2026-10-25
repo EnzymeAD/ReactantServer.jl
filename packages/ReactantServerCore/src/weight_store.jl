@@ -27,6 +27,19 @@
 #            worker is mid-create (holds EX), spin on the fast path until it publishes READY.
 #   release: try to upgrade to LOCK_EX non-blocking; success means last holder, so shm_unlink the
 #            region. The lock file itself is left in place (tiny, reused). A crash auto-releases.
+#
+# Node budget (`budget` set). The regions in /dev/shm are then a cache bounded across every worker
+# on the node, and their sizes are the whole ledger: nothing else records what is cached, so a
+# crash cannot leave the accounting wrong. A release never unlinks; the region stays cached until
+# evicted. Before creating a region a worker takes LOCK_EX on `/dev/shm/rsw-budget.lock`, sums the
+# regions, and evicts holder-free ones (a non-blocking LOCK_EX on the region's lock succeeds), least
+# recently loaded first, until the new one fits; it creates and reserves the region while still
+# holding that lock (so the next admitter counts it) and fills it after dropping it. A worker holds
+# a region's lock only while pinned (`residency: system`) or while uploading from it, so a model
+# that stays on a device ages out of the cache. "Recently loaded" is the region lock file's mtime,
+# touched on every load from the region. The creator holds the region's LOCK_EX while it waits for
+# the budget lock, and an evictor only ever tries region locks without blocking, so the two locks
+# cannot deadlock.
 
 """
     WeightStore
@@ -46,23 +59,36 @@ The default store: each worker materializes its own host copy of a model's weigh
 struct PrivateWeightStore <: WeightStore end
 
 """
-    SharedWeightStore(; mode=0o666)
+    SharedWeightStore(; mode=0o666, budget=nothing)
 
 Opt-in store backing each model's host weights with a node-level POSIX shared-memory region so
 same-node workers share one copy. See the file header for the flock-coordinated protocol.
 `mode` sets the permission bits for the regions and their lock files. The default `0o666`
 lets workers running as unrelated UIDs (for example different containers) share the regions,
 but is world-writable; `0o660` is recommended for production and multi-user systems.
+
+`budget` (bytes) caps the regions in `/dev/shm` across every worker on the node; see "Node
+budget" in the file header. `nothing` (the default) leaves them unbudgeted. `prefix` names the
+regions and lock files (`/dev/shm/<prefix>-...`); stores with different prefixes share neither
+regions nor a budget. Every worker on a node must use the same one, which the server does.
 """
 mutable struct SharedWeightStore <: WeightStore
     attached::Dict{String, NamedTuple{(:shm, :fd, :name, :lockpath), Tuple{SharedMemory, Cint, String, String}}}
     lock::ReentrantLock
     mode::UInt16                  # POSIX permission bits for the regions and lock files
+    budget::Union{Int, Nothing}   # node-wide byte cap on the regions; nothing = unbudgeted
+    prefix::String                # region and lock file name prefix in /dev/shm
 end
-SharedWeightStore(; mode::Integer = 0o666) = SharedWeightStore(
-    Dict{String, NamedTuple{(:shm, :fd, :name, :lockpath), Tuple{SharedMemory, Cint, String, String}}}(),
-    ReentrantLock(), UInt16(mode)
-)
+function SharedWeightStore(;
+        mode::Integer = 0o666, budget::Union{Integer, Nothing} = nothing, prefix::AbstractString = "rsw"
+    )
+    occursin(r"^[A-Za-z0-9]+$", prefix) || throw(ArgumentError("SharedWeightStore prefix must be alphanumeric, got $(repr(prefix))"))
+    budget === nothing || budget >= 0 || throw(ArgumentError("SharedWeightStore budget must be non-negative, got $budget"))
+    return SharedWeightStore(
+        Dict{String, NamedTuple{(:shm, :fd, :name, :lockpath), Tuple{SharedMemory, Cint, String, String}}}(),
+        ReentrantLock(), UInt16(mode), budget === nothing ? nothing : Int(budget), String(prefix)
+    )
+end
 
 const _RSW_MAGIC = 0x52535701      # 'RSW' + format version 1
 const _RSW_DATA_OFFSET = 64        # header occupies the first bytes; tensor data starts here
@@ -272,8 +298,8 @@ end
 # in /dev/shm (a RAM-backed tmpfs) forever. This reclaims exactly those, touching nothing in use.
 function _sweep_stale_versions(store::SharedWeightStore, key::AbstractString, keep_digest::UInt64)
     san = _sanitize_name(key)
-    keep = "rsw-" * san * "-" * string(keep_digest; base = 16)
-    rx = Regex("^rsw-" * san * "-[0-9a-f]+\$")
+    keep = store.prefix * "-" * san * "-" * string(keep_digest; base = 16)
+    rx = Regex("^" * store.prefix * "-" * san * "-[0-9a-f]+\$")
     entries = try
         readdir("/dev/shm")
     catch
@@ -292,17 +318,127 @@ function _sweep_stale_versions(store::SharedWeightStore, key::AbstractString, ke
     return nothing
 end
 
-function materialize_host_weights!(store::SharedWeightStore, key, digest::UInt64, specs, fill!)
+# Blocking exclusive lock on the node budget lock file; returns its fd. Held only for the
+# bookkeeping around a region's creation, never across a fill.
+function _lock_budget(store::SharedWeightStore)
+    path = "/dev/shm/" * store.prefix * "-budget.lock"
+    fd = _open_lock(path, store.mode)
+    fd < 0 && throw(SystemError("open weight-store budget lock $path"))
+    while _flock(fd, _LOCK_EX) != 0
+        if Libc.errno() != Libc.EINTR
+            err = Libc.errno()
+            _close_fd(fd)
+            throw(SystemError("locking $path", err))
+        end
+    end
+    return fd
+end
+
+function _unlock_budget(fd::Cint)
+    _flock(fd, _LOCK_UN)
+    _close_fd(fd)
+    return nothing
+end
+
+# Every weight region in /dev/shm: (file name, bytes, last load time). The last load time is the
+# region lock file's mtime (0 when it has none, so an orphan is evicted first).
+function _regions(store::SharedWeightStore)
+    rx = Regex("^" * store.prefix * "-[A-Za-z0-9_]+-[0-9a-f]+\$")
+    out = Tuple{String, Int, Float64}[]
+    entries = try
+        readdir("/dev/shm")
+    catch
+        return out
+    end
+    for f in entries
+        match(rx, f) === nothing && continue
+        st = stat("/dev/shm/" * f)
+        isfile(st) || continue
+        lk = stat("/dev/shm/" * f * ".lock")
+        push!(out, (f, Int(st.size), isfile(lk) ? lk.mtime : 0.0))
+    end
+    return out
+end
+
+"""
+    host_cache_bytes(store) -> Int
+
+Bytes held by every weight region on the node (the quantity the node budget bounds). 0 for the
+private store.
+"""
+host_cache_bytes(::WeightStore) = 0
+host_cache_bytes(store::SharedWeightStore) = sum((r[2] for r in _regions(store)); init = 0)
+
+# Evict holder-free regions, least recently loaded first, until `need` more bytes fit the budget.
+# The caller holds the budget lock. `keep` (a region file name) is never evicted. Evicts nothing
+# unless that makes the bytes fit: every candidate is locked first (a non-blocking LOCK_EX succeeds
+# only with no holder and no creator), and the locks are dropped untouched when the evictable total
+# is short, unless `partial` (a trim), which evicts what it can. Returns whether the bytes fit, and
+# the number of regions evicted.
+function _make_room!(store::SharedWeightStore, need::Int; keep::AbstractString = "", partial::Bool = false)
+    budget = store.budget::Int
+    regions = _regions(store)
+    total = sum((r[2] for r in regions); init = 0)
+    total + need <= budget && return true, 0
+    sort!(regions; by = r -> r[3])
+    locked = Tuple{String, Int, Cint}[]
+    freeable = 0
+    for (f, bytes, _) in regions
+        f == keep && continue
+        total - freeable + need <= budget && break
+        fd = _open_lock("/dev/shm/" * f * ".lock", store.mode)
+        fd < 0 && continue
+        if _flock(fd, _LOCK_EX | _LOCK_NB) == 0
+            push!(locked, (f, bytes, fd))
+            freeable += bytes
+        else
+            _close_fd(fd)
+        end
+    end
+    fits = total - freeable + need <= budget
+    evict = fits || partial
+    for (f, _, fd) in locked
+        evict && _shm_unlink("/" * f)
+        _flock(fd, _LOCK_UN)
+        _close_fd(fd)
+    end
+    return fits, evict ? length(locked) : 0
+end
+
+"""
+    trim_host_cache!(store) -> Int
+
+Evict holder-free regions until the node fits the store's budget (a lowered budget, or regions an
+earlier run left behind). Returns the number evicted; a no-op without a budget.
+"""
+trim_host_cache!(::WeightStore) = 0
+function trim_host_cache!(store::SharedWeightStore)
+    store.budget === nothing && return 0
+    bfd = _lock_budget(store)
+    try
+        return _make_room!(store, 0; partial = true)[2]
+    finally
+        _unlock_budget(bfd)
+    end
+end
+
+# Attach a READY region for `digest`, or create and fill it, and return it with a shared lock held:
+# `(; shm, fd, name, lockpath, arrays, hit)`. Under a budget a new region is admitted first; when
+# it cannot fit, a `pinned` caller creates it anyway (with a warning: a pinned floor is a
+# guarantee) and any other caller gets `nothing`, holding no lock.
+function _acquire_region(store::SharedWeightStore, key, digest::UInt64, specs, fill!; pinned::Bool)
     offs, total = _layout(specs)
     tag = _sanitize_name(key) * "-" * string(digest; base = 16)
-    name = "/rsw-" * tag
-    lockpath = "/dev/shm/rsw-" * tag * ".lock"
+    name = "/" * store.prefix * "-" * tag
+    lockpath = "/dev/shm/" * store.prefix * "-" * tag * ".lock"
 
     fd = _open_lock(lockpath, store.mode)
     fd < 0 && throw(SystemError("open weight-store lock $lockpath"))
     local shm::SharedMemory
     local arrays
     created = false                 # true once this call created the region (and must clean it up on failure)
+    hit = true
+    bfd = Cint(-1)                  # the budget lock, while this call holds it
     try
         while true
             # Fast path: shared lock, reuse a published region (readers run concurrently).
@@ -320,9 +456,10 @@ function materialize_host_weights!(store::SharedWeightStore, key, digest::UInt64
                 if ready2 !== nothing
                     shm = ready2
                     arrays = _build_arrays(shm, specs, offs)
-                    _flock(fd, _LOCK_SH)            # downgrade, hold while pinned
+                    _flock(fd, _LOCK_SH)            # downgrade, hold while in use
                     break
                 end
+                hit = false
                 # Remove any non-ready remnant, then create exclusively and populate.
                 stale = try
                     SharedMemory(name)
@@ -333,6 +470,20 @@ function materialize_host_weights!(store::SharedWeightStore, key, digest::UInt64
                     finalize(stale)
                     _shm_unlink(name)
                 end
+                if store.budget !== nothing
+                    bfd = _lock_budget(store)
+                    fits, _ = _make_room!(store, total; keep = store.prefix * "-" * tag)
+                    if !fits
+                        if !pinned
+                            _unlock_budget(bfd)
+                            bfd = Cint(-1)
+                            _flock(fd, _LOCK_UN)
+                            _close_fd(fd)
+                            return nothing
+                        end
+                        @warn "host weight budget overcommitted: pinned (residency: system) weights exceed it" model = String(key) budget = Base.format_bytes(store.budget) cached = Base.format_bytes(host_cache_bytes(store)) adding = Base.format_bytes(total)
+                    end
+                end
                 shm = SharedMemory(name, total; perms = store.mode, volatile = false)
                 rc = _RESERVE_REGION[](name, total)
                 if rc != 0
@@ -341,6 +492,8 @@ function materialize_host_weights!(store::SharedWeightStore, key, digest::UInt64
                     throw(SharedStoreFull(name, total, rc))
                 end
                 created = true
+                # The region now counts toward the budget; let other admitters proceed during the fill.
+                bfd >= 0 && (_unlock_budget(bfd); bfd = Cint(-1))
                 p = convert(Ptr{UInt8}, pointer(shm))
                 _hdr_write!(p, _RSW_MAGIC, 0)
                 _hdr_write!(p, UInt32(0), 4)        # ready = 0 until the data is durable
@@ -350,13 +503,14 @@ function materialize_host_weights!(store::SharedWeightStore, key, digest::UInt64
                 _msync(shm)
                 _hdr_write!(p, UInt32(1), 4)        # READY written last
                 _msync(shm)
-                _flock(fd, _LOCK_SH)                # downgrade, hold while pinned
+                _flock(fd, _LOCK_SH)                # downgrade, hold while in use
                 break
             end
             # Another worker is mid-create; back off and retry the fast path until it publishes.
             sleep(0.005)
         end
     catch
+        bfd >= 0 && _unlock_budget(bfd)
         # A region this call created but did not publish (the fill threw) is removed now, while the
         # exclusive lock is still held, rather than left for the next creator to find.
         if created
@@ -367,11 +521,44 @@ function materialize_host_weights!(store::SharedWeightStore, key, digest::UInt64
         _close_fd(fd)
         rethrow()
     end
-    @lock store.lock store.attached[String(key)] = (; shm, fd, name, lockpath)
+    # A load from this region: it becomes the most recently loaded for eviction.
+    store.budget === nothing || try
+        touch(lockpath)
+    catch
+    end
+    return (; shm, fd, name, lockpath, arrays, hit)
+end
+
+function materialize_host_weights!(store::SharedWeightStore, key, digest::UInt64, specs, fill!)
+    r = _acquire_region(store, key, digest, specs, fill!; pinned = true)::NamedTuple
+    @lock store.lock store.attached[String(key)] = (; r.shm, r.fd, r.name, r.lockpath)
     # Our region is attached (shared lock held), so reclaim any holder-free older versions of this
     # model now: a weights update moved the digest, and only crashed runs leave the old ones behind.
     _sweep_stale_versions(store, String(key), digest)
-    return arrays
+    return r.arrays
+end
+
+"""
+    with_cached_host_weights(f, store, key, digest, specs, fill!) -> Union{Tuple{Bool, Any}, Nothing}
+
+Run `f(arrays)` on a model's host weights from the node cache. The store must have a budget. The
+region is held only while `f` runs (an upload) and then detached without unlinking, so it stays
+cached for the next load by any worker. A missing region
+is admitted (evicting least recently loaded ones) and filled via `fill!(arrays)` first. Returns
+`(hit, f(arrays))`, where `hit` says the region already existed, or `nothing` when the region
+cannot fit the budget; the caller then loads without the cache.
+"""
+function with_cached_host_weights(f, store::SharedWeightStore, key, digest::UInt64, specs, fill!)
+    r = _acquire_region(store, key, digest, specs, fill!; pinned = false)
+    r === nothing && return nothing
+    try
+        return (r.hit, f(r.arrays))
+    finally
+        finalize(r.shm)                     # munmap; the region itself stays cached
+        _flock(r.fd, _LOCK_UN)
+        _close_fd(r.fd)
+        r.hit || _sweep_stale_versions(store, String(key), digest)
+    end
 end
 
 """
@@ -405,7 +592,8 @@ end
 function release_host_weights!(store::SharedWeightStore, key)
     ent = @lock store.lock get(store.attached, String(key), nothing)
     ent === nothing && return nothing
-    last_holder = _flock(ent.fd, _LOCK_EX | _LOCK_NB) == 0   # success => no other shared holders
+    # Under a node budget the region stays cached when released; eviction reclaims it.
+    last_holder = store.budget === nothing && _flock(ent.fd, _LOCK_EX | _LOCK_NB) == 0   # success => no other shared holders
     finalize(ent.shm)                                        # munmap our mapping
     # Last holder unlinks the region. The lock file is left in place (tiny, reused); unlinking it
     # would race a worker that just opened it, so we keep it.

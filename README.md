@@ -33,7 +33,8 @@ share a GPU, such as computer vision and scientific computing.
 - **Balances memory and compute.** Every model's weights stay resident in host RAM and stream
   onto the GPU on demand, evicted under a byte budget by a cost-aware policy that keeps costly,
   frequently used models and checks contiguous free memory before it loads, so a card serves far
-  more models than fit in VRAM, paying a single host-to-device transfer on a cold call. → [On-demand Weights](https://enzymead.github.io/ReactantServer.jl/dev/on_demand_weights/)
+  more models than fit in VRAM, paying a single host-to-device transfer on a cold call. An optional
+  host RAM budget, shared by a node's workers, turns the host copies into a cache too. → [On-demand Weights](https://enzymead.github.io/ReactantServer.jl/dev/on_demand_weights/)
 - **Batch coalescing.** Concurrent same-model requests are merged into one execution at a compiled
   batch size, amortizing per-launch overhead and the one-time weight transfer across the batch.
   → [Scheduling](https://enzymead.github.io/ReactantServer.jl/dev/scheduling/)

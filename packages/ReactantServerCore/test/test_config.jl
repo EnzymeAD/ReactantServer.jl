@@ -271,6 +271,45 @@ end
     end
 end
 
+@testset "host weight budget: byte sizes, env, worker split, validation" begin
+    @test parse_byte_size("0") == 0 && parse_byte_size("0b") == 0 && parse_byte_size(0) == 0
+    @test parse_byte_size("512m") == 512 << 20
+    @test parse_byte_size("5g") == parse_byte_size("5G") == parse_byte_size("5GB") == parse_byte_size("5 GiB") == 5 << 30
+    @test parse_byte_size("1.5t") == 3 << 39
+    @test parse_byte_size("100") == 100 && parse_byte_size("2k") == 2048
+    for bad in ("", "g", "-1", "5x", "5 g b", "1e9")
+        @test_throws ArgumentError parse_byte_size(bad)
+    end
+    @test_throws ArgumentError parse_byte_size(-1)
+
+    mktempdir() do dir
+        modeldir = joinpath(dir, "models"); mkpath(modeldir)
+        cfg, _, _ = load_single_worker(dir, ""; model_repo = modeldir)
+        @test cfg.runtime.host_weight_budget === nothing        # unbudgeted unless set
+        @test cfg.runtime.host_weight_budget_workers == 1
+
+        cfg, _, _ = load_single_worker(
+            dir, "runtime:\n  host_weight_budget: 48g\n  host_weight_budget_workers: 4"; model_repo = modeldir
+        )
+        @test cfg.runtime.host_weight_budget == 48 << 30 && cfg.runtime.host_weight_budget_workers == 4
+        cfg0, _, _ = load_single_worker(dir, "runtime:\n  host_weight_budget: 0"; model_repo = modeldir)
+        @test cfg0.runtime.host_weight_budget == 0
+
+        withenv(
+            "INFERENCE_SERVER_RUNTIME_HOST_WEIGHT_BUDGET" => "0b",
+            "INFERENCE_SERVER_RUNTIME_HOST_WEIGHT_BUDGET_WORKERS" => "2"
+        ) do
+            cfge, applied, _ = load_single_worker(dir, "runtime:\n  host_weight_budget: 8g"; model_repo = modeldir)
+            @test cfge.runtime.host_weight_budget == 0 && cfge.runtime.host_weight_budget_workers == 2
+            @test ("INFERENCE_SERVER_RUNTIME_HOST_WEIGHT_BUDGET", "0b") in applied
+        end
+
+        @test_throws ReactantServer.ConfigError load_single_worker(dir, "runtime:\n  host_weight_budget: 5q"; model_repo = modeldir)
+        @test_throws ReactantServer.ConfigError load_single_worker(dir, "runtime:\n  host_weight_budget: -1"; model_repo = modeldir)
+        @test_throws ReactantServer.ConfigError load_single_worker(dir, "runtime:\n  host_weight_budget_workers: 0"; model_repo = modeldir)
+    end
+end
+
 @testset "grpc config: defaults, node-global parse, env override, validation" begin
     mktempdir() do dir
         modeldir = joinpath(dir, "models"); mkpath(modeldir)

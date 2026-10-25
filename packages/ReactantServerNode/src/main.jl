@@ -209,11 +209,12 @@ function build_supervisor(
                 specs, sole_public ?
                     worker_spec(
                         _worker_name(w), node_file, selectors[i], children;
-                        compute_threads = worker_threads, grpc_port = gpub, metrics_port = mpub
+                        compute_threads = worker_threads, grpc_port = gpub, metrics_port = mpub,
+                        node_workers = length(ws)
                     ) :
                     worker_spec(
                         _worker_name(w), node_file, selectors[i], children;
-                        compute_threads = worker_threads
+                        compute_threads = worker_threads, node_workers = length(ws)
                     )
             )
         end

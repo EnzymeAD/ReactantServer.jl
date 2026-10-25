@@ -38,17 +38,26 @@ mutable struct WeightCache
     search::VictimSearch           # reusable victim-search arrays (dispatch thread only)
     fallback_compactions::Int      # observability: compactions admission ran because eviction alone could not fit
     admission_failures::Int        # observability: models admission could not fit even after compacting
+    # Host weight cache (host_cache below). With the shared store the budget and the cache live in
+    # /dev/shm (`store.budget`); with the private store they are this worker's, below.
+    host_budget::Union{Int, Nothing}       # this worker's share of the host budget (private store); nothing = unbudgeted
+    host_cached::Dict{String, Vector{Any}} # private store: cached host copies of unpinned models
+    host_lru::Vector{String}               # private store: cached names, least recently loaded at front
+    host_cached_bytes::Int                 # private store: bytes in host_cached
+    host_hits::Int                         # observability: loads served from a cached host copy
+    host_misses::Int                       # observability: loads that read the weights file
     lock::ReentrantLock
 end
 
 WeightCache(
     backend::AbstractBackend, pool::MemoryPool, registry::ModelRegistry, max_bytes::Integer;
     mode::ResidencyMode = SELF_MANAGED, store::WeightStore = PrivateWeightStore(),
-    min_residency_seconds::Real = 0.0
+    min_residency_seconds::Real = 0.0, host_budget::Union{Integer, Nothing} = nothing
 ) =
     WeightCache(
     backend, pool, registry, mode, store, Int(max_bytes), 0, String[], 0, 0, 0.0, 0, 0, 0, 0, 0,
     Dict{String, ModelFootprint}(), 0.0, Float64(min_residency_seconds), VictimSearch(), 0, 0,
+    host_budget === nothing ? nothing : Int(host_budget), Dict{String, Vector{Any}}(), String[], 0, 0, 0,
     ReentrantLock()
 )
 
@@ -142,12 +151,13 @@ _remove_lru!(cache::WeightCache, name::AbstractString) = begin
 end
 
 # Transfer a model's weights to GPU buffers. When the weights are pinned in host RAM
-# (host_weights set, the normal on-demand case) this is a pure host->device transfer; otherwise
-# it falls back to reading from the weights file (used by tests that do not pin in RAM).
+# (host_weights set, the normal on-demand case) this is a pure host->device transfer; under a host
+# weight budget it goes through the host cache; otherwise it reads the weights file.
 function _device_buffers(cache::WeightCache, entry::ModelEntry, model::LoadedModel)
     if model.host_weights !== nothing
         return transfer_to_device(cache.backend, cache.pool, model.host_weights)
     end
+    host_budgeted(cache) && return _load_via_host_cache(cache, cache.store, entry, model)
     return load_pinned_weights(cache.backend, cache.pool, entry.weights, model.sig.weight_names)
 end
 
@@ -291,9 +301,12 @@ function set_residency_state!(cache::WeightCache, entry::ModelEntry, target::Res
 
     # Slow work outside the lock: materialize the host floor and/or transfer to the device.
     new_host = model.host_weights
+    old_host = model.host_weights
     drop_host = false
     if target == PINNED_SYSTEM && model.host_weights === nothing
-        new_host = host_materialize(cache.store, entry, model.sig.weight_names)
+        # A cached host copy (private store) becomes the floor without rereading the file.
+        new_host = _take_cached_host!(cache, entry.name)
+        new_host === nothing && (new_host = host_materialize(cache.store, entry, model.sig.weight_names))
     elseif target == UNPINNED && model.host_weights !== nothing
         new_host = nothing        # drop the host floor
         drop_host = true
@@ -328,6 +341,12 @@ function set_residency_state!(cache::WeightCache, entry::ModelEntry, target::Res
     # The host arrays are no longer referenced (model.host_weights was set to nothing); release the
     # store entry (detach + last-one-out unlink for the shared store).
     drop_host && host_release!(cache.store, entry.name)
+    # Under a host budget a dropped floor stays cached (the shared store keeps the region; the
+    # private store keeps the arrays if they fit), so the next load does not read the file.
+    if host_budgeted(cache) && !(cache.store isa SharedWeightStore)
+        drop_host && _cache_host!(cache, entry.name, old_host)
+        target == PINNED_SYSTEM && _fit_floors!(cache)
+    end
     log_residency_change(
         entry.name, cur, target, model.nbytes;
         memory = memory_report(cache.backend, cache.pool; registry = cache.registry, weight_cache = cache)
@@ -360,6 +379,7 @@ function release_all!(cache::WeightCache, entry::ModelEntry)
         model.host_weights = nothing
         host_release!(cache.store, entry.name)
     end
+    _uncache_host!(cache, entry.name)
     return nothing
 end
 
@@ -377,6 +397,10 @@ function rename!(cache::WeightCache, old::AbstractString, new::AbstractString)
         i === nothing || (cache.lru[i] = String(new))
         fp = pop!(cache.footprints, String(old), nothing)
         fp === nothing || (cache.footprints[String(new)] = fp)
+        arrays = pop!(cache.host_cached, String(old), nothing)
+        arrays === nothing || (cache.host_cached[String(new)] = arrays)
+        j = findfirst(==(String(old)), cache.host_lru)
+        j === nothing || (cache.host_lru[j] = String(new))
     end
     host_rename!(cache.store, old, new)
     return nothing
@@ -474,6 +498,8 @@ function weight_cache_stats(cache::WeightCache)
             weight_pool = cache.weight_pool, load_bytes = cache.load_bytes,
             fallback_compactions = cache.fallback_compactions,
             admission_failures = cache.admission_failures,
+            host_budget = host_budget(cache), host_cached_bytes = host_cached_bytes(cache),
+            host_hits = cache.host_hits, host_misses = cache.host_misses,
             footprints = Dict(
                 name => (
                     weight_bytes = fp.weight_bytes, max_weight_bytes = fp.max_weight_bytes,

@@ -60,6 +60,7 @@ include("runtime/model.jl")
 include("runtime/footprint.jl")
 include("runtime/victim_search.jl")
 include("runtime/weight_cache.jl")
+include("runtime/host_cache.jl")
 include("runtime/admission.jl")
 include("runtime/execution.jl")
 # Per-bundle serialized-executable cache (backend-agnostic policy: layout, hashes, invalidation).

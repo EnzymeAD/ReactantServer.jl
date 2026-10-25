@@ -67,7 +67,8 @@ export pool_base_pointer, pool_region_name, pool_slot_bytes
 # ---- weight store ----
 export WeightStore, PrivateWeightStore, SharedWeightStore
 export materialize_host_weights!, release_host_weights!, rename_host_weights!, weights_digest,
-    weights_file_token, WeightsFileId, NO_WEIGHTS_FILE, weights_file_id, SharedStoreFull
+    weights_file_token, WeightsFileId, NO_WEIGHTS_FILE, weights_file_id, SharedStoreFull,
+    with_cached_host_weights, trim_host_cache!, host_cache_bytes
 
 # ---- boundary ----
 export NamedTensor, InferRequest, QueuedRequest, DeadlineExceeded
@@ -92,7 +93,7 @@ export BatchSizeMode, BATCH_SIZES_ALL, BATCH_SIZES_LARGEST
 export WeightsMigration, MIGRATE_OFF, MIGRATE_COPY, MIGRATE_REPLACE
 export RuntimeProfile, PROFILE_DEFAULT, PROFILE_REGULATED
 export RuntimeConfig, ModelSchedConfig, SchedulerConfig, EndpointsConfig, GrpcConfig, ServerConfig
-export build_config, validate_config, apply_env_overrides!, log_effective_config
+export build_config, validate_config, apply_env_overrides!, log_effective_config, parse_byte_size
 
 # ---- node ----
 export load_node, load_node_raw, validate_node, worker_names, worker_raw_config, node_server_config

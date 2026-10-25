@@ -176,7 +176,11 @@ plus the profile's) is a mapping of XLA `DebugOptions` field names to values, pa
 compile, for example `xla_gpu_exclude_nondeterministic_ops: true`; names and value types are
 checked against the linked XLA at startup, and the flags are part of the executable cache key.
 `weights_migration` (default `off`) converts legacy-order weights files at load; see
-[`WeightsMigration`](@ref).
+[`WeightsMigration`](@ref). `host_weight_budget` (default `nothing`, unbudgeted) caps the host RAM
+held by weight copies kept between GPU loads, in bytes (see [`parse_byte_size`](@ref) for the
+accepted spellings); `0` keeps no copies. With `shared_host_weights` the budget is one node-wide
+pool shared by every worker; without it each worker gets `budget ÷ host_weight_budget_workers`
+(default 1, which the node supervisor sets to its worker count).
 """
 struct RuntimeConfig
     backend::BackendKind
@@ -198,7 +202,28 @@ struct RuntimeConfig
     batch_sizes::BatchSizeMode            # which compiled batch sizes to load (resolved; profile applied)
     xla_flags::Dict{String, Any}          # XLA DebugOptions overrides (resolved; profile applied)
     weights_migration::WeightsMigration   # convert legacy-order weights files at load
+    host_weight_budget::Union{Int, Nothing}  # bytes of host weight copies kept between loads; nothing = unbudgeted
+    host_weight_budget_workers::Int       # workers splitting the budget when host copies are private
 end
+
+# Nineteen-argument form: the previous full positional layout (through `weights_migration`), with
+# no host weight budget.
+RuntimeConfig(
+    backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
+    preallocate::Bool, allow_cpu_fallback::Bool, residency_mode::ResidencyMode,
+    shared_host_weights::Bool, shared_host_weights_mode::Integer,
+    weight_cache_fraction::Real, weight_cache_wiggle_fraction::Real, autotune::Bool,
+    autotune_cache::Union{Bool, Nothing}, autotune_cache_dir::AbstractString, numerics::NumericsMode,
+    executable_cache::Bool, profile::RuntimeProfile, batch_sizes::BatchSizeMode,
+    xla_flags::AbstractDict, weights_migration::WeightsMigration
+) =
+    RuntimeConfig(
+    backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
+    residency_mode, shared_host_weights, UInt16(shared_host_weights_mode),
+    Float64(weight_cache_fraction), Float64(weight_cache_wiggle_fraction), autotune,
+    autotune_cache, String(autotune_cache_dir), numerics, executable_cache,
+    profile, batch_sizes, Dict{String, Any}(xla_flags), weights_migration, nothing, 1
+)
 
 # Eighteen-argument form: the previous full positional layout (through `xla_flags`), with weights
 # migration off.
@@ -216,7 +241,7 @@ RuntimeConfig(
     residency_mode, shared_host_weights, UInt16(shared_host_weights_mode),
     Float64(weight_cache_fraction), Float64(weight_cache_wiggle_fraction), autotune,
     autotune_cache, String(autotune_cache_dir), numerics, executable_cache,
-    profile, batch_sizes, Dict{String, Any}(xla_flags), MIGRATE_OFF
+    profile, batch_sizes, Dict{String, Any}(xla_flags), MIGRATE_OFF, nothing, 1
 )
 
 # Fifteen-argument form: the previous full positional layout (through `executable_cache`), with the
@@ -234,7 +259,7 @@ RuntimeConfig(
     residency_mode, shared_host_weights, UInt16(shared_host_weights_mode),
     Float64(weight_cache_fraction), Float64(weight_cache_wiggle_fraction), autotune,
     autotune_cache, String(autotune_cache_dir), numerics, executable_cache,
-    PROFILE_DEFAULT, BATCH_SIZES_ALL, Dict{String, Any}(), MIGRATE_OFF
+    PROFILE_DEFAULT, BATCH_SIZES_ALL, Dict{String, Any}(), MIGRATE_OFF, nothing, 1
 )
 
 # Five-argument form: device/backend only; residency self-managed, private host weights, and the
@@ -492,6 +517,8 @@ const ENV_PATHS = Tuple{String, Vector{String}, DataType}[
     ("RUNTIME_SHARED_HOST_WEIGHTS", ["runtime", "shared_host_weights"], Bool),
     ("RUNTIME_SHARED_HOST_WEIGHTS_MODE", ["runtime", "shared_host_weights_mode"], String),
     ("RUNTIME_WEIGHTS_MIGRATION", ["runtime", "weights_migration"], String),
+    ("RUNTIME_HOST_WEIGHT_BUDGET", ["runtime", "host_weight_budget"], String),
+    ("RUNTIME_HOST_WEIGHT_BUDGET_WORKERS", ["runtime", "host_weight_budget_workers"], Int),
     ("SCHEDULER_DISCIPLINE", ["scheduler", "discipline"], String),
     ("SCHEDULER_EMA_HALFLIFE_SECONDS", ["scheduler", "ema_halflife_seconds"], Float64),
     ("SCHEDULER_RECENCY_PENALTY_CAP", ["scheduler", "recency_penalty_cap"], Float64),
@@ -669,6 +696,50 @@ function _parse_weights_migration(s)
     throw(ConfigError("runtime.weights_migration must be 'off', 'copy' or 'replace', got '$s'"))
 end
 
+const _BYTE_UNITS = Dict(
+    "" => 1, "b" => 1,
+    "k" => 1 << 10, "kb" => 1 << 10, "kib" => 1 << 10,
+    "m" => 1 << 20, "mb" => 1 << 20, "mib" => 1 << 20,
+    "g" => 1 << 30, "gb" => 1 << 30, "gib" => 1 << 30,
+    "t" => 1 << 40, "tb" => 1 << 40, "tib" => 1 << 40,
+)
+
+"""
+    parse_byte_size(s) -> Int
+
+Parse a byte count such as `0`, `0b`, `512m`, `5g` or `1.5TiB`: a non-negative number with an
+optional unit, case insensitive. Every unit is binary (`5g` and `5GB` are both 5 GiB, as in
+Docker), so no two spellings disagree. An integer is taken as bytes.
+"""
+parse_byte_size(n::Integer) =
+    n >= 0 ? Int(n) : throw(ArgumentError("byte size must be non-negative, got $n"))
+function parse_byte_size(s::AbstractString)
+    m = match(r"^\s*([0-9]+(?:\.[0-9]*)?|\.[0-9]+)\s*([A-Za-z]*)\s*$", s)
+    m === nothing && throw(ArgumentError("not a byte size: $(repr(s))"))
+    unit = get(_BYTE_UNITS, lowercase(m.captures[2]), nothing)
+    unit === nothing && throw(ArgumentError("unknown byte unit in $(repr(s)); use b, k, m, g or t"))
+    return round(Int, parse(Float64, m.captures[1]) * unit)
+end
+
+function _parse_budget_workers(n::Int)
+    n >= 1 || throw(ConfigError("runtime.host_weight_budget_workers must be at least 1, got $n"))
+    return n
+end
+
+# runtime.host_weight_budget: absent or null leaves host copies unbudgeted (today's behavior).
+function _parse_host_weight_budget(rt)
+    v = get(rt, "host_weight_budget", nothing)
+    v === nothing && return nothing
+    v isa Union{Integer, AbstractString} ||
+        throw(ConfigError("runtime.host_weight_budget must be a byte size like \"0b\" or \"5g\", got $(repr(v))"))
+    try
+        return parse_byte_size(v)
+    catch err
+        err isa ArgumentError || rethrow()
+        throw(ConfigError("runtime.host_weight_budget: $(err.msg)"))
+    end
+end
+
 # runtime.xla_flags: a mapping of XLA DebugOptions field names to scalar values, layered over the
 # profile's flags (an explicit entry wins, so `false` turns a profile flag back off). Only the shape
 # is checked here; field names and value types are checked against the linked XLA at startup.
@@ -752,6 +823,8 @@ function build_config(raw::AbstractDict)
             _profile_batch_sizes(profile),
         _parse_xla_flags(rt, profile),
         _parse_weights_migration(_opt(rt, "weights_migration", String, "off")),
+        _parse_host_weight_budget(rt),
+        _parse_budget_workers(_opt(rt, "host_weight_budget_workers", Int, 1)),
     )
 
     sc = _subdict(raw, "scheduler")
@@ -843,7 +916,7 @@ end
 # `apply_env_overrides!` is applied on top by `node_server_config`.
 
 function log_effective_config(cfg::ServerConfig, applied)
-    @info "Effective configuration" model_dirs = cfg.model_dirs models_include = cfg.models_include model_control_mode = cfg.model_control_mode model_poll_seconds = cfg.model_poll_seconds cache_dir = cfg.cache_dir backend = cfg.runtime.backend device_ordinal = cfg.runtime.device_ordinal mem_fraction = cfg.runtime.mem_fraction preallocate = cfg.runtime.preallocate allow_cpu_fallback = cfg.runtime.allow_cpu_fallback weight_cache_fraction = cfg.runtime.weight_cache_fraction weight_cache_wiggle_fraction = cfg.runtime.weight_cache_wiggle_fraction autotune = cfg.runtime.autotune autotune_cache = cfg.runtime.autotune_cache autotune_cache_dir = cfg.runtime.autotune_cache_dir numerics = cfg.runtime.numerics executable_cache = cfg.runtime.executable_cache profile = cfg.runtime.profile batch_sizes = cfg.runtime.batch_sizes weights_migration = cfg.runtime.weights_migration xla_flags = sort!(["$k=$v" for (k, v) in cfg.runtime.xla_flags]) residency_mode = cfg.runtime.residency_mode shared_host_weights = cfg.runtime.shared_host_weights shared_host_weights_mode = string(cfg.runtime.shared_host_weights_mode; base = 8) host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests discipline = cfg.scheduler.discipline ema_halflife_seconds = cfg.scheduler.ema_halflife_seconds recency_penalty_cap = cfg.scheduler.recency_penalty_cap coalescing = cfg.scheduler.coalescing coalescing_discount = cfg.scheduler.coalescing_discount cost_ema_alpha = cfg.scheduler.cost_ema_alpha max_queue_depth = cfg.scheduler.max_queue_depth compaction_interval = cfg.scheduler.compaction_interval scheduler_models = collect(keys(cfg.scheduler.models))
+    @info "Effective configuration" model_dirs = cfg.model_dirs models_include = cfg.models_include model_control_mode = cfg.model_control_mode model_poll_seconds = cfg.model_poll_seconds cache_dir = cfg.cache_dir backend = cfg.runtime.backend device_ordinal = cfg.runtime.device_ordinal mem_fraction = cfg.runtime.mem_fraction preallocate = cfg.runtime.preallocate allow_cpu_fallback = cfg.runtime.allow_cpu_fallback weight_cache_fraction = cfg.runtime.weight_cache_fraction weight_cache_wiggle_fraction = cfg.runtime.weight_cache_wiggle_fraction autotune = cfg.runtime.autotune autotune_cache = cfg.runtime.autotune_cache autotune_cache_dir = cfg.runtime.autotune_cache_dir numerics = cfg.runtime.numerics executable_cache = cfg.runtime.executable_cache profile = cfg.runtime.profile batch_sizes = cfg.runtime.batch_sizes weights_migration = cfg.runtime.weights_migration host_weight_budget = cfg.runtime.host_weight_budget host_weight_budget_workers = cfg.runtime.host_weight_budget_workers xla_flags = sort!(["$k=$v" for (k, v) in cfg.runtime.xla_flags]) residency_mode = cfg.runtime.residency_mode shared_host_weights = cfg.runtime.shared_host_weights shared_host_weights_mode = string(cfg.runtime.shared_host_weights_mode; base = 8) host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests discipline = cfg.scheduler.discipline ema_halflife_seconds = cfg.scheduler.ema_halflife_seconds recency_penalty_cap = cfg.scheduler.recency_penalty_cap coalescing = cfg.scheduler.coalescing coalescing_discount = cfg.scheduler.coalescing_discount cost_ema_alpha = cfg.scheduler.cost_ema_alpha max_queue_depth = cfg.scheduler.max_queue_depth compaction_interval = cfg.scheduler.compaction_interval scheduler_models = collect(keys(cfg.scheduler.models))
     isempty(applied) || @info "Configuration overridden by environment" overrides = ["$k=$v" for (k, v) in applied]
     return nothing
 end
