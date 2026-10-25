@@ -69,7 +69,7 @@ end
             dir, """
             runtime:
               backend: cpu
-              mem_fraction: 0.8
+              device_memory_fraction: 0.8
             scheduler:
               ema_halflife_seconds: 60.0
               max_queue_depth: 256
@@ -82,7 +82,7 @@ end
         @test isempty(applied)
         @test cfg.model_dirs == [modeldir]
         @test cfg.runtime.backend == ReactantServer.CPU_BACKEND
-        @test cfg.runtime.mem_fraction == 0.8
+        @test cfg.runtime.device_memory_fraction == 0.8
         @test cfg.scheduler.ema_halflife_seconds == 60.0
         @test cfg.scheduler.max_queue_depth == 256
         @test cfg.endpoints.port == 9000          # derived from base_port
@@ -200,7 +200,7 @@ end
             dir, """
             model_control_mode: explicit
             runtime:
-              weight_cache_fraction: 0.5
+              device_weight_fraction: 0.5
               shared_host_weights: true
             scheduler:
               models:
@@ -213,7 +213,7 @@ end
             """; model_repo = modeldir
         )
         @test ReactantServer.validate_config(cfg) === cfg
-        @test cfg.runtime.weight_cache_fraction == 0.5
+        @test cfg.runtime.device_weight_fraction == 0.5
         # residency_mode is derived from the control mode: explicit ⇒ externally-managed.
         @test cfg.model_control_mode == ReactantServer.EXPLICIT
         @test cfg.runtime.residency_mode == ReactantServer.EXTERNALLY_MANAGED
@@ -224,8 +224,8 @@ end
 
         # defaults: self-sizing cache (fraction 1.0, wiggle 0.1), dynamic mode, self-managed, private host weights
         cfgb, _, _ = load_single_worker(dir, ""; model_repo = modeldir)
-        @test cfgb.runtime.weight_cache_fraction == 1.0
-        @test cfgb.runtime.weight_cache_wiggle_fraction == 0.1
+        @test cfgb.runtime.device_weight_fraction == 1.0
+        @test cfgb.runtime.device_headroom_fraction == 0.1
         @test cfgb.model_control_mode == ReactantServer.DYNAMIC
         @test cfgb.model_poll_seconds == 15.0
         @test cfgb.runtime.residency_mode == ReactantServer.SELF_MANAGED
@@ -241,33 +241,90 @@ end
         cfg, _, _ = load_single_worker(
             dir, """
             runtime:
-              weight_cache_fraction: 0.6
-              weight_cache_wiggle_fraction: 0.05
+              device_weight_fraction: 0.6
+              device_headroom_fraction: 0.05
             """; model_repo = modeldir
         )
         @test ReactantServer.validate_config(cfg) === cfg
-        @test cfg.runtime.weight_cache_fraction == 0.6
-        @test cfg.runtime.weight_cache_wiggle_fraction == 0.05
+        @test cfg.runtime.device_weight_fraction == 0.6
+        @test cfg.runtime.device_headroom_fraction == 0.05
 
-        # 0 disables the on-demand cache (all weights resident).
-        cfg0, _, _ = load_single_worker(dir, "runtime:\n  weight_cache_fraction: 0.0"; model_repo = modeldir)
-        @test cfg0.runtime.weight_cache_fraction == 0.0
+        # 0 leaves no room for resident weights, so it is rejected (it no longer means "cache off").
+        cfg0, _, _ = load_single_worker(dir, "runtime:\n  device_weight_fraction: 0.0"; model_repo = modeldir)
+        @test_throws ReactantServer.ConfigError ReactantServer.validate_config(cfg0)
+
+        # The 0.1 names fail loudly, in the file and in the environment.
+        for (old, new) in (
+                "mem_fraction" => "device_memory_fraction",
+                "weight_cache_fraction" => "device_weight_fraction",
+                "weight_cache_wiggle_fraction" => "device_headroom_fraction",
+            )
+            err = try
+                load_single_worker(dir, "runtime:\n  $old: 0.5"; model_repo = modeldir)
+                nothing
+            catch e
+                e
+            end
+            @test err isa ReactantServer.ConfigError && occursin(new, err.msg)
+            withenv("INFERENCE_SERVER_RUNTIME_" * uppercase(old) => "0.5") do
+                @test_throws ReactantServer.ConfigError load_single_worker(dir, ""; model_repo = modeldir)
+            end
+        end
 
         withenv(
-            "INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_FRACTION" => "0.75",
-            "INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_WIGGLE_FRACTION" => "0.2"
+            "INFERENCE_SERVER_RUNTIME_DEVICE_WEIGHT_FRACTION" => "0.75",
+            "INFERENCE_SERVER_RUNTIME_DEVICE_HEADROOM_FRACTION" => "0.2"
         ) do
             cfge, applied, _ = load_single_worker(dir, ""; model_repo = modeldir)
-            @test cfge.runtime.weight_cache_fraction == 0.75
-            @test cfge.runtime.weight_cache_wiggle_fraction == 0.2
-            @test ("INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_FRACTION", "0.75") in applied
+            @test cfge.runtime.device_weight_fraction == 0.75
+            @test cfge.runtime.device_headroom_fraction == 0.2
+            @test ("INFERENCE_SERVER_RUNTIME_DEVICE_WEIGHT_FRACTION", "0.75") in applied
         end
 
         # validation: fraction in [0,1], wiggle in [0,1)
-        cf, _, _ = load_single_worker(dir, "runtime:\n  weight_cache_fraction: 1.5"; model_repo = modeldir)
+        cf, _, _ = load_single_worker(dir, "runtime:\n  device_weight_fraction: 1.5"; model_repo = modeldir)
         @test_throws ReactantServer.ConfigError ReactantServer.validate_config(cf)
-        cw, _, _ = load_single_worker(dir, "runtime:\n  weight_cache_wiggle_fraction: 1.0"; model_repo = modeldir)
+        cw, _, _ = load_single_worker(dir, "runtime:\n  device_headroom_fraction: 1.0"; model_repo = modeldir)
         @test_throws ReactantServer.ConfigError ReactantServer.validate_config(cw)
+    end
+end
+
+@testset "host weight budget: byte sizes, env, worker split, validation" begin
+    @test parse_byte_size("0") == 0 && parse_byte_size("0b") == 0 && parse_byte_size(0) == 0
+    @test parse_byte_size("512m") == 512 << 20
+    @test parse_byte_size("5g") == parse_byte_size("5G") == parse_byte_size("5GB") == parse_byte_size("5 GiB") == 5 << 30
+    @test parse_byte_size("1.5t") == 3 << 39
+    @test parse_byte_size("100") == 100 && parse_byte_size("2k") == 2048
+    for bad in ("", "g", "-1", "5x", "5 g b", "1e9")
+        @test_throws ArgumentError parse_byte_size(bad)
+    end
+    @test_throws ArgumentError parse_byte_size(-1)
+
+    mktempdir() do dir
+        modeldir = joinpath(dir, "models"); mkpath(modeldir)
+        cfg, _, _ = load_single_worker(dir, ""; model_repo = modeldir)
+        @test cfg.runtime.host_weight_budget == 0               # no host copies unless asked for
+        @test cfg.runtime.host_weight_budget_workers == 1
+
+        cfg, _, _ = load_single_worker(
+            dir, "runtime:\n  host_weight_budget: 48g\n  host_weight_budget_workers: 4"; model_repo = modeldir
+        )
+        @test cfg.runtime.host_weight_budget == 48 << 30 && cfg.runtime.host_weight_budget_workers == 4
+        cfgu, _, _ = load_single_worker(dir, "runtime:\n  host_weight_budget: Unlimited"; model_repo = modeldir)
+        @test cfgu.runtime.host_weight_budget === nothing
+
+        withenv(
+            "INFERENCE_SERVER_RUNTIME_HOST_WEIGHT_BUDGET" => "0b",
+            "INFERENCE_SERVER_RUNTIME_HOST_WEIGHT_BUDGET_WORKERS" => "2"
+        ) do
+            cfge, applied, _ = load_single_worker(dir, "runtime:\n  host_weight_budget: 8g"; model_repo = modeldir)
+            @test cfge.runtime.host_weight_budget == 0 && cfge.runtime.host_weight_budget_workers == 2
+            @test ("INFERENCE_SERVER_RUNTIME_HOST_WEIGHT_BUDGET", "0b") in applied
+        end
+
+        @test_throws ReactantServer.ConfigError load_single_worker(dir, "runtime:\n  host_weight_budget: 5q"; model_repo = modeldir)
+        @test_throws ReactantServer.ConfigError load_single_worker(dir, "runtime:\n  host_weight_budget: -1"; model_repo = modeldir)
+        @test_throws ReactantServer.ConfigError load_single_worker(dir, "runtime:\n  host_weight_budget_workers: 0"; model_repo = modeldir)
     end
 end
 
@@ -368,10 +425,10 @@ end
             model_repo: $modeldir
             base_port: 8080
             global:
-              runtime: { backend: cpu, mem_fraction: 0.9 }
+              runtime: { backend: cpu, device_memory_fraction: 0.9 }
               endpoints: { host: 0.0.0.0 }
             workers:
-              - { name: worker0, gpu: 0, runtime: { mem_fraction: 0.5 } }
+              - { name: worker0, gpu: 0, runtime: { device_memory_fraction: 0.5 } }
               - { name: worker1, gpu: 1 }
             models:
               resnet50: [worker0, worker1]
@@ -381,12 +438,12 @@ end
         )
         cluster = ReactantServer.load_node(path)
 
-        # worker0: port = base_port + 0, gpu 0, per-worker mem_fraction override, its slice.
+        # worker0: port = base_port + 0, gpu 0, per-worker device_memory_fraction override, its slice.
         cfg0, _, n0 = ReactantServer.node_server_config(cluster, "worker0")
         @test n0 == "worker0"
         @test cfg0.endpoints.port == 8080
         @test cfg0.runtime.device_ordinal == 0
-        @test cfg0.runtime.mem_fraction == 0.5
+        @test cfg0.runtime.device_memory_fraction == 0.5
         # The map no longer restricts loading: every worker loads all bundles (empty allowlist).
         @test isempty(cfg0.models_include)
         # Its assigned models are pinned to device on this worker; unassigned ones are not listed.
@@ -395,11 +452,11 @@ end
         @test !haskey(cfg0.scheduler.models, "spine")
         @test ReactantServer.validate_config(cfg0) === cfg0
 
-        # worker1: port = base_port + 1, gpu 1, inherits global mem_fraction; loads all, pins its slice.
+        # worker1: port = base_port + 1, gpu 1, inherits global device_memory_fraction; loads all, pins its slice.
         cfg1, _, _ = ReactantServer.node_server_config(cluster, "worker1")
         @test cfg1.endpoints.port == 8081
         @test cfg1.runtime.device_ordinal == 1
-        @test cfg1.runtime.mem_fraction == 0.9
+        @test cfg1.runtime.device_memory_fraction == 0.9
         @test isempty(cfg1.models_include)
         @test cfg1.scheduler.models["resnet50"].residency == ReactantServer.PINNED_DEVICE   # pinned on both
         @test cfg1.scheduler.models["spine"].residency == ReactantServer.PINNED_DEVICE

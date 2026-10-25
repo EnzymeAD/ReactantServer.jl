@@ -771,12 +771,14 @@ function start!(
     if autosize_arena > 0 && s.weight_cache !== nothing
         # The probe runs every model (seeding FAIR costs too) and sizes the cache.
         _autosize_weight_cache!(s, Int(autosize_arena), Float64(autosize_fraction), Float64(autosize_wiggle))
+        _fill_device!(s)
     elseif s.cfg.discipline == FAIR
         # No auto-size (cache off, or no device stats): just seed FAIR costs.
         for entry in values(s.registry.by_name)
             _warmup_entry!(s, entry)
         end
     end
+    s.weight_cache === nothing || (s.weight_cache.serving = true)
     s.running = true
     # Run the dispatch loop on the interactive threadpool when one exists (the worker is started
     # with `--threads=auto,1`), so the GPU dispatch is scheduled promptly and is never starved by
@@ -788,6 +790,29 @@ function start!(
         s.task = Threads.@spawn dispatch_loop(s)
     end
     return s
+end
+
+# After the startup probe (which leaves only the last model it measured on the device), load the
+# on-demand models that fit the device budget, largest first, the order that packs without gaps. A
+# deployment whose models all fit then starts with every one resident and never reads a weights file
+# after startup, whatever the host weight budget. Self-managed only: under externally managed
+# residency the control plane decides what is resident. Returns the number of models loaded.
+function _fill_device!(s::Scheduler)
+    wc = s.weight_cache
+    (wc === nothing || wc.mode == EXTERNALLY_MANAGED) && return 0
+    names = String[
+        e.name for e in values(s.registry.by_name)
+            if e.executable !== nothing && !is_device_pinned(e.executable) && e.executable.weights === nothing
+    ]
+    loaded = 0
+    for name in _largest_first(wc, s.registry, names)
+        entry = s.registry.by_name[name]
+        wc.resident_bytes + entry.executable.nbytes <= wc.max_bytes || continue
+        acquire!(wc, entry)
+        loaded += 1
+    end
+    loaded > 0 && @info "startup: on-demand models loaded onto the device" loaded = loaded of = length(names) resident_bytes = wc.resident_bytes on_demand_budget = wc.max_bytes
+    return loaded
 end
 
 function shutdown!(s::Scheduler)
@@ -977,7 +1002,7 @@ function set_residency!(s::Scheduler, name::AbstractString, target::ResidencySta
     return _run_control(
         s, function (sch)
             sch.weight_cache === nothing &&
-                throw(ErrorException("residency control requires the on-demand weight cache (set runtime.weight_cache_fraction > 0)"))
+                throw(ErrorException("residency control requires a GPU worker (a CPU worker keeps every model resident)"))
             sch.weight_cache.mode == EXTERNALLY_MANAGED ||
                 throw(ErrorException("worker is self-managed; residency is not externally controllable"))
             nm = String(name)

@@ -30,10 +30,11 @@ share a GPU, such as computer vision and scientific computing.
 - **One container, one GPU or many.** A node supervisor runs one worker per visible GPU, behind
   one endpoint that stays the same as the node grows.
   → [Deployment](https://enzymead.github.io/ReactantServer.jl/dev/deployment/), [Multi-GPU Gateway](https://enzymead.github.io/ReactantServer.jl/dev/gateway/)
-- **Balances memory and compute.** Every model's weights stay resident in host RAM and stream
-  onto the GPU on demand, evicted under a byte budget by a cost-aware policy that keeps costly,
-  frequently used models and checks contiguous free memory before it loads, so a card serves far
-  more models than fit in VRAM, paying a single host-to-device transfer on a cold call. → [On-demand Weights](https://enzymead.github.io/ReactantServer.jl/dev/on_demand_weights/)
+- **Balances memory and compute.** Models that do not fit on the GPU together stream onto it on
+  demand, evicted under a byte budget by a cost-aware policy that keeps costly, frequently used
+  models and checks contiguous free memory before it loads, so a card serves far more models than
+  fit in VRAM. A host RAM budget, shared by a node's workers, keeps weight copies in RAM so a swap
+  is a single host-to-device transfer rather than a disk read. → [Use Cases](https://enzymead.github.io/ReactantServer.jl/dev/use_cases/), [On-demand Weights](https://enzymead.github.io/ReactantServer.jl/dev/on_demand_weights/)
 - **Batch coalescing.** Concurrent same-model requests are merged into one execution at a compiled
   batch size, amortizing per-launch overhead and the one-time weight transfer across the batch.
   → [Scheduling](https://enzymead.github.io/ReactantServer.jl/dev/scheduling/)

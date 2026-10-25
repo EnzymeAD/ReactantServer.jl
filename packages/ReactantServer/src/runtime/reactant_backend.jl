@@ -43,13 +43,13 @@ function _apply_compile_cache_prefs(autotune_cache::Union{Bool, Nothing}, autotu
 end
 
 function make_client(
-        ::ReactantBackend, platform::String; mem_fraction::Float64 = 0.9,
+        ::ReactantBackend, platform::String; device_memory_fraction::Float64 = 0.9,
         preallocate::Bool = true, autotune_cache::Union{Bool, Nothing} = nothing,
         autotune_cache_dir::AbstractString = "", kwargs...
     )
     if platform == "cuda" || platform == "gpu"
         # These BFC allocator knobs must be set before the GPU client is first created.
-        _RXLA.XLA_REACTANT_GPU_MEM_FRACTION[] = mem_fraction
+        _RXLA.XLA_REACTANT_GPU_MEM_FRACTION[] = device_memory_fraction
         _RXLA.XLA_REACTANT_GPU_PREALLOCATE[] = preallocate
         # Persistent autotune cache prefs must be set before the first compile (they are read per
         # compile); do it here, before the client/first executable exists.
@@ -111,7 +111,7 @@ end
 
 # Query the device allocator for memory usage. Only the CUDA client reports this; the CPU client
 # (and any platform without an allocator-stats hook) throws, so failures degrade to `nothing`.
-# `bytes_limit` is the BFC pool ceiling (mem_fraction of the card); fall back to the card's total
+# `bytes_limit` is the BFC pool ceiling (device_memory_fraction of the card); fall back to the card's total
 # global memory when the limit is unreported.
 function device_memory_stats(::ReactantBackend, pool::MemoryPool)
     try

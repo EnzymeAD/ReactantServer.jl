@@ -58,7 +58,7 @@ global:
   model_poll_seconds: 15.0     # repository poll interval in dynamic mode
   runtime:                     # -> RuntimeConfig
     backend: cuda              # cpu or cuda
-    mem_fraction: 0.9          # fraction of device memory claimed for the pool (GPU only)
+    device_memory_fraction: 0.9  # share of GPU memory claimed for the pool (weights, scratch, I/O)
     preallocate: true          # claim the pool up front (GPU only)
     allow_cpu_fallback: false
     numerics: auto             # f32 | auto | tf32; see below
@@ -66,14 +66,16 @@ global:
     profile: default           # default | regulated; see below
     batch_sizes: all           # all | largest compiled batch size per model (profile default)
     xla_flags: {}              # XLA DebugOptions overrides, e.g. xla_gpu_exclude_nondeterministic_ops: true
-    weight_cache_fraction: 1.0 # arena fraction for all weights (pinned + on-demand); 0 disables
-    weight_cache_wiggle_fraction: 0.1  # arena fraction kept free; drives startup auto-sizing
+    device_weight_fraction: 1.0    # GPU arena share for resident weights (pinned + on-demand), (0, 1]
+    device_headroom_fraction: 0.1  # GPU arena share kept free; drives startup auto-sizing
     autotune: true             # XLA GPU compile autotuner; false = default kernels, no trials
     # autotune_cache: false    # persistent per-fusion autotune cache; omit to inherit Reactant's
     # autotune_cache_dir: /cache/autotune  # cache directory; omit to inherit Reactant's defaults
     shared_host_weights: false # one shm-backed host copy of each model on this node's workers
     shared_host_weights_mode: "666"  # octal permissions for the shared regions; "660" preferred
     weights_migration: off     # off | copy | replace legacy-order weights files at load; see below
+    host_weight_budget: 0      # host RAM for weight copies (0b, 512m, 5g... or unlimited); see Use Cases
+    # host_weight_budget_workers: 1  # private copies: workers splitting the budget (set by the supervisor)
   scheduler:                   # -> SchedulerConfig
     discipline: fair           # fair | fifo | edf; fifo or edf behind a gateway in lpt_packing
     ema_halflife_seconds: 30.0
@@ -217,8 +219,8 @@ each worker serves and schedules requests across them. The optional top-level `m
 per-model override that pins the named models to device memory on the listed workers for the
 lowest latency. It translates into `scheduler.models.<name>.residency: device` on those
 workers, merging into any per-model block already set under `global:` (an explicit `residency`
-wins; the map only fills an unspecified one). Unlisted models stay system-pinned in host RAM and
-load to the device on demand. Omit the block entirely to keep every model on-demand.
+wins; the map only fills an unspecified one). Unlisted models load to the device on demand, from
+a host RAM copy when `runtime.host_weight_budget` keeps one ([Use Cases](use_cases.md)). Omit the block entirely to keep every model on-demand.
 
 To load only a subset of the repository on a worker, the resolved config also supports a
 `models_include` allowlist (empty means load all); set it with the
@@ -242,9 +244,9 @@ scheduler:
 
 `weight` sets the model's fair share (consulted only by the `fair` discipline). `residency` sets
 the model's residency floor: `unpinned`, `system`, or `device` (`pin_to_gpu: true` is a
-back-compat alias for `residency: device`). When the weight cache is enabled, models
-without an explicit `residency` default to `system` (weights pinned in host RAM); see
-[On-demand Weights](on_demand_weights.md).
+back-compat alias for `residency: device`). Models without an explicit `residency` are
+swapped on demand, keeping host RAM copies within `runtime.host_weight_budget`, or pinned in host
+RAM when that budget is `unlimited`; see [Use Cases](use_cases.md).
 
 `max_batch_size` caps how many rows the scheduler coalesces into one dispatch of the model. It
 does not change compiled shapes: the dispatch sizes come from the batch sizes the bundle was
@@ -300,7 +302,7 @@ Any worker value can be overridden per process by an environment variable of the
 ```text
 INFERENCE_SERVER_ENDPOINTS_PORT=9100
 INFERENCE_SERVER_RUNTIME_BACKEND=cpu
-INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_FRACTION=0.8
+INFERENCE_SERVER_RUNTIME_DEVICE_WEIGHT_FRACTION=0.8
 ```
 
 Booleans parse as `1`, `true`, `yes`, or `on` (case-insensitive). List-valued overrides
@@ -317,11 +319,11 @@ overrides were applied, is logged at startup.
 | `INFERENCE_SERVER_MODELS_INCLUDE` | `models_include` | colon-separated model names |
 | `INFERENCE_SERVER_RUNTIME_BACKEND` | `runtime.backend` | `cpu` \| `cuda` |
 | `INFERENCE_SERVER_RUNTIME_DEVICE_ORDINAL` | `runtime.device_ordinal` | device index |
-| `INFERENCE_SERVER_RUNTIME_MEM_FRACTION` | `runtime.mem_fraction` | `0..1` |
+| `INFERENCE_SERVER_RUNTIME_DEVICE_MEMORY_FRACTION` | `runtime.device_memory_fraction` | `(0, 1]` |
 | `INFERENCE_SERVER_RUNTIME_PREALLOCATE` | `runtime.preallocate` | bool |
 | `INFERENCE_SERVER_RUNTIME_ALLOW_CPU_FALLBACK` | `runtime.allow_cpu_fallback` | bool |
-| `INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_FRACTION` | `runtime.weight_cache_fraction` | `0..1` |
-| `INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_WIGGLE_FRACTION` | `runtime.weight_cache_wiggle_fraction` | `0..1` |
+| `INFERENCE_SERVER_RUNTIME_DEVICE_WEIGHT_FRACTION` | `runtime.device_weight_fraction` | `(0, 1]` |
+| `INFERENCE_SERVER_RUNTIME_DEVICE_HEADROOM_FRACTION` | `runtime.device_headroom_fraction` | `[0, 1)` |
 | `INFERENCE_SERVER_RUNTIME_AUTOTUNE` | `runtime.autotune` | bool |
 | `INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE` | `runtime.autotune_cache` | bool |
 | `INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE_DIR` | `runtime.autotune_cache_dir` | path |
@@ -332,6 +334,8 @@ overrides were applied, is logged at startup.
 | `INFERENCE_SERVER_RUNTIME_SHARED_HOST_WEIGHTS` | `runtime.shared_host_weights` | bool |
 | `INFERENCE_SERVER_RUNTIME_SHARED_HOST_WEIGHTS_MODE` | `runtime.shared_host_weights_mode` | octal string |
 | `INFERENCE_SERVER_RUNTIME_WEIGHTS_MIGRATION` | `runtime.weights_migration` | `off` \| `copy` \| `replace` |
+| `INFERENCE_SERVER_RUNTIME_HOST_WEIGHT_BUDGET` | `runtime.host_weight_budget` | byte size, e.g. `0b`, `5g` |
+| `INFERENCE_SERVER_RUNTIME_HOST_WEIGHT_BUDGET_WORKERS` | `runtime.host_weight_budget_workers` | worker count |
 | `INFERENCE_SERVER_SCHEDULER_DISCIPLINE` | `scheduler.discipline` | `fair` \| `fifo` \| `edf` |
 | `INFERENCE_SERVER_SCHEDULER_EMA_HALFLIFE_SECONDS` | `scheduler.ema_halflife_seconds` | seconds |
 | `INFERENCE_SERVER_SCHEDULER_RECENCY_PENALTY_CAP` | `scheduler.recency_penalty_cap` | `0..1` |

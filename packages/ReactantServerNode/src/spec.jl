@@ -134,6 +134,7 @@ function worker_spec(
         compute_threads::Integer = _worker_thread_count(Sys.CPU_THREADS, 1),
         grpc_port::Union{Integer, Nothing} = nothing,
         metrics_port::Union{Integer, Nothing} = nothing,
+        node_workers::Integer = 1,
         grace_seconds::Real = 15.0
     )
     ce = children isa ChildEnvironment ? children : workspace_environment(children)
@@ -154,6 +155,10 @@ function worker_spec(
     # to the public ones, so the external interface matches the multi-worker gateway's.
     grpc_port === nothing || push!(pairs, "INFERENCE_SERVER_ENDPOINTS_PORT" => string(Int(grpc_port)))
     metrics_port === nothing || push!(pairs, "INFERENCE_SERVER_ENDPOINTS_METRICS_PORT" => string(Int(metrics_port)))
+    # Without shared host weights a host weight budget is split evenly among the node's workers;
+    # the supervisor knows how many there are. An explicit value in the environment wins.
+    haskey(ENV, "INFERENCE_SERVER_RUNTIME_HOST_WEIGHT_BUDGET_WORKERS") ||
+        push!(pairs, "INFERENCE_SERVER_RUNTIME_HOST_WEIGHT_BUDGET_WORKERS" => string(Int(node_workers)))
     # Meta sub-calls run in-process now, so no loopback gRPC endpoint or shared-memory fan-out mesh is
     # injected; each worker builds its own local meta-scratch pool in serve().
     return ChildSpec(String(name), addenv(cmd, pairs...), Float64(grace_seconds))

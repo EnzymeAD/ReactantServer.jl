@@ -42,6 +42,8 @@ Prometheus.metric_names(::WorkerSnapshotCollector) = (
     "worker_weight_load_seconds_total", "worker_weight_load_bytes_total",
     "worker_weight_compactions_total", "worker_weight_fallback_compactions_total",
     "worker_weight_admission_failures_total",
+    "worker_host_weight_budget_bytes", "worker_host_weight_cached_bytes",
+    "worker_host_weight_hits_total", "worker_host_weight_misses_total",
     "worker_model_scratch_bytes", "worker_model_load_seconds",
     "worker_device_memory_in_use_bytes",
     "worker_device_memory_limit_bytes", "worker_device_memory_free_bytes",
@@ -214,6 +216,24 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
                 "Models that could not be placed on the device even after compacting.", wc.admission_failures
             ),
         )
+        # Host weight cache (only under runtime.host_weight_budget).
+        if wc.host_budget !== nothing
+            push!(
+                metrics,
+                _scalar(
+                    "worker_host_weight_budget_bytes", "gauge",
+                    "Host weight budget this worker enforces (node-wide with shared host weights, else its share).",
+                    wc.host_budget
+                ),
+                _scalar(
+                    "worker_host_weight_cached_bytes", "gauge",
+                    "Host RAM the budget counts (every region on the node with shared host weights, else this worker's).",
+                    wc.host_cached_bytes
+                ),
+                _scalar("worker_host_weight_hits_total", "counter", "Weight loads served from a cached host copy.", wc.host_hits),
+                _scalar("worker_host_weight_misses_total", "counter", "Weight loads that read the weights file.", wc.host_misses),
+            )
+        end
         # Per-model footprint, for the models measured or loaded so far.
         fpsamples(f) = Prometheus.Sample[
             Prometheus.Sample(nothing, model_ln, Prometheus.LabelValues((name,)), Float64(f(fp)))
