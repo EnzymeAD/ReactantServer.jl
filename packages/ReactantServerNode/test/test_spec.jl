@@ -360,9 +360,11 @@ end
     end
 end
 
-@testset "build_supervisor: shared_host_weights warning" begin
-    # Multiple workers + on-demand cache + private host floor: warn about the Nx host-RAM copies.
-    ondemand_node(dir; shared) = begin
+@testset "build_supervisor: no host-RAM advisory for private host copies" begin
+    # Without shared host weights each worker gets an equal share of runtime.host_weight_budget, so
+    # private copies never multiply host RAM by the worker count and the supervisor has nothing to
+    # warn about.
+    mktempdir() do dir
         path = joinpath(dir, "node.yaml")
         write(
             path, """
@@ -372,40 +374,13 @@ end
             global:
               runtime:
                 backend: cuda
-                weight_cache_fraction: 0.6
-                shared_host_weights: $shared
+                host_weight_budget: 8g
+                shared_host_weights: false
             """
         )
-        path
-    end
-
-    # Two workers, on-demand cache, shared store off: the warning fires.
-    mktempdir() do dir
         sink = IOBuffer()
         RSN.build_supervisor(
-            ondemand_node(dir; shared = false); env = Dict("REACTANT_GPUS" => "2"),
-            sink = sink, workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "run")
-        )
-        out = String(take!(sink))
-        @test occursin("shared_host_weights", out)
-        @test occursin("private host copy", out)
-    end
-
-    # Same, but the shared store is on: no warning.
-    mktempdir() do dir
-        sink = IOBuffer()
-        RSN.build_supervisor(
-            ondemand_node(dir; shared = true); env = Dict("REACTANT_GPUS" => "2"),
-            sink = sink, workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "run")
-        )
-        @test !occursin("private host copy", String(take!(sink)))
-    end
-
-    # A single worker materializes one floor regardless, so the warning is gated on >1 worker.
-    mktempdir() do dir
-        sink = IOBuffer()
-        RSN.build_supervisor(
-            ondemand_node(dir; shared = false); env = Dict("REACTANT_GPUS" => "1"),
+            path; env = Dict("REACTANT_GPUS" => "2"),
             sink = sink, workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "run")
         )
         @test !occursin("private host copy", String(take!(sink)))

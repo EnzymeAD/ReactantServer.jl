@@ -226,16 +226,17 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
         weights_migration = cfg.runtime.weights_migration
     )
     isempty(registry.by_name) && @warn "no model bundles found" model_dirs = cfg.model_dirs models_include = cfg.models_include
-    # On-demand weight residency is sized as a fraction of the BFC arena (`mem_fraction * device`),
-    # resolved now that the device pool exists. The cache is GPU-only: `arena` is 0 when the device
-    # cannot report its pool ceiling (CPU / mock), so on-demand is off there (all weights resident).
+    # Resident weights are sized as a share of the BFC arena (`mem_fraction * device`), resolved now
+    # that the device pool exists, and models that do not fit are swapped on demand. GPU only: `arena`
+    # is 0 when the device cannot report its pool ceiling (CPU / mock), so every model's weights stay
+    # resident there.
     arena = let dm = device_memory_stats(backend, pool)
         dm === nothing ? 0 : dm.limit
     end
-    frac = cfg.runtime.weight_cache_fraction
-    on_demand = frac > 0 && arena > 0
+    frac = cfg.runtime.device_weight_fraction
+    on_demand = arena > 0
     if cfg.runtime.residency_mode == EXTERNALLY_MANAGED && !on_demand
-        @warn "externally-managed residency has no effect without the on-demand weight cache; set runtime.weight_cache_fraction > 0 (GPU only) to enable residency control"
+        @warn "externally-managed residency has no effect on a worker without a GPU memory pool (CPU): every model's weights stay resident"
     end
     # One host-weight store for the worker: node-shared SHM when opted in, otherwise private. A host
     # weight budget is one node-wide pool with the shared store, and an even per-worker share with
@@ -243,7 +244,7 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     budget = cfg.runtime.host_weight_budget
     if !on_demand
         budget !== nothing && budget > 0 &&
-            @warn "runtime.host_weight_budget has no effect without the on-demand weight cache (GPU, weight_cache_fraction > 0): every model's weights stay on the device"
+            @warn "runtime.host_weight_budget has no effect on a worker without a GPU memory pool (CPU): every model's weights stay resident"
         budget = nothing
     end
     store = if cfg.runtime.shared_host_weights
@@ -260,11 +261,9 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
         trimmed = trim_host_cache!(store)
         @info "host weight budget" budget = budget === nothing ? "unlimited" : Base.format_bytes(budget) shared = store isa SharedWeightStore worker_share = worker_host_budget === nothing ? nothing : Base.format_bytes(worker_host_budget) trimmed_regions = trimmed
     end
-    # Unspecified residency resolves to system-pinned under the on-demand cache (so every
-    # model's weights are materialized into host RAM at startup and an on-demand GPU load is a
-    # pure host-to-device transfer) and to unpinned otherwise. An explicit
-    # `residency: unpinned` opts a model out of the host floor. The same rule is applied to
-    # models loaded later by the directory watcher (see `_resolve_residency`).
+    # Unspecified residency resolves to unpinned (swapped on demand, with host RAM copies within
+    # runtime.host_weight_budget), or to system-pinned when that budget is unlimited. The same rule
+    # is applied to models loaded later by the directory watcher (see `_resolve_residency`).
     for entry in values(registry.by_name)
         state = _resolve_residency(cfg, entry.name, on_demand)
         @info "Compiling model" name = entry.name residency = state on_demand = on_demand executable_cache = use_exec_cache
@@ -294,7 +293,7 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     if on_demand
         start!(
             sched; autosize_arena = arena, autosize_fraction = frac,
-            autosize_wiggle = cfg.runtime.weight_cache_wiggle_fraction
+            autosize_wiggle = cfg.runtime.device_headroom_fraction
         )
     else
         start!(sched)

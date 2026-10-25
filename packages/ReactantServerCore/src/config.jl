@@ -145,12 +145,12 @@ Runtime and device settings (the `runtime:` config block). `backend` selects CPU
 execution; `device_ordinal` picks the GPU among several visible ones; `mem_fraction` is the
 fraction of device memory claimed for the pool; `preallocate` claims that pool up front;
 `allow_cpu_fallback` permits falling back to CPU when the device is unavailable;
-`weight_cache_fraction` is the single knob sizing on-demand (unpinned) weight residency, the
-fraction of the BFC arena (`mem_fraction * device memory`) devoted to all weights, pinned plus
-on-demand (`1.0`, the default, uses the whole arena minus measured scratch and wiggle; `0`
-disables the cache so every model's weights stay resident; resolved to a byte budget at startup,
-GPU only); `weight_cache_wiggle_fraction` is the fraction of the arena kept free as
-anti-fragmentation slack and feeds the startup auto-sizing (the worker probes each model's peak
+`device_weight_fraction` is the share of the BFC arena (`mem_fraction * device memory`) that holds
+resident model weights, device-pinned and on-demand together, in `(0, 1]` (`1.0`, the default,
+uses the whole arena minus measured scratch and headroom; resolved to a byte budget at startup,
+GPU only; models that do not fit in it are swapped on and off the device on demand);
+`device_headroom_fraction` is the fraction of the arena kept free as anti-fragmentation slack and
+feeds the startup auto-sizing (the worker probes each model's peak
 device usage and sizes the cache so pinned weights + on-demand + scratch + this slack fit);
 `residency_mode` selects self-managed or externally-managed residency; `shared_host_weights` opts
 the node into the shared-memory host-weight store so same-node workers share one host copy of each
@@ -191,8 +191,8 @@ struct RuntimeConfig
     residency_mode::ResidencyMode
     shared_host_weights::Bool
     shared_host_weights_mode::UInt16   # permission bits for the shared host-weight regions
-    weight_cache_fraction::Float64        # arena fraction for all weights (pinned + on-demand); 0 = cache off
-    weight_cache_wiggle_fraction::Float64 # arena fraction kept free as headroom (drives startup auto-sizing)
+    device_weight_fraction::Float64       # arena share for resident weights (pinned + on-demand), in (0, 1]
+    device_headroom_fraction::Float64     # arena share kept free as headroom (drives startup auto-sizing)
     autotune::Bool                        # false disables the GPU compile autotuner (xla_gpu_autotune_level=0)
     autotune_cache::Union{Bool, Nothing}   # persistent per-fusion autotune cache; nothing = inherit Reactant's LocalPreferences
     autotune_cache_dir::String            # persistent autotune cache directory; "" = inherit Reactant's LocalPreferences
@@ -212,7 +212,7 @@ RuntimeConfig(
     backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
     preallocate::Bool, allow_cpu_fallback::Bool, residency_mode::ResidencyMode,
     shared_host_weights::Bool, shared_host_weights_mode::Integer,
-    weight_cache_fraction::Real, weight_cache_wiggle_fraction::Real, autotune::Bool,
+    device_weight_fraction::Real, device_headroom_fraction::Real, autotune::Bool,
     autotune_cache::Union{Bool, Nothing}, autotune_cache_dir::AbstractString, numerics::NumericsMode,
     executable_cache::Bool, profile::RuntimeProfile, batch_sizes::BatchSizeMode,
     xla_flags::AbstractDict, weights_migration::WeightsMigration
@@ -220,7 +220,7 @@ RuntimeConfig(
     RuntimeConfig(
     backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
     residency_mode, shared_host_weights, UInt16(shared_host_weights_mode),
-    Float64(weight_cache_fraction), Float64(weight_cache_wiggle_fraction), autotune,
+    Float64(device_weight_fraction), Float64(device_headroom_fraction), autotune,
     autotune_cache, String(autotune_cache_dir), numerics, executable_cache,
     profile, batch_sizes, Dict{String, Any}(xla_flags), weights_migration, 0, 1
 )
@@ -231,7 +231,7 @@ RuntimeConfig(
     backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
     preallocate::Bool, allow_cpu_fallback::Bool, residency_mode::ResidencyMode,
     shared_host_weights::Bool, shared_host_weights_mode::Integer,
-    weight_cache_fraction::Real, weight_cache_wiggle_fraction::Real, autotune::Bool,
+    device_weight_fraction::Real, device_headroom_fraction::Real, autotune::Bool,
     autotune_cache::Union{Bool, Nothing}, autotune_cache_dir::AbstractString, numerics::NumericsMode,
     executable_cache::Bool, profile::RuntimeProfile, batch_sizes::BatchSizeMode,
     xla_flags::AbstractDict
@@ -239,7 +239,7 @@ RuntimeConfig(
     RuntimeConfig(
     backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
     residency_mode, shared_host_weights, UInt16(shared_host_weights_mode),
-    Float64(weight_cache_fraction), Float64(weight_cache_wiggle_fraction), autotune,
+    Float64(device_weight_fraction), Float64(device_headroom_fraction), autotune,
     autotune_cache, String(autotune_cache_dir), numerics, executable_cache,
     profile, batch_sizes, Dict{String, Any}(xla_flags), MIGRATE_OFF, 0, 1
 )
@@ -250,32 +250,31 @@ RuntimeConfig(
     backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
     preallocate::Bool, allow_cpu_fallback::Bool, residency_mode::ResidencyMode,
     shared_host_weights::Bool, shared_host_weights_mode::Integer,
-    weight_cache_fraction::Real, weight_cache_wiggle_fraction::Real, autotune::Bool,
+    device_weight_fraction::Real, device_headroom_fraction::Real, autotune::Bool,
     autotune_cache::Union{Bool, Nothing}, autotune_cache_dir::AbstractString, numerics::NumericsMode,
     executable_cache::Bool
 ) =
     RuntimeConfig(
     backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
     residency_mode, shared_host_weights, UInt16(shared_host_weights_mode),
-    Float64(weight_cache_fraction), Float64(weight_cache_wiggle_fraction), autotune,
+    Float64(device_weight_fraction), Float64(device_headroom_fraction), autotune,
     autotune_cache, String(autotune_cache_dir), numerics, executable_cache,
     PROFILE_DEFAULT, BATCH_SIZES_ALL, Dict{String, Any}(), MIGRATE_OFF, 0, 1
 )
 
 # Five-argument form: device/backend only; residency self-managed, private host weights, and the
-# on-demand cache off (fraction 0). Used by tests and programmatic construction; the YAML path
-# (`build_config`) supplies the 1.0 fraction default.
+# YAML defaults for the device weight share and headroom. Used by tests and programmatic
+# construction.
 RuntimeConfig(
     backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
     preallocate::Bool, allow_cpu_fallback::Bool
 ) =
     RuntimeConfig(
     backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
-    SELF_MANAGED, false, 0o666, 0.0, 0.0, true, nothing, "", NUMERICS_AUTO, true
+    SELF_MANAGED, false, 0o666, 1.0, 0.1, true, nothing, "", NUMERICS_AUTO, true
 )
 
-# Seven-argument form: adds residency mode and the shared-host-weights flag (cache still off unless
-# a fraction is given). Used where a test needs to exercise externally-managed residency.
+# Seven-argument form: adds residency mode and the shared-host-weights flag. Used where a test needs to exercise externally-managed residency.
 RuntimeConfig(
     backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
     preallocate::Bool, allow_cpu_fallback::Bool, residency_mode::ResidencyMode,
@@ -283,7 +282,7 @@ RuntimeConfig(
 ) =
     RuntimeConfig(
     backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
-    residency_mode, shared_host_weights, 0o666, 0.0, 0.0, true, nothing, "", NUMERICS_AUTO, true
+    residency_mode, shared_host_weights, 0o666, 1.0, 0.1, true, nothing, "", NUMERICS_AUTO, true
 )
 
 # Fourteen-argument form: the previous full positional layout (through `numerics`), with the
@@ -292,13 +291,13 @@ RuntimeConfig(
     backend::BackendKind, device_ordinal::Integer, mem_fraction::Real,
     preallocate::Bool, allow_cpu_fallback::Bool, residency_mode::ResidencyMode,
     shared_host_weights::Bool, shared_host_weights_mode::Integer,
-    weight_cache_fraction::Real, weight_cache_wiggle_fraction::Real, autotune::Bool,
+    device_weight_fraction::Real, device_headroom_fraction::Real, autotune::Bool,
     autotune_cache::Union{Bool, Nothing}, autotune_cache_dir::AbstractString, numerics::NumericsMode
 ) =
     RuntimeConfig(
     backend, Int(device_ordinal), Float64(mem_fraction), preallocate, allow_cpu_fallback,
     residency_mode, shared_host_weights, UInt16(shared_host_weights_mode),
-    Float64(weight_cache_fraction), Float64(weight_cache_wiggle_fraction), autotune,
+    Float64(device_weight_fraction), Float64(device_headroom_fraction), autotune,
     autotune_cache, String(autotune_cache_dir), numerics, true
 )
 
@@ -504,8 +503,8 @@ const ENV_PATHS = Tuple{String, Vector{String}, DataType}[
     ("RUNTIME_MEM_FRACTION", ["runtime", "mem_fraction"], Float64),
     ("RUNTIME_PREALLOCATE", ["runtime", "preallocate"], Bool),
     ("RUNTIME_ALLOW_CPU_FALLBACK", ["runtime", "allow_cpu_fallback"], Bool),
-    ("RUNTIME_WEIGHT_CACHE_FRACTION", ["runtime", "weight_cache_fraction"], Float64),
-    ("RUNTIME_WEIGHT_CACHE_WIGGLE_FRACTION", ["runtime", "weight_cache_wiggle_fraction"], Float64),
+    ("RUNTIME_DEVICE_WEIGHT_FRACTION", ["runtime", "device_weight_fraction"], Float64),
+    ("RUNTIME_DEVICE_HEADROOM_FRACTION", ["runtime", "device_headroom_fraction"], Float64),
     ("RUNTIME_AUTOTUNE", ["runtime", "autotune"], Bool),
     ("RUNTIME_AUTOTUNE_CACHE", ["runtime", "autotune_cache"], Bool),
     ("RUNTIME_AUTOTUNE_CACHE_DIR", ["runtime", "autotune_cache_dir"], String),
@@ -573,6 +572,14 @@ const _BATCH_POLICY_REMOVED_MSG =
 
 # runtime.residency_mode was folded into the top-level model_control_mode (explicit ⇒ the former
 # externally_managed). Fail loudly rather than silently ignore a stale setting.
+# Settings renamed in 0.2: the old names fail loudly rather than being silently ignored.
+const _RENAMED_RUNTIME_KEYS = Dict(
+    "weight_cache_fraction" => "device_weight_fraction",
+    "weight_cache_wiggle_fraction" => "device_headroom_fraction",
+)
+_renamed_msg(old, new) =
+    "runtime.$old has been renamed to runtime.$new (the share of GPU memory it governs; it must be greater than 0)"
+
 const _RESIDENCY_MODE_REMOVED_MSG =
     "runtime.residency_mode has been removed; use the top-level model_control_mode instead " *
     "('explicit' replaces 'externally_managed'; 'static'/'dynamic' are self-managed)"
@@ -583,6 +590,10 @@ function apply_env_overrides!(raw::AbstractDict)
             throw(ConfigError("environment override $var: " * _BATCH_POLICY_REMOVED_MSG))
         var == ENV_PREFIX * "RUNTIME_RESIDENCY_MODE" &&
             throw(ConfigError("environment override $var: " * _RESIDENCY_MODE_REMOVED_MSG))
+        for (old, new) in _RENAMED_RUNTIME_KEYS
+            var == ENV_PREFIX * "RUNTIME_" * uppercase(old) &&
+                throw(ConfigError("environment override $var: " * _renamed_msg(old, new)))
+        end
     end
     applied = Tuple{String, String}[]
     for (suffix, path, T) in ENV_PATHS
@@ -800,6 +811,9 @@ function build_config(raw::AbstractDict)
 
     rt = _subdict(raw, "runtime")
     haskey(rt, "residency_mode") && throw(ConfigError(_RESIDENCY_MODE_REMOVED_MSG))
+    for (old, new) in _RENAMED_RUNTIME_KEYS
+        haskey(rt, old) && throw(ConfigError(_renamed_msg(old, new)))
+    end
     profile = _parse_profile(_opt(rt, "profile", String, "default"))
     runtime = RuntimeConfig(
         _parse_backend(_opt(rt, "backend", String, "cpu")),
@@ -810,8 +824,8 @@ function build_config(raw::AbstractDict)
         residency_mode,
         _opt(rt, "shared_host_weights", Bool, false),
         _parse_shm_mode(_opt(rt, "shared_host_weights_mode", String, "666")),
-        _opt(rt, "weight_cache_fraction", Float64, 1.0),
-        _opt(rt, "weight_cache_wiggle_fraction", Float64, 0.1),
+        _opt(rt, "device_weight_fraction", Float64, 1.0),
+        _opt(rt, "device_headroom_fraction", Float64, 0.1),
         _opt(rt, "autotune", Bool, true),
         _opt(rt, "autotune_cache", Bool, nothing),
         _opt(rt, "autotune_cache_dir", String, ""),
@@ -897,10 +911,10 @@ function validate_config(cfg::ServerConfig)
             throw(ConfigError("scheduler.models.$name.max_batch_size must be >= 1"))
     end
     0 < cfg.runtime.mem_fraction <= 1 || throw(ConfigError("runtime.mem_fraction must be in (0, 1]"))
-    0 <= cfg.runtime.weight_cache_fraction <= 1 ||
-        throw(ConfigError("runtime.weight_cache_fraction must be in [0, 1] (0 disables the on-demand cache)"))
-    0 <= cfg.runtime.weight_cache_wiggle_fraction < 1 ||
-        throw(ConfigError("runtime.weight_cache_wiggle_fraction must be in [0, 1)"))
+    0 < cfg.runtime.device_weight_fraction <= 1 ||
+        throw(ConfigError("runtime.device_weight_fraction must be in (0, 1]: it is the share of GPU memory that holds resident model weights, so 0 leaves no room for any (to keep no host RAM copies, set runtime.host_weight_budget: 0)"))
+    0 <= cfg.runtime.device_headroom_fraction < 1 ||
+        throw(ConfigError("runtime.device_headroom_fraction must be in [0, 1)"))
     # TF32 exists only on NVIDIA GPUs (CC >= 8.0); requiring it on a CPU backend can never be
     # satisfied, so fail at config time. GPU capability is checked at startup once a device exists.
     !(cfg.runtime.numerics == NUMERICS_TF32 && cfg.runtime.backend == CPU_BACKEND) ||
@@ -916,7 +930,7 @@ end
 # `apply_env_overrides!` is applied on top by `node_server_config`.
 
 function log_effective_config(cfg::ServerConfig, applied)
-    @info "Effective configuration" model_dirs = cfg.model_dirs models_include = cfg.models_include model_control_mode = cfg.model_control_mode model_poll_seconds = cfg.model_poll_seconds cache_dir = cfg.cache_dir backend = cfg.runtime.backend device_ordinal = cfg.runtime.device_ordinal mem_fraction = cfg.runtime.mem_fraction preallocate = cfg.runtime.preallocate allow_cpu_fallback = cfg.runtime.allow_cpu_fallback weight_cache_fraction = cfg.runtime.weight_cache_fraction weight_cache_wiggle_fraction = cfg.runtime.weight_cache_wiggle_fraction autotune = cfg.runtime.autotune autotune_cache = cfg.runtime.autotune_cache autotune_cache_dir = cfg.runtime.autotune_cache_dir numerics = cfg.runtime.numerics executable_cache = cfg.runtime.executable_cache profile = cfg.runtime.profile batch_sizes = cfg.runtime.batch_sizes weights_migration = cfg.runtime.weights_migration host_weight_budget = cfg.runtime.host_weight_budget host_weight_budget_workers = cfg.runtime.host_weight_budget_workers xla_flags = sort!(["$k=$v" for (k, v) in cfg.runtime.xla_flags]) residency_mode = cfg.runtime.residency_mode shared_host_weights = cfg.runtime.shared_host_weights shared_host_weights_mode = string(cfg.runtime.shared_host_weights_mode; base = 8) host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests discipline = cfg.scheduler.discipline ema_halflife_seconds = cfg.scheduler.ema_halflife_seconds recency_penalty_cap = cfg.scheduler.recency_penalty_cap coalescing = cfg.scheduler.coalescing coalescing_discount = cfg.scheduler.coalescing_discount cost_ema_alpha = cfg.scheduler.cost_ema_alpha max_queue_depth = cfg.scheduler.max_queue_depth compaction_interval = cfg.scheduler.compaction_interval scheduler_models = collect(keys(cfg.scheduler.models))
+    @info "Effective configuration" model_dirs = cfg.model_dirs models_include = cfg.models_include model_control_mode = cfg.model_control_mode model_poll_seconds = cfg.model_poll_seconds cache_dir = cfg.cache_dir backend = cfg.runtime.backend device_ordinal = cfg.runtime.device_ordinal mem_fraction = cfg.runtime.mem_fraction preallocate = cfg.runtime.preallocate allow_cpu_fallback = cfg.runtime.allow_cpu_fallback device_weight_fraction = cfg.runtime.device_weight_fraction device_headroom_fraction = cfg.runtime.device_headroom_fraction autotune = cfg.runtime.autotune autotune_cache = cfg.runtime.autotune_cache autotune_cache_dir = cfg.runtime.autotune_cache_dir numerics = cfg.runtime.numerics executable_cache = cfg.runtime.executable_cache profile = cfg.runtime.profile batch_sizes = cfg.runtime.batch_sizes weights_migration = cfg.runtime.weights_migration host_weight_budget = cfg.runtime.host_weight_budget host_weight_budget_workers = cfg.runtime.host_weight_budget_workers xla_flags = sort!(["$k=$v" for (k, v) in cfg.runtime.xla_flags]) residency_mode = cfg.runtime.residency_mode shared_host_weights = cfg.runtime.shared_host_weights shared_host_weights_mode = string(cfg.runtime.shared_host_weights_mode; base = 8) host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests discipline = cfg.scheduler.discipline ema_halflife_seconds = cfg.scheduler.ema_halflife_seconds recency_penalty_cap = cfg.scheduler.recency_penalty_cap coalescing = cfg.scheduler.coalescing coalescing_discount = cfg.scheduler.coalescing_discount cost_ema_alpha = cfg.scheduler.cost_ema_alpha max_queue_depth = cfg.scheduler.max_queue_depth compaction_interval = cfg.scheduler.compaction_interval scheduler_models = collect(keys(cfg.scheduler.models))
     isempty(applied) || @info "Configuration overridden by environment" overrides = ["$k=$v" for (k, v) in applied]
     return nothing
 end

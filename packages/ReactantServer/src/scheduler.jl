@@ -1002,7 +1002,7 @@ function set_residency!(s::Scheduler, name::AbstractString, target::ResidencySta
     return _run_control(
         s, function (sch)
             sch.weight_cache === nothing &&
-                throw(ErrorException("residency control requires the on-demand weight cache (set runtime.weight_cache_fraction > 0)"))
+                throw(ErrorException("residency control requires a GPU worker (a CPU worker keeps every model resident)"))
             sch.weight_cache.mode == EXTERNALLY_MANAGED ||
                 throw(ErrorException("worker is self-managed; residency is not externally controllable"))
             nm = String(name)

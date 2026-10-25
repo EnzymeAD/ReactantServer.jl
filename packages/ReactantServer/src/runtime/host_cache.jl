@@ -200,8 +200,7 @@ admitted.
 """
 function check_host_budget(cache::WeightCache)
     budget = host_budget(cache)
-    # No budget, or the default 0, where pinning anything is a deliberate exception.
-    (budget === nothing || budget == 0) && return nothing
+    budget === nothing && return nothing
     held = cache.store isa SharedWeightStore ? host_cache_bytes(cache.store) : _host_floor_bytes(cache)
     held > budget &&
         @warn "host weight budget overcommitted: pinned (residency: system) weights exceed it, so no other model's weights stay cached in host RAM" budget = Base.format_bytes(budget) pinned = Base.format_bytes(held)

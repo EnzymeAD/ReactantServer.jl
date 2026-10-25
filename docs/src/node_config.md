@@ -66,8 +66,8 @@ global:
     profile: default           # default | regulated; see below
     batch_sizes: all           # all | largest compiled batch size per model (profile default)
     xla_flags: {}              # XLA DebugOptions overrides, e.g. xla_gpu_exclude_nondeterministic_ops: true
-    weight_cache_fraction: 1.0 # arena fraction for all weights (pinned + on-demand); 0 disables
-    weight_cache_wiggle_fraction: 0.1  # arena fraction kept free; drives startup auto-sizing
+    device_weight_fraction: 1.0    # GPU arena share for resident weights (pinned + on-demand), (0, 1]
+    device_headroom_fraction: 0.1  # GPU arena share kept free; drives startup auto-sizing
     autotune: true             # XLA GPU compile autotuner; false = default kernels, no trials
     # autotune_cache: false    # persistent per-fusion autotune cache; omit to inherit Reactant's
     # autotune_cache_dir: /cache/autotune  # cache directory; omit to inherit Reactant's defaults
@@ -302,7 +302,7 @@ Any worker value can be overridden per process by an environment variable of the
 ```text
 INFERENCE_SERVER_ENDPOINTS_PORT=9100
 INFERENCE_SERVER_RUNTIME_BACKEND=cpu
-INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_FRACTION=0.8
+INFERENCE_SERVER_RUNTIME_DEVICE_WEIGHT_FRACTION=0.8
 ```
 
 Booleans parse as `1`, `true`, `yes`, or `on` (case-insensitive). List-valued overrides
@@ -322,8 +322,8 @@ overrides were applied, is logged at startup.
 | `INFERENCE_SERVER_RUNTIME_MEM_FRACTION` | `runtime.mem_fraction` | `0..1` |
 | `INFERENCE_SERVER_RUNTIME_PREALLOCATE` | `runtime.preallocate` | bool |
 | `INFERENCE_SERVER_RUNTIME_ALLOW_CPU_FALLBACK` | `runtime.allow_cpu_fallback` | bool |
-| `INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_FRACTION` | `runtime.weight_cache_fraction` | `0..1` |
-| `INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_WIGGLE_FRACTION` | `runtime.weight_cache_wiggle_fraction` | `0..1` |
+| `INFERENCE_SERVER_RUNTIME_DEVICE_WEIGHT_FRACTION` | `runtime.device_weight_fraction` | `(0, 1]` |
+| `INFERENCE_SERVER_RUNTIME_DEVICE_HEADROOM_FRACTION` | `runtime.device_headroom_fraction` | `[0, 1)` |
 | `INFERENCE_SERVER_RUNTIME_AUTOTUNE` | `runtime.autotune` | bool |
 | `INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE` | `runtime.autotune_cache` | bool |
 | `INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE_DIR` | `runtime.autotune_cache_dir` | path |

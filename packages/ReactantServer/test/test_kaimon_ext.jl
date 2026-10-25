@@ -65,7 +65,7 @@ const KGE = Base.get_extension(ReactantServer, :ReactantServerKaimonGateExt)
             base = (
                 model_dir = root, models = String[], accelerator = "cuda", device = 2,
                 host = "0.0.0.0", port = 8080, metrics_port = 9100, cache_dir = nothing,
-                mem_fraction = nothing, weight_cache_fraction = nothing, numerics = nothing,
+                mem_fraction = nothing, device_weight_fraction = nothing, numerics = nothing,
                 poll_seconds = nothing,
             )
             cfg = KGE._build_config(; base...)
@@ -81,7 +81,7 @@ const KGE = Base.get_extension(ReactantServer, :ReactantServerKaimonGateExt)
             @test cfg.model_control_mode == ReactantServer.STATIC
             @test cfg.runtime.mem_fraction == 0.9
             @test cfg.runtime.preallocate
-            @test cfg.runtime.weight_cache_fraction == 1.0
+            @test cfg.runtime.device_weight_fraction == 1.0
 
             dyn = KGE._build_config(; base..., poll_seconds = 5.0, models = ["a", "b"])
             @test dyn.model_control_mode == ReactantServer.DYNAMIC
@@ -90,11 +90,11 @@ const KGE = Base.get_extension(ReactantServer, :ReactantServerKaimonGateExt)
 
             tuned = KGE._build_config(;
                 base..., accelerator = "cpu", device = 0, mem_fraction = 0.5,
-                weight_cache_fraction = 0.0, numerics = "f32"
+                device_weight_fraction = 0.5, numerics = "f32"
             )
             @test tuned.runtime.backend == ReactantServer.CPU_BACKEND
             @test tuned.runtime.mem_fraction == 0.5
-            @test tuned.runtime.weight_cache_fraction == 0.0
+            @test tuned.runtime.device_weight_fraction == 0.5
             @test tuned.runtime.numerics == ReactantServer.NUMERICS_F32
 
             # Config validation is the same validation a node file gets.
@@ -113,7 +113,7 @@ const KGE = Base.get_extension(ReactantServer, :ReactantServerKaimonGateExt)
             mk(frac) = KGE._build_config(;
                 model_dir = root, models = String[], accelerator = "cuda", device = 0,
                 host = "127.0.0.1", port = 8080, metrics_port = 0, cache_dir = nothing,
-                mem_fraction = frac, weight_cache_fraction = nothing, numerics = nothing,
+                mem_fraction = frac, device_weight_fraction = nothing, numerics = nothing,
                 poll_seconds = nothing
             )
             saved = KGE.CLIENT_COMMIT[]
@@ -131,7 +131,7 @@ const KGE = Base.get_extension(ReactantServer, :ReactantServerKaimonGateExt)
                 cpu = KGE._build_config(;
                     model_dir = root, models = String[], accelerator = "cpu", device = 0,
                     host = "127.0.0.1", port = 8080, metrics_port = 0, cache_dir = nothing,
-                    mem_fraction = 0.5, weight_cache_fraction = nothing, numerics = nothing,
+                    mem_fraction = 0.5, device_weight_fraction = nothing, numerics = nothing,
                     poll_seconds = nothing
                 )
                 KGE._check_client_commit_locked(cpu)

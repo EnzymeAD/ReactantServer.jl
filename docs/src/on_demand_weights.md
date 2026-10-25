@@ -30,25 +30,27 @@ model's weight size over the host-to-device bandwidth.
 
 ## Enabling it
 
-The main setting is `runtime.weight_cache_fraction`, the fraction of the BFC arena
-(`mem_fraction * device memory`) devoted to all weights, pinned plus on-demand. It
-defaults to **1.0** (use the whole arena, GPU only), and `0` disables the cache so every
-model's weights stay resident. You normally do not set it at all.
+The main setting is `runtime.device_weight_fraction`, the share of the BFC arena
+(`mem_fraction * device memory`) that holds resident model weights, pinned plus on-demand. It
+defaults to **1.0** (use the whole arena, GPU only) and must be greater than 0: models that do not
+fit in it are swapped on and off the GPU. You normally do not set it at all. (In 0.1 it was called
+`weight_cache_fraction`, and `device_headroom_fraction` was `weight_cache_wiggle_fraction`; the old
+names are rejected at startup.)
 
 ```yaml
 global:
   runtime:
     backend: cuda
-    weight_cache_fraction: 1.0         # default: use the whole arena, self-sized (see below)
-    weight_cache_wiggle_fraction: 0.1  # default: keep 10% of the arena free as headroom
+    device_weight_fraction: 1.0    # default: use the whole arena, self-sized (see below)
+    device_headroom_fraction: 0.1  # default: keep 10% of the arena free as headroom
 ```
 
-These are the `weight_cache_fraction` / `weight_cache_wiggle_fraction` fields of
-[`RuntimeConfig`](@ref), also settable via `INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_FRACTION`
-and `INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_WIGGLE_FRACTION` environment variables. The cache
+These are the `device_weight_fraction` / `device_headroom_fraction` fields of
+[`RuntimeConfig`](@ref), also settable via `INFERENCE_SERVER_RUNTIME_DEVICE_WEIGHT_FRACTION`
+and `INFERENCE_SERVER_RUNTIME_DEVICE_HEADROOM_FRACTION` environment variables. The cache
 is GPU-only; on CPU there is no arena, so weights stay resident regardless.
 
-### Self-sizing: pinned + scratch + wiggle
+### Self-sizing: pinned + scratch + headroom
 
 The fraction is a ceiling on weight memory, not a promise it all fits as cache: each
 execution also needs transient device memory (activations, conv/GEMM workspace, IO) on top
@@ -58,10 +60,10 @@ in isolation (loads and runs it), reads the allocator's peak device usage to mea
 worst-case scratch, and sets
 
 ```text
-on_demand_budget = min(fraction*arena, (1-wiggle)*arena - max_scratch) - pinned_weights
+on_demand_budget = min(fraction*arena, (1-headroom)*arena - max_scratch) - pinned_weights
 ```
 
-so pinned weights reserve their share, the measured scratch and the wiggle slack are held
+so pinned weights reserve their share, the measured scratch and the headroom are held
 back, and the rest is the weight cache. When everything fits, the cache simply holds all
 weights resident (no eviction); when it does not, it is memory-safe. The probe is bounded
 one-time startup work and doubles as an execution smoke test; the resolved budget is
@@ -173,8 +175,8 @@ fit, largest first, so a deployment whose models all fit never reads a weights f
 After that, a model reloaded from disk because it had no host copy logs a
 `model weights reloaded from disk` warning, once per model, so slow swaps have a visible cause.
 
-The budget needs the on-demand weight cache (GPU, `weight_cache_fraction > 0`); without it every
-model's weights stay on the device and the setting is ignored (with a warning when it is not 0).
+The budget applies to GPU workers; a CPU worker keeps every model's weights resident, so the
+setting is ignored there (with a warning when it is not 0).
 
 ## Memory fragmentation and compaction
 
@@ -300,9 +302,8 @@ a one-off fleet defragment.
 
 ### Cost and when to enable
 
-With the weight cache disabled (`weight_cache_fraction: 0`) every model is permanently
-resident from startup and nothing churns, so compaction has no working set to defragment
-and is a no-op. When it does run it has a cost: freeing the on-demand region drops models
+When every model fits on the GPU nothing churns, so compaction has no working set to defragment.
+When it does run it has a cost: freeing the on-demand region drops models
 that were warm, so they pay a host-to-device reload (lazily on next request for `eager`,
 or up front for `scheduled`).
 

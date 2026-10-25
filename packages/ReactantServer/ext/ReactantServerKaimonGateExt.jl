@@ -145,7 +145,7 @@ function _build_config(;
         model_dir::AbstractString, models::Vector{String}, accelerator::AbstractString,
         device::Int, host::AbstractString, port::Int, metrics_port::Int,
         cache_dir::Union{AbstractString, Nothing}, mem_fraction::Union{Float64, Nothing},
-        weight_cache_fraction::Union{Float64, Nothing}, numerics::Union{AbstractString, Nothing},
+        device_weight_fraction::Union{Float64, Nothing}, numerics::Union{AbstractString, Nothing},
         poll_seconds::Union{Float64, Nothing}
     )
     dir = abspath(expanduser(String(model_dir)))
@@ -154,8 +154,8 @@ function _build_config(;
 
     runtime = Dict{String, Any}("backend" => accelerator, "device_ordinal" => device)
     mem_fraction === nothing || (runtime["mem_fraction"] = mem_fraction)
-    weight_cache_fraction === nothing ||
-        (runtime["weight_cache_fraction"] = weight_cache_fraction)
+    device_weight_fraction === nothing ||
+        (runtime["device_weight_fraction"] = device_weight_fraction)
     numerics === nothing || (runtime["numerics"] = lowercase(strip(String(numerics))))
 
     raw = Dict{String, Any}(
@@ -353,7 +353,7 @@ end
 
 """
     rserver_start(model_dir; models, accelerator, device, port, metrics_port, host, cache_dir,
-                  mem_fraction, weight_cache_fraction, numerics, poll_seconds) -> String
+                  mem_fraction, device_weight_fraction, numerics, poll_seconds) -> String
 
 Start a ReactantServer worker in this session and return its id immediately.
 
@@ -376,7 +376,7 @@ during bring-up lands in `rserver_status`.
 picked up (and a removed one is unloaded). Omit it and the model set is fixed at startup.
 
 The remaining keywords take the same defaults a node file takes: `mem_fraction` (0.9 of the
-card for the BFC arena), `weight_cache_fraction` (1.0, the self-sizing on-demand weight cache),
+card for the BFC arena), `device_weight_fraction` (1.0, the self-sizing on-demand weight cache),
 `numerics` (`"auto"`, or `"f32"` to pin full f32 precision), `cache_dir`, `host`
 (127.0.0.1), `port` (8080) and `metrics_port` (0, meaning no Prometheus endpoint).
 
@@ -400,7 +400,7 @@ function rserver_start(
         host::String = "127.0.0.1",
         cache_dir::Union{String, Nothing} = nothing,
         mem_fraction::Union{Float64, Nothing} = nothing,
-        weight_cache_fraction::Union{Float64, Nothing} = nothing,
+        device_weight_fraction::Union{Float64, Nothing} = nothing,
         numerics::Union{String, Nothing} = nothing,
         poll_seconds::Union{Float64, Nothing} = nothing,
     )
@@ -412,7 +412,7 @@ function rserver_start(
     )
     cfg = _build_config(;
         model_dir, models = _model_names(models), accelerator = accel, device, host, port,
-        metrics_port, cache_dir, mem_fraction, weight_cache_fraction, numerics, poll_seconds,
+        metrics_port, cache_dir, mem_fraction, device_weight_fraction, numerics, poll_seconds,
     )
 
     state = lock(SERVERS_LOCK) do
