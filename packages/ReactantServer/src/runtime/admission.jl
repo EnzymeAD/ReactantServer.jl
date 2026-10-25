@@ -14,8 +14,9 @@
 #      Requiring a block of W rather than wmax is deliberate: a free block holding the largest
 #      tensor does not guarantee the other tensors find room, and the allocator reports only its
 #      largest block, so wmax alone would let a multi-tensor upload be refused partway (10 s).
-#      With a W block free, every tensor fits however best fit scatters the earlier ones. The
-#      address map of Phase 5 can relax this to an exact per-tensor placement check.
+#      A block of exactly W is not enough either: BFC splits a chunk only when it is at least
+#      twice the request or the remainder is at least 128 MiB, so one tensor can swallow the rest
+#      of the block. The check replays that rule over the model's tensors (`bfc_block_fits`).
 #   B. Upload. A failed transfer frees its partial upload and falls back to compaction.
 #   C. Guarantee the scratch: the largest free block must hold the largest scratch of any resident
 #      model, m included, so every resident model can still run. Evict until it does.
@@ -147,7 +148,7 @@ function _weights_shortfall(cache::WeightCache, model::LoadedModel, fp::ModelFoo
     if stats !== nothing
         deficit = max(deficit, fp.weight_bytes + _scratch_need(cache, fp) - stats.free)
         lf = largest_free_bytes(stats)
-        contiguous_short = lf !== nothing && lf < fp.weight_bytes
+        contiguous_short = lf !== nothing && !bfc_block_fits(lf, fp.tensor_bytes)
     end
     return deficit, contiguous_short
 end

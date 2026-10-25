@@ -463,6 +463,14 @@ end
     @test fp.weight_bytes == 256 + 256 + 512            # every tensor rounds up to the 256-byte granule
     @test fp.max_weight_bytes == 512
     @test ReactantServer.weight_footprint(Int[]) == (weight_bytes = 0, max_weight_bytes = 0)
+    # BFC's split rule: measured on an A6000, three f32 tensors (34928640, 34952704 and 34952192
+    # bytes rounded) failed to upload into a free block of exactly their sum, after a 10 s wait.
+    sizes = [34928640, 34952704, 34952192]
+    @test !ReactantServer.bfc_block_fits(sum(sizes), sizes)
+    @test ReactantServer.bfc_block_fits(sum(sizes) + 34952704, sizes)
+    @test ReactantServer.bfc_block_fits(1 << 30, fill(300 << 20, 3))   # 128 MiB remainders split
+    @test !ReactantServer.bfc_block_fits(1000, [1001])
+    @test ReactantServer.bfc_block_fits(0, Int[])
 
     @test ReactantServer.fragmentation(nothing) === nothing
     @test ReactantServer.fragmentation((in_use = 0, limit = 100, free = 100)) === nothing   # no largest_free
