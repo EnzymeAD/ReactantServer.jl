@@ -150,7 +150,10 @@ function _apply_change!(
                     executable_cache = w.cfg.runtime.executable_cache
                 )
             end
-            w.seen[name] = desired
+            # Record the bundle as loaded, not as detected: a weights migration during the load
+            # rewrites its files, and the pre-migration signature would make the next poll see that
+            # as a change and reload the model a second time.
+            w.seen[name] = bundle_signature(dir)
             w.dir_ids[name] = _dir_id(dir)
         end
         # On the heartbeat as well as in the log: a hot-load is an event a supervisor wants to see

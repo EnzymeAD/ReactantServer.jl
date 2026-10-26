@@ -146,6 +146,39 @@ end
     end
 end
 
+@testset "a bundle migrated as it loads is loaded once (CPU)" begin
+    mktempdir() do root
+        backend = ReactantServer.ReactantBackend()
+        rt = ReactantServer.RuntimeConfig(ReactantServer.CPU_BACKEND, 0, 0.9, true, true)
+        runtime = ReactantServer.RuntimeConfig(
+            (f === :weights_migration ? ReactantServer.MIGRATE_REPLACE : getfield(rt, f) for f in fieldnames(typeof(rt)))...
+        )
+        pool = ReactantServer.resolve_client(backend, runtime)
+        reg = ReactantServer.ModelRegistry()
+        sched = ReactantServer.Scheduler(reg, backend, pool, ReactantServer.SchedulerConfig(30.0, 64, 30.0))
+        ReactantServer.start!(sched)
+        cfg = ReactantServer.ServerConfig(
+            [root], "", runtime,
+            ReactantServer.SchedulerConfig(30.0, 64, 30.0),
+            ReactantServer.EndpointsConfig("127.0.0.1", 0)
+        )
+        w = BundleWatcher(sched, backend, pool, cfg; interval = 0.1, on_demand = false)
+        try
+            dir = _write_scale_bundle(root, "mig4")          # legacy axis order
+            @test _poll_action(w) === nothing                # pending
+            @test _poll_action(w) === :load
+            @test occursin("format_version: \"2.1\"", read(joinpath(dir, "manifest.yaml"), String))   # migrated
+            # The migration rewrote the bundle's files during the load; that is not a new change.
+            @test _poll_action(w) === nothing
+            @test _poll_action(w) === nothing
+            out = infer(sched, InferRequest("mig4", ["y"], [NamedTensor("x", Float32[1, 2, 3, 4])]))
+            @test out[1].data == Float32[2, 4, 6, 8]
+        finally
+            ReactantServer.shutdown!(sched)
+        end
+    end
+end
+
 @testset "model name comes from the bundle directory, not the manifest" begin
     mktempdir() do root
         # A manifest whose `name` disagrees with the directory: the directory wins.
