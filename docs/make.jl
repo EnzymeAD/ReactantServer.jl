@@ -87,9 +87,9 @@ makedocs(;
         edit_link = "main",
         canonical = "https://enzymead.github.io/ReactantServer.jl/",
         # The workspace root (../Project.toml) is not a package, so Documenter
-        # cannot infer a version for the search inventory; set it explicitly to
-        # match the member packages.
-        inventory_version = "0.1.0",
+        # cannot infer a version for the search inventory. The docs are versioned
+        # by ReactantServer's release (see deploydocs below), so use its version.
+        inventory_version = string(pkgversion(ReactantServer)),
         footer = "Made with [Documenter.jl](https://documenter.juliadocs.org/stable/), [DocumenterLandingPage.jl](https://github.com/csvance/DocumenterLandingPage.jl), and [DocumenterCodeBlocks.jl](https://github.com/fredrikekre/DocumenterCodeBlocks.jl)<br>© Copyright $(Dates.year(Dates.today())).",
     ),
     plugins = [
@@ -148,12 +148,19 @@ makedocs(;
     ],
 )
 
-# PRs get a preview URL via `push_preview = true`; pushes to main deploy the
-# live site (tag pushes deliberately do not build, see .github/workflows/docs.yml).
-# This is Documenter's own deployer, unlike the
-# VitePress-specific DocumenterVitepress.deploydocs the docs previously used.
+# PRs get a preview URL via `push_preview = true`; pushes to main deploy `dev`.
+#
+# The site is versioned by ReactantServer's release alone. TagBot pushes a
+# PkgName-vX.Y.Z tag for every subpackage, but ReactantServer is released last in
+# each round and its version names the whole release (the container image is
+# published from the same tag, see .github/workflows/image.yml). `tag_prefix`
+# makes a ReactantServer-vX.Y.Z build deploy as vX.Y.Z and makes every other tag
+# a no-op, and `stable` follows the highest such version. The subpackages carry
+# their own semver and have no docs versions of their own.
 Documenter.deploydocs(;
     repo = "github.com/EnzymeAD/ReactantServer.jl.git",
     push_preview = true,
     devbranch = "main",
+    tag_prefix = "ReactantServer-",
+    versions = ["stable" => "v^", "v#.#.#", "dev" => "dev"],
 )
