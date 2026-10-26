@@ -248,7 +248,7 @@ end
     @test cfg.first_rebalance_compute_seconds == 60.0
     @test cfg.hysteresis == 0.0
     @test cfg.ema_halflife_compute_seconds == 0.0
-    @test cfg.compaction_mode == :on_demand
+    @test cfg.compaction_mode == :off
     @test cfg.compaction_interval == 1
     @test cfg.forbid_memory_oversubscription == true
     # 0 resolves to the rebalance interval (~50% decay per rebalance); a set value is honored.
@@ -307,7 +307,7 @@ end
         "info", "json", "lpt_packing", "compute", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr", "run",
         Dict{String, GW.GatewayModelConfig}(), 32, 64, mode, interval, false
     )
-    cfg = mk(:eager, 2)
+    cfg = mk(:lazy, 2)
     s = GW.LptPackingState(cfg)
     pool = GW.ClientPool(cfg)               # no workers; the ghost URL below is skipped (no network)
     moved = Set(["ghost:1"])
@@ -326,16 +326,27 @@ end
     GW._maybe_compact_fleet!(s, pool, nothing, moved)
     @test s.repacks_since_compact == 0      # first move after the interval fires and resets
 
-    # mode :off never counts or fires.
-    s_off = GW.LptPackingState(mk(:off, 2))
-    GW._maybe_compact_fleet!(s_off, GW.ClientPool(mk(:off, 2)), nothing, moved)
+    # mode :off (the default) leaves compaction to each worker's admission: never counts or fires.
+    s_off = GW.LptPackingState(mk(:off, 1))
+    GW._maybe_compact_fleet!(s_off, GW.ClientPool(mk(:off, 1)), nothing, moved)
     @test s_off.repacks_since_compact == 0
+end
 
-    # mode :on_demand (the default) leaves compaction to each worker's admission: no fan-out.
-    s_od = GW.LptPackingState(mk(:on_demand, 1))
-    GW._maybe_compact_fleet!(s_od, GW.ClientPool(mk(:on_demand, 1)), nothing, moved)
-    @test s_od.repacks_since_compact == 0
-    @test GW._parse_gateway_compaction_mode("on_demand") == :on_demand
+@testset "compaction_mode: off | lazy | preload; the 0.1 names fail with their replacement" begin
+    @test GW._parse_gateway_compaction_mode("off") == :off
+    @test GW._parse_gateway_compaction_mode("Lazy") == :lazy
+    @test GW._parse_gateway_compaction_mode("preload") == :preload
+    for (old, new) in ("on_demand" => "off", "eager" => "lazy", "scheduled" => "preload")
+        err = try
+            GW._parse_gateway_compaction_mode(old)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ReactantServerCore.ConfigError
+        @test occursin("renamed to '$new'", err.msg)
+    end
+    @test_throws ReactantServerCore.ConfigError GW._parse_gateway_compaction_mode("sometimes")
 end
 
 # Build a packing state directly for routing unit tests. Defaults to a single two-replica model

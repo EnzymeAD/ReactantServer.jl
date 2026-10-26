@@ -57,7 +57,7 @@ struct PackingKnobs
     work_basis::Symbol                         # :compute | :items | :requests
     routing_fill_mode::Symbol                  # :run | :spread | :inflight
     forbid_memory_oversubscription::Bool
-    compaction_mode::Symbol                    # :on_demand | :off | :eager | :scheduled
+    compaction_mode::Symbol                    # :off | :lazy | :preload
     compaction_interval::Int
     generation::Int
 end

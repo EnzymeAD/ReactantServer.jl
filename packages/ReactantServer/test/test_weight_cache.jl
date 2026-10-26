@@ -238,7 +238,7 @@ end
     end
 end
 
-@testset "compaction frees on-demand weights and leaves pinned in place (eager)" begin
+@testset "compaction frees on-demand weights and leaves pinned in place (lazy refill)" begin
     sched = _od_scheduler(
         _od_entry("P"; pinned = true, nbytes = _WBYTES),
         _od_entry("A"; pinned = false, nbytes = _WBYTES); budget = _WBYTES * 4
@@ -249,7 +249,7 @@ end
     a_bufs = A.weights; p_bufs = P.weights
     @test a_bufs !== nothing && p_bufs !== nothing
 
-    n = ReactantServer.compact!(sched.weight_cache, sched.registry)   # eager: free non-pinned only
+    n = ReactantServer.compact!(sched.weight_cache, sched.registry)   # no reload list: free non-pinned only
     @test n == 0                                         # nothing eagerly reloaded
     @test all(b -> b.freed, a_bufs)                      # on-demand A's device buffers freed
     @test A.weights === nothing                          # ...and left freed (reloads lazily)
@@ -307,7 +307,7 @@ end
 
     _dispatch1!(sched, "B")                              # loads = 2
     ReactantServer._maybe_compact!(sched)
-    @test sched.weight_cache.compactions == 1            # loads advanced by the interval -> compacted (eager)
+    @test sched.weight_cache.compactions == 1            # loads advanced by the interval -> compacted (lazy refill)
     @test sched.registry.by_name["A"].executable.weights === nothing
     @test sched.registry.by_name["B"].executable.weights === nothing
     @test sched.weight_cache.resident_bytes == 0
@@ -332,7 +332,7 @@ end
 
         p_bufs = sched.registry.by_name["P"].executable.weights
         resp = ReactantServer._handle_compact_memory(ctx, _Ctl.CompactMemoryRequest())
-        @test resp.reloaded_models == 0                  # eager: nothing eagerly reloaded
+        @test resp.reloaded_models == 0                  # no reload list: nothing reloaded
         @test sched.registry.by_name["A"].executable.weights === nothing   # on-demand A freed (lazy reload)
         @test sched.registry.by_name["P"].executable.weights === p_bufs    # pinned P untouched
     finally

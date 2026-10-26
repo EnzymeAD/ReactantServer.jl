@@ -129,13 +129,13 @@ struct GatewayConfig
     max_concurrent_requests_per_worker::Int
     # Memory compaction (lpt_packing only). After a placement-changing repack, the gateway can fan a
     # `CompactMemory` RPC out to the workers whose assignment changed, defragmenting their on-demand
-    # weight region. `compaction_mode` selects what each worker reloads eagerly afterward: `:off`
-    # disables it, `:eager` reloads nothing (the region refills lazily as traffic arrives), and
-    # `:scheduled` reloads the set of models the repack just assigned to that worker (warming the new
-    # placement). `:on_demand` (the default) sends nothing on a repack: each worker's admission
-    # evicts only what a load needs and compacts by itself only when eviction cannot make a model
-    # fit. `compaction_interval` is the cadence in repacks: the first placement-changing repack at or
-    # after this many repacks fires it (so it can land later than exactly N).
+    # weight region. `compaction_mode`: `:off` (the default) sends nothing on a repack, so each
+    # worker's admission evicts only what a load needs and compacts by itself only when eviction
+    # cannot make a model fit; `:lazy` compacts and reloads nothing (models come back as requests
+    # arrive); `:preload` compacts and then reloads the models the repack just assigned to that
+    # worker (warming the new placement). `compaction_interval` is the cadence in repacks: the first
+    # placement-changing repack at or after this many repacks fires it (so it can land later than
+    # exactly N).
     compaction_mode::Symbol
     compaction_interval::Int
     # No-eviction guarantee (lpt_packing only). When true, the packer treats each worker's weight
@@ -284,7 +284,7 @@ function _build_gateway_config(raw::Dict{String, Any})
     work_basis = String(_parse_work_basis(_opt(sched, "work_basis", String, "compute")))
     routing_policy = String(_parse_routing_policy(_opt(sched, "routing_policy", String, "fill_least")))
     routing_fill_mode = String(_parse_fill_mode(_opt(sched, "routing_fill_mode", String, "run")))
-    compaction_mode = _parse_gateway_compaction_mode(_opt(sched, "compaction_mode", String, "on_demand"))
+    compaction_mode = _parse_gateway_compaction_mode(_opt(sched, "compaction_mode", String, "off"))
 
     cfg = GatewayConfig(
         _opt(listen, "grpc", String, "0.0.0.0:8001"),
@@ -381,13 +381,22 @@ function _ck_nonneg_int(key::AbstractString, v; hint::AbstractString = "")
     return x
 end
 
+# Values renamed in 0.2. The old names fail with their replacement rather than being accepted.
+const _RENAMED_COMPACTION_MODES = Dict(
+    "on_demand" => "off",      # the two were the same behavior
+    "eager" => "lazy",
+    "scheduled" => "preload",
+)
+
 function _parse_gateway_compaction_mode(s)
     ls = lowercase(strip(s))
     ls == "off" && return :off
-    ls == "eager" && return :eager
-    ls == "scheduled" && return :scheduled
-    ls == "on_demand" && return :on_demand
-    throw(ConfigError("scheduling.compaction_mode must be 'on_demand', 'off', 'eager', or 'scheduled', got '$s'"))
+    ls == "lazy" && return :lazy
+    ls == "preload" && return :preload
+    new = get(_RENAMED_COMPACTION_MODES, ls, nothing)
+    new === nothing ||
+        throw(ConfigError("scheduling.compaction_mode '$ls' has been renamed to '$new' (see On-demand Weights)"))
+    throw(ConfigError("scheduling.compaction_mode must be 'off', 'lazy', or 'preload', got '$s'"))
 end
 
 # Where a fresh batch opens within a model's replica set. Returns a Symbol; `GatewayConfig` keeps the

@@ -174,7 +174,7 @@ message SchedulingPolicy
   // by ONE replica indefinitely while the others receive no traffic. Diagnose with
   // gateway_replica_routed_total. Prefer "run", or "spread" when a model needs every GPU at once.
   string routing_fill_mode = 8;
-  string compaction_mode = 9;                    // "off" | "eager" | "scheduled"
+  string compaction_mode = 9;                    // "off" | "lazy" | "preload"
   int64 compaction_interval = 10;                // repacks between compactions; 0 disables
   bool forbid_memory_oversubscription = 11;
   // 0 while every knob still matches gateway.yml; bumped by each accepted mutation, so an operator

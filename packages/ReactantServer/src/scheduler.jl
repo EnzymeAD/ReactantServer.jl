@@ -1078,8 +1078,8 @@ compact!(s::Scheduler; reload_models::Vector{String} = String[]) =
 # on-demand weight-cache loads, not dispatches: a load is what places a variable-size weight block
 # and so drives fragmentation, while a dispatch to an already-resident model does not. This is the
 # standalone (no-gateway) trigger and is off by default, so a gateway-fronted worker never
-# self-compacts (the gateway owns compaction there, via the CompactMemory RPC). It is eager: the
-# on-demand region is freed and refills lazily as requests arrive.
+# self-compacts (the gateway owns compaction there, via the CompactMemory RPC). It refills lazily:
+# the on-demand region is freed and models come back as requests arrive.
 #
 # Called from the dispatch loop after a dispatch, so it is already on the dispatch thread and must
 # NOT go through `_run_control` (nesting it would deadlock). A failure must not kill the loop.

@@ -620,22 +620,22 @@ inflight_work(s::LptPackingState) = (knobs(s).work_basis, @atomic s.worker_load)
 # After a repack, fan a CompactMemory out to the workers whose assignment changed, on the gateway's
 # compaction cadence. Counts every repack; once `compaction_interval` repacks have elapsed, the first
 # one that actually moved a model (non-empty `changed`) fires the fan-out and resets the counter, so
-# it can land later than exactly N. `:off` and `:on_demand` send nothing (under `:on_demand` each
-# worker's admission compacts by itself, only when eviction cannot fit a model); `:eager` sends an empty reload list (the
-# on-demand region refills lazily as requests arrive); `:scheduled` sends each changed worker the set
-# of models this repack assigned to it, warming the new placement. Runs on the prober task.
+# it can land later than exactly N. `:off` sends nothing (each worker's admission compacts by itself,
+# only when eviction cannot fit a model); `:lazy` sends an empty reload list (models come back as
+# requests arrive); `:preload` sends each changed worker the set of models this repack assigned to
+# it, warming the new placement. Runs on the prober task.
 function _maybe_compact_fleet!(
         s::LptPackingState, pool::ClientPool,
         metrics::Union{GatewayMetrics, Nothing}, changed::Set{String};
         k::PackingKnobs = knobs(s)
     )
-    (k.compaction_mode in (:off, :on_demand) || k.compaction_interval <= 0) && return nothing
+    (k.compaction_mode == :off || k.compaction_interval <= 0) && return nothing
     s.repacks_since_compact += 1
     (s.repacks_since_compact >= k.compaction_interval && !isempty(changed)) || return nothing
     s.repacks_since_compact = 0
 
     perworker = Dict{String, Vector{String}}(w => String[] for w in changed)
-    if k.compaction_mode == :scheduled
+    if k.compaction_mode == :preload
         for (m, placement) in @atomic(s.assignment), (w, _) in placement
             haskey(perworker, w) && push!(perworker[w], m)
         end

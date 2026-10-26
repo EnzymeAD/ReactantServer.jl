@@ -16,7 +16,7 @@
 #   RS_MIGRATION=off|copy|replace (off) runtime.weights_migration
 #   RS_EXEC_CACHE=true|false   (true)  runtime.executable_cache
 #   RS_COMPACTION_INTERVAL=N   (0)     scheduler.compaction_interval (single mode only)
-#   RS_GW_COMPACTION=MODE      (on_demand) gateway scheduling.compaction_mode (node mode)
+#   RS_GW_COMPACTION=MODE      (off)   gateway scheduling.compaction_mode (node mode)
 #   RS_POLL=SECONDS            (3)     model_poll_seconds for the directory watcher
 #   RS_DEBUG=1                         JULIA_DEBUG=ReactantServer (per load/evict memory lines)
 #   RS_READY_TIMEOUT=SECONDS   (1800)
@@ -125,7 +125,7 @@ else
     export REACTANT_WORKSPACE_ROOT="$REPO_ROOT"
     export REACTANT_GATEWAY_LISTEN_GRPC="127.0.0.1:$GW_PORT"
     export REACTANT_GATEWAY_LISTEN_METRICS="127.0.0.1:$GW_METRICS_PORT"
-    export REACTANT_GATEWAY_SCHEDULING_COMPACTION_MODE="${RS_GW_COMPACTION:-on_demand}"
+    export REACTANT_GATEWAY_SCHEDULING_COMPACTION_MODE="${RS_GW_COMPACTION:-off}"
     if [[ "$BACKEND" == "cpu" ]]; then
         export REACTANT_GPUS=0
         export REACTANT_CPU_WORKERS="${RS_GPUS:-2}"
