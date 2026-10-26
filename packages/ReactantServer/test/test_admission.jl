@@ -1,7 +1,7 @@
 # Fragmentation-aware admission (runtime/admission.jl) and its victim search
 # (runtime/victim_search.jl), against a fake allocator that fragments the way XLA's BFC does:
-# address-ordered best fit, 256-byte rounding, coalescing frees, and a refused allocation when no
-# single free block is large enough. Executions claim their scratch transiently, so running a model
+# address-ordered best fit, 256-byte rounding, BFC's split rule, coalescing frees, and a refused
+# allocation when no single free block is large enough. Executions claim their scratch transiently, so running a model
 # fails exactly when its scratch block does not fit. Reactant-free and deterministic.
 
 using Random
@@ -31,8 +31,14 @@ function _frag_alloc!(b::FragBackend, n::Int)
         error("RESOURCE_EXHAUSTED: fake allocator cannot place $r bytes")
     end
     off, sz = b.free[best]
-    sz == r ? deleteat!(b.free, best) : (b.free[best] = (off + r, sz - r))
-    return off, r
+    # BFC splits a chunk only when it is at least twice the request or the remainder is at least
+    # max_internal_fragmentation (128 MiB); otherwise the request takes the whole chunk.
+    if sz >= 2r || sz - r >= ReactantServer.BFC_MAX_INTERNAL_FRAGMENTATION
+        b.free[best] = (off + r, sz - r)
+        return off, r
+    end
+    deleteat!(b.free, best)
+    return off, sz
 end
 
 function _frag_release!(b::FragBackend, off::Int, r::Int)
@@ -92,14 +98,18 @@ end
 
 # ── Models and a scheduler on it ─────────────────────────────────────────────────────────────────
 
-# A model with weight tensors of `kib` KiB each and a measured scratch of `scratch` bytes.
-function _frag_entry(b::FragBackend, name; kib::Vector{Int}, scratch::Int = 0, pinned::Bool = false)
-    names = ["w$i" for i in eachindex(kib)]
-    tensors = Dict{String, Array}(n => zeros(Float32, k * _KiB ÷ 4) for (n, k) in zip(names, kib))
+# A model with weight tensors of `kib` KiB each (or `bytes` bytes each) and a measured scratch of
+# `scratch` bytes.
+function _frag_entry(
+        b::FragBackend, name; kib::Vector{Int} = Int[], bytes::Vector{Int} = kib .* _KiB,
+        scratch::Int = 0, pinned::Bool = false
+    )
+    names = ["w$i" for i in eachindex(bytes)]
+    tensors = Dict{String, Array}(n => zeros(Float32, k ÷ 4) for (n, k) in zip(names, bytes))
     sig = ReactantServer.ModelSignature(["x"], DataType[Float32], names, 1, ["y"], DataType[Float32], 1)
     exec = ReactantServer.MockExecutable(args -> [copy(args[1])], 1)
     b.scratch[exec] = scratch
-    lm = ReactantServer.LoadedModel(sig, Dict{Int, Any}(1 => exec), nothing, pinned, sum(kib) * _KiB, nothing)
+    lm = ReactantServer.LoadedModel(sig, Dict{Int, Any}(1 => exec), nothing, pinned, sum(bytes), nothing)
     return ReactantServer.ModelEntry(
         name, _batched_manifest(name), Dict{Int, Vector{UInt8}}(), "", FakeWeights(tensors), lm, nothing,
         identity, identity
@@ -285,8 +295,9 @@ end
 end
 
 @testset "admission: infeasible model is rejected without evicting anything" begin
-    b = FragBackend(16 * _KiB)
-    sched = _frag_scheduler(b, _frag_entry(b, "P"; kib = [10], pinned = true), _frag_entry(b, "A"; kib = [2]), _frag_entry(b, "big"; kib = [8]))
+    # 24 KiB rather than 16: under the split rule a 10 KiB pin would take all of a 16 KiB device.
+    b = FragBackend(24 * _KiB)
+    sched = _frag_scheduler(b, _frag_entry(b, "P"; kib = [10], pinned = true), _frag_entry(b, "A"; kib = [2]), _frag_entry(b, "big"; kib = [15]))
     _frag_load!(sched, "A")
     @test_throws ReactantServer.AdmissionError _frag_load!(sched, "big")
     @test _resident(sched, "A")
@@ -303,6 +314,24 @@ end
     @test _resident(sched, "B") && _resident(sched, "A")         # A, worth keeping, reloaded with B
     @test sched.weight_cache.fallback_compactions == 1
     @test isempty(setdiff(Set(keys(b.live)), Set(vcat(sched.registry.by_name["A"].executable.weights, sched.registry.by_name["B"].executable.weights))))
+end
+
+@testset "admission: a free block of exactly the weights' size is not enough under BFC's split rule" begin
+    # The residency stress suite's case at test scale: the first tensor splits the block, the
+    # second is too large to split the 6400-byte remainder and swallows it, and the third finds no
+    # room. Admission must see that and evict for contiguity rather than upload and fall back.
+    w = [3072, 3328, 3072]
+    b = FragBackend(8 * _KiB + sum(w) + 4 * _KiB + 2 * _KiB)
+    sched = _frag_scheduler(b, _frag_entry(b, "x"; kib = [8]), _frag_entry(b, "m"; bytes = w))
+    _frag_load!(sched, "x")                                      # x at 0..8 KiB
+    # A hole of exactly sum(w) after x, a 4 KiB block held by something else, then 2 KiB free:
+    # enough free bytes for m and its scratch, but no single block that holds m under the split rule.
+    b.free = [(8 * _KiB, sum(w)), (8 * _KiB + sum(w) + 4 * _KiB, 2 * _KiB)]
+    @test !ReactantServer.bfc_block_fits(sum(w), ReactantServer.model_footprint(sched.weight_cache, sched.registry.by_name["m"]).tensor_bytes)
+    _frag_load!(sched, "m")
+    @test _resident(sched, "m") && !_resident(sched, "x")       # x evicted so the hole coalesces
+    @test b.refusals == 0
+    @test sched.weight_cache.fallback_compactions == 0
 end
 
 @testset "admission: compaction cannot beat a pinned model splitting the device" begin

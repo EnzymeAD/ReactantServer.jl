@@ -248,7 +248,7 @@ end
     @test cfg.first_rebalance_compute_seconds == 60.0
     @test cfg.hysteresis == 0.0
     @test cfg.ema_halflife_compute_seconds == 0.0
-    @test cfg.compaction_mode == :on_demand
+    @test cfg.compaction_mode == :off
     @test cfg.compaction_interval == 1
     @test cfg.forbid_memory_oversubscription == true
     # 0 resolves to the rebalance interval (~50% decay per rebalance); a set value is honored.
@@ -307,7 +307,7 @@ end
         "info", "json", "lpt_packing", "compute", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr", "run",
         Dict{String, GW.GatewayModelConfig}(), 32, 64, mode, interval, false
     )
-    cfg = mk(:eager, 2)
+    cfg = mk(:lazy, 2)
     s = GW.LptPackingState(cfg)
     pool = GW.ClientPool(cfg)               # no workers; the ghost URL below is skipped (no network)
     moved = Set(["ghost:1"])
@@ -326,16 +326,27 @@ end
     GW._maybe_compact_fleet!(s, pool, nothing, moved)
     @test s.repacks_since_compact == 0      # first move after the interval fires and resets
 
-    # mode :off never counts or fires.
-    s_off = GW.LptPackingState(mk(:off, 2))
-    GW._maybe_compact_fleet!(s_off, GW.ClientPool(mk(:off, 2)), nothing, moved)
+    # mode :off (the default) leaves compaction to each worker's admission: never counts or fires.
+    s_off = GW.LptPackingState(mk(:off, 1))
+    GW._maybe_compact_fleet!(s_off, GW.ClientPool(mk(:off, 1)), nothing, moved)
     @test s_off.repacks_since_compact == 0
+end
 
-    # mode :on_demand (the default) leaves compaction to each worker's admission: no fan-out.
-    s_od = GW.LptPackingState(mk(:on_demand, 1))
-    GW._maybe_compact_fleet!(s_od, GW.ClientPool(mk(:on_demand, 1)), nothing, moved)
-    @test s_od.repacks_since_compact == 0
-    @test GW._parse_gateway_compaction_mode("on_demand") == :on_demand
+@testset "compaction_mode: off | lazy | preload; the 0.1 names fail with their replacement" begin
+    @test GW._parse_gateway_compaction_mode("off") == :off
+    @test GW._parse_gateway_compaction_mode("Lazy") == :lazy
+    @test GW._parse_gateway_compaction_mode("preload") == :preload
+    for (old, new) in ("on_demand" => "off", "eager" => "lazy", "scheduled" => "preload")
+        err = try
+            GW._parse_gateway_compaction_mode(old)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ReactantServerCore.ConfigError
+        @test occursin("renamed to '$new'", err.msg)
+    end
+    @test_throws ReactantServerCore.ConfigError GW._parse_gateway_compaction_mode("sometimes")
 end
 
 # Build a packing state directly for routing unit tests. Defaults to a single two-replica model
@@ -901,6 +912,43 @@ end
     close(srv)
 end
 
+@testset "invoke_infer: a call caught by reset_clients! fails over as UNAVAILABLE" begin
+    # reset_clients! shuts the worker's handle down and re-opens it. A ModelInfer in flight at that
+    # moment, or submitted while the handle is down, must come back retryable (UNAVAILABLE), never
+    # as an empty success or as the worker's FAILED_PRECONDITION shared-memory signal.
+    srv = Sockets.listen(Sockets.localhost, 0)
+    port = Int(Sockets.getsockname(srv)[2])
+    acceptor = @async try
+        while isopen(srv)
+            Sockets.accept(srv)   # accept and hold; never respond
+        end
+    catch
+    end
+    grpc = gRPCClient.gRPCCURL(; sticky = true)
+    client = gRPCClient.gRPCServiceClient{Vector{UInt8}, false, Vector{UInt8}, false}(
+        "127.0.0.1", port, "/inference.GRPCInferenceService/ModelInfer"; grpc = grpc, deadline = 10
+    )
+    wc = GW.WorkerClients("127.0.0.1:$port", grpc, client, client, client, client, client, client, client, client)
+    call() = try
+        GW.invoke_infer(wc, UInt8[0x0a, 0x01, 0x61])
+    catch e
+        e
+    end
+    unavailable(r) = r isa gRPCClient.gRPCServiceCallException &&
+        GW.client_status(r) == GW.STATUS_UNAVAILABLE
+
+    inflight = [@async(call()) for _ in 1:4]
+    sleep(0.5)
+    GW.reset_clients!(wc)
+    @test timedwait(() -> all(istaskdone, inflight), 5.0) == :ok
+    @test all(unavailable, fetch.(inflight))
+
+    gRPCClient.grpc_shutdown(grpc)            # the reset's window: the handle is down
+    @test unavailable(call())
+
+    close(srv)
+end
+
 @testset "_bounded: a probe that hits its deadline counts as hung, a refuse does not" begin
     # Since gRPCClient 1.1 a call on a stalled connection fails at its deadline instead of hanging
     # past the watchdog. If only the watchdog counted as a hang, the poisoned connection would never
@@ -1037,13 +1085,12 @@ end
     models = ["alpha", "beta"]
     w0 = AffMockWorker("worker0", copy(models))
     w1 = AffMockWorker("worker1", copy(models))
-    p0, p1 = grpc_free_port(), grpc_free_port()
-    s0 = _aff_server(p0, w0); gRPCServer.start!(s0)
-    s1 = _aff_server(p1, w1); gRPCServer.start!(s1)
+    s0 = _aff_server(0, w0); p0 = grpc_start_ephemeral!(s0)
+    s1 = _aff_server(0, w1); p1 = grpc_start_ephemeral!(s1)
 
-    gw_port, admin_port = grpc_free_port(), grpc_free_port()
-    gatewayfile = _aff_gatewayfile(gw_port, admin_port, [p0, p1])
+    gatewayfile = _aff_gatewayfile(0, 0, [p0, p1])
     gw = GW.serve_gateway(gatewayfile; blocking = false)
+    gw_port, admin_port = GW.bound_ports(gw)
     try
         # wait for routing
         routed = false
@@ -1155,28 +1202,25 @@ end
 
 @testset "lpt_packing gateway: startup hard-fail" begin
     models = ["alpha", "beta"]
-    gw_port, admin_port = grpc_free_port(), grpc_free_port()
 
     # A worker reporting fair discipline is rejected.
     wfair = AffMockWorker("worker0", copy(models); discipline = "fair")
-    pf = grpc_free_port()
-    sf = _aff_server(pf, wfair); gRPCServer.start!(sf)
-    f1 = _aff_gatewayfile(gw_port, admin_port, [pf])
+    sf = _aff_server(0, wfair); pf = grpc_start_ephemeral!(sf)
+    f1 = _aff_gatewayfile(0, 0, [pf])
     @test_throws ErrorException GW.serve_gateway(f1; blocking = false)
     close(sf)
 
     # Differing model sets are rejected.
     wa = AffMockWorker("worker0", ["alpha", "beta"])
     wb = AffMockWorker("worker1", ["alpha"])
-    pa, pb = grpc_free_port(), grpc_free_port()
-    sa = _aff_server(pa, wa); gRPCServer.start!(sa)
-    sb = _aff_server(pb, wb); gRPCServer.start!(sb)
-    f2 = _aff_gatewayfile(gw_port, admin_port, [pa, pb])
+    sa = _aff_server(0, wa); pa = grpc_start_ephemeral!(sa)
+    sb = _aff_server(0, wb); pb = grpc_start_ephemeral!(sb)
+    f2 = _aff_gatewayfile(0, 0, [pa, pb])
     @test_throws ErrorException GW.serve_gateway(f2; blocking = false)
     close(sa); close(sb)
 
     # An unreachable worker is rejected.
-    f3 = _aff_gatewayfile(gw_port, admin_port, [grpc_free_port()])
+    f3 = _aff_gatewayfile(0, 0, [grpc_free_port()])
     @test_throws ErrorException GW.serve_gateway(f3; blocking = false)
 
     rm(f1; force = true); rm(f2; force = true); rm(f3; force = true)
@@ -1192,13 +1236,12 @@ end
     # reported rows == requests could not tell the two apart.
     w0 = AffMockWorker("worker0", copy(models); rows_per_request = 4, batch_at = ("IN", 2))
     w1 = AffMockWorker("worker1", copy(models); rows_per_request = 4, batch_at = ("IN", 2))
-    p0, p1 = grpc_free_port(), grpc_free_port()
-    s0 = _aff_server(p0, w0); gRPCServer.start!(s0)
-    s1 = _aff_server(p1, w1); gRPCServer.start!(s1)
+    s0 = _aff_server(0, w0); p0 = grpc_start_ephemeral!(s0)
+    s1 = _aff_server(0, w1); p1 = grpc_start_ephemeral!(s1)
 
-    gw_port, admin_port = grpc_free_port(), grpc_free_port()
-    gatewayfile = _aff_gatewayfile(gw_port, admin_port, [p0, p1])
+    gatewayfile = _aff_gatewayfile(0, 0, [p0, p1])
     gw = GW.serve_gateway(gatewayfile; blocking = false)
+    gw_port, admin_port = GW.bound_ports(gw)
     try
         routed = false
         for _ in 1:40

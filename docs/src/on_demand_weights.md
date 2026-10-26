@@ -213,7 +213,10 @@ uploads because a refused device allocation is slow to discover: XLA's allocator
    without evicting anything.
 2. **Room for the weights.** Free memory must hold the weights plus the largest scratch any
    resident model needs, the largest free block must hold all of the weights, and the
-   on-demand byte budget must allow them. A byte shortfall evicts the cheapest *set* of
+   on-demand byte budget must allow them. "Hold" follows the allocator's split rule: it
+   splits a free block for a tensor only when the block is at least twice the tensor or
+   the remainder is at least 128 MiB, so a block of exactly the weights' size can be too
+   small. Admission replays that rule over the model's tensors in upload order. A byte shortfall evicts the cheapest *set* of
    models that covers it; a contiguity shortfall evicts the cheapest single model at a time.
 3. **Upload**, then **the scratch guarantee**: the largest free block must still hold the
    largest scratch of every resident model, the new one included, so every resident model
@@ -231,7 +234,9 @@ measured at 64 resident models it takes about 6 to 22 microseconds.
 Compaction (below) is the fallback when eviction alone cannot make room: the worker frees
 every evictable model, reloads the most valuable of them largest first together with the
 new model, and retries once; if that fails too the request fails with an admission error
-naming the reason. Device-pinned models never move, so a pinned model that splits the
+naming the reason. A former resident is reloaded only if the whole refill, replayed under
+the allocator's split rule, still leaves the scratch block free; one that fails to reload
+anyway stays evicted rather than failing the request. Device-pinned models never move, so a pinned model that splits the
 device can make a large model unplaceable; place pinned models with that in mind. Without
 device statistics (the CPU backend) only the byte budget applies.
 
@@ -253,8 +258,8 @@ scheduler:
 
 A load is what places a variable-size weight block on the device, so loads are what
 fragment the arena; a dispatch to an already-resident model does not, which is why the
-cadence counts loads rather than requests or time. The worker trigger is always eager: it
-frees the on-demand region and lets it refill lazily as requests arrive. It is **off by
+cadence counts loads rather than requests or time. The worker trigger always refills lazily:
+it frees the on-demand region and lets models come back as requests arrive. It is **off by
 default**, and a gateway-fronted worker should leave it off, so the gateway is the sole
 authority on compaction in a gateway deployment (next section). It is the
 `compaction_interval` field of [`SchedulerConfig`](@ref), also exposed as
@@ -272,24 +277,27 @@ worker loads it and the old worker's copy goes cold. Two settings under the gate
 ```yaml
 scheduling:
   mode: lpt_packing
-  compaction_mode: on_demand   # on_demand (default) | eager | off | scheduled
+  compaction_mode: off         # off (default) | lazy | preload
   compaction_interval: 1       # every placement-changing repack (see below)
 ```
 
-`compaction_mode` selects whether a repack compacts and what each affected worker reloads
-eagerly after the free:
+`compaction_mode` selects whether a repack compacts each worker whose placement changed,
+and what that worker reloads afterwards:
 
-- **`on_demand`** (the default) sends nothing on a repack. Each worker's admission evicts
-  only what a load needs and compacts by itself only when eviction cannot make a model fit.
-- **`eager`** frees the on-demand region on each worker whose placement changed and lets it
-  refill with live traffic. Models the worker no longer serves are dropped immediately; the
-  ones it still serves reload on their next request. This was the default before admission
-  existed, and stays available for one release.
-- **`off`** disables gateway-driven compaction.
-- **`scheduled`** also reloads the set of models the repack just assigned to that worker,
-  so the worker's new placement is warm right away instead of cold-loading on first
-  request. The gateway computes that per-worker list from the placement, which is why this
-  is a gateway concept.
+- **`off`** (the default) sends nothing on a repack. Each worker's admission evicts only
+  what a load needs and compacts by itself only when eviction cannot make a model fit.
+- **`lazy`** frees the worker's on-demand region and reloads nothing. Models the worker no
+  longer serves are dropped immediately; the ones it still serves reload on their next
+  request, so each pays its upload only if it is actually used.
+- **`preload`** frees the region and then immediately reloads the models the repack just
+  assigned to that worker, largest first, so the new placement is warm before traffic
+  arrives. The worker's queue waits once while that set uploads. The gateway computes the
+  per-worker list from the placement, which is why this is a gateway setting.
+
+Renamed in 0.2: `eager` is now `lazy`, `scheduled` is now `preload`, and `on_demand` is now
+`off` (they were the same behavior). The old names fail at startup with the replacement in
+the error; there is no alias, so update `gateway.yml` or
+`REACTANT_GATEWAY_SCHEDULING_COMPACTION_MODE` before upgrading.
 
 `compaction_interval` is the cadence in repacks (default `1`, so every placement-changing
 repack compacts). Because the demand signal is smoothed, most repacks recompute the same
@@ -305,17 +313,17 @@ a one-off fleet defragment.
 
 When every model fits on the GPU nothing churns, so compaction has no working set to defragment.
 When it does run it has a cost: freeing the on-demand region drops models
-that were warm, so they pay a host-to-device reload (lazily on next request for `eager`,
-or up front for `scheduled`).
+that were warm, so they pay a host-to-device reload (on next request for `lazy`, or up
+front for `preload`).
 
-The default, `on_demand`, compacts only when admission cannot otherwise place a model, so
-models that are still warm are not dropped on every placement change. Watch
+The default, `off`, compacts only when a worker's admission cannot otherwise place a model,
+so models that are still warm are not dropped on every placement change. Watch
 `worker_weight_fallback_compactions_total` for how often that happens and
-`worker_weight_admission_failures_total` for models that could not be placed at all. The
-older `eager` mode compacts every affected worker on every placement-changing repack
+`worker_weight_admission_failures_total` for models that could not be placed at all.
+`lazy` compacts every affected worker on every placement-changing repack
 (`compaction_interval: 1`), which pays a one-time reload on the first request per moved
-model; raise `compaction_interval` to fire it less often, or use `scheduled` to warm the
-new placement up front instead of lazily.
+model; raise `compaction_interval` to fire it less often, or use `preload` to warm the new
+placement up front instead.
 
 ## Observability
 
@@ -331,8 +339,9 @@ on-demand budget before and after, plus the largest free block and fragmentation
 after, and the weight cache tracks a `compactions` counter. Compare the before/after
 largest free block to confirm that compaction actually recovered contiguous space on your
 hardware: it relies on the allocator returning freed buffers to the arena and coalescing
-them, which the log lets you verify rather than assume. Models named for an eager reload
-are reloaded largest first, so the refill packs tightly instead of leaving gaps.
+them, which the log lets you verify rather than assume. Models named for reload (`preload`,
+or a `CompactMemory` reload list) are reloaded largest first, so the refill packs tightly
+instead of leaving gaps.
 
 With `JULIA_DEBUG=ReactantServer`, every on-demand load and eviction also logs a
 `memory: weight load` or `memory: weight evict` line with raw byte counts: the model's

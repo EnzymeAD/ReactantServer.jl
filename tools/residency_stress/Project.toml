@@ -1,0 +1,18 @@
+# Generator environment for the residency stress suite (gen_models.jl). The driver (stress.jl) runs
+# under packages/ReactantServerGateway instead, so it never loads Reactant.
+[deps]
+BFloat16s = "ab4f0b2a-ad5b-11e8-123f-65d77653426b"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+ReactantServerExport = "90fa0446-f028-4638-8833-e223884d9b4d"
+SafeTensors = "eeda0dda-7046-4914-a807-2495fc7abb89"
+TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
+
+[sources]
+ReactantServerExport = {path = "../../packages/ReactantServerExport"}
+
+[compat]
+BFloat16s = "0.6.1"
+Reactant = "0.2.287"
+SafeTensors = "1.2.1"
+julia = "1.12"

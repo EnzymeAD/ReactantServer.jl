@@ -388,7 +388,7 @@
     {
       "type": "timeseries",
       "title": "Weight loads / s",
-      "description": "On-demand weight loads (host->device) per worker. Routine: a load happens on any cold request and on every eager-compaction reload (compaction's free is NOT counted as an eviction). Spikes after a compaction flush are expected, not a problem.",
+      "description": "On-demand weight loads (host->device) per worker. Routine: a load happens on any cold request and on every model a compaction reloads, e.g. under compaction_mode: preload (compaction's free is NOT counted as an eviction). Spikes after a compaction flush are expected, not a problem.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -557,7 +557,7 @@
     {
       "type": "timeseries",
       "title": "Resident models per worker",
-      "description": "How many models are currently device-resident on each worker. Drops to 0 on an eager compaction flush, then climbs as traffic re-warms.",
+      "description": "How many models are currently device-resident on each worker. Drops to 0 when a compaction frees the worker's on-demand models, then climbs as traffic re-warms.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"

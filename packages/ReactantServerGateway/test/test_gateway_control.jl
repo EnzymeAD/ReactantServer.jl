@@ -77,17 +77,16 @@ end
     models = ["alpha", "beta"]
     w0 = AffMockWorker("worker0", copy(models))
     w1 = AffMockWorker("worker1", copy(models))
-    p0, p1 = grpc_free_port(), grpc_free_port()
-    s0 = _aff_server(p0, w0); gRPCServer.start!(s0)
-    s1 = _aff_server(p1, w1); gRPCServer.start!(s1)
+    s0 = _aff_server(0, w0); p0 = grpc_start_ephemeral!(s0)
+    s1 = _aff_server(0, w1); p1 = grpc_start_ephemeral!(s1)
 
-    gw_port, admin_port = grpc_free_port(), grpc_free_port()
-    gatewayfile = _aff_gatewayfile(gw_port, admin_port, [p0, p1])
+    gatewayfile = _aff_gatewayfile(0, 0, [p0, p1])
     # A short probe interval keeps the bounded-wait test fast: the prober is nudged awake by a forced
     # repack, and this bounds how long the nudge can take to be noticed.
     gw = withenv("REACTANT_GATEWAY_HEALTH_INTERVAL_SECONDS" => "0.2") do
         GW.serve_gateway(gatewayfile; blocking = false)
     end
+    gw_port, admin_port = GW.bound_ports(gw)
     try
         routed = false
         for _ in 1:40
@@ -375,15 +374,13 @@ end
 
 @testset "gateway control: the mutators require lpt_packing" begin
     w0 = AffMockWorker("worker0", ["alpha"])
-    p0 = grpc_free_port()
-    s0 = _aff_server(p0, w0); gRPCServer.start!(s0)
-    gw_port, admin_port = grpc_free_port(), grpc_free_port()
+    s0 = _aff_server(0, w0); p0 = grpc_start_ephemeral!(s0)
     path = tempname() * ".yaml"
     write(
         path, """
         listen:
-          grpc: "127.0.0.1:$gw_port"
-          metrics: "127.0.0.1:$admin_port"
+          grpc: "127.0.0.1:0"
+          metrics: "127.0.0.1:0"
         scheduling:
           mode: round_robin
         endpoints:
@@ -391,6 +388,7 @@ end
         """
     )
     gw = GW.serve_gateway(path; blocking = false)
+    gw_port, admin_port = GW.bound_ports(gw)
     try
         for _ in 1:40
             try

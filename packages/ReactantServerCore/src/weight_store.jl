@@ -485,7 +485,12 @@ function _acquire_region(store::SharedWeightStore, key, digest::UInt64, specs, f
                     end
                 end
                 shm = SharedMemory(name, total; perms = store.mode, volatile = false)
+                # A signal can interrupt a large reservation; tmpfs undoes the partial allocation and
+                # reports EINTR, so retry rather than mistake it for a full /dev/shm.
                 rc = _RESERVE_REGION[](name, total)
+                while rc == Libc.EINTR
+                    rc = _RESERVE_REGION[](name, total)
+                end
                 if rc != 0
                     finalize(shm)
                     _shm_unlink(name)

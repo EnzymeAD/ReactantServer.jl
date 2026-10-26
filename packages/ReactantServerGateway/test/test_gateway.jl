@@ -82,7 +82,10 @@ mutable struct MockWorker
     fail_infer::Bool
     fail_shm::Bool
     fail_exhausted::Bool        # shed ModelInfer with RESOURCE_EXHAUSTED (worker concurrency cap)
+    empty_infer::Bool           # answer ModelInfer with an empty body (a call aborted by a reset)
 end
+MockWorker(name, models, fail_infer, fail_shm, fail_exhausted) =
+    MockWorker(name, models, fail_infer, fail_shm, fail_exhausted, false)
 
 function _mock_server(worker::MockWorker)
     server = gRPCServer.GRPCServerHTTPJl("127.0.0.1", 1; context = worker)
@@ -100,6 +103,7 @@ function _mock_server(worker::MockWorker)
             w = ctx.payload
             w.fail_infer && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, "mock $(w.name) down"))
             w.fail_exhausted && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.RESOURCE_EXHAUSTED, "mock $(w.name) at capacity"))
+            w.empty_infer && return GWInf.ModelInferResponse()   # every field default: encodes to 0 bytes
             # A real worker NOT_FOUNDs a model it no longer serves; mirror that so the gateway's
             # unloaded-model handling (route refresh on worker NOT_FOUND) can be exercised.
             (req.model_name in w.models) ||
@@ -169,9 +173,6 @@ end
     # from each worker's RepositoryIndex rather than from any config.
     w0 = MockWorker("worker0", ["replicated", "only0"], false, false, false)
     w1 = MockWorker("worker1", ["replicated"], false, false, false)
-    gw_port = grpc_free_port()
-    admin_port = grpc_free_port()
-
     # OS-assigned worker ports: the mock binds an ephemeral port (no free-port race), and the
     # readiness poll above guarantees it is serving before the gateway starts.
     s0, p0 = _start_mock(w0)
@@ -181,8 +182,8 @@ end
     write(
         gatewayfile, """
         listen:
-          grpc: "127.0.0.1:$gw_port"
-          metrics: "127.0.0.1:$admin_port"
+          grpc: "127.0.0.1:0"
+          metrics: "127.0.0.1:0"
         endpoints:
           - "127.0.0.1:$p0"
           - "127.0.0.1:$p1"
@@ -190,6 +191,7 @@ end
     )
 
     gw = ReactantServerGateway.serve_gateway(gatewayfile; blocking = false)
+    gw_port, admin_port = ReactantServerGateway.bound_ports(gw)
 
     # Wait for the first discovery round to populate routes before asserting.
     routed = false
@@ -243,6 +245,24 @@ end
             end
             @test err isa gRPCClient.gRPCServiceCallException
             w0.fail_infer = false
+        end
+
+        @testset "an empty worker response fails over instead of passing as a success" begin
+            # gRPCClient before 1.1.2 completed a call aborted by reset_clients! with an empty body.
+            # A real worker always sets model_name, so the gateway treats empty as unavailable.
+            w0.empty_infer = true
+            for _ in 1:4
+                @test _infer(gw_port, "replicated").model_name == "worker1"
+            end
+            err = try
+                _infer(gw_port, "only0")
+                nothing
+            catch e
+                e
+            end
+            @test err isa gRPCClient.gRPCServiceCallException
+            @test err.grpc_status == gRPCClient.GRPC_UNAVAILABLE
+            w0.empty_infer = false
         end
 
         @testset "worker overload shed surfaces as RESOURCE_EXHAUSTED" begin
@@ -414,21 +434,20 @@ end
     @testset "aggregated /metrics endpoint" begin
         # Two fake workers serving pre-tagged expositions, one dead endpoint.
         function fake(text)
-            p = grpc_free_port()
-            s = HTTP.serve!("127.0.0.1", p) do req
+            s = HTTP.serve!("127.0.0.1", 0) do req
                 HTTP.Response(200; body = text)
             end
-            return s, "127.0.0.1:$p"
+            return s, "127.0.0.1:$(HTTP.port(s))"
         end
         s0, ep0 = fake("worker_models_loaded{worker=\"worker0\",gpu=\"0\"} 1\n")
         s1, ep1 = fake("worker_models_loaded{worker=\"worker1\",gpu=\"1\"} 1\n")
         dead = "127.0.0.1:$(grpc_free_port())"
-        admin_port = grpc_free_port()
         metrics = ReactantServerGateway.GatewayMetrics()
         admin = ReactantServerGateway.start_admin(
-            metrics, "127.0.0.1:$admin_port";
+            metrics, "127.0.0.1:0";
             worker_metrics = [ep0, ep1, dead]
         )
+        admin_port = HTTP.port(admin.server)
         try
             body = String(HTTP.get("http://127.0.0.1:$admin_port/metrics"; retry = false).body)
             @test occursin("worker_models_loaded{worker=\"worker0\",gpu=\"0\"} 1", body)

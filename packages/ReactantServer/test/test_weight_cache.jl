@@ -238,7 +238,7 @@ end
     end
 end
 
-@testset "compaction frees on-demand weights and leaves pinned in place (eager)" begin
+@testset "compaction frees on-demand weights and leaves pinned in place (lazy refill)" begin
     sched = _od_scheduler(
         _od_entry("P"; pinned = true, nbytes = _WBYTES),
         _od_entry("A"; pinned = false, nbytes = _WBYTES); budget = _WBYTES * 4
@@ -249,7 +249,7 @@ end
     a_bufs = A.weights; p_bufs = P.weights
     @test a_bufs !== nothing && p_bufs !== nothing
 
-    n = ReactantServer.compact!(sched.weight_cache, sched.registry)   # eager: free non-pinned only
+    n = ReactantServer.compact!(sched.weight_cache, sched.registry)   # no reload list: free non-pinned only
     @test n == 0                                         # nothing eagerly reloaded
     @test all(b -> b.freed, a_bufs)                      # on-demand A's device buffers freed
     @test A.weights === nothing                          # ...and left freed (reloads lazily)
@@ -307,7 +307,7 @@ end
 
     _dispatch1!(sched, "B")                              # loads = 2
     ReactantServer._maybe_compact!(sched)
-    @test sched.weight_cache.compactions == 1            # loads advanced by the interval -> compacted (eager)
+    @test sched.weight_cache.compactions == 1            # loads advanced by the interval -> compacted (lazy refill)
     @test sched.registry.by_name["A"].executable.weights === nothing
     @test sched.registry.by_name["B"].executable.weights === nothing
     @test sched.weight_cache.resident_bytes == 0
@@ -332,7 +332,7 @@ end
 
         p_bufs = sched.registry.by_name["P"].executable.weights
         resp = ReactantServer._handle_compact_memory(ctx, _Ctl.CompactMemoryRequest())
-        @test resp.reloaded_models == 0                  # eager: nothing eagerly reloaded
+        @test resp.reloaded_models == 0                  # no reload list: nothing reloaded
         @test sched.registry.by_name["A"].executable.weights === nothing   # on-demand A freed (lazy reload)
         @test sched.registry.by_name["P"].executable.weights === p_bufs    # pinned P untouched
     finally
@@ -463,6 +463,20 @@ end
     @test fp.weight_bytes == 256 + 256 + 512            # every tensor rounds up to the 256-byte granule
     @test fp.max_weight_bytes == 512
     @test ReactantServer.weight_footprint(Int[]) == (weight_bytes = 0, max_weight_bytes = 0)
+    # BFC's split rule: measured on an A6000, three f32 tensors (34928640, 34952704 and 34952192
+    # bytes rounded) failed to upload into a free block of exactly their sum, after a 10 s wait.
+    sizes = [34928640, 34952704, 34952192]
+    @test !ReactantServer.bfc_block_fits(sum(sizes), sizes)
+    @test ReactantServer.bfc_block_fits(sum(sizes) + 34952704, sizes)
+    @test ReactantServer.bfc_block_fits(1 << 30, fill(300 << 20, 3))   # 128 MiB remainders split
+    @test !ReactantServer.bfc_block_fits(1000, [1001])
+    @test ReactantServer.bfc_block_fits(0, Int[])
+    # bfc_place returns what is left, so models uploaded into one chunk in turn chain
+    @test ReactantServer.bfc_place(1000, [400]) == 600
+    @test ReactantServer.bfc_place(1000, [600]) == 0                     # 400 left < 600: whole chunk
+    @test ReactantServer.bfc_place(1000, [600, 1]) === nothing
+    @test ReactantServer.bfc_place(ReactantServer.bfc_place(1 << 30, fill(300 << 20, 2)), [300 << 20]) ==
+        ReactantServer.bfc_place(1 << 30, fill(300 << 20, 3))
 
     @test ReactantServer.fragmentation(nothing) === nothing
     @test ReactantServer.fragmentation((in_use = 0, limit = 100, free = 100)) === nothing   # no largest_free

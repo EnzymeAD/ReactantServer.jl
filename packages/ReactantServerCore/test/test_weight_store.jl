@@ -90,6 +90,19 @@ end
         finally
             ReactantServerCore._RESERVE_REGION[] = saved
         end
+        # An interrupted reservation (EINTR = 4) is retried, not reported as a full store.
+        calls = Ref(0)
+        ReactantServerCore._RESERVE_REGION[] = (name, bytes) -> (calls[] += 1; calls[] <= 2 ? Cint(Libc.EINTR) : saved(name, bytes))
+        try
+            store = SharedWeightStore()
+            arrs = materialize_host_weights!(store, key, dg, specs, a -> (a[1] .= 3.0f0))
+            @test arrs[1] == fill(3.0f0, 4)
+            @test calls[] == 3
+            arrs = nothing
+            release_host_weights!(store, key)
+        finally
+            ReactantServerCore._RESERVE_REGION[] = saved
+        end
         # The real reservation succeeds for a normal region.
         store = SharedWeightStore()
         arrs = materialize_host_weights!(store, key, dg, specs, a -> (a[1] .= 7.0f0))

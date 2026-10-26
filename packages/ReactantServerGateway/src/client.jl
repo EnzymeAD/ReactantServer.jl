@@ -127,9 +127,20 @@ end
 # `deadline` (seconds, or nothing) overrides the worker client's default per-call timeout so the
 # gateway can forward the request's REMAINING budget as grpc-timeout — decrementing it for the time
 # already spent reaching the gateway, rather than granting the worker a fresh full budget.
+#
+# Submission and await are kept apart because what each throws means different things. Submission
+# fails only on this gateway's own handle: before gRPCClient 1.2 a handle shut down by
+# `reset_clients!` (a worker probe hit its deadline) raises FAILED_PRECONDITION, which must fail
+# over like any other unavailable worker, not reach the client as the worker's stale
+# shared-memory signal. A worker's own statuses only ever come from await.
 function invoke_infer(wc::WorkerClients, body::Vector{UInt8}; deadline::Union{Real, Nothing} = nothing)
-    deadline === nothing && return gRPCClient.grpc_sync_request(wc.infer, body)
-    req = gRPCClient.grpc_async_request(wc.infer, body; deadline = deadline)
+    req = try
+        deadline === nothing ? gRPCClient.grpc_async_request(wc.infer, body) :
+            gRPCClient.grpc_async_request(wc.infer, body; deadline = deadline)
+    catch e
+        (e isa gRPCClient.gRPCServiceCallException && e.grpc_status == gRPCClient.GRPC_FAILED_PRECONDITION) || rethrow()
+        throw(gRPCClient.gRPCServiceCallException(gRPCClient.GRPC_UNAVAILABLE, e.message))
+    end
     return gRPCClient.grpc_async_await(wc.infer, req)
 end
 invoke_shm_register(wc::WorkerClients, body::Vector{UInt8}) = gRPCClient.grpc_sync_request(wc.shm_register, body)

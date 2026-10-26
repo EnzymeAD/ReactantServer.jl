@@ -73,7 +73,7 @@ scheduling:
   routing_fill_mode: run        # run (default) | spread | inflight  (what the quantum counts;
                                 #   `inflight` can park a model on one GPU, see the warning below)
   forbid_memory_oversubscription: true # never strand a model on-demand when it could fit resident (default on)
-  compaction_mode: on_demand    # on_demand (default) | eager | off | scheduled  (see On-demand Weights)
+  compaction_mode: off          # off (default) | lazy | preload  (see On-demand Weights)
   compaction_interval: 1        # repacks between compactions; 0 disables  (see On-demand Weights)
   models:
     big-model:
