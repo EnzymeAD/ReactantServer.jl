@@ -471,6 +471,12 @@ end
     @test ReactantServer.bfc_block_fits(1 << 30, fill(300 << 20, 3))   # 128 MiB remainders split
     @test !ReactantServer.bfc_block_fits(1000, [1001])
     @test ReactantServer.bfc_block_fits(0, Int[])
+    # bfc_place returns what is left, so models uploaded into one chunk in turn chain
+    @test ReactantServer.bfc_place(1000, [400]) == 600
+    @test ReactantServer.bfc_place(1000, [600]) == 0                     # 400 left < 600: whole chunk
+    @test ReactantServer.bfc_place(1000, [600, 1]) === nothing
+    @test ReactantServer.bfc_place(ReactantServer.bfc_place(1 << 30, fill(300 << 20, 2)), [300 << 20]) ==
+        ReactantServer.bfc_place(1 << 30, fill(300 << 20, 3))
 
     @test ReactantServer.fragmentation(nothing) === nothing
     @test ReactantServer.fragmentation((in_use = 0, limit = 100, free = 100)) === nothing   # no largest_free

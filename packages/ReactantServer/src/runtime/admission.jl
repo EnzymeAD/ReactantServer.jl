@@ -22,7 +22,8 @@
 #      model, m included, so every resident model can still run. Evict until it does.
 #
 # When eviction runs out of candidates, compaction is the fallback (`_compact_and_retry!`):
-# free every evictable model, reload the ones worth keeping largest first with m, retry once.
+# free every evictable model, reload the ones worth keeping largest first with m (as many as the
+# split rule says fit), retry once.
 #
 # The pinned set is m plus the device-pinned models. Executions are synchronous on the dispatch
 # thread, which also runs admission, so no other model can have an execution in flight here.
@@ -246,6 +247,17 @@ function admit_weights!(cache::WeightCache, entry::ModelEntry)
     return
 end
 
+# The bytes left in a free chunk of `block` bytes after uploading `entries` into it in order, under
+# BFC's split rule, or `nothing` if they do not all fit.
+function _reload_left(cache::WeightCache, block::Integer, entries)
+    left = Int(block)
+    for e in entries
+        left = bfc_place(left, cache.footprints[e.name].tensor_bytes)
+        left === nothing && return nothing
+    end
+    return left
+end
+
 # The fallback: free every evictable model (and `entry` if it got uploaded), then reload the most
 # valuable of the previously resident models that fit alongside `entry`, largest first so the
 # refill packs tightly, and check that the weights and the scratch block both fit. Runs at most
@@ -269,25 +281,40 @@ function _compact_and_retry!(cache::WeightCache, entry::ModelEntry)
     scratch = _scratch_need(cache, fp)
     room = stats.free - fp.weight_bytes - scratch
     budget = cache.max_bytes - entry.executable.nbytes
+    # Bytes alone over-commit: BFC can hand a tensor a whole chunk (`bfc_block_fits`), and an upload
+    # it refuses costs a 10 s allocator retry. So a former resident is kept only if the whole reload,
+    # simulated into the largest free block in upload order (largest first), still leaves the scratch
+    # block. Other free chunks can only add room, so `entry` fits whenever the simulation does.
+    lf = largest_free_bytes(stats)
+    by_size = e -> cache.footprints[e.name].weight_bytes
     reload = ModelEntry[entry]
     for name in keep
         e = cache.registry.by_name[name]
         f = cache.footprints[name]
         extra = max(0, _scratch_of(cache, f) - scratch)    # a larger scratch block it would need
         (f.weight_bytes + extra <= room && e.executable.nbytes <= budget) || continue
+        if lf !== nothing
+            left = _reload_left(cache, lf, sort!(push!(copy(reload), e); by = by_size, rev = true))
+            (left !== nothing && left >= scratch + extra) || continue
+        end
         push!(reload, e)
         room -= f.weight_bytes + extra
         budget -= e.executable.nbytes
         scratch += extra
     end
-    sort!(reload; by = e -> cache.footprints[e.name].weight_bytes, rev = true)
+    sort!(reload; by = by_size, rev = true)
     for e in reload
         try
             _upload_commit!(cache, e; fresh = e === entry)
         catch err
-            cache.admission_failures += 1
             report = memory_report(cache.backend, cache.pool; registry = cache.registry, weight_cache = cache)
-            @error "admission: reload after compaction failed" model = entry.name reloading = e.name memory = report exception = err
+            if e !== entry
+                # `entry` is resident; a former resident that does not fit just stays evicted.
+                @warn "admission: reload of a former resident after compaction failed" model = entry.name reloading = e.name memory = report exception = err
+                continue
+            end
+            cache.admission_failures += 1
+            @error "admission: reload after compaction failed" model = entry.name memory = report exception = err
             throw(AdmissionError(entry.name, "upload failed after compaction ($(report))"))
         end
     end

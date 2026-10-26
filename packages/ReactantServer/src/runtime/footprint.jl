@@ -84,13 +84,22 @@ of `block` bytes under the BFC allocator's split rule (see `BFC_MAX_INTERNAL_FRA
 Other free chunks can only help (best fit uses the smallest chunk that fits), so this is a
 sufficient condition for an upload to succeed.
 """
-function bfc_block_fits(block::Integer, sizes)
+bfc_block_fits(block::Integer, sizes) = bfc_place(block, sizes) !== nothing
+
+"""
+    bfc_place(block, sizes) -> Union{Int, Nothing}
+
+The bytes left in a free chunk of `block` bytes after allocating `sizes` into it under the BFC split
+rule, or `nothing` if they do not all fit. The result is monotone in `block`, so chaining calls
+simulates several models uploaded into one chunk in turn.
+"""
+function bfc_place(block::Integer, sizes)
     rem = Int(block)
     for r in sizes
-        rem >= r || return false
+        rem >= r || return nothing
         rem = (rem >= 2r || rem - r >= BFC_MAX_INTERNAL_FRAGMENTATION) ? rem - r : 0
     end
-    return true
+    return rem
 end
 
 """

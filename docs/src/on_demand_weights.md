@@ -213,7 +213,10 @@ uploads because a refused device allocation is slow to discover: XLA's allocator
    without evicting anything.
 2. **Room for the weights.** Free memory must hold the weights plus the largest scratch any
    resident model needs, the largest free block must hold all of the weights, and the
-   on-demand byte budget must allow them. A byte shortfall evicts the cheapest *set* of
+   on-demand byte budget must allow them. "Hold" follows the allocator's split rule: it
+   splits a free block for a tensor only when the block is at least twice the tensor or
+   the remainder is at least 128 MiB, so a block of exactly the weights' size can be too
+   small. Admission replays that rule over the model's tensors in upload order. A byte shortfall evicts the cheapest *set* of
    models that covers it; a contiguity shortfall evicts the cheapest single model at a time.
 3. **Upload**, then **the scratch guarantee**: the largest free block must still hold the
    largest scratch of every resident model, the new one included, so every resident model
@@ -231,7 +234,9 @@ measured at 64 resident models it takes about 6 to 22 microseconds.
 Compaction (below) is the fallback when eviction alone cannot make room: the worker frees
 every evictable model, reloads the most valuable of them largest first together with the
 new model, and retries once; if that fails too the request fails with an admission error
-naming the reason. Device-pinned models never move, so a pinned model that splits the
+naming the reason. A former resident is reloaded only if the whole refill, replayed under
+the allocator's split rule, still leaves the scratch block free; one that fails to reload
+anyway stays evicted rather than failing the request. Device-pinned models never move, so a pinned model that splits the
 device can make a large model unplaceable; place pinned models with that in mind. Without
 device statistics (the CPU backend) only the byte budget applies.
 
