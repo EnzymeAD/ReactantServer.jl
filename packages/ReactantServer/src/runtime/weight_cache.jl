@@ -222,6 +222,16 @@ function acquire!(cache::WeightCache, entry::ModelEntry)
     return nothing
 end
 
+# Load a model only to measure it (the startup scratch probe, which frees it again). Counted as a
+# load like any other, and also as a probe load, so it is not mistaken for the model's first load
+# in service (see `_note_disk_load!`).
+function probe_acquire!(cache::WeightCache, entry::ModelEntry)
+    acquire!(cache, entry)
+    fp = model_footprint(cache, entry)
+    lock(() -> fp.probe_loads += 1, cache.lock)
+    return nothing
+end
+
 # Upload a model's weights and commit residency. Used by admission for both a fresh admission
 # (`fresh = true`: its eviction priority starts over) and a fallback-compaction reload (`fresh =
 # false`: it keeps the priority it had earned). On a failed transfer the partial upload has

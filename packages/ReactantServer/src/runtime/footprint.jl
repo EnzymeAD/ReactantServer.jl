@@ -23,6 +23,7 @@ mutable struct ModelFootprint
     scratch_bytes::Int          # S: transient bytes of the largest compiled batch (0 = unmeasured)
     load_seconds::Float64       # moving average of measured on-demand load time (0.0 = never loaded)
     loads::Int
+    probe_loads::Int            # of `loads`, those made only to measure the model at startup
     # Eviction policy state (GreedyDual-Size-Frequency, see admission.jl), for the current residency.
     hits::Int                   # dispatches since the weights were last loaded
     priority::Float64           # H: inflation at last use + hits * reload seconds / weight bytes
@@ -66,7 +67,7 @@ function _new_footprint(entry::ModelEntry, model::LoadedModel)
     w = sizes === nothing ? (weight_bytes = model.nbytes, max_weight_bytes = model.nbytes) :
         weight_footprint(sizes)
     tensors = sizes === nothing ? Int[model.nbytes] : Int[_alloc_rounded(n) for n in sizes]
-    return ModelFootprint(model, w.weight_bytes, w.max_weight_bytes, 0, 0.0, 0, 0, 0.0, 0.0, tensors)
+    return ModelFootprint(model, w.weight_bytes, w.max_weight_bytes, 0, 0.0, 0, 0, 0, 0.0, 0.0, tensors)
 end
 
 # XLA's BFC allocator splits a free chunk for a request only when the chunk is at least twice the

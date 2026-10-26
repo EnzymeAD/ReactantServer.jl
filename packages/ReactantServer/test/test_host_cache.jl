@@ -171,6 +171,20 @@ end
     @test_logs _served(sched, "A")
 end
 
+@testset "the startup probe's loads do not make a model's first load in service warn" begin
+    sched = _hc_scheduler("A", "B"; host_budget = 0)
+    wc = sched.weight_cache
+    for name in ("A", "B")                                      # the probe: load, measure, free
+        ReactantServer._free_nonpinned!(wc)
+        ReactantServer.probe_acquire!(wc, sched.registry.by_name[name])
+    end
+    ReactantServer._free_nonpinned!(wc)
+    wc.serving = true
+    @test_logs _served(sched, "A")                              # first load in service: silent
+    @test_logs _served(sched, "B")
+    @test_logs (:warn, r"reloaded from disk") _served(sched, "A")
+end
+
 @testset "startup fills the device with the on-demand models that fit, largest first" begin
     sched = _hc_scheduler("A", "B", "C"; device_models = 2, host_budget = 0)
     wc = sched.weight_cache
