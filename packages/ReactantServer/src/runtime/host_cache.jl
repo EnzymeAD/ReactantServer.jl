@@ -176,10 +176,13 @@ end
 # Warn, once per model per process, when a model that has been on the device before is reloaded
 # from its weights file after startup: with no host copy, every reload reads the disk, far slower
 # than a copy from RAM, and an operator seeing slow hot swaps should learn why from the log. A
-# model's first load (startup, or a model the watcher just added) is expected and not warned.
+# model's first load (startup, or a model the watcher just added) is expected and not warned. The
+# startup scratch probe's loads do not count: the probe frees each model again, so a model's first
+# load in service is still its first, even when the probe pushed its host copy out of the budget.
 function _note_disk_load!(cache::WeightCache, entry::ModelEntry)
     cache.serving || return nothing
-    model_footprint(cache, entry).loads > 0 || return nothing
+    fp = model_footprint(cache, entry)
+    fp.loads > fp.probe_loads || return nothing
     fresh = lock(cache.lock) do
         entry.name in cache.disk_warned && return false
         push!(cache.disk_warned, entry.name)

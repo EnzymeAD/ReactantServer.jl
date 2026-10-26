@@ -662,7 +662,7 @@ function _probe_max_scratch!(s::Scheduler, pinned_bytes::Int)
         if !is_device_pinned(model)
             _free_nonpinned!(s.weight_cache)                     # isolate: only pinned + M will be resident
             try
-                acquire!(s.weight_cache, entry)
+                probe_acquire!(s.weight_cache, entry)
             catch err
                 err isa NotResidentError && continue             # externally-managed: cannot load to measure
                 rethrow()
