@@ -82,7 +82,10 @@ mutable struct MockWorker
     fail_infer::Bool
     fail_shm::Bool
     fail_exhausted::Bool        # shed ModelInfer with RESOURCE_EXHAUSTED (worker concurrency cap)
+    empty_infer::Bool           # answer ModelInfer with an empty body (a call aborted by a reset)
 end
+MockWorker(name, models, fail_infer, fail_shm, fail_exhausted) =
+    MockWorker(name, models, fail_infer, fail_shm, fail_exhausted, false)
 
 function _mock_server(worker::MockWorker)
     server = gRPCServer.GRPCServerHTTPJl("127.0.0.1", 1; context = worker)
@@ -100,6 +103,7 @@ function _mock_server(worker::MockWorker)
             w = ctx.payload
             w.fail_infer && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, "mock $(w.name) down"))
             w.fail_exhausted && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.RESOURCE_EXHAUSTED, "mock $(w.name) at capacity"))
+            w.empty_infer && return GWInf.ModelInferResponse()   # every field default: encodes to 0 bytes
             # A real worker NOT_FOUNDs a model it no longer serves; mirror that so the gateway's
             # unloaded-model handling (route refresh on worker NOT_FOUND) can be exercised.
             (req.model_name in w.models) ||
@@ -243,6 +247,24 @@ end
             end
             @test err isa gRPCClient.gRPCServiceCallException
             w0.fail_infer = false
+        end
+
+        @testset "an empty worker response fails over instead of passing as a success" begin
+            # gRPCClient before 1.1.2 completed a call aborted by reset_clients! with an empty body.
+            # A real worker always sets model_name, so the gateway treats empty as unavailable.
+            w0.empty_infer = true
+            for _ in 1:4
+                @test _infer(gw_port, "replicated").model_name == "worker1"
+            end
+            err = try
+                _infer(gw_port, "only0")
+                nothing
+            catch e
+                e
+            end
+            @test err isa gRPCClient.gRPCServiceCallException
+            @test err.grpc_status == gRPCClient.GRPC_UNAVAILABLE
+            w0.empty_infer = false
         end
 
         @testset "worker overload shed surfaces as RESOURCE_EXHAUSTED" begin

@@ -901,6 +901,43 @@ end
     close(srv)
 end
 
+@testset "invoke_infer: a call caught by reset_clients! fails over as UNAVAILABLE" begin
+    # reset_clients! shuts the worker's handle down and re-opens it. A ModelInfer in flight at that
+    # moment, or submitted while the handle is down, must come back retryable (UNAVAILABLE), never
+    # as an empty success or as the worker's FAILED_PRECONDITION shared-memory signal.
+    srv = Sockets.listen(Sockets.localhost, 0)
+    port = Int(Sockets.getsockname(srv)[2])
+    acceptor = @async try
+        while isopen(srv)
+            Sockets.accept(srv)   # accept and hold; never respond
+        end
+    catch
+    end
+    grpc = gRPCClient.gRPCCURL(; sticky = true)
+    client = gRPCClient.gRPCServiceClient{Vector{UInt8}, false, Vector{UInt8}, false}(
+        "127.0.0.1", port, "/inference.GRPCInferenceService/ModelInfer"; grpc = grpc, deadline = 10
+    )
+    wc = GW.WorkerClients("127.0.0.1:$port", grpc, client, client, client, client, client, client, client, client)
+    call() = try
+        GW.invoke_infer(wc, UInt8[0x0a, 0x01, 0x61])
+    catch e
+        e
+    end
+    unavailable(r) = r isa gRPCClient.gRPCServiceCallException &&
+        GW.client_status(r) == GW.STATUS_UNAVAILABLE
+
+    inflight = [@async(call()) for _ in 1:4]
+    sleep(0.5)
+    GW.reset_clients!(wc)
+    @test timedwait(() -> all(istaskdone, inflight), 5.0) == :ok
+    @test all(unavailable, fetch.(inflight))
+
+    gRPCClient.grpc_shutdown(grpc)            # the reset's window: the handle is down
+    @test unavailable(call())
+
+    close(srv)
+end
+
 @testset "_bounded: a probe that hits its deadline counts as hung, a refuse does not" begin
     # Since gRPCClient 1.1 a call on a stalled connection fails at its deadline instead of hanging
     # past the watchdog. If only the watchdog counted as a hang, the poisoned connection would never
