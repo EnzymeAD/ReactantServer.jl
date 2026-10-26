@@ -1085,13 +1085,12 @@ end
     models = ["alpha", "beta"]
     w0 = AffMockWorker("worker0", copy(models))
     w1 = AffMockWorker("worker1", copy(models))
-    p0, p1 = grpc_free_port(), grpc_free_port()
-    s0 = _aff_server(p0, w0); gRPCServer.start!(s0)
-    s1 = _aff_server(p1, w1); gRPCServer.start!(s1)
+    s0 = _aff_server(0, w0); p0 = grpc_start_ephemeral!(s0)
+    s1 = _aff_server(0, w1); p1 = grpc_start_ephemeral!(s1)
 
-    gw_port, admin_port = grpc_free_port(), grpc_free_port()
-    gatewayfile = _aff_gatewayfile(gw_port, admin_port, [p0, p1])
+    gatewayfile = _aff_gatewayfile(0, 0, [p0, p1])
     gw = GW.serve_gateway(gatewayfile; blocking = false)
+    gw_port, admin_port = GW.bound_ports(gw)
     try
         # wait for routing
         routed = false
@@ -1203,28 +1202,25 @@ end
 
 @testset "lpt_packing gateway: startup hard-fail" begin
     models = ["alpha", "beta"]
-    gw_port, admin_port = grpc_free_port(), grpc_free_port()
 
     # A worker reporting fair discipline is rejected.
     wfair = AffMockWorker("worker0", copy(models); discipline = "fair")
-    pf = grpc_free_port()
-    sf = _aff_server(pf, wfair); gRPCServer.start!(sf)
-    f1 = _aff_gatewayfile(gw_port, admin_port, [pf])
+    sf = _aff_server(0, wfair); pf = grpc_start_ephemeral!(sf)
+    f1 = _aff_gatewayfile(0, 0, [pf])
     @test_throws ErrorException GW.serve_gateway(f1; blocking = false)
     close(sf)
 
     # Differing model sets are rejected.
     wa = AffMockWorker("worker0", ["alpha", "beta"])
     wb = AffMockWorker("worker1", ["alpha"])
-    pa, pb = grpc_free_port(), grpc_free_port()
-    sa = _aff_server(pa, wa); gRPCServer.start!(sa)
-    sb = _aff_server(pb, wb); gRPCServer.start!(sb)
-    f2 = _aff_gatewayfile(gw_port, admin_port, [pa, pb])
+    sa = _aff_server(0, wa); pa = grpc_start_ephemeral!(sa)
+    sb = _aff_server(0, wb); pb = grpc_start_ephemeral!(sb)
+    f2 = _aff_gatewayfile(0, 0, [pa, pb])
     @test_throws ErrorException GW.serve_gateway(f2; blocking = false)
     close(sa); close(sb)
 
     # An unreachable worker is rejected.
-    f3 = _aff_gatewayfile(gw_port, admin_port, [grpc_free_port()])
+    f3 = _aff_gatewayfile(0, 0, [grpc_free_port()])
     @test_throws ErrorException GW.serve_gateway(f3; blocking = false)
 
     rm(f1; force = true); rm(f2; force = true); rm(f3; force = true)
@@ -1240,13 +1236,12 @@ end
     # reported rows == requests could not tell the two apart.
     w0 = AffMockWorker("worker0", copy(models); rows_per_request = 4, batch_at = ("IN", 2))
     w1 = AffMockWorker("worker1", copy(models); rows_per_request = 4, batch_at = ("IN", 2))
-    p0, p1 = grpc_free_port(), grpc_free_port()
-    s0 = _aff_server(p0, w0); gRPCServer.start!(s0)
-    s1 = _aff_server(p1, w1); gRPCServer.start!(s1)
+    s0 = _aff_server(0, w0); p0 = grpc_start_ephemeral!(s0)
+    s1 = _aff_server(0, w1); p1 = grpc_start_ephemeral!(s1)
 
-    gw_port, admin_port = grpc_free_port(), grpc_free_port()
-    gatewayfile = _aff_gatewayfile(gw_port, admin_port, [p0, p1])
+    gatewayfile = _aff_gatewayfile(0, 0, [p0, p1])
     gw = GW.serve_gateway(gatewayfile; blocking = false)
+    gw_port, admin_port = GW.bound_ports(gw)
     try
         routed = false
         for _ in 1:40

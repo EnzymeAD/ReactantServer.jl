@@ -173,9 +173,6 @@ end
     # from each worker's RepositoryIndex rather than from any config.
     w0 = MockWorker("worker0", ["replicated", "only0"], false, false, false)
     w1 = MockWorker("worker1", ["replicated"], false, false, false)
-    gw_port = grpc_free_port()
-    admin_port = grpc_free_port()
-
     # OS-assigned worker ports: the mock binds an ephemeral port (no free-port race), and the
     # readiness poll above guarantees it is serving before the gateway starts.
     s0, p0 = _start_mock(w0)
@@ -185,8 +182,8 @@ end
     write(
         gatewayfile, """
         listen:
-          grpc: "127.0.0.1:$gw_port"
-          metrics: "127.0.0.1:$admin_port"
+          grpc: "127.0.0.1:0"
+          metrics: "127.0.0.1:0"
         endpoints:
           - "127.0.0.1:$p0"
           - "127.0.0.1:$p1"
@@ -194,6 +191,7 @@ end
     )
 
     gw = ReactantServerGateway.serve_gateway(gatewayfile; blocking = false)
+    gw_port, admin_port = ReactantServerGateway.bound_ports(gw)
 
     # Wait for the first discovery round to populate routes before asserting.
     routed = false
@@ -436,21 +434,20 @@ end
     @testset "aggregated /metrics endpoint" begin
         # Two fake workers serving pre-tagged expositions, one dead endpoint.
         function fake(text)
-            p = grpc_free_port()
-            s = HTTP.serve!("127.0.0.1", p) do req
+            s = HTTP.serve!("127.0.0.1", 0) do req
                 HTTP.Response(200; body = text)
             end
-            return s, "127.0.0.1:$p"
+            return s, "127.0.0.1:$(HTTP.port(s))"
         end
         s0, ep0 = fake("worker_models_loaded{worker=\"worker0\",gpu=\"0\"} 1\n")
         s1, ep1 = fake("worker_models_loaded{worker=\"worker1\",gpu=\"1\"} 1\n")
         dead = "127.0.0.1:$(grpc_free_port())"
-        admin_port = grpc_free_port()
         metrics = ReactantServerGateway.GatewayMetrics()
         admin = ReactantServerGateway.start_admin(
-            metrics, "127.0.0.1:$admin_port";
+            metrics, "127.0.0.1:0";
             worker_metrics = [ep0, ep1, dead]
         )
+        admin_port = HTTP.port(admin.server)
         try
             body = String(HTTP.get("http://127.0.0.1:$admin_port/metrics"; retry = false).body)
             @test occursin("worker_models_loaded{worker=\"worker0\",gpu=\"0\"} 1", body)

@@ -81,6 +81,15 @@ struct RunningGateway{S}
     server::S          # the gRPC server handle (GRPCServer)
 end
 
+"""
+    bound_ports(g::RunningGateway) -> (; grpc, metrics)
+
+The ports a running gateway is listening on. Configure a listen address with port 0
+(`127.0.0.1:0`) to have the OS pick a free one, then read the actual ports back here.
+"""
+bound_ports(g::RunningGateway) =
+    (grpc = something(gRPCServer.bound_port(g.server)), metrics = HTTP.port(g.admin.server))
+
 # HTTP/2 receive flow-control windows the gateway advertises to its clients. The protocol default
 # is only 64 KiB per stream and per connection, which throttles a large inline-tensor *upload*
 # (the client's inference request) to ~window/RTT. Match the gRPC client (libcurl), which
