@@ -4,19 +4,27 @@
 # rendered before it merges. No Node is involved: the build is pure Julia
 # (Documenter + the DocumenterLandingPage and DocumenterCodeBlocks plugins).
 #
-# Tag pushes build only for ReactantServer-vX.Y.Z, which deploys that release's
-# docs as vX.Y.Z and moves `stable` (see deploydocs in docs/make.jl). The other
-# subpackages' tags do not build: TagBot tags each one at the commit the General
-# registry references, which need not sit on main (ReactantServerExport-v1.0.0
-# landed on an orphaned feature branch commit whose tree could not resolve the
-# docs environment). ReactantServer is released last in each round, from main.
+# A release's docs are not built from the tag push. .github/workflows/image.yml
+# calls this workflow once it has pushed the ReactantServer-vX.Y.Z image, still on
+# the tag ref, so deploydocs deploys them as vX.Y.Z and moves `stable` (see
+# docs/make.jl), and passes the pushed digest so the release's own page is
+# complete (see docs/releases.jl). The other subpackages' tags do not build:
+# TagBot tags each one at the commit the General registry references, which need
+# not sit on main (ReactantServerExport-v1.0.0 landed on an orphaned feature
+# branch commit whose tree could not resolve the docs environment).
+# ReactantServer is released last in each round, from main.
 name: Docs
 
 on:
   push:
     branches: [main]
-    tags: ["ReactantServer-v*"]
   pull_request:
+  workflow_call:
+    inputs:
+      image-digest:
+        description: The digest of the release image just pushed for the tag being built
+        type: string
+        required: true
 
 jobs:
   docs:
@@ -34,6 +42,12 @@ jobs:
         # fresh here (ReactantServer and friends come from the [sources] paths,
         # and DocumenterLandingPage from its git URL, see CONTRIBUTING.md).
         run: julia --project=docs -e 'using Pkg; Pkg.instantiate()'
+      # The tree carries the release's draft record; complete it with what only the pushed image
+      # has, so the page renders as published. Only this build's copy changes; image.yml commits
+      # the same record to main.
+      - name: Complete the release record
+        if: inputs.image-digest != ''
+        run: julia docs/releases.jl record "${GITHUB_REF_NAME#ReactantServer-v}" --digest "${{ inputs.image-digest }}"
       - name: Build and deploy
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

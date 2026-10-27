@@ -23,9 +23,19 @@
 # overview, and one page per release. Rendering fails, naming the missing entry, when a release uses
 # a component components.toml does not describe yet.
 #
-# After a release's image is published, from the repository root:
+# A release's record is committed twice. As the last commit before registering, from the repository
+# root, a draft written from HEAD, so the tagged docs carry the release's own page:
 #
-#   julia docs/releases.jl record 0.1.2                          # digest from the registry
+#   julia docs/releases.jl draft 0.1.2
+#
+# A draft has everything the tree pins but not what only the published image has: the commit (the
+# draft would have to name its own), the image digest (the image's revision label names that same
+# commit) and the publication date. Its page says the image is not published yet. Once the image is
+# pushed, .github/workflows/image.yml runs `record` with the pushed digest twice: in the tagged docs
+# build, before it renders, and on main, where it commits the completed record. By hand, digest
+# from the registry:
+#
+#   julia docs/releases.jl record 0.1.2
 #   julia docs/releases.jl record 0.1.2 --digest sha256:... --published 2026-11-02
 module ContainerReleases
 
@@ -89,6 +99,9 @@ module ContainerReleases
         end
         return sort!(releases; by = r -> VersionNumber(r["version"]), rev = true)
     end
+
+    # A draft is written before the image exists, so it has no commit, digest or publication date.
+    isdraft(r) = !haskey(r, "image_digest")
 
     missing_component(r, what) =
         error("release $(r["version"]) uses $what, which docs/releases/components.toml does not describe; add it")
@@ -171,10 +184,14 @@ module ContainerReleases
         tag = "ReactantServer-v$v"
         println(io, "```@meta\nEditURL = \"../../releases/$v.toml\"\n```\n")
         println(io, "# Release $v\n")
-        println(
-            io, code("$IMAGE:$v"), ", published ", r["published"], " from [`", tag, "`](", REPO_URL,
-            "/tree/", tag, ") (commit ", code(r["commit"]), ").\n"
-        )
+        if isdraft(r)
+            println(io, code("$IMAGE:$v"), " is not published yet; this page is completed when it is.\n")
+        else
+            println(
+                io, code("$IMAGE:$v"), ", published ", r["published"], " from [`", tag, "`](", REPO_URL,
+                "/tree/", tag, ") (commit ", code(r["commit"]), ").\n"
+            )
+        end
         if prev === nothing
             println(io, "This is the first container release.\n")
         else
@@ -199,18 +216,21 @@ module ContainerReleases
         end
         table(io, ["Component", "Version"], body)
         base = lookup(c, r, "base_image", r["base_image"])
-        digests = [["Image", code(r["image_digest"])], ["Base image, `linux/amd64`", code(base["amd64"])]]
+        image = isdraft(r) ? "not published yet" : code(r["image_digest"])
+        digests = [["Image", image], ["Base image, `linux/amd64`", code(base["amd64"])]]
         for (_, spec, a) in accelerators(r, c), (l, d) in spec.digests(a)
             push!(digests, [l, d])
         end
         println(io, "## Digests\n")
         table(io, ["", "Digest"], digests)
-        print(io, "Pull by digest with ", code("$IMAGE@$(r["image_digest"])"), ".")
+        notes = String[]
+        isdraft(r) || push!(notes, "Pull by digest with $(code("$IMAGE@$(r["image_digest"])")).")
         if r["labels"]
-            println(io, " The image also records its ReactantServer package versions and the commit it was built from in its labels (`podman inspect`).")
+            push!(notes, "The image also records its ReactantServer package versions and the commit it was built from in its labels (`podman inspect`).")
         else
-            println(io, " This image predates the version labels later images carry.")
+            push!(notes, "This image predates the version labels later images carry.")
         end
+        println(io, join(notes, " "))
         return println(io)
     end
 
@@ -222,7 +242,7 @@ module ContainerReleases
             prev = i < length(releases) ? releases[i + 1] : nothing
             accel = join([spec.summary(a) for (_, spec, a) in accelerators(r, c)], "; ")
             v = r["version"]
-            ["[$v]($v.md)", string(r["published"]), r["julia"], r["packages"]["Reactant"], accel, change_summary(r, prev, c)]
+            ["[$v]($v.md)", string(get(r, "published", "not yet")), r["julia"], r["packages"]["Reactant"], accel, change_summary(r, prev, c)]
         end
         table(buf, ["Release", "Published", "Julia", "Reactant", "Accelerators", "Changes from previous"], body)
         println(io, "```@meta\nEditURL = \"../../releases/overview.md\"\n```\n")
@@ -283,15 +303,20 @@ module ContainerReleases
     end
 
     """
-        record(version; digest = nothing, published = today())
+        record(version; draft = false, digest = nothing, published = today())
 
     Write docs/releases/<version>.toml from the `ReactantServer-v<version>` tag: the Julia version,
-    base image digest, platform and accelerators pinned in that tree, and the package versions from
-    its deploy/Manifest.toml. The image digest comes from the registry unless given.
+    base image digest, platform and accelerators pinned in that tree, the package versions from its
+    deploy/Manifest.toml, and the release's commit, image digest and publication date. The image
+    digest comes from the registry unless given, and the publication date is today's unless given or
+    already recorded for the same digest, so recording a release again changes nothing.
+
+    With `draft = true`, write it from the committed HEAD instead, without the commit, image digest
+    and publication date, for the last commit before the release is registered.
     """
-    function record(version; digest = nothing, published = today())
-        tag = "ReactantServer-v$version"
-        show(path) = read(`git -C $ROOT show $tag:$path`, String)
+    function record(version; draft = false, digest = nothing, published = nothing)
+        ref = draft ? "HEAD" : "ReactantServer-v$version"
+        show(path) = read(`git -C $ROOT show $ref:$path`, String)
         manifest = TOML.parse(show("deploy/Manifest.toml"))
         mod = show("MODULE.bazel")
         build = show("deploy/BUILD.bazel")
@@ -300,15 +325,26 @@ module ContainerReleases
         base = capture(match(r"name = \"reactantserver_cuda_base\",.*?digest = \"(sha256:[0-9a-f]{64})\""s, mod), "the base image digest in MODULE.bazel")
         platform = capture(match(r"name = \"reactantserver_cuda_base\",.*?platforms = \[\"([^\"]+)\"\]"s, mod), "the base image platform in MODULE.bazel")
         pkgversion(p) = manifest["deps"][p][1]["version"]
-        commit = readchomp(`git -C $ROOT rev-list -n 1 $tag`)
-        digest = something(digest, registry_digest(version))
+        pkgversion("ReactantServer") == version ||
+            error("$ref locks ReactantServer $(pkgversion("ReactantServer")) in deploy/Manifest.toml, not $version")
         file = joinpath(DATA, "$version.toml")
+        if !draft
+            digest = something(digest, registry_digest(version))
+            previous = isfile(file) ? TOML.parsefile(file) : Dict()
+            published = something(published, get(previous, "image_digest", nothing) == digest ? previous["published"] : today())
+        end
         open(file, "w") do io
-            println(io, "# Container release $version, written by `julia docs/releases.jl record $version`.")
-            println(io, "version = \"$version\"")
-            println(io, "published = $published")
-            println(io, "commit = \"$commit\"")
-            println(io, "image_digest = \"$digest\"")
+            if draft
+                println(io, "# Container release $version, drafted by `julia docs/releases.jl draft $version`; the commit,")
+                println(io, "# image digest and publication date are added once the image is published.")
+                println(io, "version = \"$version\"")
+            else
+                println(io, "# Container release $version, written by `julia docs/releases.jl record $version`.")
+                println(io, "version = \"$version\"")
+                println(io, "published = $published")
+                println(io, "commit = \"$(readchomp(`git -C $ROOT rev-list -n 1 $ref`))\"")
+                println(io, "image_digest = \"$digest\"")
+            end
             println(io, "labels = $(occursin("name = \"image_labels\"", build))")
             println(io, "platform = \"$platform\"")
             println(io, "julia = \"$julia\"")
@@ -333,13 +369,20 @@ module ContainerReleases
     end
 
     function main(args)
-        (length(args) >= 2 && args[1] == "record") ||
-            error("usage: julia docs/releases.jl record <version> [--digest sha256:...] [--published YYYY-MM-DD]")
-        opts = Dict(args[i] => args[i + 1] for i in 3:2:(length(args) - 1))
-        file = record(
-            args[2]; digest = get(opts, "--digest", nothing),
-            published = haskey(opts, "--published") ? Date(opts["--published"]) : today()
-        )
+        usage = """
+        usage: julia docs/releases.jl draft <version>
+               julia docs/releases.jl record <version> [--digest sha256:...] [--published YYYY-MM-DD]"""
+        if length(args) == 2 && args[1] == "draft"
+            file = record(args[2]; draft = true)
+        elseif length(args) >= 2 && args[1] == "record"
+            opts = Dict(args[i] => args[i + 1] for i in 3:2:(length(args) - 1))
+            file = record(
+                args[2]; digest = get(opts, "--digest", nothing),
+                published = haskey(opts, "--published") ? Date(opts["--published"]) : nothing
+            )
+        else
+            error(usage)
+        end
         return println("wrote ", relpath(file, ROOT))
     end
 

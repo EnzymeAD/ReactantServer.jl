@@ -181,17 +181,24 @@ bazel run //deploy:image_check
 ```
 
 The docs' Container Releases pages record what each release's image ships, rendered from
-`docs/releases/`. After the image for a release is published, record it from the repository root
-and commit the file it writes:
+`docs/releases/`. Make the release's draft record the last commit before registering
+ReactantServer, so the release's tagged docs include its own page:
 
 ```
-julia docs/releases.jl record X.Y.Z
+julia docs/releases.jl draft X.Y.Z
 ```
 
-This reads the tag's `deploy/Manifest.toml` and `MODULE.bazel` and the image digest from the
-registry. When the release is the first to use a new Julia, base image, or accelerator provider
-version (for CUDA, a new Reactant_jll), also describe that component in
-`docs/releases/components.toml`; the docs build fails, naming the missing entry, until it is there.
+This reads the committed `deploy/Manifest.toml`, `MODULE.bazel` and `deploy/BUILD.bazel` at HEAD,
+and fails unless the lock is for ReactantServer X.Y.Z. When the release is the first to use a new
+Julia, base image, or accelerator provider version (for CUDA, a new Reactant_jll), also describe
+that component in `docs/releases/components.toml` in the same commit; the docs build fails, naming
+the missing entry, until it is there.
+
+A draft lacks what only the published image has: the commit, the image digest, and the publication
+date. Once the image is pushed, the image workflow completes the record with
+`julia docs/releases.jl record X.Y.Z --digest ...` for the tagged docs build, and commits the same
+record to main. If that commit fails, run `julia docs/releases.jl record X.Y.Z` (digest from the
+registry) and commit the file it writes.
 
 The image is published to the GitHub Container Registry as `ghcr.io/enzymead/reactantserver`,
 tagged with each ReactantServer release and with signed build provenance, by

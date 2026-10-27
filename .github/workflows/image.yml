@@ -18,6 +18,11 @@
 # organization then makes it public once, in the package's settings, so it can be pulled
 # anonymously.
 #
+# A release then builds its versioned docs (docs.yml, on the tag ref) and commits its completed
+# container release record (docs/releases/X.Y.Z.toml) to main. The commit is pushed with the
+# RELEASE_RECORD_KEY deploy key, which main's branch rules exempt so the commit needs no pull
+# request; a push with GITHUB_TOKEN would also not run the workflows that rebuild the dev docs.
+#
 # The attestation is SLSA build provenance binding the pushed digest to this repository, commit,
 # workflow and run. It is stored with GitHub and next to the image in the registry. Verify with:
 #   gh attestation verify oci://ghcr.io/enzymead/reactantserver:0.1.0 --repo EnzymeAD/ReactantServer.jl
@@ -47,6 +52,9 @@ jobs:
       id-token: write           # the OIDC token Sigstore issues the signing certificate for
       attestations: write       # store the attestation with GitHub
       artifact-metadata: write  # record where the attested image is stored
+    outputs:
+      version: ${{ steps.tags.outputs.version }}
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -101,6 +109,7 @@ jobs:
             tags=("$version")
             [[ "$(grep -E "^${line//./\\.}\\." <<<"$released" | tail -n1)" == "$version" ]] && tags+=("$line")
             [[ "$(tail -n1 <<<"$released")" == "$version" ]] && tags+=(latest)
+            echo "version=$version" >> "$GITHUB_OUTPUT"
           else
             tags=("sha-${GITHUB_SHA::12}")
           fi
@@ -140,3 +149,47 @@ jobs:
           subject-name: ${{ steps.push.outputs.repository }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+
+  docs:
+    needs: image
+    if: needs.image.outputs.version != ''
+    permissions:
+      contents: write           # deploy to gh-pages
+    uses: ./.github/workflows/docs.yml
+    with:
+      image-digest: ${{ needs.image.outputs.digest }}
+
+  # The same `record` the docs build ran, committed to main so the dev docs and every later release's
+  # docs carry it. Rerunning it rewrites the same file, and a run with nothing new commits nothing.
+  # Only this file changes, so a push that loses a race to another merge rebases cleanly.
+  record:
+    needs: image
+    if: needs.image.outputs.version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.image.outputs.version }}
+      DIGEST: ${{ needs.image.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          ssh-key: ${{ secrets.RELEASE_RECORD_KEY }}
+      - uses: julia-actions/setup-julia@da908477b5db94c10ffce8cfea9f2b3b9d5db687 # v3.0.3
+        with:
+          version: '1.12'
+      - name: Commit the release record to main
+        run: |
+          git fetch --depth=1 origin tag "ReactantServer-v$VERSION"
+          julia --startup-file=no docs/releases.jl record "$VERSION" --digest "$DIGEST"
+          git add "docs/releases/$VERSION.toml"
+          git diff --cached --quiet && { echo "docs/releases/$VERSION.toml is already current"; exit 0; }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Record container release $VERSION" -m "Written by the Image workflow once ghcr.io/enzymead/reactantserver:$VERSION was pushed ($DIGEST): the commit, image digest and publication date a draft cannot carry."
+          for attempt in 1 2 3; do
+            git push origin HEAD:main && exit 0
+            git fetch origin main && git rebase origin/main
+          done
+          exit 1
