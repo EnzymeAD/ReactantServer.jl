@@ -260,6 +260,55 @@ _load_manifest(dir) = ReactantServer.parse_manifest(
         end
     end
 
+    @testset "a Julia callback is refused before anything is written" begin
+        double!(out, x) = (out .= 2 .* x; nothing)
+        # The frontend also runs `g` on host arrays, where there is nothing to call back into.
+        cb(y::Reactant.TracedRArray) = Reactant.Ops.julia_callback(double!, ((Float32, size(y)),), y)
+        cb(y::AbstractArray) = 2 .* y
+        g(x, W) = cb(W * x)
+        W = Float32[1 0 0; 0 1 0]
+        x0 = reshape(collect(Float32, 1:3), 3, 1)
+        nofiles(dir) = !isfile(joinpath(dir, "weights.safetensors")) &&
+            (!isdir(dir) || !any(endswith(".mlir"), readdir(dir)))
+
+        # The op survives Reactant's default passes, and the exporter's attribute dropping, with
+        # its call target intact.
+        ctx = Reactant.ReactantContext()
+        mod, _ = Reactant.Compiler.compile_mlir(
+            ctx, g, (Reactant.to_rarray(x0), Reactant.to_rarray(W)); drop_unsupported_attributes = true
+        )
+        text, bytes = GC.@preserve ctx begin
+            @test ReactantServerExport._has_julia_callback(mod)
+            string(mod), ReactantServerExport._serialize_module(mod)   # the second lowers `mod` to VHLO
+        end
+        @test ReactantServerExport._has_julia_callback(text)
+        @test ReactantServerExport._has_julia_callback(bytes)
+
+        mktempdir() do root
+            dir = joinpath(root, "cb")
+            @test_throws "reactant_julia_callback" export_bundle(
+                :reactant, g, (x0,), ["W" => W]; dir, name = "cb", input_names = ["x"]
+            )
+            @test nofiles(dir)
+            spec(n) = [IOSpec(n, Float32, [3, 1]; batch_axis = 1)]
+            for m in (text, bytes)
+                err = try
+                    write_bundle(
+                        dir; name = "cb", executable_inputs = spec("x"), executable_outputs = spec("y"),
+                        modules = Dict(4 => m), weights = ["W" => W]
+                    )
+                    nothing
+                catch e
+                    e
+                end
+                @test err isa ErrorException
+                @test occursin("batch size 4", err.msg)
+                @test occursin("Ops.julia_callback", err.msg)
+                @test nofiles(dir)
+            end
+        end
+    end
+
     @testset "entry-arity gate refuses an unservable bundle before writing it" begin
         # THE 2026-08-11 AND 2026-08-19 DEFECT, reproduced. `export_bundle(:lux, ...)` CAPTURES `st`
         # in the closure it compiles rather than passing it, and Reactant lifts every device-resident
