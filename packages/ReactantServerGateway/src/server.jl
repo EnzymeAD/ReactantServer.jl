@@ -5,7 +5,7 @@
 # decoded (see headers.jl). Mirrors the Go gateway's internal/grpcserver.
 
 # Per-request state threaded through gRPCServer's context payload. Parametric on the pool and
-# scheduler types so the request hot path (`st.pool` -> `get_clients` -> `wc.infer`, and the
+# scheduler types so the request hot path (`st.pool` -> `get_clients` -> `wc.chan`, and the
 # `select_replicas` dispatch) stays type-stable.
 struct GatewayState{P <: ClientPool, S <: GatewayScheduler}
     pool::P

@@ -168,6 +168,10 @@ struct KServeModel <: AbstractInferenceModel
     # concurrent requests). Pass a dedicated handle with a larger `max_streams` to drive more
     # concurrency than 16 (e.g. a load generator sizing it to its request concurrency).
     grpc::gRPCClient.gRPCCURL
+    # The model's connection over `grpc`: endpoint, transport security, message-size limits and
+    # the default deadline. Every RPC goes through it; a call that needs a different deadline (a
+    # retry's remaining budget, a short probe) overrides it per call.
+    chan::gRPCClient.gRPCChannel
 
     function KServeModel(
             host,
@@ -199,6 +203,16 @@ struct KServeModel <: AbstractInferenceModel
             shared_memory,
             retry,
             grpc,
+            gRPCClient.gRPCChannel(
+                host,
+                Int(port);
+                grpc = grpc,
+                secure = secure,
+                deadline = deadline,
+                max_send_message_length = max_send_message_length,
+                # gRPCClient spells the option 'recieve'; the public field does not.
+                max_recieve_message_length = max_receive_message_length,
+            ),
         )
     end
 
@@ -243,56 +257,6 @@ retry_policy(::AbstractInferenceModel) = RetryPolicy(enabled = false)
 overall_deadline(x::KServeModel) = x.deadline
 overall_deadline(::AbstractInferenceModel) = 0.0
 
-# `deadline_s` overrides the per-call gRPC/curl timeout so a retry attempt gets only the request's
-# remaining budget instead of a fresh full deadline. `grpc_infer_client(x)` keeps the full budget.
-grpc_infer_client(x::KServeModel) = grpc_infer_client(x, x.deadline)
-function grpc_infer_client(x::KServeModel, deadline_s::Real)
-    return GRPCInferenceService_ModelInfer_Client(
-        x.host,
-        x.port;
-        secure = x.secure,
-        deadline = deadline_s,
-        max_send_message_length = x.max_send_message_length,
-        # The generated client stub's keyword spells it 'recieve'; the public field does not.
-        max_recieve_message_length = x.max_receive_message_length,
-        grpc = x.grpc,
-    )
-end
-
-function grpc_shm_unregister_client(x::KServeModel)
-    return GRPCInferenceService_SystemSharedMemoryUnregister_Client(
-        x.host,
-        x.port;
-        secure = x.secure,
-        grpc = x.grpc,
-    )
-end
-
-function grpc_shm_register_client(x::KServeModel)
-    return GRPCInferenceService_SystemSharedMemoryRegister_Client(
-        x.host,
-        x.port;
-        secure = x.secure,
-        grpc = x.grpc,
-    )
-end
-
-function grpc_is_same_ipc_namespace_client(x::KServeModel; deadline = x.deadline)
-    return GRPCInferenceService_IsSameIPCNamespace_Client(
-        x.host,
-        x.port;
-        secure = x.secure,
-        grpc = x.grpc,
-        deadline = deadline,
-    )
-end
-
-function grpc_metadata_client(x::KServeModel)
-    return GRPCInferenceService_ModelMetadata_Client(
-        x.host,
-        x.port;
-        secure = x.secure,
-        deadline = x.deadline,
-        grpc = x.grpc,
-    )
-end
+# Deadline for the SHM register/unregister RPCs. They have always run on gRPCClient's 10s default
+# rather than the model's deadline; moving them onto the model's channel keeps that explicitly.
+const SHM_CONTROL_DEADLINE = 10.0

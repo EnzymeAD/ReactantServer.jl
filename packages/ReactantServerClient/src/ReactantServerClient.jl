@@ -28,8 +28,8 @@ import ReactantServerCore: acquire_slot!, is_shm_backed, scratch, pool_view
 
 import Base: length, sizeof, rm, elsize
 
-# The generated inference module carries the gRPC client constructors
-# (GRPCInferenceService_*_Client); `using .inference` above brings them in. No server-side stubs
+# The generated inference module carries the gRPC client stubs (the GRPCInferenceService service
+# module, one function per RPC); `using .inference` above brings them in. No server-side stubs
 # are generated or needed: this package never serves gRPC.
 
 const DEFAULT_POOL_BYTES = 256 * 1024 * 1024  # 256 MiB

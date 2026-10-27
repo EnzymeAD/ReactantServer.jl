@@ -140,12 +140,9 @@ function _start_mock(worker::MockWorker; timeout::Real = 30.0)
         sleep(0.1)
     end
     port > 0 || error("mock worker $(worker.name) never bound a port")
-    client = gRPCClient.gRPCServiceClient{GWInf.ServerReadyRequest, false, GWInf.ServerReadyResponse, false}(
-        "127.0.0.1", port, "/inference.GRPCInferenceService/ServerReady"
-    )
     while time() < deadline
         try
-            gRPCClient.grpc_sync_request(client, GWInf.ServerReadyRequest())
+            GWInf.GRPCInferenceService.ServerReady("127.0.0.1", port, GWInf.ServerReadyRequest())
             return server, port
         catch
             sleep(0.1)
@@ -156,8 +153,7 @@ end
 
 # Send a typed ModelInfer through the gateway and return the response (or rethrow).
 _infer(port, model) = grpc_call(
-    GWInf.ModelInferRequest, GWInf.ModelInferResponse, "ModelInfer",
-    port, GWInf.ModelInferRequest(; model_name = model)
+    GWInf.GRPCInferenceService.ModelInfer, port, GWInf.ModelInferRequest(; model_name = model)
 )
 
 function _http_get(port, path)
@@ -283,8 +279,7 @@ end
 
         @testset "SHM register fan-out and rollback" begin
             reg(name) = grpc_call(
-                GWInf.SystemSharedMemoryRegisterRequest, GWInf.SystemSharedMemoryRegisterResponse,
-                "SystemSharedMemoryRegister", gw_port, GWInf.SystemSharedMemoryRegisterRequest(; name = name)
+                GWInf.GRPCInferenceService.SystemSharedMemoryRegister, gw_port, GWInf.SystemSharedMemoryRegisterRequest(; name = name)
             )
             # all workers ok
             @test reg("region-ok") isa GWInf.SystemSharedMemoryRegisterResponse

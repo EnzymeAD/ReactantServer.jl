@@ -138,8 +138,7 @@ end
             # --- register both regions ---
             for (rname, key, bytes) in (("rin", kin, 16), ("rio", kio, 32))
                 resp = grpc_call(
-                    _ShmInf.SystemSharedMemoryRegisterRequest, _ShmInf.SystemSharedMemoryRegisterResponse,
-                    "SystemSharedMemoryRegister", port,
+                    WorkerRPC.SystemSharedMemoryRegister, port,
                     _ShmInf.SystemSharedMemoryRegisterRequest(; name = rname, key = key, offset = 0, byte_size = bytes)
                 )
                 @test resp isa _ShmInf.SystemSharedMemoryRegisterResponse
@@ -147,8 +146,7 @@ end
 
             # status reports both regions
             st = grpc_call(
-                _ShmInf.SystemSharedMemoryStatusRequest, _ShmInf.SystemSharedMemoryStatusResponse,
-                "SystemSharedMemoryStatus", port, _ShmInf.SystemSharedMemoryStatusRequest(; name = "")
+                WorkerRPC.SystemSharedMemoryStatus, port, _ShmInf.SystemSharedMemoryStatusRequest(; name = "")
             )
             @test haskey(st.regions, "rin") && haskey(st.regions, "rio")
             @test st.regions["rin"].byte_size == 16
@@ -165,7 +163,7 @@ end
                 )
             )
             mA = grpc_call(
-                _ShmInf.ModelInferRequest, _ShmInf.ModelInferResponse, "ModelInfer", port,
+                WorkerRPC.ModelInfer, port,
                 _ShmInf.ModelInferRequest(; model_name = "scale4", inputs = [inA])
             )
             @test collect(reinterpret(Float32, mA.raw_output_contents[1])) == Float32[2, 4, 6, 8]
@@ -189,7 +187,7 @@ end
                 )
             )
             mB = grpc_call(
-                _ShmInf.ModelInferRequest, _ShmInf.ModelInferResponse, "ModelInfer", port,
+                WorkerRPC.ModelInfer, port,
                 _ShmInf.ModelInferRequest(; model_name = "scale4", inputs = [inB], outputs = [outB])
             )
             @test isempty(mB.raw_output_contents)                 # output went to shm, not inline
@@ -199,13 +197,11 @@ end
 
             # --- unregister one, then confirm it is gone ---
             ru = grpc_call(
-                _ShmInf.SystemSharedMemoryUnregisterRequest, _ShmInf.SystemSharedMemoryUnregisterResponse,
-                "SystemSharedMemoryUnregister", port, _ShmInf.SystemSharedMemoryUnregisterRequest(; name = "rin")
+                WorkerRPC.SystemSharedMemoryUnregister, port, _ShmInf.SystemSharedMemoryUnregisterRequest(; name = "rin")
             )
             @test ru isa _ShmInf.SystemSharedMemoryUnregisterResponse
             st2 = grpc_call(
-                _ShmInf.SystemSharedMemoryStatusRequest, _ShmInf.SystemSharedMemoryStatusResponse,
-                "SystemSharedMemoryStatus", port, _ShmInf.SystemSharedMemoryStatusRequest(; name = "")
+                WorkerRPC.SystemSharedMemoryStatus, port, _ShmInf.SystemSharedMemoryStatusRequest(; name = "")
             )
             @test !haskey(st2.regions, "rin") && haskey(st2.regions, "rio")
 
@@ -220,7 +216,7 @@ end
             )
             try
                 grpc_call(
-                    _ShmInf.ModelInferRequest, _ShmInf.ModelInferResponse, "ModelInfer", port,
+                    WorkerRPC.ModelInfer, port,
                     _ShmInf.ModelInferRequest(; model_name = "scale4", inputs = [inBad])
                 )
                 @test false
@@ -243,7 +239,7 @@ end
             )
             try
                 grpc_call(
-                    _ShmInf.ModelInferRequest, _ShmInf.ModelInferResponse, "ModelInfer", port,
+                    WorkerRPC.ModelInfer, port,
                     _ShmInf.ModelInferRequest(; model_name = "scale4", inputs = [inStale])
                 )
                 @test false

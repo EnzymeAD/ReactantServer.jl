@@ -51,25 +51,25 @@ const _EInf = ReactantServer.inference
         try
             # health / readiness
             @test grpc_call(
-                _EInf.ServerLiveRequest, _EInf.ServerLiveResponse, "ServerLive", port,
+                WorkerRPC.ServerLive, port,
                 _EInf.ServerLiveRequest()
             ).live
             @test grpc_call(
-                _EInf.ServerReadyRequest, _EInf.ServerReadyResponse, "ServerReady", port,
+                WorkerRPC.ServerReady, port,
                 _EInf.ServerReadyRequest()
             ).ready
             @test grpc_call(
-                _EInf.ModelReadyRequest, _EInf.ModelReadyResponse, "ModelReady", port,
+                WorkerRPC.ModelReady, port,
                 _EInf.ModelReadyRequest(; name = "scale4")
             ).ready
             @test !grpc_call(
-                _EInf.ModelReadyRequest, _EInf.ModelReadyResponse, "ModelReady", port,
+                WorkerRPC.ModelReady, port,
                 _EInf.ModelReadyRequest(; name = "nope")
             ).ready
 
             # model metadata
             md = grpc_call(
-                _EInf.ModelMetadataRequest, _EInf.ModelMetadataResponse, "ModelMetadata", port,
+                WorkerRPC.ModelMetadata, port,
                 _EInf.ModelMetadataRequest(; name = "scale4")
             )
             @test md.name == "scale4"
@@ -79,7 +79,7 @@ const _EInf = ReactantServer.inference
             # unknown model metadata -> NOT_FOUND
             try
                 grpc_call(
-                    _EInf.ModelMetadataRequest, _EInf.ModelMetadataResponse, "ModelMetadata", port,
+                    WorkerRPC.ModelMetadata, port,
                     _EInf.ModelMetadataRequest(; name = "nope")
                 )
                 @test false
@@ -95,14 +95,14 @@ const _EInf = ReactantServer.inference
                 model_name = "scale4", inputs = [inp],
                 raw_input_contents = [collect(reinterpret(UInt8, x))]
             )
-            rmsg = grpc_call(_EInf.ModelInferRequest, _EInf.ModelInferResponse, "ModelInfer", port, reqmsg)
+            rmsg = grpc_call(WorkerRPC.ModelInfer, port, reqmsg)
             @test rmsg.model_name == "scale4"
             @test collect(reinterpret(Float32, rmsg.raw_output_contents[1])) == Float32[2, 4, 6, 8]
 
             # inference against an unknown model -> NOT_FOUND
             try
                 grpc_call(
-                    _EInf.ModelInferRequest, _EInf.ModelInferResponse, "ModelInfer", port,
+                    WorkerRPC.ModelInfer, port,
                     _EInf.ModelInferRequest(;
                         model_name = "nope", inputs = [inp],
                         raw_input_contents = [collect(reinterpret(UInt8, x))]
@@ -116,15 +116,14 @@ const _EInf = ReactantServer.inference
 
             # repository index lists the loaded model (direct RepositoryIndex introspection)
             idx = grpc_call(
-                _EInf.RepositoryIndexRequest, _EInf.RepositoryIndexResponse, "RepositoryIndex", port,
+                WorkerRPC.RepositoryIndex, port,
                 _EInf.RepositoryIndexRequest(; ready = true)
             )
             @test "scale4" in [m.name for m in idx.models]
 
             # shared-memory status with nothing registered returns an empty region set
             shmst = grpc_call(
-                _EInf.SystemSharedMemoryStatusRequest, _EInf.SystemSharedMemoryStatusResponse,
-                "SystemSharedMemoryStatus", port, _EInf.SystemSharedMemoryStatusRequest(; name = "")
+                WorkerRPC.SystemSharedMemoryStatus, port, _EInf.SystemSharedMemoryStatusRequest(; name = "")
             )
             @test isempty(shmst.regions)
         finally
@@ -199,18 +198,18 @@ end
         try
             # The meta model reports ready and is discoverable, exactly like a regular model.
             @test grpc_call(
-                _EInf.ModelReadyRequest, _EInf.ModelReadyResponse, "ModelReady", port,
+                WorkerRPC.ModelReady, port,
                 _EInf.ModelReadyRequest(; name = "detector")
             ).ready
             idx = grpc_call(
-                _EInf.RepositoryIndexRequest, _EInf.RepositoryIndexResponse, "RepositoryIndex", port,
+                WorkerRPC.RepositoryIndex, port,
                 _EInf.RepositoryIndexRequest(; ready = true)
             )
             @test "detector" in [m.name for m in idx.models]
 
             # Metadata reflects the meta model's client-facing I/O.
             md = grpc_call(
-                _EInf.ModelMetadataRequest, _EInf.ModelMetadataResponse, "ModelMetadata", port,
+                WorkerRPC.ModelMetadata, port,
                 _EInf.ModelMetadataRequest(; name = "detector")
             )
             @test md.inputs[1].name == "x" && md.outputs[1].name == "OUT"
@@ -222,7 +221,7 @@ end
                 model_name = "detector", inputs = [inp],
                 raw_input_contents = [collect(reinterpret(UInt8, x))]
             )
-            rmsg = grpc_call(_EInf.ModelInferRequest, _EInf.ModelInferResponse, "ModelInfer", port, reqmsg)
+            rmsg = grpc_call(WorkerRPC.ModelInfer, port, reqmsg)
             @test rmsg.model_name == "detector"
             @test collect(reinterpret(Float32, rmsg.raw_output_contents[1])) == Float32[3, 5, 7, 9]
         finally

@@ -62,12 +62,11 @@ function split_target(t)
     return String(t[1:(i - 1)]), parse(Int, t[(i + 1):end])
 end
 
-# One client per call, all sharing the global libcurl handle: this is a short-lived CLI. The deadline
-# must exceed any bounded wait the gateway is asked to do, or we would give up before it answers. The
-# handle is shut down once in `main`, not per call (a service client is not itself closeable).
-function call(ctor, host, port, req; deadline = 20)
-    client = ctor(host, port; deadline = deadline)
-    return gRPCClient.grpc_sync_request(client, req)
+# Every call goes through the global libcurl handle: this is a short-lived CLI. The deadline must
+# exceed any bounded wait the gateway is asked to do, or we would give up before it answers. The
+# handle is shut down once in `main`, not per call.
+function call(rpc, host, port, req; deadline = 20)
+    return rpc(host, port, req; deadline = deadline)
 end
 
 # --- formatting --------------------------------------------------------------------------------
@@ -219,7 +218,7 @@ function dispatch(cmd, rest, host, port)
     if cmd == "status"
         print_status(
             call(
-                GatewayControlService_GetSchedulingStatus_Client, host, port,
+                GatewayControlService.GetSchedulingStatus, host, port,
                 GetSchedulingStatusRequest()
             )
         )
@@ -228,7 +227,7 @@ function dispatch(cmd, rest, host, port)
         j = findfirst(==("--wait"), rest)
         j === nothing || (wait = parse(Float64, rest[j + 1]))
         resp = call(
-            GatewayControlService_Repack_Client, host, port,
+            GatewayControlService.Repack, host, port,
             RepackRequest(; wait_seconds = wait); deadline = ceil(Int, wait) + 30
         )
         println(
@@ -254,7 +253,7 @@ function dispatch(cmd, rest, host, port)
             error("unexpected argument '$a'")
         end
         resp = call(
-            GatewayControlService_SetModelPlacement_Client, host, port,
+            GatewayControlService.SetModelPlacement, host, port,
             SetModelPlacementRequest(;
                 name = model, replicas = replicas,
                 fill_mode = fill_mode, fill_factor = fill_factor,
@@ -270,7 +269,7 @@ function dispatch(cmd, rest, host, port)
         isempty(rest) && (usage(); return 2)
         mask, policy = build_policy(rest)
         resp = call(
-            GatewayControlService_SetSchedulingPolicy_Client, host, port,
+            GatewayControlService.SetSchedulingPolicy, host, port,
             SetSchedulingPolicyRequest(; update_mask = mask, policy = policy)
         )
         println("applied $(join(mask, ", ")) (generation $(resp.applied.generation))")

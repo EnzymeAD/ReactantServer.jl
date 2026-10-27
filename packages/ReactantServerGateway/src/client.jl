@@ -1,9 +1,9 @@
-# Per-worker gRPC clients used to forward requests to the Julia inference workers. ModelInfer and
-# the SHM RPCs use raw Vector{UInt8} clients so request and response bytes pass through without
-# re-marshaling; ServerReady uses a typed client (the message is tiny). Clients are lightweight
-# value structs over a shared libcurl multi handle, so one is built per worker and method up front
-# and reused. The RegisterGate serializes ModelInfer against a worker while a SHM
-# register/unregister to that worker is in flight (POSIX shm registration is host-global).
+# Per-worker gRPC connections used to forward requests to the Julia inference workers. ModelInfer
+# and the SHM RPCs send and receive raw Vector{UInt8} so request and response bytes pass through
+# without re-marshaling; the probes are typed (the messages are tiny). Each worker has one
+# gRPCChannel over its own libcurl multi handle, built up front and reused. The RegisterGate
+# serializes ModelInfer against a worker while a SHM register/unregister to that worker is in flight
+# (POSIX shm registration is host-global).
 
 # Status strings surfaced to clients and recorded in metrics, mirroring the Go gateway.
 const STATUS_OK = "OK"
@@ -15,31 +15,26 @@ const STATUS_FAILED_PRE = "FailedPrecondition"
 const STATUS_INTERNAL = "Internal"
 const STATUS_DEADLINE = "DeadlineExceeded"
 
-# A worker's gRPC clients, all sharing one per-worker libcurl multi handle (`grpc`). Each worker
-# gets its own gRPCCURL: HTTP/2 multiplexing only reuses connections within one host:port, so
-# workers share nothing, and a separate handle gives each its own GRPC_MAX_STREAMS (16) in-flight
-# budget and request semaphore, isolating a slow or wedged worker to its own slots. The struct is
-# parametric so every field keeps its concrete client type (the request path forwards through
-# `infer` with no dynamic dispatch); the type parameters are inferred at construction.
-struct WorkerClients{G, I, SR, SU, RD, RI, CS, CM, NS}
+# A worker's gRPC connection: one per-worker libcurl multi handle (`grpc`) and the channel over it
+# that every RPC to the worker uses. Each worker gets its own gRPCCURL: HTTP/2 multiplexing only
+# reuses connections within one host:port, so workers share nothing, and a separate handle gives
+# each its own GRPC_MAX_STREAMS (16) in-flight budget and request semaphore, isolating a slow or
+# wedged worker to its own slots. The channel carries the data-plane defaults (request timeout,
+# message-size limits); the probes and compaction override the deadline per call.
+struct WorkerClients
     url::String
-    grpc::G
-    infer::I
-    shm_register::SR
-    shm_unregister::SU
-    ready::RD
-    repo_index::RI
-    control_status::CS    # ControlService/ModelControlStatus (lpt_packing cost polling + preconditions)
-    compact::CM           # ControlService/CompactMemory (memory-compaction fan-out)
-    is_same_ns::NS        # GRPCInferenceService/IsSameIPCNamespace (SHM-namespace probe fan-out)
+    grpc::gRPCClient.gRPCCURL
+    chan::gRPCClient.gRPCChannel
+    probe_deadline::Float64      # ServerReady, RepositoryIndex, ModelControlStatus, IsSameIPCNamespace
+    compact_deadline::Float64    # ControlService/CompactMemory (memory-compaction fan-out)
 end
 
-struct ClientPool{W <: WorkerClients}
+struct ClientPool
     order::Vector{String}
-    clients::Dict{String, W}
+    clients::Dict{String, WorkerClients}
 end
 
-# Build one worker's clients over a freshly-created multi handle.
+# Build one worker's connection over a freshly-created multi handle.
 function _worker_clients(cfg::GatewayConfig, url::AbstractString)
     host, port = _split_hostport(url)
     # sticky=true pins each handle's libcurl driving tasks (socket watchers + timer) to the thread
@@ -49,35 +44,15 @@ function _worker_clients(cfg::GatewayConfig, url::AbstractString)
     # one running multi handle per worker; its stream semaphore caps outbound in-flight requests to
     # this worker (the rest block until a slot frees).
     grpc = gRPCClient.gRPCCURL(; sticky = true, max_streams = cfg.max_concurrent_streams_per_worker)
-    infer = GRPCInferenceService_ModelInfer_Client(
+    chan = gRPCClient.gRPCChannel(
         host, port; grpc = grpc,
-        TRequest = Vector{UInt8}, TResponse = Vector{UInt8},
         deadline = cfg.request_timeout_seconds,
         max_send_message_length = cfg.max_send_msg_bytes,
         max_recieve_message_length = cfg.max_recv_msg_bytes
     )
-    shm_reg = GRPCInferenceService_SystemSharedMemoryRegister_Client(
-        host, port; grpc = grpc,
-        TRequest = Vector{UInt8}, TResponse = Vector{UInt8},
-        deadline = cfg.request_timeout_seconds
-    )
-    shm_unreg = GRPCInferenceService_SystemSharedMemoryUnregister_Client(
-        host, port; grpc = grpc,
-        TRequest = Vector{UInt8}, TResponse = Vector{UInt8},
-        deadline = cfg.request_timeout_seconds
-    )
-    ready = GRPCInferenceService_ServerReady_Client(host, port; grpc = grpc, deadline = 5)
-    repo_index = GRPCInferenceService_RepositoryIndex_Client(host, port; grpc = grpc, deadline = 5)
-    control_status = ControlService_ModelControlStatus_Client(host, port; grpc = grpc, deadline = 5)
     # Compaction frees and reloads weights (device-pinned models re-read from the mmap), so it can
     # run far longer than a status probe; give it a generous deadline rather than the 5s probe one.
-    compact = ControlService_CompactMemory_Client(
-        host, port; grpc = grpc,
-        deadline = max(cfg.request_timeout_seconds, 300)
-    )
-    # Typed (decoded response) so the gateway can read `.same` to aggregate across workers.
-    is_same_ns = GRPCInferenceService_IsSameIPCNamespace_Client(host, port; grpc = grpc, deadline = 5)
-    return WorkerClients(url, grpc, infer, shm_reg, shm_unreg, ready, repo_index, control_status, compact, is_same_ns)
+    return WorkerClients(url, grpc, chan, 5.0, max(cfg.request_timeout_seconds, 300.0))
 end
 
 function ClientPool(cfg::GatewayConfig)
@@ -85,8 +60,7 @@ function ClientPool(cfg::GatewayConfig)
     for url in cfg.workers
         url in order || push!(order, url)
     end
-    wcs = map(url -> _worker_clients(cfg, url), order)   # Vector{W}, W concrete and identical
-    clients = Dict(wc.url => wc for wc in wcs)           # Dict{String,W}
+    clients = Dict(url => _worker_clients(cfg, url) for url in order)
     return ClientPool(order, clients)
 end
 
@@ -94,8 +68,8 @@ get_clients(p::ClientPool, url::AbstractString) = get(p.clients, url, nothing)
 all_clients(p::ClientPool) = [p.clients[u] for u in p.order]
 
 # Reset a worker's multi handle in place: close it (dropping every pooled connection and aborting
-# any in-flight request on it) and re-open it. The worker's client stubs hold this handle by
-# identity, so they transparently use the fresh handle afterward. This recovers from a poisoned
+# any in-flight request on it) and re-open it. The worker's channel holds this handle by
+# identity, so it transparently uses the fresh handle afterward. This recovers from a poisoned
 # connection: when a worker is caught mid-stall (TCP accepted but HTTP/2 not yet negotiated),
 # libcurl keeps the half-open connection pooled and every later request reuses (PIPEWAITs on) it
 # and hangs forever; only dropping the connection recovers it (the per-worker equivalent of a
@@ -124,34 +98,29 @@ function close_pool!(p::ClientPool)
     return nothing
 end
 
-# `deadline` (seconds, or nothing) overrides the worker client's default per-call timeout so the
-# gateway can forward the request's REMAINING budget as grpc-timeout — decrementing it for the time
-# already spent reaching the gateway, rather than granting the worker a fresh full budget.
+# `deadline` (seconds, or nothing) overrides the channel's default per-call timeout so the
+# gateway can forward the request's REMAINING budget as grpc-timeout, decrementing it for the time
+# already spent reaching the gateway rather than granting the worker a fresh full budget.
 #
-# Submission and await are kept apart because what each throws means different things. Submission
-# fails only on this gateway's own handle: before gRPCClient 1.2 a handle shut down by
-# `reset_clients!` (a worker probe hit its deadline) raises FAILED_PRECONDITION, which must fail
-# over like any other unavailable worker, not reach the client as the worker's stale
-# shared-memory signal. A worker's own statuses only ever come from await.
+# A call on a handle that `reset_clients!` has shut down (a worker probe hit its deadline) fails
+# with UNAVAILABLE, so it fails over like any other unavailable worker rather than reaching the
+# client as the worker's stale shared-memory signal (FAILED_PRECONDITION).
 function invoke_infer(wc::WorkerClients, body::Vector{UInt8}; deadline::Union{Real, Nothing} = nothing)
-    req = try
-        deadline === nothing ? gRPCClient.grpc_async_request(wc.infer, body) :
-            gRPCClient.grpc_async_request(wc.infer, body; deadline = deadline)
-    catch e
-        (e isa gRPCClient.gRPCServiceCallException && e.grpc_status == gRPCClient.GRPC_FAILED_PRECONDITION) || rethrow()
-        throw(gRPCClient.gRPCServiceCallException(gRPCClient.GRPC_UNAVAILABLE, e.message))
-    end
-    return gRPCClient.grpc_async_await(wc.infer, req)
+    return deadline === nothing ? GRPCInferenceService.ModelInfer(wc.chan, body, Vector{UInt8}) :
+        GRPCInferenceService.ModelInfer(wc.chan, body, Vector{UInt8}; deadline = deadline)
 end
-invoke_shm_register(wc::WorkerClients, body::Vector{UInt8}) = gRPCClient.grpc_sync_request(wc.shm_register, body)
-invoke_shm_unregister(wc::WorkerClients, body::Vector{UInt8}) = gRPCClient.grpc_sync_request(wc.shm_unregister, body)
+invoke_shm_register(wc::WorkerClients, body::Vector{UInt8}) =
+    GRPCInferenceService.SystemSharedMemoryRegister(wc.chan, body, Vector{UInt8})
+invoke_shm_unregister(wc::WorkerClients, body::Vector{UInt8}) =
+    GRPCInferenceService.SystemSharedMemoryUnregister(wc.chan, body, Vector{UInt8})
 
 # Forward a CompactMemory request to the worker; returns its CompactMemoryResponse.
-invoke_compact(wc::WorkerClients, req::CompactMemoryRequest) = gRPCClient.grpc_sync_request(wc.compact, req)
+invoke_compact(wc::WorkerClients, req::CompactMemoryRequest) =
+    ControlService.CompactMemory(wc.chan, req; deadline = wc.compact_deadline)
 
 # Forward an IsSameIPCNamespace probe to the worker; returns its IsSameIPCNamespaceResponse.
 invoke_is_same_ipc_namespace(wc::WorkerClients, req::IsSameIPCNamespaceRequest) =
-    gRPCClient.grpc_sync_request(wc.is_same_ns, req)
+    GRPCInferenceService.IsSameIPCNamespace(wc.chan, req; deadline = wc.probe_deadline)
 
 # A call that failed at its gRPC deadline: the connection stalled rather than refused. The probe
 # helpers below rethrow it so `_bounded` can reset the worker's connection (see there).
@@ -161,7 +130,7 @@ _deadline_exceeded(e) =
 # Returns the worker's ServerReadyResponse.ready, or false on any other transport error.
 function probe_ready(wc::WorkerClients)
     try
-        resp = gRPCClient.grpc_sync_request(wc.ready, ServerReadyRequest())
+        resp = GRPCInferenceService.ServerReady(wc.chan, ServerReadyRequest(); deadline = wc.probe_deadline)
         return resp.ready
     catch e
         _deadline_exceeded(e) && rethrow()
@@ -173,7 +142,7 @@ end
 # Returns the response, or `nothing` on any other transport error.
 function fetch_control_status(wc::WorkerClients)
     try
-        return gRPCClient.grpc_sync_request(wc.control_status, ModelControlStatusRequest())
+        return ControlService.ModelControlStatus(wc.chan, ModelControlStatusRequest(); deadline = wc.probe_deadline)
     catch e
         _deadline_exceeded(e) && rethrow()
         return nothing
@@ -184,7 +153,9 @@ end
 # `nothing` on any other transport error (so the caller can leave the worker's routes untouched).
 function discover_models(wc::WorkerClients)
     try
-        resp = gRPCClient.grpc_sync_request(wc.repo_index, RepositoryIndexRequest(; ready = true))
+        resp = GRPCInferenceService.RepositoryIndex(
+            wc.chan, RepositoryIndexRequest(; ready = true); deadline = wc.probe_deadline
+        )
         return String[m.name for m in resp.models if m.state == "READY"]
     catch e
         _deadline_exceeded(e) && rethrow()

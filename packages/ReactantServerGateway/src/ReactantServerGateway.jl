@@ -228,9 +228,8 @@ function probe_worker_ready(node_path::AbstractString, worker::Union{AbstractStr
     idx = findfirst(w -> _worker_name(w) == wname, workers)
     idx === nothing && throw(ConfigError("worker '$wname' not defined in node"))
     port = _worker_port(node, workers[idx], idx - 1)
-    client = GRPCInferenceService_ServerReady_Client("127.0.0.1", port; deadline = 5)
     try
-        resp = gRPCClient.grpc_sync_request(client, ServerReadyRequest())
+        resp = GRPCInferenceService.ServerReady("127.0.0.1", port, ServerReadyRequest(); deadline = 5)
         return resp.ready
     catch
         return false

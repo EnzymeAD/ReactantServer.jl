@@ -1200,57 +1200,111 @@ function PB._encoded_size(x::ModelControlStatusResponse)
 end
 
 # gRPCClient.jl BEGIN
-GatewayControlService_GetSchedulingStatus_Client(
-    host, port;
-    TRequest = GetSchedulingStatusRequest,
-    TResponse = GetSchedulingStatusResponse,
-    grpc = gRPCClient.grpc_global_handle(),
-    options...
-) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
-    host, port, "/reactant_control.GatewayControlService/GetSchedulingStatus";
-    grpc = grpc,
-    options...
-)
-export GatewayControlService_GetSchedulingStatus_Client
 
-GatewayControlService_SetSchedulingPolicy_Client(
-    host, port;
-    TRequest = SetSchedulingPolicyRequest,
-    TResponse = SetSchedulingPolicyResponse,
-    grpc = gRPCClient.grpc_global_handle(),
-    options...
-) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
-    host, port, "/reactant_control.GatewayControlService/SetSchedulingPolicy";
-    grpc = grpc,
-    options...
-)
-export GatewayControlService_SetSchedulingPolicy_Client
+baremodule GatewayControlService
+    import gRPCClient
+    import Base
 
-GatewayControlService_SetModelPlacement_Client(
-    host, port;
-    TRequest = SetModelPlacementRequest,
-    TResponse = SetModelPlacementResponse,
-    grpc = gRPCClient.grpc_global_handle(),
-    options...
-) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
-    host, port, "/reactant_control.GatewayControlService/SetModelPlacement";
-    grpc = grpc,
-    options...
-)
-export GatewayControlService_SetModelPlacement_Client
+    # Check compatibility between the loaded version of `gRPCClient` and
+    # the version used to generate this module (1.2.0).
+    gRPCClient.check_codegen_compat(Base.VersionNumber("1.2.0"))
 
-GatewayControlService_Repack_Client(
-    host, port;
-    TRequest = RepackRequest,
-    TResponse = RepackResponse,
-    grpc = gRPCClient.grpc_global_handle(),
-    options...
-) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
-    host, port, "/reactant_control.GatewayControlService/Repack";
-    grpc = grpc,
-    options...
-)
-export GatewayControlService_Repack_Client
+    const GetSchedulingStatusRequest::DataType = Base.parentmodule(GatewayControlService).GetSchedulingStatusRequest
+    const SetSchedulingPolicyRequest::DataType = Base.parentmodule(GatewayControlService).SetSchedulingPolicyRequest
+    const GetSchedulingStatusResponse::DataType = Base.parentmodule(GatewayControlService).GetSchedulingStatusResponse
+    const SetModelPlacementRequest::DataType = Base.parentmodule(GatewayControlService).SetModelPlacementRequest
+    const SetModelPlacementResponse::DataType = Base.parentmodule(GatewayControlService).SetModelPlacementResponse
+    const RepackRequest::DataType = Base.parentmodule(GatewayControlService).RepackRequest
+    const RepackResponse::DataType = Base.parentmodule(GatewayControlService).RepackResponse
+    const SetSchedulingPolicyResponse::DataType = Base.parentmodule(GatewayControlService).SetSchedulingPolicyResponse
+
+    # GatewayControlService.GetSchedulingStatus
+    Base.@inline function GetSchedulingStatus(chan::gRPCClient.gRPCChannel, req::GetSchedulingStatusRequest, args...; kws...)
+        return gRPCClient.grpc_call_unary(chan, typeof(GetSchedulingStatus), req, args...; kws...)
+    end
+    Base.@inline function GetSchedulingStatus(chan::gRPCClient.gRPCChannel, req::Base.Vector{UInt8}, args...; kws...)
+        return gRPCClient.grpc_call_unary(chan, typeof(GetSchedulingStatus), req, args...; kws...)
+    end
+    Base.@inline function GetSchedulingStatus(host::AbstractString, port::Integer, args...; kws...)
+        return GetSchedulingStatus(gRPCClient.gRPCChannel(host, port), args...; kws...)
+    end
+    gRPCClient.rpc_path(::Type{typeof(GetSchedulingStatus)}) = "/reactant_control.GatewayControlService/GetSchedulingStatus"
+    gRPCClient.isstreaming_request(::Type{typeof(GetSchedulingStatus)}) = false
+    gRPCClient.isstreaming_response(::Type{typeof(GetSchedulingStatus)}) = false
+    gRPCClient.request_type(::Type{typeof(GetSchedulingStatus)}) = GetSchedulingStatusRequest
+    gRPCClient.response_type(::Type{typeof(GetSchedulingStatus)}) = GetSchedulingStatusResponse
+    gRPCClient.request_type_displayname(::Type{typeof(GetSchedulingStatus)}) = "GetSchedulingStatusRequest"
+    gRPCClient.response_type_displayname(::Type{typeof(GetSchedulingStatus)}) = "GetSchedulingStatusResponse"
+    Base.@doc gRPCClient.grpc_generate_rpc_docstring(typeof(GetSchedulingStatus)) GetSchedulingStatus
+    export GetSchedulingStatus
+
+
+    # GatewayControlService.SetSchedulingPolicy
+    Base.@inline function SetSchedulingPolicy(chan::gRPCClient.gRPCChannel, req::SetSchedulingPolicyRequest, args...; kws...)
+        return gRPCClient.grpc_call_unary(chan, typeof(SetSchedulingPolicy), req, args...; kws...)
+    end
+    Base.@inline function SetSchedulingPolicy(chan::gRPCClient.gRPCChannel, req::Base.Vector{UInt8}, args...; kws...)
+        return gRPCClient.grpc_call_unary(chan, typeof(SetSchedulingPolicy), req, args...; kws...)
+    end
+    Base.@inline function SetSchedulingPolicy(host::AbstractString, port::Integer, args...; kws...)
+        return SetSchedulingPolicy(gRPCClient.gRPCChannel(host, port), args...; kws...)
+    end
+    gRPCClient.rpc_path(::Type{typeof(SetSchedulingPolicy)}) = "/reactant_control.GatewayControlService/SetSchedulingPolicy"
+    gRPCClient.isstreaming_request(::Type{typeof(SetSchedulingPolicy)}) = false
+    gRPCClient.isstreaming_response(::Type{typeof(SetSchedulingPolicy)}) = false
+    gRPCClient.request_type(::Type{typeof(SetSchedulingPolicy)}) = SetSchedulingPolicyRequest
+    gRPCClient.response_type(::Type{typeof(SetSchedulingPolicy)}) = SetSchedulingPolicyResponse
+    gRPCClient.request_type_displayname(::Type{typeof(SetSchedulingPolicy)}) = "SetSchedulingPolicyRequest"
+    gRPCClient.response_type_displayname(::Type{typeof(SetSchedulingPolicy)}) = "SetSchedulingPolicyResponse"
+    Base.@doc gRPCClient.grpc_generate_rpc_docstring(typeof(SetSchedulingPolicy)) SetSchedulingPolicy
+    export SetSchedulingPolicy
+
+
+    # GatewayControlService.SetModelPlacement
+    Base.@inline function SetModelPlacement(chan::gRPCClient.gRPCChannel, req::SetModelPlacementRequest, args...; kws...)
+        return gRPCClient.grpc_call_unary(chan, typeof(SetModelPlacement), req, args...; kws...)
+    end
+    Base.@inline function SetModelPlacement(chan::gRPCClient.gRPCChannel, req::Base.Vector{UInt8}, args...; kws...)
+        return gRPCClient.grpc_call_unary(chan, typeof(SetModelPlacement), req, args...; kws...)
+    end
+    Base.@inline function SetModelPlacement(host::AbstractString, port::Integer, args...; kws...)
+        return SetModelPlacement(gRPCClient.gRPCChannel(host, port), args...; kws...)
+    end
+    gRPCClient.rpc_path(::Type{typeof(SetModelPlacement)}) = "/reactant_control.GatewayControlService/SetModelPlacement"
+    gRPCClient.isstreaming_request(::Type{typeof(SetModelPlacement)}) = false
+    gRPCClient.isstreaming_response(::Type{typeof(SetModelPlacement)}) = false
+    gRPCClient.request_type(::Type{typeof(SetModelPlacement)}) = SetModelPlacementRequest
+    gRPCClient.response_type(::Type{typeof(SetModelPlacement)}) = SetModelPlacementResponse
+    gRPCClient.request_type_displayname(::Type{typeof(SetModelPlacement)}) = "SetModelPlacementRequest"
+    gRPCClient.response_type_displayname(::Type{typeof(SetModelPlacement)}) = "SetModelPlacementResponse"
+    Base.@doc gRPCClient.grpc_generate_rpc_docstring(typeof(SetModelPlacement)) SetModelPlacement
+    export SetModelPlacement
+
+
+    # GatewayControlService.Repack
+    Base.@inline function Repack(chan::gRPCClient.gRPCChannel, req::RepackRequest, args...; kws...)
+        return gRPCClient.grpc_call_unary(chan, typeof(Repack), req, args...; kws...)
+    end
+    Base.@inline function Repack(chan::gRPCClient.gRPCChannel, req::Base.Vector{UInt8}, args...; kws...)
+        return gRPCClient.grpc_call_unary(chan, typeof(Repack), req, args...; kws...)
+    end
+    Base.@inline function Repack(host::AbstractString, port::Integer, args...; kws...)
+        return Repack(gRPCClient.gRPCChannel(host, port), args...; kws...)
+    end
+    gRPCClient.rpc_path(::Type{typeof(Repack)}) = "/reactant_control.GatewayControlService/Repack"
+    gRPCClient.isstreaming_request(::Type{typeof(Repack)}) = false
+    gRPCClient.isstreaming_response(::Type{typeof(Repack)}) = false
+    gRPCClient.request_type(::Type{typeof(Repack)}) = RepackRequest
+    gRPCClient.response_type(::Type{typeof(Repack)}) = RepackResponse
+    gRPCClient.request_type_displayname(::Type{typeof(Repack)}) = "RepackRequest"
+    gRPCClient.response_type_displayname(::Type{typeof(Repack)}) = "RepackResponse"
+    Base.@doc gRPCClient.grpc_generate_rpc_docstring(typeof(Repack)) Repack
+    export Repack
+
+
+end # module GatewayControlService
+export GatewayControlService
+
 # gRPCClient.jl END
 # gRPCServer.jl BEGIN
 # reactant_control.GatewayControlService.GetSchedulingStatus (unary)
@@ -1462,57 +1516,111 @@ export register_GatewayControlService!
 # gRPCServer.jl END
 
 # gRPCClient.jl BEGIN
-ControlService_ModelControlStatus_Client(
-    host, port;
-    TRequest = ModelControlStatusRequest,
-    TResponse = ModelControlStatusResponse,
-    grpc = gRPCClient.grpc_global_handle(),
-    options...
-) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
-    host, port, "/reactant_control.ControlService/ModelControlStatus";
-    grpc = grpc,
-    options...
-)
-export ControlService_ModelControlStatus_Client
 
-ControlService_SetModelResidency_Client(
-    host, port;
-    TRequest = SetModelResidencyRequest,
-    TResponse = SetModelResidencyResponse,
-    grpc = gRPCClient.grpc_global_handle(),
-    options...
-) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
-    host, port, "/reactant_control.ControlService/SetModelResidency";
-    grpc = grpc,
-    options...
-)
-export ControlService_SetModelResidency_Client
+baremodule ControlService
+    import gRPCClient
+    import Base
 
-ControlService_SetModelPolicy_Client(
-    host, port;
-    TRequest = SetModelPolicyRequest,
-    TResponse = SetModelPolicyResponse,
-    grpc = gRPCClient.grpc_global_handle(),
-    options...
-) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
-    host, port, "/reactant_control.ControlService/SetModelPolicy";
-    grpc = grpc,
-    options...
-)
-export ControlService_SetModelPolicy_Client
+    # Check compatibility between the loaded version of `gRPCClient` and
+    # the version used to generate this module (1.2.0).
+    gRPCClient.check_codegen_compat(Base.VersionNumber("1.2.0"))
 
-ControlService_CompactMemory_Client(
-    host, port;
-    TRequest = CompactMemoryRequest,
-    TResponse = CompactMemoryResponse,
-    grpc = gRPCClient.grpc_global_handle(),
-    options...
-) = gRPCClient.gRPCServiceClient{TRequest, false, TResponse, false}(
-    host, port, "/reactant_control.ControlService/CompactMemory";
-    grpc = grpc,
-    options...
-)
-export ControlService_CompactMemory_Client
+    const ModelControlStatusResponse::DataType = Base.parentmodule(ControlService).ModelControlStatusResponse
+    const SetModelResidencyResponse::DataType = Base.parentmodule(ControlService).SetModelResidencyResponse
+    const SetModelPolicyRequest::DataType = Base.parentmodule(ControlService).SetModelPolicyRequest
+    const CompactMemoryResponse::DataType = Base.parentmodule(ControlService).CompactMemoryResponse
+    const SetModelPolicyResponse::DataType = Base.parentmodule(ControlService).SetModelPolicyResponse
+    const SetModelResidencyRequest::DataType = Base.parentmodule(ControlService).SetModelResidencyRequest
+    const CompactMemoryRequest::DataType = Base.parentmodule(ControlService).CompactMemoryRequest
+    const ModelControlStatusRequest::DataType = Base.parentmodule(ControlService).ModelControlStatusRequest
+
+    # ControlService.ModelControlStatus
+    Base.@inline function ModelControlStatus(chan::gRPCClient.gRPCChannel, req::ModelControlStatusRequest, args...; kws...)
+        return gRPCClient.grpc_call_unary(chan, typeof(ModelControlStatus), req, args...; kws...)
+    end
+    Base.@inline function ModelControlStatus(chan::gRPCClient.gRPCChannel, req::Base.Vector{UInt8}, args...; kws...)
+        return gRPCClient.grpc_call_unary(chan, typeof(ModelControlStatus), req, args...; kws...)
+    end
+    Base.@inline function ModelControlStatus(host::AbstractString, port::Integer, args...; kws...)
+        return ModelControlStatus(gRPCClient.gRPCChannel(host, port), args...; kws...)
+    end
+    gRPCClient.rpc_path(::Type{typeof(ModelControlStatus)}) = "/reactant_control.ControlService/ModelControlStatus"
+    gRPCClient.isstreaming_request(::Type{typeof(ModelControlStatus)}) = false
+    gRPCClient.isstreaming_response(::Type{typeof(ModelControlStatus)}) = false
+    gRPCClient.request_type(::Type{typeof(ModelControlStatus)}) = ModelControlStatusRequest
+    gRPCClient.response_type(::Type{typeof(ModelControlStatus)}) = ModelControlStatusResponse
+    gRPCClient.request_type_displayname(::Type{typeof(ModelControlStatus)}) = "ModelControlStatusRequest"
+    gRPCClient.response_type_displayname(::Type{typeof(ModelControlStatus)}) = "ModelControlStatusResponse"
+    Base.@doc gRPCClient.grpc_generate_rpc_docstring(typeof(ModelControlStatus)) ModelControlStatus
+    export ModelControlStatus
+
+
+    # ControlService.SetModelResidency
+    Base.@inline function SetModelResidency(chan::gRPCClient.gRPCChannel, req::SetModelResidencyRequest, args...; kws...)
+        return gRPCClient.grpc_call_unary(chan, typeof(SetModelResidency), req, args...; kws...)
+    end
+    Base.@inline function SetModelResidency(chan::gRPCClient.gRPCChannel, req::Base.Vector{UInt8}, args...; kws...)
+        return gRPCClient.grpc_call_unary(chan, typeof(SetModelResidency), req, args...; kws...)
+    end
+    Base.@inline function SetModelResidency(host::AbstractString, port::Integer, args...; kws...)
+        return SetModelResidency(gRPCClient.gRPCChannel(host, port), args...; kws...)
+    end
+    gRPCClient.rpc_path(::Type{typeof(SetModelResidency)}) = "/reactant_control.ControlService/SetModelResidency"
+    gRPCClient.isstreaming_request(::Type{typeof(SetModelResidency)}) = false
+    gRPCClient.isstreaming_response(::Type{typeof(SetModelResidency)}) = false
+    gRPCClient.request_type(::Type{typeof(SetModelResidency)}) = SetModelResidencyRequest
+    gRPCClient.response_type(::Type{typeof(SetModelResidency)}) = SetModelResidencyResponse
+    gRPCClient.request_type_displayname(::Type{typeof(SetModelResidency)}) = "SetModelResidencyRequest"
+    gRPCClient.response_type_displayname(::Type{typeof(SetModelResidency)}) = "SetModelResidencyResponse"
+    Base.@doc gRPCClient.grpc_generate_rpc_docstring(typeof(SetModelResidency)) SetModelResidency
+    export SetModelResidency
+
+
+    # ControlService.SetModelPolicy
+    Base.@inline function SetModelPolicy(chan::gRPCClient.gRPCChannel, req::SetModelPolicyRequest, args...; kws...)
+        return gRPCClient.grpc_call_unary(chan, typeof(SetModelPolicy), req, args...; kws...)
+    end
+    Base.@inline function SetModelPolicy(chan::gRPCClient.gRPCChannel, req::Base.Vector{UInt8}, args...; kws...)
+        return gRPCClient.grpc_call_unary(chan, typeof(SetModelPolicy), req, args...; kws...)
+    end
+    Base.@inline function SetModelPolicy(host::AbstractString, port::Integer, args...; kws...)
+        return SetModelPolicy(gRPCClient.gRPCChannel(host, port), args...; kws...)
+    end
+    gRPCClient.rpc_path(::Type{typeof(SetModelPolicy)}) = "/reactant_control.ControlService/SetModelPolicy"
+    gRPCClient.isstreaming_request(::Type{typeof(SetModelPolicy)}) = false
+    gRPCClient.isstreaming_response(::Type{typeof(SetModelPolicy)}) = false
+    gRPCClient.request_type(::Type{typeof(SetModelPolicy)}) = SetModelPolicyRequest
+    gRPCClient.response_type(::Type{typeof(SetModelPolicy)}) = SetModelPolicyResponse
+    gRPCClient.request_type_displayname(::Type{typeof(SetModelPolicy)}) = "SetModelPolicyRequest"
+    gRPCClient.response_type_displayname(::Type{typeof(SetModelPolicy)}) = "SetModelPolicyResponse"
+    Base.@doc gRPCClient.grpc_generate_rpc_docstring(typeof(SetModelPolicy)) SetModelPolicy
+    export SetModelPolicy
+
+
+    # ControlService.CompactMemory
+    Base.@inline function CompactMemory(chan::gRPCClient.gRPCChannel, req::CompactMemoryRequest, args...; kws...)
+        return gRPCClient.grpc_call_unary(chan, typeof(CompactMemory), req, args...; kws...)
+    end
+    Base.@inline function CompactMemory(chan::gRPCClient.gRPCChannel, req::Base.Vector{UInt8}, args...; kws...)
+        return gRPCClient.grpc_call_unary(chan, typeof(CompactMemory), req, args...; kws...)
+    end
+    Base.@inline function CompactMemory(host::AbstractString, port::Integer, args...; kws...)
+        return CompactMemory(gRPCClient.gRPCChannel(host, port), args...; kws...)
+    end
+    gRPCClient.rpc_path(::Type{typeof(CompactMemory)}) = "/reactant_control.ControlService/CompactMemory"
+    gRPCClient.isstreaming_request(::Type{typeof(CompactMemory)}) = false
+    gRPCClient.isstreaming_response(::Type{typeof(CompactMemory)}) = false
+    gRPCClient.request_type(::Type{typeof(CompactMemory)}) = CompactMemoryRequest
+    gRPCClient.response_type(::Type{typeof(CompactMemory)}) = CompactMemoryResponse
+    gRPCClient.request_type_displayname(::Type{typeof(CompactMemory)}) = "CompactMemoryRequest"
+    gRPCClient.response_type_displayname(::Type{typeof(CompactMemory)}) = "CompactMemoryResponse"
+    Base.@doc gRPCClient.grpc_generate_rpc_docstring(typeof(CompactMemory)) CompactMemory
+    export CompactMemory
+
+
+end # module ControlService
+export ControlService
+
 # gRPCClient.jl END
 # gRPCServer.jl BEGIN
 # reactant_control.ControlService.ModelControlStatus (unary)
