@@ -114,49 +114,48 @@ tree before committing so the diff stays clean.
 
 ## Regenerating the protobuf bindings
 
-The KServe V2 messages and gRPC service stubs in
-`packages/ReactantServerCore/src/proto/inference/` are generated from
-`proto_src/grpc_predict_v2.proto` with ProtoBuf.jl. Load gRPCServer and gRPCClient alongside
-ProtoBuf so both the server method builders / `register_GRPCInferenceService!` and the client
-constructors are emitted, and keep `add_kwarg_constructors=true` (the handlers and codec build
-messages with keyword arguments):
+The KServe V2 messages (`proto_src/grpc_predict_v2.proto`) and the control plane
+(`proto_src/reactant_control_v1.proto`) are generated with ProtoBuf.jl. Generate both into a scratch
+directory with gRPCServer and gRPCClient loaded, so the server method builders
+(`register_<Service>!`) and the client service modules are both emitted. Register the gRPCClient
+generator with `legacy = false` so it emits only the per-service modules (`GRPCInferenceService`,
+`ControlService`, `GatewayControlService`, one function per RPC) and not the old
+`<Service>_<Rpc>_Client` constructors. Both packages export `grpc_register_service_codegen`, so
+qualify it. Keep `add_kwarg_constructors=true` (the handlers and codec build messages with keyword
+arguments):
 
 ```julia
 using ProtoBuf, gRPCServer, gRPCClient
-ProtoBuf.protojl("grpc_predict_v2.proto", "proto_src", "packages/ReactantServerCore/src/proto";
-    always_use_modules=true, add_kwarg_constructors=true)
+gRPCClient.grpc_register_service_codegen(legacy = false)
+for f in ("grpc_predict_v2.proto", "reactant_control_v1.proto")
+    ProtoBuf.protojl(f, "proto_src", "<scratch dir>"; always_use_modules=true, add_kwarg_constructors=true)
+end
 ```
 
-The generated file is then split so `ReactantServerCore` compiles only the messages (no gRPC
-dependency): the messages stay in `grpc_predict_v2_pb.jl`, while the gRPCClient and gRPCServer
-service stubs are extracted into `grpc_client_stubs.jl` and `grpc_server_stubs.jl`, which
-`ReactantServerCore` ships but does not compile. Each consumer includes the stub file it needs
-(client stubs in the client and gateway; server stubs in the worker and gateway) via
-`ReactantServerCore.inference_client_stubs_path()` / `inference_server_stubs_path()`.
+Each generated `_pb.jl` holds the messages, then a `# gRPCClient.jl BEGIN`/`END` block and a
+`# gRPCServer.jl BEGIN`/`END` block per service. Each package keeps only what it uses, so copy the
+file in whole or with blocks removed:
 
-The control-plane bindings in `packages/ReactantServerCore/src/proto/control/` are generated the same
-way from `proto_src/reactant_control_v1.proto`:
+| Package | `inference` | `control` |
+|---------|-------------|-----------|
+| `ReactantServerCore` | messages only | messages only |
+| `ReactantServer` (worker) | messages + gRPCServer | messages + gRPCServer |
+| `ReactantServerClient` | messages + gRPCClient | not used |
+| `ReactantServerGateway` | whole file | whole file |
 
-```julia
-using ProtoBuf, gRPCServer, gRPCClient
-ProtoBuf.protojl("reactant_control_v1.proto", "proto_src", "<scratch dir>";
-    always_use_modules=true, add_kwarg_constructors=true)
-```
+When removing a generator's blocks, also remove the `import gRPCClient` or `import gRPCServer` /
+`using gRPCServer: GRPCServer` lines it adds at the top; `ReactantServerCore` must not gain a gRPC
+dependency. The control proto declares two services, so it has two blocks per generator.
+The generator names the control module `reactant_control`; each package's hand-written `control.jl`
+wrapper exposes it as `control`.
 
-Generate into a scratch directory rather than over the real one, because the split here is manual and
-the two stub files are hand-maintained:
+The worker's tests call the worker with the generated client, which the worker package does not
+ship: `packages/ReactantServer/test/proto/grpc_inference_client.jl` holds the inference
+`# gRPCClient.jl` block alone, behind a short provenance header.
 
-1. The messages-only body (everything before the first `# gRPCClient.jl BEGIN` marker) becomes
-   `reactant_control_v1_pb.jl`, **minus** the `import gRPCClient` / `import gRPCServer` lines the
-   generator adds when a file declares services. `ReactantServerCore` must not gain a gRPC dependency.
-   Message order changes when you add a message (the generator emits them in topological order so a
-   nested-message field is defined before its use), so expect a large, mostly-cosmetic diff.
-2. This proto declares two services, `ControlService` (answered by workers) and
-   `GatewayControlService` (answered by the gateway), so the generator emits **two** BEGIN/END blocks
-   per generator, in an order that does not follow the proto. Match them by content, not position.
-   Move the `<Service>_<Rpc>_Method` builders and `register_<Service>!` into
-   `control_server_stubs.jl` and the `<Service>_<Rpc>_Client` constructors into
-   `control_client_stubs.jl`, preserving the hand-tuned deadlines already in those files.
+Message order changes when you add a message (the generator emits them in topological order so a
+nested-message field is defined before its use), so expect a large, mostly cosmetic diff. Run
+`runic --inplace` over the copied files.
 
 ## The production image lock
 

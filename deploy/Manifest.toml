@@ -2,7 +2,7 @@
 
 julia_version = "1.12.7"
 manifest_format = "2.0"
-project_hash = "229cb2630d705b204646f4a1291a58e74214745f"
+project_hash = "c148703699f9982bf124b2dfd996ab4c091fe0ab"
 
 [[deps.Adapt]]
 deps = ["LinearAlgebra"]
@@ -896,9 +896,9 @@ version = "1.3.1+2"
 
 [[deps.gRPCClient]]
 deps = ["FileWatching", "LibCURL", "PrecompileTools", "ProtoBuf"]
-git-tree-sha1 = "9aa4ff88ef75a8528b5d418338fd9dd48d4a5175"
+git-tree-sha1 = "2177680fbfe763c14fd27db9d8b7896f01e2df69"
 uuid = "aaca4a50-36af-4a1d-b878-4c443f2061ad"
-version = "1.1.2"
+version = "1.2.0"
 
 [[deps.gRPCServer]]
 deps = ["Base64", "CodecZlib", "Dates", "HTTP", "Logging", "PrecompileTools", "ProtoBuf", "Reseau", "Sockets", "TranscodingStreams", "UUIDs"]

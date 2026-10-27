@@ -7,14 +7,11 @@
 import ProtoBuf
 import gRPCClient
 
-const _GW_CONTROL = "/reactant_control.GatewayControlService"
-
-_ctl_call(reqT, respT, rpc, port, req; deadline = 30) =
-    grpc_call(reqT, respT, rpc, port, req; service = _GW_CONTROL, deadline = deadline)
+# A GatewayControlService call; the gateway may be asked to do a bounded wait, so allow 30s.
+_ctl_call(rpc, port, req; deadline = 30) = grpc_call(rpc, port, req; deadline = deadline)
 
 _status(port) = _ctl_call(
-    ACtl.GetSchedulingStatusRequest, ACtl.GetSchedulingStatusResponse,
-    "GetSchedulingStatus", port, ACtl.GetSchedulingStatusRequest()
+    ACtl.GatewayControlService.GetSchedulingStatus, port, ACtl.GetSchedulingStatusRequest()
 )
 
 # gRPC status of a failed call, for the negative paths.
@@ -128,8 +125,7 @@ end
         @testset "SetSchedulingPolicy is all-or-nothing" begin
             before = GW.knobs(aff)
             resp = _ctl_call(
-                ACtl.SetSchedulingPolicyRequest, ACtl.SetSchedulingPolicyResponse,
-                "SetSchedulingPolicy", gw_port,
+                ACtl.GatewayControlService.SetSchedulingPolicy, gw_port,
                 ACtl.SetSchedulingPolicyRequest(;
                     update_mask = ["hysteresis", "routing_policy", "compaction_interval"],
                     policy = ACtl.SchedulingPolicy(;
@@ -151,8 +147,7 @@ end
             # The work basis travels the same path, so an operator can change what "least busy" means
             # on a running fleet (the whole point of it being a knob rather than a startup setting).
             resp2 = _ctl_call(
-                ACtl.SetSchedulingPolicyRequest, ACtl.SetSchedulingPolicyResponse,
-                "SetSchedulingPolicy", gw_port,
+                ACtl.GatewayControlService.SetSchedulingPolicy, gw_port,
                 ACtl.SetSchedulingPolicyRequest(;
                     update_mask = ["work_basis"],
                     policy = ACtl.SchedulingPolicy(; work_basis = "items")
@@ -162,8 +157,7 @@ end
             @test GW.knobs(aff).work_basis === :items
             @test _ctl_status(
                 () -> _ctl_call(
-                    ACtl.SetSchedulingPolicyRequest,
-                    ACtl.SetSchedulingPolicyResponse, "SetSchedulingPolicy", gw_port,
+                    ACtl.GatewayControlService.SetSchedulingPolicy, gw_port,
                     ACtl.SetSchedulingPolicyRequest(;
                         update_mask = ["work_basis"],
                         policy = ACtl.SchedulingPolicy(; work_basis = "gpu_seconds")
@@ -173,8 +167,7 @@ end
                 gRPCClient.GRPC_INVALID_ARGUMENT
             @test GW.knobs(aff).work_basis === :items           # rejected, live knobs untouched
             _ctl_call(
-                ACtl.SetSchedulingPolicyRequest, ACtl.SetSchedulingPolicyResponse,
-                "SetSchedulingPolicy", gw_port,
+                ACtl.GatewayControlService.SetSchedulingPolicy, gw_port,
                 ACtl.SetSchedulingPolicyRequest(;
                     update_mask = ["work_basis"],
                     policy = ACtl.SchedulingPolicy(; work_basis = "compute")
@@ -185,8 +178,7 @@ end
             held = GW.knobs(aff)
             @test _ctl_status(
                 () -> _ctl_call(
-                    ACtl.SetSchedulingPolicyRequest,
-                    ACtl.SetSchedulingPolicyResponse, "SetSchedulingPolicy", gw_port,
+                    ACtl.GatewayControlService.SetSchedulingPolicy, gw_port,
                     ACtl.SetSchedulingPolicyRequest(;
                         update_mask = ["hysteresis", "routing_fill_factor"],
                         policy = ACtl.SchedulingPolicy(; hysteresis = 1.5, routing_fill_factor = 2.0)
@@ -199,8 +191,7 @@ end
             for mask in (String[], ["nope"], ["max_worker_share"], ["mode"])
                 @test _ctl_status(
                     () -> _ctl_call(
-                        ACtl.SetSchedulingPolicyRequest,
-                        ACtl.SetSchedulingPolicyResponse, "SetSchedulingPolicy", gw_port,
+                        ACtl.GatewayControlService.SetSchedulingPolicy, gw_port,
                         ACtl.SetSchedulingPolicyRequest(;
                             update_mask = mask,
                             policy = ACtl.SchedulingPolicy(; hysteresis = 0.1)
@@ -212,8 +203,7 @@ end
 
             # Changing the halflife warns that existing EWMA history is not recomputed.
             resp = _ctl_call(
-                ACtl.SetSchedulingPolicyRequest, ACtl.SetSchedulingPolicyResponse,
-                "SetSchedulingPolicy", gw_port,
+                ACtl.GatewayControlService.SetSchedulingPolicy, gw_port,
                 ACtl.SetSchedulingPolicyRequest(;
                     update_mask = ["ema_halflife_compute_seconds"],
                     policy = ACtl.SchedulingPolicy(; ema_halflife_compute_seconds = 5.0)
@@ -225,8 +215,7 @@ end
             # ...and 0 means "track the rebalance interval", exactly as in gateway.yml, rather than
             # being rejected as out of range (the stored knob is the resolved value).
             resp = _ctl_call(
-                ACtl.SetSchedulingPolicyRequest, ACtl.SetSchedulingPolicyResponse,
-                "SetSchedulingPolicy", gw_port,
+                ACtl.GatewayControlService.SetSchedulingPolicy, gw_port,
                 ACtl.SetSchedulingPolicyRequest(;
                     update_mask = ["ema_halflife_compute_seconds"],
                     policy = ACtl.SchedulingPolicy(; ema_halflife_compute_seconds = 0.0)
@@ -238,8 +227,7 @@ end
 
         @testset "SetModelPlacement promotes a model and reports the effect" begin
             resp = _ctl_call(
-                ACtl.SetModelPlacementRequest, ACtl.SetModelPlacementResponse,
-                "SetModelPlacement", gw_port,
+                ACtl.GatewayControlService.SetModelPlacement, gw_port,
                 ACtl.SetModelPlacementRequest(;
                     name = "alpha", replicas = Int64(2),
                     fill_factor = -1.0
@@ -254,8 +242,7 @@ end
 
             # Above the fleet size: accepted and clamped, with the clamp reported rather than an error.
             resp = _ctl_call(
-                ACtl.SetModelPlacementRequest, ACtl.SetModelPlacementResponse,
-                "SetModelPlacement", gw_port,
+                ACtl.GatewayControlService.SetModelPlacement, gw_port,
                 ACtl.SetModelPlacementRequest(;
                     name = "beta", replicas = Int64(5),
                     fill_factor = -1.0
@@ -267,8 +254,7 @@ end
             # A typo is NOT_FOUND, unless the caller is deliberately pre-seeding.
             @test _ctl_status(
                 () -> _ctl_call(
-                    ACtl.SetModelPlacementRequest,
-                    ACtl.SetModelPlacementResponse, "SetModelPlacement", gw_port,
+                    ACtl.GatewayControlService.SetModelPlacement, gw_port,
                     ACtl.SetModelPlacementRequest(;
                         name = "nope", replicas = Int64(2),
                         fill_factor = -1.0
@@ -276,8 +262,7 @@ end
                 )
             ) == gRPCClient.GRPC_NOT_FOUND
             resp = _ctl_call(
-                ACtl.SetModelPlacementRequest, ACtl.SetModelPlacementResponse,
-                "SetModelPlacement", gw_port,
+                ACtl.GatewayControlService.SetModelPlacement, gw_port,
                 ACtl.SetModelPlacementRequest(;
                     name = "nope", replicas = Int64(2),
                     fill_factor = -1.0, allow_unknown_model = true
@@ -289,8 +274,7 @@ end
             # The per-model fill fields are independent of the replica count, and selecting the legacy
             # basis returns the parking warning.
             resp = _ctl_call(
-                ACtl.SetModelPlacementRequest, ACtl.SetModelPlacementResponse,
-                "SetModelPlacement", gw_port,
+                ACtl.GatewayControlService.SetModelPlacement, gw_port,
                 ACtl.SetModelPlacementRequest(;
                     name = "alpha", replicas = Int64(2),
                     fill_mode = "inflight", fill_factor = 0.5
@@ -302,8 +286,7 @@ end
 
             # ...and clearing puts it back on the fleet default.
             resp = _ctl_call(
-                ACtl.SetModelPlacementRequest, ACtl.SetModelPlacementResponse,
-                "SetModelPlacement", gw_port,
+                ACtl.GatewayControlService.SetModelPlacement, gw_port,
                 ACtl.SetModelPlacementRequest(;
                     name = "alpha", replicas = Int64(2),
                     fill_mode = "inherit", fill_factor = 0.0
@@ -320,7 +303,7 @@ end
                 first_rebalance_compute_seconds = 0.0
             )
             resp = _ctl_call(
-                ACtl.RepackRequest, ACtl.RepackResponse, "Repack", gw_port,
+                ACtl.GatewayControlService.Repack, gw_port,
                 ACtl.RepackRequest(; wait_seconds = 10.0); deadline = 40
             )
             @test resp.completed
@@ -341,14 +324,13 @@ end
 
             # wait_seconds = 0 queues without waiting.
             resp = _ctl_call(
-                ACtl.RepackRequest, ACtl.RepackResponse, "Repack", gw_port,
+                ACtl.GatewayControlService.Repack, gw_port,
                 ACtl.RepackRequest(; wait_seconds = 0.0)
             )
             @test resp.sequence == 2 && !resp.completed
             @test _ctl_status(
                 () -> _ctl_call(
-                    ACtl.RepackRequest, ACtl.RepackResponse, "Repack",
-                    gw_port, ACtl.RepackRequest(; wait_seconds = -1.0)
+                    ACtl.GatewayControlService.Repack, gw_port, ACtl.RepackRequest(; wait_seconds = -1.0)
                 )
             ) ==
                 gRPCClient.GRPC_INVALID_ARGUMENT
@@ -358,9 +340,7 @@ end
             # Two services on one router must stay path-namespaced: CompactMemory is the gateway's
             # pre-existing control RPC and fans out to every worker.
             resp = grpc_call(
-                ACtl.CompactMemoryRequest, ACtl.CompactMemoryResponse, "CompactMemory",
-                gw_port, ACtl.CompactMemoryRequest(; reload_models = String[]);
-                service = "/reactant_control.ControlService"
+                ACtl.ControlService.CompactMemory, gw_port, ACtl.CompactMemoryRequest(; reload_models = String[])
             )
             @test resp.reloaded_models == 0
         end
@@ -407,15 +387,13 @@ end
 
         @test _ctl_status(
             () -> _ctl_call(
-                ACtl.RepackRequest, ACtl.RepackResponse, "Repack",
-                gw_port, ACtl.RepackRequest(; wait_seconds = 0.0)
+                ACtl.GatewayControlService.Repack, gw_port, ACtl.RepackRequest(; wait_seconds = 0.0)
             )
         ) ==
             gRPCClient.GRPC_FAILED_PRECONDITION
         @test _ctl_status(
             () -> _ctl_call(
-                ACtl.SetModelPlacementRequest,
-                ACtl.SetModelPlacementResponse, "SetModelPlacement", gw_port,
+                ACtl.GatewayControlService.SetModelPlacement, gw_port,
                 ACtl.SetModelPlacementRequest(;
                     name = "alpha", replicas = Int64(2),
                     fill_factor = -1.0
@@ -425,8 +403,7 @@ end
             gRPCClient.GRPC_FAILED_PRECONDITION
         @test _ctl_status(
             () -> _ctl_call(
-                ACtl.SetSchedulingPolicyRequest,
-                ACtl.SetSchedulingPolicyResponse, "SetSchedulingPolicy", gw_port,
+                ACtl.GatewayControlService.SetSchedulingPolicy, gw_port,
                 ACtl.SetSchedulingPolicyRequest(;
                     update_mask = ["hysteresis"],
                     policy = ACtl.SchedulingPolicy(; hysteresis = 0.2)

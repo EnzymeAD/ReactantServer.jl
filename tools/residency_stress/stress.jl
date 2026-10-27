@@ -130,24 +130,23 @@ end
 
 # ---- requests -------------------------------------------------------------------------------------
 
-const _SVC = "/inference.GRPCInferenceService/ModelInfer"
 const GRPC = Ref{Any}(nothing)
 host_port(t) = (i = findlast(==(':'), t); (t[1:(i - 1)], parse(Int, t[(i + 1):end])))
 
+# A channel for ModelInfer calls to the target; pass it to `infer`.
 function infer_client(o::Opts, deadline)
     h, p = host_port(o.target)
-    return gRPCClient.gRPCServiceClient{Inf_.ModelInferRequest, false, Inf_.ModelInferResponse, false}(
-        h, p, _SVC; grpc = GRPC[], deadline = deadline,
+    return gRPCClient.gRPCChannel(
+        h, p; grpc = GRPC[], deadline = deadline,
         max_send_message_length = 256 << 20, max_recieve_message_length = 256 << 20
     )
 end
+infer(client::gRPCClient.gRPCChannel, req) = Inf_.GRPCInferenceService.ModelInfer(client, req)
 
 function compact!(o::Opts, reload::Vector{String})
     h, p = host_port(o.target)
-    c = gRPCClient.gRPCServiceClient{Ctl.CompactMemoryRequest, false, Ctl.CompactMemoryResponse, false}(
-        h, p, "/reactant_control.ControlService/CompactMemory"; grpc = GRPC[], deadline = 300
-    )
-    return gRPCClient.grpc_sync_request(c, Ctl.CompactMemoryRequest(; reload_models = reload))
+    chan = gRPCClient.gRPCChannel(h, p; grpc = GRPC[], deadline = 300)
+    return Ctl.ControlService.CompactMemory(chan, Ctl.CompactMemoryRequest(; reload_models = reload))
 end
 
 errmsg(e) = e isa gRPCClient.gRPCServiceCallException ? "grpc $(e.grpc_status): $(e.message)" : sprint(showerror, e)
@@ -255,7 +254,7 @@ function fire(o::Opts, m::Model, client, rng; rows = rand(rng, 1:o.max_rows))
     t0 = time()
     local resp
     try
-        resp = gRPCClient.grpc_sync_request(client, req)
+        resp = infer(client, req)
     catch e
         atomic_add!(INFLIGHT, -1)
         lat = time() - t0
@@ -427,7 +426,7 @@ function do_remove_add(o::Opts, rng)
         client = infer_client(o, 30)
         try
             req, _ = m.cat["kind"] == "checksum" ? checksum_request(m, m.name, 1, Xoshiro(1)) : (bit_request(m, m.name), nothing)
-            gRPCClient.grpc_sync_request(client, req)
+            infer(client, req)
             finding!("NOTUNLOADED", m.name, "still answering $(o.settle)s after its bundle was removed")
         catch e
             is_absent(e) || finding!("ERROR", m.name, "after removal: " * first(errmsg(e), 300))

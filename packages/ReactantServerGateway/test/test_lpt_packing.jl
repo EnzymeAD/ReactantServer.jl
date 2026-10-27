@@ -877,14 +877,13 @@ end
     end
 
     grpc = gRPCClient.gRPCCURL(; sticky = true)
-    client = gRPCClient.gRPCServiceClient{Vector{UInt8}, false, Vector{UInt8}, false}(
-        "127.0.0.1", port, "/probe.Svc/Call"; grpc = grpc, deadline = 0.5
-    )
-    # Returns (whether the call returned within `cap`, the exception it threw).
+    chan = gRPCClient.gRPCChannel("127.0.0.1", port; grpc = grpc, deadline = 0.5)
+    # Returns (whether the call returned within `cap`, the exception it threw). The server never
+    # answers, so which RPC is called does not matter.
     bounded_call(cap) = begin
         err = Ref{Any}(nothing)
         t = @async try
-            gRPCClient.grpc_sync_request(client, UInt8[0x00, 0x00, 0x00, 0x00, 0x00])
+            AInf.GRPCInferenceService.ServerReady(chan, UInt8[0x00, 0x00, 0x00, 0x00, 0x00], Vector{UInt8})
         catch e
             err[] = e
         end
@@ -901,7 +900,7 @@ end
         @test expired(err)
     end
 
-    wc = GW.WorkerClients("127.0.0.1:$port", grpc, client, client, client, client, client, client, client, client)
+    wc = GW.WorkerClients("127.0.0.1:$port", grpc, chan, 0.5, 0.5)
     GW.reset_clients!(wc)                    # close + reopen the handle: drops the poisoned connection
 
     status, err = bounded_call(3.0)          # fresh connection: still bounded by the deadline
@@ -925,10 +924,8 @@ end
     catch
     end
     grpc = gRPCClient.gRPCCURL(; sticky = true)
-    client = gRPCClient.gRPCServiceClient{Vector{UInt8}, false, Vector{UInt8}, false}(
-        "127.0.0.1", port, "/inference.GRPCInferenceService/ModelInfer"; grpc = grpc, deadline = 10
-    )
-    wc = GW.WorkerClients("127.0.0.1:$port", grpc, client, client, client, client, client, client, client, client)
+    chan = gRPCClient.gRPCChannel("127.0.0.1", port; grpc = grpc, deadline = 10)
+    wc = GW.WorkerClients("127.0.0.1:$port", grpc, chan, 10.0, 10.0)
     call() = try
         GW.invoke_infer(wc, UInt8[0x0a, 0x01, 0x61])
     catch e
@@ -964,8 +961,8 @@ end
     end
     workers(p) = begin
         grpc = gRPCClient.gRPCCURL(; sticky = true)
-        ctl = GW.ControlService_ModelControlStatus_Client("127.0.0.1", p; grpc = grpc, deadline = 0.5)
-        GW.WorkerClients("127.0.0.1:$p", grpc, ctl, ctl, ctl, ctl, ctl, ctl, ctl, ctl)
+        chan = gRPCClient.gRPCChannel("127.0.0.1", p; grpc = grpc)
+        GW.WorkerClients("127.0.0.1:$p", grpc, chan, 0.5, 0.5)   # 0.5s probe deadline
     end
     poll(wc) = GW._bounded(() -> GW.fetch_control_status(wc), 3.0, nothing, "ModelControlStatus poll", wc.url; level = :debug)
 
@@ -1059,8 +1056,7 @@ function _aff_server(port::Integer, w::AffMockWorker)
 end
 
 _aff_infer(port, model) = grpc_call(
-    AInf.ModelInferRequest, AInf.ModelInferResponse, "ModelInfer",
-    port, AInf.ModelInferRequest(; model_name = model)
+    AInf.GRPCInferenceService.ModelInfer, port, AInf.ModelInferRequest(; model_name = model)
 )
 
 function _aff_gatewayfile(gw_port, admin_port, worker_ports)

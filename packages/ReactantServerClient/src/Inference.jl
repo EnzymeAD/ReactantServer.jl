@@ -542,15 +542,16 @@ function _run_chunk(m, io, pool, fill_lock, r, slot)
         response = GC.@preserve pool begin
             _send_with_shm_recovery(m, pool) do
                 _infer_with_retry(m) do budget_s
-                    grpc_sync_request(
-                        grpc_infer_client(m, budget_s),
+                    GRPCInferenceService.ModelInfer(
+                        m.chan,
                         ModelInferRequest(
                             model_name = model_name(m),
                             inputs = materialized,
                             outputs = requested,
                             parameters = _request_deadline_params(budget_s),
                             raw_input_contents = raws,
-                        ),
+                        );
+                        deadline = budget_s,
                     )
                 end
             end
@@ -617,13 +618,14 @@ function infer_sync(m::AbstractInferenceModel, network_inputs)
         "and use infer_async or infer_sync(model, io) to stage through the buffer pool and send " *
         "raw bytes" maxlog = 1
     return _infer_with_retry(m) do budget_s
-        grpc_sync_request(
-            grpc_infer_client(m, budget_s),
+        GRPCInferenceService.ModelInfer(
+            m.chan,
             ModelInferRequest(
                 model_name = model_name(m),
                 inputs = network_inputs,
                 parameters = _request_deadline_params(budget_s),
-            ),
+            );
+            deadline = budget_s,
         )
     end
 end

@@ -75,23 +75,25 @@ function register_pool_with_model!(p::InferenceBufferPool, model::KServeModel)
     lock(p.register_lock) do
         key in p.registered_keys && return
 
-        client_register = grpc_shm_register_client(model)
-        client_unregister = grpc_shm_unregister_client(model)
-
         try
-            grpc_sync_request(client_unregister, SystemSharedMemoryUnregisterRequest(name = pool_name(p)))
+            GRPCInferenceService.SystemSharedMemoryUnregister(
+                model.chan,
+                SystemSharedMemoryUnregisterRequest(name = pool_name(p));
+                deadline = SHM_CONTROL_DEADLINE,
+            )
         catch ex
             @info ex
         end
 
-        grpc_sync_request(
-            client_register,
+        GRPCInferenceService.SystemSharedMemoryRegister(
+            model.chan,
             SystemSharedMemoryRegisterRequest(
                 name = pool_name(p),
                 key = shmid(p.pool.backing),
                 offset = 0,
                 byte_size = sizeof(p),
-            ),
+            );
+            deadline = SHM_CONTROL_DEADLINE,
         )
         push!(p.registered_keys, key)
         # One representative model per endpoint drives the teardown fan-out; re-registration reuses
@@ -129,9 +131,10 @@ function unregister_pool!(p::InferenceBufferPool)
     lock(p.register_lock) do
         for m in p.registered_models
             try
-                grpc_sync_request(
-                    grpc_shm_unregister_client(m),
-                    SystemSharedMemoryUnregisterRequest(name = pool_name(p))
+                GRPCInferenceService.SystemSharedMemoryUnregister(
+                    m.chan,
+                    SystemSharedMemoryUnregisterRequest(name = pool_name(p));
+                    deadline = SHM_CONTROL_DEADLINE,
                 )
             catch ex
                 @info ex
@@ -220,9 +223,10 @@ end
 # read as "no shared memory". The probe gets the model's own deadline, like every other call the
 # model makes; the background re-probe passes a shorter one.
 function query_same_ipc_namespace(model::KServeModel, name::AbstractString; deadline = model.deadline)
-    client = grpc_is_same_ipc_namespace_client(model; deadline = deadline)
     try
-        resp = grpc_sync_request(client, IsSameIPCNamespaceRequest(name = name))
+        resp = GRPCInferenceService.IsSameIPCNamespace(
+            model.chan, IsSameIPCNamespaceRequest(name = name); deadline = deadline
+        )
         return resp.same ? :yes : :no
     catch ex
         if ex isa gRPCClient.gRPCServiceCallException && ex.grpc_status == gRPCClient.GRPC_UNIMPLEMENTED
