@@ -90,10 +90,12 @@ end
 # ## Run it
 #
 # [`kserve_init`](@ref) creates the staging pool. `max_batch_size` matches the bundle's largest
-# compiled batch, so each request fills one execution:
+# compiled batch, so each request fills one execution. The first request a freshly started server
+# handles also compiles the request paths of both the server and the client, which can take longer
+# than the client's default 10 second deadline, so this allows a minute:
 
 kserve_init()
-mlp = KServeModel("grpc://127.0.0.1:8001", "mlp"; max_batch_size = 8)
+mlp = KServeModel("grpc://127.0.0.1:8001", "mlp"; max_batch_size = 8, deadline = 60)
 
 data = randn(Random.Xoshiro(1), Float32, 4, 100)
 io = FeatureIO(data, zeros(Float32, 3, 100))
