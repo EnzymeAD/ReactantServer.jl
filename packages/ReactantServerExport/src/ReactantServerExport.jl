@@ -380,6 +380,7 @@ function write_bundle(
     layout in (:xla, :legacy) || error("ReactantServerExport: layout must be :xla or :legacy, got :$layout")
     basename(normpath(dir)) == String(name) ||
         error("ReactantServerExport: bundle dir basename must equal name '$name' (got '$(basename(normpath(dir)))')")
+    _check_no_julia_callbacks(modules, input_shapes)
     mkpath(dir)
 
     wnames = String[String(first(p)) for p in weights]
@@ -500,6 +501,54 @@ function _check_exportable_ops(mod, label::AbstractString)
             "it still contains Reactant-internal $(join(("`" * o * "`" for o in ops), ", ")), which XLA cannot " *
             "compile. Reactant's optimization passes lower these ops; check `compile_options` (for example " *
             "`optimize = false` skips them)."
+    )
+end
+
+# `Reactant.Ops.julia_callback` lowers to a `stablehlo.custom_call @reactant_julia_callback` whose
+# `backend_config` holds a raw `@cfunction` pointer into the process that traced the program. In a
+# server loading the bundle that pointer is an arbitrary address, so the program is refused here in
+# `write_bundle`, which every frontend ends in and which also takes modules as text or bytes that
+# never passed `_check_exportable_ops`. ReactantServer refuses the same target on load.
+const JULIA_CALLBACK_TARGET = "reactant_julia_callback"
+
+function _has_julia_callback(op::MLIR.IR.Operation)
+    if MLIR.IR.name(op) == "stablehlo.custom_call"
+        t = MLIR.IR.getattr(op, "call_target_name")
+        t !== nothing && MLIR.IR.isstring(t) && String(t) == JULIA_CALLBACK_TARGET && return true
+    end
+    for region in op, block in region, inner in block
+        _has_julia_callback(inner) && return true
+    end
+    return false
+end
+_has_julia_callback(mod::MLIR.IR.Module) = any(_has_julia_callback, MLIR.IR.body(mod))
+_has_julia_callback(text::AbstractString) =
+    MLIR.IR.@with_context Reactant.ReactantContext() _has_julia_callback(parse(MLIR.IR.Module, String(text)))
+function _has_julia_callback(bytes::AbstractVector{UInt8})
+    ctx = Reactant.ReactantContext()
+    return MLIR.IR.@with_context ctx begin
+        mref = MLIR.API.stablehloDeserializePortableArtifactNoError(String(copy(bytes)), ctx)
+        _has_julia_callback(MLIR.IR.Module(mref))
+    end
+end
+
+function _check_no_julia_callbacks(modules::AbstractDict, input_shapes)
+    found = String[]
+    if input_shapes === nothing
+        for (s, m) in modules
+            _has_julia_callback(m) && push!(found, s == 0 ? "unbatched" : "batch size $s")
+        end
+    else
+        for (vk, batchmap) in modules, (s, m) in batchmap
+            _has_julia_callback(m) && push!(found, "variant $vk, " * (s == 0 ? "unbatched" : "batch size $s"))
+        end
+    end
+    isempty(found) && return nothing
+    return error(
+        "ReactantServerExport: the compiled program is UNSERVABLE and has not been written " *
+            "($(join(sort!(found), "; "))): it calls `$JULIA_CALLBACK_TARGET`, which " *
+            "`Reactant.Ops.julia_callback` emits with a function pointer valid only in the process that " *
+            "traced it. Remove the `Ops.julia_callback` from the traced code."
     )
 end
 

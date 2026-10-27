@@ -300,6 +300,40 @@ function _cache_policy(pool::MemoryPool, tf32_capable::Bool)
     )
 end
 
+# `Reactant.Ops.julia_callback` lowers to a custom call whose `backend_config` holds a raw
+# `@cfunction` pointer into the process that traced the program. A served program was traced in
+# another process, so here the pointer is an arbitrary address and executing it would jump there.
+# ReactantServerExport refuses to write one; this refuses to compile one, whatever wrote the bundle.
+const JULIA_CALLBACK_TARGET = "reactant_julia_callback"
+
+function _has_julia_callback(op)
+    if _RMLIR.IR.name(op) == "stablehlo.custom_call"
+        t = _RMLIR.IR.getattr(op, "call_target_name")
+        t !== nothing && _RMLIR.IR.isstring(t) && String(t) == JULIA_CALLBACK_TARGET && return true
+    end
+    for region in op, block in region, inner in block
+        _has_julia_callback(inner) && return true
+    end
+    return false
+end
+
+"""
+    refuse_julia_callbacks(mod)
+
+Throw if the StableHLO module `mod` calls `reactant_julia_callback` anywhere, including inside
+nested regions. Other custom calls are allowed.
+"""
+function refuse_julia_callbacks(mod::_RMLIR.IR.Module)
+    any(_has_julia_callback, _RMLIR.IR.body(mod)) || return nothing
+    return throw(
+        ErrorException(
+            "the program calls `$JULIA_CALLBACK_TARGET` (Reactant.Ops.julia_callback), whose " *
+                "function pointer is valid only in the process that traced it; refusing to compile it. " *
+                "Remove the `Ops.julia_callback` from the traced code and export the bundle again."
+        )
+    )
+end
+
 # Compile a StableHLO portable artifact, or, with a cache slot, load the compiled program that an
 # earlier start stored for this exact module, policy and device kind. Look-up, compile, serialize,
 # store: a hit skips XLA entirely; a miss compiles and stores; an entry that fails to load is dropped
@@ -318,6 +352,8 @@ function compile_artifact(
         artifact = String(copy(Vector{UInt8}(mlir_bytes)))
         mlir_mod = _RMLIR.API.stablehloDeserializePortableArtifactNoError(artifact, ctx)
         mod = _RMLIR.IR.Module(mlir_mod)
+        # In every numerics mode and before the cache lookup, so a hit cannot skip it.
+        refuse_julia_callbacks(mod)
         tf32 = tf32_supported(pool.client, pool.device)
         _apply_numerics_policy!(mod, pool, tf32, numerics_stats)
         opts = _compile_options(pool, device_ordinal(backend, pool.device))

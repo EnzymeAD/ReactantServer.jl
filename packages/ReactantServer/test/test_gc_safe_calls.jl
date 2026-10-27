@@ -85,7 +85,16 @@ const _GCX = ReactantServer.GcSafeXLA
               }
             }
             """
-            cb_exec = ReactantServer.compile_artifact(backend, pool, stablehlo_artifact(cb_mlir), 1, 1)
+            # compile_artifact refuses a Julia callback (its pointer is only valid in the tracing
+            # process, which here is this one), so compile with Reactant directly.
+            cb_exec = Reactant.MLIR.IR.@with_context pool.ctx begin
+                Reactant.XLA.compile(
+                    client, parse(Reactant.MLIR.IR.Module, cb_mlir);
+                    compile_options = ReactantServer._compile_options(pool, ReactantServer.device_ordinal(backend, device)),
+                    num_parameters = Int64(1), num_outputs = Int64(1),
+                    is_sharded = false, num_replicas = Int64(1), num_partitions = Int64(1),
+                )
+            end
             stop = Threads.Atomic{Bool}(false)
             churn = Threads.@spawn while !stop[]
                 GC.gc(false)
@@ -105,6 +114,27 @@ const _GCX = ReactantServer.GcSafeXLA
             @test correct == 50
             @test length(threads_seen) == 50
         end
+    end
+
+    @testset "compile_artifact refuses a Julia callback" begin
+        # The pointer is never followed, so any value will do.
+        nested = """
+        module {
+          func.func @main(%p: tensor<i1>, %x: tensor<4xf32>) -> tensor<4xf32> {
+            %0 = "stablehlo.if"(%p) ({
+              %1 = stablehlo.custom_call @reactant_julia_callback(%x) {api_version = 4 : i32, backend_config = {callback_ptr = 1 : i64}, has_side_effect = true} : (tensor<4xf32>) -> tensor<4xf32>
+              stablehlo.return %1 : tensor<4xf32>
+            }, {
+              stablehlo.return %x : tensor<4xf32>
+            }) : (tensor<i1>) -> tensor<4xf32>
+            return %0 : tensor<4xf32>
+          }
+        }
+        """
+        @test_throws "reactant_julia_callback" ReactantServer.compile_artifact(backend, pool, stablehlo_artifact(nested), 2, 1)
+        # Another custom call target is not refused.
+        other = replace(nested, "@reactant_julia_callback" => "@some_other_target")
+        @test Reactant.MLIR.IR.@with_context(pool.ctx, ReactantServer.refuse_julia_callbacks(parse(Reactant.MLIR.IR.Module, other))) === nothing
     end
 
     @testset "collections on another thread while the calls run" begin
