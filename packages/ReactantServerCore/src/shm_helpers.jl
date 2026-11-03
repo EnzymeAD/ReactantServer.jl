@@ -64,6 +64,32 @@ memcpy_safe_arr_n_bytes(a::MemCopySafeArray) = Base.checked_mul(length(a), Base.
 const _SHM_KEEPALIVE = Dict{UInt, SharedMemory}()
 const _SHM_KEEPALIVE_LOCK = ReentrantLock()
 
+# Pin `owner` in `table` for as long as `mem` lives, and drop the pin from `mem`'s finalizer.
+function _pin_alias!(table::Dict{UInt, V}, lk::ReentrantLock, mem::Memory, owner::V) where {V}
+    @lock lk table[objectid(mem)] = owner
+    finalizer(m -> _unpin_alias!(table, lk, m), mem)
+    return mem
+end
+
+# Finalizer half of `_pin_alias!`. A finalizer must never block on a lock: if it has to park it
+# throws "task switch not allowed from inside gc finalizer" (the entry is then never deleted and
+# the owner, with its mapping, is pinned for the life of the process), and if it does not park it
+# stalls the thread that ran the GC. So take the lock only if it is free, and otherwise re-register
+# the finalizer to retry at a later GC, which is the deferral Base itself uses. Re-registering keeps
+# `m` alive, so its address, and therefore its objectid, cannot be reused before the entry is gone.
+function _unpin_alias!(table::Dict{UInt, V}, lk::ReentrantLock, m) where {V}
+    if trylock(lk)
+        try
+            delete!(table, objectid(m))
+        finally
+            unlock(lk)
+        end
+    else
+        finalizer(x -> _unpin_alias!(table, lk, x), m)
+    end
+    return nothing
+end
+
 # Wrap a SHM region as a Memory{T} that aliases the SHM bytes. own=false because IPC owns the
 # underlying region, not the Julia GC.
 function memory_from_shm(shm::SharedMemory, ::Type{T}, n_elem::Integer) where {T}
@@ -74,12 +100,7 @@ function memory_from_shm(shm::SharedMemory, ::Type{T}, n_elem::Integer) where {T
         throw(ArgumentError("memory_from_shm: $(nbytes) bytes exceeds SHM region of $(sizeof(shm)) bytes"))
     ptr = convert(Ptr{T}, pointer(shm))
     mem = unsafe_wrap(Memory{T}, ptr, n; own = false)
-    key = objectid(mem)
-    @lock _SHM_KEEPALIVE_LOCK _SHM_KEEPALIVE[key] = shm
-    finalizer(mem) do m
-        @lock _SHM_KEEPALIVE_LOCK delete!(_SHM_KEEPALIVE, objectid(m))
-    end
-    return mem
+    return _pin_alias!(_SHM_KEEPALIVE, _SHM_KEEPALIVE_LOCK, mem, shm)
 end
 
 # One bulk memcpy from protobuf-decoded bytes into a typed Memory{T}.

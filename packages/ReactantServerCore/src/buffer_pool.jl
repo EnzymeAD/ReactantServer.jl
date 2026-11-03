@@ -30,6 +30,8 @@ mutable struct BufferPool
     freed::Threads.Condition     # tied to alloc_lock; signaled on release and waiter exit
     waitq::Vector{UInt64}        # FIFO of waiter tokens; only the head may allocate
     token_counter::UInt64
+    closed::Bool                 # close() was called: no new slots (guarded by alloc_lock)
+    released::Bool               # the SHM mapping has been released (guarded by alloc_lock)
 end
 
 """
@@ -66,7 +68,7 @@ function BufferPool(
     return BufferPool(
         backing, usable, region_name, slot_bytes, Int(n_slots),
         trues(Int(n_slots)), alloc_lock, Threads.Condition(alloc_lock),
-        UInt64[], UInt64(0)
+        UInt64[], UInt64(0), false, false
     )
 end
 
@@ -83,6 +85,48 @@ end
 # whether a sub-call input's bytes already live in this pool (so it can be sent by SHM reference
 # instead of inlined) — robust to the caller reshaping/sub-viewing the scratch buffer.
 pool_base_pointer(pool::BufferPool) = _pool_base_pointer(pool)
+
+"""
+    close(pool::BufferPool)
+
+Retire a pool. Later `acquire_slot!` calls, and waiters already parked in one, throw a
+[`PoolClosedError`](@ref); slots already handed out stay valid until released. For a SHM-backed
+pool the name is unlinked at once, and the mapping is released as soon as no slot is outstanding:
+here if the pool is idle, otherwise in the `release_slot!` that returns the last slot. Unlinking alone does
+not free the pages in /dev/shm while the region is still mapped, and before this the mapping was
+only released when the GC got round to finalizing the `SharedMemory`. A live `pool_memory` alias
+may be read at any time, so while one exists the mapping is left to the GC as before. Idempotent.
+"""
+function Base.close(pool::BufferPool)
+    @lock pool.alloc_lock begin
+        pool.closed && return nothing
+        pool.closed = true
+        if pool.backing isa SharedMemory
+            try
+                rm(pool.backing)            # shm_unlink by name; the mapping is untouched
+            catch ex
+                @warn "Failed to unlink SHM region $(pool.name)" exception = ex
+            end
+        end
+        _release_if_idle!(pool)
+        notify(pool.freed)                  # parked waiters re-check and throw
+    end
+    return nothing
+end
+
+Base.isopen(pool::BufferPool) = !(@lock pool.alloc_lock pool.closed)
+
+# Release a closed SHM pool's mapping once nothing can still touch it: no slot outstanding and no
+# pool_memory alias alive. Caller holds alloc_lock. `finalize` runs InterProcessCommunication's
+# _destroy (munmap) now instead of at some later GC, and unregisters it so it never runs twice.
+function _release_if_idle!(pool::BufferPool)
+    (pool.closed && !pool.released && pool.backing isa SharedMemory) || return
+    all(pool.free) || return
+    _has_pinned_alias(pool) && return
+    pool.released = true
+    finalize(pool.backing)
+    return
+end
 
 # ---- PoolSlot: a byte range within a pool, with a cursor for carving subslots ----
 
@@ -138,6 +182,15 @@ Base.showerror(io::IO, e::PoolAcquireTimeout) =
 )
 
 """
+    PoolClosedError()
+
+Raised by [`acquire_slot!`](@ref) on a pool that has been `close`d, including to a waiter that was
+already parked when the pool closed.
+"""
+struct PoolClosedError <: Exception end
+Base.showerror(io::IO, ::PoolClosedError) = print(io, "acquire_slot!: the buffer pool is closed")
+
+"""
     acquire_slot!(pool, span=1; deadline_ns=0) -> PoolSlot
 
 Block until `span` physically contiguous slots are free, then return them as one slot whose
@@ -166,12 +219,17 @@ function acquire_slot!(pool::BufferPool, span::Integer = 1; deadline_ns::Integer
     dl = Int64(deadline_ns)
     t0 = Int64(time_ns())
     lock(pool.alloc_lock)
+    if pool.closed
+        unlock(pool.alloc_lock)
+        throw(PoolClosedError())
+    end
     token = UInt64(0)   # sentinel keeps the finally safe if we are interrupted pre-enqueue
     timer = nothing     # one-shot wake at the deadline; armed on first park, closed in finally
     return try
         token = (pool.token_counter += 1)
         push!(pool.waitq, token)
         while true
+            pool.closed && throw(PoolClosedError())
             if dl != 0 && Int64(time_ns()) >= dl
                 throw(PoolAcquireTimeout(s, Int64(time_ns()) - t0))
             end
@@ -238,6 +296,7 @@ function release_slot!(slot::PoolSlot)
             )
             pool.free[i] = true
         end
+        _release_if_idle!(pool)
         notify(pool.freed)
     end
     return nothing
@@ -291,13 +350,14 @@ function pool_memory(slot::PoolSlot, ::Type{T}, n_elem::Integer) where {T}
     pool = slot.pool
     ptr = Ptr{T}(_pool_base_pointer(pool) + slot.offset)
     mem = unsafe_wrap(Memory{T}, ptr, n; own = false)
-    key = objectid(mem)
-    @lock _POOL_KEEPALIVE_LOCK _POOL_KEEPALIVE[key] = pool
-    finalizer(mem) do m
-        @lock _POOL_KEEPALIVE_LOCK delete!(_POOL_KEEPALIVE, objectid(m))
-    end
-    return mem
+    return _pin_alias!(_POOL_KEEPALIVE, _POOL_KEEPALIVE_LOCK, mem, pool)
 end
+
+# Whether any pool_memory alias of `pool` is still pinned. Linear in the live aliases, and only
+# consulted for a closed pool. An entry whose finalizer was deferred still counts, which errs
+# toward keeping the mapping.
+_has_pinned_alias(pool::BufferPool) =
+    @lock _POOL_KEEPALIVE_LOCK any(p -> p === pool, values(_POOL_KEEPALIVE))
 
 # FixedSizeArray view over a pool slot, backed by the slot's Memory{T} alias.
 pool_fsa(slot::PoolSlot, ::Type{T}, dims::NTuple{N, <:Integer}) where {T, N} =

@@ -200,19 +200,15 @@ function _get_inline_pool!()
     end
 end
 
-# Unregister the current SHM pool from every server it registered with and unlink its /dev/shm
-# region. Caller must hold _pools_lock. Errors during unlink are logged and swallowed.
+# Unregister the current SHM pool from every server it registered with, then close it: the
+# /dev/shm name is unlinked now and the mapping, which is what holds the pages, is released once
+# in-flight requests return their slots rather than whenever the GC finalizes it. Caller must hold
+# _pools_lock. Errors during unlink are logged and swallowed.
 function _teardown_shm_pool!()
     shm = _shm_pool[]
     shm === nothing && return
     unregister_pool!(shm)
-    if is_shm_backed(shm)
-        try
-            rm(shm.pool.backing)
-        catch ex
-            @warn "Failed to unlink SHM region $(pool_name(shm))" exception = ex
-        end
-    end
+    close(shm.pool)
     _shm_pool[] = nothing
     return
 end

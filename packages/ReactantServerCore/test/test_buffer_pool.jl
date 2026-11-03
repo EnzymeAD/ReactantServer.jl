@@ -295,4 +295,98 @@ using InterProcessCommunication: SharedMemory
             rm(p.backing)
         end
     end
+
+    @testset "keepalive finalizer defers instead of blocking on a held lock" begin
+        # A finalizer that blocks on a contended ReentrantLock either throws "task switch not
+        # allowed from inside gc finalizer" (the pin then leaks for the life of the process) or
+        # stalls the thread running the GC until the lock is free. The unpin must instead give up,
+        # re-register, and complete at a later GC once the lock is free.
+        RSC = ReactantServerCore
+        p = RSC.BufferPool(4096; n_slots = 1, use_shm = false)
+        s = RSC.acquire_slot!(p)
+        pinned() = @lock RSC._POOL_KEEPALIVE_LOCK count(v -> v === p, values(RSC._POOL_KEEPALIVE))
+        # Held until the lock is taken, so a GC on another thread cannot collect them early.
+        aliases = [RSC.pool_memory(s, UInt8, 16) for _ in 1:32]
+        @test pinned() == 32
+
+        held = Threads.Event()
+        done = Threads.Event()
+        holder = Threads.@spawn begin
+            lock(RSC._POOL_KEEPALIVE_LOCK)
+            try
+                notify(held)
+                timedwait(() -> done.set, 10.0)   # bounded, so a regression fails rather than hangs
+            finally
+                unlock(RSC._POOL_KEEPALIVE_LOCK)
+            end
+        end
+        wait(held)
+        empty!(aliases)
+        t = @elapsed GC.gc(true)
+        @test pinned() > 0                         # deferred, not dropped and not blocked on
+        notify(done)
+        wait(holder)
+        @test t < 5.0                              # the GC did not wait for the lock holder
+        for _ in 1:5
+            GC.gc(true)
+            pinned() == 0 && break
+        end
+        @test pinned() == 0                        # the deferred unpins completed
+        RSC.release_slot!(s)
+    end
+
+    @testset "close releases an idle shm pool's mapping at once" begin
+        p = ReactantServerCore.BufferPool(4096; n_slots = 2, use_shm = true)
+        region = "/" * ReactantServerCore.pool_region_name(p)
+        @test isopen(p)
+        close(p)
+        @test !isopen(p)
+        @test p.released
+        @test pointer(p.backing) == C_NULL         # munmapped (IPC's PARANOID destroy)
+        @test_throws Exception SharedMemory(region; readonly = true)   # unlinked
+        @test_throws ReactantServerCore.PoolClosedError ReactantServerCore.acquire_slot!(p)
+        close(p)                                   # idempotent
+    end
+
+    @testset "close waits for outstanding slots before releasing" begin
+        p = ReactantServerCore.BufferPool(4096; n_slots = 2, use_shm = true)
+        region = "/" * ReactantServerCore.pool_region_name(p)
+        a = ReactantServerCore.acquire_slot!(p)
+        b = ReactantServerCore.acquire_slot!(p)
+        close(p)
+        @test_throws Exception SharedMemory(region; readonly = true)   # name gone immediately
+        @test !p.released                          # but in-flight slots keep the mapping
+        ReactantServerCore.pool_view(a, UInt8, 8) .= 0x11              # still writable
+        ReactantServerCore.release_slot!(a)
+        @test !p.released
+        ReactantServerCore.release_slot!(b)
+        @test p.released                           # the last release frees it
+        @test pointer(p.backing) == C_NULL
+    end
+
+    @testset "close wakes parked waiters with an error" begin
+        p = ReactantServerCore.BufferPool(4096; n_slots = 1, use_shm = true)
+        s = ReactantServerCore.acquire_slot!(p)
+        waiter = Threads.@spawn ReactantServerCore.acquire_slot!(p)
+        @test timedwait(() -> !isempty(@lock(p.alloc_lock, copy(p.waitq))), 5.0) == :ok
+        close(p)
+        @test timedwait(() -> istaskdone(waiter), 5.0) == :ok
+        @test_throws TaskFailedException fetch(waiter)
+        @test isempty(p.waitq)
+        ReactantServerCore.release_slot!(s)
+        @test p.released
+    end
+
+    @testset "close leaves the mapping to the GC while a pool_memory alias lives" begin
+        p = ReactantServerCore.BufferPool(4096; n_slots = 1, use_shm = true)
+        s = ReactantServerCore.acquire_slot!(p)
+        mem = ReactantServerCore.pool_memory(s, UInt8, 8)
+        close(p)
+        ReactantServerCore.release_slot!(s)
+        @test !p.released                          # the alias may still be read
+        GC.@preserve mem @test pointer(p.backing) != C_NULL
+        finalize(mem)                              # drop the pin (the alias's own finalizer)
+        @test !ReactantServerCore._has_pinned_alias(p)
+        finalize(p.backing)                        # what the GC would now do
+    end
 end
