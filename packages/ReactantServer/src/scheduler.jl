@@ -488,6 +488,31 @@ function _slice_outputs(entry::ModelEntry, out::Vector{NamedTensor}, offset::Int
     return sliced
 end
 
+# Executions that run off the interactive thread. The dispatch loop runs on the interactive thread,
+# which is also the thread Julia services its I/O on, so while an execution blocks it (the wait for a
+# program's results is a gc_safe call that never yields) the worker reads no requests and answers no
+# health checks. A long program therefore runs on a default-pool task the loop waits for
+# (`off_interactive`); executions stay serialized exactly as before. The hand-off is not free: on a
+# 128-core host it measured a 264 us median (347 us p99) with the default pool idle, the time to wake
+# a sleeping thread, and with the pool saturated by request handlers a 14 us median but a 6.3 ms p99
+# and a 152 ms worst case, waiting for a free thread. That is material next to a millisecond program,
+# so only a program whose learned cost at this batch size is at least `_OFFLOAD_EXEC_SECONDS`, or that
+# has not been measured yet (it could be long), is handed off; a shorter one delays request intake by
+# no more than its own run time.
+const _OFFLOAD_EXEC_SECONDS = 0.05
+
+_offload_execution(st::ModelSchedState, B::Integer) = get(st.cost_estimate, B, Inf) >= _OFFLOAD_EXEC_SECONDS
+
+# Run one execution, timed where it runs, so the measured compute excludes any task hand-off.
+function _timed_run(s::Scheduler, model::LoadedModel, inputs; offload::Bool)
+    run = function ()
+        t0 = time()
+        out = run_model(s.backend, s.pool, model, inputs)
+        return (out, time() - t0)
+    end
+    return offload ? off_interactive(run) : run()
+end
+
 function _record_wait!(st::ModelSchedState, now::Float64, taken::Vector{QueuedRequest})
     for qr in taken
         push!(st.wait_samples, now - qr.enqueued_at)
@@ -548,9 +573,9 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
         # LRU under budget pressure). Load time is excluded from compute_time, which feeds the
         # cost estimate, so the estimate reflects steady-state (resident) execution.
         _acquire_for_dispatch!(s, entry)
-        t0 = time()
-        out = run_model(s.backend, s.pool, entry.executable, merged)
-        compute_time = time() - t0
+        out, compute_time = _timed_run(
+            s, entry.executable, merged; offload = _offload_execution(st, B)
+        )
 
         # Slice every per-request result before delivering any. Slicing can throw; doing it up
         # front means the catch below has not yet filled any reply channel, so it can deliver the
@@ -717,9 +742,8 @@ function _probe_entry_scratch!(s::Scheduler, entry::ModelEntry, resettable::Bool
             inputs = _zero_inputs(entry, variant, sz)
             inputs === nothing && continue
             try
-                t0 = time()
-                run_model(s.backend, s.pool, model, inputs)
-                entry.sched === nothing || (entry.sched.cost_estimate[sz] = max(time() - t0, eps()))
+                _, dt = _timed_run(s, model, inputs; offload = true)
+                entry.sched === nothing || (entry.sched.cost_estimate[sz] = max(dt, eps()))
                 ran = true
             catch err
                 @warn "memory probe / warmup run failed; using default cost" model = entry.name variant = variant size = sz exception = err
@@ -905,9 +929,8 @@ function _warmup_entry!(s::Scheduler, entry::ModelEntry)
             inputs === nothing && continue
             try
                 s.weight_cache === nothing || acquire!(s.weight_cache, entry)
-                t0 = time()
-                run_model(s.backend, s.pool, entry.executable, inputs)
-                entry.sched.cost_estimate[sz] = max(time() - t0, eps())
+                _, dt = _timed_run(s, entry.executable, inputs; offload = true)
+                entry.sched.cost_estimate[sz] = max(dt, eps())
             catch err
                 @warn "scheduler cost warmup failed; using default cost" model = entry.name variant = variant size = sz exception = err
             end

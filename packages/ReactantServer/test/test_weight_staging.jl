@@ -1,7 +1,7 @@
-# Loading weights without stalling the worker. A model off the device gets its weights read into
-# host memory by a background task while the dispatch loop keeps serving the models already on the
-# device, and the slow calls the loop does make run off the interactive thread, which is also the
-# thread Julia services its I/O on. Against the MockBackend; uses the helpers of
+# Loading weights and running long programs without stalling the worker. A model off the device gets
+# its weights read into host memory by a background task while the dispatch loop keeps serving the
+# models already on the device, and the slow calls the loop does make (loads, long executions) run
+# off the interactive thread, which is also the thread Julia services its I/O on. Against the MockBackend; uses the helpers of
 # test_weight_cache.jl (_W, _WBYTES, _batched_manifest) and test_host_cache.jl (CountingWeights).
 
 # A weights double whose reads wait at a gate once armed, so a test can hold a model's background
@@ -199,5 +199,54 @@ end
             end
         )
         @test err isa ArgumentError
+    end
+end
+
+@testset "a long execution runs off the interactive thread and leaves it free" begin
+    if Threads.nthreads(:interactive) == 0
+        @test_skip "needs an interactive thread (run with --threads=auto,1)"
+    else
+        # A program that holds its thread for 1.5 s without yielding, as the wait for a GPU program's
+        # results does.
+        slow = function (args)
+            t_end = time() + 1.5
+            while time() < t_end
+                @ccall gc_safe = true usleep(50_000::Cuint)::Cint
+            end
+            return [args[1] .* args[2]]
+        end
+        sig = ReactantServer.ModelSignature(["x"], DataType[Float32], ["w"], 1, ["y"], DataType[Float32], 1)
+        lm = ReactantServer.LoadedModel(
+            sig, Dict{Int, Any}(1 => ReactantServer.MockExecutable(slow, 1)),
+            Any[ReactantServer.MockBuffer(copy(_W))], true, _WBYTES, nothing
+        )
+        S = ReactantServer.ModelEntry(
+            "S", _batched_manifest("S"), Dict{Int, Vector{UInt8}}(), "",
+            FakeWeights(Dict{String, Array}("w" => copy(_W))), lm, nothing, identity, identity
+        )
+        backend = ReactantServer.MockBackend()
+        pool = ReactantServer.MemoryPool(backend, ReactantServer.MockClient(), ReactantServer.MockDevice(0), "mock", nothing)
+        reg = ReactantServer.ModelRegistry()
+        reg.by_name["S"] = S
+        sched = ReactantServer.Scheduler(reg, backend, pool, ReactantServer.SchedulerConfig(30.0, 1024, 30.0))
+        S.sched = ReactantServer.ModelSchedState("S", ReactantServer.ModelSchedConfig(1.0), 0.0)
+        ReactantServer.start!(sched)
+        try
+            done = Threads.Atomic{Bool}(false)
+            worst = Threads.Atomic{Float64}(0.0)
+            hb = Threads.@spawn :default while !done[]
+                t = time()
+                sleep(0.01)
+                Threads.atomic_max!(worst, time() - t - 0.01)
+            end
+            @test _st_infer(sched, "S") == _ST_OUT
+            done[] = true
+            wait(hb)
+            @test worst[] < 0.5                         # timers kept firing through the 1.5 s run
+            # The cost is measured where the program ran, so it reflects the run, not the hand-off.
+            @test 1.4 < S.sched.cost_estimate[1] < 3.0
+        finally
+            ReactantServer.shutdown!(sched)
+        end
     end
 end
