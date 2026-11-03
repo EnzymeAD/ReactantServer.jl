@@ -221,6 +221,109 @@ end
     @test asn3["a"][1][1] in W
 end
 
+_homes(asn) = Dict(m => Set(first.(pl)) for (m, pl) in asn)
+_moved(prev, next) = sort!([m for m in keys(next) if haskey(prev, m) && _homes(prev)[m] != _homes(next)[m]])
+
+@testset "rebalance_assignment: a settled placement moves nothing" begin
+    W = ["w0", "w1"]
+    GB = 1.0e9
+    prev = Dict{String, GW.Placement}(
+        "a" => [("w0", 1.0)], "b" => [("w1", 1.0)], "c" => [("w0", 1.0)], "d" => [("w1", 1.0)]
+    )
+    mem = Dict("a" => 4GB, "b" => 4GB, "c" => 4GB, "d" => 4GB)
+    caps = Dict("w0" => 10GB, "w1" => 10GB)
+    # A from-scratch pack of the same inputs reorders everything when demand shifts a little; the
+    # rebalance keeps every model where it is.
+    u = Dict("a" => 0.02, "b" => 0.01, "c" => 0.03, "d" => 0.0)
+    asn = GW.rebalance_assignment(u, W, prev; mem = mem, mem_cap = caps, forbid_memory_oversubscription = true)
+    @test asn == prev
+    # Models absent from `u` are not placed, as with the packer.
+    @test !haskey(GW.rebalance_assignment(Dict("a" => 0.1), W, prev), "b")
+end
+
+@testset "rebalance_assignment: only what lost its worker, or is new, gets placed" begin
+    W = ["w0", "w1"]                                   # w2 has left
+    prev = Dict{String, GW.Placement}(
+        "a" => [("w0", 1.0)], "b" => [("w1", 1.0)], "orphan" => [("w2", 1.0)]
+    )
+    u = Dict("a" => 0.5, "b" => 0.1, "orphan" => 0.2, "fresh" => 0.0)
+    asn = GW.rebalance_assignment(u, W, prev)
+    @test asn["a"] == [("w0", 1.0)] && asn["b"] == [("w1", 1.0)]
+    @test asn["orphan"] == [("w1", 1.0)]               # onto the lighter worker
+    @test length(asn["fresh"]) == 1 && asn["fresh"][1][1] in W
+    # A raised replica count adds a replica and keeps the first; a lowered one drops the extra.
+    up = GW.rebalance_assignment(Dict("a" => 0.5), W, prev; replicas = Dict("a" => 2))
+    @test _homes(up)["a"] == Set(W) && all(==(0.5), last.(up["a"]))
+    two = Dict{String, GW.Placement}("a" => [("w0", 0.5), ("w1", 0.5)])
+    down = GW.rebalance_assignment(Dict("a" => 0.5), W, two)
+    @test length(down["a"]) == 1 && down["a"][1] == ("w0", 1.0)
+end
+
+@testset "rebalance_assignment: an over-budget worker sheds the smallest model that clears it" begin
+    W = ["w0", "w1"]
+    GB = 1.0e9
+    caps = Dict("w0" => 10GB, "w1" => 10GB)
+    mem = Dict("big" => 6GB, "mid" => 3GB, "small" => 2GB, "other" => 4GB)
+    prev = Dict{String, GW.Placement}(
+        "big" => [("w0", 1.0)], "mid" => [("w0", 1.0)], "small" => [("w0", 1.0)], "other" => [("w1", 1.0)]
+    )                                                   # w0 holds 11 GB of a 10 GB budget
+    u = Dict(m => 0.0 for m in keys(mem))
+    asn = GW.rebalance_assignment(u, W, prev; mem = mem, mem_cap = caps, forbid_memory_oversubscription = true)
+    @test _moved(prev, asn) == ["small"]               # 2 GB clears the 1 GB overflow; 3 GB would too, but moves more
+    @test asn["small"] == [("w1", 1.0)]
+    for w in W
+        @test sum((mem[m] for (m, pl) in asn for (ww, _) in pl if ww == w); init = 0.0) <= caps[w]
+    end
+end
+
+@testset "rebalance_assignment: a hot worker is relieved only when the gain clears min_gain" begin
+    W = ["w0", "w1"]
+    prev = Dict{String, GW.Placement}("hot" => [("w0", 1.0)], "warm" => [("w0", 1.0)], "cool" => [("w1", 1.0)])
+    u = Dict("hot" => 0.6, "warm" => 0.3, "cool" => 0.1)
+    # Moving warm takes w0 from 0.9 to 0.6 (w1 to 0.4): a third off the busiest worker.
+    asn = GW.rebalance_assignment(u, W, prev; min_gain = 0.05)
+    @test _moved(prev, asn) == ["warm"] && asn["warm"] == [("w1", 1.0)]
+    # The same move is not worth it at a higher bar, and the repack reports how close it came.
+    st = GW.RepackStats()
+    held = GW.rebalance_assignment(u, W, prev; min_gain = 0.5, stats = st)
+    @test held == prev
+    @test st.max_improvement ≈ 0.3 / 0.9
+    # A move never hands the destination more pressure than the source had.
+    tight = GW.rebalance_assignment(Dict("hot" => 0.6, "cool" => 0.5), W, Dict{String, GW.Placement}("hot" => [("w0", 1.0)], "cool" => [("w1", 1.0)]))
+    @test _moved(Dict{String, GW.Placement}("hot" => [("w0", 1.0)], "cool" => [("w1", 1.0)]), tight) == String[]
+end
+
+@testset "repack accounting: compute is counted per worker; a missing worker holds the repack" begin
+    path = tempname() * ".yaml"
+    write(path, "endpoints:\n  - \"127.0.0.1:7001\"\n")
+    cfg = try
+        GW.load_gateway(path)
+    finally
+        rm(path; force = true)
+    end
+    s = GW.LptPackingState(cfg)
+    poll(wc) = (; polled = sort!(collect(keys(wc))), worker_compute = Dict{String, Float64}(wc))
+    @test GW._compute_delta!(s, poll(Dict("w0" => 100.0, "w1" => 50.0))) == 0.0   # first sight: baseline only
+    @test GW._compute_delta!(s, poll(Dict("w0" => 110.0, "w1" => 55.0))) == 15.0
+    # w1 misses a poll: nothing from it, and nothing read as a restart.
+    @test GW._compute_delta!(s, poll(Dict("w0" => 120.0))) == 10.0
+    # On its return only what it ran meanwhile counts, not its lifetime total.
+    @test GW._compute_delta!(s, poll(Dict("w0" => 120.0, "w1" => 65.0))) == 10.0
+    # A restarted worker (counter went backwards) is re-baselined.
+    @test GW._compute_delta!(s, poll(Dict("w0" => 5.0, "w1" => 65.0))) == 0.0
+    @test GW._compute_delta!(s, poll(Dict("w0" => 7.0, "w1" => 65.0))) == 2.0
+
+    @atomic s.assignment = Dict{String, GW.Placement}("a" => [("w0", 1.0)], "b" => [("w1", 1.0)])
+    t0 = 1000.0
+    @test !GW._hold_for_absent_workers!(s, poll(Dict("w0" => 1.0, "w1" => 1.0)), t0)
+    @test GW._hold_for_absent_workers!(s, poll(Dict("w0" => 1.0)), t0 + 10)          # w1 just went missing
+    @test GW._hold_for_absent_workers!(s, poll(Dict("w0" => 1.0)), t0 + 10 + GW._ABSENT_GRACE_SECONDS - 1)
+    @test !GW._hold_for_absent_workers!(s, poll(Dict("w0" => 1.0)), t0 + 10 + GW._ABSENT_GRACE_SECONDS)   # gone: repack
+    @test !GW._hold_for_absent_workers!(s, poll(Dict("w0" => 1.0, "w1" => 1.0)), t0 + 100)   # back: clock reset
+    @test isempty(s.absent_since)
+    @test GW._hold_for_absent_workers!(s, poll(Dict{String, Float64}()), t0 + 200)   # no worker answered
+end
+
 @testset "EMA decay: gamma tracks compute elapsed against the halflife" begin
     # _ewma(old, sample, dt, h): one halflife of elapsed compute folds ~50% toward the sample, so a
     # halflife equal to the rebalance interval gives about 50% decay per rebalance.
@@ -246,7 +349,7 @@ end
     cfg = _load(eps)
     @test cfg.rebalance_compute_seconds == 300.0
     @test cfg.first_rebalance_compute_seconds == 60.0
-    @test cfg.hysteresis == 0.0
+    @test cfg.hysteresis == 0.05
     @test cfg.ema_halflife_compute_seconds == 0.0
     @test cfg.compaction_mode == :off
     @test cfg.compaction_interval == 1

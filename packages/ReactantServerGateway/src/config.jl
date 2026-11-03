@@ -73,7 +73,7 @@ struct GatewayConfig
     rebalance_compute_seconds::Float64
     first_rebalance_compute_seconds::Float64
     max_worker_share::Float64               # advisory only: load no longer drives a model's GPU count
-    hysteresis::Float64                     # min relative max-load improvement required to move a placement
+    hysteresis::Float64                     # min relative pressure improvement a repack needs to move a model (default 0.05)
     # EWMA halflife for the per-model arrival-rate and cost smoothing, measured in fleet
     # compute-seconds (the same clock that triggers repacks), not wall-clock. The EWMA folds only at
     # a repack and decays against the compute consumed since the last one, so the demand signal ages
@@ -302,7 +302,7 @@ function _build_gateway_config(raw::Dict{String, Any})
         _opt(sched, "rebalance_compute_seconds", Float64, 300.0),
         _opt(sched, "first_rebalance_compute_seconds", Float64, 60.0),
         _opt(sched, "max_worker_share", Float64, 0.8),
-        _opt(sched, "hysteresis", Float64, 0.0),
+        _opt(sched, "hysteresis", Float64, 0.05),
         _opt(sched, "ema_halflife_compute_seconds", Float64, 0.0),
         _parse_replicas(get(sched, "default_replicas", 1), "scheduling.default_replicas"),
         _opt(sched, "routing_fill_factor", Float64, 1.0),

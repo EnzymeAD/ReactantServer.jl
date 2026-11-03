@@ -194,6 +194,161 @@ function compute_assignment(
     return out
 end
 
+"""
+    rebalance_assignment(u, workers, prev; mem=Dict(), mem_cap=Dict(), replicas=Dict(),
+                         default_replicas=1, min_gain=0.05,
+                         forbid_memory_oversubscription=false, stats=nothing)
+        -> Dict{String,Placement}
+
+Rebalance an existing placement with as few moves as possible, the counterpart of
+[`compute_assignment`](@ref) for every repack after the first. Every move costs a weight load (often a
+read from disk) and fragments the worker it lands on, so instead of packing from scratch, which on a
+memory-bound fleet reorders the whole pack and can move most models (68 of 95 on one measured repack),
+this keeps `prev` and changes only what it must:
+
+1. Keep every placement whose workers are still present. A model whose worker left, a new model, or a
+   raised replica count gets the missing replicas on the lowest-pressure workers, largest demand
+   first; a lowered replica count drops the extra replicas.
+2. With `forbid_memory_oversubscription`, shed models from any worker over its weight budget onto
+   workers where they fit, preferring the smallest model that clears the overflow.
+3. Repeatedly make the single move off the highest-pressure worker that lowers its pressure the most
+   per byte moved, as long as the gain is at least `min_gain` of that pressure and the destination
+   ends below the source's old pressure. Pressure is the same max-norm as the packer's: the larger of
+   a worker's compute load and its weight memory over budget.
+
+With nothing to fix and no move worth `min_gain`, the result is `prev` (restricted to `u` and to the
+present workers). Weights are even across a model's replicas, as in the packer.
+"""
+function rebalance_assignment(
+        u::Dict{String, Float64}, workers::Vector{String},
+        prev::Dict{String, Placement};
+        mem::Dict{String, Float64} = Dict{String, Float64}(),
+        mem_cap::Dict{String, Float64} = Dict{String, Float64}(),
+        replicas::Dict{String, Int} = Dict{String, Int}(),
+        default_replicas::Int = 1, min_gain::Float64 = 0.05,
+        forbid_memory_oversubscription::Bool = false,
+        stats::Union{Nothing, RepackStats} = nothing
+    )
+    out = Dict{String, Placement}()
+    isempty(workers) && return out
+    present = Set(workers)
+    capof(w) = (c = get(mem_cap, w, Inf); c <= 0 ? Inf : c)
+    memof(m) = get(mem, m, 0.0)
+    cload = Dict{String, Float64}(w => 0.0 for w in workers)
+    mload = Dict{String, Float64}(w => 0.0 for w in workers)
+    pressure(w, c = cload[w], b = mload[w]) = max(c, capof(w) == Inf ? 0.0 : b / capof(w))
+    fits(w, b) = (c = capof(w); c == Inf || mload[w] + b <= c)
+    members = Dict{String, Vector{String}}()
+    share(m) = u[m] / length(members[m])
+    function charge!(m, sign)
+        s = share(m)
+        for w in members[m]
+            cload[w] += sign * s
+            mload[w] += sign * memof(m)
+        end
+        return
+    end
+
+    # 1. Keep what stands; collect the replicas that are missing.
+    want = Dict{String, Int}()
+    for m in keys(u)
+        k = clamp(get(replicas, m, default_replicas), 1, length(workers))
+        want[m] = k
+        pl = get(prev, m, nothing)
+        ws = pl === nothing ? String[] : sort!([w for (w, _) in pl if w in present])
+        length(ws) > k && resize!(ws, k)
+        members[m] = ws
+        isempty(ws) || charge!(m, 1)
+    end
+    pending = sort!([m for m in keys(u) if length(members[m]) < want[m]]; by = m -> (-u[m], -memof(m), m))
+    for m in pending
+        isempty(members[m]) || charge!(m, -1)
+        need = want[m] - length(members[m])
+        k = want[m]
+        fitrank(w) = (forbid_memory_oversubscription && !fits(w, memof(m))) ? 1 : 0
+        cands = [w for w in workers if !(w in members[m])]
+        sort!(cands; by = w -> (fitrank(w), pressure(w, cload[w] + u[m] / k, mload[w] + memof(m)), w))
+        append!(members[m], cands[1:need])
+        sort!(members[m])
+        charge!(m, 1)
+    end
+
+    # Move one replica of `m` from `src` to `dst`, keeping the loads current.
+    function move!(m, src, dst)
+        charge!(m, -1)
+        members[m][findfirst(==(src), members[m])] = dst
+        sort!(members[m])
+        charge!(m, 1)
+        return
+    end
+
+    # 2. Shed models from workers over their weight budget.
+    if forbid_memory_oversubscription
+        for w in workers
+            while mload[w] > capof(w)
+                over = mload[w] - capof(w)
+                best = nothing
+                bestkey = nothing
+                for (m, ws) in members
+                    w in ws || continue
+                    b = memof(m)
+                    b > 0 || continue
+                    for t in workers
+                        (t in ws || !fits(t, b)) && continue
+                        # Prefer a model that clears the overflow alone, the smallest such; otherwise
+                        # the largest one, so the fewest moves are made. Then the emptiest destination.
+                        key = (b >= over ? 0 : 1, b >= over ? b : -b, pressure(t, cload[t] + share(m), mload[t] + b), m, t)
+                        if bestkey === nothing || key < bestkey
+                            best, bestkey = (m, t), key
+                        end
+                    end
+                end
+                best === nothing && break        # nothing fits anywhere: leave it (the repack warns)
+                move!(best[1], w, best[2])
+            end
+        end
+    end
+
+    # 3. Improve: move off the highest-pressure worker while it is worth a load.
+    best_gain = 0.0
+    for _ in 1:(4 * length(u) + 16)
+        src = argmax(w -> (pressure(w), w), workers)
+        psrc = pressure(src)
+        psrc <= 0 && break
+        best = nothing
+        bestscore = 0.0
+        best_gain = 0.0
+        for (m, ws) in members
+            src in ws || continue
+            s, b = share(m), memof(m)
+            for t in workers
+                t in ws && continue
+                (forbid_memory_oversubscription && !fits(t, b)) && continue
+                after_src = pressure(src, cload[src] - s, mload[src] - b)
+                after_dst = pressure(t, cload[t] + s, mload[t] + b)
+                after_dst < psrc || continue
+                gain = psrc - max(after_src, after_dst)
+                gain > best_gain && (best_gain = gain)
+                gain >= min_gain * psrc && gain > 1.0e-12 || continue
+                score = gain / max(b, 1.0)
+                if best === nothing || score > bestscore
+                    best, bestscore = (m, t), score
+                end
+            end
+        end
+        if best === nothing
+            stats === nothing || (stats.max_improvement = max(stats.max_improvement, best_gain / psrc))
+            break
+        end
+        move!(best[1], src, best[2])
+    end
+
+    for (m, ws) in members
+        out[m] = [(w, 1.0 / length(ws)) for w in ws]
+    end
+    return out
+end
+
 # ---------------------------------------------------------------------------------------------
 
 # One model's in-progress fill run (multi-replica models only). Every field is read and written
@@ -232,10 +387,14 @@ mutable struct LptPackingState <: GatewayScheduler
     cost_ewma::Dict{String, Float64}          # compute seconds/request
     last_cum::Dict{String, Tuple{Float64, UInt64}}
     last_rebalance::Float64
-    # compute-trigger accounting (prober task only): fleet GPU-seconds since the last repack and the
-    # previous fleet cumulative-compute total used to derive the per-tick delta.
+    # compute-trigger accounting (prober task only): fleet GPU-seconds since the last repack, and each
+    # worker's cumulative compute at its last poll, from which the per-tick delta is summed worker by
+    # worker (see `_compute_delta!`).
     compute_accum::Float64
-    last_fleet_compute::Float64
+    last_worker_compute::Dict{String, Float64}
+    # when each placed worker was first missing from a poll (prober task only); see
+    # `_hold_for_absent_workers!`.
+    absent_since::Dict{String, Float64}
     # whether a tick-driven repack has fired yet. The startup cold placement does not count; the
     # first tick repack sets this, after which the steady-state `rebalance_compute_seconds` applies.
     did_first_tick_repack::Bool
@@ -296,7 +455,7 @@ LptPackingState(cfg::GatewayConfig, meta::RoutingMeta = RoutingMeta(cfg)) = LptP
     PackingKnobs(cfg), ReentrantLock(), meta,
     Dict{String, Threads.Atomic{Int}}(), ReentrantLock(),
     Dict{String, Float64}(), Dict{String, Float64}(), Dict{String, Tuple{Float64, UInt64}}(),
-    0.0, 0.0, 0.0, false,
+    0.0, 0.0, Dict{String, Float64}(), Dict{String, Float64}(), false,
     Dict{String, Int}(), Dict{String, Float64}(), Dict{String, Placement}(),
     Dict{Tuple{String, String}, Threads.Atomic{Int}}(),
     Dict{Tuple{String, String}, Threads.Atomic{Int}}(),
@@ -402,6 +561,8 @@ function _repack!(
         s::LptPackingState, poll, metrics::Union{GatewayMetrics, Nothing};
         trigger::Symbol = :compute, k::PackingKnobs = knobs(s)
     )
+    # Never replace a live placement with one packed over no workers.
+    (isempty(poll.polled) && !isempty(@atomic s.assignment)) && return Set{String}()
     now = time()
     # Elapsed since the last repack, for the repack log: wall time and the fleet GPU-seconds that
     # accumulated (the compute that triggered this repack). Captured before they are reset below.
@@ -465,25 +626,44 @@ function _repack!(
 
     prev = @atomic s.assignment
     stats = RepackStats()
-    next = compute_assignment(
-        full, sort(poll.polled), prev;
-        mem = poll.mem, mem_cap = poll.mem_cap,
-        replicas = replica_overrides(k), default_replicas = k.default_replicas,
-        hysteresis = k.hysteresis,
-        forbid_memory_oversubscription = k.forbid_memory_oversubscription,
-        stats = stats
-    )
+    polled = sort(poll.polled)
+    # Pack from scratch only when there is nothing to keep (the startup placement, or a fleet whose
+    # workers were all replaced); every later repack moves as few models as it can, since each move is
+    # a weight load on the worker it lands on.
+    cold = !any(pl -> any(wv -> first(wv) in polled, pl), values(prev))
+    next = if cold
+        compute_assignment(
+            full, polled, prev;
+            mem = poll.mem, mem_cap = poll.mem_cap,
+            replicas = replica_overrides(k), default_replicas = k.default_replicas,
+            hysteresis = k.hysteresis,
+            forbid_memory_oversubscription = k.forbid_memory_oversubscription,
+            stats = stats
+        )
+    else
+        rebalance_assignment(
+            full, polled, prev;
+            mem = poll.mem, mem_cap = poll.mem_cap,
+            replicas = replica_overrides(k), default_replicas = k.default_replicas,
+            min_gain = k.hysteresis,
+            forbid_memory_oversubscription = k.forbid_memory_oversubscription,
+            stats = stats
+        )
+    end
     merge!(next, drifted)
     @atomic s.assignment = next
     _swap_outstanding!(s, next)
 
     s.compute_accum = 0.0
-    s.last_fleet_compute = poll.fleet_compute
+    for (w, c) in poll.worker_compute
+        s.last_worker_compute[w] = c
+    end
 
     # Count models whose worker set changed from the previous assignment (a model new this repack is
     # an initial placement, not a move, so it is not counted), and collect the workers affected by a
     # move (gained or lost a model) so the caller can compact just those.
     moved = 0
+    moved_bytes = 0.0
     changed_workers = Set{String}()
     for (m, placement) in next
         prevpl = get(prev, m, nothing)
@@ -491,13 +671,14 @@ function _repack!(
         nextws = Set(first.(placement)); prevws = Set(first.(prevpl))
         nextws == prevws && continue
         moved += 1
+        moved_bytes += get(poll.mem, m, 0.0) * length(setdiff(nextws, prevws))
         union!(changed_workers, symdiff(nextws, prevws))
     end
     for (m, prevpl) in prev          # models dropped entirely this repack: their old workers lose them
         haskey(next, m) && continue
         union!(changed_workers, Set(first.(prevpl)))
     end
-    @info "lpt_packing: repack" models = length(next) moved = moved held_by_hysteresis = stats.held max_improvement = round(stats.max_improvement; digits = 3) hysteresis = k.hysteresis compute_seconds = round(compute_elapsed; digits = 2) wall_seconds = round(wall_elapsed; digits = 1)
+    @info "lpt_packing: repack" models = length(next) moved = moved moved_weights = Base.format_bytes(round(Int, moved_bytes)) incremental = !cold held_by_hysteresis = stats.held max_improvement = round(stats.max_improvement; digits = 3) hysteresis = k.hysteresis compute_seconds = round(compute_elapsed; digits = 2) wall_seconds = round(wall_elapsed; digits = 1)
 
     # Memory oversubscription warning: when a worker's assigned weight footprint exceeds its
     # on-demand budget the packing is infeasible (total weights outgrew the fleet); the worker's
@@ -660,6 +841,44 @@ function rebalance!(
     return nothing
 end
 
+# GPU-seconds the polled workers ran since their previous poll, summed worker by worker. A worker's
+# first poll only sets its baseline; a worker missing from a poll contributes nothing then and, when
+# it returns, only what it ran meanwhile; a counter that went backwards (a restart) is re-baselined.
+# A fleet sum would instead read a missing worker as a restart and its return as a burst of its whole
+# lifetime's compute, enough to fire a spurious repack.
+function _compute_delta!(s::LptPackingState, poll)
+    total = 0.0
+    for (w, c) in poll.worker_compute
+        last = get(s.last_worker_compute, w, nothing)
+        last !== nothing && c >= last && (total += c - last)
+        s.last_worker_compute[w] = c
+    end
+    return total
+end
+
+# How long a placed worker may be missing from the polls before a repack moves its models elsewhere:
+# three probe rounds. A worker busy loading weights, or a dropped connection, misses a poll now and
+# then; packing without it would move every model it holds onto the rest of the fleet and back again
+# once it answers, each move a weight load. A worker gone for longer is treated as gone.
+const _ABSENT_GRACE_SECONDS = 30.0
+
+# Whether a due repack must wait: no worker answered the poll, or a worker that holds placements has
+# been missing for less than the grace period. Records when each placed worker went missing.
+function _hold_for_absent_workers!(s::LptPackingState, poll, now::Float64)
+    polled = Set(poll.polled)
+    placed = Set(w for pl in values(@atomic s.assignment) for (w, _) in pl)
+    for w in collect(keys(s.absent_since))
+        (w in polled || !(w in placed)) && delete!(s.absent_since, w)
+    end
+    hold = isempty(polled)
+    for w in placed
+        w in polled && continue
+        t = get!(s.absent_since, w, now)
+        now - t < _ABSENT_GRACE_SECONDS && (hold = true)
+    end
+    return hold
+end
+
 """
     tick_packing!(s, pool, ready_urls, metrics, poll=poll_workers(pool, ready_urls)) -> nothing
 
@@ -688,20 +907,17 @@ function tick_packing!(
     @atomic s.max_batch = poll.max_batch         # keep routing metadata fresh between repacks
     _publish_fill_plan!(s, k, poll.max_batch, poll.batch_at)   # ...and re-resolve the fill rules
     _refresh_live_gauges!(s, metrics)            # in-flight and quantum, refreshed between repacks
-    if s.last_fleet_compute == 0.0
-        s.last_fleet_compute = poll.fleet_compute   # first observation: baseline only
-    else
-        delta = poll.fleet_compute - s.last_fleet_compute
-        s.last_fleet_compute = poll.fleet_compute
-        delta > 0 && (s.compute_accum += delta)     # negative delta = worker restart: re-baseline
-    end
+    s.compute_accum += _compute_delta!(s, poll)
+    hold = _hold_for_absent_workers!(s, poll, time())
     # The first tick-driven repack may use a smaller budget so an early rebalance corrects the cold
     # placement quickly; steady-state then uses the larger budget. The flag is flipped here, not in
     # `_repack!`, because the startup `rebalance!` also calls `_repack!` and must not consume it.
     threshold = (!s.did_first_tick_repack && k.first_rebalance_compute_seconds > 0) ?
         k.first_rebalance_compute_seconds : k.rebalance_compute_seconds
     forced = requested > (@atomic s.repack_completed)
-    if forced || s.compute_accum >= threshold
+    if (forced || s.compute_accum >= threshold) && hold
+        @info "lpt_packing: repack deferred while a placed worker is missing from the poll" missing = sort!(collect(keys(s.absent_since))) grace_seconds = _ABSENT_GRACE_SECONDS
+    elseif forced || s.compute_accum >= threshold
         # A forced repack does not consume the first-repack budget, for the same reason the startup
         # cold placement does not: that budget is about the first repack driven by real traffic.
         forced || (s.did_first_tick_repack = true)

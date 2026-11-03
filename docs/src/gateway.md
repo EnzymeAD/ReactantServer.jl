@@ -66,7 +66,7 @@ scheduling:
   rebalance_compute_seconds: 300 # fleet GPU-seconds consumed that triggers a repack
   first_rebalance_compute_seconds: 60 # smaller budget for the first repack (0 = use rebalance_compute_seconds)
   ema_halflife_compute_seconds: 0 # demand-EMA halflife in fleet compute-seconds (0 = track rebalance_compute_seconds)
-  hysteresis: 0.0               # extra improvement required before a model moves workers (0 = move on any gain)
+  hysteresis: 0.05              # least relative gain a repack needs to move a model (0 = move on any gain)
   default_replicas: 1           # GPUs per model unless overridden below (a number, or "all")
   routing_fill_factor: 1.0      # fill quantum as a multiple of max batch size (lpt_packing only)
   routing_policy: fill_least    # fill_least (default) | fill_rr  (lpt_packing only)
@@ -179,10 +179,18 @@ Placement is kept stable mainly by smoothing the demand signal rather than by a 
 the arrival rate and per-request cost are each tracked with an exponential moving average whose
 halflife is measured in fleet compute-seconds (`ema_halflife_compute_seconds`, defaulting to one
 `rebalance_compute_seconds` interval, so the signal decays about half per repack and ages with
-how busy the fleet is rather than with wall-clock). `hysteresis` adds an optional dead band on
-top: a single-replica model moves only when the move improves its resulting pressure by more than
-`hysteresis` (default `0.0`, i.e. move on any improvement), because batching depends on traffic
-staying where the queues are. (`max_worker_share` is accepted but does not affect a model's GPU
+how busy the fleet is rather than with wall-clock).
+
+Only the startup placement packs from scratch. Every later repack starts from the current placement
+and moves as few models as it can, because each move is a weight load on the GPU it lands on (often a
+read from disk) and fragments that GPU's memory, and batching depends on traffic staying where the
+queues are. A repack places what is new or lost its worker, then, with
+`forbid_memory_oversubscription`, moves models off any worker over its weight budget (the smallest
+model that clears the overflow first), and then repeatedly moves the one model off the
+highest-pressure worker that relieves it most per byte moved, stopping once no move would lower that
+worker's pressure by at least `hysteresis` (a fraction, default `0.05`). With a settled fleet a
+repack therefore moves nothing. A worker that misses the poll for less than 30 s (three probe rounds)
+keeps its models: the repack waits rather than moving them onto the rest of the fleet and back. (`max_worker_share` is accepted but does not affect a model's GPU
 count.)
 
 Repacks are driven by accumulated compute, not wall-clock: the gateway polls the workers every
@@ -433,10 +441,13 @@ returning whether it reported ready.
   metadata and accumulate consumed compute, but recomputes the placement only once the fleet has
   consumed `scheduling.rebalance_compute_seconds` GPU-seconds (the first repack uses
   `scheduling.first_rebalance_compute_seconds` when set). Each repack logs a `lpt_packing: repack`
-  line with the number of models placed, how many `moved` workers, how many were
-  `held_by_hysteresis`, the largest available `max_improvement` against the `hysteresis`
-  threshold, and the `compute_seconds`/`wall_seconds` since the last repack, useful for watching
-  placement churn and the trigger cadence.
+  line with the number of models placed, how many `moved` workers and the weight bytes that
+  move puts on their new workers (`moved_weights`), whether it was `incremental` (every repack
+  after the startup placement), the largest available `max_improvement` against the `hysteresis`
+  threshold (a relative gain the repack judged not worth a move), and the
+  `compute_seconds`/`wall_seconds` since the last repack, useful for watching placement churn and
+  the trigger cadence. A repack that comes due while a placed worker is missing from the poll logs
+  `repack deferred` instead and runs once the worker answers or 30 s have passed.
 - If a probe to a worker hangs (times out, rather than failing fast), the gateway drops and
   recreates that worker's gRPC connection before the next attempt. This recovers from a
   half-open connection (for example one caught during a worker's brief silent-accept window at
