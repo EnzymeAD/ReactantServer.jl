@@ -297,7 +297,14 @@ end
 # not scheduled here: they run on the request task under the meta gate (see `infer`), and their GPU
 # sub-calls enter these queues as ordinary (committed) requests for the sub-models.
 _schedulable(entry::ModelEntry) =
-    entry.sched !== nothing && entry.executable !== nothing && !isempty(entry.sched.queue)
+    entry.sched !== nothing && entry.executable !== nothing && !isempty(entry.sched.queue) &&
+    !_awaiting_stage(entry)
+
+# A model whose weights a background task is reading into host memory waits for that read instead
+# of repeating it on the dispatch loop, which meanwhile serves the other models. A model already on
+# the device is never held back. See `_kick_staging!`.
+_awaiting_stage(entry::ModelEntry) =
+    entry.sched.host_stage === :staging && entry.executable.weights === nothing
 
 # There is work when any model has a queued request. A committed meta sub-call is pushed onto its
 # sub-model's queue, so it is covered by this scan (and `s.committed` is only ever set with that push).
@@ -318,9 +325,17 @@ function select_dispatch!(s::Scheduler, now::Float64)
     # at most REACTANT_META_CONCURRENCY of them). Each was pushed to the front of its sub-model's queue,
     # so plan_batch draws it (leading the batch). Pop in arrival order; skip a stale entry whose request
     # is no longer queued (already coalesced/dispatched) or whose model is gone.
-    while !isempty(s.committed)
-        qr = popfirst!(s.committed)
+    i = 1
+    while i <= length(s.committed)
+        qr = s.committed[i]
         entry = get(s.registry.by_name, qr.req.model_name, nothing)
+        # A sub-call whose model is still being read into host memory keeps its place in line.
+        if entry !== nothing && entry.sched !== nothing && entry.executable !== nothing &&
+                _awaiting_stage(entry) && any(x -> x === qr, entry.sched.queue)
+            i += 1
+            continue
+        end
+        deleteat!(s.committed, i)
         (entry === nothing || !_schedulable(entry)) && continue
         # `===` does not curry (it is a builtin, not a Fix2), so test identity with an explicit closure.
         any(x -> x === qr, entry.sched.queue) || continue
@@ -514,7 +529,7 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
     end
     if length(live) != length(taken)
         taken = live          # the catch below and the slicing loop operate only on live requests
-        isempty(taken) && return nothing
+        isempty(taken) && return _release_idle_stage!(s, entry)
     end
     try
         # Inputs were already run through the model's preprocess hook on each caller's task before
@@ -532,7 +547,7 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
         # Ensure the model's weights are resident before running (loads on demand and evicts
         # LRU under budget pressure). Load time is excluded from compute_time, which feeds the
         # cost estimate, so the estimate reflects steady-state (resident) execution.
-        s.weight_cache === nothing || acquire!(s.weight_cache, entry)
+        _acquire_for_dispatch!(s, entry)
         t0 = time()
         out = run_model(s.backend, s.pool, entry.executable, merged)
         compute_time = time() - t0
@@ -833,6 +848,12 @@ function _reject_pending_locked!(s::Scheduler)
             put!(qr.reply, err)
         end
         empty!(entry.sched.queue)
+        st = entry.sched
+        if st.host_stage === :staged && s.weight_cache !== nothing
+            release_staged!(s.weight_cache, entry, st.staged; uploaded = false)
+            st.staged = nothing
+            st.host_stage = :none
+        end
     end
     for entry in values(s.registry.meta)
         entry.sched === nothing && continue
@@ -896,6 +917,135 @@ function _warmup_entry!(s::Scheduler, entry::ModelEntry)
 end
 
 # ---------------------------------------------------------------------------------------------
+# Staging: reading weights into host memory ahead of the dispatch
+# ---------------------------------------------------------------------------------------------
+#
+# Loading a model off the device has a host half (the shared store's lock waits, reserving its
+# region, reading the weights file) and a device half (eviction and upload). Run on the dispatch
+# loop, the host half holds the GPU idle for as long as a disk read takes. Instead, a model with
+# queued requests and no weights on the device gets a background task that does the host half
+# (`stage_host_weights`); while it runs the model is not selectable (`_awaiting_stage`) and the loop
+# serves everything else. When the read lands the model becomes selectable again, and its dispatch
+# evicts and uploads in order, as any load does, so a staged model never takes device memory ahead
+# of its turn. Staging is an optimization only: a model that was never staged, or whose read failed,
+# loads on the dispatch as before.
+#
+# The read is host memory only, so at most `_MAX_HOST_STAGES` models per worker are read ahead
+# (counting those read and waiting for their dispatch), oldest queued request first. Each one
+# waiting holds its shared-store region against eviction until it is uploaded.
+
+const _MAX_HOST_STAGES = 2
+
+# Start background reads for models that need one, up to the cap. Caller holds `s.cond`.
+function _kick_staging!(s::Scheduler)
+    wc = s.weight_cache
+    (wc === nothing || !s.running) && return nothing
+    busy = 0
+    cands = ModelEntry[]
+    for e in values(s.registry.by_name)
+        st = e.sched
+        (st === nothing || e.executable === nothing) && continue
+        if st.host_stage === :staging || st.host_stage === :staged
+            busy += 1
+        elseif st.host_stage === :none && !isempty(st.queue) && needs_host_stage(wc, e)
+            push!(cands, e)
+        end
+    end
+    busy >= _MAX_HOST_STAGES && return nothing
+    sort!(cands; by = e -> e.sched.queue[1].enqueued_at)
+    for e in cands
+        busy >= _MAX_HOST_STAGES && break
+        e.sched.host_stage = :staging
+        e.sched.stage_task = Threads.@spawn :default _run_stage!(s, e)
+        busy += 1
+    end
+    return nothing
+end
+
+# The background read for one model. On success the model waits, staged, for its dispatch; if it
+# was unloaded, loaded some other way, or the read failed, the read is dropped and the dispatch
+# loads the model itself. Either way the loop is woken to reconsider it.
+function _run_stage!(s::Scheduler, entry::ModelEntry)
+    wc = s.weight_cache::WeightCache
+    staged = nothing
+    failed = false
+    try
+        staged = stage_host_weights(wc, entry)
+    catch err
+        failed = true
+        @warn "reading weights ahead of the dispatch failed; the dispatch loads the model instead" model = entry.name exception = (err, catch_backtrace())
+    end
+    drop = nothing
+    lock(s.cond) do
+        st = entry.sched
+        live = s.running && get(s.registry.by_name, entry.name, nothing) === entry
+        if staged !== nothing && live && st.host_stage === :staging && entry.executable.weights === nothing
+            st.staged = staged
+            st.host_stage = :staged
+        else
+            drop = staged
+            # A failed read is not retried in the background: the dispatch loads the model and its
+            # requests see the error if there is one.
+            st.host_stage === :staging && (st.host_stage = failed ? :failed : :none)
+        end
+        st.stage_task = nothing
+        _kick_staging!(s)
+        notify(s.cond)
+    end
+    drop === nothing || release_staged!(wc, entry, drop; uploaded = false)
+    return nothing
+end
+
+# Make the dispatched model's weights resident, uploading its staged weights when it has them.
+# Evictions here may leave other queued models off the device, so staging is reconsidered after.
+function _acquire_for_dispatch!(s::Scheduler, entry::ModelEntry)
+    wc = s.weight_cache
+    wc === nothing && return nothing
+    model = entry.executable
+    st = entry.sched
+    # Already on the device with nothing staged (the common case): a hit, nothing to reconsider.
+    (model.weights !== nothing && st.host_stage === :none) && return acquire!(wc, entry)
+    staged = nothing
+    lock(s.cond) do
+        if st.host_stage === :staged
+            staged = st.staged
+            st.staged = nothing
+            st.host_stage = :loading
+        elseif st.host_stage === :none || st.host_stage === :failed
+            st.host_stage = :loading          # keeps a background read from starting for it now
+        end
+    end
+    try
+        acquire!(wc, entry; staged = staged)
+    finally
+        lock(s.cond) do
+            st.host_stage === :loading && (st.host_stage = :none)
+            _kick_staging!(s)
+        end
+    end
+    return nothing
+end
+
+# Release a staged model's weights when it has nothing left to run (its requests were all dropped
+# at their deadline), so its region does not stay held. Caller does not hold `s.cond`.
+function _release_idle_stage!(s::Scheduler, entry::ModelEntry)
+    wc = s.weight_cache
+    wc === nothing && return nothing
+    staged = lock(s.cond) do
+        st = entry.sched
+        st.host_stage === :failed && isempty(st.queue) && (st.host_stage = :none)
+        (st.host_stage === :staged && isempty(st.queue)) || return nothing
+        h = st.staged
+        st.staged = nothing
+        st.host_stage = :none
+        _kick_staging!(s)
+        return h
+    end
+    staged === nothing || release_staged!(wc, entry, staged; uploaded = false)
+    return nothing
+end
+
+# ---------------------------------------------------------------------------------------------
 # Submission and the dispatch loop
 # ---------------------------------------------------------------------------------------------
 
@@ -930,6 +1080,7 @@ function submit!(s::Scheduler, qr::QueuedRequest)
         else
             push!(entry.sched.queue, qr)
         end
+        _kick_staging!(s)
         notify(s.cond)
     end
     return nothing
@@ -968,6 +1119,8 @@ function dispatch_loop(s::Scheduler)
             execute_and_record!(s, chosen)
             _maybe_compact!(s)
         end
+        # A residency change or a compaction can leave queued models off the device.
+        lock(() -> _kick_staging!(s), s.cond)
     end
     return nothing
 end
@@ -1130,17 +1283,29 @@ end
 # Remove a model from the live registry, rejecting any queued requests, and release its residency.
 # Runs on the dispatch thread. Returns the removed entry, or `nothing` if it was not registered.
 function _evict_entry!(sch::Scheduler, name::AbstractString)
-    entry = lock(sch.cond) do
+    entry, reading, staged = lock(sch.cond) do
         e = pop!(sch.registry.by_name, String(name), nothing)
+        t = nothing
+        h = nothing
         if e !== nothing && e.sched !== nothing
             for qr in e.sched.queue
                 put!(qr.reply, ErrorException("model '$name' was unloaded"))
             end
             empty!(e.sched.queue)
+            t = e.sched.stage_task
+            h = e.sched.staged
+            e.sched.staged = nothing
+            e.sched.host_stage = :none
         end
-        return e
+        return (e, t, h)
     end
     entry === nothing && return nothing
+    # A background read of this model's weights must end before its weights file is closed below:
+    # a descriptor closed under a running pread can be reused by another open, and the read would
+    # then copy the wrong file's bytes. The read sees the model gone and drops what it read.
+    reading === nothing || wait(reading)
+    staged === nothing || sch.weight_cache === nothing ||
+        release_staged!(sch.weight_cache, entry, staged; uploaded = false)
     # Release residency outside the lock (device frees can be slow).
     sch.weight_cache === nothing || release_all!(sch.weight_cache, entry)
     # Close the weights file: it holds the loaded version's inode, which a replaced file keeps alive

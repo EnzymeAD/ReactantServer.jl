@@ -1,0 +1,203 @@
+# Loading weights without stalling the worker. A model off the device gets its weights read into
+# host memory by a background task while the dispatch loop keeps serving the models already on the
+# device, and the slow calls the loop does make run off the interactive thread, which is also the
+# thread Julia services its I/O on. Against the MockBackend; uses the helpers of
+# test_weight_cache.jl (_W, _WBYTES, _batched_manifest) and test_host_cache.jl (CountingWeights).
+
+# A weights double whose reads wait at a gate once armed, so a test can hold a model's background
+# read in progress. `fail_next` makes the next read throw instead.
+mutable struct GatedWeights
+    tensors::Dict{String, Array}
+    armed::Bool
+    gate::Base.Event          # notify to let held reads through
+    started::Base.Event       # notified when a held read begins
+    reads::Threads.Atomic{Int}
+    fail_next::Bool
+end
+GatedWeights() = GatedWeights(
+    Dict{String, Array}("w" => copy(_W)), false, Base.Event(), Base.Event(), Threads.Atomic{Int}(0), false
+)
+Base.haskey(g::GatedWeights, k) = haskey(g.tensors, k)
+function Base.getindex(g::GatedWeights, k)
+    if g.armed
+        notify(g.started)
+        wait(g.gate)
+    end
+    Threads.atomic_add!(g.reads, 1)
+    if g.fail_next
+        g.fail_next = false
+        error("simulated read failure")
+    end
+    return g.tensors[k]
+end
+ReactantServer.weight_spec(g::GatedWeights, k) = (eltype(g.tensors[k]), size(g.tensors[k]))
+
+function _st_entry(name, weights)
+    sig = ReactantServer.ModelSignature(["x"], DataType[Float32], ["w"], 1, ["y"], DataType[Float32], 1)
+    exec = ReactantServer.MockExecutable(args -> [args[1] .* args[2]], 1)
+    lm = ReactantServer.LoadedModel(sig, Dict{Int, Any}(1 => exec), nothing, false, _WBYTES, nothing)
+    return ReactantServer.ModelEntry(
+        name, _batched_manifest(name), Dict{Int, Vector{UInt8}}(), "", weights, lm, nothing,
+        identity, identity
+    )
+end
+
+# A running scheduler with room on the device for `device_models` models, and `B` (gated) off the
+# device while `A` is on it, so the next request for B needs a load from its weights file.
+function _st_running(gw::GatedWeights; device_models::Int = 1)
+    A = _st_entry("A", CountingWeights())
+    B = _st_entry("B", gw)
+    backend = ReactantServer.MockBackend()
+    pool = ReactantServer.MemoryPool(backend, ReactantServer.MockClient(), ReactantServer.MockDevice(0), "mock", nothing)
+    reg = ReactantServer.ModelRegistry()
+    reg.by_name["A"] = A
+    reg.by_name["B"] = B
+    sched = ReactantServer.Scheduler(reg, backend, pool, ReactantServer.SchedulerConfig(30.0, 1024, 30.0))
+    for e in (A, B)
+        e.sched = ReactantServer.ModelSchedState(e.name, ReactantServer.ModelSchedConfig(1.0), 0.0)
+    end
+    sched.weight_cache = ReactantServer.WeightCache(backend, pool, reg, device_models * _WBYTES)
+    ReactantServer.start!(sched)
+    @test _st_infer(sched, "A") == _ST_OUT          # A on the device, B off it
+    @test B.executable.weights === nothing
+    gw.reads[] = 0
+    gw.armed = true
+    return sched, A, B
+end
+
+const _ST_OUT = reshape(Float32[10, 100], 2, 1)
+_st_infer(sched, name) = ReactantServer.infer(
+    sched, ReactantServer.InferRequest(name, ["y"], [ReactantServer.NamedTensor("x", reshape(Float32[1, 1], 2, 1))])
+)[1].data
+
+@testset "staging: a model's weights are read in the background while resident models keep serving" begin
+    gw = GatedWeights()
+    sched, A, B = _st_running(gw)
+    try
+        tB = Threads.@spawn _st_infer(sched, "B")
+        wait(gw.started)                                # B's read has begun, off the dispatch loop
+        @test B.sched.host_stage === :staging
+        for _ in 1:3
+            @test _st_infer(sched, "A") == _ST_OUT      # served while B's read is held
+        end
+        @test !istaskdone(tB)
+        @test A.executable.weights !== nothing          # nothing was evicted for B ahead of its turn
+        notify(gw.gate)
+        @test fetch(tB) == _ST_OUT
+        @test gw.reads[] == 1                           # read once, in the background; the dispatch only uploaded
+        @test B.sched.host_stage === :none && B.sched.staged === nothing
+        @test B.executable.weights !== nothing
+    finally
+        notify(gw.gate)
+        ReactantServer.shutdown!(sched)
+    end
+end
+
+@testset "staging: a failed background read is not retried there; the dispatch loads the model" begin
+    gw = GatedWeights()
+    sched, A, B = _st_running(gw)
+    try
+        gw.armed = false
+        gw.fail_next = true
+        @test _st_infer(sched, "B") == _ST_OUT          # the background read failed, the dispatch's succeeded
+        @test gw.reads[] == 2
+        @test B.sched.host_stage === :none
+    finally
+        ReactantServer.shutdown!(sched)
+    end
+end
+
+@testset "staging: unloading a model waits for its background read before closing its weights" begin
+    gw = GatedWeights()
+    sched, A, B = _st_running(gw)
+    try
+        tB = Threads.@spawn try
+            _st_infer(sched, "B")
+        catch err
+            err
+        end
+        wait(gw.started)
+        tE = Threads.@spawn ReactantServer.evict!(sched, "B")
+        sleep(0.3)
+        @test !istaskdone(tE)                           # the unload waits on the read in progress
+        notify(gw.gate)
+        @test fetch(tE) === B
+        @test fetch(tB) isa ErrorException              # the queued request was rejected as unloaded
+        @test B.sched.host_stage === :none && B.sched.staged === nothing
+        @test _st_infer(sched, "A") == _ST_OUT          # the worker carries on
+    finally
+        notify(gw.gate)
+        ReactantServer.shutdown!(sched)
+    end
+end
+
+@testset "staging: with the private host cache, a staged read is cached once uploaded" begin
+    gw = GatedWeights()
+    A = _st_entry("A", CountingWeights())
+    B = _st_entry("B", gw)
+    backend = ReactantServer.MockBackend()
+    pool = ReactantServer.MemoryPool(backend, ReactantServer.MockClient(), ReactantServer.MockDevice(0), "mock", nothing)
+    reg = ReactantServer.ModelRegistry()
+    reg.by_name["A"] = A
+    reg.by_name["B"] = B
+    sched = ReactantServer.Scheduler(reg, backend, pool, ReactantServer.SchedulerConfig(30.0, 1024, 30.0))
+    for e in (A, B)
+        e.sched = ReactantServer.ModelSchedState(e.name, ReactantServer.ModelSchedConfig(1.0), 0.0)
+    end
+    wc = ReactantServer.WeightCache(backend, pool, reg, _WBYTES; host_budget = 2 * sizeof(_W))
+    sched.weight_cache = wc
+    ReactantServer.start!(sched)
+    try
+        _st_infer(sched, "A")
+        _st_infer(sched, "B")                           # B evicts A
+        n = gw.reads[]
+        hits = wc.host_hits
+        _st_infer(sched, "A")                           # A from its host copy, staged in the background
+        _st_infer(sched, "B")                           # and B from its
+        @test gw.reads[] == n                           # no further file read
+        @test wc.host_hits == hits + 2
+        @test haskey(wc.host_cached, "A") && haskey(wc.host_cached, "B")
+    finally
+        ReactantServer.shutdown!(sched)
+    end
+end
+
+@testset "off_interactive: a long blocking call made from the interactive thread leaves it free" begin
+    if Threads.nthreads(:interactive) == 0
+        @test_skip "needs an interactive thread (run with --threads=auto,1)"
+    else
+        # A call that blocks its thread without yielding, as a weight read or upload does.
+        block() = (
+            t_end = time() + 1.5; while time() < t_end
+                @ccall gc_safe = true usleep(50_000::Cuint)::Cint
+            end
+        )
+        # The worst lateness of a 10 ms timer on the default pool while `f` runs on the interactive pool.
+        function worst_lag(f)
+            done = Threads.Atomic{Bool}(false)
+            worst = Threads.Atomic{Float64}(0.0)
+            hb = Threads.@spawn :default while !done[]
+                t = time()
+                sleep(0.01)
+                Threads.atomic_max!(worst, time() - t - 0.01)
+            end
+            fetch(Threads.@spawn :interactive f())
+            done[] = true
+            wait(hb)
+            return worst[]
+        end
+        # The hazard itself: blocked in place, the interactive thread stops timers (and request
+        # handling) for the whole call. If this stops holding, the case below proves nothing.
+        @test worst_lag(block) > 1.0
+        @test worst_lag(() -> ReactantServer.off_interactive(block)) < 0.5
+        # An error comes back as itself, not wrapped in a TaskFailedException.
+        err = fetch(
+            Threads.@spawn :interactive try
+                ReactantServer.off_interactive(() -> throw(ArgumentError("boom")))
+            catch e
+                e
+            end
+        )
+        @test err isa ArgumentError
+    end
+end

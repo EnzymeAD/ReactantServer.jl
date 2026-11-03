@@ -117,11 +117,20 @@ mutable struct ModelSchedState
     total_compute::Float64
     wait_samples::Vector{Float64}
     batch_size_hist::Dict{Int, Int}
+    # Reading the weights into host memory ahead of the upload (see `_kick_staging!` in
+    # scheduler.jl). `host_stage` is one of :none, :staging (a background task is reading them),
+    # :staged (read; `staged` holds them until the dispatch uploads), :loading (the dispatch is
+    # loading the model itself), :failed (the background read failed; the dispatch loads it the old
+    # way). All three fields are guarded by the scheduler's `cond`.
+    host_stage::Symbol
+    staged::Any                           # a StagedWeights while :staged, else nothing
+    stage_task::Union{Task, Nothing}      # the background read while :staging
 end
 
 function ModelSchedState(name::AbstractString, mc::ModelSchedConfig, now::Float64)
     return ModelSchedState(
         String(name), mc.weight, mc.max_batch_size, QueuedRequest[],
-        0.0, now, Dict{Int, Float64}(), 0, 0, 0, 0.0, Float64[], Dict{Int, Int}()
+        0.0, now, Dict{Int, Float64}(), 0, 0, 0, 0.0, Float64[], Dict{Int, Int}(),
+        :none, nothing, nothing
     )
 end

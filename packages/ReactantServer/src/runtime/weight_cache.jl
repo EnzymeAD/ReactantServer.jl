@@ -9,9 +9,11 @@
 # `max_bytes` budgets only the on-demand pool, i.e. the GPU memory left after the pinned
 # models. It is sized by the operator with that in mind.
 #
-# Only the single dispatch-loop thread mutates the cache (plus startup, before that loop is
-# spawned), so the read-decide-write of victim selection is internally consistent without a
-# lock. The lock guards the brief bookkeeping commits against the read-only metrics snapshot;
+# Only the single dispatch loop mutates the cache (plus startup, before that loop is spawned), so
+# the read-decide-write of victim selection is internally consistent without a lock. The loop runs
+# the slow calls on a default-pool task it waits for (`off_interactive`), which keeps one mutator at
+# a time; the background reads that stage weights into host memory (host_cache.jl) touch no device
+# residency. The lock guards the brief bookkeeping commits against the read-only metrics snapshot;
 # the slow device transfers run outside it.
 
 mutable struct WeightCache
@@ -155,7 +157,12 @@ end
 # Transfer a model's weights to GPU buffers. When the weights are pinned in host RAM
 # (host_weights set, the normal on-demand case) this is a pure host->device transfer; under a host
 # weight budget it goes through the host cache; otherwise it reads the weights file.
-function _device_buffers(cache::WeightCache, entry::ModelEntry, model::LoadedModel)
+function _device_buffers(cache::WeightCache, entry::ModelEntry, model::LoadedModel; staged = nothing)
+    if staged !== nothing
+        bufs = transfer_to_device(cache.backend, cache.pool, staged.arrays)
+        _note_staged_load!(cache, entry, staged)
+        return bufs
+    end
     if model.host_weights !== nothing
         return transfer_to_device(cache.backend, cache.pool, model.host_weights)
     end
@@ -170,7 +177,10 @@ end
 Ensure every pinned model's weights are resident. `build_loaded_model` already loads them
 when on-demand mode is on, so this is normally a no-op; it loads defensively otherwise.
 """
-function preload_pinned!(cache::WeightCache, registry::ModelRegistry)
+preload_pinned!(cache::WeightCache, registry::ModelRegistry) =
+    off_interactive(() -> _preload_pinned!(cache, registry))
+
+function _preload_pinned!(cache::WeightCache, registry::ModelRegistry)
     for entry in values(registry.by_name)
         model = entry.executable
         if is_device_pinned(model) && model.weights === nothing
@@ -194,7 +204,29 @@ Base.showerror(io::IO, e::NotResidentError) =
     print(io, "model '", e.model, "' is not resident on the device; the control plane must pin it before inference")
 
 """
-    acquire!(cache, entry) -> nothing
+    off_interactive(f) -> f()
+
+Run `f()` on a default-pool task when called from the interactive thread pool, waiting for it there;
+otherwise run it in place. The worker runs its dispatch loop on the interactive thread, which is also
+the thread Julia services its I/O event loop on, so a long blocking call there (a weight read or
+upload, held for seconds) stops the whole worker from handling requests, health checks included.
+Waiting on a task instead yields that thread for the duration. The caller still waits, so the work
+stays serialized exactly as before: the dispatch loop remains the only task mutating residency. An
+error is rethrown as itself, not wrapped, so callers still see `AdmissionError` and the like.
+"""
+function off_interactive(f)
+    Threads.threadpool() === :interactive || return f()
+    t = Threads.@spawn :default f()
+    try
+        return fetch(t)
+    catch err
+        err isa TaskFailedException && throw(err.task.exception)
+        rethrow()
+    end
+end
+
+"""
+    acquire!(cache, entry; staged=nothing) -> nothing
 
 Guarantee `entry.executable.weights` is resident before the model runs. Device-pinned and
 already-resident models return immediately (the latter is bumped to most-recently-used and its
@@ -205,8 +237,28 @@ and the execution scratch fit, compacting only as a fallback. Without device mem
 budget is loaded anyway after evicting everything, with a warning, since it cannot run
 otherwise. In externally-managed mode the worker does not autonomously load: an evicted model
 raises [`NotResidentError`](@ref).
+
+`staged` (a `StagedWeights`, see host_cache.jl) is the model's weights already read into host
+memory by a background task; the load then only uploads them. It is released here either way. A
+load runs off the interactive thread (see [`off_interactive`](@ref)).
 """
-function acquire!(cache::WeightCache, entry::ModelEntry)
+function acquire!(cache::WeightCache, entry::ModelEntry; staged = nothing)
+    model = entry.executable
+    # A hit is bookkeeping only; keep it on the calling thread rather than paying for a task.
+    if staged === nothing && (is_device_pinned(model) || model.weights !== nothing)
+        return _acquire!(cache, entry, nothing)
+    end
+    return off_interactive() do
+        try
+            _acquire!(cache, entry, staged)
+        finally
+            staged === nothing ||
+                release_staged!(cache, entry, staged; uploaded = model.weights !== nothing)
+        end
+    end
+end
+
+function _acquire!(cache::WeightCache, entry::ModelEntry, staged)
     model = entry.executable
     is_device_pinned(model) && return nothing
     if model.weights !== nothing
@@ -218,7 +270,7 @@ function acquire!(cache::WeightCache, entry::ModelEntry)
     end
 
     cache.mode == EXTERNALLY_MANAGED && throw(NotResidentError(entry.name))
-    admit_weights!(cache, entry)
+    admit_weights!(cache, entry; staged = staged)
     return nothing
 end
 
@@ -236,14 +288,16 @@ end
 # (`fresh = true`: its eviction priority starts over) and a fallback-compaction reload (`fresh =
 # false`: it keeps the priority it had earned). On a failed transfer the partial upload has
 # already been freed (see `transfer_to_device`) and the error propagates.
-function _upload_commit!(cache::WeightCache, entry::ModelEntry; fresh::Bool = true)
+function _upload_commit!(cache::WeightCache, entry::ModelEntry; fresh::Bool = true, staged = nothing)
     model = entry.executable
     fp = model_footprint(cache, entry)
     before = _memory_point(cache)
     # With weights pinned in host RAM this is a pure host->device copy, not a re-materialization.
     t0 = time()
-    bufs = _device_buffers(cache, entry, model)
-    dt = time() - t0
+    bufs = _device_buffers(cache, entry, model; staged = staged)
+    # A staged load read its weights earlier, off the dispatch loop; that read is part of what
+    # reloading the model costs, which is what the eviction priority weighs.
+    dt = time() - t0 + (staged === nothing ? 0.0 : staged.host_seconds)
     lock(cache.lock) do
         model.weights = bufs
         push!(cache.lru, entry.name)
@@ -307,7 +361,10 @@ buffers (there is no autonomous evictor to reclaim them); in self-managed mode t
 resident but become evictable. The slow host/device work runs outside the lock; only the
 bookkeeping commit is locked.
 """
-function set_residency_state!(cache::WeightCache, entry::ModelEntry, target::ResidencyState)
+set_residency_state!(cache::WeightCache, entry::ModelEntry, target::ResidencyState) =
+    off_interactive(() -> _set_residency_state!(cache, entry, target))
+
+function _set_residency_state!(cache::WeightCache, entry::ModelEntry, target::ResidencyState)
     model = entry.executable
     cur = model.state
     cur == target && return target
@@ -437,7 +494,10 @@ while it is being freed. In externally-managed mode `acquire!` will not autonomo
 `reload` list is ignored there (the control plane re-pins what it needs). Returns the number of
 models reloaded.
 """
-function compact!(cache::WeightCache, registry::ModelRegistry; reload::Vector{String} = String[])
+compact!(cache::WeightCache, registry::ModelRegistry; reload::Vector{String} = String[]) =
+    off_interactive(() -> _compact!(cache, registry, reload))
+
+function _compact!(cache::WeightCache, registry::ModelRegistry, reload::Vector{String})
     before = memory_report(cache.backend, cache.pool; registry = registry, weight_cache = cache)
     before_point = _memory_point(cache)
 

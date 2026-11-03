@@ -383,3 +383,65 @@ end
         end
     end
 end
+
+@testset "SharedWeightStore node budget: regions are reserved and filled outside the budget lock" begin
+    if !(Sys.islinux() && isdir("/dev/shm"))
+        @test_skip "shared weight store requires Linux /dev/shm"
+    else
+        prefix = "tr" * string(getpid())
+        specs = [(Float32, (1024,))]
+        R = ReactantServerCore._layout(specs)[2]
+        store = SharedWeightStore(; budget = 2R, prefix = prefix)
+        # Whether another opener could take the budget lock right now: flock locks belong to the open
+        # file description, so a separate open contends with this process's own holder.
+        function budget_lock_free()
+            fd = ReactantServerCore._open_lock("/dev/shm/" * prefix * "-budget.lock", 0o666)
+            got = ReactantServerCore._flock(fd, ReactantServerCore._LOCK_EX | ReactantServerCore._LOCK_NB) == 0
+            got && ReactantServerCore._flock(fd, ReactantServerCore._LOCK_UN)
+            ReactantServerCore._close_fd(fd)
+            return got
+        end
+        free_at_reserve = Ref{Union{Bool, Nothing}}(nothing)
+        free_at_fill = Ref{Union{Bool, Nothing}}(nothing)
+        saved = ReactantServerCore._RESERVE_REGION[]
+        ReactantServerCore._RESERVE_REGION[] = (name, bytes) -> (free_at_reserve[] = budget_lock_free(); saved(name, bytes))
+        try
+            r = with_cached_host_weights(
+                a -> a[1][1], store, "m1", weights_digest("m1", specs), specs,
+                a -> (free_at_fill[] = budget_lock_free(); a[1] .= 5)
+            )
+            @test r == (false, 5.0f0)
+            @test free_at_reserve[] === true        # another worker could admit its own region meanwhile
+            @test free_at_fill[] === true
+        finally
+            ReactantServerCore._RESERVE_REGION[] = saved
+            _budget_cleanup(prefix)
+        end
+    end
+end
+
+@testset "SharedWeightStore node budget: a region held from acquire to release is not evicted" begin
+    if !(Sys.islinux() && isdir("/dev/shm"))
+        @test_skip "shared weight store requires Linux /dev/shm"
+    else
+        prefix = "th" * string(getpid())
+        specs = [(Float32, (1024,))]
+        R = ReactantServerCore._layout(specs)[2]
+        region(k) = "/dev/shm/" * prefix * "-" * k * "-" * string(weights_digest(k, specs); base = 16)
+        store = SharedWeightStore(; budget = R, prefix = prefix)
+        try
+            h = acquire_cached_host_weights(store, "m1", weights_digest("m1", specs), specs, a -> (a[1] .= 3))
+            @test h isa CachedHostWeights && !h.hit && h.arrays[1][1] == 3
+            # The budget is full and m1 is held, so a second model cannot be cached.
+            @test acquire_cached_host_weights(store, "m2", weights_digest("m2", specs), specs, a -> nothing) === nothing
+            @test isfile(region("m1"))
+            release_cached_host_weights!(store, h)
+            @test isfile(region("m1"))              # released, not unlinked: it stays cached
+            h2 = acquire_cached_host_weights(store, "m2", weights_digest("m2", specs), specs, a -> (a[1] .= 4))
+            @test h2 !== nothing && !isfile(region("m1"))   # now m1 could be evicted for m2
+            release_cached_host_weights!(store, h2)
+        finally
+            _budget_cleanup(prefix)
+        end
+    end
+end

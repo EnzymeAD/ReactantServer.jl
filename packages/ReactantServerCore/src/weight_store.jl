@@ -33,10 +33,11 @@
 # crash cannot leave the accounting wrong. A release never unlinks; the region stays cached until
 # evicted. Before creating a region a worker takes LOCK_EX on `/dev/shm/rsw-budget.lock`, sums the
 # regions, and evicts holder-free ones (a non-blocking LOCK_EX on the region's lock succeeds), least
-# recently loaded first, until the new one fits; it creates and reserves the region while still
-# holding that lock (so the next admitter counts it) and fills it after dropping it. A worker holds
-# a region's lock only while pinned (`residency: system`) or while uploading from it, so a model
-# that stays on a device ages out of the cache. "Recently loaded" is the region lock file's mtime,
+# recently loaded first, until the new one fits; it creates the region at its full size while still
+# holding that lock (so the next admitter counts it), then drops it before backing the region with
+# pages and filling it, so workers loading different models only serialize on the bookkeeping. A
+# worker holds a region's lock only while pinned (`residency: system`) or from reading a model into
+# the region until its upload ends, so a model that stays on a device ages out of the cache. "Recently loaded" is the region lock file's mtime,
 # touched on every load from the region. The creator holds the region's LOCK_EX while it waits for
 # the budget lock, and an evictor only ever tries region locks without blocking, so the two locks
 # cannot deadlock.
@@ -485,6 +486,12 @@ function _acquire_region(store::SharedWeightStore, key, digest::UInt64, specs, f
                     end
                 end
                 shm = SharedMemory(name, total; perms = store.mode, volatile = false)
+                # The region's size already counts toward the budget (the ledger is the regions'
+                # sizes), and its exclusive lock keeps any evictor off it, so other workers can admit
+                # their own regions while this one is backed with pages and filled. Holding the
+                # budget lock through the reservation would serialize every worker's loads behind
+                # it for as long as the kernel takes to allocate the pages.
+                bfd >= 0 && (_unlock_budget(bfd); bfd = Cint(-1))
                 # A signal can interrupt a large reservation; tmpfs undoes the partial allocation and
                 # reports EINTR, so retry rather than mistake it for a full /dev/shm.
                 rc = _RESERVE_REGION[](name, total)
@@ -497,8 +504,6 @@ function _acquire_region(store::SharedWeightStore, key, digest::UInt64, specs, f
                     throw(SharedStoreFull(name, total, rc))
                 end
                 created = true
-                # The region now counts toward the budget; let other admitters proceed during the fill.
-                bfd >= 0 && (_unlock_budget(bfd); bfd = Cint(-1))
                 p = convert(Ptr{UInt8}, pointer(shm))
                 _hdr_write!(p, _RSW_MAGIC, 0)
                 _hdr_write!(p, UInt32(0), 4)        # ready = 0 until the data is durable
@@ -554,16 +559,57 @@ is admitted (evicting least recently loaded ones) and filled via `fill!(arrays)`
 cannot fit the budget; the caller then loads without the cache.
 """
 function with_cached_host_weights(f, store::SharedWeightStore, key, digest::UInt64, specs, fill!)
+    h = acquire_cached_host_weights(store, key, digest, specs, fill!)
+    h === nothing && return nothing
+    try
+        return (h.hit, f(h.arrays))
+    finally
+        release_cached_host_weights!(store, h)
+    end
+end
+
+"""
+    CachedHostWeights
+
+A model's host weights held from the node cache: `arrays` alias the region, `hit` says the region
+already existed. The region's shared lock is held, so no worker can evict it, until
+[`release_cached_host_weights!`](@ref).
+"""
+struct CachedHostWeights
+    arrays::Vector{Any}
+    hit::Bool
+    key::String
+    digest::UInt64
+    shm::SharedMemory
+    fd::Cint
+end
+
+"""
+    acquire_cached_host_weights(store, key, digest, specs, fill!) -> Union{CachedHostWeights, Nothing}
+
+The two halves of [`with_cached_host_weights`](@ref), for a caller that holds the region across
+tasks: a worker reads a model into the cache on one task and uploads it from another, later. Returns
+`nothing`, holding nothing, when the region cannot fit the budget. Every non-`nothing` result must be
+passed to [`release_cached_host_weights!`](@ref) exactly once.
+"""
+function acquire_cached_host_weights(store::SharedWeightStore, key, digest::UInt64, specs, fill!)
     r = _acquire_region(store, key, digest, specs, fill!; pinned = false)
     r === nothing && return nothing
-    try
-        return (r.hit, f(r.arrays))
-    finally
-        finalize(r.shm)                     # munmap; the region itself stays cached
-        _flock(r.fd, _LOCK_UN)
-        _close_fd(r.fd)
-        r.hit || _sweep_stale_versions(store, String(key), digest)
-    end
+    return CachedHostWeights(r.arrays, r.hit, String(key), digest, r.shm, r.fd)
+end
+
+"""
+    release_cached_host_weights!(store, h::CachedHostWeights) -> nothing
+
+Detach a region held by [`acquire_cached_host_weights`](@ref) without unlinking it, so it stays
+cached for the next load by any worker. The caller must drop every reference to `h.arrays` first.
+"""
+function release_cached_host_weights!(store::SharedWeightStore, h::CachedHostWeights)
+    finalize(h.shm)                     # munmap; the region itself stays cached
+    _flock(h.fd, _LOCK_UN)
+    _close_fd(h.fd)
+    h.hit || _sweep_stale_versions(store, h.key, h.digest)
+    return nothing
 end
 
 """
