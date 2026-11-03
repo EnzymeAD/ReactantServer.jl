@@ -68,7 +68,8 @@ export pool_base_pointer, pool_region_name, pool_slot_bytes
 export WeightStore, PrivateWeightStore, SharedWeightStore
 export materialize_host_weights!, release_host_weights!, rename_host_weights!, weights_digest,
     weights_file_token, WeightsFileId, NO_WEIGHTS_FILE, weights_file_id, SharedStoreFull,
-    with_cached_host_weights, trim_host_cache!, host_cache_bytes
+    with_cached_host_weights, trim_host_cache!, host_cache_bytes,
+    CachedHostWeights, acquire_cached_host_weights, release_cached_host_weights!
 
 # ---- boundary ----
 export NamedTensor, InferRequest, QueuedRequest, DeadlineExceeded

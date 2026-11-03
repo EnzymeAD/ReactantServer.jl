@@ -11,9 +11,10 @@
 #
 # With the shared store the budget is one node-wide pool in /dev/shm shared by every worker (see
 # "Node budget" in ReactantServerCore's weight_store.jl). With the private store each worker manages
-# its own share, `budget ÷ host_weight_budget_workers`, here, with no coordination. Both run on the
-# dispatch thread, the sole residency mutator; `cache.lock` covers the bookkeeping against the
-# metrics snapshot.
+# its own share, `budget ÷ host_weight_budget_workers`, here, with no coordination. Loads run for
+# the dispatch loop, the sole residency mutator, and the background reads that stage weights ahead
+# of a load (below) only read the private cache; `cache.lock` covers the bookkeeping against both and
+# against the metrics snapshot.
 #
 # A miss reads the whole model and queues every upload, exactly like an unbudgeted load; the arrays
 # it read are left to the GC when they are not cached, and do not count against the budget.
@@ -207,5 +208,142 @@ function check_host_budget(cache::WeightCache)
     held = cache.store isa SharedWeightStore ? host_cache_bytes(cache.store) : _host_floor_bytes(cache)
     held > budget &&
         @warn "host weight budget overcommitted: pinned (residency: system) weights exceed it, so no other model's weights stay cached in host RAM" budget = Base.format_bytes(budget) pinned = Base.format_bytes(held)
+    return nothing
+end
+
+# ---------------------------------------------------------------------------------------------
+# Staging: reading a model's weights into host memory ahead of its upload
+# ---------------------------------------------------------------------------------------------
+#
+# A load has a host half (waiting on the shared store's locks, reserving the region, reading the
+# weights file, the legacy-layout permute) and a device half (eviction and the upload). The host half
+# touches no device memory, so the scheduler runs it on a background task while the dispatch loop
+# keeps serving the models already on the device (see `_kick_staging!` in scheduler.jl), and the
+# dispatch that finally runs the model only has to upload. Several workers stage at once: the shared
+# store serializes only its bookkeeping, and two workers wanting the same model share one read.
+
+"""
+    StagedWeights
+
+A model's weights read into host memory for one upload: `arrays` in executable order and whether
+they came from a host copy (`hit`) or from the weights file. `cached` is the shared-store region,
+held (so no worker evicts it) until `release_staged!`. `fresh` marks private-store arrays
+read from the file, which are offered to the host cache once uploaded, as an unstaged load does.
+"""
+mutable struct StagedWeights
+    arrays::Vector{Any}
+    hit::Bool
+    cached::Union{CachedHostWeights, Nothing}
+    fresh::Bool
+    host_seconds::Float64                 # time the host half took, lock waits included
+    released::Bool
+end
+StagedWeights(arrays, hit; cached = nothing, fresh = false) =
+    StagedWeights(arrays, hit, cached, fresh, 0.0, false)
+
+"""
+    needs_host_stage(cache, entry) -> Bool
+
+Whether loading `entry` has host work to do ahead of time: a self-managed, unpinned model that is
+off the device and has no host floor (`residency: system`) to upload from.
+"""
+function needs_host_stage(cache::WeightCache, entry::ModelEntry)
+    cache.mode == SELF_MANAGED || return false
+    model = entry.executable
+    model === nothing && return false
+    return !is_device_pinned(model) && model.weights === nothing && model.host_weights === nothing
+end
+
+"""
+    stage_host_weights(cache, entry) -> StagedWeights
+
+Do every host step of loading `entry` and no device step: take its region from the node cache
+(shared store, reading the file into it on a miss), its cached copy (private store), or read the
+file. Runs on a background task, concurrently with the dispatch loop: it reads the weights file
+with `pread`, which keeps no file position, and takes `cache.lock` for the cache bookkeeping. Hit and
+miss counters are left to the upload (`_device_buffers`), so they count loads, as before, and the
+time taken is recorded on the result so the load's full cost still reaches the eviction policy.
+"""
+function stage_host_weights(cache::WeightCache, entry::ModelEntry)
+    t0 = time()
+    staged = _stage_host_weights(cache, entry)
+    staged.host_seconds = time() - t0
+    return staged
+end
+
+function _stage_host_weights(cache::WeightCache, entry::ModelEntry)
+    model = entry.executable::LoadedModel
+    names = model.sig.weight_names
+    st = entry.weights
+    if host_budgeted(cache) && cache.store isa SharedWeightStore
+        specs = [weight_spec(st, n) for n in names]
+        digest = weights_digest(entry.name, specs; content = weights_file_token(entry.weights_id))
+        fill! = function (arrays)
+            for (i, n) in enumerate(names)
+                read_weight!(arrays[i], st, n)
+            end
+            _check_unmodified(entry)
+            return
+        end
+        h = try
+            acquire_cached_host_weights(cache.store, entry.name, digest, specs, fill!)
+        catch err
+            err isa SharedStoreFull || rethrow()
+            @warn "host weight cache: the node cannot back this model's region; loading without it" model = entry.name exception = err
+            nothing
+        end
+        h === nothing || return StagedWeights(h.arrays, h.hit; cached = h)
+        # No room in the node budget: a private copy for this one upload, not cached.
+        return StagedWeights(_read_checked(entry, names), false)
+    end
+    if host_budgeted(cache)
+        arrays = lock(() -> get(cache.host_cached, entry.name, nothing), cache.lock)
+        arrays === nothing || return StagedWeights(arrays, true)
+        return StagedWeights(_read_checked(entry, names), false; fresh = true)
+    end
+    return StagedWeights(_read_checked(entry, names), false)
+end
+
+function _read_checked(entry::ModelEntry, names::Vector{String})
+    arrays = materialize_host_weights(entry.weights, names)
+    _check_unmodified(entry)
+    return arrays
+end
+
+# The host-cache bookkeeping of one upload from staged weights, the same as an unstaged load records
+# (see `_load_via_host_cache`): a hit or a miss under a budget, the most recent load for a private
+# copy, and the once-per-model warning for a reload from disk.
+function _note_staged_load!(cache::WeightCache, entry::ModelEntry, staged::StagedWeights)
+    if host_budgeted(cache)
+        lock(cache.lock) do
+            staged.hit ? (cache.host_hits += 1) : (cache.host_misses += 1)
+            if staged.hit && !(cache.store isa SharedWeightStore)
+                j = findfirst(==(entry.name), cache.host_lru)
+                j === nothing || (deleteat!(cache.host_lru, j); push!(cache.host_lru, entry.name))
+            end
+        end
+    end
+    staged.hit || _note_disk_load!(cache, entry)
+    return nothing
+end
+
+"""
+    release_staged!(cache, entry, staged; uploaded) -> nothing
+
+Let go of staged weights once their upload is done (`uploaded`) or abandoned: drop the region's lock
+(it stays cached in the node budget), and keep a private copy read from the file if the budget has
+room, as an unstaged load does. Idempotent.
+"""
+function release_staged!(cache::WeightCache, entry::ModelEntry, staged::StagedWeights; uploaded::Bool)
+    staged.released && return nothing
+    staged.released = true
+    arrays = staged.arrays
+    staged.arrays = Any[]                 # a region's arrays alias its mapping, which goes away below
+    if staged.cached !== nothing
+        arrays = nothing
+        release_cached_host_weights!(cache.store, staged.cached)
+    elseif uploaded && staged.fresh
+        _cache_host!(cache, entry.name, arrays)
+    end
     return nothing
 end

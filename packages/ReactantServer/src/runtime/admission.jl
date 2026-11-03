@@ -26,7 +26,8 @@
 # split rule says fit), retry once.
 #
 # The pinned set is m plus the device-pinned models. Executions are synchronous on the dispatch
-# thread, which also runs admission, so no other model can have an execution in flight here.
+# loop, which also runs admission (on a default-pool task it waits for, see `off_interactive`), so
+# no other model can have an execution in flight here.
 #
 # Victims are ranked by GreedyDual-Size-Frequency: priority H = L + hits * reload seconds / W,
 # refreshed on every dispatch, with the inflation L raised to each evicted model's priority. The
@@ -177,13 +178,14 @@ end
 _chosen_names(s::VictimSearch) = [s.names[i] for i in 1:s.n if s.best[i]]
 
 """
-    admit_weights!(cache, entry) -> nothing
+    admit_weights!(cache, entry; staged=nothing) -> nothing
 
 Make the evicted model `entry` resident, evicting what it must (see the file header for the
-steps). Throws [`AdmissionError`](@ref) when the model cannot be placed. Runs on the dispatch
-thread, the sole residency mutator.
+steps). Throws [`AdmissionError`](@ref) when the model cannot be placed. Runs for the dispatch
+loop, the sole residency mutator. `staged` is the model's weights already read into host memory
+(see `stage_host_weights`), which every upload of `entry` here uses; the caller releases it.
 """
-function admit_weights!(cache::WeightCache, entry::ModelEntry)
+function admit_weights!(cache::WeightCache, entry::ModelEntry; staged = nothing)
     model = entry.executable
     fp = model_footprint(cache, entry)
     stats = device_memory_stats(cache.backend, cache.pool)
@@ -218,18 +220,18 @@ function admit_weights!(cache::WeightCache, entry::ModelEntry)
                 @warn "weight cache: model exceeds budget even after evicting all unpinned models; loading anyway" model = entry.name nbytes = model.nbytes budget = cache.max_bytes
                 break
             end
-            return _compact_and_retry!(cache, entry)
+            return _compact_and_retry!(cache, entry; staged = staged)
         end
         stats = _evict_chosen!(cache, stats, chosen)
     end
 
     # B. Upload; a failed transfer has freed its partial upload already.
     try
-        _upload_commit!(cache, entry)
+        _upload_commit!(cache, entry; staged = staged)
     catch err
         stats === nothing && rethrow()
         @warn "weight upload failed despite admission; compacting and retrying" model = entry.name exception = err
-        return _compact_and_retry!(cache, entry)
+        return _compact_and_retry!(cache, entry; staged = staged)
     end
 
     # C. Guarantee the scratch block for every resident model, this one included.
@@ -241,7 +243,7 @@ function admit_weights!(cache::WeightCache, entry::ModelEntry)
         s = _fill_candidates!(cache, entry.name, time())
         i = select_cheapest!(s)
         i == 0 && (i = select_cheapest!(s; allow_protected = true))
-        i == 0 && return _compact_and_retry!(cache, entry)
+        i == 0 && return _compact_and_retry!(cache, entry; staged = staged)
         _evict_chosen!(cache, stats, [s.names[i]])
     end
     return
@@ -262,7 +264,7 @@ end
 # valuable of the previously resident models that fit alongside `entry`, largest first so the
 # refill packs tightly, and check that the weights and the scratch block both fit. Runs at most
 # once per admission; a second failure is an AdmissionError.
-function _compact_and_retry!(cache::WeightCache, entry::ModelEntry)
+function _compact_and_retry!(cache::WeightCache, entry::ModelEntry; staged = nothing)
     fp = model_footprint(cache, entry)
     keep = [name for name in cache.lru if name != entry.name]
     sort!(keep; by = name -> cache.footprints[name].priority, rev = true)
@@ -273,7 +275,7 @@ function _compact_and_retry!(cache::WeightCache, entry::ModelEntry)
     # A model uploaded moments ago (step C's fallback) may free late; wait so the room is real.
     stats = before === nothing ? nothing : _await_frees!(cache, before.in_use, freed)
     if stats === nothing
-        _upload_commit!(cache, entry)
+        _upload_commit!(cache, entry; staged = staged)
         return nothing
     end
     # Room left once the pinned floor, `entry` and the scratch block are accounted for: fill it
@@ -305,7 +307,7 @@ function _compact_and_retry!(cache::WeightCache, entry::ModelEntry)
     sort!(reload; by = by_size, rev = true)
     for e in reload
         try
-            _upload_commit!(cache, e; fresh = e === entry)
+            _upload_commit!(cache, e; fresh = e === entry, staged = e === entry ? staged : nothing)
         catch err
             report = memory_report(cache.backend, cache.pool; registry = cache.registry, weight_cache = cache)
             if e !== entry

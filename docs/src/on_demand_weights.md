@@ -157,13 +157,22 @@ budget they load anyway and the worker warns that it is overcommitted. A load th
 reads the whole model and queues every transfer at once, the same as an unbudgeted load; those
 temporary arrays are freed by the GC and are not counted.
 
+Reading a model into host RAM does not hold up the worker. When a request arrives for a model that
+is not on the GPU, a background task reads its weights (from the cache, or from the weights file)
+while the worker keeps serving the models already on the GPU; once the read finishes, the model's
+turn in the queue evicts what it must and transfers the weights, exactly as any load does, so a
+model being read never takes GPU memory ahead of requests queued before it. Up to two models per
+worker are read ahead at a time, oldest request first. Workers on the same node read different
+models at once; two workers wanting the same model share one read.
+
 How the budget is shared depends on `shared_host_weights`:
 
 - **Shared** (`true`): one budget for the whole node. Every worker may use all of it, each copy
   lives once in `/dev/shm` however many workers load from it, and the copies are the ledger: a
   worker sums the regions under a node-wide lock (`/dev/shm/rsw-budget.lock`, held only for that
-  bookkeeping, never across a disk read) and evicts copies no worker is using. A worker holds a
-  copy only while transferring from it, so a copy in use is never evicted. Copies survive worker
+  bookkeeping, never across a disk read or the reservation of a copy's memory) and evicts copies
+  no worker is using. A worker holds a copy from the moment its read finishes until its transfer
+  to the GPU ends, so a copy in use is never evicted. Copies survive worker
   restarts, so the cache is warm after a restart, and each worker trims the node to the budget at
   startup.
 - **Private** (`false`): each worker keeps its own copies and gets an even share,
