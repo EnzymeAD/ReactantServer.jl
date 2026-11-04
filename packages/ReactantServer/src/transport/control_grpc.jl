@@ -82,6 +82,16 @@ function _handle_compact_memory(ctx::InferContext, req)
     end
 end
 
+function _handle_describe_models(ctx::InferContext, req)
+    found = _as_control(() -> describe_models(ctx.sched, collect(String, req.names)))
+    return _CTRL.DescribeModelsResponse(;
+        models = [
+            encode_model_description(_CTRL, d.name, d.manifest; max_batch_size = d.max_batch_size)
+                for d in found
+        ]
+    )
+end
+
 # Register the ControlService handlers on an existing gRPC server (the inference server),
 # reusing the InferContext payload so both services share the scheduler.
 function register_control_service!(server::gRPCServer.GRPCServer)
@@ -90,7 +100,8 @@ function register_control_service!(server::gRPCServer.GRPCServer)
         ModelControlStatus = (ctx, req) -> _handle_model_control_status(ctx.payload),
         SetModelResidency = (ctx, req) -> _handle_set_model_residency(ctx.payload, req),
         SetModelPolicy = (ctx, req) -> _handle_set_model_policy(ctx.payload, req),
-        CompactMemory = (ctx, req) -> _handle_compact_memory(ctx.payload, req)
+        CompactMemory = (ctx, req) -> _handle_compact_memory(ctx.payload, req),
+        DescribeModels = (ctx, req) -> _handle_describe_models(ctx.payload, req)
     )
     return server
 end

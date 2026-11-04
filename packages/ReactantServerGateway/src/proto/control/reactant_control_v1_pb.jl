@@ -9,12 +9,14 @@ using ProtoBuf: OneOf
 using ProtoBuf.EnumX: @enumx
 
 export ReplicaPlacement, SetModelPlacementRequest, SetModelPlacementResponse
-export SetModelPolicyRequest, RepackStatus, RepackRequest, CompactMemoryRequest
-export SetModelPolicyResponse, ModelControlStatusRequest, SchedulingPolicy
-export GetSchedulingStatusRequest, Residency, CompactMemoryResponse, WorkerSchedulingStatus
-export ModelSchedulingStatus, RepackResponse, SetSchedulingPolicyResponse
-export SetSchedulingPolicyRequest, SetModelResidencyResponse, SetModelResidencyRequest
-export ModelStatus, GetSchedulingStatusResponse, ModelControlStatusResponse
+export SetModelPolicyRequest, RepackStatus, RepackRequest, CompactMemoryRequest, AxisKind
+export SetModelPolicyResponse, DescribeModelsRequest, ModelControlStatusRequest
+export SchedulingPolicy, GetSchedulingStatusRequest, Residency, TensorShape
+export CompactMemoryResponse, WorkerSchedulingStatus, ModelSchedulingStatus, RepackResponse
+export TensorDescription, SetSchedulingPolicyResponse, SetSchedulingPolicyRequest
+export SetModelResidencyResponse, SetModelResidencyRequest, ModelStatus, ShapeVariant
+export GetSchedulingStatusResponse, ModelControlStatusResponse, ModelDescription
+export DescribeModelsResponse
 
 
 struct ReplicaPlacement
@@ -402,6 +404,8 @@ function PB._encoded_size(x::CompactMemoryRequest)
     return encoded_size
 end
 
+@enumx AxisKind AXIS_KIND_UNSPECIFIED = 0 AXIS_FIXED = 1 AXIS_BATCH = 2 AXIS_VARIABLE = 3
+
 struct SetModelPolicyResponse end
 
 function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SetModelPolicyResponse}, _endpos::Int = 0, _group::Bool = false)
@@ -418,6 +422,37 @@ function PB.encode(e::PB.AbstractProtoEncoder, x::SetModelPolicyResponse)
 end
 function PB._encoded_size(x::SetModelPolicyResponse)
     encoded_size = 0
+    return encoded_size
+end
+
+struct DescribeModelsRequest
+    names::Vector{String}
+end
+DescribeModelsRequest(; names = Vector{String}()) = DescribeModelsRequest(names)
+PB.default_values(::Type{DescribeModelsRequest}) = (; names = Vector{String}())
+PB.field_numbers(::Type{DescribeModelsRequest}) = (; names = 1)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:DescribeModelsRequest}, _endpos::Int = 0, _group::Bool = false)
+    names = PB.BufferedVector{String}()
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            PB.decode!(d, names)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return DescribeModelsRequest(names[])
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::DescribeModelsRequest)
+    initpos = position(e.io)
+    !isempty(x.names) && PB.encode(e, 1, x.names)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::DescribeModelsRequest)
+    encoded_size = 0
+    !isempty(x.names) && (encoded_size += PB._encoded_size(x.names, 1))
     return encoded_size
 end
 
@@ -563,6 +598,43 @@ function PB._encoded_size(x::GetSchedulingStatusRequest)
 end
 
 @enumx Residency RESIDENCY_UNSPECIFIED = 0 UNPINNED = 1 PINNED_SYSTEM = 2 PINNED_DEVICE = 3
+
+struct TensorShape
+    name::String
+    shape::Vector{Int64}
+end
+TensorShape(; name = "", shape = Vector{Int64}()) = TensorShape(name, shape)
+PB.default_values(::Type{TensorShape}) = (; name = "", shape = Vector{Int64}())
+PB.field_numbers(::Type{TensorShape}) = (; name = 1, shape = 2)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:TensorShape}, _endpos::Int = 0, _group::Bool = false)
+    name = ""
+    shape = PB.BufferedVector{Int64}()
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            name = PB.decode(d, String)
+        elseif field_number == 2
+            PB.decode!(d, wire_type, shape)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return TensorShape(name, shape[])
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::TensorShape)
+    initpos = position(e.io)
+    !isempty(x.name) && PB.encode(e, 1, x.name)
+    !isempty(x.shape) && PB.encode(e, 2, x.shape)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::TensorShape)
+    encoded_size = 0
+    !isempty(x.name) && (encoded_size += PB._encoded_size(x.name, 1))
+    !isempty(x.shape) && (encoded_size += PB._encoded_size(x.shape, 2))
+    return encoded_size
+end
 
 struct CompactMemoryResponse
     reloaded_models::Int64
@@ -832,6 +904,55 @@ function PB._encoded_size(x::RepackResponse)
     return encoded_size
 end
 
+struct TensorDescription
+    name::String
+    datatype::String
+    shape::Vector{Int64}
+    axes::Vector{AxisKind.T}
+end
+TensorDescription(; name = "", datatype = "", shape = Vector{Int64}(), axes = Vector{AxisKind.T}()) = TensorDescription(name, datatype, shape, axes)
+PB.default_values(::Type{TensorDescription}) = (; name = "", datatype = "", shape = Vector{Int64}(), axes = Vector{AxisKind.T}())
+PB.field_numbers(::Type{TensorDescription}) = (; name = 1, datatype = 2, shape = 3, axes = 4)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:TensorDescription}, _endpos::Int = 0, _group::Bool = false)
+    name = ""
+    datatype = ""
+    shape = PB.BufferedVector{Int64}()
+    axes = PB.BufferedVector{AxisKind.T}()
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            name = PB.decode(d, String)
+        elseif field_number == 2
+            datatype = PB.decode(d, String)
+        elseif field_number == 3
+            PB.decode!(d, wire_type, shape)
+        elseif field_number == 4
+            PB.decode!(d, wire_type, axes)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return TensorDescription(name, datatype, shape[], axes[])
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::TensorDescription)
+    initpos = position(e.io)
+    !isempty(x.name) && PB.encode(e, 1, x.name)
+    !isempty(x.datatype) && PB.encode(e, 2, x.datatype)
+    !isempty(x.shape) && PB.encode(e, 3, x.shape)
+    !isempty(x.axes) && PB.encode(e, 4, x.axes)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::TensorDescription)
+    encoded_size = 0
+    !isempty(x.name) && (encoded_size += PB._encoded_size(x.name, 1))
+    !isempty(x.datatype) && (encoded_size += PB._encoded_size(x.datatype, 2))
+    !isempty(x.shape) && (encoded_size += PB._encoded_size(x.shape, 3))
+    !isempty(x.axes) && (encoded_size += PB._encoded_size(x.axes, 4))
+    return encoded_size
+end
+
 struct SetSchedulingPolicyResponse
     applied::Union{Nothing, SchedulingPolicy}
     warnings::Vector{String}
@@ -1089,6 +1210,37 @@ function PB._encoded_size(x::ModelStatus)
     return encoded_size
 end
 
+struct ShapeVariant
+    inputs::Vector{TensorShape}
+end
+ShapeVariant(; inputs = Vector{TensorShape}()) = ShapeVariant(inputs)
+PB.default_values(::Type{ShapeVariant}) = (; inputs = Vector{TensorShape}())
+PB.field_numbers(::Type{ShapeVariant}) = (; inputs = 1)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ShapeVariant}, _endpos::Int = 0, _group::Bool = false)
+    inputs = PB.BufferedVector{TensorShape}()
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            PB.decode!(d, inputs)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return ShapeVariant(inputs[])
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::ShapeVariant)
+    initpos = position(e.io)
+    !isempty(x.inputs) && PB.encode(e, 1, x.inputs)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::ShapeVariant)
+    encoded_size = 0
+    !isempty(x.inputs) && (encoded_size += PB._encoded_size(x.inputs, 1))
+    return encoded_size
+end
+
 struct GetSchedulingStatusResponse
     mode::String
     policy::Union{Nothing, SchedulingPolicy}
@@ -1196,6 +1348,85 @@ function PB._encoded_size(x::ModelControlStatusResponse)
     !isempty(x.discipline) && (encoded_size += PB._encoded_size(x.discipline, 2))
     !isempty(x.models) && (encoded_size += PB._encoded_size(x.models, 3))
     x.weight_cache_max_bytes != zero(UInt64) && (encoded_size += PB._encoded_size(x.weight_cache_max_bytes, 4))
+    return encoded_size
+end
+
+struct ModelDescription
+    name::String
+    kind::String
+    description::String
+    inputs::Vector{TensorDescription}
+    outputs::Vector{TensorDescription}
+    batch_sizes::Vector{Int64}
+    max_batch_size::Int64
+    calls::Vector{String}
+    variants::Vector{ShapeVariant}
+end
+ModelDescription(; name = "", kind = "", description = "", inputs = Vector{TensorDescription}(), outputs = Vector{TensorDescription}(), batch_sizes = Vector{Int64}(), max_batch_size = zero(Int64), calls = Vector{String}(), variants = Vector{ShapeVariant}()) = ModelDescription(name, kind, description, inputs, outputs, batch_sizes, max_batch_size, calls, variants)
+PB.default_values(::Type{ModelDescription}) = (; name = "", kind = "", description = "", inputs = Vector{TensorDescription}(), outputs = Vector{TensorDescription}(), batch_sizes = Vector{Int64}(), max_batch_size = zero(Int64), calls = Vector{String}(), variants = Vector{ShapeVariant}())
+PB.field_numbers(::Type{ModelDescription}) = (; name = 1, kind = 2, description = 3, inputs = 4, outputs = 5, batch_sizes = 6, max_batch_size = 7, calls = 8, variants = 9)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelDescription}, _endpos::Int = 0, _group::Bool = false)
+    name = ""
+    kind = ""
+    description = ""
+    inputs = PB.BufferedVector{TensorDescription}()
+    outputs = PB.BufferedVector{TensorDescription}()
+    batch_sizes = PB.BufferedVector{Int64}()
+    max_batch_size = zero(Int64)
+    calls = PB.BufferedVector{String}()
+    variants = PB.BufferedVector{ShapeVariant}()
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            name = PB.decode(d, String)
+        elseif field_number == 2
+            kind = PB.decode(d, String)
+        elseif field_number == 3
+            description = PB.decode(d, String)
+        elseif field_number == 4
+            PB.decode!(d, inputs)
+        elseif field_number == 5
+            PB.decode!(d, outputs)
+        elseif field_number == 6
+            PB.decode!(d, wire_type, batch_sizes)
+        elseif field_number == 7
+            max_batch_size = PB.decode(d, Int64)
+        elseif field_number == 8
+            PB.decode!(d, calls)
+        elseif field_number == 9
+            PB.decode!(d, variants)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return ModelDescription(name, kind, description, inputs[], outputs[], batch_sizes[], max_batch_size, calls[], variants[])
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::ModelDescription)
+    initpos = position(e.io)
+    !isempty(x.name) && PB.encode(e, 1, x.name)
+    !isempty(x.kind) && PB.encode(e, 2, x.kind)
+    !isempty(x.description) && PB.encode(e, 3, x.description)
+    !isempty(x.inputs) && PB.encode(e, 4, x.inputs)
+    !isempty(x.outputs) && PB.encode(e, 5, x.outputs)
+    !isempty(x.batch_sizes) && PB.encode(e, 6, x.batch_sizes)
+    x.max_batch_size != zero(Int64) && PB.encode(e, 7, x.max_batch_size)
+    !isempty(x.calls) && PB.encode(e, 8, x.calls)
+    !isempty(x.variants) && PB.encode(e, 9, x.variants)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::ModelDescription)
+    encoded_size = 0
+    !isempty(x.name) && (encoded_size += PB._encoded_size(x.name, 1))
+    !isempty(x.kind) && (encoded_size += PB._encoded_size(x.kind, 2))
+    !isempty(x.description) && (encoded_size += PB._encoded_size(x.description, 3))
+    !isempty(x.inputs) && (encoded_size += PB._encoded_size(x.inputs, 4))
+    !isempty(x.outputs) && (encoded_size += PB._encoded_size(x.outputs, 5))
+    !isempty(x.batch_sizes) && (encoded_size += PB._encoded_size(x.batch_sizes, 6))
+    x.max_batch_size != zero(Int64) && (encoded_size += PB._encoded_size(x.max_batch_size, 7))
+    !isempty(x.calls) && (encoded_size += PB._encoded_size(x.calls, 8))
+    !isempty(x.variants) && (encoded_size += PB._encoded_size(x.variants, 9))
     return encoded_size
 end
 
@@ -1515,6 +1746,37 @@ export register_GatewayControlService!
 
 # gRPCServer.jl END
 
+struct DescribeModelsResponse
+    models::Vector{ModelDescription}
+end
+DescribeModelsResponse(; models = Vector{ModelDescription}()) = DescribeModelsResponse(models)
+PB.default_values(::Type{DescribeModelsResponse}) = (; models = Vector{ModelDescription}())
+PB.field_numbers(::Type{DescribeModelsResponse}) = (; models = 1)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:DescribeModelsResponse}, _endpos::Int = 0, _group::Bool = false)
+    models = PB.BufferedVector{ModelDescription}()
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            PB.decode!(d, models)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return DescribeModelsResponse(models[])
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::DescribeModelsResponse)
+    initpos = position(e.io)
+    !isempty(x.models) && PB.encode(e, 1, x.models)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::DescribeModelsResponse)
+    encoded_size = 0
+    !isempty(x.models) && (encoded_size += PB._encoded_size(x.models, 1))
+    return encoded_size
+end
+
 # gRPCClient.jl BEGIN
 
 baremodule ControlService
@@ -1525,11 +1787,13 @@ baremodule ControlService
     # the version used to generate this module (1.2.0).
     gRPCClient.check_codegen_compat(Base.VersionNumber("1.2.0"))
 
+    const DescribeModelsResponse::DataType = Base.parentmodule(ControlService).DescribeModelsResponse
     const ModelControlStatusResponse::DataType = Base.parentmodule(ControlService).ModelControlStatusResponse
     const SetModelResidencyResponse::DataType = Base.parentmodule(ControlService).SetModelResidencyResponse
     const SetModelPolicyRequest::DataType = Base.parentmodule(ControlService).SetModelPolicyRequest
     const CompactMemoryResponse::DataType = Base.parentmodule(ControlService).CompactMemoryResponse
     const SetModelPolicyResponse::DataType = Base.parentmodule(ControlService).SetModelPolicyResponse
+    const DescribeModelsRequest::DataType = Base.parentmodule(ControlService).DescribeModelsRequest
     const SetModelResidencyRequest::DataType = Base.parentmodule(ControlService).SetModelResidencyRequest
     const CompactMemoryRequest::DataType = Base.parentmodule(ControlService).CompactMemoryRequest
     const ModelControlStatusRequest::DataType = Base.parentmodule(ControlService).ModelControlStatusRequest
@@ -1616,6 +1880,27 @@ baremodule ControlService
     gRPCClient.response_type_displayname(::Type{typeof(CompactMemory)}) = "CompactMemoryResponse"
     Base.@doc gRPCClient.grpc_generate_rpc_docstring(typeof(CompactMemory)) CompactMemory
     export CompactMemory
+
+
+    # ControlService.DescribeModels
+    Base.@inline function DescribeModels(chan::gRPCClient.gRPCChannel, req::DescribeModelsRequest, args...; kws...)
+        return gRPCClient.grpc_call_unary(chan, typeof(DescribeModels), req, args...; kws...)
+    end
+    Base.@inline function DescribeModels(chan::gRPCClient.gRPCChannel, req::Base.Vector{UInt8}, args...; kws...)
+        return gRPCClient.grpc_call_unary(chan, typeof(DescribeModels), req, args...; kws...)
+    end
+    Base.@inline function DescribeModels(host::AbstractString, port::Integer, args...; kws...)
+        return DescribeModels(gRPCClient.gRPCChannel(host, port), args...; kws...)
+    end
+    gRPCClient.rpc_path(::Type{typeof(DescribeModels)}) = "/reactant_control.ControlService/DescribeModels"
+    gRPCClient.isstreaming_request(::Type{typeof(DescribeModels)}) = false
+    gRPCClient.isstreaming_response(::Type{typeof(DescribeModels)}) = false
+    gRPCClient.request_type(::Type{typeof(DescribeModels)}) = DescribeModelsRequest
+    gRPCClient.response_type(::Type{typeof(DescribeModels)}) = DescribeModelsResponse
+    gRPCClient.request_type_displayname(::Type{typeof(DescribeModels)}) = "DescribeModelsRequest"
+    gRPCClient.response_type_displayname(::Type{typeof(DescribeModels)}) = "DescribeModelsResponse"
+    Base.@doc gRPCClient.grpc_generate_rpc_docstring(typeof(DescribeModels)) DescribeModels
+    export DescribeModels
 
 
 end # module ControlService
@@ -1799,8 +2084,52 @@ end
 register_ControlService_CompactMemory!(handler::Function, server::GRPCServer; kwargs...) = register_ControlService_CompactMemory!(server, handler; kwargs...)
 export register_ControlService_CompactMemory!
 
+# reactant_control.ControlService.DescribeModels (unary)
 """
-    register_ControlService!(server::GRPCServer; ModelControlStatus=nothing, SetModelResidency=nothing, SetModelPolicy=nothing, CompactMemory=nothing) -> server
+    ControlService_DescribeModels_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
+
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/reactant_control.ControlService/DescribeModels`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::DescribeModelsRequest) -> DescribeModelsResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+ControlService_DescribeModels_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("DescribeModels", gRPCServer.MethodType.UNARY, DescribeModelsRequest, DescribeModelsResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export ControlService_DescribeModels_Method
+
+"""
+    register_ControlService_DescribeModels!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_ControlService_DescribeModels!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/reactant_control.ControlService/DescribeModels` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::DescribeModelsRequest) -> DescribeModelsResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`ControlService_DescribeModels_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_ControlService_DescribeModels!(server) do ctx, req
+    # compute and return a DescribeModelsResponse
+end
+```
+"""
+function register_ControlService_DescribeModels!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "reactant_control.ControlService", ControlService_DescribeModels_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_ControlService_DescribeModels!(handler::Function, server::GRPCServer; kwargs...) = register_ControlService_DescribeModels!(server, handler; kwargs...)
+export register_ControlService_DescribeModels!
+
+"""
+    register_ControlService!(server::GRPCServer; ModelControlStatus=nothing, SetModelResidency=nothing, SetModelPolicy=nothing, CompactMemory=nothing, DescribeModels=nothing) -> server
 
 Register the `reactant_control.ControlService` service on `server`: every non-`nothing` keyword
 registers its RPC. Each keyword accepts a handler or a `(handler,
@@ -1808,7 +2137,7 @@ raw_request, raw_response)` tuple (raw flags per method). All-nothing is a
 no-op. Equivalent to calling the per-RPC `register_<Service>_<Rpc>!`
 functions individually.
 """
-function register_ControlService!(server::GRPCServer; ModelControlStatus = nothing, SetModelResidency = nothing, SetModelPolicy = nothing, CompactMemory = nothing)
+function register_ControlService!(server::GRPCServer; ModelControlStatus = nothing, SetModelResidency = nothing, SetModelPolicy = nothing, CompactMemory = nothing, DescribeModels = nothing)
     if ModelControlStatus !== nothing
         handler, raw_request, raw_response = ModelControlStatus isa Tuple ? ModelControlStatus : (ModelControlStatus, false, false)
         register_ControlService_ModelControlStatus!(server, handler; raw_request = raw_request, raw_response = raw_response)
@@ -1824,6 +2153,10 @@ function register_ControlService!(server::GRPCServer; ModelControlStatus = nothi
     if CompactMemory !== nothing
         handler, raw_request, raw_response = CompactMemory isa Tuple ? CompactMemory : (CompactMemory, false, false)
         register_ControlService_CompactMemory!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    if DescribeModels !== nothing
+        handler, raw_request, raw_response = DescribeModels isa Tuple ? DescribeModels : (DescribeModels, false, false)
+        register_ControlService_DescribeModels!(server, handler; raw_request = raw_request, raw_response = raw_response)
     end
     return server
 end

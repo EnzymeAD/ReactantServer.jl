@@ -22,6 +22,11 @@ include("proto/inference/inference.jl")
 using .inference
 export inference
 
+# Own generated control-plane module (messages + gRPC client stubs), for DescribeModels. Kept
+# qualified (`control.X`) rather than brought in with `using`: its message names would collide
+# with the client's own ModelDescription and TensorDescription.
+include("proto/control/control.jl")
+
 # These Core functions get new methods below (on InferenceBufferPool, and the client `scratch`
 # overload returning wire descriptors), so they must be imported to extend rather than shadow them.
 import ReactantServerCore: acquire_slot!, is_shm_backed, scratch, pool_view
@@ -40,6 +45,7 @@ include("Model.jl")
 include("SharedMemory.jl")
 include("Inference.jl")
 include("Metadata.jl")
+include("Describe.jl")
 
 """
     kserve_init(; pool_bytes=DEFAULT_POOL_BYTES, n_slots=DEFAULT_POOL_SLOTS, shm_reprobe_interval=60.0)
@@ -110,6 +116,7 @@ export acquire_slot!, release_slot!
 
 export ModelIOSpec, TensorMeta
 export model_io_spec, manifest_io_spec, validate_io
+export ModelDescription, TensorDescription, describe_models, describe_model
 export with_bounds_checks, @infer_inbounds
 
 export DEFAULT_POOL_BYTES

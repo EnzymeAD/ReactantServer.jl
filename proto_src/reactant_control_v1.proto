@@ -5,7 +5,8 @@
 //                         Modeled on NVIDIA Triton's model-control extension with our pinning
 //                         semantics. Residency RPCs are authoritative only on an externally-managed
 //                         worker; a self-managed worker rejects them. SetModelPolicy works in both
-//                         modes. The gateway also terminates CompactMemory and fans it out.
+//                         modes. The gateway also terminates CompactMemory and fans it out, and
+//                         answers DescribeModels by merging every worker's answer.
 //   GatewayControlService answered by the GATEWAY process itself: its live lpt_packing scheduling
 //                         state (placement, knobs, repacks). Workers do not implement it.
 
@@ -27,6 +28,13 @@ service ControlService
   // Free all resident device weights so the allocator coalesces its free list, then reload the
   // pinned models (always) plus any named in reload_models. Used to defragment the device arena.
   rpc CompactMemory(CompactMemoryRequest) returns (CompactMemoryResponse) {}
+
+  // Describe the served models: each one's client-facing inputs and outputs with the kind of every
+  // axis, the batch sizes and input shapes it was compiled for, and the models a meta model calls.
+  // KServe's ModelMetadata carries the tensors alone and writes -1 for a batch axis and a variable
+  // axis alike, which is not enough to build a valid request without reading the bundle. Workers
+  // answer from their registry; the gateway also terminates it, merging every worker's answer.
+  rpc DescribeModels(DescribeModelsRequest) returns (DescribeModelsResponse) {}
 }
 
 // Residency floor for a model's weights. UNSPECIFIED is never returned; it is the proto3 zero
@@ -126,6 +134,71 @@ message CompactMemoryResponse
 {
   int64 reloaded_models = 1;
   uint64 resident_bytes_after = 2;
+}
+
+// What one axis of a tensor's shape is. UNSPECIFIED is never returned.
+enum AxisKind
+{
+  AXIS_KIND_UNSPECIFIED = 0;
+  AXIS_FIXED = 1;      // a concrete size, given in the shape
+  AXIS_BATCH = 2;      // the batch axis: the rows a request carries (see batch_sizes)
+  AXIS_VARIABLE = 3;   // a dynamic non-batch axis (see ModelDescription.variants)
+}
+
+message TensorDescription
+{
+  string name = 1;
+  string datatype = 2;          // the KServe wire datatype, e.g. "FP32"
+  // Row-major, as KServe ModelMetadata and a request's InferInputTensor.shape write it. A batch or
+  // variable axis is -1; `axes` says which.
+  repeated int64 shape = 3;
+  repeated AxisKind axes = 4;   // one per entry of `shape`
+}
+
+message TensorShape
+{
+  string name = 1;
+  repeated int64 shape = 2;     // row-major; the batch axis stays -1
+}
+
+// One compiled input shape: a concrete shape for every input, with each variable axis filled in.
+message ShapeVariant
+{
+  repeated TensorShape inputs = 1;
+}
+
+message ModelDescription
+{
+  string name = 1;
+  string kind = 2;                          // "model" or "meta"
+  string description = 3;                   // the manifest's free-text description
+  repeated TensorDescription inputs = 4;    // client-facing, in declaration order
+  repeated TensorDescription outputs = 5;
+  // The batch sizes the bundle declares it was compiled for, ascending. Empty when it declares none.
+  repeated int64 batch_sizes = 6;
+  // The most rows the worker coalesces into one execution: the largest compiled batch size, lowered
+  // by any configured scheduler cap. 0 for a meta model and when unknown.
+  int64 max_batch_size = 7;
+  // A meta model's sub-models, in declaration order. They are internal: the gateway does not route
+  // requests to them, and an unfiltered DescribeModels does not list them.
+  repeated string calls = 8;
+  // The input shapes compiled for a model whose inputs have variable axes, one entry per variant.
+  // Empty when no input has a variable axis, and when the model's preprocessing transforms its
+  // inputs, since the compiled shapes then do not constrain what a client sends.
+  repeated ShapeVariant variants = 9;
+}
+
+message DescribeModelsRequest
+{
+  // The models to describe. Empty describes every model the server routes requests to (a meta
+  // model's internal sub-models are described only when named). A name the server does not serve
+  // fails the call with NOT_FOUND.
+  repeated string names = 1;
+}
+
+message DescribeModelsResponse
+{
+  repeated ModelDescription models = 1;     // sorted by name
 }
 
 // ------------------------------------------------------------------------------------------------

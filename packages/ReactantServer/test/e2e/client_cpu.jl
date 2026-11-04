@@ -1,5 +1,5 @@
-# Client for the CPU supervisor e2e (run_e2e_cpu.sh): drives the scale4 model through the
-# embedded gateway over the inline (TCP) data path and asserts exact results. Runs in the
+# Client for the CPU supervisor e2e (run_e2e_cpu.sh): reads scale4's metadata through the embedded
+# gateway, drives it over the inline (TCP) data path, and asserts exact results. Runs in the
 # ReactantServerGateway project (ReactantServerGateway message types + gRPCClient), so it never
 # loads Reactant.
 #
@@ -9,6 +9,7 @@ import gRPCClient
 import ProtoBuf
 using ReactantServerGateway
 const Inf = ReactantServerGateway.inference
+const Ctl = ReactantServerGateway.control
 
 const GATEWAY_PORT = parse(Int, ARGS[1])
 const WORKER0_PORT = parse(Int, ARGS[2])
@@ -25,11 +26,26 @@ function check(name::AbstractString, cond::Bool; detail::AbstractString = "")
     end
 end
 
-# Worker0 serves full model metadata (the gateway only forwards inference and SHM RPCs).
-md = grpc_call(
+# A worker answers the KServe metadata itself; the gateway forwards it to one that hosts the model.
+md0 = grpc_call(
     Inf.GRPCInferenceService.ModelMetadata, WORKER0_PORT, Inf.ModelMetadataRequest(; name = "scale4")
 )
-check("worker0 ModelMetadata", md.name == "scale4")
+check("worker0 ModelMetadata", md0.name == "scale4")
+md = grpc_call(
+    Inf.GRPCInferenceService.ModelMetadata, GATEWAY_PORT, Inf.ModelMetadataRequest(; name = "scale4")
+)
+check("gateway ModelMetadata", md.name == "scale4" && md.inputs[1].shape == md0.inputs[1].shape)
+idx = grpc_call(Inf.GRPCInferenceService.RepositoryIndex, GATEWAY_PORT, Inf.RepositoryIndexRequest())
+check("gateway RepositoryIndex", [(m.name, m.state) for m in idx.models] == [("scale4", "READY")])
+# DescribeModels merges both workers' answers into one description per model.
+desc = grpc_call(Ctl.ControlService.DescribeModels, GATEWAY_PORT, Ctl.DescribeModelsRequest())
+check(
+    "gateway DescribeModels", [m.name for m in desc.models] == ["scale4"] &&
+        desc.models[1].inputs[1].shape == Int64[4] &&
+        desc.models[1].inputs[1].axes == [Ctl.AxisKind.AXIS_FIXED] &&
+        desc.models[1].batch_sizes == Int64[1];
+    detail = "got $(desc.models)"
+)
 in_shape = Int64[d <= 0 ? 1 : d for d in md.inputs[1].shape]
 
 # Two inferences through the gateway: with both CPU workers serving scale4, round-robin lands

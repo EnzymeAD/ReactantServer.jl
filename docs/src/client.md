@@ -86,10 +86,9 @@ Because an IO hard-codes a model's tensor names, dtypes, and shapes, it can sile
 from the served model. [`validate_io`](@ref) dry-runs an IO against the model's true I/O spec
 without sending an inference request: it runs `infer_encode_chunk!` and `infer_decode_chunk!`
 once over synthetic, spec-shaped data and surfaces name, dtype, shape, and indexing mismatches
-as errors. Get the spec from [`model_io_spec`](@ref)`(model)` against a running server (the
-ModelMetadata RPC; it throws if the server is unreachable or does not implement metadata, as a
-gateway does not, so point it at a worker), or
-from [`manifest_io_spec`](@ref)`(path)` offline against a model's `manifest.yaml`, suitable for
+as errors. Get the spec from [`model_io_spec`](@ref)`(model)` against a running worker or gateway
+(the KServe ModelMetadata RPC; it throws if the server is unreachable or does not implement it),
+or from [`manifest_io_spec`](@ref)`(path)` offline against a model's `manifest.yaml`, suitable for
 a build-time check. Reported shapes are Julia column-major (batch axis last), matching the
 axis order you build arrays in.
 
@@ -122,6 +121,22 @@ Julia is started with `--check-bounds=yes` (which `Pkg.test` does).
 # Force the checked behavior anywhere, not just in validate_io:
 with_bounds_checks() do
     run_my_io_step()
+end
+```
+
+## Describing the served models
+
+KServe's metadata writes `-1` for a batch axis and a variable axis alike and says nothing about
+batch sizes. [`describe_models`](@ref)`(url)` asks a worker or the gateway for every model it
+routes requests to, and [`describe_model`](@ref)`(model)` for one; each [`ModelDescription`](@ref)
+carries the tensors in Julia column-major order with the kind of every axis (`:fixed`, `:batch`,
+`:variable`), the compiled batch sizes and the worker's coalescing limit, the compiled input
+shapes of a model with variable axes, and the sub-models a meta model calls. That is enough to
+build a valid request without the bundle; the load generator in `tools/loadgen` works this way.
+
+```julia
+for d in describe_models("grpc://127.0.0.1:8001")
+    println(d.name, " ", [(t.name, t.shape, t.axes) for t in d.inputs], " batches ", d.batch_sizes)
 end
 ```
 

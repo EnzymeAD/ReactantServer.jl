@@ -45,6 +45,13 @@ nmodels(t::RoutingTable) = length(t.routes)
 # reject a typo'd model name instead of storing an override that could never take effect.
 has_model(t::RoutingTable, model::AbstractString) = haskey(t.routes, model)
 
+# The worker URLs hosting `model` in the table's order, or `nothing` when no worker routes it. Unlike
+# `pick` it leaves the round-robin cursor alone, so the metadata RPCs never shift request routing.
+function replicas(t::RoutingTable, model::AbstractString)
+    e = get(t.routes, model, nothing)
+    return e === nothing ? nothing : copy(e.urls)
+end
+
 # Holder for the current routing table. Autodiscovery swaps a freshly built table in atomically;
 # `pick` reads the current table lock free. Starts empty until the first discovery round.
 mutable struct DiscoveredRoutes
@@ -58,3 +65,4 @@ swap_table!(d::DiscoveredRoutes, t::RoutingTable) = (@atomic d.current = t; noth
 pick(d::DiscoveredRoutes, model::AbstractString) = pick(current_table(d), model)
 nmodels(d::DiscoveredRoutes) = nmodels(current_table(d))
 has_model(d::DiscoveredRoutes, model::AbstractString) = has_model(current_table(d), model)
+replicas(d::DiscoveredRoutes, model::AbstractString) = replicas(current_table(d), model)

@@ -122,6 +122,15 @@ invoke_compact(wc::WorkerClients, req::CompactMemoryRequest) =
 invoke_is_same_ipc_namespace(wc::WorkerClients, req::IsSameIPCNamespaceRequest) =
     GRPCInferenceService.IsSameIPCNamespace(wc.chan, req; deadline = wc.probe_deadline)
 
+# The metadata RPCs a client sends the gateway, forwarded with the probe deadline: they read the
+# worker's registry and never wait on the GPU.
+invoke_describe_models(wc::WorkerClients, req::DescribeModelsRequest) =
+    ControlService.DescribeModels(wc.chan, req; deadline = wc.probe_deadline)
+invoke_model_metadata(wc::WorkerClients, req::ModelMetadataRequest) =
+    GRPCInferenceService.ModelMetadata(wc.chan, req; deadline = wc.probe_deadline)
+invoke_repository_index(wc::WorkerClients, req::RepositoryIndexRequest) =
+    GRPCInferenceService.RepositoryIndex(wc.chan, req; deadline = wc.probe_deadline)
+
 # A call that failed at its gRPC deadline: the connection stalled rather than refused. The probe
 # helpers below rethrow it so `_bounded` can reset the worker's connection (see there).
 _deadline_exceeded(e) =

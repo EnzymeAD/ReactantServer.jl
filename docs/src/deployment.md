@@ -224,12 +224,14 @@ integrates against, and what answers depends on the port:
 
 - **Each worker's own port** serves the full KServe V2 data plane, including `ModelInfer`,
   `RepositoryIndex`, `ServerReady`, and `ModelMetadata`, plus the worker control RPCs
-  (`ModelControlStatus`, `SetModelResidency`, `SetModelPolicy`, `CompactMemory`). A control plane
-  discovers which models a worker serves with `RepositoryIndex`.
-- **A multi-worker node's public port** is the gateway, which forwards only `ModelInfer` and the
-  shared-memory RPCs, answers `CompactMemory` and its own `GatewayControlService`, and returns
-  `UNIMPLEMENTED` for the rest ([Multi-GPU Gateway](gateway.md)). Discovery and metadata go to the
-  workers.
+  (`ModelControlStatus`, `SetModelResidency`, `SetModelPolicy`, `CompactMemory`,
+  `DescribeModels`). A control plane discovers which models a worker serves with
+  `RepositoryIndex`.
+- **A multi-worker node's public port** is the gateway, which forwards `ModelInfer` and the
+  shared-memory RPCs, answers the metadata RPCs (`ModelMetadata`, `RepositoryIndex`,
+  `DescribeModels`) from its workers, answers `CompactMemory` and its own
+  `GatewayControlService`, and returns `UNIMPLEMENTED` for the rest
+  ([Multi-GPU Gateway](gateway.md)). Worker health (`ServerReady`) goes to the workers.
 - **The HTTP admin port** serves `/healthz`, `/readyz`, and Prometheus `/metrics`.
 
 The simplest multi-node setup is a standalone gateway pointed at every node's worker endpoints

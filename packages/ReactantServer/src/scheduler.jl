@@ -1757,6 +1757,30 @@ function _meta_group_status(s::Scheduler, meta::MetaEntry)
 end
 
 """
+    describe_models(scheduler, names) -> Vector{NamedTuple}
+
+What the control plane's DescribeModels reports, as `(name, manifest, max_batch_size)` per model,
+sorted by name. An empty `names` describes every model requests are routed to, which leaves out the
+internal sub-models a meta model calls; naming one describes it. Throws naming every model the
+worker does not serve, which the handler maps to NOT_FOUND. `max_batch_size` is the effective
+coalescing limit (0 for a meta model, and for a model not yet compiled).
+"""
+function describe_models(s::Scheduler, names::AbstractVector{<:AbstractString})
+    return lock(s.cond) do
+        reg = s.registry
+        wanted = isempty(names) ? routable_model_names(reg) : sort!(unique(String.(names)))
+        unknown = [n for n in wanted if get_model(reg, n) === nothing && get_meta(reg, n) === nothing]
+        isempty(unknown) || throw(ArgumentError("unknown model: $(join(unknown, ", "))"))
+        return map(wanted) do n
+            e = get_model(reg, n)
+            e === nothing && return (name = n, manifest = get_meta(reg, n).manifest, max_batch_size = 0)
+            compiled = e.sched !== nothing && e.executable !== nothing
+            return (name = n, manifest = e.manifest, max_batch_size = compiled ? _effective_max_batch(e) : 0)
+        end
+    end
+end
+
+"""
     control_status(scheduler) -> NamedTuple
 
 A control-plane snapshot of the worker: its residency mode and scheduling discipline, plus a

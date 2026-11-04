@@ -129,6 +129,56 @@ end
     @test md.outputs[1].name == "y"
 end
 
+@testset "codec model description" begin
+    _Ctl = ReactantServer.control
+    AK = _Ctl.AxisKind
+    # A detector compiled for two image sizes: `whn` puts the batch axis last in Julia order, so it
+    # comes first on the row-major wire, and both variable axes are filled in per variant.
+    detector = ReactantServer.parse_manifest(
+        Dict{String, Any}(
+            "format_version" => "2.0", "name" => "det", "description" => "a detector",
+            "executable_inputs" => [
+                Dict("name" => "img", "dtype" => "f32", "shape" => "whcn", "dims" => Dict("w" => -1, "h" => -1, "c" => 3)),
+            ],
+            "executable_outputs" => [
+                Dict("name" => "boxes", "dtype" => "f32", "shape" => "kn", "dims" => Dict("k" => 4)),
+            ],
+            "batching" => Dict{String, Any}("compiled_batch_sizes" => [4, 1, 2]),
+            "input_shapes" => [Dict("w" => 640, "h" => 480), Dict("w" => 480, "h" => 640)],
+        )
+    )
+    d = ReactantServer.encode_model_description("det", detector; max_batch_size = 2)
+    @test d isa _Ctl.ModelDescription
+    @test d.name == "det" && d.kind == "model" && d.description == "a detector"
+    @test d.inputs[1].name == "img" && d.inputs[1].datatype == "FP32"
+    @test d.inputs[1].shape == Int64[-1, 3, -1, -1]
+    @test d.inputs[1].axes == [AK.AXIS_BATCH, AK.AXIS_FIXED, AK.AXIS_VARIABLE, AK.AXIS_VARIABLE]
+    @test d.outputs[1].shape == Int64[-1, 4]
+    @test d.outputs[1].axes == [AK.AXIS_BATCH, AK.AXIS_FIXED]
+    @test d.batch_sizes == Int64[1, 2, 4]
+    @test d.max_batch_size == 2
+    @test isempty(d.calls)
+    @test [[(t.name, t.shape) for t in v.inputs] for v in d.variants] ==
+        [[("img", Int64[-1, 3, 480, 640])], [("img", Int64[-1, 3, 640, 480])]]
+    # The KServe metadata writes the same row-major shape, with -1 for both kinds of axis.
+    @test ReactantServer.encode_model_metadata("det", detector, "").inputs[1].shape == d.inputs[1].shape
+
+    pipeline = ReactantServer.parse_manifest(
+        Dict{String, Any}(
+            "format_version" => "2.0", "name" => "pipe", "kind" => "meta",
+            "meta" => Dict{String, Any}("calls" => ["stage1", "stage2"]),
+            "client_inputs" => [Dict("name" => "x", "dtype" => "u8", "shape" => "c", "dims" => Dict("c" => -1))],
+            "client_outputs" => [Dict("name" => "y", "dtype" => "f32", "shape" => "c", "dims" => Dict("c" => 2))],
+            "batching" => Dict{String, Any}(),
+        )
+    )
+    p = ReactantServer.encode_model_description("pipe", pipeline)
+    @test p.kind == "meta"
+    @test p.calls == ["stage1", "stage2"]
+    @test p.inputs[1].axes == [AK.AXIS_VARIABLE]
+    @test isempty(p.batch_sizes) && p.max_batch_size == 0 && isempty(p.variants)
+end
+
 @testset "codec repository index" begin
     idx = ReactantServer.encode_repository_index(["a", "b"])
     @test idx isa _Inf.RepositoryIndexResponse

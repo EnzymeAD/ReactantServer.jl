@@ -219,6 +219,49 @@ end
     @test wire["bscale"].max_batch_size == 4
 end
 
+@testset "DescribeModels lists routed models and describes internal ones only by name" begin
+    sched = _batched_scheduler("bscale", [1, 4, 8])
+    sched.registry.by_name["bscale"].sched =
+        ReactantServer.ModelSchedState("bscale", ReactantServer.ModelSchedConfig(1.0; max_batch_size = 2), 0.0)
+    ctx = ReactantServer.InferContext(sched, sched.registry, ReactantServer.SharedMemoryRegistry(), "mock")
+    _Ctl = ReactantServer.control
+    _describe(names...) =
+        ReactantServer._handle_describe_models(ctx, _Ctl.DescribeModelsRequest(; names = collect(String, names))).models
+
+    d = only(_describe())
+    @test d.name == "bscale" && d.kind == "model"
+    @test d.max_batch_size == 2                 # the scheduler cap, not the largest compiled size
+    @test d.inputs[1].shape == Int64[-1, 2]     # (2, n) in Julia order, batch first on the wire
+    @test d.inputs[1].axes == [_Ctl.AxisKind.AXIS_BATCH, _Ctl.AxisKind.AXIS_FIXED]
+
+    # Once a meta calls it, bscale is an internal stage: the unfiltered list shows only the meta, and
+    # naming bscale still describes it.
+    meta_manifest = ReactantServer.parse_manifest(
+        Dict{String, Any}(
+            "format_version" => "2.0", "name" => "pipe", "kind" => "meta",
+            "meta" => Dict{String, Any}("calls" => ["bscale"]),
+            "client_inputs" => [Dict("name" => "x", "dtype" => "f32", "shape" => "c", "dims" => Dict("c" => 2))],
+            "client_outputs" => [Dict("name" => "y", "dtype" => "f32", "shape" => "c", "dims" => Dict("c" => 2))],
+            "batching" => Dict{String, Any}(),
+        )
+    )
+    sched.registry.meta["pipe"] = ReactantServer.MetaEntry("pipe", meta_manifest, ["bscale"], identity)
+    @test [m.name for m in _describe()] == ["pipe"]
+    @test only(_describe()).calls == ["bscale"]
+    @test only(_describe()).max_batch_size == 0
+    @test [m.name for m in _describe("pipe", "bscale", "pipe")] == ["bscale", "pipe"]
+
+    err = try
+        _describe("bscale", "nope", "gone")
+        nothing
+    catch e
+        e
+    end
+    @test err isa ReactantServer.gRPCServer.GRPCError
+    @test err.code == ReactantServer.gRPCServer.StatusCode.NOT_FOUND
+    @test occursin("nope", err.message) && occursin("gone", err.message)
+end
+
 # Drive select_dispatch! + execute_and_record! directly (no spawned loop) so coalescing is
 # deterministic rather than dependent on arrival timing.
 @testset "mock scheduler coalesces queued requests into one dispatch" begin
