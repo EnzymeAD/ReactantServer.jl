@@ -78,6 +78,11 @@ mutable struct HealthProber
     # wakes the prober early (see the wait in `start_prober!`) instead of waiting out `interval`.
     # Prober-task-owned; plain.
     last_repack_seq::Int
+    # Per-worker outage bookkeeping for the recovery message, keyed by url and prober-task owned: the
+    # workers that have reported ready at least once, and for each one currently not ready, when the
+    # outage began and how many rounds it has missed.
+    ever_ready::Set{String}
+    outages::Dict{String, Tuple{Float64, Int}}
 end
 
 function HealthProber(
@@ -96,7 +101,8 @@ function HealthProber(
     )
     return HealthProber(
         pool, metrics, admin, routes, scheduler, meta, Float64(interval),
-        Threads.Atomic{Bool}(true), nothing, 0, Int(wedge_exit_rounds), false, 0
+        Threads.Atomic{Bool}(true), nothing, 0, Int(wedge_exit_rounds), false, 0,
+        Set{String}(), Dict{String, Tuple{Float64, Int}}()
     )
 end
 
@@ -157,6 +163,7 @@ function _check_once(p::HealthProber)
         # connection is poisoned; drop it so this round's discovery and the next probe reconnect
         # fresh, instead of reusing (and hanging on) the half-open connection forever.
         timeouts[i] && reset_clients!(wc)
+        _track_outage!(p, wc.url, results[i])
     end
     set_ready!(p.admin, any_ready)
     p.ever_responsive |= any_responsive
@@ -189,6 +196,26 @@ function _check_once(p::HealthProber)
         end
     end
     return any_ready
+end
+
+# Outage accounting: a worker that was ready and then missed one or more rounds (a probe timeout,
+# which already logs a warning, or a fast refuse or not-ready answer, which does not) logs one line
+# when it reports ready again, so a reader of the log can see that the outage ended and how long it
+# lasted. A worker that has never been ready is still warming up; its first ready is not a recovery.
+# `p` is the prober, or anything with its `ever_ready` and `outages` fields (the tests pass a stand-in).
+function _track_outage!(p, url::String, ready::Bool, now::Float64 = time())
+    if ready
+        outage = pop!(p.outages, url, nothing)
+        if outage !== nothing
+            since, rounds = outage
+            @info "health: worker ready again" worker = url down_s = round(now - since; digits = 1) missed_rounds = rounds
+        end
+        push!(p.ever_ready, url)
+    elseif url in p.ever_ready
+        since, rounds = get(p.outages, url, (now, 0))
+        p.outages[url] = (since, rounds + 1)
+    end
+    return nothing
 end
 
 # Wedge accounting: a round where EVERY probe missed even the watchdog. This is treated as a

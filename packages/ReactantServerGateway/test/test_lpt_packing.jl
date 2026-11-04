@@ -162,6 +162,27 @@ end
     end
 end
 
+@testset "health: a worker that recovers from an outage logs once, with its downtime" begin
+    st = (; ever_ready = Set{String}(), outages = Dict{String, Tuple{Float64, Int}}())
+    w = "127.0.0.1:8083"
+    # Warmup: not ready before ever being ready is not an outage, and its first ready is silent.
+    @test_logs GW._track_outage!(st, w, false, 0.0)
+    @test isempty(st.outages)
+    @test_logs GW._track_outage!(st, w, true, 5.0)
+    # An outage counts its missed rounds from the first one and logs on the round it recovers.
+    @test_logs GW._track_outage!(st, w, false, 10.0)
+    @test_logs GW._track_outage!(st, w, false, 20.0)
+    @test st.outages[w] == (10.0, 2)
+    logger = Test.TestLogger()
+    Logging.with_logger(() -> GW._track_outage!(st, w, true, 32.5), logger)
+    rec = only(logger.logs)
+    @test rec.level == Logging.Info && rec.message == "health: worker ready again"
+    @test rec.kwargs[:worker] == w && rec.kwargs[:down_s] == 22.5 && rec.kwargs[:missed_rounds] == 2
+    @test isempty(st.outages)
+    # Staying ready logs nothing more.
+    @test_logs GW._track_outage!(st, w, true, 40.0)
+end
+
 @testset "compute_assignment: memory dimension steers placement" begin
     W = ["w0", "w1"]
     GB = 1.0e9
