@@ -93,9 +93,10 @@ end
 """
     model_io_spec(model::KServeModel) -> ModelIOSpec
 
-Fetch a model's input/output spec from a running server over the ModelMetadata RPC. Throws if the
-server is unreachable or does not implement ModelMetadata; the call is explicit, so failing loudly
-is intended. Pair with [`validate_io`](@ref) or use it to introspect a model's I/O directly. The
+Fetch a model's input/output spec from a running server (a worker or the gateway) over the KServe
+ModelMetadata RPC. Throws if the server is unreachable or does not implement ModelMetadata; the call
+is explicit, so failing loudly is intended. [`describe_model`](@ref) reports more: which axes are
+batch or variable, and the compiled batch sizes and input shapes. Pair with [`validate_io`](@ref) or use it to introspect a model's I/O directly. The
 reported shapes are Julia column-major (batch axis last), matching the order you build arrays in;
 the row-major KServe wire shape is reversed away by the client.
 """

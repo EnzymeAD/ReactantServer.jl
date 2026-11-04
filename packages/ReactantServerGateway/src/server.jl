@@ -2,7 +2,8 @@
 # (round-robin across replicas, failover on retryable errors). The SHM RPCs fan out to every
 # worker because POSIX shared-memory regions live on the host and each worker attaches
 # independently. All three are raw Vector{UInt8} in and out; only the small routing headers are
-# decoded (see headers.jl). Mirrors the Go gateway's internal/grpcserver.
+# decoded (see headers.jl). Mirrors the Go gateway's internal/grpcserver. The metadata RPCs
+# (ModelMetadata, RepositoryIndex, DescribeModels) are answered from the workers' registries.
 
 # Per-request state threaded through gRPCServer's context payload. Parametric on the pool and
 # scheduler types so the request hot path (`st.pool` -> `get_clients` -> `wc.chan`, and the
@@ -392,6 +393,145 @@ function _gw_compact(req::CompactMemoryRequest, st::GatewayState)
     return CompactMemoryResponse(; reloaded_models = Int64(total))
 end
 
+# --- Model metadata ---------------------------------------------------------------------------
+#
+# Workers normally load the same bundles, but any one of them may be down or restarting, so the
+# metadata RPCs never depend on a single worker. DescribeModels and RepositoryIndex ask every worker
+# at once and merge the answers; ModelMetadata tries the workers that host the model, then the rest.
+# None of them goes through the scheduler or moves a round-robin cursor.
+
+# Run `f(wc)` against every worker concurrently. Returns the workers in pool order and, for each,
+# its result or the exception it threw.
+function _ask_workers(f, st::GatewayState)
+    workers = all_clients(st.pool)
+    answers = Vector{Any}(undef, length(workers))
+    @sync for (i, wc) in enumerate(workers)
+        @async answers[i] = try
+            f(wc)
+        catch e
+            e
+        end
+    end
+    return workers, answers
+end
+
+_call_status(e) = e isa gRPCClient.gRPCServiceCallException ? e.grpc_status : -1
+
+# The error for a fan-out every worker failed: UNIMPLEMENTED when they all lack the RPC (workers older
+# than the gateway, which a client should hear about as such), UNAVAILABLE otherwise.
+function _all_workers_failed(rpc::AbstractString, workers, answers)
+    if !isempty(answers) && all(a -> _call_status(a) == gRPCClient.GRPC_UNIMPLEMENTED, answers)
+        return STATUS_UNAVAILABLE, gRPCServer.GRPCError(
+                gRPCServer.StatusCode.UNIMPLEMENTED, "no worker implements $rpc; the workers are older than the gateway"
+            )
+    end
+    return STATUS_UNAVAILABLE, gRPCServer.GRPCError(
+            gRPCServer.StatusCode.UNAVAILABLE,
+            isempty(workers) ? "$rpc: the gateway has no workers" :
+            "$rpc failed on every worker: $(join((wc.url for wc in workers), ", "))"
+        )
+end
+
+# Record a metadata RPC's latency and outcome. The model label stays empty: these take arbitrary
+# names from clients, which must not become label values.
+function _record_metadata!(st::GatewayState, rpc, status, t0)
+    observe_request!(st.metrics, rpc, "", time() - t0)
+    inc_requests!(st.metrics, rpc, "", status)
+    return nothing
+end
+
+# Merge every worker's description of `names` (empty: every model it routes) into `merged`, the first
+# worker in pool order winning a name several describe. Returns the workers that answered.
+function _merge_descriptions!(merged::Dict{String, ModelDescription}, st::GatewayState, names)
+    workers, answers = _ask_workers(wc -> invoke_describe_models(wc, DescribeModelsRequest(; names = names)), st)
+    answered = String[]
+    for (wc, a) in zip(workers, answers)
+        a isa DescribeModelsResponse || continue
+        push!(answered, wc.url)
+        for m in a.models
+            get!(merged, m.name, m)
+        end
+    end
+    return workers, answers, answered
+end
+
+function _gw_describe_models(req::DescribeModelsRequest, st::GatewayState)
+    t0 = time()
+    merged = Dict{String, ModelDescription}()
+    workers, answers, answered = _merge_descriptions!(merged, st, String[])
+    if isempty(answered)
+        status, err = _all_workers_failed("DescribeModels", workers, answers)
+        _record_metadata!(st, "DescribeModels", status, t0)
+        throw(err)
+    end
+    names = isempty(req.names) ? sort!(collect(keys(merged))) : sort!(unique(collect(String, req.names)))
+    # A named model missing from the routed set may be a meta model's internal sub-model, which
+    # workers describe only when asked for it by name. Ask once more for exactly those, one at a time:
+    # a worker answers NOT_FOUND for the whole call if it lacks any one of them.
+    for n in filter(n -> !haskey(merged, n), names)
+        _merge_descriptions!(merged, st, [n])
+    end
+    unknown = filter(n -> !haskey(merged, n), names)
+    if !isempty(unknown)
+        _record_metadata!(st, "DescribeModels", STATUS_NOT_FOUND, t0)
+        throw(gRPCServer.GRPCError(gRPCServer.StatusCode.NOT_FOUND, "unknown model: $(join(unknown, ", "))"))
+    end
+    _record_metadata!(st, "DescribeModels", STATUS_OK, t0)
+    return DescribeModelsResponse(; models = [merged[n] for n in names])
+end
+
+# KServe ModelMetadata, forwarded to a worker: the replicas the routing table lists first (a model
+# loaded since the last discovery round is not listed yet), then every other worker. NOT_FOUND only
+# when every worker that answered said so.
+function _gw_model_metadata(req::ModelMetadataRequest, st::GatewayState)
+    t0 = time()
+    routed = something(replicas(st.routes, req.name), String[])
+    order = vcat(routed, filter(u -> !(u in routed), st.pool.order))
+    errors = Any[]
+    for url in order
+        wc = get_clients(st.pool, url)
+        wc === nothing && continue
+        try
+            resp = invoke_model_metadata(wc, req)
+            _record_metadata!(st, "ModelMetadata", STATUS_OK, t0)
+            return resp
+        catch e
+            push!(errors, e)
+        end
+    end
+    if !isempty(errors) && all(e -> _call_status(e) == gRPCClient.GRPC_NOT_FOUND, errors)
+        _record_metadata!(st, "ModelMetadata", STATUS_NOT_FOUND, t0)
+        throw(gRPCServer.GRPCError(gRPCServer.StatusCode.NOT_FOUND, "unknown model: $(req.name)"))
+    end
+    status, err = _all_workers_failed("ModelMetadata", all_clients(st.pool), errors)
+    _record_metadata!(st, "ModelMetadata", status, t0)
+    throw(err)
+end
+
+# KServe RepositoryIndex: the union of every worker's index, a model READY when any worker has it
+# READY (otherwise the first worker's entry, with its reason).
+function _gw_repository_index(req::RepositoryIndexRequest, st::GatewayState)
+    t0 = time()
+    workers, answers = _ask_workers(wc -> invoke_repository_index(wc, req), st)
+    best = Dict{String, var"RepositoryIndexResponse.ModelIndex"}()
+    nanswered = 0
+    for a in answers
+        a isa RepositoryIndexResponse || continue
+        nanswered += 1
+        for m in a.models
+            cur = get(best, m.name, nothing)
+            (cur === nothing || (cur.state != "READY" && m.state == "READY")) && (best[m.name] = m)
+        end
+    end
+    if nanswered == 0
+        status, err = _all_workers_failed("RepositoryIndex", workers, answers)
+        _record_metadata!(st, "RepositoryIndex", status, t0)
+        throw(err)
+    end
+    _record_metadata!(st, "RepositoryIndex", STATUS_OK, t0)
+    return RepositoryIndexResponse(; models = [best[n] for n in sort!(collect(keys(best)))])
+end
+
 # --- Server ---------------------------------------------------------------------------------
 
 # Old gRPCServer handed handlers an absolute deadline on Julia's machine-relative time_ns()
@@ -405,8 +545,9 @@ end
 Register the forwarded RPCs on a fresh [`gRPCServer.GRPCServer`](@ref) bound to `host:port`.
 ModelInfer and the two SHM register/unregister RPCs are raw `Vector{UInt8}` methods (bytes pass
 through unchanged); IsSameIPCNamespace is typed because the gateway aggregates each worker's
-answer rather than forwarding one. Every other GRPCInferenceService RPC is left unimplemented
-(clients get UNIMPLEMENTED).
+answer rather than forwarding one. ModelMetadata, RepositoryIndex, and the control plane's
+DescribeModels and CompactMemory are typed too (see "Model metadata" above). Every other
+GRPCInferenceService RPC is left unimplemented (clients get UNIMPLEMENTED).
 """
 function build_gateway_server(
         state::GatewayState, cfg::GatewayConfig, host::AbstractString, port::Integer;
@@ -441,8 +582,14 @@ function build_gateway_server(
         server,
         (ctx, req) -> _gw_is_same_ipc_namespace(req, ctx.payload)
     )
-    # Control plane: a single CompactMemory RPC to the gateway fans out to every worker.
-    register_ControlService!(server; CompactMemory = (ctx, req) -> _gw_compact(req, ctx.payload))
+    register_GRPCInferenceService_ModelMetadata!(server, (ctx, req) -> _gw_model_metadata(req, ctx.payload))
+    register_GRPCInferenceService_RepositoryIndex!(server, (ctx, req) -> _gw_repository_index(req, ctx.payload))
+    # Control plane: CompactMemory fans out to every worker, and DescribeModels merges every worker's.
+    register_ControlService!(
+        server;
+        CompactMemory = (ctx, req) -> _gw_compact(req, ctx.payload),
+        DescribeModels = (ctx, req) -> _gw_describe_models(req, ctx.payload)
+    )
     # The gateway's own scheduling control plane (see control_service.jl). A distinct service, so the
     # worker-facing ControlService above keeps its meaning.
     register_gateway_control_service!(server, state)

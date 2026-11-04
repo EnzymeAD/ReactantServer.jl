@@ -45,6 +45,12 @@ that serves the model. On a multi-worker node it also serves the node's merged m
 - **SHM namespace probe:** `IsSameIPCNamespace` is fanned out to every worker and the gateway
   returns `true` only if all of them can see the client's region (any worker may service a later
   `ModelInfer`). A worker that errors or does not implement the RPC counts as `false`.
+- **Model metadata:** `ControlService/DescribeModels` asks every worker and merges the answers,
+  so a client learns what the node serves without reading its model repository: each model's
+  tensors with the kind of every axis (fixed, batch, or variable), its compiled batch sizes and
+  input shapes, and the sub-models a meta model calls. The KServe `ModelMetadata` is forwarded to
+  a worker that hosts the model, and `RepositoryIndex` is the union of every worker's index. One
+  worker being down does not fail any of them.
 - **Observability:** structured logs, Prometheus metrics, `/healthz`, and `/readyz` on a
   separate admin HTTP port.
 
@@ -393,13 +399,14 @@ installed.
 ## What the gateway does not do
 
 - Streaming RPCs.
-- The repository / model-config / statistics / trace / log RPCs in the Triton spec, plus
-  `ServerLive`, `ServerReady`, `ModelMetadata`, and `RepositoryIndex` for clients. Of the KServe
-  data plane only `ModelInfer`, the two SHM register/unregister RPCs, and `IsSameIPCNamespace`
-  are proxied; everything else returns `UNIMPLEMENTED`. On the control plane the gateway answers
-  `ControlService/CompactMemory` (fanned out to every worker) and all four
-  `GatewayControlService` RPCs itself (see [Runtime scheduling control](#Runtime-scheduling-control));
-  the other `ControlService` RPCs are worker-only.
+- The repository-control / model-config / statistics / trace / log RPCs in the Triton spec,
+  plus `ServerLive` and `ServerReady` for clients. Of the KServe data plane the gateway serves
+  `ModelInfer`, the two SHM register/unregister RPCs, `IsSameIPCNamespace`, `ModelMetadata`, and
+  `RepositoryIndex`; everything else returns `UNIMPLEMENTED`. On the control plane the gateway
+  answers `ControlService/CompactMemory` (fanned out to every worker), `DescribeModels` (merged
+  from every worker), and all four `GatewayControlService` RPCs itself (see
+  [Runtime scheduling control](#Runtime-scheduling-control)); the other `ControlService` RPCs are
+  worker-only.
 - TLS: parsed but not yet enforced; the listener and the worker back-hop are cleartext h2c.
 - CUDA shared memory.
 - Dynamic worker membership: the worker endpoint list is fixed at startup (from `gateway.yml`

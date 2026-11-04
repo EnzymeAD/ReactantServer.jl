@@ -83,9 +83,25 @@ mutable struct MockWorker
     fail_shm::Bool
     fail_exhausted::Bool        # shed ModelInfer with RESOURCE_EXHAUSTED (worker concurrency cap)
     empty_infer::Bool           # answer ModelInfer with an empty body (a call aborted by a reset)
+    internal::Vector{String}    # models it serves but does not list (a meta model's sub-models)
+    metadata::Symbol            # the metadata RPCs: :ok, :down (UNAVAILABLE), :old (UNIMPLEMENTED)
 end
 MockWorker(name, models, fail_infer, fail_shm, fail_exhausted) =
-    MockWorker(name, models, fail_infer, fail_shm, fail_exhausted, false)
+    MockWorker(name, models, fail_infer, fail_shm, fail_exhausted, false, String[], :ok)
+
+# The metadata RPCs' failure modes, and whether the mock serves `name` at all.
+function _mock_metadata_check(w::MockWorker)
+    w.metadata === :down && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, "mock $(w.name) down"))
+    w.metadata === :old && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.UNIMPLEMENTED, "Method not found"))
+    return nothing
+end
+_mock_serves(w::MockWorker, name) = name in w.models || name in w.internal
+_mock_not_found(w::MockWorker, names) =
+    throw(gRPCServer.GRPCError(gRPCServer.StatusCode.NOT_FOUND, "unknown model: $(join(names, ", ")) on $(w.name)"))
+
+# A description that says which worker wrote it, so a test can see whose answer the gateway kept.
+_mock_description(w::MockWorker, name) =
+    ReactantServerGateway.control.ModelDescription(; name = name, kind = "model", description = w.name)
 
 function _mock_server(worker::MockWorker)
     server = gRPCServer.GRPCServerHTTPJl("127.0.0.1", 1; context = worker)
@@ -115,6 +131,23 @@ function _mock_server(worker::MockWorker)
             GWInf.SystemSharedMemoryRegisterResponse()
         end,
         SystemSharedMemoryUnregister = (ctx, req) -> GWInf.SystemSharedMemoryUnregisterResponse(),
+        ModelMetadata = (ctx, req) -> begin
+            w = ctx.payload
+            _mock_metadata_check(w)
+            _mock_serves(w, req.name) || _mock_not_found(w, [req.name])
+            GWInf.ModelMetadataResponse(; name = req.name, platform = w.name)
+        end,
+    )
+    ReactantServerGateway.register_ControlService!(
+        server;
+        DescribeModels = (ctx, req) -> begin
+            w = ctx.payload
+            _mock_metadata_check(w)
+            names = isempty(req.names) ? sort(w.models) : sort(unique(req.names))
+            unknown = filter(n -> !_mock_serves(w, n), names)
+            isempty(unknown) || _mock_not_found(w, unknown)
+            ReactantServerGateway.control.DescribeModelsResponse(; models = [_mock_description(w, n) for n in names])
+        end,
     )
     return server
 end
@@ -294,6 +327,56 @@ end
             @test err isa gRPCClient.gRPCServiceCallException
             @test err.grpc_status == gRPCClient.GRPC_FAILED_PRECONDITION
             w1.fail_shm = false
+        end
+
+        @testset "metadata RPCs merge every worker's answer" begin
+            Ctl = ReactantServerGateway.control
+            describe(names...) = grpc_call(
+                Ctl.ControlService.DescribeModels, gw_port, Ctl.DescribeModelsRequest(; names = collect(String, names))
+            ).models
+            metadata(name) = grpc_call(
+                GWInf.GRPCInferenceService.ModelMetadata, gw_port, GWInf.ModelMetadataRequest(; name = name)
+            )
+            index() = grpc_call(
+                GWInf.GRPCInferenceService.RepositoryIndex, gw_port, GWInf.RepositoryIndexRequest()
+            ).models
+            status_of(f) = try
+                f(); nothing
+            catch e
+                e isa gRPCClient.gRPCServiceCallException ? e.grpc_status : rethrow()
+            end
+            w1.internal = ["stage"]
+            try
+                # The union over both workers, sorted; worker0 is first in pool order, so its
+                # description of the replicated model is the one kept.
+                @test [(m.name, m.description) for m in describe()] ==
+                    [("only0", "worker0"), ("replicated", "worker0")]
+                @test [m.name for m in index()] == ["only0", "replicated"]
+                # An internal sub-model is left out of the full list but described when named,
+                # by the worker that has it, and KServe metadata for it reaches that worker too.
+                @test [(m.name, m.description) for m in describe("stage", "only0")] ==
+                    [("only0", "worker0"), ("stage", "worker1")]
+                @test metadata("stage").platform == "worker1"
+                @test metadata("only0").platform == "worker0"
+                @test status_of(() -> describe("only0", "nope")) == gRPCClient.GRPC_NOT_FOUND
+                @test status_of(() -> metadata("nope")) == gRPCClient.GRPC_NOT_FOUND
+
+                # One worker down: the other's answer still comes back, and metadata for a model
+                # only the down worker has is UNAVAILABLE rather than NOT_FOUND.
+                w0.metadata = :down
+                @test [(m.name, m.description) for m in describe()] == [("replicated", "worker1")]
+                @test metadata("replicated").platform == "worker1"
+                @test status_of(() -> metadata("only0")) == gRPCClient.GRPC_UNAVAILABLE
+                @test status_of(() -> describe("only0")) == gRPCClient.GRPC_NOT_FOUND
+                # Every worker down is UNAVAILABLE; every worker too old to have the RPC says so.
+                w1.metadata = :down
+                @test status_of(describe) == gRPCClient.GRPC_UNAVAILABLE
+                w0.metadata = w1.metadata = :old
+                @test status_of(describe) == gRPCClient.GRPC_UNIMPLEMENTED
+            finally
+                w0.metadata = w1.metadata = :ok
+                w1.internal = String[]
+            end
         end
 
         @testset "admin endpoints" begin

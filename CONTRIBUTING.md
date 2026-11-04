@@ -140,7 +140,7 @@ file in whole or with blocks removed:
 |---------|-------------|-----------|
 | `ReactantServerCore` | messages only | messages only |
 | `ReactantServer` (worker) | messages + gRPCServer | messages + gRPCServer |
-| `ReactantServerClient` | messages + gRPCClient | not used |
+| `ReactantServerClient` | messages + gRPCClient | messages + gRPCClient |
 | `ReactantServerGateway` | whole file | whole file |
 
 When removing a generator's blocks, also remove the `import gRPCClient` or `import gRPCServer` /

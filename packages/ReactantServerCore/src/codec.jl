@@ -511,6 +511,68 @@ function encode_model_metadata(PB::Module, name::AbstractString, manifest::Manif
     )
 end
 
+_axis_kind(PB::Module, d::Dim) =
+    d.kind == FIXED ? PB.AxisKind.AXIS_FIXED :
+    d.kind == BATCH ? PB.AxisKind.AXIS_BATCH : PB.AxisKind.AXIS_VARIABLE
+
+# Row-major like the KServe metadata, with the kind of each axis alongside, so a batch axis and a
+# variable axis (both -1 in the shape) can be told apart.
+function _tensor_description(PB::Module, s::TensorSpec)
+    return PB.TensorDescription(;
+        name = s.name, datatype = kserve_string(s.dtype),
+        shape = reverse(_julia_shape_int64(s)),
+        axes = reverse([_axis_kind(PB, d) for d in s.shape])
+    )
+end
+
+# The compiled input shapes, one concrete shape per executable input for each variant. A variant key
+# lists the variable-axis sizes in (input, axis) order (see `_variable_axes` in manifest.jl), so they
+# are consumed in that same order. Only reported when the client sends the executable inputs: a
+# model.jl that transforms its inputs decides for itself which client shapes map onto a variant.
+function _shape_variants(PB::Module, m::Manifest)
+    (isempty(m.input_shapes) || m.client_inputs !== nothing) && return PB.ShapeVariant[]
+    return map(m.input_shapes) do key
+        k = 0
+        inputs = map(m.executable_inputs) do sp
+            dims = map(sp.shape) do d
+                d.kind == FIXED && return Int64(d.size)
+                d.kind == BATCH && return Int64(-1)
+                k += 1
+                return Int64(key[k])
+            end
+            PB.TensorShape(; name = sp.name, shape = reverse(dims))
+        end
+        PB.ShapeVariant(; inputs = inputs)
+    end
+end
+
+"""
+    encode_model_description(name, manifest; max_batch_size = 0) -> ModelDescription
+    encode_model_description(PB::Module, name, manifest; max_batch_size = 0) -> ModelDescription
+
+Build the control plane's `ModelDescription` for a served model from its manifest: the client-facing
+tensors with the kind of every axis, the compiled batch sizes and input-shape variants, and a meta
+model's sub-models. `max_batch_size` is the worker's effective coalescing limit, which the manifest
+alone does not know. The PB-first form builds the message from pb module `PB`.
+"""
+function encode_model_description(name::AbstractString, manifest::Manifest; max_batch_size::Integer = 0)
+    return encode_model_description(control, name, manifest; max_batch_size = max_batch_size)
+end
+
+function encode_model_description(
+        PB::Module, name::AbstractString, manifest::Manifest; max_batch_size::Integer = 0
+    )
+    return PB.ModelDescription(;
+        name = String(name), kind = manifest.kind, description = manifest.description,
+        inputs = [_tensor_description(PB, s) for s in client_input_spec(manifest)],
+        outputs = [_tensor_description(PB, s) for s in client_output_spec(manifest)],
+        batch_sizes = Int64.(sort(unique(manifest.batching.compiled_batch_sizes))),
+        max_batch_size = Int64(max_batch_size),
+        calls = copy(manifest.meta_calls),
+        variants = _shape_variants(PB, manifest)
+    )
+end
+
 """
     encode_repository_index(names) -> RepositoryIndexResponse
     encode_repository_index(entries::AbstractVector{<:Pair}) -> RepositoryIndexResponse

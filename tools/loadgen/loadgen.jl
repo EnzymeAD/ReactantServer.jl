@@ -2,17 +2,18 @@
 #
 # Connects to a running node's gateway over KServe V2 gRPC and drives sustained, concurrent
 # inference with zero-filled inputs across every model, to surface memory leaks, races, and
-# instability. Input shapes and dtypes come from each bundle's manifest (manifest_io_spec), read
-# from the model repository directory, so no dependency on the gateway's ModelMetadata RPC (the
-# gateway does not serve it). Runs to a fixed duration, then prints a per-model summary and exits
-# nonzero if any request errored (exit 1) or any model fell short of the per-model coverage
-# minimum (exit 3).
+# instability. The gateway describes the models it serves (ControlService/DescribeModels): their
+# input shapes and dtypes, which axes are batch or variable, the compiled batch sizes and input
+# shapes, so the tool needs no access to the model repository. Every request stages its inputs in
+# the client's buffer pool and sends raw bytes, inline or through shared memory. Runs to a fixed
+# duration, then prints a per-model summary and exits nonzero if any request errored (exit 1) or
+# any model fell short of the per-model coverage minimum (exit 3).
 #
 # Reactant-free: it needs only ReactantServerClient (which pulls in ReactantServerCore and
 # gRPCClient), so run it under that package's project. Point it at any node (native launcher or
 # otherwise) via the LOADGEN_* env below; run it as:
 #   LOADGEN_GATEWAY=grpc://127.0.0.1:8001 LOADGEN_METRICS=http://127.0.0.1:8002/metrics \
-#   LOADGEN_MODEL_REPO=/path/to/bundles LOADGEN_DURATION_SECONDS=300 \
+#   LOADGEN_DURATION_SECONDS=300 \
 #     julia --project=packages/ReactantServerClient tools/loadgen/loadgen.jl
 # The default host names (gateway:8001/8002) are legacy container-network defaults; set the LOADGEN_*
 # values above for a native run.
@@ -20,13 +21,12 @@
 # Env knobs (all optional):
 #   LOADGEN_GATEWAY            grpc URL of the gateway          (default grpc://gateway:8001)
 #   LOADGEN_METRICS            gateway /metrics URL to scrape   (default http://gateway:8002/metrics)
-#   LOADGEN_MODEL_REPO         path to bundles directory        (default /var/lib/reactantserver/models)
 #   LOADGEN_CONCURRENCY        number of concurrent requesters  (default 32)
 #   LOADGEN_DURATION_SECONDS   soak duration                    (default 3600)
-#   LOADGEN_TRANSPORT          tcp | shm | mixed                (default tcp)
+#   LOADGEN_TRANSPORT          tcp | shm | mixed                (default tcp; raw bytes either way)
 #   LOADGEN_SHM_OUTPUTS        read outputs back through shm    (default true; shm path only)
 #   LOADGEN_REPORT_SECONDS     rolling-summary interval         (default 30)
-#   LOADGEN_MODELS             comma list to restrict the set   (default: all bundles)
+#   LOADGEN_MODELS             comma list to restrict the set   (default: every model the gateway routes)
 #   LOADGEN_MIN_OK_PER_MODEL   coverage floor per model         (default 1; shortfall -> exit 3;
 #                                                                ignored in deadline mode)
 #   LOADGEN_SWEEP_EVERY        every Nth pick is round-robin    (default 4; 0 = pure random)
@@ -37,9 +37,9 @@
 #   LOADGEN_RAMP_START         ramp initial concurrency         (default 4)
 #   LOADGEN_RAMP_FACTOR        ramp multiplier per step         (default 2)
 #   LOADGEN_RAMP_MAX           ramp ceiling; sizes handle/pool  (default 512)
+#   LOADGEN_POOL_MAX_MIB       ceiling on each staging pool     (default 1024)
 
 using ReactantServerClient
-using ReactantServerCore: ReactantServerCore, load_manifest   # meta.calls, batch ladder, dim kinds
 import gRPCClient                          # for a dedicated gRPCCURL sized to CONCURRENCY
 using Base.Threads
 
@@ -48,12 +48,14 @@ using Base.Threads
 env(k, d) = get(ENV, k, d)
 const GATEWAY = env("LOADGEN_GATEWAY", "grpc://gateway:8001")
 const METRICS_URL = env("LOADGEN_METRICS", "http://gateway:8002/metrics")
-const MODEL_REPO = env("LOADGEN_MODEL_REPO", "/var/lib/reactantserver/models")
 const CONCURRENCY = parse(Int, env("LOADGEN_CONCURRENCY", "32"))
 const DURATION = parse(Float64, env("LOADGEN_DURATION_SECONDS", "3600"))
 const TRANSPORT = Symbol(env("LOADGEN_TRANSPORT", "tcp"))   # :tcp | :shm | :mixed
 const SHM_OUTPUTS = lowercase(env("LOADGEN_SHM_OUTPUTS", "true")) in ("1", "true", "yes", "on")
 const REPORT_SEC = parse(Float64, env("LOADGEN_REPORT_SECONDS", "30"))
+# Ceiling on each staging pool (one inline, one shared-memory), which main() sizes to fit the
+# largest request once per firing task.
+const POOL_MAX_BYTES = round(Int, parse(Float64, env("LOADGEN_POOL_MAX_MIB", "1024")) * 2^20)
 # Serial warmup before the concurrent soak: one request per model with a long deadline. The first
 # request to a model triggers Reactant compilation (often >10s); firing 32 concurrent cold requests
 # instead stampedes the gRPCClient libcurl multi-handle into a wedge, so the soak never makes
@@ -70,7 +72,7 @@ const WARMUP_DEADLINE = parse(Float64, env("LOADGEN_WARMUP_DEADLINE", "300"))
 const MIN_OK_PER_MODEL = parse(Int, env("LOADGEN_MIN_OK_PER_MODEL", "1"))
 const SWEEP_EVERY = parse(Int, env("LOADGEN_SWEEP_EVERY", "4"))
 
-# Batch mode. :rows sends multi-row requests sized from each manifest's compiled batch ladder
+# Batch mode. :rows sends multi-row requests sized from each model's compiled batch ladder
 # (client-side prebatching, exercising the multi-row execution path). :burst aims BURST_K
 # consecutive global tickets at the same model so concurrent same-model requests queue together
 # and the worker's plan_batch coalesces them (server-side request merging). :both does both, with
@@ -116,20 +118,23 @@ const DTYPE = Dict(
 
 # ---- model discovery + dummy-input synthesis --------------------------------------------------
 
-# One input tensor: its name, Julia element type, per-item Julia column-major dims (batch dropped),
-# and whether the manifest declares a batch axis for it. A model with `has_batch=false` is unbatched
-# (e.g. a meta core with mixed-rank inputs); we must NOT append a batch row to it, or it arrives one
-# rank too large.
+# One input tensor as sent: its name, Julia element type, Julia column-major dims with every
+# variable axis filled in from a compiled shape, and the 1-based position of its batch axis (0 when
+# the input has none, e.g. a cross-encoder's unbatched query). The batch axis may sit anywhere: an
+# image's `whcn` puts it last, a tokenized `nc` first.
 struct InputSpec
     name::String
     dtype::DataType
-    per_item_dims::Vector{Int}
-    has_batch::Bool
+    dims::Vector{Int}       # the batch axis, if any, holds a placeholder 1
+    batch_axis::Int
 end
 
-# Julia column-major wire dims for one input carrying `n` rows: batched inputs get the batch axis
-# appended (last, matching the manifest); unbatched inputs are sent at exactly their fixed dims.
-_wire_dims(inp::InputSpec, n::Int) = inp.has_batch ? Int[inp.per_item_dims..., n] : copy(inp.per_item_dims)
+# Julia column-major wire dims for one input carrying `n` rows; an unbatched input is sent as is.
+function _wire_dims(inp::InputSpec, n::Int)
+    d = copy(inp.dims)
+    inp.batch_axis > 0 && (d[inp.batch_axis] = n)
+    return d
+end
 
 # Per-model result counters, all atomics so the hot path never takes a lock or a Dict lookup.
 struct ModelStats
@@ -146,66 +151,55 @@ ModelStats() = ModelStats(
     Atomic{Int}(0), Atomic{Int}(0), Atomic{Bool}(false)
 )
 
-# One model's everything needed to fire a request: its gateway handle, ALL of its input specs, the
-# prebuilt inline InferInputs for the TCP path (immutable, reused across requests, one entry per
-# ladder size, built eagerly at discovery so the hot path never builds or locks), shm output
-# read-back declarations, its compiled batch ladder, and its counters.
+# One model's everything needed to fire a request: a handle per transport (both send raw bytes
+# staged through the client's buffer pool; `shm` stages into shared memory, `tcp` inline), one input
+# set per compiled shape (a single entry for a model without variable axes), shm output read-back
+# declarations, its batch ladder, and its counters.
 struct ModelSpec
     name::String
-    model::KServeModel
-    inputs::Vector{InputSpec}
-    out_specs::Vector{OutputSpec}   # shm read-back declarations; empty = outputs stay inline
-    batch_sizes::Vector{Int}        # sorted compiled ladder; [1] when ineligible or mode off
-    tcp_inputs_by_n::Dict{Int, Vector{Any}}   # inline inputs per row count (n=1 always present)
+    tcp::KServeModel                 # shared_memory = :off
+    shm::KServeModel                 # shared_memory = :on
+    variants::Vector{Vector{InputSpec}}
+    out_specs::Vector{OutputSpec}    # shm read-back declarations; empty = outputs stay inline
+    batch_sizes::Vector{Int}         # sorted ladder; [1] when ineligible or mode off
     stats::ModelStats
 end
 
-# Julia column-major shape from manifest_io_spec has the batch axis (-1) last; drop -1 axes to get
-# the per-item dims, and pin any other dynamic axis to 1 (the bundles here have none).
-function per_item_dims(shape)
-    dims = Int[]
-    for d in shape
-        d == -1 && continue
-        push!(dims, d)
-    end
-    return dims
-end
-
-# Output read-back declarations for the shm path: every output, sized per item (Julia col-major
-# shape with the trailing batch axis dropped). Returns [] when disabled or when any output has an
-# unmapped dtype or a non-batch dynamic axis; an empty vector keeps that model's outputs inline.
-function output_shm_specs(io)
+# Output read-back declarations for the shm path: every output, sized per item (its batch axis
+# dropped). Returns [] when disabled or when any output has an unmapped dtype or a variable axis; an
+# empty vector keeps that model's outputs inline.
+function output_shm_specs(d::ModelDescription)
     SHM_OUTPUTS || return OutputSpec[]
     specs = OutputSpec[]
-    for oname in io.output_order
-        om = io.outputs[oname]
-        haskey(DTYPE, om.datatype) || return OutputSpec[]
-        dims = copy(om.shape)
-        !isempty(dims) && dims[end] == -1 && pop!(dims)    # batch axis is last in col-major order
-        any(==(-1), dims) && return OutputSpec[]           # dynamic non-batch axis: keep inline
-        push!(specs, OutputSpec(oname, DTYPE[om.datatype], dims))
+    for o in d.outputs
+        haskey(DTYPE, o.datatype) || return OutputSpec[]
+        any(==(:variable), o.axes) && return OutputSpec[]
+        push!(specs, OutputSpec(o.name, DTYPE[o.datatype], [s for (s, a) in zip(o.shape, o.axes) if a !== :batch]))
     end
     return specs
 end
 
-# Models that are internal sub-bundles of a meta model (declared in some meta's meta.calls, e.g.
-# <m>_stage1 / <m>_stage2 / <m>_core). Clients call the meta, which fans out to these; soaking them
-# directly doubles their queue load with zero/garbage inputs and congests the queues the metas wait
-# on. Skipped by default; set LOADGEN_SKIP_INTERNAL=false to soak them anyway.
-function _internal_submodels(names)
-    internal = Set{String}()
-    for name in names
-        mf = joinpath(MODEL_REPO, name, "manifest.yaml")
-        isfile(mf) || continue
-        try
-            for c in load_manifest(mf).meta_calls
-                push!(internal, String(c))
-            end
-        catch ex
-            @warn "could not read meta.calls" model = name exception = ex
+# The input sets to send, one per compiled shape: the declared dims with every variable axis taken
+# from a variant. Returns a reason string instead when the model cannot be driven blind.
+function input_variants(d::ModelDescription)
+    for t in d.inputs
+        haskey(DTYPE, t.datatype) || return "unmapped dtype $(t.datatype)"
+        count(==(:batch), t.axes) <= 1 || return "input $(t.name) has more than one batch axis"
+    end
+    variable = any(t -> any(==(:variable), t.axes), d.inputs)
+    # A variable axis needs a size only certain compiled programs accept; without the compiled
+    # shapes (a model whose preprocessing transforms its inputs reports none) there is nothing valid
+    # to send.
+    variable && isempty(d.variants) && return "variable input axis with no compiled shapes"
+    shapes = variable ? d.variants : [Dict{String, Vector{Int}}()]
+    return map(shapes) do v
+        map(d.inputs) do t
+            dims = haskey(v, t.name) ? copy(v[t.name]) : copy(t.shape)
+            b = something(findfirst(==(:batch), t.axes), 0)
+            b > 0 && (dims[b] = 1)
+            InputSpec(t.name, DTYPE[t.datatype], dims, b)
         end
     end
-    return internal
 end
 
 # Every model the discovery pass dropped, with the reason — reported prominently at startup and in
@@ -213,81 +207,64 @@ end
 const SKIPPED = Vector{Tuple{String, String}}()
 _skip!(name, reason) = (push!(SKIPPED, (name, reason)); @warn "skip: $reason" model = name)
 
-function discover_models(grpc)
-    names = readdir(MODEL_REPO)
-    want = get(ENV, "LOADGEN_MODELS", "")
-    if !isempty(want)
-        sel = Set(strip.(split(want, ",")))
-        names = filter(in(sel), names)
+# Ask the gateway what it serves (ControlService/DescribeModels): every model it routes, or the
+# LOADGEN_MODELS subset. A meta model's internal sub-models are not routed, so they are not listed
+# and never soaked directly.
+function describe_fleet(grpc)
+    want = strip(get(ENV, "LOADGEN_MODELS", ""))
+    names = isempty(want) ? String[] : String.(strip.(split(want, ",")))
+    try
+        return describe_models(GATEWAY; names = names, deadline = 30.0, grpc = grpc)
+    catch ex
+        println("ERROR: DescribeModels against $GATEWAY failed: ", sprint(showerror, ex))
+        ex isa gRPCClient.gRPCServiceCallException && ex.grpc_status == gRPCClient.GRPC_UNIMPLEMENTED &&
+            println("  The node predates ControlService/DescribeModels; update its gateway and workers.")
+        exit(2)
     end
-    skip_internal = lowercase(env("LOADGEN_SKIP_INTERNAL", "true")) != "false"
-    internal = skip_internal ? _internal_submodels(names) : Set{String}()
-    isempty(internal) || @info "skipping internal meta sub-bundles" count = length(internal) models = sort(collect(internal))
+end
+
+function build_specs(descriptions, grpc)
     specs = ModelSpec[]
-    for name in sort(names)
-        if name in internal
-            push!(SKIPPED, (name, "internal meta sub-bundle"))
-            continue
-        end
-        manifest = joinpath(MODEL_REPO, name, "manifest.yaml")
-        if !isfile(manifest)
-            isdir(joinpath(MODEL_REPO, name)) && push!(SKIPPED, (name, "no manifest.yaml"))
-            continue
-        end
-        local spec
-        try
-            m = load_manifest(manifest)
-            # A VARIABLE (non-batch -1) input axis needs a concrete per-request size we can't
-            # invent (only certain compiled variants are valid); driving it blind just errors.
-            tins = something(m.client_inputs, m.executable_inputs)
-            if any(d.kind == ReactantServerCore.VARIABLE for t in tins for d in t.shape)
-                _skip!(name, "variable non-batch input axis")
-                continue
-            end
-            io = manifest_io_spec(manifest)
-            isempty(io.input_order) && (_skip!(name, "no inputs"); continue)
-            inputs = InputSpec[]
-            unmapped = ""
-            for tname in io.input_order                      # ALL inputs, not just the first
-                tm = io.inputs[tname]
-                haskey(DTYPE, tm.datatype) || (unmapped = tm.datatype; break)
-                # batch axis shows up as -1 in the metadata shape; absent => unbatched input
-                push!(
-                    inputs, InputSpec(
-                        tname, DTYPE[tm.datatype],
-                        per_item_dims(tm.shape), any(==(-1), tm.shape)
-                    )
-                )
-            end
-            isempty(unmapped) || (_skip!(name, "unmapped dtype $unmapped"); continue)
-            # Multi-row eligibility: a compiled batch size > 1 AND every input has a batch axis.
-            sizes = sort(unique(Int.(m.batching.compiled_batch_sizes)))
-            ladder = isempty(sizes) ? Int[1] : sizes
-            eligible = any(>(1), ladder) && all(inp.has_batch for inp in inputs)
-            batch_sizes = (BATCH_ROWS && eligible) ? ladder : Int[1]
-            # Retries off: this is a measurement tool. The client's default retry-on-shed policy
-            # (#57) would silently absorb sheds and EDF drops, hiding exactly what ramp and
-            # deadline modes exist to observe.
-            model = KServeModel(
-                GATEWAY, name; max_batch_size = maximum(batch_sizes),
-                deadline = DEADLINE_MODE ? DEADLINE_SEC : 10.0, grpc = grpc,
-                retry = ReactantServerClient.RetryPolicy(enabled = false)
+    for d in descriptions
+        variants = input_variants(d)
+        variants isa String && (_skip!(d.name, variants); continue)
+        isempty(d.inputs) && (_skip!(d.name, "no inputs"); continue)
+        # Multi-row eligibility: a compiled batch size > 1 AND every input has a batch axis. Sizes
+        # above the worker's coalescing cap are left out; the cap is what it executes at once.
+        ladder = isempty(d.batch_sizes) ? Int[1] : copy(d.batch_sizes)
+        d.max_batch_size > 0 && filter!(<=(d.max_batch_size), ladder)
+        isempty(ladder) && (ladder = Int[1])
+        eligible = any(>(1), ladder) && all(inp.batch_axis > 0 for inp in first(variants))
+        batch_sizes = (BATCH_ROWS && eligible) ? ladder : Int[1]
+        # Retries off: this is a measurement tool. The client's default retry-on-shed policy
+        # (#57) would silently absorb sheds and EDF drops, hiding exactly what ramp and
+        # deadline modes exist to observe.
+        handle(mode) = KServeModel(
+            GATEWAY, d.name; max_batch_size = maximum(batch_sizes),
+            deadline = DEADLINE_MODE ? DEADLINE_SEC : 10.0, grpc = grpc, shared_memory = mode,
+            retry = ReactantServerClient.RetryPolicy(enabled = false)
+        )
+        push!(
+            specs, ModelSpec(
+                d.name, handle(:off), handle(TRANSPORT === :tcp ? :off : :on), variants,
+                output_shm_specs(d), batch_sizes, ModelStats()
             )
-            by_n = Dict{Int, Vector{Any}}(
-                n => Any[InferInput(inp.name, zeros(inp.dtype, _wire_dims(inp, n)...)) for inp in inputs]
-                    for n in union(1, batch_sizes)
-            )
-            spec = ModelSpec(
-                name, model, inputs, output_shm_specs(io),
-                batch_sizes, by_n, ModelStats()
-            )
-        catch ex
-            _skip!(name, "manifest_io_spec failed: $(sprint(showerror, ex))")
-            continue
-        end
-        push!(specs, spec)
+        )
     end
     return specs
+end
+
+# The largest request any model can send, inputs plus shm-read outputs, so the staging pool can be
+# sized to fit one in each slot instead of spanning slots under load.
+function max_request_bytes(specs)
+    worst = 0
+    for spec in specs, v in spec.variants
+        n = maximum(spec.batch_sizes)
+        ins = sum(sizeof(inp.dtype) * prod(_wire_dims(inp, n)) for inp in v)
+        outs = sum((sizeof(o.dtype) * prod(o.per_item_dims) * n for o in spec.out_specs); init = 0)
+        worst = max(worst, ins + outs)
+    end
+    return worst
 end
 
 function print_skipped()
@@ -321,20 +298,23 @@ function print_model_table(specs)
     return
 end
 
-# Minimal IO for the shared-memory path: `n` zero-filled items of every one of a model's inputs.
+# The IO every request goes through: `n` zero-filled items of one compiled shape of a model's inputs,
+# staged in the client's buffer pool and sent as raw bytes, through shared memory or inline
+# depending on the handle's transport.
 struct DummyIO <: AbstractInferenceIO
     spec::ModelSpec
+    inputs::Vector{InputSpec}   # one entry of spec.variants
     n::Int
 end
 Base.length(io::DummyIO) = io.n
-# Per-item bytes summed across all inputs (each input's per-item size; the batch row, if any, is 1).
+# Per-item bytes summed across all inputs (each input's size at one row).
 ReactantServerClient.item_input_bytes(io::DummyIO) =
-    sum(sizeof(inp.dtype) * prod(_wire_dims(inp, 1)) for inp in io.spec.inputs)
+    sum(sizeof(inp.dtype) * prod(_wire_dims(inp, 1)) for inp in io.inputs)
 function ReactantServerClient.infer_encode_chunk!(io::DummyIO, r, slot)
     n = length(r)
-    ins = InferInput[]
-    for inp in io.spec.inputs
-        wire = _wire_dims(inp, n)                          # Julia col-major; batch (if any) last
+    ins = PoolInferInput[]
+    for inp in io.inputs
+        wire = _wire_dims(inp, n)                          # Julia col-major
         nbytes = sizeof(inp.dtype) * prod(wire)
         sub = subslot(slot, nbytes)
         fill!(pool_view(sub, UInt8, nbytes), 0x00)
@@ -346,7 +326,8 @@ ReactantServerClient.infer_decode_chunk!(::DummyIO, r, response) = nothing
 # Declaring outputs opts the shm path into shared-memory read-back (explicit-output mode): the
 # server writes results into the registered region instead of returning them inline, exercising
 # the full shm data plane in both directions. Empty (e.g. LOADGEN_SHM_OUTPUTS=false or a dynamic
-# output shape) keeps outputs inline, the safe fallback. The tcp path never consults this.
+# output shape) keeps outputs inline, the safe fallback. On the inline transport the declared
+# outputs are only requested by name.
 ReactantServerClient.output_specs(io::DummyIO) = io.spec.out_specs
 
 # ---- counters ---------------------------------------------------------------------------------
@@ -432,13 +413,9 @@ function record_result(spec::ModelSpec, ex)
     end
 end
 
-function fire(spec::ModelSpec, use_shm::Bool, nrows::Int)
+function fire(spec::ModelSpec, use_shm::Bool, nrows::Int, inputs::Vector{InputSpec})
     t0 = time_ns()
-    if use_shm
-        infer_async(spec.model, DummyIO(spec, nrows))
-    else
-        infer_sync(spec.model, spec.tcp_inputs_by_n[nrows])
-    end
+    infer_sync(use_shm ? spec.shm : spec.tcp, DummyIO(spec, inputs, nrows))
     dt = Int(time_ns() - t0)
     atomic_add!(N_OK, 1)
     atomic_add!(spec.stats.ok, 1)
@@ -467,8 +444,9 @@ function pick_spec(specs::Vector{ModelSpec}, t::Int)
     end
 end
 
-# Rows for this request. In burst mode the row count is a function of the burst index, so every
-# request within a burst shares one shape variant (mixed variants would split the coalescable run).
+# Rows and input shape for this request. In burst mode both are a function of the burst index, so
+# every request within a burst shares one compiled program (mixed shapes would split the run the
+# worker coalesces).
 function pick_rows(spec::ModelSpec, t::Int)
     (BATCH_ROWS && length(spec.batch_sizes) > 1) || return 1
     if BATCH_BURST
@@ -478,28 +456,35 @@ function pick_rows(spec::ModelSpec, t::Int)
     end
 end
 
+function pick_variant(spec::ModelSpec, t::Int)
+    length(spec.variants) == 1 && return spec.variants[1]
+    BATCH_BURST && return spec.variants[1 + (t ÷ BURST_K) % length(spec.variants)]
+    return rand(spec.variants)
+end
+
 # Serial warmup: fire one request per model with a long deadline so first-request compilation
 # completes before the concurrent soak begins (see WARMUP comment). Sequential by design — a
 # concurrent cold stampede wedges the gRPCClient multi-handle. In rows mode every ladder size is
 # primed (each batch size is a separate compiled executable; a cold large-batch compile mid-soak
-# would recreate the stampede). Failures are logged, not fatal.
+# would recreate the stampede), and so is every compiled input shape. Failures are logged, not fatal.
 function warmup(specs::Vector{ModelSpec})
-    nreq = sum(length(spec.batch_sizes) for spec in specs)
+    nreq = sum(length(spec.batch_sizes) * length(spec.variants) for spec in specs)
     println("warmup: priming $(length(specs)) models / $nreq requests serially (deadline $(WARMUP_DEADLINE)s) ...")
     t0 = time(); nok = 0
     for spec in specs
         m = KServeModel(
             GATEWAY, spec.name; max_batch_size = maximum(spec.batch_sizes),
-            deadline = WARMUP_DEADLINE, grpc = spec.model.grpc,
+            deadline = WARMUP_DEADLINE, grpc = spec.tcp.grpc, shared_memory = :off,
             retry = ReactantServerClient.RetryPolicy(enabled = false)
         )
         allok = true
-        for n in spec.batch_sizes
+        for v in spec.variants, n in spec.batch_sizes
             try
-                infer_sync(m, spec.tcp_inputs_by_n[n])
+                infer_sync(m, DummyIO(spec, v, n))
             catch ex
                 allok = false
-                @warn "warmup failed (continuing)" model = spec.name rows = n exception = ex
+                shape = Dict(inp.name => _wire_dims(inp, n) for inp in v)
+                @warn "warmup failed (continuing)" model = spec.name rows = n shape exception = ex
             end
         end
         if allok
@@ -562,21 +547,25 @@ function main()
         DURATION < steps_needed * RAMP_STEP &&
             @warn "duration too short for the ramp to reach RAMP_MAX" needed_seconds = steps_needed * RAMP_STEP duration = DURATION
     end
-    kserve_init(; n_slots = max(effective_max, ReactantServerClient.DEFAULT_POOL_SLOTS))
-    # One number (effective_max) controls everything: firing tasks, the SHM staging-pool slots
-    # above, and the gRPC concurrent-stream semaphore here. Without this the clients use the global
-    # handle (GRPC_MAX_STREAMS=16), which caps in-flight requests at 16 no matter how high the
-    # requested concurrency is.
+    # One number (effective_max) controls everything: firing tasks, the staging-pool slots, and the
+    # gRPC concurrent-stream semaphore here. Without this the clients use the global handle
+    # (GRPC_MAX_STREAMS=16), which caps in-flight requests at 16 no matter how high the requested
+    # concurrency is. The handle opens itself, so the models can be described before kserve_init.
     grpc = gRPCClient.gRPCCURL(; sticky = false, max_streams = effective_max)
+    specs = build_specs(describe_fleet(grpc), grpc)
+    print_skipped()
+    isempty(specs) && (println("ERROR: no usable models on $GATEWAY"); exit(2))
+    # Both transports stage through the pool, so size it to hold the largest request in one slot
+    # per firing task, within reason: a request bigger than a slot still works by spanning slots.
+    n_slots = max(effective_max, ReactantServerClient.DEFAULT_POOL_SLOTS)
+    pool_bytes = clamp(n_slots * max_request_bytes(specs), ReactantServerClient.DEFAULT_POOL_BYTES, POOL_MAX_BYTES)
+    kserve_init(; n_slots = n_slots, pool_bytes = pool_bytes)
     # Echo the single knob and everything it derived, so a glance at the logs confirms it propagated.
     println(
         "== loadgen config: effective_max=$effective_max -> firing_tasks=$effective_max, ",
-        "shm_pool_slots=$(max(effective_max, ReactantServerClient.DEFAULT_POOL_SLOTS)), ",
+        "pool_slots=$n_slots, pool_bytes=$(round(pool_bytes / 2^20, digits = 1))MiB, ",
         "grpc_max_streams=$effective_max, julia_threads=$(Threads.nthreads()) =="
     )
-    specs = discover_models(grpc)
-    print_skipped()
-    isempty(specs) && (println("ERROR: no usable models discovered under $MODEL_REPO"); exit(2))
     if BATCH_ROWS
         eligible = count(spec -> length(spec.batch_sizes) > 1, specs)
         println("batch rows mode: $eligible/$(length(specs)) models batch-eligible (ladder > 1 and all inputs batched)")
@@ -605,9 +594,10 @@ function main()
                 t = atomic_add!(TICKET, 1)
                 spec = pick_spec(specs, t)
                 nrows = pick_rows(spec, t)
+                inputs = pick_variant(spec, t)
                 atomic_add!(INFLIGHT, 1)
                 try
-                    fire(spec, pick_shm(t), nrows)
+                    fire(spec, pick_shm(t), nrows, inputs)
                 catch ex
                     # NOTE: must NOT be named `err` — `err` would collide with main()-scope locals
                     # that closures capture and SHARE (see the summary block below); a firing task
@@ -738,7 +728,7 @@ function main()
                         # sit in libcurl without completing; sem_free == 0 with in_multi == 0 means the
                         # concurrent-stream semaphore leaked and tasks are blocked before libcurl.
                         try
-                            g = specs[1].model.grpc
+                            g = specs[1].tcp.grpc
                             println(
                                 "gRPC handle state: running=$(g.running) ",
                                 "in_multi=$(length(g.requests)) sem_free=$(Base.n_avail(g.sem)) ",
