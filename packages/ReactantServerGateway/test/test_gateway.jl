@@ -85,9 +85,11 @@ mutable struct MockWorker
     empty_infer::Bool           # answer ModelInfer with an empty body (a call aborted by a reset)
     internal::Vector{String}    # models it serves but does not list (a meta model's sub-models)
     metadata::Symbol            # the metadata RPCs: :ok, :down (UNAVAILABLE), :old (UNIMPLEMENTED)
+    fail_invalid::Bool          # reject ModelInfer with INVALID_ARGUMENT (e.g. an unknown requested output)
+    infer_calls::Int            # ModelInfer calls received, so a test can see whether the gateway failed over
 end
 MockWorker(name, models, fail_infer, fail_shm, fail_exhausted) =
-    MockWorker(name, models, fail_infer, fail_shm, fail_exhausted, false, String[], :ok)
+    MockWorker(name, models, fail_infer, fail_shm, fail_exhausted, false, String[], :ok, false, 0)
 
 # The metadata RPCs' failure modes, and whether the mock serves `name` at all.
 function _mock_metadata_check(w::MockWorker)
@@ -117,7 +119,9 @@ function _mock_server(worker::MockWorker)
         ),
         ModelInfer = (ctx, req) -> begin
             w = ctx.payload
+            w.infer_calls += 1
             w.fail_infer && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, "mock $(w.name) down"))
+            w.fail_invalid && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.INVALID_ARGUMENT, "requested output 'x' is not produced by the model"))
             w.fail_exhausted && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.RESOURCE_EXHAUSTED, "mock $(w.name) at capacity"))
             w.empty_infer && return GWInf.ModelInferResponse()   # every field default: encodes to 0 bytes
             # A real worker NOT_FOUNDs a model it no longer serves; mirror that so the gateway's
@@ -308,6 +312,25 @@ end
             @test err isa gRPCClient.gRPCServiceCallException
             @test err.grpc_status == gRPCClient.GRPC_RESOURCE_EXHAUSTED
             w0.fail_exhausted = false
+        end
+
+        @testset "a worker's INVALID_ARGUMENT reaches the client without failover" begin
+            # Every replica would reject the same request, so trying the next one only doubles the
+            # work, and folding it into UNAVAILABLE invites the client to retry a request that
+            # cannot succeed.
+            w0.fail_invalid = w1.fail_invalid = true
+            w0.infer_calls = w1.infer_calls = 0
+            err = try
+                _infer(gw_port, "replicated")
+                nothing
+            catch e
+                e
+            end
+            @test err isa gRPCClient.gRPCServiceCallException
+            @test err.grpc_status == gRPCClient.GRPC_INVALID_ARGUMENT
+            @test occursin("is not produced by the model", err.message)
+            @test w0.infer_calls + w1.infer_calls == 1
+            w0.fail_invalid = w1.fail_invalid = false
         end
 
         @testset "SHM register fan-out and rollback" begin
