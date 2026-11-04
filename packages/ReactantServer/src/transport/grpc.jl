@@ -193,19 +193,23 @@ function _infer_or_not_found(ctx::InferContext, request)
 end
 
 # Time and count every ModelInfer for the worker's Prometheus export (worker_requests_total by
-# model+status, worker_request_latency_seconds), then delegate to the handler body.
-function _handle_infer(ctx::InferContext, req, grpc_deadline_ns::Integer = 0)
+# model+status, worker_request_latency_seconds), then delegate to the handler body. `finish` is
+# applied to the response inside the timed region (the raw path encodes there), and `t0` lets a
+# caller start the clock before its own work (the raw path starts it before decoding).
+function _handle_infer(
+        ctx::InferContext, req, grpc_deadline_ns::Integer = 0;
+        finish = identity, t0::Float64 = time()
+    )
     name = req.model_name
     if ctx.metrics === nothing
         try
-            return _handle_infer_impl(ctx, req, grpc_deadline_ns)
+            return finish(_handle_infer_impl(ctx, req, grpc_deadline_ns))
         finally
             _beat(:request, String(name))
         end
     end
-    t0 = time()
     try
-        resp = _handle_infer_impl(ctx, req, grpc_deadline_ns)
+        resp = finish(_handle_infer_impl(ctx, req, grpc_deadline_ns))
         observe_request!(ctx.metrics, name, time() - t0)
         inc_request!(ctx.metrics, name, "OK")
         return resp
@@ -217,6 +221,26 @@ function _handle_infer(ctx::InferContext, req, grpc_deadline_ns::Integer = 0)
         # Fired on success and failure alike: a failing request is still a client using this server.
         _beat(:request, String(name))
     end
+end
+
+# The ModelInfer RPC as registered: raw request bytes in, encoded response bytes out, so that the
+# protobuf decode and encode run with the rest of the request on a default-pool task (see
+# `_offloaded`). Decoding a large request or encoding a large response is a copy of the tensor data,
+# and the first decode of the process compiles; neither belongs on the interactive thread.
+function _handle_infer_raw(ctx::InferContext, body::Vector{UInt8}, grpc_deadline_ns::Integer = 0)
+    t0 = time()
+    req = try
+        ProtoBuf.decode(ProtoBuf.ProtoDecoder(IOBuffer(body)), inference.ModelInferRequest)
+    catch err
+        _invalid("malformed ModelInferRequest: " * sprint(showerror, err))
+    end
+    return _handle_infer(ctx, req, grpc_deadline_ns; finish = _encode_message, t0 = t0)
+end
+
+function _encode_message(msg)
+    io = IOBuffer()
+    ProtoBuf.encode(ProtoBuf.ProtoEncoder(io), msg)
+    return take!(io)
 end
 
 function _handle_infer_impl(ctx::InferContext, req, grpc_deadline_ns::Integer = 0)
@@ -300,6 +324,13 @@ constructing the server. The message-size caps default to `_MAX_MESSAGE_BYTES`; 
 the configured `grpc.max_recv_msg_bytes` / `max_send_msg_bytes` (passed through as the merged
 package's per-direction caps).
 """
+# HTTP.jl starts every request handler on the :interactive thread pool, which has one thread here,
+# shared with the scheduler's dispatch loop. A handler that does real work there (decoding, a lock
+# wait, file or shared-memory I/O, or code compiling on first use) stalls every other request and the
+# dispatch loop until it finishes. `_offloaded` wraps a handler so its body runs on a default-pool task
+# while the interactive task only waits; errors, gRPC status included, propagate unchanged.
+_offloaded(handler) = (ctx, req) -> off_interactive(() -> handler(ctx, req))
+
 function build_grpc_server(
         sched::Scheduler, registry::ModelRegistry, platform::AbstractString,
         shm::SharedMemoryRegistry, host::AbstractString, port::Integer, ctx::InferContext;
@@ -318,19 +349,30 @@ function build_grpc_server(
         h2_initial_window_size = h2_initial_window_size,
         h2_connection_window_size = h2_connection_window_size
     )
+    # ServerLive and ServerReady answer from the interactive thread itself: they are trivial, and
+    # they are how a prober tells whether that thread is responsive. Everything else is offloaded.
     register_GRPCInferenceService!(
         server;
         ServerLive = (ctx, req) -> inference.ServerLiveResponse(; live = true),
         ServerReady = (ctx, req) -> _handle_server_ready(ctx.payload),
-        ModelReady = (ctx, req) -> _handle_model_ready(ctx.payload, req),
-        ServerMetadata = (ctx, req) -> _handle_server_metadata(ctx.payload),
-        ModelMetadata = (ctx, req) -> _handle_model_metadata(ctx.payload, req),
-        ModelInfer = (ctx, req) -> _handle_infer(ctx.payload, req, deadline_to_time_ns(ctx.deadline, gRPCServer.remaining_time(ctx))),
-        RepositoryIndex = (ctx, req) -> _handle_repository_index(ctx.payload, req),
-        SystemSharedMemoryStatus = (ctx, req) -> _handle_shm_status(ctx.payload.shm, req.name),
-        SystemSharedMemoryRegister = (ctx, req) -> _handle_shm_register(ctx.payload.shm, req),
-        SystemSharedMemoryUnregister = (ctx, req) -> _handle_shm_unregister(ctx.payload.shm, req.name),
-        IsSameIPCNamespace = (ctx, req) -> _handle_is_same_ipc_namespace(req.name)
+        ModelReady = _offloaded((ctx, req) -> _handle_model_ready(ctx.payload, req)),
+        ServerMetadata = _offloaded((ctx, req) -> _handle_server_metadata(ctx.payload)),
+        ModelMetadata = _offloaded((ctx, req) -> _handle_model_metadata(ctx.payload, req)),
+        RepositoryIndex = _offloaded((ctx, req) -> _handle_repository_index(ctx.payload, req)),
+        SystemSharedMemoryStatus = _offloaded((ctx, req) -> _handle_shm_status(ctx.payload.shm, req.name)),
+        SystemSharedMemoryRegister = _offloaded((ctx, req) -> _handle_shm_register(ctx.payload.shm, req)),
+        SystemSharedMemoryUnregister = _offloaded((ctx, req) -> _handle_shm_unregister(ctx.payload.shm, req.name)),
+        IsSameIPCNamespace = _offloaded((ctx, req) -> _handle_is_same_ipc_namespace(req.name))
+    )
+    # ModelInfer takes and returns raw bytes so its protobuf decode and encode are offloaded too. The
+    # deadline is read here, on entry, as gRPCServer computes it.
+    inference.register_GRPCInferenceService_ModelInfer!(
+        server,
+        (ctx, body) -> begin
+            deadline_ns = deadline_to_time_ns(ctx.deadline, gRPCServer.remaining_time(ctx))
+            off_interactive(() -> _handle_infer_raw(ctx.payload, body, deadline_ns))
+        end;
+        raw_request = true, raw_response = true
     )
     register_control_service!(server)
     return server

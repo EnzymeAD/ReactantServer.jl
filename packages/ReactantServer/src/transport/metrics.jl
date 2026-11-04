@@ -574,12 +574,14 @@ function start_worker_metrics(
     handler = function (req)
         target = req.target
         if target == "/metrics" || startswith(target, "/metrics?")
-            io = IOBuffer()
-            Prometheus.expose(io, m.registry)
-            return HTTP.Response(
-                200, ["Content-Type" => PROMETHEUS_EXPOSITION_CONTENT_TYPE];
-                body = inject_metric_labels(String(take!(io)), labels)
-            )
+            # HTTP.jl runs this handler on the interactive thread; a scrape walks every model under
+            # the scheduler lock and formats the whole exposition, so do that on the default pool.
+            body = off_interactive() do
+                io = IOBuffer()
+                Prometheus.expose(io, m.registry)
+                inject_metric_labels(String(take!(io)), labels)
+            end
+            return HTTP.Response(200, ["Content-Type" => PROMETHEUS_EXPOSITION_CONTENT_TYPE]; body = body)
         elseif target == "/healthz"
             return HTTP.Response(200; body = "ok")
         elseif target == "/readyz"
