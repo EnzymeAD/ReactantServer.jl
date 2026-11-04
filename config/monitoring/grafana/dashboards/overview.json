@@ -663,7 +663,7 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
+        "w": 3,
         "x": 0,
         "y": 4
       },
@@ -728,8 +728,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 4,
+        "w": 3,
+        "x": 3,
         "y": 4
       },
       "id": 10,
@@ -794,8 +794,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 8,
+        "w": 3,
+        "x": 6,
         "y": 4
       },
       "id": 11,
@@ -860,8 +860,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 12,
+        "w": 3,
+        "x": 9,
         "y": 4
       },
       "id": 12,
@@ -903,6 +903,151 @@
         "type": "prometheus",
         "uid": "${ds}"
       },
+      "description": "1 minus the largest free block over the free bytes. Memory and Weights shows each worker's arena.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {},
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.3
+              },
+              {
+                "color": "red",
+                "value": 0.6
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 12,
+        "y": 4
+      },
+      "id": 13,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "expr": "max(worker_device_memory_fragmentation{worker=~'$worker'})",
+          "format": "time_series",
+          "instant": false,
+          "legendFormat": "",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Fragmentation, worst worker",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "description": "Over the range: evictions made although enough bytes were free, because no block held the new weights.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {},
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 15,
+        "y": 4
+      },
+      "id": 14,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "expr": "sum(increase(worker_weight_evicts_total{worker=~'$worker',reason='contiguity'}[$__range]))",
+          "format": "time_series",
+          "instant": false,
+          "legendFormat": "",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Evictions for contiguity",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
       "description": "",
       "fieldConfig": {
         "defaults": {
@@ -926,11 +1071,11 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 16,
+        "w": 3,
+        "x": 18,
         "y": 4
       },
-      "id": 13,
+      "id": 15,
       "options": {
         "colorMode": "value",
         "graphMode": "none",
@@ -992,11 +1137,11 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 20,
+        "w": 3,
+        "x": 21,
         "y": 4
       },
-      "id": 14,
+      "id": 16,
       "options": {
         "colorMode": "value",
         "graphMode": "none",
@@ -1038,7 +1183,7 @@
         "x": 0,
         "y": 8
       },
-      "id": 15,
+      "id": 17,
       "panels": [],
       "title": "Traffic and latency",
       "type": "row"
@@ -1092,7 +1237,7 @@
         "x": 0,
         "y": 9
       },
-      "id": 16,
+      "id": 18,
       "options": {
         "legend": {
           "calcs": [
@@ -1177,7 +1322,7 @@
         "x": 12,
         "y": 9
       },
-      "id": 17,
+      "id": 19,
       "options": {
         "legend": {
           "calcs": [
@@ -1292,7 +1437,7 @@
         "x": 0,
         "y": 17
       },
-      "id": 18,
+      "id": 20,
       "options": {
         "legend": {
           "calcs": [
@@ -1383,7 +1528,7 @@
         "x": 12,
         "y": 17
       },
-      "id": 19,
+      "id": 21,
       "options": {
         "legend": {
           "calcs": [
@@ -1427,7 +1572,7 @@
         "x": 0,
         "y": 25
       },
-      "id": 20,
+      "id": 22,
       "panels": [],
       "title": "Saturation",
       "type": "row"
@@ -1512,7 +1657,7 @@
         "x": 0,
         "y": 26
       },
-      "id": 21,
+      "id": 23,
       "options": {
         "legend": {
           "calcs": [
@@ -1608,7 +1753,7 @@
         "x": 8,
         "y": 26
       },
-      "id": 22,
+      "id": 24,
       "options": {
         "legend": {
           "calcs": [
@@ -1692,7 +1837,7 @@
         "x": 16,
         "y": 26
       },
-      "id": 23,
+      "id": 25,
       "options": {
         "legend": {
           "calcs": [
@@ -1781,7 +1926,7 @@
         "x": 0,
         "y": 34
       },
-      "id": 24,
+      "id": 26,
       "options": {
         "legend": {
           "calcs": [
@@ -1865,7 +2010,7 @@
         "x": 12,
         "y": 34
       },
-      "id": 25,
+      "id": 27,
       "options": {
         "legend": {
           "calcs": [
@@ -1921,7 +2066,7 @@
         "x": 0,
         "y": 42
       },
-      "id": 26,
+      "id": 28,
       "panels": [],
       "title": "Readiness",
       "type": "row"
@@ -1980,7 +2125,7 @@
         "x": 0,
         "y": 43
       },
-      "id": 27,
+      "id": 29,
       "options": {
         "alignValue": "left",
         "legend": {
@@ -2067,7 +2212,7 @@
         "x": 12,
         "y": 43
       },
-      "id": 28,
+      "id": 30,
       "options": {
         "alignValue": "left",
         "legend": {

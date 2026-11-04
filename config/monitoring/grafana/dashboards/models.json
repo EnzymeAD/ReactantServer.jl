@@ -2060,11 +2060,11 @@
         "type": "prometheus",
         "uid": "${ds}"
       },
-      "description": "",
+      "description": "Green is fuller batches, red is emptier.",
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "continuous-GrYlRd"
+            "mode": "continuous-RdYlGr"
           },
           "custom": {},
           "links": [
