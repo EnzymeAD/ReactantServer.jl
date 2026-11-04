@@ -1286,6 +1286,15 @@ end
         @test occursin("gateway_placement_weight", body)
         @test occursin("gateway_model_utilization", body)
         @test occursin("gateway_model_replicas", body)
+        # Repack moves and the planned weight load per worker, next to its budget.
+        @test occursin("# TYPE gateway_repack_moved_models_total counter", body)
+        @test occursin("# TYPE gateway_repack_moved_bytes_total counter", body)
+        @test occursin("gateway_worker_assigned_weight_bytes{worker=", body)
+        @test occursin("gateway_worker_weight_budget_bytes{worker=", body)
+        # The health probe's round trip, per worker (the earliest sign of a stalled worker), and the
+        # gateway process's own runtime series, unlabelled so they do not mix with the workers'.
+        @test occursin("gateway_worker_probe_seconds_count{worker=", body)
+        @test occursin(r"\njulia_gc_seconds_total \S+\n", body)
         # ...and so is the per-worker load fill_least compares, labelled with the basis in force, so a
         # routing decision can be explained after the fact rather than guessed at.
         @test occursin("# TYPE gateway_worker_inflight_work gauge", body)

@@ -242,7 +242,14 @@ region in `/dev/shm` with shared host weights). So of two equally used models, t
 host RAM is evicted first, and a fallback compaction prefers to reload the ones that would otherwise need a
 file read. The worker exports the two halves of its load time as
 `worker_weight_upload_seconds_total` and `worker_weight_read_seconds_total`, with
-`worker_weight_read_bytes_total`. Choosing a set rather than evicting one model at a time means one large
+`worker_weight_read_bytes_total`. `worker_weight_evicts_total` carries a `reason`: `bytes` for a
+byte deficit, `contiguity` when enough bytes were free but no block could hold the weights
+(fragmentation costing a load), and `scratch` for keeping the execution scratch block free after an
+upload; per model, `worker_model_loads_total`, `worker_model_reads_total` and
+`worker_model_evicts_total` show which models churn. Reads ahead of the dispatch are counted by
+`worker_weight_stages_total`, `worker_weight_stage_seconds_total` and
+`worker_weight_stage_failures_total`, and `worker_weight_staging_models{state}` shows the ones in
+progress. Choosing a set rather than evicting one model at a time means one large
 idle model is evicted in place of two smaller busy ones. Models with requests already queued
 are evicted only when nothing else frees enough. The search is allocation-free and bounded:
 measured at 64 resident models it takes about 6 to 22 microseconds.

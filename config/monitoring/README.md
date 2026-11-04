@@ -1,7 +1,7 @@
 # ReactantServer monitoring stack (Grafana + Prometheus)
 
 A self-contained Grafana + Prometheus stack that scrapes a running ReactantServer node and ships a
-seven-dashboard suite. It runs as its own compose project with an independent lifecycle (restart the
+six-dashboard suite. It runs as its own compose project with an independent lifecycle (restart the
 server without touching Grafana, and vice versa). Prometheus scrapes the metrics port the node
 container publishes on the host, so the two stacks need no shared network.
 
@@ -21,8 +21,8 @@ Prometheus reaches the node's published port at `host.docker.internal:8002`, map
 gateway by `extra_hosts` in the compose file (Docker 20.10+). If the node listens on a **different
 host**, edit the target in `prometheus.yml` to that host's `address:8002` instead.
 
-- **Grafana**: `http://<host>:3000` — anonymous viewing is on; log in `admin` / `admin` to edit
-  (override with `GRAFANA_ADMIN_PASSWORD`). Lands on Fleet Overview.
+- **Grafana**: `http://<host>:3000`: anonymous viewing is on; log in `admin` / `admin` to edit
+  (override with `GRAFANA_ADMIN_PASSWORD`). Lands on Overview.
 - **Prometheus**: `http://<host>:9090` — check `Status -> Targets` shows the `reactantserver` job UP.
 
 Environment overrides: `GRAFANA_ADMIN_PASSWORD`.
@@ -35,77 +35,67 @@ self-tags its series with `worker` and `gpu` labels, so a single scrape of the n
 covers the whole fleet (`prometheus.yml`). No model names are configured anywhere, dashboards
 discover models dynamically via Grafana template variables (`$worker`, `$model`).
 
+
 ## Dashboards
 
-1. **Fleet Overview** — RED top-line: request rate, error rate, in-flight/shed, latency
-   percentiles, worker-readiness state timeline, per-worker device-memory saturation, and the
-   per-worker routing load. "Is it OK right now."
-2. **Latency & Throughput** — request-latency **heatmap** (the full distribution, not just p99),
-   percentile lines, throughput by gRPC status, **coalescing factor** (rows per dispatch = effective
-   batch size) by worker, queue-wait by worker, top-N models by request rate.
-3. **Device Memory Anatomy** — per-worker stacked **Live occupancy** (resident weights + transient + free
-   = pool limit) and **Budget plan** (pinned + on-demand budget + scratch reserve + wiggle), peak
-   vs limit, weight-cache load/evict churn, out-of-pool driver memory, on-demand budget utilization, resident model count.
-4. **Scheduling & Placement** — lpt_packing: models placed per worker, in-flight load balance,
-   gateway-to-worker call p99, top models by utilization, the model->worker placement table, and
-   worker metrics-scrape health. `gateway_replica_routed_total` (cumulative requests routed per
-   replica) is the series to watch when a replicated model looks like it is only using one GPU;
-   `gateway_model_fill_quantum` and `gateway_repacks_total{trigger}` explain why. Note the units
-   differ on purpose: `gateway_replica_outstanding` counts in-flight ITEMS (summed batch sizes) so it
-   is comparable to the quantum, while `gateway_replica_routed_total` counts routing decisions.
-   `gateway_worker_inflight_work` is the third unit and the one that decides routing: the per-worker
-   load `fill_least` (or the `least_outstanding` mode) compares, denominated by `scheduling.work_basis`
-   and labelled with it, so the dashboard states which basis is in force rather than trusting the
-   config file, which a runtime `set-policy` can have superseded. The spread panel (`max - min`) is
-   what `fill_least` exists to shrink; read a persistently high spread next to the placement table,
-   since it usually means the replicas cannot absorb the imbalance rather than that the policy is
-   failing.
-5. **Per-Model Drilldown** (`$model`) — one model's rate/errors, handler-latency heatmap, queue
-   depth & wait, its coalescing, residency-by-worker timeline, and placement.
-6. **Coalescing & Batching** — every model's **coalescing factor** (requests merged per dispatch =
-   effective batch size) vs its compiled **max batch**, with a **fill** column (factor / max),
-   rank-ordered lowest-fill first. Surfaces models receiving traffic but not batching well, i.e.
-   where raising the batch window or arrival concurrency could help. Covers meta sub-models too.
-7. **GPU Work Balance** — is the fleet's work actually spread across the devices? Built entirely on
-   `rate(worker_compute_seconds_total)` per worker, which is device-seconds per wall-second and so
-   reads directly as a utilization between 0 and 1. The headline is **work spread**, the coefficient
-   of variation of that rate across devices: 0% means every device is doing the same amount of work,
-   green under 10%, red over 25%. It is scale free (comparable across load levels) and stays finite
-   when a device idles, which busiest/idlest does not. Alongside it: each device's **share of fleet
-   work** as a bar gauge (even is 1/N), per-device utilization over time against the fleet mean, the
-   spread as a time series (a spike during a burst is normal, a flat elevated line is a standing
-   imbalance that costs headroom as utilization climbs), **planned vs actual share** (the packer's
-   intent from `gateway_placement_weight * gateway_model_utilization` against what the devices really
-   did, which separates "the plan is skewed" from "routing is not following the plan"), and two
-   tables: per-device totals with deviation from even, and the top model-on-device pairs so an
-   imbalance can be attributed to a model.
+The dashboards are generated by `grafana/build.jl` (Julia standard library only). Edit it, not the
+JSON, then regenerate and check every query against a running Prometheus:
 
-   Deliberately carries no `$worker` variable: filtering out a device would distort every share on
-   the page. Note the utilization measures time inside `run_model` only, excluding queue wait and
-   host-side pre/postprocess, so it answers "what did the device do", not "what did the request cost".
-   Calibration from a real 4x T4 node: a routing policy leaving one device with 1.9x another's work
-   read 26% spread, and switching to even rotation read 2%.
+```bash
+julia config/monitoring/grafana/build.jl                                 # rewrite grafana/dashboards/*.json
+julia config/monitoring/grafana/build.jl --check http://<prometheus>:9090 # run every query
+```
+
+`--check` fails only on queries that do not parse or evaluate. Queries that return nothing are
+listed too and are often expected: no failures, no evictions, a node without a host weight budget,
+or a single worker (whose `:8002` is the worker itself, with no `gateway_*` series).
+
+Every dashboard picks its Prometheus with the **Prometheus** variable, opens with a strip of
+headline numbers, then groups panels in rows that each answer one question. Top N panels rank over
+the whole time range, so their series stay put while you scroll, and `Top N` sets N. Numbers "over
+the range" cover exactly the window on screen. Events (loads, evictions, repacks) are drawn per
+minute. Repacks and worker restarts are marked on every graph. Clicking a model anywhere opens
+Model Detail for it.
+
+| Dashboard | uid | Answers |
+| --- | --- | --- |
+| Overview | `rs-overview` | Is the node healthy and keeping up? Readiness, traffic, latency, device busy, health probe round trip, churn at a glance |
+| Models and Batching | `rs-models` | Which models use the devices, how fast they answer, how well they batch; the per-model table over the range |
+| Model Detail | `rs-model` | One model: demand, latency, batching, where it is placed, how often it is loaded and evicted |
+| Memory and Weights | `rs-memory` | Device memory per worker, fragmentation, evictions by reason, compactions, load time and bandwidth, file reads, the host weight cache, reading ahead of the dispatch, churn by model |
+| Placement and Routing | `rs-placement` | lpt_packing: planned weights against each worker's budget, what repacks move, planned against actual share of work, the placement table, gateway to worker latency |
+| Resources | `rs-resources` | Process CPU and memory, Julia GC, I/O, for every worker and the gateway; scrape health; what the stack cannot see |
+
+Two series are the first to read when something goes wrong:
+
+- `gateway_worker_probe_seconds` (Overview) is the ServerReady round trip per worker. A worker
+  whose request handling stalls shows here before requests start failing; 5 s is the probe's
+  deadline.
+- `worker_weight_evicts_total{reason}` (Memory and Weights) says why weights left the device.
+  `contiguity` means enough bytes were free but no block could hold the next model:
+  fragmentation is costing loads. The Arena panel, repeated per worker, shows the same thing as
+  memory: orange is free memory no large allocation can use, and the red line is the scratch
+  reserve admission keeps free.
 
 ## A label note (important when extending)
 
 Everything is keyed by a single `worker` label (`worker0..N`); each worker owns exactly one device,
-so there is no separate `gpu` label in the dashboards. `worker_*` series self-tag `worker` (and still
-carry a `gpu` index, unused here). The gateway's own `gateway_worker_*` / `gateway_placement_weight`
-/ `gateway_replica_outstanding` / `gateway_worker_metrics_up` series **also** carry `worker="worker0..N"`
-now: the supervisor threads each worker's name to the embedded gateway (`REACTANT_GATEWAY_WORKER_NAMES`),
-which maps its endpoint urls to those names. So gateway-side and worker-side panels share one label
-space and join directly (no host:port, no index mapping). A **standalone** gateway given bare
-`endpoints:` and no names falls back to labelling by url.
+so the dashboards do not use the `gpu` label that `worker_*` series also carry. The gateway's own
+`gateway_worker_*`, `gateway_placement_weight` and `gateway_replica_*` series carry the same
+`worker="worker0..N"` values (the supervisor passes each worker's name to the embedded gateway), so
+gateway and worker series join directly. A standalone gateway given bare `endpoints:` and no names
+labels by url instead. The gateway's own process and GC series (`process_*`, `julia_gc_*`) carry no
+`worker` label at all, which is how the Resources dashboard tells them apart.
 
-Terminology: the hardware is called "device" (GPU/TPU-agnostic) in titles; the identity is the
-`worker`. So e.g. "device s/s" is device-seconds per second for a `worker`.
+Terminology: the hardware is a "device" (GPU or otherwise) in titles; the identity is the `worker`.
 
 ## Files
 
 ```
-docker-compose.monitoring.yml      prometheus + grafana, joins external network ${REACTANTSERVER_NETWORK}
-prometheus.yml                     single scrape job -> reactantserver:8002 (15s, 15d retention)
+docker-compose.monitoring.yml      prometheus + grafana
+prometheus.yml                     one scrape job of the node's :8002 (15s)
+grafana/build.jl                   generates the dashboards
+grafana/dashboards/*.json          the generated dashboards (datasource chosen by variable)
 grafana/provisioning/datasources/  Prometheus datasource (uid: prometheus)
 grafana/provisioning/dashboards/   file provider -> /var/lib/grafana/dashboards
-grafana/dashboards/*.json          the seven dashboards (datasource referenced by uid)
 ```

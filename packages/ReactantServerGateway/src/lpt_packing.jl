@@ -695,6 +695,10 @@ function _repack!(
 
     if metrics !== nothing
         inc_repacks!(metrics, trigger)
+        inc_repack_moves!(metrics, moved, moved_bytes)
+        for (w, bytes) in assigned_mem
+            set_worker_weights!(metrics, w, bytes, get(poll.mem_cap, w, 0.0))
+        end
         live = Set{Tuple{String, String}}()
         live_models = Set{String}()
         for (m, placement) in next

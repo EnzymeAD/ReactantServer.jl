@@ -274,8 +274,21 @@ time taken is recorded on the result so the load's full cost still reaches the e
 """
 function stage_host_weights(cache::WeightCache, entry::ModelEntry)
     t0 = time()
-    staged = _stage_host_weights(cache, entry)
+    staged = try
+        _stage_host_weights(cache, entry)
+    catch
+        lock(cache.lock) do
+            cache.stages += 1
+            cache.stage_failures += 1
+            cache.stage_seconds += time() - t0
+        end
+        rethrow()
+    end
     staged.host_seconds = time() - t0
+    lock(cache.lock) do
+        cache.stages += 1
+        cache.stage_seconds += staged.host_seconds
+    end
     return staged
 end
 

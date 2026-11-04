@@ -246,6 +246,9 @@ end
     @test b.refusals == 0                                        # decided from statistics, never by trying
     @test !_resident(sched, "A") && !_resident(sched, "B")       # the two least recently used, adjacent
     @test _resident(sched, "C") && _resident(sched, "D")
+    # A byte deficit took one model; contiguity alone took the second. Both are counted per model.
+    @test sched.weight_cache.evicts_by_reason == Dict(:bytes => 1, :contiguity => 1, :scratch => 0)
+    @test sched.weight_cache.footprints["A"].evicts == 1 && sched.weight_cache.footprints["B"].evicts == 1
     for m in ("C", "D", "E")
         @test _frag_run(sched, m)[1].data == reshape(Float32[1, 2], 2, 1)
     end
@@ -265,6 +268,7 @@ end
     # LRU would now evict "hot" (touched before B); the cost-aware policy evicts B.
     _frag_load!(sched, "C")
     @test _resident(sched, "hot") && _resident(sched, "C") && !_resident(sched, "B")
+    @test sched.weight_cache.evicts_by_reason[:bytes] == 1    # the budget is a byte deficit
 end
 
 @testset "admission: a model with queued requests is evicted only as a last resort" begin

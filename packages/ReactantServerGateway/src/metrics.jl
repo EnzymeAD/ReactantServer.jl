@@ -27,6 +27,11 @@ struct GatewayMetrics
     model_fill_quantum::Prometheus.Family{Prometheus.Gauge}
     repacks_total::Prometheus.Family{Prometheus.Counter}
     worker_metrics_up::Prometheus.Family{Prometheus.Gauge}
+    probe_latency::Prometheus.Family{Prometheus.Histogram}
+    repack_moved_models::Prometheus.Counter
+    repack_moved_bytes::Prometheus.Counter
+    assigned_weight_bytes::Prometheus.Family{Prometheus.Gauge}
+    weight_budget_bytes::Prometheus.Family{Prometheus.Gauge}
     # Maps a worker endpoint url (gRPC or metrics) to its friendly name (worker0..N), so every
     # worker-labelled gateway series matches the workers' own self-tagged `worker` label instead of
     # showing a host:port. Empty for a standalone gateway given no names: labels fall back to the url.
@@ -93,11 +98,38 @@ function GatewayMetrics(worker_names::Dict{String, String} = Dict{String, String
         "1 if the worker's metrics endpoint answered the most recent aggregated scrape, else 0.",
         (:worker,); registry = reg
     )
+    probe_latency = Prometheus.Family{Prometheus.Histogram}(
+        "gateway_worker_probe_seconds",
+        "Round trip of the ServerReady health probe (a probe that times out counts its full wait). " *
+            "A worker whose request handling is stalled shows here first.",
+        (:worker,); buckets = _LE_BUCKETS, registry = reg
+    )
+    repack_moved_models = Prometheus.Counter(
+        "gateway_repack_moved_models_total",
+        "Models whose set of workers a repack changed (a model's first placement is not a move).";
+        registry = reg
+    )
+    repack_moved_bytes = Prometheus.Counter(
+        "gateway_repack_moved_bytes_total",
+        "Weight bytes repacks placed on workers that did not hold the model before: what they cost in loads.";
+        registry = reg
+    )
+    assigned_weight_bytes = Prometheus.Family{Prometheus.Gauge}(
+        "gateway_worker_assigned_weight_bytes",
+        "Weight bytes of the models the last repack placed on the worker.",
+        (:worker,); registry = reg
+    )
+    weight_budget_bytes = Prometheus.Family{Prometheus.Gauge}(
+        "gateway_worker_weight_budget_bytes",
+        "The worker's on-demand weight budget as the last repack saw it (0 = unconstrained).",
+        (:worker,); registry = reg
+    )
     return GatewayMetrics(
         reg, requests_total, request_latency, worker_latency,
         routing_table_size, worker_ready, placement_weight, model_utilization,
         model_replicas, replica_outstanding, model_fill_quantum, repacks_total,
-        worker_metrics_up, worker_names
+        worker_metrics_up, probe_latency, repack_moved_models, repack_moved_bytes,
+        assigned_weight_bytes, weight_budget_bytes, worker_names
     )
 end
 
@@ -135,6 +167,34 @@ set_model_fill_quantum!(m::GatewayMetrics, model, q) =
 
 inc_repacks!(m::GatewayMetrics, trigger) =
     Prometheus.inc(Prometheus.labels(m.repacks_total, (String(trigger),)))
+
+observe_probe!(m::GatewayMetrics, worker, secs) =
+    Prometheus.observe(Prometheus.labels(m.probe_latency, (_wname(m, worker),)), Float64(secs))
+
+function inc_repack_moves!(m::GatewayMetrics, models, bytes)
+    Prometheus.inc(m.repack_moved_models, Float64(models))
+    Prometheus.inc(m.repack_moved_bytes, Float64(bytes))
+    return nothing
+end
+
+function set_worker_weights!(m::GatewayMetrics, worker, assigned, budget)
+    Prometheus.set(Prometheus.labels(m.assigned_weight_bytes, (_wname(m, worker),)), Float64(assigned))
+    Prometheus.set(Prometheus.labels(m.weight_budget_bytes, (_wname(m, worker),)), Float64(budget))
+    return nothing
+end
+
+# The gateway process's own runtime metrics (julia_gc_*, process_*), unlabelled: worker series
+# carry a `worker` label, so `{worker=""}` selects the gateway's. Called once, for the serving
+# gateway's registry. Guarded so a platform without /proc cannot break startup.
+function register_process_metrics!(m::GatewayMetrics)
+    try
+        Prometheus.GCCollector(; registry = m.registry)
+        Prometheus.ProcessCollector(; registry = m.registry)
+    catch err
+        @warn "gateway metrics: GC/Process collectors unavailable" exception = err
+    end
+    return nothing
+end
 
 # Reads the gRPC server's live admission counters at scrape time: in-flight RPCs, the cumulative
 # count shed at the inbound concurrency cap, and the configured cap (0 = uncapped). Holds only
