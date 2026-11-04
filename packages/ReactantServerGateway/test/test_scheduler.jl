@@ -66,6 +66,11 @@ function _poll(cum::Dict; batch_at::Dict = Dict(), max_batch::Dict = Dict(), wor
         mem_cap = Dict{String, Float64}(w => 0.0 for w in workers),
         max_batch = mb, batch_at = ba, polled = collect(workers),
         fleet_compute = sum(Float64(c) for (c, _, _) in values(cum); init = 0.0),
+        # The fixture's compute all runs on its first worker.
+        worker_compute = Dict{String, Float64}(
+            w => (i == 1 ? sum(Float64(c) for (c, _, _) in values(cum); init = 0.0) : 0.0)
+                for (i, w) in enumerate(workers)
+        ),
     )
 end
 

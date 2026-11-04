@@ -138,8 +138,9 @@ end
 
 # Poll every ready worker's ModelControlStatus concurrently and aggregate: per-model cumulative
 # (compute, requests, rows) summed across workers, the per-model weight footprint, effective max
-# batch and batch axis, each worker's weight-memory budget, the workers that answered, and the
-# fleet's total cumulative compute (the compute-trigger signal). I/O only; no state mutation, so
+# batch and batch axis, each worker's weight-memory budget, the workers that answered, the fleet's
+# total cumulative compute, and each worker's own (the compute-trigger signal, counted per worker so a
+# worker missing from one poll cannot skew it). I/O only; no state mutation, so
 # both this cache and lpt_packing's repack can be driven from one call.
 function poll_workers(pool::ClientPool, ready_urls::Vector{String})
     sums = Dict{String, Tuple{Float64, UInt64, UInt64}}()   # model -> (compute, requests, rows)
@@ -149,6 +150,7 @@ function poll_workers(pool::ClientPool, ready_urls::Vector{String})
     max_batch = Dict{String, Int}()               # model -> effective max batch (max across workers)
     batch_at = Dict{String, Tuple{String, Int}}()  # model -> (wire input name, 1-based batch axis)
     polled = String[]
+    worker_compute = Dict{String, Float64}()      # worker -> its cumulative compute (all models)
     lk = ReentrantLock()
     @sync for url in ready_urls
         wc = get_clients(pool, url)
@@ -168,6 +170,7 @@ function poll_workers(pool::ClientPool, ready_urls::Vector{String})
             end
             lock(lk) do
                 push!(polled, url)
+                worker_compute[url] = sum((ms.total_compute_seconds for ms in resp.models); init = 0.0)
                 mem_cap[url] = Float64(resp.weight_cache_max_bytes)
                 for ms in resp.models
                     tc, rq, rw = get(sums, ms.name, (0.0, UInt64(0), UInt64(0)))
@@ -190,7 +193,7 @@ function poll_workers(pool::ClientPool, ready_urls::Vector{String})
     for (tc, _, _) in values(sums)
         fleet_compute += tc
     end
-    return (; sums, permodel_workers, mem, mem_cap, max_batch, batch_at, polled, fleet_compute)
+    return (; sums, permodel_workers, mem, mem_cap, max_batch, batch_at, polled, fleet_compute, worker_compute)
 end
 
 """
