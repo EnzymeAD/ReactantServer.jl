@@ -72,7 +72,7 @@
       },
       "id": 1,
       "options": {
-        "content": "**What this dashboard cannot show.** *Device busy* is time the worker spent inside model executions, timed on the host; it is not SM occupancy, memory bandwidth or power, which need a GPU exporter such as DCGM. Host memory pressure, swap and `/dev/shm` use outside the host weight cache are not exported; nor is a stall of a worker's dispatch thread directly, though the health probe round trip (Overview) is the earliest sign of one. Series with no `worker` label are the gateway's own process.\n",
+        "content": "**What this dashboard cannot show.** *Device busy* is time the worker spent inside model executions, timed on the host; it is not SM occupancy, memory bandwidth or power, which need a GPU exporter such as DCGM. Host memory pressure, swap and `/dev/shm` use outside the host weight cache are not exported. A stall of the gateway's event loop or a worker's interactive thread (shared by request handling and dispatch) shows under Responsiveness. Series with no `worker` label are the gateway's own process.\n",
         "mode": "markdown"
       },
       "title": "What this dashboard cannot show",
@@ -1481,6 +1481,314 @@
       },
       "id": 20,
       "panels": [],
+      "title": "Responsiveness",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "description": "How often each responsiveness monitor woke. A free thread ticks 10 times a second; fewer means it was held by other work (a blocking call, code compiling on first use) and every request, probe and scrape on it waited. Gateway: its single event loop. Workers: the interactive thread request handling shares with the dispatch loop.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "mappings": [],
+          "max": 11,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 9
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 55
+      },
+      "id": 21,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "expr": "sum(rate(gateway_event_loop_lag_seconds_count{job=~'$job',worker=''}[$__rate_interval]))",
+          "format": "time_series",
+          "instant": false,
+          "legendFormat": "gateway",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "expr": "sum by (worker) (rate(worker_interactive_lag_seconds_count{worker=~'$worker'}[$__rate_interval]))",
+          "format": "time_series",
+          "instant": false,
+          "legendFormat": "{{worker}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Responsiveness monitor tick rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "description": "How late the monitor woke: the time its thread was held. About a millisecond when free.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 55
+      },
+      "id": 22,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(gateway_event_loop_lag_seconds_bucket{job=~'$job',worker=''}[$__rate_interval])))",
+          "format": "time_series",
+          "instant": false,
+          "legendFormat": "gateway",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (worker, le) (rate(worker_interactive_lag_seconds_bucket{worker=~'$worker'}[$__rate_interval])))",
+          "format": "time_series",
+          "instant": false,
+          "legendFormat": "{{worker}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Monitor lateness, p99",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "description": "Each is also logged with how long the thread was blocked.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "gradientMode": "opacity",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 55
+      },
+      "id": 23,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "expr": "(sum(rate(gateway_event_loop_stalls_total{job=~'$job',worker=''}[$__rate_interval]))) * 60",
+          "format": "time_series",
+          "instant": false,
+          "legendFormat": "gateway",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "expr": "(sum by (worker) (rate(worker_interactive_stalls_total{worker=~'$worker'}[$__rate_interval]))) * 60",
+          "format": "time_series",
+          "instant": false,
+          "legendFormat": "{{worker}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Stalls over 1 s per minute",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 63
+      },
+      "id": 24,
+      "panels": [],
       "title": "Monitoring",
       "type": "row"
     },
@@ -1536,9 +1844,9 @@
         "h": 6,
         "w": 8,
         "x": 0,
-        "y": 55
+        "y": 64
       },
-      "id": 21,
+      "id": 25,
       "options": {
         "alignValue": "left",
         "legend": {
@@ -1623,9 +1931,9 @@
         "h": 6,
         "w": 8,
         "x": 8,
-        "y": 55
+        "y": 64
       },
-      "id": 22,
+      "id": 26,
       "options": {
         "alignValue": "left",
         "legend": {
@@ -1705,9 +2013,9 @@
         "h": 6,
         "w": 8,
         "x": 16,
-        "y": 55
+        "y": 64
       },
-      "id": 23,
+      "id": 27,
       "options": {
         "legend": {
           "calcs": [],

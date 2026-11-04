@@ -22,6 +22,7 @@ struct RunningServer
     port::Int
     watcher::Union{BundleWatcher, Nothing}
     metrics_server::Any        # HTTP metrics listener, or nothing when metrics_port == 0
+    monitor::InteractiveMonitor
 end
 
 # ── Heartbeat registration ──────────────────────────────────────────────────────────────────────
@@ -106,6 +107,7 @@ dispatch loop, and tears down any registered shared-memory regions. Returns `not
 """
 function stop!(s::RunningServer)
     s.watcher === nothing || stop_watching!(s.watcher)
+    stop_interactive_monitor!(s.monitor)
     s.metrics_server === nothing || close(s.metrics_server)
     close(s.server)
     shutdown!(s.scheduler)
@@ -428,6 +430,8 @@ function serve(
         sched, backend, pool, cfg; worker_name = worker_name,
         inflight = inflight, shed = shed
     )
+    # Measure the interactive thread from here on: it is the one request handling shares with dispatch.
+    monitor = start_interactive_monitor!(InteractiveMonitor(metrics.registry))
     server.context = InferContext(sched, registry, shm, pool.platform, metrics)   # swap before start!
     # Optional Prometheus metrics endpoint (opt-in via endpoints.metrics_port > 0). Request counting
     # is always on (the InferContext carries `metrics`); only the HTTP listener is gated.
@@ -444,11 +448,12 @@ function serve(
         try
             run(server)
         finally
+            stop_interactive_monitor!(monitor)
             _beat(:down, cfg)
         end
         return nothing
     end
     gRPCServer.start!(server)
     _beat(:up, cfg)
-    return RunningServer(cfg, registry, sched, pool, shm, server, cfg.endpoints.port, watcher, metrics_server)
+    return RunningServer(cfg, registry, sched, pool, shm, server, cfg.endpoints.port, watcher, metrics_server, monitor)
 end

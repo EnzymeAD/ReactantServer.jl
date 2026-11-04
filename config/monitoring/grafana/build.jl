@@ -349,6 +349,19 @@ end
 # Device busy: device-seconds of execution per second of wall time, per worker. Timed on the host
 # around each execution, so it is "the device had work", not SM occupancy.
 const BUSY = "sum by (worker) (rate(worker_compute_seconds_total{%W}%ri))"
+
+# The responsiveness monitors: the gateway's event loop (unlabelled, so worker='') and each worker's
+# interactive thread wake every 100 ms, so a free thread ticks 10 times a second and fewer ticks mean
+# it was held by other work.
+const GW_SELF = "%job,worker=''"
+const TICKS_GW = "sum(rate(gateway_event_loop_lag_seconds_count{$GW_SELF}%ri))"
+const TICKS_WORKER = "sum by (worker) (rate(worker_interactive_lag_seconds_count{%W}%ri))"
+const TICKS_HELP = "How often each responsiveness monitor woke. A free thread ticks 10 times a second; fewer means it was held by other work (a blocking call, code compiling on first use) and every request, probe and scrape on it waited. Gateway: its single event loop. Workers: the interactive thread request handling shares with the dispatch loop."
+tick_rate(; kw...) = ts(
+    "Responsiveness monitor tick rate", [q(TICKS_GW; legend = "gateway"), q(TICKS_WORKER; legend = "{{worker}}")];
+    min = 0, max = 11, thresholds = steps("red", (9, "green")), custom = D("thresholdsStyle" => D("mode" => "dashed")),
+    desc = TICKS_HELP, kw...
+)
 # Rank models over the range by a counter, and keep the top N.
 top(inner, counter, filt = "%W,%M") = "($inner) and on (model) topk(%n, sum by (model) (increase($counter{$filt}%rg @ end())))"
 per_min(x) = "($x) * 60"
@@ -475,11 +488,12 @@ function overview()
         ),
     )
 
-    row!(b, "Readiness")
+    row!(b, "Readiness and responsiveness")
     line!(
         b,
-        timeline("Worker ready", q("max by (worker) (gateway_worker_ready{%W})"; legend = "{{worker}}"); w = 12, h = 6),
-        timeline("Worker metrics answering", q("max by (worker) (gateway_worker_metrics_up{%W})"; legend = "{{worker}}"); w = 12, h = 6),
+        timeline("Worker ready", q("max by (worker) (gateway_worker_ready{%W})"; legend = "{{worker}}"); w = 8, h = 6),
+        timeline("Worker metrics answering", q("max by (worker) (gateway_worker_metrics_up{%W})"; legend = "{{worker}}"); w = 8, h = 6),
+        tick_rate(; w = 8, h = 6, legend = :list),
     )
     return b
 end
@@ -1070,7 +1084,7 @@ end
 # ---- Resources ------------------------------------------------------------------------------------
 
 const RESOURCES_HELP = """
-**What this dashboard cannot show.** *Device busy* is time the worker spent inside model executions, timed on the host; it is not SM occupancy, memory bandwidth or power, which need a GPU exporter such as DCGM. Host memory pressure, swap and `/dev/shm` use outside the host weight cache are not exported; nor is a stall of a worker's dispatch thread directly, though the health probe round trip (Overview) is the earliest sign of one. Series with no `worker` label are the gateway's own process.
+**What this dashboard cannot show.** *Device busy* is time the worker spent inside model executions, timed on the host; it is not SM occupancy, memory bandwidth or power, which need a GPU exporter such as DCGM. Host memory pressure, swap and `/dev/shm` use outside the host weight cache are not exported. A stall of the gateway's event loop or a worker's interactive thread (shared by request handling and dispatch) shows under Responsiveness. Series with no `worker` label are the gateway's own process.
 """
 
 function resources()
@@ -1175,6 +1189,25 @@ function resources()
                 q("sum by (worker) (rate(process_io_rchar_bytes_total{%W}%ri))"; legend = "{{worker}} read"),
                 q("sum by (worker) (rate(process_io_wchar_bytes_total{%W}%ri))"; legend = "{{worker}} write"),
             ]; unit = "Bps"
+        ),
+    )
+    row!(b, "Responsiveness")
+    line!(
+        b,
+        tick_rate(; w = 8),
+        ts(
+            "Monitor lateness, p99", [
+                q("histogram_quantile(0.99, sum by (le) (rate(gateway_event_loop_lag_seconds_bucket{$GW_SELF}%ri)))"; legend = "gateway"),
+                q("histogram_quantile(0.99, sum by (worker, le) (rate(worker_interactive_lag_seconds_bucket{%W}%ri)))"; legend = "{{worker}}"),
+            ]; unit = "s", w = 8,
+            desc = "How late the monitor woke: the time its thread was held. About a millisecond when free."
+        ),
+        ts(
+            "Stalls over 1 s per minute", [
+                q(per_min("sum(rate(gateway_event_loop_stalls_total{$GW_SELF}%ri))"); legend = "gateway"),
+                q(per_min("sum by (worker) (rate(worker_interactive_stalls_total{%W}%ri))"); legend = "{{worker}}"),
+            ]; bars = true, w = 8,
+            desc = "Each is also logged with how long the thread was blocked."
         ),
     )
     row!(b, "Monitoring")
