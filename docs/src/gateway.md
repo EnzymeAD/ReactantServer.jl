@@ -186,10 +186,15 @@ and moves as few models as it can, because each move is a weight load on the GPU
 read from disk) and fragments that GPU's memory, and batching depends on traffic staying where the
 queues are. A repack places what is new or lost its worker, then, with
 `forbid_memory_oversubscription`, moves models off any worker over its weight budget (the smallest
-model that clears the overflow first), and then repeatedly moves the one model off the
-highest-pressure worker that relieves it most per byte moved, stopping once no move would lower that
-worker's pressure by at least `hysteresis` (a fraction, default `0.05`). With a settled fleet a
-repack therefore moves nothing. A worker that misses the poll for less than 30 s (three probe rounds)
+model that clears the overflow first), and then repeatedly relieves the most loaded worker with the
+change that helps it most per byte loaded: moving one of its models to another worker, or swapping one
+of its models for a less loaded model of another worker. It stops once no change would lower that
+worker's load by at least `hysteresis` (a fraction, default `0.05`) of its load, or of half a GPU
+when it is less busy than that. With `forbid_memory_oversubscription` the load is compute alone and
+every change must keep both workers within their weight budgets. A worker near its budget serves as
+fast as an emptier one, so on a node whose weights fill every budget the repack still balances
+compute, and the swap is what makes that possible when no single model fits anywhere else. With a
+settled fleet a repack moves nothing. A worker that misses the poll for less than 30 s (three probe rounds)
 keeps its models: the repack waits rather than moving them onto the rest of the fleet and back. (`max_worker_share` is accepted but does not affect a model's GPU
 count.)
 

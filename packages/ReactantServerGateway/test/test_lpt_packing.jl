@@ -293,6 +293,45 @@ end
     @test _moved(Dict{String, GW.Placement}("hot" => [("w0", 1.0)], "cool" => [("w1", 1.0)]), tight) == String[]
 end
 
+@testset "rebalance_assignment: a fleet at its budget balances compute by swapping" begin
+    # netai02's case at test scale: every worker holds 90% of its budget, so no model can move, and
+    # under the max-norm every worker scored 0.9 whatever its compute. The busy worker swaps a busy
+    # model for a cold one of the same size.
+    W = ["w0", "w1"]
+    GB = 1.0e9
+    caps = Dict("w0" => 10GB, "w1" => 10GB)
+    mem = Dict(m => 3GB for m in ("hot", "warm", "x", "cool", "c1", "c2"))
+    prev = Dict{String, GW.Placement}(
+        "hot" => [("w0", 1.0)], "warm" => [("w0", 1.0)], "x" => [("w0", 1.0)],
+        "cool" => [("w1", 1.0)], "c1" => [("w1", 1.0)], "c2" => [("w1", 1.0)]
+    )
+    u = Dict("hot" => 0.6, "warm" => 0.3, "x" => 0.0, "cool" => 0.1, "c1" => 0.0, "c2" => 0.0)
+    asn = GW.rebalance_assignment(u, W, prev; mem = mem, mem_cap = caps, forbid_memory_oversubscription = true)
+    @test _moved(prev, asn) == ["c1", "warm"]           # one swap: 0.9 / 0.1 becomes 0.6 / 0.4
+    @test asn["warm"] == [("w1", 1.0)] && asn["c1"] == [("w0", 1.0)]
+    for w in W
+        @test sum((mem[m] for (m, pl) in asn for (ww, _) in pl if ww == w); init = 0.0) <= caps[w]
+    end
+    # The result is stable: the next repack changes nothing.
+    @test GW.rebalance_assignment(u, W, asn; mem = mem, mem_cap = caps, forbid_memory_oversubscription = true) == asn
+end
+
+@testset "rebalance_assignment: a swap keeps both workers within their budgets" begin
+    W = ["w0", "w1"]
+    GB = 1.0e9
+    caps = Dict("w0" => 10GB, "w1" => 10GB)
+    mem = Dict("hot" => 4GB, "warm" => 2GB, "big" => 8GB, "cool" => 1GB)
+    prev = Dict{String, GW.Placement}(
+        "hot" => [("w0", 1.0)], "warm" => [("w0", 1.0)], "big" => [("w1", 1.0)], "cool" => [("w1", 1.0)]
+    )
+    u = Dict("hot" => 0.6, "warm" => 0.3, "big" => 0.0, "cool" => 0.1)
+    # Moving warm overfills w1 (11 GB), and swapping it for the idle big model overfills w0 (12 GB),
+    # though that swap would balance best. Swapping it for cool fits both.
+    asn = GW.rebalance_assignment(u, W, prev; mem = mem, mem_cap = caps, forbid_memory_oversubscription = true)
+    @test _moved(prev, asn) == ["cool", "warm"]
+    @test asn["big"] == [("w1", 1.0)]
+end
+
 @testset "repack accounting: compute is counted per worker; a missing worker holds the repack" begin
     path = tempname() * ".yaml"
     write(path, "endpoints:\n  - \"127.0.0.1:7001\"\n")

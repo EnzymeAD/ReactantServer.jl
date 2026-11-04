@@ -194,6 +194,10 @@ function compute_assignment(
     return out
 end
 
+# The least load `rebalance_assignment` measures `min_gain` against (half a device): below it, a
+# repack moves weights only for a gain of at least `min_gain` of half a device.
+const _REBALANCE_LOAD_FLOOR = 0.5
+
 """
     rebalance_assignment(u, workers, prev; mem=Dict(), mem_cap=Dict(), replicas=Dict(),
                          default_replicas=1, min_gain=0.05,
@@ -211,12 +215,20 @@ this keeps `prev` and changes only what it must:
    first; a lowered replica count drops the extra replicas.
 2. With `forbid_memory_oversubscription`, shed models from any worker over its weight budget onto
    workers where they fit, preferring the smallest model that clears the overflow.
-3. Repeatedly make the single move off the highest-pressure worker that lowers its pressure the most
-   per byte moved, as long as the gain is at least `min_gain` of that pressure and the destination
-   ends below the source's old pressure. Pressure is the same max-norm as the packer's: the larger of
-   a worker's compute load and its weight memory over budget.
+3. Repeatedly relieve the most loaded worker with the single change that lowers its load the most
+   per byte loaded: moving one of its models to another worker, or swapping one of its models for a
+   less loaded model of another worker. A change is made only while its gain is at least `min_gain`
+   of the source's load (and of half a device, whichever is larger, so a lightly loaded fleet does not
+   trade loads for noise), and the other worker ends below the source's old load.
 
-With nothing to fix and no move worth `min_gain`, the result is `prev` (restricted to `u` and to the
+With `forbid_memory_oversubscription`, the load is compute alone and the weight budget a constraint
+every change must keep (a worker already over budget may not grow). A worker near its budget serves
+as fast as an emptier one, so counting memory as load would hide a compute imbalance whenever every
+worker is near its budget, which is how a node runs when its weights outgrow it; and with every
+worker full, a swap is the only change that fits. Without the guarantee, the load is the packer's
+max-norm pressure: the larger of a worker's compute load and its weight memory over budget.
+
+With nothing to fix and no change worth `min_gain`, the result is `prev` (restricted to `u` and to the
 present workers). Weights are even across a model's replicas, as in the packer.
 """
 function rebalance_assignment(
@@ -309,38 +321,77 @@ function rebalance_assignment(
         end
     end
 
-    # 3. Improve: move off the highest-pressure worker while it is worth a load.
+    # 3. Improve: relieve the most loaded worker while it is worth a load. With the budget enforced,
+    # memory is a constraint here and compute the objective: a worker holding 98% of its budget serves
+    # as fast as one holding half, so counting memory as load would hide a compute imbalance whenever
+    # every worker is near its budget, which is how a node is run when the weights outgrow it. Without
+    # the guarantee, the load is the packer's max-norm pressure, as before.
+    load(w, c = cload[w], b = mload[w]) = forbid_memory_oversubscription ? c : pressure(w, c, b)
+    # A worker's weights after a change are acceptable within budget, or when they do not grow.
+    holds(w, b) = !forbid_memory_oversubscription || (c = capof(w); c == Inf || b <= c || b <= mload[w])
+    # Swap two models' replicas between `src` and `dst`, keeping the loads current.
+    function swap!(m, src, m2, dst)
+        charge!(m, -1); charge!(m2, -1)
+        members[m][findfirst(==(src), members[m])] = dst
+        members[m2][findfirst(==(dst), members[m2])] = src
+        sort!(members[m]); sort!(members[m2])
+        charge!(m, 1); charge!(m2, 1)
+        return
+    end
+    names = sort!(collect(keys(members)))
     best_gain = 0.0
     for _ in 1:(4 * length(u) + 16)
-        src = argmax(w -> (pressure(w), w), workers)
-        psrc = pressure(src)
-        psrc <= 0 && break
+        src = argmax(w -> (load(w), w), workers)
+        lsrc = load(src)
+        lsrc <= 0 && break
+        # The bar a change must clear: `min_gain` of the source's load, but never less than `min_gain`
+        # of half a device, so a lightly loaded fleet does not trade weight loads for noise.
+        bar = min_gain * max(lsrc, _REBALANCE_LOAD_FLOOR)
         best = nothing
-        bestscore = 0.0
+        bestkey = nothing
         best_gain = 0.0
-        for (m, ws) in members
+        consider!(gain, bytes, loads, cand) = begin
+            gain > best_gain && (best_gain = gain)
+            (gain >= bar && gain > 1.0e-12) || return
+            # Most gain per byte loaded, then the fewest loads (a move before an equal swap).
+            key = (-gain / max(bytes, 1.0), loads, cand)
+            (bestkey === nothing || key < bestkey) && (best = cand; bestkey = key)
+            return
+        end
+        for m in names
+            ws = members[m]
             src in ws || continue
             s, b = share(m), memof(m)
             for t in workers
                 t in ws && continue
-                (forbid_memory_oversubscription && !fits(t, b)) && continue
-                after_src = pressure(src, cload[src] - s, mload[src] - b)
-                after_dst = pressure(t, cload[t] + s, mload[t] + b)
-                after_dst < psrc || continue
-                gain = psrc - max(after_src, after_dst)
-                gain > best_gain && (best_gain = gain)
-                gain >= min_gain * psrc && gain > 1.0e-12 || continue
-                score = gain / max(b, 1.0)
-                if best === nothing || score > bestscore
-                    best, bestscore = (m, t), score
+                # Move m to t.
+                after_dst = load(t, cload[t] + s, mload[t] + b)
+                if after_dst < lsrc && holds(t, mload[t] + b) &&
+                        (!forbid_memory_oversubscription || fits(t, b))
+                    consider!(lsrc - max(load(src, cload[src] - s, mload[src] - b), after_dst), b, 1, (m, t, ""))
+                end
+                # Swap m for a model m2 on t that carries less load: both workers keep a full set of
+                # weights, which is the only change possible when every worker is at its budget.
+                for m2 in names
+                    ws2 = members[m2]
+                    (m2 == m || !(t in ws2) || src in ws2) && continue
+                    s2, b2 = share(m2), memof(m2)
+                    d = s - s2
+                    d > 0 || continue
+                    bs, bt = mload[src] - b + b2, mload[t] - b2 + b
+                    (holds(src, bs) && holds(t, bt)) || continue
+                    after_t = load(t, cload[t] + d, bt)
+                    after_t < lsrc || continue
+                    consider!(lsrc - max(load(src, cload[src] - d, bs), after_t), b + b2, 2, (m, t, m2))
                 end
             end
         end
         if best === nothing
-            stats === nothing || (stats.max_improvement = max(stats.max_improvement, best_gain / psrc))
+            stats === nothing || (stats.max_improvement = max(stats.max_improvement, best_gain / lsrc))
             break
         end
-        move!(best[1], src, best[2])
+        m, t, m2 = best
+        isempty(m2) ? move!(m, src, t) : swap!(m, src, m2, t)
     end
 
     for (m, ws) in members
