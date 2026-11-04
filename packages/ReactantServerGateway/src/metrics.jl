@@ -5,8 +5,12 @@
 # (inc_requests!/observe_*/set_*) is unchanged, so the call sites in server.jl/health.jl are
 # untouched. Prometheus collectors are atomically thread-safe, so no external lock is needed.
 
-# ExponentialBuckets(0.001, 2, 14); Prometheus.jl appends the +Inf bucket.
-const _LE_BUCKETS = Float64[0.001 * 2.0^k for k in 0:13]
+# ExponentialBuckets(0.001, 2, 18): 1 ms doubling to 131.072 s; Prometheus.jl appends the +Inf
+# bucket. The range reaches past the longest deadlines clients use (60 s), so a request that takes
+# 10 s or 50 s lands in a bucket that says so instead of in +Inf, where a quantile can only report
+# the last finite bound. The worker's _WM_BUCKETS must match, so the two layers compare bucket for
+# bucket.
+const _LE_BUCKETS = Float64[0.001 * 2.0^k for k in 0:17]
 
 # The media type of the Prometheus text exposition format (version 0.0.4), from the Prometheus
 # exposition spec. Prometheus.jl used to export it as a constant and removed it in 1.6.0; it is
@@ -183,16 +187,50 @@ function set_worker_weights!(m::GatewayMetrics, worker, assigned, budget)
     return nothing
 end
 
-# The gateway process's own runtime metrics (julia_gc_*, process_*), unlabelled: worker series
+# Time the Julia compiler has spent in this process (JIT of methods on first use), from
+# `Base.cumulative_compile_time_ns`. Compilation runs on the thread that first calls a method, so a
+# burst of it on the thread that handles requests stalls every call in flight; these counters make
+# that visible next to julia_gc_*. Timing must be switched on first (`enable_compile_timing!`), and
+# compilation before that is not counted.
+struct CompileTimeCollector <: Prometheus.Collector end
+
+Prometheus.metric_names(::CompileTimeCollector) = ("julia_compile_seconds_total", "julia_recompile_seconds_total")
+
+function Prometheus.collect!(metrics::Vector, ::CompileTimeCollector)
+    compile_ns, recompile_ns = Base.cumulative_compile_time_ns()
+    push!(
+        metrics,
+        Prometheus.Metric(
+            "counter", "julia_compile_seconds_total",
+            "Time the Julia compiler has spent compiling code, since compile timing was enabled at startup.",
+            Prometheus.Sample(nothing, nothing, nothing, compile_ns / 1.0e9)
+        ),
+        Prometheus.Metric(
+            "counter", "julia_recompile_seconds_total",
+            "The part of julia_compile_seconds_total spent recompiling methods invalidated by later definitions.",
+            Prometheus.Sample(nothing, nothing, nothing, recompile_ns / 1.0e9)
+        ),
+    )
+    return metrics
+end
+
+# Switch on the runtime's cumulative compile timing for the life of the process. `@time` toggles the
+# same switch on and off around its expression; this leaves it on, so the counters above keep
+# accumulating. The cost is a clock read around each compilation.
+enable_compile_timing!() = (Base.cumulative_compile_timing(true); nothing)
+
+# The gateway process's own runtime metrics (julia_gc_*, julia_compile_*, process_*), unlabelled: worker series
 # carry a `worker` label, so `{worker=""}` selects the gateway's. Called once, for the serving
 # gateway's registry. Guarded so a platform without /proc cannot break startup.
 function register_process_metrics!(m::GatewayMetrics)
     try
         Prometheus.GCCollector(; registry = m.registry)
         Prometheus.ProcessCollector(; registry = m.registry)
+        Prometheus.register(m.registry, CompileTimeCollector())
     catch err
         @warn "gateway metrics: GC/Process collectors unavailable" exception = err
     end
+    enable_compile_timing!()
     return nothing
 end
 

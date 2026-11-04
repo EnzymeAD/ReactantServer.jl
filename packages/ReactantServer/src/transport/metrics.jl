@@ -16,8 +16,9 @@ import Prometheus
 # a protocol value, so state it here rather than reaching into the package.
 const PROMETHEUS_EXPOSITION_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 
-# Mirror the gateway's latency buckets: ExponentialBuckets(0.001, 2, 14).
-const _WM_BUCKETS = Float64[0.001 * 2.0^k for k in 0:13]
+# Mirror the gateway's latency buckets (its _LE_BUCKETS): ExponentialBuckets(0.001, 2, 18), 1 ms
+# to 131.072 s.
+const _WM_BUCKETS = Float64[0.001 * 2.0^k for k in 0:17]
 
 # --- Pull collector ---------------------------------------------------------------------------
 
@@ -62,6 +63,38 @@ Prometheus.metric_names(::WorkerSnapshotCollector) = (
 
 _scalar(name, type, help, v) =
     Prometheus.Metric(type, name, help, Prometheus.Sample(nothing, nothing, nothing, Float64(v)))
+
+# Time the Julia compiler has spent in this process (JIT of methods on first use), from
+# `Base.cumulative_compile_time_ns`. Compilation runs on the thread that first calls a method, so a
+# burst of it on the thread that handles requests stalls every call in flight; these counters make
+# that visible next to julia_gc_*. Timing must be switched on first (`enable_compile_timing!`), and
+# compilation before that is not counted.
+struct CompileTimeCollector <: Prometheus.Collector end
+
+Prometheus.metric_names(::CompileTimeCollector) = ("julia_compile_seconds_total", "julia_recompile_seconds_total")
+
+function Prometheus.collect!(metrics::Vector, ::CompileTimeCollector)
+    compile_ns, recompile_ns = Base.cumulative_compile_time_ns()
+    push!(
+        metrics,
+        Prometheus.Metric(
+            "counter", "julia_compile_seconds_total",
+            "Time the Julia compiler has spent compiling code, since compile timing was enabled at startup.",
+            Prometheus.Sample(nothing, nothing, nothing, compile_ns / 1.0e9)
+        ),
+        Prometheus.Metric(
+            "counter", "julia_recompile_seconds_total",
+            "The part of julia_compile_seconds_total spent recompiling methods invalidated by later definitions.",
+            Prometheus.Sample(nothing, nothing, nothing, recompile_ns / 1.0e9)
+        ),
+    )
+    return metrics
+end
+
+# Switch on the runtime's cumulative compile timing for the life of the process. `@time` toggles the
+# same switch on and off around its expression; this leaves it on, so the counters above keep
+# accumulating. The cost is a clock read around each compilation.
+enable_compile_timing!() = (Base.cumulative_compile_timing(true); nothing)
 
 # Reads the gRPC server's live admission counters at scrape time: in-flight RPCs, the cumulative
 # count shed at the concurrency cap, and the configured cap (0 = uncapped). Holds only references.
@@ -450,6 +483,7 @@ function WorkerMetrics(
     try
         Prometheus.GCCollector(; registry = reg)
         Prometheus.ProcessCollector(; registry = reg)
+        Prometheus.register(reg, CompileTimeCollector())
     catch err
         @warn "worker metrics: GC/Process collectors unavailable" exception = err
     end

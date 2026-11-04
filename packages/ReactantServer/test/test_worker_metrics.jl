@@ -113,6 +113,17 @@ end
     @test occursin("worker_request_latency_seconds", s)
 end
 
+@testset "worker metrics: latency buckets reach past a minute" begin
+    # A 50 s request lands in a finite bucket (and matches the gateway's buckets), not in +Inf.
+    sched, backend, pool, cfg = _wm_sched()
+    wm = WorkerMetrics(sched, backend, pool, cfg)
+    observe_request!(wm, "m", 50.0)
+    s = _expose(wm)
+    @test occursin("worker_request_latency_seconds_bucket{model=\"m\",le=\"32.768\"} 0", s)
+    @test occursin("worker_request_latency_seconds_bucket{model=\"m\",le=\"65.536\"} 1", s)
+    @test occursin("worker_request_latency_seconds_bucket{model=\"m\",le=\"131.072\"} 1", s)
+end
+
 @testset "worker metrics: unloading a model drops its snapshot series" begin
     sched, backend, pool, cfg = _wm_sched()
     wm = WorkerMetrics(sched, backend, pool, cfg)

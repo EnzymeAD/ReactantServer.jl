@@ -563,6 +563,18 @@ end
         end
     end
 
+    @testset "latency buckets reach past a minute" begin
+        # A 50 s request lands in a finite bucket (and matches the worker's buckets), not in +Inf.
+        metrics = ReactantServerGateway.GatewayMetrics()
+        ReactantServerGateway.observe_request!(metrics, "ModelInfer", "m", 50.0)
+        io = IOBuffer()
+        ReactantServerGateway.expose(io, metrics)
+        body = String(take!(io))
+        @test occursin("gateway_request_latency_seconds_bucket{rpc=\"ModelInfer\",model=\"m\",le=\"32.768\"} 0", body)
+        @test occursin("gateway_request_latency_seconds_bucket{rpc=\"ModelInfer\",model=\"m\",le=\"65.536\"} 1", body)
+        @test occursin("gateway_request_latency_seconds_bucket{rpc=\"ModelInfer\",model=\"m\",le=\"131.072\"} 1", body)
+    end
+
     @testset "metrics endpoints config" begin
         withenv(
             "REACTANT_GATEWAY_WORKERS" => "127.0.0.1:8080",

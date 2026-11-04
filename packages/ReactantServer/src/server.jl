@@ -385,6 +385,9 @@ function serve(
         worker_name::AbstractString = ""
     )
     _check_serve_guards(cfg)
+    # Count JIT time from here on (julia_compile_seconds_total), so model loading, the startup probe
+    # and each model's first requests all show up.
+    enable_compile_timing!()
     shm = SharedMemoryRegistry()   # client-facing SystemSharedMemory feature (decode/encode shm path)
     pool, registry, sched, watcher = _bring_up(cfg, backend)
     # Local reuse pool for meta-model intermediates: plain Memory, never shared. With one meta at a time
