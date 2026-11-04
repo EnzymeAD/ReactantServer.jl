@@ -134,17 +134,23 @@ function _check_once(p::HealthProber)
     workers = all_clients(p.pool)
     results = Vector{Bool}(undef, length(workers))
     timeouts = Vector{Bool}(undef, length(workers))
+    elapsed = Vector{Float64}(undef, length(workers))
     @sync for (i, wc) in enumerate(workers)
-        @async results[i], timeouts[i] =
-            _bounded(
-            () -> probe_ready(wc), PROBE_TIMEOUT_SECONDS, false,
-            "ServerReady probe", wc.url
-        )
+        @async begin
+            t0 = time()
+            results[i], timeouts[i] =
+                _bounded(
+                () -> probe_ready(wc), PROBE_TIMEOUT_SECONDS, false,
+                "ServerReady probe", wc.url
+            )
+            elapsed[i] = time() - t0
+        end
     end
     any_ready = false
     any_responsive = false
     for (i, wc) in enumerate(workers)
         set_worker_ready!(p.metrics, wc.url, results[i])
+        observe_probe!(p.metrics, wc.url, elapsed[i])
         any_ready |= results[i]
         any_responsive |= !timeouts[i]   # answered within the watchdog (ready or not)
         # A hung probe (timed out, not a fast refuse) means the worker was caught mid-stall and its

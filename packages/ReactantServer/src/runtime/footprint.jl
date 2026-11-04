@@ -36,6 +36,7 @@ mutable struct ModelFootprint
     read_seconds::Float64
     reads::Int                  # of `loads`, those that read the weights file
     prio_base::Float64          # the inflation L at the model's last use; its priority is L + its gain
+    evicts::Int                 # observability: times admission evicted the model from the device
 end
 
 """
@@ -74,7 +75,7 @@ function _new_footprint(entry::ModelEntry, model::LoadedModel)
     w = sizes === nothing ? (weight_bytes = model.nbytes, max_weight_bytes = model.nbytes) :
         weight_footprint(sizes)
     tensors = sizes === nothing ? Int[model.nbytes] : Int[_alloc_rounded(n) for n in sizes]
-    return ModelFootprint(model, w.weight_bytes, w.max_weight_bytes, 0, 0.0, 0, 0, 0, 0.0, 0.0, tensors, 0.0, 0.0, 0, 0.0)
+    return ModelFootprint(model, w.weight_bytes, w.max_weight_bytes, 0, 0.0, 0, 0, 0, 0.0, 0.0, tensors, 0.0, 0.0, 0, 0.0, 0)
 end
 
 # XLA's BFC allocator splits a free chunk for a request only when the chunk is at least twice the

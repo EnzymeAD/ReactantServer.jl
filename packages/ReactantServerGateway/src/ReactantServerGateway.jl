@@ -144,6 +144,7 @@ function serve_gateway(gateway_path::Union{AbstractString, Nothing} = nothing; b
         i <= length(cfg.worker_names) && (name_by_url[u] = cfg.worker_names[i])
     end
     metrics = GatewayMetrics(name_by_url)
+    register_process_metrics!(metrics)
     refresher = RouteRefresher(pool, routes, metrics)
     # Build the gateway scheduler for the configured mode and run its startup hook before anything
     # else starts: lpt_packing verifies hard preconditions (all workers reachable, FIFO discipline,

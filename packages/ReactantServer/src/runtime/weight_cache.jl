@@ -56,8 +56,20 @@ mutable struct WeightCache
     upload_bytes::Int
     read_seconds::Float64
     read_bytes::Int
+    # Why admission evicted (observability): `:bytes` for a byte deficit (device or budget),
+    # `:contiguity` when the bytes were there but no block could hold the weights, `:scratch` to
+    # keep the execution scratch block free after an upload. Compaction frees are not evictions.
+    evicts_by_reason::Dict{Symbol, Int}
+    compaction_seconds::Float64    # observability: time spent in compaction passes
+    # Background host reads ahead of the dispatch (`stage_host_weights`), for observability.
+    stages::Int
+    stage_failures::Int
+    stage_seconds::Float64
     lock::ReentrantLock
 end
+
+# The eviction reasons admission records, in exposition order.
+const EVICT_REASONS = (:bytes, :contiguity, :scratch)
 
 WeightCache(
     backend::AbstractBackend, pool::MemoryPool, registry::ModelRegistry, max_bytes::Integer;
@@ -68,7 +80,8 @@ WeightCache(
     backend, pool, registry, mode, store, Int(max_bytes), 0, String[], 0, 0, 0.0, 0, 0, 0, 0, 0,
     Dict{String, ModelFootprint}(), 0.0, Float64(min_residency_seconds), VictimSearch(), 0, 0,
     host_budget === nothing ? nothing : Int(host_budget), Dict{String, Vector{Any}}(), String[], 0, 0, 0,
-    false, Set{String}(), 0.0, 0, 0.0, 0, ReentrantLock()
+    false, Set{String}(), 0.0, 0, 0.0, 0, Dict{Symbol, Int}(r => 0 for r in EVICT_REASONS), 0.0, 0, 0, 0.0,
+    ReentrantLock()
 )
 
 # How long the halves of one load took: the device transfer, and reading the weights file when the
@@ -361,8 +374,9 @@ end
 
 # Evict resident non-pinned models by name: commit the bookkeeping under the lock, then release the
 # device buffers outside it. Raises the policy's inflation to the highest evicted priority, which
-# is what ages every model that was not touched since (GreedyDual). Returns the weight bytes freed.
-function _evict!(cache::WeightCache, names)
+# is what ages every model that was not touched since (GreedyDual). `reason` is one of
+# `EVICT_REASONS`, counted for observability. Returns the weight bytes freed.
+function _evict!(cache::WeightCache, names; reason::Symbol)
     to_free = Any[]
     freed = 0
     lock(cache.lock) do
@@ -374,8 +388,10 @@ function _evict!(cache::WeightCache, names)
             _remove_lru!(cache, name)
             cache.resident_bytes -= vm.nbytes
             cache.evicts += 1
+            cache.evicts_by_reason[reason] = get(cache.evicts_by_reason, reason, 0) + 1
             fp = get(cache.footprints, name, nothing)
             if fp !== nothing
+                fp.evicts += 1
                 cache.inflation = max(cache.inflation, fp.priority)
                 freed += fp.weight_bytes
             end
@@ -537,6 +553,7 @@ compact!(cache::WeightCache, registry::ModelRegistry; reload::Vector{String} = S
     off_interactive(() -> _compact!(cache, registry, reload))
 
 function _compact!(cache::WeightCache, registry::ModelRegistry, reload::Vector{String})
+    t0 = time()
     before = memory_report(cache.backend, cache.pool; registry = registry, weight_cache = cache)
     before_point = _memory_point(cache)
 
@@ -576,6 +593,7 @@ function _compact!(cache::WeightCache, registry::ModelRegistry, reload::Vector{S
         end
     end
 
+    lock(() -> cache.compaction_seconds += time() - t0, cache.lock)
     after = memory_report(cache.backend, cache.pool; registry = registry, weight_cache = cache)
     after_point = _memory_point(cache)
     @info "memory compacted" reloaded = reloaded requested = length(reload) before = before after = after largest_free_before = _point_field(before_point, :largest_free) largest_free_after = _point_field(after_point, :largest_free) fragmentation_before = _point_field(before_point, :fragmentation) fragmentation_after = _point_field(after_point, :fragmentation)
@@ -612,6 +630,8 @@ function weight_cache_stats(cache::WeightCache)
             weight_pool = cache.weight_pool, load_bytes = cache.load_bytes,
             fallback_compactions = cache.fallback_compactions,
             admission_failures = cache.admission_failures,
+            evicts_by_reason = copy(cache.evicts_by_reason), compaction_seconds = cache.compaction_seconds,
+            stages = cache.stages, stage_failures = cache.stage_failures, stage_seconds = cache.stage_seconds,
             host_budget = host_budget(cache), host_cached_bytes = host_cached_bytes(cache),
             host_hits = cache.host_hits, host_misses = cache.host_misses,
             footprints = Dict(
@@ -619,6 +639,7 @@ function weight_cache_stats(cache::WeightCache)
                     weight_bytes = fp.weight_bytes, max_weight_bytes = fp.max_weight_bytes,
                     scratch_bytes = fp.scratch_bytes, load_seconds = fp.load_seconds, loads = fp.loads,
                     upload_seconds = fp.upload_seconds, read_seconds = fp.read_seconds, reads = fp.reads,
+                    evicts = fp.evicts,
                 ) for (name, fp) in cache.footprints
             ),
         )

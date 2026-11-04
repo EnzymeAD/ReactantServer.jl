@@ -195,9 +195,9 @@ function _await_frees!(cache::WeightCache, in_use_before::Int, freed::Int)
 end
 
 # Evict the chosen candidates of the cache's search and wait for the frees; returns fresh stats.
-function _evict_chosen!(cache::WeightCache, stats, chosen)
+function _evict_chosen!(cache::WeightCache, stats, chosen; reason::Symbol)
     in_use = stats === nothing ? 0 : stats.in_use
-    freed = _evict!(cache, chosen)
+    freed = _evict!(cache, chosen; reason = reason)
     return stats === nothing ? nothing : _await_frees!(cache, in_use, freed)
 end
 
@@ -242,13 +242,13 @@ function admit_weights!(cache::WeightCache, entry::ModelEntry; staged = nothing)
         if isempty(chosen)
             if stats === nothing
                 # Budget only (no device statistics): the pre-admission behavior, load anyway.
-                _evict!(cache, copy(cache.lru))
+                _evict!(cache, copy(cache.lru); reason = :bytes)
                 @warn "weight cache: model exceeds budget even after evicting all unpinned models; loading anyway" model = entry.name nbytes = model.nbytes budget = cache.max_bytes
                 break
             end
             return _compact_and_retry!(cache, entry; staged = staged)
         end
-        stats = _evict_chosen!(cache, stats, chosen)
+        stats = _evict_chosen!(cache, stats, chosen; reason = deficit > 0 ? :bytes : :contiguity)
     end
 
     # B. Upload; a failed transfer has freed its partial upload already.
@@ -270,7 +270,7 @@ function admit_weights!(cache::WeightCache, entry::ModelEntry; staged = nothing)
         i = select_cheapest!(s)
         i == 0 && (i = select_cheapest!(s; allow_protected = true))
         i == 0 && return _compact_and_retry!(cache, entry; staged = staged)
-        _evict_chosen!(cache, stats, [s.names[i]])
+        _evict_chosen!(cache, stats, [s.names[i]]; reason = :scratch)
     end
     return
 end

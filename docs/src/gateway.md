@@ -323,6 +323,14 @@ counts the **requests** routed to each replica since start (the series that show
 replica is actually being used), `gateway_model_fill_quantum` reports each model's effective
 quantum, `gateway_repacks_total` counts repacks by what triggered them, and
 `gateway_model_utilization` reports each model's estimated demand in GPU-seconds per second.
+What a repack costs is counted too: `gateway_repack_moved_models_total` and
+`gateway_repack_moved_bytes_total` (the weight bytes it placed on workers that did not hold them),
+and `gateway_worker_assigned_weight_bytes` against `gateway_worker_weight_budget_bytes` shows each
+worker's planned weights next to its budget as of the last repack.
+
+`gateway_worker_probe_seconds` is the round trip of the ServerReady health probe per worker. A
+worker whose request handling stalls shows here first, before requests fail; a probe that times out
+counts its full wait.
 
 `gateway_worker_inflight_work` reports the per-worker load the router actually compares when it
 picks a replica, so a routing decision can be explained after the fact. It is exported by both

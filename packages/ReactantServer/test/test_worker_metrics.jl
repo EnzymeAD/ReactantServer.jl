@@ -62,7 +62,17 @@ end
     s = _expose(wm)
     @test occursin("worker_weight_cache_resident_bytes", s)
     @test occursin("worker_weight_cache_max_bytes", s)
-    @test occursin("worker_weight_evicts_total", s)
+    for r in ("bytes", "contiguity", "scratch")
+        @test occursin("worker_weight_evicts_total{reason=\"$r\"} 0", s)
+    end
+    for name in (
+            "worker_weight_compaction_seconds_total", "worker_weight_stages_total",
+            "worker_weight_stage_failures_total", "worker_weight_stage_seconds_total",
+        )
+        @test occursin("$name 0", s)
+    end
+    @test occursin("worker_weight_staging_models{state=\"reading\"} 0", s)
+    @test occursin("worker_weight_staging_models{state=\"staged\"} 0", s)
 end
 
 # A backend whose allocator reports a largest free block, to exercise the fragmentation series.
@@ -85,6 +95,9 @@ ReactantServer.device_memory_stats(::FragStatsBackend, pool) = (
     @test occursin("worker_device_memory_fragmentation 0.75", s)
     @test occursin("worker_model_scratch_bytes{model=\"m\"} 12345", s)
     @test occursin("worker_model_load_seconds{model=\"m\"} 0.5", s)
+    @test occursin("worker_model_loads_total{model=\"m\"} 1", s)
+    @test occursin("worker_model_reads_total{model=\"m\"} 0", s)
+    @test occursin("worker_model_evicts_total{model=\"m\"} 0", s)
     @test occursin("worker_weight_load_bytes_total", s)
 end
 

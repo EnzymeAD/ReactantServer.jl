@@ -1699,6 +1699,7 @@ function scheduler_metrics(s::Scheduler)
                 pinned = is_device_pinned(entry.executable),
                 resident = entry.executable.weights !== nothing,
                 weight_nbytes = entry.executable.nbytes,
+                host_stage = entry.sched.host_stage,
             ) for entry in values(s.registry.by_name) if entry.sched !== nothing && entry.executable !== nothing
         )
     end

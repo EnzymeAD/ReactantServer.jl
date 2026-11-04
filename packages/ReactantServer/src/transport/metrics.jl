@@ -38,7 +38,9 @@ Prometheus.metric_names(::WorkerSnapshotCollector) = (
     "worker_weight_cache_resident_bytes",
     "worker_weight_cache_max_bytes", "worker_weight_cache_pinned_bytes",
     "worker_weight_cache_max_scratch_bytes", "worker_weight_pool_bytes",
-    "worker_weight_loads_total", "worker_weight_evicts_total",
+    "worker_weight_loads_total", "worker_weight_evicts_total", "worker_weight_compaction_seconds_total",
+    "worker_weight_stages_total", "worker_weight_stage_failures_total", "worker_weight_stage_seconds_total",
+    "worker_weight_staging_models", "worker_model_loads_total", "worker_model_reads_total", "worker_model_evicts_total",
     "worker_weight_load_seconds_total", "worker_weight_load_bytes_total",
     "worker_weight_upload_seconds_total", "worker_weight_read_seconds_total", "worker_weight_read_bytes_total",
     "worker_weight_compactions_total", "worker_weight_fallback_compactions_total",
@@ -94,6 +96,7 @@ end
 function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
     sm = scheduler_metrics(c.sched)   # Dict: model name => per-model NamedTuple
     model_ln = Prometheus.LabelNames(("model",))
+    reason_ln = Prometheus.LabelNames(("reason",))
     persamples(f) = Prometheus.Sample[
         Prometheus.Sample(nothing, model_ln, Prometheus.LabelValues((name,)), Float64(f(m)))
             for (name, m) in sm
@@ -196,7 +199,15 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
                 "Arena bytes allotted to all weights (pinned + on-demand).", wc.weight_pool
             ),
             _scalar("worker_weight_loads_total", "counter", "On-demand weight loads.", wc.loads),
-            _scalar("worker_weight_evicts_total", "counter", "On-demand weight evictions.", wc.evicts),
+            Prometheus.Metric(
+                "counter", "worker_weight_evicts_total",
+                "On-demand weight evictions by reason: bytes (a byte deficit), contiguity (enough free " *
+                    "bytes but no block to hold the weights: fragmentation), scratch (keeping the execution scratch block free).",
+                Prometheus.Sample[
+                    Prometheus.Sample(nothing, reason_ln, Prometheus.LabelValues((string(r),)), Float64(get(wc.evicts_by_reason, r, 0)))
+                        for r in EVICT_REASONS
+                ]
+            ),
             _scalar(
                 "worker_weight_load_seconds_total", "counter",
                 "Cumulative time spent loading weights (seconds).", wc.load_seconds
@@ -220,6 +231,23 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
                 "Weight bytes read from weights files (over read seconds: the file read bandwidth).", wc.read_bytes
             ),
             _scalar("worker_weight_compactions_total", "counter", "Memory compactions, from any trigger.", wc.compactions),
+            _scalar(
+                "worker_weight_compaction_seconds_total", "counter",
+                "Cumulative seconds spent in compactions (freeing and reloading weights).", wc.compaction_seconds
+            ),
+            _scalar(
+                "worker_weight_stages_total", "counter",
+                "Weight reads into host memory started ahead of a dispatch, off the dispatch loop.", wc.stages
+            ),
+            _scalar(
+                "worker_weight_stage_failures_total", "counter",
+                "Background weight reads that failed (the dispatch then loads the model itself).", wc.stage_failures
+            ),
+            _scalar(
+                "worker_weight_stage_seconds_total", "counter",
+                "Cumulative seconds of background weight reads, shared-store lock waits included (the file " *
+                    "reads among them also count in worker_weight_read_seconds_total).", wc.stage_seconds
+            ),
             _scalar(
                 "worker_weight_fallback_compactions_total", "counter",
                 "Compactions admission ran because evicting alone could not make a model fit.",
@@ -248,6 +276,21 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
                 _scalar("worker_host_weight_misses_total", "counter", "Weight loads that read the weights file.", wc.host_misses),
             )
         end
+        # Models whose weights are being read ahead of their dispatch, and those read and waiting.
+        state_ln = Prometheus.LabelNames(("state",))
+        nstaging = count(m -> m.host_stage === :staging, values(sm))
+        nstaged = count(m -> m.host_stage === :staged, values(sm))
+        push!(
+            metrics, Prometheus.Metric(
+                "gauge", "worker_weight_staging_models",
+                "Models whose weights are being read into host memory ahead of their dispatch (reading), " *
+                    "or are read and waiting for it (staged).",
+                Prometheus.Sample[
+                    Prometheus.Sample(nothing, state_ln, Prometheus.LabelValues(("reading",)), Float64(nstaging)),
+                    Prometheus.Sample(nothing, state_ln, Prometheus.LabelValues(("staged",)), Float64(nstaged)),
+                ]
+            )
+        )
         # Per-model footprint, for the models measured or loaded so far.
         fpsamples(f) = Prometheus.Sample[
             Prometheus.Sample(nothing, model_ln, Prometheus.LabelValues((name,)), Float64(f(fp)))
@@ -264,6 +307,21 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
                 "gauge", "worker_model_load_seconds",
                 "Moving average of the model's on-demand weight load time (seconds; 0 = never loaded).",
                 fpsamples(fp -> fp.load_seconds)
+            ),
+            Prometheus.Metric(
+                "counter", "worker_model_loads_total",
+                "Times the model's weights were uploaded to the device (startup measurement loads included).",
+                fpsamples(fp -> fp.loads)
+            ),
+            Prometheus.Metric(
+                "counter", "worker_model_reads_total",
+                "Of the model's loads, those that read its weights file rather than a host copy.",
+                fpsamples(fp -> fp.reads)
+            ),
+            Prometheus.Metric(
+                "counter", "worker_model_evicts_total",
+                "Times admission evicted the model from the device to make room for another.",
+                fpsamples(fp -> fp.evicts)
             ),
         )
     end
