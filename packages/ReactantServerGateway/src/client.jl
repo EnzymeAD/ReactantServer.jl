@@ -185,6 +185,10 @@ function client_status(e::gRPCClient.gRPCServiceCallException)
     # local curl timeout) is a distinct outcome from a worker being down; give it its own status
     # so metrics and logs do not fold it into STATUS_UNAVAILABLE.
     st == gRPCClient.GRPC_DEADLINE_EXCEEDED && return STATUS_DEADLINE
+    # A worker that rejects the request itself (an output the model does not produce, a malformed
+    # input) would reject it on every replica; forward it so the gateway neither fails over nor
+    # turns a caller's mistake into a retryable UNAVAILABLE.
+    st == gRPCClient.GRPC_INVALID_ARGUMENT && return STATUS_INVALID
     return STATUS_UNAVAILABLE
 end
 

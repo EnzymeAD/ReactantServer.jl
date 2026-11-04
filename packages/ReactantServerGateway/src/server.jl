@@ -30,6 +30,7 @@ function _server_exc(status::AbstractString, msg::AbstractString)
     # worker rejects it identically until the client re-registers through the gateway's fan-out.
     status == STATUS_FAILED_PRE && return gRPCServer.GRPCError(gRPCServer.StatusCode.FAILED_PRECONDITION, msg)
     status == STATUS_INTERNAL && return gRPCServer.GRPCError(gRPCServer.StatusCode.INTERNAL, msg)
+    status == STATUS_INVALID && return gRPCServer.GRPCError(gRPCServer.StatusCode.INVALID_ARGUMENT, msg)
     return gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, msg)
 end
 
