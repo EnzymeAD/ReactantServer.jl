@@ -40,11 +40,10 @@ exclude:
 #     options:
 #       postprocess_dir: postprocess
 #
-#   # A standard torchvision Faster R-CNN object detector, split into a
-#   # backbone+RPN stage, a box-head stage, and a meta bundle that chains them
-#   # through the data-dependent DetectionGlue (NMS, roi_align, box decode). The
-#   # shipped tools/handlers/torchvision_frcnn_detector.jl drives this via
-#   # torch.export (no torch.jit); see docs/src/manual/object_detection.md.
+#   # A standard torchvision Faster R-CNN object detector, exported as one bundle
+#   # whose single traced program runs the whole detector, NMS and roi_align
+#   # included. The shipped tools/handlers/torchvision_frcnn_detector.jl drives
+#   # this via torch.export (no torch.jit); see docs/src/object_detection.md.
 #   - file: handlers/torchvision_frcnn_detector.jl
 #     models: [my_detector]
 #     options:

@@ -31,7 +31,6 @@ include("grpc_helpers.jl")
 
 @testset "ReactantServer" begin
     include("test_scheduler.jl")
-    include("test_detection.jl")
     include("test_bert_text.jl")
     include("test_multishape.jl")
     include("test_observe.jl")

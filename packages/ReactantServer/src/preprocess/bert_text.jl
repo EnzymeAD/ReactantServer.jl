@@ -1,5 +1,4 @@
-# Julia text glue for BERT-family text bundles, the request-side counterpart to DetectionGlue:
-# a self-contained BERT WordPiece tokenizer plus the wire-format helpers a text bundle's
+# Julia text glue for BERT-family text bundles: a self-contained BERT WordPiece tokenizer plus the wire-format helpers a text bundle's
 # preprocess needs. Referenced from a bundle's model.jl as ReactantServer.BertText. Depends on
 # nothing but Base (Base.Unicode), so it can also be included standalone by an export-side or
 # offline test script.
