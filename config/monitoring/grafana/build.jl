@@ -307,19 +307,25 @@ modelvar() = qvar("model", "Model", "label_values(worker_model_max_batch_size{wo
 topnvar() = custom("topn", "Top N", ["5", "10", "15", "20", "30"], "10")
 
 # Annotations shared by every dashboard: repacks move models between workers (expect loads after
-# one), and a worker restart resets its counters.
+# one), and a worker restart resets its counters. Each marks one point per event: the value now minus
+# the value one step earlier, evaluated every step, telescopes, so every change lands in exactly one
+# step. A windowed `changes(x[w]) > 0` is true at every step while events come faster than `w`, and
+# Grafana draws consecutive true steps as one shaded region instead of a line per event. Beyond about
+# four days on screen Grafana widens the step past 30 s and some events go unmarked.
 const ANNOTATIONS = [
     D(
         "builtIn" => 1, "datasource" => D("type" => "grafana", "uid" => "-- Grafana --"), "enable" => true, "hide" => true,
         "iconColor" => "rgba(0, 211, 255, 1)", "name" => "Annotations & Alerts", "type" => "dashboard",
     ),
     D(
-        "name" => "Repacks", "datasource" => DS, "enable" => true, "iconColor" => "purple", "step" => "60s",
-        "expr" => "sum(changes(gateway_repacks_total[2m])) > 0", "titleFormat" => "Repack", "textFormat" => "the gateway moved models between workers",
+        "name" => "Repacks", "datasource" => DS, "enable" => true, "iconColor" => "purple", "step" => "30s",
+        "expr" => "sum(gateway_repacks_total) - sum(gateway_repacks_total offset 30s) > 0", "titleFormat" => "Repack",
+        "textFormat" => "the gateway revised the placement (it may have moved nothing)",
     ),
     D(
-        "name" => "Worker restarts", "datasource" => DS, "enable" => true, "iconColor" => "red", "step" => "60s",
-        "expr" => "changes(process_start_time_seconds{worker!=''}[2m]) > 0", "titleFormat" => "{{worker}} restarted", "textFormat" => "",
+        "name" => "Worker restarts", "datasource" => DS, "enable" => true, "iconColor" => "red", "step" => "30s",
+        "expr" => "max by (worker) (process_start_time_seconds{worker!=''}) - max by (worker) (process_start_time_seconds{worker!=''} offset 30s) > 0",
+        "titleFormat" => "{{worker}} restarted", "textFormat" => "",
     ),
 ]
 
@@ -395,15 +401,24 @@ function overview()
     )
     line!(
         b,
-        stat("Models", q("max(gateway_routing_table_size)"); w = 4, desc = "Models the gateway can route."),
-        stat("Resident on a device", q("sum(worker_models_resident{%W})"); w = 4, desc = "Model copies whose weights are on a device now, summed over workers."),
-        stat("Weight loads over the range", q("sum(increase(worker_weight_loads_total{%W}%rg))"); w = 4, decimals = 0),
+        stat("Models", q("max(gateway_routing_table_size)"); desc = "Models the gateway can route."),
+        stat("Resident on a device", q("sum(worker_models_resident{%W})"); desc = "Model copies whose weights are on a device now, summed over workers."),
+        stat("Weight loads over the range", q("sum(increase(worker_weight_loads_total{%W}%rg))"); decimals = 0),
         stat(
-            "Read from weights files", q("sum(increase(worker_weight_read_bytes_total{%W}%rg))"); w = 4, unit = "bytes",
+            "Read from weights files", q("sum(increase(worker_weight_read_bytes_total{%W}%rg))"); unit = "bytes",
             desc = "Loads that found no host copy and read the file. On a node whose host weight budget is below the total weights, this is the expensive part of churn."
         ),
-        stat("Repacks over the range", q("sum(increase(gateway_repacks_total%rg))"); w = 4, decimals = 0),
-        stat("Weights moved by repacks", q("sum(increase(gateway_repack_moved_bytes_total%rg))"); w = 4, unit = "bytes"),
+        stat(
+            "Fragmentation, worst worker", q("max(worker_device_memory_fragmentation{%W})"); unit = "percentunit", decimals = 0,
+            thresholds = steps("green", (0.3, "orange"), (0.6, "red")),
+            desc = "1 minus the largest free block over the free bytes. Memory and Weights shows each worker's arena."
+        ),
+        stat(
+            "Evictions for contiguity", q("sum(increase(worker_weight_evicts_total{%W,reason='contiguity'}%rg))"); decimals = 0,
+            thresholds = steps("green", (1, "orange")), desc = "Over the range: evictions made although enough bytes were free, because no block held the new weights."
+        ),
+        stat("Repacks over the range", q("sum(increase(gateway_repacks_total%rg))"); decimals = 0),
+        stat("Weights moved by repacks", q("sum(increase(gateway_repack_moved_bytes_total%rg))"); unit = "bytes"),
     )
 
     row!(b, "Traffic and latency")
@@ -583,7 +598,8 @@ function models()
             q(
                 "(sum by (model) (increase(worker_rows_served_total{%W,%M}%rg)) / (sum by (model) (increase(worker_dispatch_total{%W,%M}%rg)) > 0) / (max by (model) (worker_model_max_batch_size{%W,%M}) > 0)) and on (model) topk(%n, sum by (model) (increase(worker_dispatch_total{%W,%M}%rg)))";
                 legend = "{{model}}", instant = true
-            ); unit = "percentunit", min = 0, max = 1, links = model_links(), h = 10
+            ); unit = "percentunit", min = 0, max = 1, links = model_links(), h = 10,
+            color = D("mode" => "continuous-RdYlGr"), desc = "Green is fuller batches, red is emptier."
         ),
         ts(
             "Requests merged per dispatch, top N",

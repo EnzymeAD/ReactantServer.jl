@@ -7,25 +7,32 @@ container publishes on the host, so the two stacks need no shared network.
 
 ## Run it
 
-Bring the node up first (see the Deployment guide), then:
+Bring the node up first (see the Deployment guide), then start the stack with `monitor.sh`, which
+uses podman (or docker) directly and needs no compose tool:
 
 ```bash
-COMPOSE=config/monitoring/docker-compose.monitoring.yml
-docker compose -f "$COMPOSE" up -d
-docker compose -f "$COMPOSE" logs -f
-docker compose -f "$COMPOSE" ps
-docker compose -f "$COMPOSE" down
+config/monitoring/monitor.sh up                          # the node on this host, port 8002
+config/monitoring/monitor.sh up 8102                     # another node or pod on this host, published on 8102
+config/monitoring/monitor.sh up netai03:8002             # a node on another host
+config/monitoring/monitor.sh up reactantserver:8002 --network mynet   # a container on a named network
+config/monitoring/monitor.sh status                      # containers, and whether the scrape works
+config/monitoring/monitor.sh down                        # stop (data kept); purge deletes it
 ```
 
-Prometheus reaches the node's published port at `host.docker.internal:8002`, mapped to the host
-gateway by `extra_hosts` in the compose file (Docker 20.10+). If the node listens on a **different
-host**, edit the target in `prometheus.yml` to that host's `address:8002` instead.
+`up` writes the Prometheus config for the target, starts both containers, and waits for the
+first scrape, printing the error if it fails. Run it again with another target to repoint the
+stack; the collected data is kept. `--name` runs several stacks side by side (pair it with
+`--grafana-port` and `--prometheus-port`), for example one per node. A port alone means a port
+published on this host, which a container reaches as `host.containers.internal` under podman and
+`host.docker.internal` under docker: the container's own network cannot use the host's address.
 
 - **Grafana**: `http://<host>:3000`: anonymous viewing is on; log in `admin` / `admin` to edit
   (override with `GRAFANA_ADMIN_PASSWORD`). Lands on Overview.
-- **Prometheus**: `http://<host>:9090` — check `Status -> Targets` shows the `reactantserver` job UP.
+- **Prometheus**: `http://<host>:9090`.
 
-Environment overrides: `GRAFANA_ADMIN_PASSWORD`.
+The compose file runs the same stack for those who prefer compose (`docker compose -f
+config/monitoring/docker-compose.monitoring.yml up -d`); its target is fixed in `prometheus.yml`
+(`host.docker.internal:8002`; use `host.containers.internal:8002` under podman).
 
 ## How it scrapes
 
@@ -93,7 +100,8 @@ Terminology: the hardware is a "device" (GPU or otherwise) in titles; the identi
 
 ```
 docker-compose.monitoring.yml      prometheus + grafana
-prometheus.yml                     one scrape job of the node's :8002 (15s)
+monitor.sh                         starts the stack against a target, podman or docker
+prometheus.yml                     the compose file's scrape config (monitor.sh writes its own)
 grafana/build.jl                   generates the dashboards
 grafana/dashboards/*.json          the generated dashboards (datasource chosen by variable)
 grafana/provisioning/datasources/  Prometheus datasource (uid: prometheus)

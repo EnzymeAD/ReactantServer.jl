@@ -19,11 +19,11 @@
           "uid": "${ds}"
         },
         "enable": true,
-        "expr": "sum(changes(gateway_repacks_total[2m])) > 0",
+        "expr": "sum(gateway_repacks_total) - sum(gateway_repacks_total offset 30s) > 0",
         "iconColor": "purple",
         "name": "Repacks",
-        "step": "60s",
-        "textFormat": "the gateway moved models between workers",
+        "step": "30s",
+        "textFormat": "the gateway revised the placement (it may have moved nothing)",
         "titleFormat": "Repack"
       },
       {
@@ -32,10 +32,10 @@
           "uid": "${ds}"
         },
         "enable": true,
-        "expr": "changes(process_start_time_seconds{worker!=''}[2m]) > 0",
+        "expr": "max by (worker) (process_start_time_seconds{worker!=''}) - max by (worker) (process_start_time_seconds{worker!=''} offset 30s) > 0",
         "iconColor": "red",
         "name": "Worker restarts",
-        "step": "60s",
+        "step": "30s",
         "textFormat": "",
         "titleFormat": "{{worker}} restarted"
       }
@@ -2060,11 +2060,11 @@
         "type": "prometheus",
         "uid": "${ds}"
       },
-      "description": "",
+      "description": "Green is fuller batches, red is emptier.",
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "continuous-GrYlRd"
+            "mode": "continuous-RdYlGr"
           },
           "custom": {},
           "links": [
