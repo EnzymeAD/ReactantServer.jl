@@ -307,19 +307,25 @@ modelvar() = qvar("model", "Model", "label_values(worker_model_max_batch_size{wo
 topnvar() = custom("topn", "Top N", ["5", "10", "15", "20", "30"], "10")
 
 # Annotations shared by every dashboard: repacks move models between workers (expect loads after
-# one), and a worker restart resets its counters.
+# one), and a worker restart resets its counters. Each marks one point per event: the value now minus
+# the value one step earlier, evaluated every step, telescopes, so every change lands in exactly one
+# step. A windowed `changes(x[w]) > 0` is true at every step while events come faster than `w`, and
+# Grafana draws consecutive true steps as one shaded region instead of a line per event. Beyond about
+# four days on screen Grafana widens the step past 30 s and some events go unmarked.
 const ANNOTATIONS = [
     D(
         "builtIn" => 1, "datasource" => D("type" => "grafana", "uid" => "-- Grafana --"), "enable" => true, "hide" => true,
         "iconColor" => "rgba(0, 211, 255, 1)", "name" => "Annotations & Alerts", "type" => "dashboard",
     ),
     D(
-        "name" => "Repacks", "datasource" => DS, "enable" => true, "iconColor" => "purple", "step" => "60s",
-        "expr" => "sum(changes(gateway_repacks_total[2m])) > 0", "titleFormat" => "Repack", "textFormat" => "the gateway moved models between workers",
+        "name" => "Repacks", "datasource" => DS, "enable" => true, "iconColor" => "purple", "step" => "30s",
+        "expr" => "sum(gateway_repacks_total) - sum(gateway_repacks_total offset 30s) > 0", "titleFormat" => "Repack",
+        "textFormat" => "the gateway revised the placement (it may have moved nothing)",
     ),
     D(
-        "name" => "Worker restarts", "datasource" => DS, "enable" => true, "iconColor" => "red", "step" => "60s",
-        "expr" => "changes(process_start_time_seconds{worker!=''}[2m]) > 0", "titleFormat" => "{{worker}} restarted", "textFormat" => "",
+        "name" => "Worker restarts", "datasource" => DS, "enable" => true, "iconColor" => "red", "step" => "30s",
+        "expr" => "max by (worker) (process_start_time_seconds{worker!=''}) - max by (worker) (process_start_time_seconds{worker!=''} offset 30s) > 0",
+        "titleFormat" => "{{worker}} restarted", "textFormat" => "",
     ),
 ]
 
