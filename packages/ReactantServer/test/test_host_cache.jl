@@ -221,3 +221,69 @@ end
     @test ReactantServer._resolve_residency(cfg("4g"), "P", true) == ReactantServer.PINNED_SYSTEM
     @test ReactantServer._resolve_residency(cfg("0b"), "M", false) == ReactantServer.UNPINNED
 end
+
+@testset "load timing: the weights-file read and the upload are measured apart" begin
+    sched = _hc_scheduler("A", "B"; host_budget = 2 * sizeof(_W))
+    wc = sched.weight_cache
+    _served(sched, "A")                               # read from the file, then uploaded
+    fpA = wc.footprints["A"]
+    @test fpA.loads == 1 && fpA.reads == 1
+    @test wc.read_bytes == fpA.weight_bytes && wc.upload_bytes == fpA.weight_bytes
+    _served(sched, "B")                               # A leaves the device
+    _served(sched, "A")                               # back from its host copy: an upload, no read
+    @test fpA.loads == 2 && fpA.reads == 1
+    @test wc.read_bytes == 2 * fpA.weight_bytes       # A once and B once
+    @test wc.upload_bytes == 3 * fpA.weight_bytes
+    st = ReactantServer.weight_cache_stats(wc)
+    @test st.read_bytes == wc.read_bytes && st.footprints["A"].reads == 1
+end
+
+@testset "eviction: of two equally used models, the one still in host RAM goes first" begin
+    # Room on the device for two models, and in host RAM for one copy.
+    sched = _hc_scheduler("A", "B", "C"; device_models = 2, host_budget = sizeof(_W))
+    wc = sched.weight_cache
+    A, B = sched.registry.by_name["A"], sched.registry.by_name["B"]
+    _served(sched, "A")
+    _served(sched, "B")                               # B's copy displaces A's
+    @test ReactantServer.has_host_copy(wc, B) && !ReactantServer.has_host_copy(wc, A)
+    # Equal use and uploads, and B's history says its file reads are the slow ones: by history alone
+    # B is the costlier eviction. But B's reload would come from RAM, and A's from its file.
+    for (m, read) in (("A", 0.01), ("B", 1.0))
+        fp = wc.footprints[m]
+        fp.upload_seconds = 0.1
+        fp.read_seconds = read
+        fp.hits = 5
+        fp.prio_base = wc.inflation
+    end
+    fpA, fpB = wc.footprints["A"], wc.footprints["B"]
+    @test ReactantServer.reload_seconds(wc, fpB) > ReactantServer.reload_seconds(wc, fpA)
+    @test ReactantServer.reload_seconds(wc, fpB; host_copy = true) ≈ 0.1
+    _served(sched, "C")
+    @test A.executable.weights !== nothing            # kept: its reload would read the file
+    @test B.executable.weights === nothing            # evicted: its reload is an upload from RAM
+end
+
+@testset "has_host_copy: the shared store's region, as /dev/shm shows it" begin
+    if !(Sys.islinux() && isdir("/dev/shm"))
+        @test_skip "shared weight store requires Linux /dev/shm"
+    else
+        prefix = "thh" * string(getpid())
+        R = ReactantServer.ReactantServerCore._layout([(Float32, (2,))])[2]
+        store = ReactantServer.SharedWeightStore(; budget = 2R, prefix = prefix)
+        try
+            sched = _hc_scheduler("A", "B"; store = store)
+            wc = sched.weight_cache
+            A = sched.registry.by_name["A"]
+            @test !ReactantServer.has_host_copy(wc, A)
+            _served(sched, "A")
+            @test ReactantServer.has_host_copy(wc, A)  # its region stays cached after the upload
+            store.budget = 0
+            ReactantServer.trim_host_cache!(store)     # another worker's admission could do the same
+            @test !ReactantServer.has_host_copy(wc, A)
+        finally
+            for f in readdir("/dev/shm"; join = true)
+                startswith(basename(f), prefix * "-") && rm(f; force = true)
+            end
+        end
+    end
+end

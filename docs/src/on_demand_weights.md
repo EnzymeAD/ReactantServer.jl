@@ -235,7 +235,14 @@ Which models to evict is a cost decision. Each model's priority is its expected 
 per byte, scaled by how often it has been dispatched since it was loaded and aged by how
 long ago it was last used (GreedyDual-Size-Frequency). A costly, frequently used model
 stays; one nobody has called in a while goes, and among equals the least recently used goes
-first, as with LRU. Choosing a set rather than evicting one model at a time means one large
+first, as with LRU. The reload time is judged at the moment of the decision, not from history
+alone: it is the model's measured upload time, plus its measured weights-file read time only when
+no host copy would be there to upload from (a `residency: system` floor, a cached copy, or its
+region in `/dev/shm` with shared host weights). So of two equally used models, the one still in
+host RAM is evicted first, and a fallback compaction prefers to reload the ones that would otherwise need a
+file read. The worker exports the two halves of its load time as
+`worker_weight_upload_seconds_total` and `worker_weight_read_seconds_total`, with
+`worker_weight_read_bytes_total`. Choosing a set rather than evicting one model at a time means one large
 idle model is evicted in place of two smaller busy ones. Models with requests already queued
 are evicted only when nothing else frees enough. The search is allocation-free and bounded:
 measured at 64 resident models it takes about 6 to 22 microseconds.

@@ -40,6 +40,7 @@ Prometheus.metric_names(::WorkerSnapshotCollector) = (
     "worker_weight_cache_max_scratch_bytes", "worker_weight_pool_bytes",
     "worker_weight_loads_total", "worker_weight_evicts_total",
     "worker_weight_load_seconds_total", "worker_weight_load_bytes_total",
+    "worker_weight_upload_seconds_total", "worker_weight_read_seconds_total", "worker_weight_read_bytes_total",
     "worker_weight_compactions_total", "worker_weight_fallback_compactions_total",
     "worker_weight_admission_failures_total",
     "worker_host_weight_budget_bytes", "worker_host_weight_cached_bytes",
@@ -202,8 +203,21 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
             ),
             _scalar(
                 "worker_weight_load_bytes_total", "counter",
-                "Weight bytes transferred by on-demand loads (over load seconds: the host-to-device bandwidth).",
+                "Weight bytes transferred by on-demand loads (over upload seconds: the host-to-device bandwidth).",
                 wc.load_bytes
+            ),
+            _scalar(
+                "worker_weight_upload_seconds_total", "counter",
+                "Of the load time, the seconds spent transferring weights to the device.", wc.upload_seconds
+            ),
+            _scalar(
+                "worker_weight_read_seconds_total", "counter",
+                "Of the load time, the seconds spent reading weights files (a load from a host copy reads none).",
+                wc.read_seconds
+            ),
+            _scalar(
+                "worker_weight_read_bytes_total", "counter",
+                "Weight bytes read from weights files (over read seconds: the file read bandwidth).", wc.read_bytes
             ),
             _scalar("worker_weight_compactions_total", "counter", "Memory compactions, from any trigger.", wc.compactions),
             _scalar(
