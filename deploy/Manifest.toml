@@ -634,7 +634,7 @@ uuid = "a3311ec8-5e00-46d5-b541-4f83e724a433"
 version = "0.1.23"
 
 [[deps.ReactantServer]]
-deps = ["BFloat16s", "DLFP8Types", "HTTP", "InterProcessCommunication", "JSON3", "NNlib", "Prometheus", "ProtoBuf", "Reactant", "ReactantServerCore", "Reactant_jll", "SHA", "SafeTensors", "YAML", "gRPCServer"]
+deps = ["BFloat16s", "DLFP8Types", "HTTP", "InterProcessCommunication", "JSON3", "NNlib", "PrecompileTools", "Prometheus", "ProtoBuf", "Reactant", "ReactantServerCore", "Reactant_jll", "SHA", "SafeTensors", "YAML", "gRPCServer"]
 path = "packages/ReactantServer"
 uuid = "faa8a0e4-1926-4c6b-a0e2-e70699715ecf"
 version = "0.2.0"
