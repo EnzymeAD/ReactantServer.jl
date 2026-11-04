@@ -55,6 +55,66 @@ using PrecompileTools: @setup_workload, @compile_workload
         return _encode_message(req)
     end
 
+    # The live servers: the gRPC server and the metrics listener on loopback ports the OS assigns,
+    # each answering real requests, then stopped. HTTP.jl compiles its listener and stream-dispatch
+    # closures specialized on these exact server and handler types (about 5 s on a worker's first
+    # connections), which only a running server reaches. The gRPC calls go over HTTP.jl's own HTTP/2
+    # client, so the workload needs no gRPC client package.
+    _pc_grpc_frame(msg::Vector{UInt8}) =
+        vcat(UInt8[0], reinterpret(UInt8, [hton(UInt32(length(msg)))]), msg)
+    function _pc_serve(sched, reg, ctx, metrics)
+        server = build_grpc_server(sched, reg, "mock", ctx.shm, "127.0.0.1", 1, ctx)
+        server.port = 0                       # an OS-assigned port, read back after start!
+        mserver = nothing
+        client = HTTP.Client()
+        gRPCServer.start!(server)
+        try
+            port = something(gRPCServer.bound_port(server), 0)
+            t_end = time() + 10
+            while port == 0 && time() < t_end   # the bound port appears once start! has bound
+                sleep(0.01)
+                port = something(gRPCServer.bound_port(server), 0)
+            end
+            headers = ["content-type" => "application/grpc", "te" => "trailers"]
+            for (path, msg) in (
+                    ("inference.GRPCInferenceService/ServerReady", UInt8[]),
+                    ("inference.GRPCInferenceService/ModelInfer", _pc_request("pc_f32", ["x" => rand(Float32, 2, 1)])),
+                )
+                HTTP.request(
+                    "POST", "http://127.0.0.1:$port/$path"; client = client, protocol = :h2,
+                    headers = headers, body = _pc_grpc_frame(msg)
+                )
+            end
+            mserver = start_worker_metrics(metrics, "127.0.0.1", 0; ready_fn = _RegistryReady(reg), worker_name = "worker0", gpu = "0")
+            mport = HTTP.port(mserver)
+            for path in ("/metrics", "/readyz")
+                HTTP.request("GET", "http://127.0.0.1:$mport$path"; client = client, protocol = :h1)
+            end
+        finally
+            HTTP.close_idle_connections!(client)
+            mserver === nothing || close(mserver)
+            gRPCServer.stop!(server; force = true)
+        end
+        return nothing
+    end
+
+    # The model-directory watcher's poll loop is a closure inside start_watching!, so it compiles when
+    # a watcher first runs (about 0.8 s at startup). Run one over an empty directory for a few polls.
+    function _pc_watch(sched, backend, pool)
+        mktempdir() do dir
+            cfg = ServerConfig(
+                [dir], "", RuntimeConfig(CPU_BACKEND, 0, 0.9, true, true), sched.cfg,
+                EndpointsConfig("127.0.0.1", 0)
+            )
+            w = BundleWatcher(sched, backend, pool, cfg; interval = 0.05, on_demand = false)
+            start_watching!(w)
+            sleep(0.3)
+            stop_watching!(w)
+            wait(w.task)
+        end
+        return nothing
+    end
+
     @compile_workload begin
         backend = MockBackend()
         pool = MemoryPool(backend, MockClient(), MockDevice(0), "mock", nothing)
@@ -114,8 +174,66 @@ using PrecompileTools: @setup_workload, @compile_workload
             io = IOBuffer()
             Prometheus.expose(io, metrics.registry)
             inject_metric_labels(String(take!(io)), ["worker" => "worker0", "gpu" => "0"])
+            _pc_serve(sched, reg, ctx, metrics)
+            _pc_watch(sched, backend, pool)
         finally
             shutdown!(sched)
         end
     end
+end
+
+# Directives for the startup path, which runs only against a real backend (a Reactant client, model
+# compilation, device weights) and so cannot be driven by the mock workload above. `precompile`
+# infers and compiles a method and what it calls without running it. Signatures are the ones a
+# worker compiled at startup in a --trace-compile run, plus the shared host-weight store and the
+# on-demand weight cache, which a GPU node uses and a CPU run does not. A signature that stops
+# matching (a renamed keyword, say) only costs the compile time back, so it is reported, not fatal.
+let RS = ReactantServerCore, ok = Bool[]
+    kw(names, types) = NamedTuple{names, Tuple{types...}}
+    push!(ok, precompile(Tuple{typeof(serve), String}))
+    push!(
+        ok, precompile(
+            Tuple{
+                typeof(Core.kwcall), kw((:backend, :blocking, :worker_name), (ReactantBackend, Bool, String)),
+                typeof(serve), ServerConfig,
+            }
+        )
+    )
+    push!(
+        ok, precompile(
+            Tuple{
+                typeof(Core.kwcall),
+                kw((:device_memory_fraction, :preallocate, :autotune_cache, :autotune_cache_dir), (Float64, Bool, Nothing, String)),
+                typeof(make_client), ReactantBackend, String,
+            }
+        )
+    )
+    for store in (RS.PrivateWeightStore, RS.SharedWeightStore)
+        push!(
+            ok, precompile(
+                Tuple{
+                    typeof(Core.kwcall),
+                    kw((:state, :on_demand, :store, :executable_cache), (RS.ResidencyState, Bool, store, Bool)),
+                    typeof(build_loaded_model), ReactantBackend, MemoryPool, ModelEntry,
+                }
+            )
+        )
+    end
+    for cache in (Nothing, WeightCache)
+        push!(
+            ok, precompile(
+                Tuple{
+                    typeof(Core.kwcall), kw((:registry, :weight_cache), (ModelRegistry, cache)),
+                    typeof(memory_report), ReactantBackend, MemoryPool,
+                }
+            )
+        )
+    end
+    push!(ok, precompile(Tuple{typeof(run_model), ReactantBackend, MemoryPool, LoadedModel, Vector{NamedTensor}}))
+    # The "models ready" log line: the logging path specializes on its keyword NamedTuple.
+    push!(ok, precompile(Tuple{typeof(pairs), kw((:count, :control_mode, :memory), (Int, RS.ModelControlMode, String))}))
+    push!(ok, precompile(Tuple{typeof(weight_order), WeightsFile}))
+    push!(ok, precompile(Tuple{typeof(weights_nbytes), WeightsFile, Vector{String}}))
+    push!(ok, precompile(Tuple{typeof(load_pinned_weights), ReactantBackend, MemoryPool, WeightsFile, Vector{String}}))
+    all(ok) || @warn "ReactantServer precompile: some startup directives no longer match a method" failed = findall(!, ok)
 end

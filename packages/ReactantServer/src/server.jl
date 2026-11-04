@@ -380,6 +380,17 @@ function _meta_concurrency()
     return max(1, n)
 end
 
+# /readyz for the metrics listener: ready once every loaded model is compiled, the ServerReady rule.
+# A named callable rather than a closure so the precompile workload can start the listener with this
+# exact type; HTTP.jl specializes the listener's code on the handler, and through it on this.
+struct _RegistryReady
+    registry::ModelRegistry
+end
+function (r::_RegistryReady)()
+    es = values(r.registry.by_name)
+    return (!isempty(es) || !isempty(r.registry.meta)) && all(e -> e.executable !== nothing, es)
+end
+
 function serve(
         cfg::ServerConfig; backend::AbstractBackend = ReactantBackend(), blocking::Bool = true,
         worker_name::AbstractString = ""
@@ -422,13 +433,9 @@ function serve(
     # is always on (the InferContext carries `metrics`); only the HTTP listener is gated.
     metrics_server = nothing
     if cfg.endpoints.metrics_port > 0
-        ready_fn = () -> (
-            es = values(registry.by_name);
-            (!isempty(es) || !isempty(registry.meta)) && all(e -> e.executable !== nothing, es)
-        )
         metrics_server = start_worker_metrics(
             metrics, cfg.endpoints.host, cfg.endpoints.metrics_port;
-            ready_fn = ready_fn, worker_name = worker_name, gpu = _gpu_identity(cfg)
+            ready_fn = _RegistryReady(registry), worker_name = worker_name, gpu = _gpu_identity(cfg)
         )
     end
     @info "Starting gRPC server" host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests models = model_names(registry)

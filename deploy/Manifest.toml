@@ -652,13 +652,13 @@ uuid = "df172679-9d9b-4a02-a92c-27cb5f9e1c5c"
 version = "1.0.3"
 
 [[deps.ReactantServerCore]]
-deps = ["BFloat16s", "DLFP8Types", "Dates", "FixedSizeArrays", "InterProcessCommunication", "ProtoBuf", "YAML"]
+deps = ["BFloat16s", "DLFP8Types", "Dates", "FixedSizeArrays", "InterProcessCommunication", "PrecompileTools", "ProtoBuf", "YAML"]
 path = "packages/ReactantServerCore"
 uuid = "387a5f05-f7b4-4d57-bca9-cd3358e52bdc"
 version = "1.4.0"
 
 [[deps.ReactantServerGateway]]
-deps = ["HTTP", "Prometheus", "ProtoBuf", "ReactantServerCore", "YAML", "gRPCClient", "gRPCServer"]
+deps = ["HTTP", "PrecompileTools", "Prometheus", "ProtoBuf", "ReactantServerCore", "YAML", "gRPCClient", "gRPCServer"]
 path = "packages/ReactantServerGateway"
 uuid = "b92f1031-7cb7-4fde-89de-b6dd50303018"
 version = "0.1.0"

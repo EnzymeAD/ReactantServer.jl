@@ -245,4 +245,7 @@ end
 
 export serve_gateway, probe_worker_ready
 
+# Build-time workload: the real gateway against an in-process mock worker; see the file.
+include("precompile.jl")
+
 end # module ReactantServerGateway
