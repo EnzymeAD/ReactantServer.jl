@@ -50,6 +50,12 @@ mutable struct WeightCache
     host_misses::Int                       # observability: loads that read the weights file
     serving::Bool                          # startup is over: a reload from disk now warns (once per model)
     disk_warned::Set{String}               # models whose reload from disk has been warned about
+    # The two halves of the loads (observability, and the bandwidths admission prices an unmeasured
+    # model with): device transfers, and reads of weights files (a load from a host copy reads none).
+    upload_seconds::Float64
+    upload_bytes::Int
+    read_seconds::Float64
+    read_bytes::Int
     lock::ReentrantLock
 end
 
@@ -62,8 +68,29 @@ WeightCache(
     backend, pool, registry, mode, store, Int(max_bytes), 0, String[], 0, 0, 0.0, 0, 0, 0, 0, 0,
     Dict{String, ModelFootprint}(), 0.0, Float64(min_residency_seconds), VictimSearch(), 0, 0,
     host_budget === nothing ? nothing : Int(host_budget), Dict{String, Vector{Any}}(), String[], 0, 0, 0,
-    false, Set{String}(), ReentrantLock()
+    false, Set{String}(), 0.0, 0, 0.0, 0, ReentrantLock()
 )
+
+# How long the halves of one load took: the device transfer, and reading the weights file when the
+# load read it (`read === nothing` for a load from a host copy). Filled by `_device_buffers`.
+mutable struct LoadTiming
+    upload::Float64
+    read::Union{Float64, Nothing}
+end
+LoadTiming() = LoadTiming(0.0, nothing)
+
+_timed_upload!(::Nothing, seconds) = nothing
+_timed_upload!(t::LoadTiming, seconds) = (t.upload += seconds; nothing)
+_timed_read!(::Nothing, seconds) = nothing
+_timed_read!(t::LoadTiming, seconds) = (t.read = something(t.read, 0.0) + seconds; nothing)
+
+# Transfer host arrays to the device, timing the transfer as the upload half.
+function _timed_transfer(cache::WeightCache, arrays, timing)
+    t = time()
+    bufs = transfer_to_device(cache.backend, cache.pool, arrays)
+    _timed_upload!(timing, time() - t)
+    return bufs
+end
 
 """
     model_footprint(cache, entry) -> ModelFootprint
@@ -157,18 +184,21 @@ end
 # Transfer a model's weights to GPU buffers. When the weights are pinned in host RAM
 # (host_weights set, the normal on-demand case) this is a pure host->device transfer; under a host
 # weight budget it goes through the host cache; otherwise it reads the weights file.
-function _device_buffers(cache::WeightCache, entry::ModelEntry, model::LoadedModel; staged = nothing)
+function _device_buffers(
+        cache::WeightCache, entry::ModelEntry, model::LoadedModel; staged = nothing, timing = nothing
+    )
     if staged !== nothing
-        bufs = transfer_to_device(cache.backend, cache.pool, staged.arrays)
+        bufs = _timed_transfer(cache, staged.arrays, timing)
+        staged.hit || _timed_read!(timing, staged.host_seconds)
         _note_staged_load!(cache, entry, staged)
         return bufs
     end
     if model.host_weights !== nothing
-        return transfer_to_device(cache.backend, cache.pool, model.host_weights)
+        return _timed_transfer(cache, model.host_weights, timing)
     end
-    host_budgeted(cache) && return _load_via_host_cache(cache, cache.store, entry, model)
+    host_budgeted(cache) && return _load_via_host_cache(cache, cache.store, entry, model; timing = timing)
     _note_disk_load!(cache, entry)
-    return load_pinned_weights(cache.backend, cache.pool, entry.weights, model.sig.weight_names)
+    return load_pinned_weights(cache.backend, cache.pool, entry.weights, model.sig.weight_names; timing = timing)
 end
 
 """
@@ -293,11 +323,12 @@ function _upload_commit!(cache::WeightCache, entry::ModelEntry; fresh::Bool = tr
     fp = model_footprint(cache, entry)
     before = _memory_point(cache)
     # With weights pinned in host RAM this is a pure host->device copy, not a re-materialization.
+    timing = LoadTiming()
     t0 = time()
-    bufs = _device_buffers(cache, entry, model; staged = staged)
-    # A staged load read its weights earlier, off the dispatch loop; that read is part of what
-    # reloading the model costs, which is what the eviction priority weighs.
+    bufs = _device_buffers(cache, entry, model; staged = staged, timing = timing)
+    # End to end: a staged load read its weights earlier, off the dispatch loop.
     dt = time() - t0 + (staged === nothing ? 0.0 : staged.host_seconds)
+    upload = timing.upload > 0 ? timing.upload : dt - something(timing.read, 0.0)
     lock(cache.lock) do
         model.weights = bufs
         push!(cache.lru, entry.name)
@@ -305,11 +336,19 @@ function _upload_commit!(cache::WeightCache, entry::ModelEntry; fresh::Bool = tr
         cache.loads += 1
         cache.load_seconds += dt
         cache.load_bytes += fp.weight_bytes
+        cache.upload_seconds += upload
+        cache.upload_bytes += fp.weight_bytes
+        if timing.read !== nothing
+            cache.read_seconds += timing.read
+            cache.read_bytes += fp.weight_bytes
+        end
         record_load!(fp, dt)
+        record_load_halves!(fp, upload, timing.read)
         fp.loaded_at = time()
         if fresh
             fp.hits = 1
-            fp.priority = cache.inflation + _priority_gain(cache, fp)
+            fp.prio_base = cache.inflation
+            fp.priority = fp.prio_base + _priority_gain(cache, fp)
         end
     end
     log_memory_event(:load, entry.name, fp, before, _memory_point(cache))
@@ -567,6 +606,8 @@ function weight_cache_stats(cache::WeightCache)
             resident_bytes = cache.resident_bytes, max_bytes = cache.max_bytes,
             resident_models = copy(cache.lru), loads = cache.loads, evicts = cache.evicts,
             load_seconds = cache.load_seconds, compactions = cache.compactions,
+            upload_seconds = cache.upload_seconds, read_seconds = cache.read_seconds,
+            read_bytes = cache.read_bytes,
             pinned_bytes = cache.pinned_bytes, max_scratch = cache.max_scratch,
             weight_pool = cache.weight_pool, load_bytes = cache.load_bytes,
             fallback_compactions = cache.fallback_compactions,
@@ -577,6 +618,7 @@ function weight_cache_stats(cache::WeightCache)
                 name => (
                     weight_bytes = fp.weight_bytes, max_weight_bytes = fp.max_weight_bytes,
                     scratch_bytes = fp.scratch_bytes, load_seconds = fp.load_seconds, loads = fp.loads,
+                    upload_seconds = fp.upload_seconds, read_seconds = fp.read_seconds, reads = fp.reads,
                 ) for (name, fp) in cache.footprints
             ),
         )

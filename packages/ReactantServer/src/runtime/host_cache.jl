@@ -58,7 +58,9 @@ function _host_floor_bytes(cache::WeightCache)
     return total
 end
 
-function _load_via_host_cache(cache::WeightCache, store::SharedWeightStore, entry::ModelEntry, model::LoadedModel)
+function _load_via_host_cache(
+        cache::WeightCache, store::SharedWeightStore, entry::ModelEntry, model::LoadedModel; timing = nothing
+    )
     st = entry.weights
     names = model.sig.weight_names
     specs = [weight_spec(st, n) for n in names]
@@ -66,15 +68,17 @@ function _load_via_host_cache(cache::WeightCache, store::SharedWeightStore, entr
     # one worker and unpinned on another shares one region.
     digest = weights_digest(entry.name, specs; content = weights_file_token(entry.weights_id))
     fill! = function (arrays)
+        t = time()
         for (i, n) in enumerate(names)
             read_weight!(arrays[i], st, n)
         end
         _check_unmodified(entry)
+        _timed_read!(timing, time() - t)
         return
     end
     r = try
         with_cached_host_weights(store, entry.name, digest, specs, fill!) do arrays
-            transfer_to_device(cache.backend, cache.pool, arrays)
+            _timed_transfer(cache, arrays, timing)
         end
     catch err
         err isa SharedStoreFull || rethrow()
@@ -84,7 +88,7 @@ function _load_via_host_cache(cache::WeightCache, store::SharedWeightStore, entr
     if r === nothing                        # no room in the budget: load without caching
         lock(() -> cache.host_misses += 1, cache.lock)
         _note_disk_load!(cache, entry)
-        return load_pinned_weights(cache.backend, cache.pool, st, names)
+        return load_pinned_weights(cache.backend, cache.pool, st, names; timing = timing)
     end
     hit, bufs = r
     lock(cache.lock) do
@@ -94,10 +98,12 @@ function _load_via_host_cache(cache::WeightCache, store::SharedWeightStore, entr
     return bufs
 end
 
-function _load_via_host_cache(cache::WeightCache, ::WeightStore, entry::ModelEntry, model::LoadedModel)
+function _load_via_host_cache(
+        cache::WeightCache, ::WeightStore, entry::ModelEntry, model::LoadedModel; timing = nothing
+    )
     arrays = lock(() -> get(cache.host_cached, entry.name, nothing), cache.lock)
     if arrays !== nothing
-        bufs = transfer_to_device(cache.backend, cache.pool, arrays)
+        bufs = _timed_transfer(cache, arrays, timing)
         lock(cache.lock) do
             cache.host_hits += 1
             j = findfirst(==(entry.name), cache.host_lru)
@@ -106,9 +112,11 @@ function _load_via_host_cache(cache::WeightCache, ::WeightStore, entry::ModelEnt
         return bufs
     end
     _note_disk_load!(cache, entry)
+    t = time()
     arrays = materialize_host_weights(entry.weights, model.sig.weight_names)
     _check_unmodified(entry)
-    bufs = transfer_to_device(cache.backend, cache.pool, arrays)
+    _timed_read!(timing, time() - t)
+    bufs = _timed_transfer(cache, arrays, timing)
     lock(() -> cache.host_misses += 1, cache.lock)
     _cache_host!(cache, entry.name, arrays)
     return bufs
@@ -346,4 +354,28 @@ function release_staged!(cache::WeightCache, entry::ModelEntry, staged::StagedWe
         _cache_host!(cache, entry.name, arrays)
     end
     return nothing
+end
+
+"""
+    has_host_copy(cache, entry) -> Bool
+
+Whether reloading `entry` would find its weights in host RAM rather than read its weights file: a
+host floor (`residency: system`), a private cached copy, or its region in the shared store. For the
+shared store this is a snapshot of `/dev/shm` (another worker can evict the region at any moment),
+which is what an eviction estimate needs, not a guarantee. Admission asks it once per resident model
+it considers, not on every dispatch.
+"""
+function has_host_copy(cache::WeightCache, entry::ModelEntry)
+    model = entry.executable
+    model === nothing && return false
+    model.host_weights !== nothing && return true
+    host_budgeted(cache) || return false
+    store = cache.store
+    if store isa SharedWeightStore
+        names = model.sig.weight_names
+        specs = [weight_spec(entry.weights, n) for n in names]
+        digest = weights_digest(entry.name, specs; content = weights_file_token(entry.weights_id))
+        return cached_region_exists(store, entry.name, digest)
+    end
+    return lock(() -> haskey(cache.host_cached, entry.name), cache.lock)
 end

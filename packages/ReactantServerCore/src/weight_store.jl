@@ -613,6 +613,16 @@ function release_cached_host_weights!(store::SharedWeightStore, h::CachedHostWei
 end
 
 """
+    cached_region_exists(store, key, digest) -> Bool
+
+Whether the node cache holds a region for `key` at `digest`, ready or being filled. A snapshot: any
+worker can evict a holder-free region the next moment, so this estimates what a reload will find
+rather than guaranteeing it.
+"""
+cached_region_exists(store::SharedWeightStore, key, digest::UInt64) =
+    isfile("/dev/shm/" * store.prefix * "-" * _sanitize_name(key) * "-" * string(digest; base = 16))
+
+"""
     release_host_weights!(store, key) -> nothing
 
 Release a model's host weights. For [`SharedWeightStore`](@ref) this detaches the region and,

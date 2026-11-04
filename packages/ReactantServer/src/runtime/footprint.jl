@@ -29,6 +29,13 @@ mutable struct ModelFootprint
     priority::Float64           # H: inflation at last use + hits * reload seconds / weight bytes
     loaded_at::Float64          # time() of the last load, for the minimum-residency guard
     tensor_bytes::Vector{Int}   # each weight's rounded allocation, in upload order
+    # The two halves of a load, averaged separately because only the upload recurs while a host copy
+    # of the weights exists: the device transfer, and reading the weights file (seconds; 0.0 = not
+    # measured yet). `load_seconds` above stays the end-to-end figure, for observability.
+    upload_seconds::Float64
+    read_seconds::Float64
+    reads::Int                  # of `loads`, those that read the weights file
+    prio_base::Float64          # the inflation L at the model's last use; its priority is L + its gain
 end
 
 """
@@ -67,7 +74,7 @@ function _new_footprint(entry::ModelEntry, model::LoadedModel)
     w = sizes === nothing ? (weight_bytes = model.nbytes, max_weight_bytes = model.nbytes) :
         weight_footprint(sizes)
     tensors = sizes === nothing ? Int[model.nbytes] : Int[_alloc_rounded(n) for n in sizes]
-    return ModelFootprint(model, w.weight_bytes, w.max_weight_bytes, 0, 0.0, 0, 0, 0, 0.0, 0.0, tensors)
+    return ModelFootprint(model, w.weight_bytes, w.max_weight_bytes, 0, 0.0, 0, 0, 0, 0.0, 0.0, tensors, 0.0, 0.0, 0, 0.0)
 end
 
 # XLA's BFC allocator splits a free chunk for a request only when the chunk is at least twice the
@@ -109,9 +116,26 @@ end
 Fold one measured on-demand load time into the footprint's moving average.
 """
 function record_load!(fp::ModelFootprint, seconds::Real)
-    fp.load_seconds = fp.loads == 0 ? Float64(seconds) :
-        (1 - LOAD_SECONDS_ALPHA) * fp.load_seconds + LOAD_SECONDS_ALPHA * Float64(seconds)
+    fp.load_seconds = _load_ema(fp.load_seconds, seconds, fp.loads == 0)
     fp.loads += 1
+    return fp
+end
+
+_load_ema(avg, sample, first::Bool) =
+    first ? Float64(sample) : (1 - LOAD_SECONDS_ALPHA) * avg + LOAD_SECONDS_ALPHA * Float64(sample)
+
+"""
+    record_load_halves!(fp, upload_seconds, read_seconds) -> fp
+
+Fold one load's device transfer time, and its weights-file read time when it read the file
+(`read_seconds === nothing` for a load from a host copy), into the footprint's per-half averages.
+"""
+function record_load_halves!(fp::ModelFootprint, upload_seconds::Real, read_seconds::Union{Real, Nothing})
+    fp.upload_seconds = _load_ema(fp.upload_seconds, upload_seconds, fp.upload_seconds == 0.0)
+    if read_seconds !== nothing
+        fp.read_seconds = _load_ema(fp.read_seconds, read_seconds, fp.reads == 0)
+        fp.reads += 1
+    end
     return fp
 end
 

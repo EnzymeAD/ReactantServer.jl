@@ -21,13 +21,18 @@ function weight_order(st)
     throw(ErrorException("weights.safetensors has tensors but no 'argument_order' metadata"))
 end
 
-function load_pinned_weights(backend::AbstractBackend, pool::MemoryPool, st, names::Vector{String})
+function load_pinned_weights(backend::AbstractBackend, pool::MemoryPool, st, names::Vector{String}; timing = nothing)
     bufs = Vector{Any}(undef, length(names))
     try
         for (i, name) in enumerate(names)
             haskey(st, name) || throw(ErrorException("weight '$name' missing from safetensors"))
+            t = time()
             host = read_weight(st, name)             # a contiguous Array of the tensor's Julia shape
+            t1 = time()
             bufs[i] = to_device(backend, pool.client, host, pool.device)
+            # Read and upload alternate tensor by tensor, so each half is timed per tensor.
+            _timed_read!(timing, t1 - t)
+            _timed_upload!(timing, time() - t1)
         end
     catch
         _free_partial!(backend, bufs)

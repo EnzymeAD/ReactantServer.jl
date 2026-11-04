@@ -142,11 +142,14 @@ _frag_run(sched, name) = ReactantServer.run_model(
 )
 _resident(sched, name) = sched.registry.by_name[name].executable.weights !== nothing
 
-# Pin each model's reload cost so priorities depend only on use, not on timing noise.
+# Pin each model's reload cost so priorities depend only on use, not on timing noise: the whole cost
+# is the upload (the file read is pinned to next to nothing).
 function _set_reload!(sched, name, seconds)
     fp = sched.weight_cache.footprints[name]
-    fp.load_seconds = seconds
-    fp.priority = sched.weight_cache.inflation + ReactantServer._priority_gain(sched.weight_cache, fp)
+    fp.upload_seconds = seconds
+    fp.read_seconds = eps()
+    fp.prio_base = sched.weight_cache.inflation
+    fp.priority = fp.prio_base + ReactantServer._priority_gain(sched.weight_cache, fp)
     return nothing
 end
 
