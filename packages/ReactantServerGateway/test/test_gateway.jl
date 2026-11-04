@@ -563,6 +563,27 @@ end
         end
     end
 
+    @testset "the event-loop monitor sees the thread held, and counts a stall" begin
+        metrics = ReactantServerGateway.GatewayMetrics()
+        m = ReactantServerGateway.LoopMonitor(metrics; interval = 0.02, warn_after = 0.2)
+        ReactantServerGateway.start_loop_monitor!(m)
+        sleep(0.2)                                   # free ticks: each wakes about on time
+        t = time()
+        while time() - t < 0.4                       # hold the thread without yielding
+        end
+        sleep(0.2)                                   # let the monitor wake and record it
+        ReactantServerGateway.stop_loop_monitor!(m)
+        io = IOBuffer()
+        ReactantServerGateway.expose(io, metrics)
+        body = String(take!(io))
+        # The held tick is a stall; a first tick on a cold process can be one too (it compiles).
+        stalls = parse(Float64, match(r"^gateway_event_loop_stalls_total (\S+)$"m, body)[1])
+        @test stalls >= 1
+        count_ = parse(Float64, match(r"^gateway_event_loop_lag_seconds_count (\S+)$"m, body)[1])
+        under = parse(Float64, match(r"^gateway_event_loop_lag_seconds_bucket\{le=\"0.256\"\} (\S+)$"m, body)[1])
+        @test count_ >= 2 && under < count_          # some ticks were on time, at least one 0.4 s late
+    end
+
     @testset "latency buckets reach past a minute" begin
         # A 50 s request lands in a finite bucket (and matches the worker's buckets), not in +Inf.
         metrics = ReactantServerGateway.GatewayMetrics()
