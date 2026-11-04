@@ -395,15 +395,24 @@ function overview()
     )
     line!(
         b,
-        stat("Models", q("max(gateway_routing_table_size)"); w = 4, desc = "Models the gateway can route."),
-        stat("Resident on a device", q("sum(worker_models_resident{%W})"); w = 4, desc = "Model copies whose weights are on a device now, summed over workers."),
-        stat("Weight loads over the range", q("sum(increase(worker_weight_loads_total{%W}%rg))"); w = 4, decimals = 0),
+        stat("Models", q("max(gateway_routing_table_size)"); desc = "Models the gateway can route."),
+        stat("Resident on a device", q("sum(worker_models_resident{%W})"); desc = "Model copies whose weights are on a device now, summed over workers."),
+        stat("Weight loads over the range", q("sum(increase(worker_weight_loads_total{%W}%rg))"); decimals = 0),
         stat(
-            "Read from weights files", q("sum(increase(worker_weight_read_bytes_total{%W}%rg))"); w = 4, unit = "bytes",
+            "Read from weights files", q("sum(increase(worker_weight_read_bytes_total{%W}%rg))"); unit = "bytes",
             desc = "Loads that found no host copy and read the file. On a node whose host weight budget is below the total weights, this is the expensive part of churn."
         ),
-        stat("Repacks over the range", q("sum(increase(gateway_repacks_total%rg))"); w = 4, decimals = 0),
-        stat("Weights moved by repacks", q("sum(increase(gateway_repack_moved_bytes_total%rg))"); w = 4, unit = "bytes"),
+        stat(
+            "Fragmentation, worst worker", q("max(worker_device_memory_fragmentation{%W})"); unit = "percentunit", decimals = 0,
+            thresholds = steps("green", (0.3, "orange"), (0.6, "red")),
+            desc = "1 minus the largest free block over the free bytes. Memory and Weights shows each worker's arena."
+        ),
+        stat(
+            "Evictions for contiguity", q("sum(increase(worker_weight_evicts_total{%W,reason='contiguity'}%rg))"); decimals = 0,
+            thresholds = steps("green", (1, "orange")), desc = "Over the range: evictions made although enough bytes were free, because no block held the new weights."
+        ),
+        stat("Repacks over the range", q("sum(increase(gateway_repacks_total%rg))"); decimals = 0),
+        stat("Weights moved by repacks", q("sum(increase(gateway_repack_moved_bytes_total%rg))"); unit = "bytes"),
     )
 
     row!(b, "Traffic and latency")
@@ -583,7 +592,8 @@ function models()
             q(
                 "(sum by (model) (increase(worker_rows_served_total{%W,%M}%rg)) / (sum by (model) (increase(worker_dispatch_total{%W,%M}%rg)) > 0) / (max by (model) (worker_model_max_batch_size{%W,%M}) > 0)) and on (model) topk(%n, sum by (model) (increase(worker_dispatch_total{%W,%M}%rg)))";
                 legend = "{{model}}", instant = true
-            ); unit = "percentunit", min = 0, max = 1, links = model_links(), h = 10
+            ); unit = "percentunit", min = 0, max = 1, links = model_links(), h = 10,
+            color = D("mode" => "continuous-RdYlGr"), desc = "Green is fuller batches, red is emptier."
         ),
         ts(
             "Requests merged per dispatch, top N",
