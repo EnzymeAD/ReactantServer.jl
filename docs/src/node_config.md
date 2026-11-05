@@ -164,8 +164,12 @@ validated deployment should use.
 
 - `dynamic` (the default) watches the repository and loads, unloads, and reloads bundles online as
   their files change, including the weights, the MLIR, the manifest, and `model.jl`. A bundle must
-  look the same on two consecutive polls before it loads, so a half-written bundle never does, and
-  a reload swaps one model while every other model keeps serving. A renamed directory with
+  look the same on two consecutive polls before it loads, so a half-written bundle never does. A
+  load or reload compiles the bundle on the worker's dispatch loop, so every other model on that
+  worker pauses until the compile ends, and a reloaded model answers `NOT_FOUND` until its new
+  version is in. The loop shares a thread with request handling, so the worker's health probes
+  stall for that time as well. An executable-cache hit (`runtime.executable_cache`) keeps the pause
+  short; an uncached compile takes 5 to 30 seconds per compiled program. A renamed directory with
   unchanged contents renames the live model in place, without recompiling.
 - `static` loads the startup set once and never changes it.
 - `explicit` cedes the lifecycle to an external control plane: the worker takes no action of its

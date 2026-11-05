@@ -9,7 +9,10 @@
 #
 # All filesystem work (scanning, signatures, parsing) happens on this task; the actual swap goes
 # through the scheduler's control queue (`load_model!`/`evict!`), which runs the compile and the
-# device frees on the dispatch thread, stopping the world only for the duration of that one swap.
+# device frees on the dispatch loop. That stops the whole worker for the swap, not just the model:
+# no model dispatches, and the compile holds the interactive thread, so request intake and health
+# probes wait too. An executable-cache hit shortens it to a load; an uncached compile takes seconds
+# per compiled program.
 #
 # A change is acted on only once its signature is observed identical across two consecutive polls
 # (debounce), so a bundle still being copied in is not loaded half-written; `load_bundle_entry`'s
