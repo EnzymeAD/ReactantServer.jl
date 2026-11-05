@@ -23,7 +23,9 @@ that serves the model. On a multi-worker node it also serves the node's merged m
   operator-configured number of GPUs with coalescing-aware routing (`lpt_packing`); see
   [Scheduling modes](#Scheduling-modes) below. A third mode, `least_outstanding`, spreads by
   live occupancy. Either way, a request fails over to the remaining replicas when a worker
-  returns `NotFound` or `Unavailable`.
+  returns `NotFound` or `Unavailable`, or the call to it fails in the transport; every other
+  status reaches the client as the worker sent it (see
+  [Status codes and failover](#Status-codes-and-failover)).
 - **Readiness probe:** a background loop calls each worker's KServe `ServerReady` RPC; `/readyz`
   is ready when at least one worker reports ready.
 - **Raw passthrough:** the `ModelInfer` hot path never decodes or re-marshals the protobuf body.
@@ -458,6 +460,23 @@ installed.
     [Security](security.md)), so the gateway's gRPC port must not be exposed outside the
     trusted network.
 
+## Status codes and failover
+
+The gateway forwards a worker's gRPC status to the client unchanged, and moves a request on to
+the next replica only when the worker it tried could not serve it:
+
+| The worker call ended with | The gateway |
+| --- | --- |
+| `NOT_FOUND` (the model was unloaded there since the last discovery round) | tries the next replica and refreshes its routes |
+| `UNAVAILABLE` (the worker is shutting down, its dispatch loop died, or the model is not resident there) | tries the next replica |
+| a transport failure (connection refused or reset, a response that broke off, a client handle reset after a hung probe) | tries the next replica, as `UNAVAILABLE` |
+| any other status: `DEADLINE_EXCEEDED`, `INTERNAL`, `INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`, `FAILED_PRECONDITION`, `CANCELLED`, ... | returns it to the client as is |
+
+A deterministic failure (`INTERNAL`) or the request's own mistake (`INVALID_ARGUMENT`) would only
+repeat on another replica, a passed deadline cannot be met there either, and `RESOURCE_EXHAUSTED`
+and `FAILED_PRECONDITION` are signals the client acts on (back off; re-register shared memory).
+When every replica fails over, the client gets the last worker's status.
+
 ## What the gateway does not do
 
 - Streaming RPCs.
@@ -511,8 +530,9 @@ returning whether it reported ready.
   directly.
 - The routing table is rebuilt every 10s from each worker's `RepositoryIndex` and swapped in
   atomically. If a worker dies, its routes persist until the next successful probe (up to ~10s);
-  in the gap, requests to its models fail over to the remaining replicas (on `NotFound` or
-  `Unavailable`), and a model with no live replica returns `NotFound`. The worker-side readiness
+  in the gap, requests to its models fail over to the remaining replicas (on `NotFound`,
+  `Unavailable`, or a transport failure; see [Status codes and failover](#Status-codes-and-failover)),
+  and a model with no live replica returns `NotFound`. The worker-side readiness
   probe (`ServerReady`, same 10s loop) drives `/readyz` and the `gateway_worker_ready` metric.
 - Under `lpt_packing`, the gateway polls the workers on every 10s probe round to refresh routing
   metadata and accumulate consumed compute, but recomputes the placement only once the fleet has

@@ -17,22 +17,41 @@ struct GatewayState{P <: ClientPool, S <: GatewayScheduler}
     scheduler::S
 end
 
+# Gateway status string -> the gRPC code the client receives: the worker's own code, verbatim. A
+# worker shedding at its concurrency cap stays RESOURCE_EXHAUSTED (the standard signal to back off and
+# retry, which ReactantServerClient does within the request's deadline budget); a stale shared-memory
+# registration stays FAILED_PRECONDITION, so the client re-registers rather than retrying against
+# the same stale region (every worker would reject it alike, since the registration is host-global);
+# a deadline stays DEADLINE_EXCEEDED, so the client stops.
+const _CODE_BY_STATUS = Dict{String, gRPCServer.StatusCode.T}(
+    STATUS_OK => gRPCServer.StatusCode.OK,
+    STATUS_CANCELLED => gRPCServer.StatusCode.CANCELLED,
+    STATUS_UNKNOWN => gRPCServer.StatusCode.UNKNOWN,
+    STATUS_INVALID => gRPCServer.StatusCode.INVALID_ARGUMENT,
+    STATUS_DEADLINE => gRPCServer.StatusCode.DEADLINE_EXCEEDED,
+    STATUS_NOT_FOUND => gRPCServer.StatusCode.NOT_FOUND,
+    STATUS_ALREADY_EXISTS => gRPCServer.StatusCode.ALREADY_EXISTS,
+    STATUS_PERMISSION_DENIED => gRPCServer.StatusCode.PERMISSION_DENIED,
+    STATUS_RESOURCE_EXHAUSTED => gRPCServer.StatusCode.RESOURCE_EXHAUSTED,
+    STATUS_FAILED_PRE => gRPCServer.StatusCode.FAILED_PRECONDITION,
+    STATUS_ABORTED => gRPCServer.StatusCode.ABORTED,
+    STATUS_OUT_OF_RANGE => gRPCServer.StatusCode.OUT_OF_RANGE,
+    STATUS_UNIMPLEMENTED => gRPCServer.StatusCode.UNIMPLEMENTED,
+    STATUS_INTERNAL => gRPCServer.StatusCode.INTERNAL,
+    STATUS_UNAVAILABLE => gRPCServer.StatusCode.UNAVAILABLE,
+    STATUS_DATA_LOSS => gRPCServer.StatusCode.DATA_LOSS,
+    STATUS_UNAUTHENTICATED => gRPCServer.StatusCode.UNAUTHENTICATED,
+)
+
 # Map a gateway status string to a server-side gRPC exception with the matching code.
-function _server_exc(status::AbstractString, msg::AbstractString)
-    status == STATUS_NOT_FOUND && return gRPCServer.GRPCError(gRPCServer.StatusCode.NOT_FOUND, msg)
-    # A worker shedding at its concurrency cap is transient overload, so surface it verbatim as
-    # RESOURCE_EXHAUSTED (not FAILED_PRECONDITION): it is the standard signal for a client to back
-    # off and retry, which ReactantServerClient does within the request's deadline budget.
-    status == STATUS_RESOURCE_EXHAUSTED && return gRPCServer.GRPCError(gRPCServer.StatusCode.RESOURCE_EXHAUSTED, msg)
-    # A stale shared-memory registration surfaces as FAILED_PRECONDITION; preserve the code so the
-    # client re-registers and retries instead of treating it as a transient UNAVAILABLE. _try_replicas
-    # returns it immediately (no failover): the client's pool registration is host-global, so every
-    # worker rejects it identically until the client re-registers through the gateway's fan-out.
-    status == STATUS_FAILED_PRE && return gRPCServer.GRPCError(gRPCServer.StatusCode.FAILED_PRECONDITION, msg)
-    status == STATUS_INTERNAL && return gRPCServer.GRPCError(gRPCServer.StatusCode.INTERNAL, msg)
-    status == STATUS_INVALID && return gRPCServer.GRPCError(gRPCServer.StatusCode.INVALID_ARGUMENT, msg)
-    return gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, msg)
-end
+_server_exc(status::AbstractString, msg::AbstractString) =
+    gRPCServer.GRPCError(get(_CODE_BY_STATUS, status, gRPCServer.StatusCode.UNKNOWN), msg)
+
+# The worker failures a request moves on to the next replica for: the model is not there (NOT_FOUND:
+# unloaded since discovery) or the worker cannot serve right now (UNAVAILABLE: shutting down, its
+# dispatch loop died, the model not resident there, or the call failed in the transport). Every other
+# status is the request's own outcome and would only repeat on another replica.
+_fails_over(status::AbstractString) = status == STATUS_NOT_FOUND || status == STATUS_UNAVAILABLE
 
 # --- ModelInfer -------------------------------------------------------------------------------
 
@@ -87,9 +106,10 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64)
 end
 
 # Try the replicas in order (urls[1] is the round-robin choice; the rest are failover targets),
-# moving on only for a retryable status (worker NotFound or Unavailable). A worker NOT_FOUND means
-# the model was unloaded there since discovery, so kick an async route refresh to drop the stale
-# route (the request itself still fails over / returns the error; it is not retried after refresh).
+# moving on only for a retryable status (`_fails_over`: worker NotFound or Unavailable, a transport
+# failure included); every other status reaches the client verbatim. A worker NOT_FOUND means the
+# model was unloaded there since discovery, so kick an async route refresh to drop the stale route
+# (the request itself still fails over / returns the error; it is not retried after refresh).
 function _try_replicas(st::GatewayState, urls, model, id, body, deadline_ns::Int64)
     last_status = STATUS_UNAVAILABLE
     last_exc = gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, "no replica available")
@@ -97,9 +117,8 @@ function _try_replicas(st::GatewayState, urls, model, id, body, deadline_ns::Int
         resp, status, exc = _post_infer(st, url, model, id, body, deadline_ns)
         exc === nothing && return resp, status, nothing
         status == STATUS_NOT_FOUND && request_refresh!(st.refresher)
+        _fails_over(status) || return nothing, status, exc
         last_status, last_exc = status, exc
-        (status == STATUS_NOT_FOUND || status == STATUS_UNAVAILABLE) && continue
-        return nothing, status, exc
     end
     return nothing, last_status, last_exc
 end

@@ -76,6 +76,26 @@ const GWInf = ReactantServerGateway.inference
     @test ReactantServerGateway.peek_model_name_and_id(det) == ("det", "r1")
 end
 
+@testset "invoke_infer: a transport failure is UNAVAILABLE" begin
+    GW = ReactantServerGateway
+    body = UInt8[0x0a, 0x01, 0x61]
+    # Nothing listens: libcurl's connect error comes back from gRPCClient as INTERNAL, the code a
+    # worker sends for its own failures. It must fail over, so it is UNAVAILABLE here.
+    port = grpc_free_port()
+    grpc = gRPCClient.gRPCCURL(; sticky = true)
+    chan = gRPCClient.gRPCChannel("127.0.0.1", port; grpc = grpc, deadline = 5)
+    wc = GW.WorkerClients("127.0.0.1:$port", grpc, chan, 5.0, 5.0)
+    err = try
+        GW.invoke_infer(wc, body)
+    catch e
+        e
+    end
+    @test err isa gRPCClient.gRPCServiceCallException
+    @test err.grpc_status == gRPCClient.GRPC_UNAVAILABLE
+    @test GW.client_status(err) == GW.STATUS_UNAVAILABLE
+    gRPCClient.grpc_shutdown(grpc)
+end
+
 mutable struct MockWorker
     name::String
     models::Vector{String}     # models this worker reports READY via RepositoryIndex
@@ -87,9 +107,10 @@ mutable struct MockWorker
     metadata::Symbol            # the metadata RPCs: :ok, :down (UNAVAILABLE), :old (UNIMPLEMENTED)
     fail_invalid::Bool          # reject ModelInfer with INVALID_ARGUMENT (e.g. an unknown requested output)
     infer_calls::Int            # ModelInfer calls received, so a test can see whether the gateway failed over
+    fail_code::Any              # reject ModelInfer with this gRPCServer.StatusCode, or nothing
 end
 MockWorker(name, models, fail_infer, fail_shm, fail_exhausted) =
-    MockWorker(name, models, fail_infer, fail_shm, fail_exhausted, false, String[], :ok, false, 0)
+    MockWorker(name, models, fail_infer, fail_shm, fail_exhausted, false, String[], :ok, false, 0, nothing)
 
 # The metadata RPCs' failure modes, and whether the mock serves `name` at all.
 function _mock_metadata_check(w::MockWorker)
@@ -123,6 +144,7 @@ function _mock_server(worker::MockWorker)
             w.fail_infer && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, "mock $(w.name) down"))
             w.fail_invalid && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.INVALID_ARGUMENT, "requested output 'x' is not produced by the model"))
             w.fail_exhausted && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.RESOURCE_EXHAUSTED, "mock $(w.name) at capacity"))
+            w.fail_code === nothing || throw(gRPCServer.GRPCError(w.fail_code, "mock $(w.name) failed with $(w.fail_code)"))
             w.empty_infer && return GWInf.ModelInferResponse()   # every field default: encodes to 0 bytes
             # A real worker NOT_FOUNDs a model it no longer serves; mirror that so the gateway's
             # unloaded-model handling (route refresh on worker NOT_FOUND) can be exercised.
@@ -331,6 +353,48 @@ end
             @test occursin("is not produced by the model", err.message)
             @test w0.infer_calls + w1.infer_calls == 1
             w0.fail_invalid = w1.fail_invalid = false
+        end
+
+        @testset "a worker's status reaches the client verbatim; only NOT_FOUND and UNAVAILABLE fail over" begin
+            # Before, the gateway folded DEADLINE_EXCEEDED, INTERNAL, CANCELLED and the rest into
+            # UNAVAILABLE and failed over, so a deterministic failure ran on every replica and then
+            # again on each client retry, and a client never saw that its deadline had passed.
+            S = gRPCServer.StatusCode
+            calls() = w0.infer_calls + w1.infer_calls
+            outcome(model) = try
+                _infer(gw_port, model)
+                nothing
+            catch e
+                e
+            end
+            try
+                for code in (
+                        S.DEADLINE_EXCEEDED, S.INTERNAL, S.CANCELLED, S.UNKNOWN, S.ABORTED,
+                        S.UNIMPLEMENTED, S.OUT_OF_RANGE, S.PERMISSION_DENIED, S.DATA_LOSS,
+                        S.ALREADY_EXISTS, S.UNAUTHENTICATED, S.FAILED_PRECONDITION,
+                        S.RESOURCE_EXHAUSTED,
+                    )
+                    w0.fail_code = w1.fail_code = code
+                    w0.infer_calls = w1.infer_calls = 0
+                    err = outcome("replicated")
+                    @test err isa gRPCClient.gRPCServiceCallException
+                    @test err.grpc_status == Int(code)
+                    @test calls() == 1
+                end
+                for code in (S.NOT_FOUND, S.UNAVAILABLE)
+                    w0.fail_code = w1.fail_code = code
+                    w0.infer_calls = w1.infer_calls = 0
+                    err = outcome("replicated")
+                    @test err isa gRPCClient.gRPCServiceCallException
+                    @test err.grpc_status == Int(code)
+                    @test calls() == 2
+                end
+                # A replica that is merely unavailable is skipped for a healthy one.
+                w0.fail_code, w1.fail_code = S.UNAVAILABLE, nothing
+                @test all(_ -> outcome("replicated") === nothing, 1:4)
+            finally
+                w0.fail_code = w1.fail_code = nothing
+            end
         end
 
         @testset "SHM register fan-out and rollback" begin

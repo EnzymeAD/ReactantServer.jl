@@ -5,7 +5,8 @@
 # serializes ModelInfer against a worker while a SHM register/unregister to that worker is in flight
 # (POSIX shm registration is host-global).
 
-# Status strings surfaced to clients and recorded in metrics, mirroring the Go gateway.
+# Status strings surfaced to clients and recorded in metrics, mirroring the Go gateway. There is
+# one for every gRPC code, so a worker's code reaches the client verbatim (see `client_status`).
 const STATUS_OK = "OK"
 const STATUS_NOT_FOUND = "NotFound"
 const STATUS_UNAVAILABLE = "Unavailable"
@@ -14,6 +15,36 @@ const STATUS_INVALID = "InvalidArgument"
 const STATUS_FAILED_PRE = "FailedPrecondition"
 const STATUS_INTERNAL = "Internal"
 const STATUS_DEADLINE = "DeadlineExceeded"
+const STATUS_CANCELLED = "Cancelled"
+const STATUS_UNKNOWN = "Unknown"
+const STATUS_ALREADY_EXISTS = "AlreadyExists"
+const STATUS_PERMISSION_DENIED = "PermissionDenied"
+const STATUS_ABORTED = "Aborted"
+const STATUS_OUT_OF_RANGE = "OutOfRange"
+const STATUS_UNIMPLEMENTED = "Unimplemented"
+const STATUS_DATA_LOSS = "DataLoss"
+const STATUS_UNAUTHENTICATED = "Unauthenticated"
+
+# gRPC status code -> gateway status string.
+const _STATUS_BY_CODE = Dict{Int, String}(
+    gRPCClient.GRPC_OK => STATUS_OK,
+    gRPCClient.GRPC_CANCELLED => STATUS_CANCELLED,
+    gRPCClient.GRPC_UNKNOWN => STATUS_UNKNOWN,
+    gRPCClient.GRPC_INVALID_ARGUMENT => STATUS_INVALID,
+    gRPCClient.GRPC_DEADLINE_EXCEEDED => STATUS_DEADLINE,
+    gRPCClient.GRPC_NOT_FOUND => STATUS_NOT_FOUND,
+    gRPCClient.GRPC_ALREADY_EXISTS => STATUS_ALREADY_EXISTS,
+    gRPCClient.GRPC_PERMISSION_DENIED => STATUS_PERMISSION_DENIED,
+    gRPCClient.GRPC_RESOURCE_EXHAUSTED => STATUS_RESOURCE_EXHAUSTED,
+    gRPCClient.GRPC_FAILED_PRECONDITION => STATUS_FAILED_PRE,
+    gRPCClient.GRPC_ABORTED => STATUS_ABORTED,
+    gRPCClient.GRPC_OUT_OF_RANGE => STATUS_OUT_OF_RANGE,
+    gRPCClient.GRPC_UNIMPLEMENTED => STATUS_UNIMPLEMENTED,
+    gRPCClient.GRPC_INTERNAL => STATUS_INTERNAL,
+    gRPCClient.GRPC_UNAVAILABLE => STATUS_UNAVAILABLE,
+    gRPCClient.GRPC_DATA_LOSS => STATUS_DATA_LOSS,
+    gRPCClient.GRPC_UNAUTHENTICATED => STATUS_UNAUTHENTICATED,
+)
 
 # A worker's gRPC connection: one per-worker libcurl multi handle (`grpc`) and the channel over it
 # that every RPC to the worker uses. Each worker gets its own gRPCCURL: HTTP/2 multiplexing only
@@ -104,11 +135,29 @@ end
 #
 # A call on a handle that `reset_clients!` has shut down (a worker probe hit its deadline) fails
 # with UNAVAILABLE, so it fails over like any other unavailable worker rather than reaching the
-# client as the worker's stale shared-memory signal (FAILED_PRECONDITION).
+# client as the worker's stale shared-memory signal (FAILED_PRECONDITION). So does a call the
+# transport failed (a refused or reset connection, a response that broke off): gRPCClient reports
+# those as INTERNAL, the same code a worker sends for its own failures, so they are told apart
+# here, where the call itself is at hand, and only the worker's INTERNAL reaches the client as such.
 function invoke_infer(wc::WorkerClients, body::Vector{UInt8}; deadline::Union{Real, Nothing} = nothing)
-    return deadline === nothing ? GRPCInferenceService.ModelInfer(wc.chan, body, Vector{UInt8}) :
-        GRPCInferenceService.ModelInfer(wc.chan, body, Vector{UInt8}; deadline = deadline)
+    rpc = deadline === nothing ? GRPCInferenceService.ModelInfer(wc.chan, body, gRPCClient.gRPCAsync()) :
+        GRPCInferenceService.ModelInfer(wc.chan, body, gRPCClient.gRPCAsync(); deadline = deadline)
+    req = rpc.req
+    try
+        return gRPCClient.grpc_async_await(req, Vector{UInt8})
+    catch e
+        e isa gRPCClient.gRPCServiceCallException || rethrow()
+        _transport_failure(req, e) || rethrow()
+        throw(gRPCClient.gRPCServiceCallException(gRPCClient.GRPC_UNAVAILABLE, "transport error: $(e.message)"))
+    end
 end
+
+# Whether a failed call ended in the transport rather than with a status the worker sent. A worker's
+# status arrives as the call's `grpc-status` with no local exception recorded; a call that broke off
+# records none and has no status, and libcurl's error comes back as INTERNAL. A call failed locally for
+# any other reason (its deadline, a cancellation, a shut-down handle) keeps the code it was given.
+_transport_failure(req::gRPCClient.gRPCRequest, e::gRPCClient.gRPCServiceCallException) =
+    e.grpc_status == gRPCClient.GRPC_INTERNAL && req.ex === nothing && req.grpc_status == gRPCClient.GRPC_OK
 invoke_shm_register(wc::WorkerClients, body::Vector{UInt8}) =
     GRPCInferenceService.SystemSharedMemoryRegister(wc.chan, body, Vector{UInt8})
 invoke_shm_unregister(wc::WorkerClients, body::Vector{UInt8}) =
@@ -180,25 +229,13 @@ function discover_models(wc::WorkerClients)
     end
 end
 
-# Map a client-side gRPC status code to one of the gateway's status strings.
-function client_status(e::gRPCClient.gRPCServiceCallException)
-    st = e.grpc_status
-    st == gRPCClient.GRPC_NOT_FOUND && return STATUS_NOT_FOUND
-    st == gRPCClient.GRPC_RESOURCE_EXHAUSTED && return STATUS_RESOURCE_EXHAUSTED
-    # A stale shared-memory registration (region unknown after a worker restart) comes back as
-    # FAILED_PRECONDITION; forward it verbatim so the client can re-register and retry, rather than
-    # folding it into UNAVAILABLE (which the client would blindly retry against the same stale region).
-    st == gRPCClient.GRPC_FAILED_PRECONDITION && return STATUS_FAILED_PRE
-    # A deadline observed at the worker (admission shed, server-enforced grpc-timeout, or a
-    # local curl timeout) is a distinct outcome from a worker being down; give it its own status
-    # so metrics and logs do not fold it into STATUS_UNAVAILABLE.
-    st == gRPCClient.GRPC_DEADLINE_EXCEEDED && return STATUS_DEADLINE
-    # A worker that rejects the request itself (an output the model does not produce, a malformed
-    # input) would reject it on every replica; forward it so the gateway neither fails over nor
-    # turns a caller's mistake into a retryable UNAVAILABLE.
-    st == gRPCClient.GRPC_INVALID_ARGUMENT && return STATUS_INVALID
-    return STATUS_UNAVAILABLE
-end
+# Map a client-side gRPC status code to the gateway's status string for the same code. Every code
+# keeps its identity: a worker's FAILED_PRECONDITION (a stale shared-memory registration) must reach
+# the client so it re-registers, its DEADLINE_EXCEEDED so the client stops rather than retries, its
+# INVALID_ARGUMENT because every replica would reject the same request, and its INTERNAL because a
+# deterministic failure would only fail again elsewhere. A transport failure arrives here already as
+# UNAVAILABLE (see `invoke_infer`). Which statuses fail over is `_fails_over`'s call.
+client_status(e::gRPCClient.gRPCServiceCallException) = get(_STATUS_BY_CODE, Int(e.grpc_status), STATUS_UNKNOWN)
 
 # --- RegisterGate -----------------------------------------------------------------------------
 
