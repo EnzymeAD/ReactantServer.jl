@@ -170,7 +170,8 @@ validated deployment should use.
   version is in. The loop shares a thread with request handling, so the worker's health probes
   stall for that time as well. An executable-cache hit (`runtime.executable_cache`) keeps the pause
   short; an uncached compile takes 5 to 30 seconds per compiled program. A renamed directory is an
-  unload of the old name and a load of the new one.
+  unload of the old name and a load of the new one. A bundle whose files change while it loads is
+  not admitted: the next poll loads it again from the files as they are then.
 - `static` loads the startup set once and never changes it.
 - `explicit` cedes the lifecycle to an external control plane: the worker takes no action of its
   own, and a model serves only while the control plane holds it resident through the worker

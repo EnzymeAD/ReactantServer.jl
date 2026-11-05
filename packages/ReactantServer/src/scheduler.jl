@@ -1916,18 +1916,23 @@ function evict!(s::Scheduler, name::AbstractString)
 end
 
 """
-    load_model!(scheduler, backend, pool, entry; state, on_demand, store) -> String
+    load_model!(scheduler, backend, pool, entry; state, on_demand, store, unchanged) -> Union{String, Nothing}
 
 Compile and admit a freshly loaded (uncompiled) bundle `entry`, replacing any existing model of
 the same name. Runs entirely on the dispatch thread inside one control op (a stop-the-world swap):
 any existing model is evicted first so its device memory is freed before the new artifact is
 compiled, then the new entry is compiled (`build_loaded_model`) and admitted. This is the dynamic
 directory watcher's load/reload path. Returns the model name.
+
+`unchanged()` says whether the bundle's files are still the ones `entry` was read from. It is asked
+before the control op, where `false` leaves any existing model serving, and again once the new
+version is compiled, before it is admitted, where `false` discards it (the existing model is gone by
+then). Either way the entry is never admitted and `nothing` is returned.
 """
 function load_model!(
         s::Scheduler, backend::AbstractBackend, pool::MemoryPool, entry::ModelEntry;
         state::ResidencyState, on_demand::Bool, store::WeightStore = PrivateWeightStore(),
-        executable_cache::Bool = false
+        executable_cache::Bool = false, unchanged::Function = () -> true
     )
     # Read the weights before the control op, which runs on the dispatch loop: a device-resident
     # model's host arrays (and a CPU worker's, which keeps every model resident), or an on-demand
@@ -1945,6 +1950,8 @@ function load_model!(
     end
     defer_floor = on_demand && state == PINNED_SYSTEM
     name = try
+        # The files changed while the weights were read: keep the running version, try again later.
+        unchanged() || (close_weights!(entry.weights); return nothing)
         _run_control(
             s, function (sch)
                 _evict_entry!(sch, entry.name)          # no-op on a fresh load; frees device memory on reload
@@ -1954,6 +1961,8 @@ function load_model!(
                     executable_cache = executable_cache, host_arrays = host_arrays,
                     defer_floor = defer_floor
                 )
+                # Changed during the compile: this version may mix old and new files. Never admit it.
+                unchanged() || (_discard_unadmitted!(sch, entry); return nothing)
                 n = _admit_entry!(sch, entry; staged = staged)
                 _reprobe_after_load!(sch, entry)
                 return n
@@ -1962,8 +1971,20 @@ function load_model!(
     finally
         staged === nothing || release_staged!(s.weight_cache, entry, staged; uploaded = false)
     end
+    name === nothing && return nothing
     defer_floor && _attach_floor!(s, entry, store, names)
     return name
+end
+
+# Free what `build_loaded_model` gave an entry that is then not admitted (see `load_model!`): the
+# releases `_evict_entry!` makes, for an entry that never reached the registry. Dispatch thread.
+function _discard_unadmitted!(sch::Scheduler, entry::ModelEntry)
+    sch.weight_cache === nothing || release_all!(sch.weight_cache, entry)
+    close_weights!(entry.weights)
+    for inner in values(entry.executable.execs), exec in values(inner)
+        free_executable!(sch.backend, exec)
+    end
+    return nothing
 end
 
 # Give a hot-loaded system-pinned model its host floor: read it off the dispatch loop, then commit

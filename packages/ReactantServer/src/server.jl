@@ -224,9 +224,12 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     probe = pool.platform == "cuda" ? tf32_probe(backend, pool) : nothing
     cfg.runtime.profile == PROFILE_REGULATED && _report_regulated_precision(cfg.runtime, backend, pool, probe; coalescing = cfg.scheduler.coalescing)
     include = isempty(cfg.models_include) ? nothing : cfg.models_include
+    # Each bundle's signature as it was read: the directory watcher starts from these, so a bundle
+    # added, changed or removed while the models below compile is a change to its first polls.
+    signatures = Dict{String, BundleSig}()
     registry = load_bundles(
         cfg.model_dirs; include = include, batch_sizes = cfg.runtime.batch_sizes,
-        weights_migration = cfg.runtime.weights_migration
+        weights_migration = cfg.runtime.weights_migration, signatures = signatures
     )
     isempty(registry.by_name) && @warn "no model bundles found" model_dirs = cfg.model_dirs models_include = cfg.models_include
     # Resident weights are sized as a share of the BFC arena (`device_memory_fraction * device`), resolved now
@@ -312,7 +315,7 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
         watcher = BundleWatcher(
             sched, backend, pool, cfg;
             interval = cfg.model_poll_seconds, on_demand = on_demand,
-            store = store, include = include_names
+            store = store, include = include_names, seen = signatures
         )
         start_watching!(watcher)
     end

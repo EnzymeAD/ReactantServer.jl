@@ -16,6 +16,11 @@
 # A change is acted on only once its signature is observed identical across two consecutive polls
 # (debounce), so a bundle still being copied in is not loaded half-written; `load_bundle_entry`'s
 # validation is the backstop. A failed load/reload is logged and retried on the next poll.
+#
+# A load records the signature the files had when they were read, not when the load ended, and a
+# new version is admitted only if the files still have that signature once it is built. A bundle
+# that changed while it loaded (a deploy landing mid-compile) is not admitted; the poll after loads
+# it again from the files as they are then.
 
 # A bundle's on-disk fingerprint: (filename, mtime, size) for each file that defines it. Two equal
 # signatures mean the bundle is unchanged.
@@ -71,7 +76,9 @@ end
 Background poller for one worker's model repository. Construct it with the running [`Scheduler`](@ref),
 the runtime `backend`/`pool`, the resolved [`ServerConfig`](@ref), and the residency knobs
 (`on_demand`, `store`) the worker resolved at startup, then [`start_watching!`](@ref) it. Stop it
-with [`stop_watching!`](@ref).
+with [`stop_watching!`](@ref). `seen` is what the scheduler has loaded: each model's bundle
+signature as it was read (`load_bundles`' `signatures`), so that a bundle changed, added or removed
+since is a change. Without it, the repository as it is now is taken to be what is loaded.
 """
 mutable struct BundleWatcher
     scheduler::Scheduler
@@ -93,23 +100,41 @@ function BundleWatcher(
         sched::Scheduler, backend::AbstractBackend, pool::MemoryPool,
         cfg::ServerConfig; interval::Real, on_demand::Bool,
         store::WeightStore = PrivateWeightStore(),
-        include::Union{Nothing, AbstractVector} = nothing
+        include::Union{Nothing, AbstractVector} = nothing,
+        seen::Union{Nothing, AbstractDict} = nothing
     )
     inc = include === nothing ? nothing : Set{String}(String(x) for x in include)
-    # Seed `seen` from what is on disk now: it matches what `_bring_up` just loaded, so the first
-    # poll is a no-op for the startup models and only later changes are acted on.
-    initial = scan_repository(cfg.model_dirs, inc)
-    seen = Dict{String, BundleSig}(name => cs[2] for (name, cs) in initial)
+    # `_bring_up` passes the signatures its bundles had when they were read, before compiling them:
+    # what is on disk by now can be newer, and seeding from it would take a bundle that changed
+    # during the startup compile as loaded.
+    loaded = if seen === nothing
+        Dict{String, BundleSig}(name => cs[2] for (name, cs) in scan_repository(cfg.model_dirs, inc))
+    else
+        Dict{String, BundleSig}(seen)
+    end
     return BundleWatcher(
         sched, backend, pool, cfg, copy(cfg.model_dirs), inc, on_demand, store,
-        Float64(interval), seen,
+        Float64(interval), loaded,
         Dict{String, Union{BundleSig, Nothing}}(), false, nothing
     )
 end
 
+# The signature of the bundle in `dir` now, or `nothing` when it is gone (no manifest), as
+# `scan_repository` would see it. Never raises: a directory that disappears midway reads as gone.
+function _signature_now(dir::AbstractString)
+    try
+        isfile(joinpath(dir, "manifest.yaml")) || return nothing
+        return bundle_signature(dir)
+    catch
+        return nothing
+    end
+end
+
 # Apply a single confirmed change. `desired === nothing` means the bundle is gone (unload); a
 # BundleSig means load or reload from `dir`. Failures are logged and not propagated: `seen` is left
-# untouched on a load failure so the next poll retries.
+# untouched on a load failure so the next poll retries. A load whose files changed before the new
+# version was admitted is not admitted; it is left pending at what is on disk then, so the next poll
+# loads it again once that has held still.
 function _apply_change!(
         w::BundleWatcher, name::AbstractString,
         desired::Union{BundleSig, Nothing}, dir::Union{String, Nothing}
@@ -126,26 +151,32 @@ function _apply_change!(
                 unload_model!(w.scheduler, name)
             delete!(w.seen, name)
         else
-            # named by its directory basename, i.e. `name`
+            # named by its directory basename, i.e. `name`. `read_sig` is the signature of the files
+            # the entry is built from: taken after a weights migration rewrites them (so the
+            # migration is not a change of its own) and before they are read.
+            read_sig = Ref{BundleSig}()
             entry = load_bundle_entry(
                 dir; batch_sizes = w.cfg.runtime.batch_sizes,
-                weights_migration = w.cfg.runtime.weights_migration
+                weights_migration = w.cfg.runtime.weights_migration, signature = read_sig
             )
-            if entry isa MetaEntry
+            unchanged = () -> _signature_now(dir) == read_sig[]
+            admitted = if entry isa MetaEntry
                 # Meta bundles need no compilation; register them straight into the meta map.
-                put_meta!(w.scheduler, entry)
+                unchanged() && (put_meta!(w.scheduler, entry); true)
             else
                 state = _resolve_residency(w.cfg, name, w.on_demand)
                 load_model!(
                     w.scheduler, w.backend, w.pool, entry;
                     state = state, on_demand = w.on_demand, store = w.store,
-                    executable_cache = w.cfg.runtime.executable_cache
-                )
+                    executable_cache = w.cfg.runtime.executable_cache, unchanged = unchanged
+                ) !== nothing
             end
-            # Record the bundle as loaded, not as detected: a weights migration during the load
-            # rewrites its files, and the pre-migration signature would make the next poll see that
-            # as a change and reload the model a second time.
-            w.seen[name] = bundle_signature(dir)
+            if !admitted
+                @warn "watcher: bundle files changed while the model loaded; not admitted, loading it again on the next poll" name
+                w.pending[name] = _signature_now(dir)
+                return nothing
+            end
+            w.seen[name] = read_sig[]
         end
         # On the heartbeat as well as in the log: a hot-load is an event a supervisor wants to see
         # (it is the server doing work), and a log line is not something another process can
@@ -176,10 +207,10 @@ function _watch_once!(w::BundleWatcher)
             next_pending[name] = d
         end
     end
+    w.pending = next_pending           # before applying: a load that saw its files change adds to it
     for (name, d) in confirmed
         _apply_change!(w, name, d, d === nothing ? nothing : current[name][1])
     end
-    w.pending = next_pending
     return nothing
 end
 

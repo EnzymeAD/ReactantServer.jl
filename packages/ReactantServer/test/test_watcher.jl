@@ -179,6 +179,148 @@ end
     end
 end
 
+# A second program for the scale bundle: y = x .* w .+ x, so a version switch shows in the output.
+const _W_MLIR_PLUS_X = """
+module {
+  func.func @main(%x: tensor<4xf32>, %w: tensor<4xf32>) -> tensor<4xf32> {
+    %0 = stablehlo.multiply %x, %w : tensor<4xf32>
+    %1 = stablehlo.add %0, %x : tensor<4xf32>
+    return %1 : tensor<4xf32>
+  }
+}
+"""
+
+# A model.jl that, the first time the loader includes it, replaces its bundle's model.mlir with
+# `mlir` and makes each `moves` rename: files changing after the loader read them, as a deploy
+# landing during a load does. The loader reads model.mlir before it includes model.jl.
+function _change_once_jl(name, mlir; moves = Pair{String, String}[])
+    lines = String[
+        "let dir = @__DIR__",
+        "    if !isfile(joinpath(dir, \"changed.flag\"))",
+        "        write(joinpath(dir, \"changed.flag\"), \"\")",
+        "        cp($(repr(mlir)), joinpath(dir, \"model.mlir\"); force = true)",
+    ]
+    for (a, b) in moves
+        push!(lines, "        mv($(repr(a)), $(repr(b)))")
+    end
+    append!(lines, ["    end", "end", "register_model($(repr(name)))"])
+    return join(lines, "\n") * "\n"
+end
+
+# A CPU scheduler, started, and a dynamic-mode config over `root`.
+function _cpu_watch_env(root; poll = 1.0)
+    backend = ReactantServer.ReactantBackend()
+    runtime = ReactantServer.RuntimeConfig(ReactantServer.CPU_BACKEND, 0, 0.9, true, true)
+    pool = ReactantServer.resolve_client(backend, runtime)
+    reg = ReactantServer.ModelRegistry()
+    sched = ReactantServer.Scheduler(reg, backend, pool, ReactantServer.SchedulerConfig(30.0, 64, 30.0))
+    cfg = ReactantServer.ServerConfig(
+        [root], "", runtime, ReactantServer.SchedulerConfig(30.0, 64, 30.0),
+        ReactantServer.EndpointsConfig("127.0.0.1", 0), String[], Float64(poll), ReactantServer.DYNAMIC
+    )
+    return (; backend, pool, reg, sched, cfg)
+end
+
+_y(sched, name) = infer(sched, InferRequest(name, ["y"], [NamedTensor("x", Float32[1, 2, 3, 4])]))[1].data
+
+@testset "a bundle whose files change while it loads is not admitted, and loads again next poll (CPU)" begin
+    mktempdir() do root
+        env = _cpu_watch_env(root)
+        ReactantServer.start!(env.sched)
+        w = BundleWatcher(env.sched, env.backend, env.pool, env.cfg; interval = 0.1, on_demand = false)
+        stage = mktempdir()
+        try
+            dir = _write_scale_bundle(root, "m")
+            @test _poll_action(w) === nothing
+            @test _poll_action(w) === :load
+            v1 = get_model(env.reg, "m")
+            @test _y(env.sched, "m") == Float32[2, 4, 6, 8]
+
+            # A redeploy whose model.mlir is replaced again while the reload reads the bundle.
+            plus_x = joinpath(stage, "model.mlir")
+            write(plus_x, stablehlo_artifact(_W_MLIR_PLUS_X))
+            write(joinpath(dir, "model.jl"), _change_once_jl("m", plus_x))
+            @test _poll_action(w) === nothing
+            @test _poll_action(w) === :reload
+            # Not admitted: the running version stays (the change was seen before its control op).
+            @test get_model(env.reg, "m") === v1
+            @test _y(env.sched, "m") == Float32[2, 4, 6, 8]
+            # The change is already pending, at the files as they are now, so the next poll reloads.
+            @test _poll_action(w) === :reload
+            @test get_model(env.reg, "m") !== v1
+            @test _y(env.sched, "m") == Float32[3, 6, 9, 12]     # the program that landed mid-load
+            @test _poll_action(w) === nothing
+            @test _poll_action(w) === nothing
+        finally
+            ReactantServer.shutdown!(env.sched)
+        end
+    end
+end
+
+@testset "load_model!: a version whose files changed during the load is never admitted (CPU)" begin
+    mktempdir() do root
+        env = _cpu_watch_env(root)
+        ReactantServer.start!(env.sched)
+        dir = _write_scale_bundle(root, "m")
+        function load(unchanged)
+            entry = ReactantServer.load_bundle_entry(dir)
+            name = ReactantServer.load_model!(
+                env.sched, env.backend, env.pool, entry;
+                state = ReactantServer.UNPINNED, on_demand = false, unchanged = unchanged
+            )
+            return name, entry
+        end
+        try
+            @test first(load(() -> true)) == "m"
+            v1 = get_model(env.reg, "m")
+            # Changed before the control op: the running version keeps serving.
+            name, e = load(() -> false)
+            @test name === nothing && e.executable === nothing && !isopen(e.weights.io)
+            @test get_model(env.reg, "m") === v1
+            @test _y(env.sched, "m") == Float32[2, 4, 6, 8]
+            # Changed during the compile (the second check): compiled, then discarded unadmitted.
+            calls = Ref(0)
+            name, e = load(() -> (calls[] += 1) == 1)
+            @test name === nothing && calls[] == 2
+            @test e.executable !== nothing && e.sched === nothing && !isopen(e.weights.io)
+            @test get_model(env.reg, "m") === nothing      # the old version made way for the compile
+            @test_throws Exception _y(env.sched, "m")
+            @test first(load(() -> true)) == "m"
+            @test _y(env.sched, "m") == Float32[2, 4, 6, 8]
+        finally
+            ReactantServer.shutdown!(env.sched)
+        end
+    end
+end
+
+@testset "bundles changed or added while the worker starts are picked up by its first polls (CPU)" begin
+    mktempdir() do root
+        stage = mktempdir()
+        plus_x = joinpath(stage, "model.mlir")
+        write(plus_x, stablehlo_artifact(_W_MLIR_PLUS_X))
+        _write_scale_bundle(stage, "z")
+        # While the startup reads `a`, its model.mlir is replaced and bundle `z` is moved in.
+        dir = _write_scale_bundle(root, "a")
+        write(joinpath(dir, "model.jl"), _change_once_jl("a", plus_x; moves = [joinpath(stage, "z") => joinpath(root, "z")]))
+        env = _cpu_watch_env(root; poll = 3600.0)
+        _, reg, sched, w = ReactantServer._bring_up(env.cfg, env.backend)
+        try
+            # Drive the polls by hand: the watcher's own loop polled at most once (marks pending).
+            ReactantServer.stop_watching!(w)
+            wait(w.task)
+            @test get_model(reg, "z") === nothing           # it arrived after the repository was read
+            @test _y(sched, "a") == Float32[2, 4, 6, 8]     # the program read at startup
+            _watch_once!(w)
+            _watch_once!(w)
+            @test get_model(reg, "z") !== nothing
+            @test _y(sched, "z") == Float32[2, 4, 6, 8]
+            @test _y(sched, "a") == Float32[3, 6, 9, 12]    # reloaded with the program that landed
+        finally
+            ReactantServer.shutdown!(sched)
+        end
+    end
+end
+
 @testset "model name comes from the bundle directory, not the manifest" begin
     mktempdir() do root
         # A manifest whose `name` disagrees with the directory: the directory wins.
