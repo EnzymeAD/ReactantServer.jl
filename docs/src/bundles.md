@@ -115,9 +115,10 @@ SHA-256 of `weights.safetensors` equals the one the copy recorded; size and modi
 not trusted, since a reproducible build, normalized timestamps, `rsync -t` or `cp -p` can keep
 both. A redeployed legacy file is loaded itself and, with migration on, copied again. A file in the
 program's axis order (re-exported with ReactantServerExport 2.0, manifest kept) is loaded itself,
-and with migration on the server removes the `weights_file` line and the stale copy, leaving
-`format_version` as it was. Comments and formatting in `manifest.yaml` are kept; only the
-`weights_file` and `format_version` lines change.
+and with migration on the server removes the `weights_file` line and the stale copy. `copy` leaves
+`format_version` as it was; `replace` sets it to `"2.1"`, as after any replace, so servers older
+than 0.2 refuse the bundle rather than misread it. Comments and formatting in `manifest.yaml` are
+kept; only the `weights_file` and `format_version` lines change.
 
 Hashing a large file takes a while (on the order of 150 MB/s), so the worker keeps the hash of
 `weights.safetensors` in `.cache/weights_sha256.json`, keyed by the file's inode, size,

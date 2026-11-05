@@ -294,8 +294,11 @@ const _MIG_NEWER = Dict{String, Array}(k => v .* 2 for (k, v) in _MIG_WEIGHTS)
                 @test (@test_logs (:warn, r"axis order; loading it rather than") match_mode = :any _mig_loaded(dir, _MIG_NEWER)) ==
                     ("weights.safetensors", true)
             else
-                @test (@test_logs (:info, r"dropping weights.T.safetensors") match_mode = :any _RSM.migrate_bundle_weights!(dir, mode)) == :current
-                @test !haskey(_mfst(dir), "weights_file") && _mfst(dir)["format_version"] == "2.0"
+                # copy leaves format_version as it is; replace marks the manifest 2.1, as any replace
+                result, format = mode == _RSM.MIGRATE_COPY ? (:current, "2.0") : (:replaced, "2.1")
+                @test (@test_logs (:info, r"dropping weights.T.safetensors") match_mode = :any _RSM.migrate_bundle_weights!(dir, mode)) == result
+                @test !haskey(_mfst(dir), "weights_file") && _mfst(dir)["format_version"] == format
+                @test startswith(read(joinpath(dir, "manifest.yaml"), String), "# a comment the migration must keep")
                 @test !isfile(tpath) && _no_tmp(dir)
                 @test (@test_logs min_level = Base.CoreLogging.Warn _mig_loaded(dir, _MIG_NEWER)) == ("weights.safetensors", true)
                 @test _RSM.migrate_bundle_weights!(dir, mode) == :current
@@ -305,21 +308,24 @@ const _MIG_NEWER = Dict{String, Array}(k => v .* 2 for (k, v) in _MIG_WEIGHTS)
 end
 
 @testset "a crash while dropping a stale copy leaves the export loaded and resumes" begin
-    mktempdir() do root
-        dir = _mig_bundle(root, "dropcrash")
-        lpath, tpath = joinpath(dir, "weights.safetensors"), joinpath(dir, "weights.T.safetensors")
-        @test _RSM.migrate_bundle_weights!(dir, _RSM.MIGRATE_COPY) == :copied
-        Base.Filesystem.rename(_mig_xla(joinpath(root, "incoming.safetensors"), _MIG_NEWER), lpath)
-        _RSM._MIGRATION_STEP_HOOK[] = s -> s === :unlink_copy && error("simulated crash at $s")
-        try
-            @test (@test_logs (:error, r"weights migration failed") match_mode = :any _RSM.migrate_bundle_weights!(dir, _RSM.MIGRATE_COPY)) == :failed
-        finally
-            _RSM._MIGRATION_STEP_HOOK[] = nothing
+    for (mode, format) in ((_RSM.MIGRATE_COPY, "2.0"), (_RSM.MIGRATE_REPLACE, "2.1"))
+        mktempdir() do root
+            dir = _mig_bundle(root, "dropcrash")
+            lpath, tpath = joinpath(dir, "weights.safetensors"), joinpath(dir, "weights.T.safetensors")
+            @test _RSM.migrate_bundle_weights!(dir, _RSM.MIGRATE_COPY) == :copied
+            Base.Filesystem.rename(_mig_xla(joinpath(root, "incoming.safetensors"), _MIG_NEWER), lpath)
+            _RSM._MIGRATION_STEP_HOOK[] = s -> s === :unlink_copy && error("simulated crash at $s")
+            try
+                @test (@test_logs (:error, r"weights migration failed") match_mode = :any _RSM.migrate_bundle_weights!(dir, mode)) == :failed
+            finally
+                _RSM._MIGRATION_STEP_HOOK[] = nothing
+            end
+            @test !haskey(_mfst(dir), "weights_file") && _mfst(dir)["format_version"] == format && isfile(tpath)
+            @test _mig_loaded(dir, _MIG_NEWER) == ("weights.safetensors", true)
+            @test _RSM.migrate_bundle_weights!(dir, mode) == :current
+            @test !isfile(tpath) && _mfst(dir)["format_version"] == format
+            @test _mig_loaded(dir, _MIG_NEWER) == ("weights.safetensors", true)
         end
-        @test !haskey(_mfst(dir), "weights_file") && isfile(tpath)
-        @test _mig_loaded(dir, _MIG_NEWER) == ("weights.safetensors", true)
-        @test _RSM.migrate_bundle_weights!(dir, _RSM.MIGRATE_COPY) == :current
-        @test !isfile(tpath)
     end
 end
 

@@ -19,7 +19,8 @@
 # still the file the copy was made from, judged by content (see `_source_sha256`). A redeployed
 # legacy original is loaded itself (and, with migration on, copied again). Once
 # `weights.safetensors` is in the program's axis order (replace's swap, or an export deployed over
-# the original) it is the weights file in every mode, and copy and replace drop the stale copy.
+# the original) it is the weights file in every mode, and copy and replace drop the stale copy
+# (replace also marking the manifest 2.1).
 #
 # Workers on one node serialize on an flock in the bundle's `.cache/`, so one bundle is migrated
 # once. A migration never fails a model: errors are logged and the bundle loads as it was.
@@ -322,9 +323,11 @@ end
 Migrate one bundle's weights file to the program's axis order (see [`WeightsMigration`](@ref)).
 Returns `:off`, `:skipped` (nothing to migrate: a meta bundle, or a custom `weights_file`),
 `:current` (already in the program's axis order, or already copied under `copy`), `:copied`,
-`:replaced`, or `:failed` (logged; the bundle is left loadable as it was). A `weights.safetensors`
-deployed in the program's axis order over a copy-migrated bundle is `:current` in both modes: the
-manifest is pointed back at it and the copy, made from the file it replaced, is removed.
+`:replaced`, or `:failed` (logged; the bundle is left loadable as it was). When a
+`weights.safetensors` in the program's axis order was deployed over a copy-migrated bundle, the
+manifest is pointed back at it and the copy, made from the file it replaced, is removed: under
+`copy` that is `:current` and `format_version` is left as it is; under `replace` the manifest is
+also marked `format_version: "2.1"`, as after any replace, and the result is `:replaced`.
 """
 function migrate_bundle_weights!(dir::AbstractString, mode::WeightsMigration)
     mode == MIGRATE_OFF && return :off
@@ -358,7 +361,7 @@ function _migrate!(dir::String, mode::WeightsMigration)
     # copy that an export deployed over the original made stale, or done.
     if isfile(lpath) && _with_weights(w -> w.xla_order, lpath)
         wf == XLA_COPY_FILE || return _drop_copy!(dir, lpath, tpath, :current)
-        (isfile(tpath) && samefile(lpath, tpath)) || return _drop_stale_copy!(dir, lpath, tpath)
+        (isfile(tpath) && samefile(lpath, tpath)) || return _drop_stale_copy!(dir, lpath, tpath, mode)
         mode == MIGRATE_REPLACE || return :current
         return _finish_replace!(dir, lpath, tpath)
     end
@@ -414,13 +417,18 @@ end
 
 # weights.safetensors is in the program's axis order but is not the copy the manifest points at: an
 # export was deployed over the original, so the copy, made from the file it replaced, is stale.
-# Point the manifest back at weights.safetensors, then remove the copy. `format_version` stays as
-# deployed, as for a bundle that was never migrated.
-function _drop_stale_copy!(dir, lpath, tpath)
+# Point the manifest back at weights.safetensors, then remove the copy. `replace` also marks the
+# manifest 2.1 in the same edit, ending where `_finish_replace!` does (so `:replaced`: older servers
+# now refuse the bundle); `copy` leaves `format_version` as it is (`:current`).
+function _drop_stale_copy!(dir, lpath, tpath, mode)
     isfile(tpath) && !_made_by_migration(tpath) && return :skipped      # the manifest's own file
-    _edit_manifest!(dir, "weights_file" => nothing)
+    if mode == MIGRATE_REPLACE
+        _edit_manifest!(dir, "format_version" => "2.1", "weights_file" => nothing)
+    else
+        _edit_manifest!(dir, "weights_file" => nothing)
+    end
     @info "$(LEGACY_WEIGHTS_FILE) is in the program's axis order; dropping $(XLA_COPY_FILE), which was made from an earlier version of it" bundle = dir
-    return _drop_copy!(dir, lpath, tpath, :current)
+    return _drop_copy!(dir, lpath, tpath, mode == MIGRATE_REPLACE ? :replaced : :current)
 end
 
 # A copy written by `_build_copy!`, whatever weights.safetensors is now.
