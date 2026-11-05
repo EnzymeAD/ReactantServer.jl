@@ -368,7 +368,9 @@ inference API and the worker control service). `worker` selects which worker ent
 may be omitted when the node file has exactly one worker. When `blocking` is false the server runs
 in the background and a `RunningServer` is returned (stop it with `stop!`). A blocking server serves
 until a drain is requested (`request_drain!`, or under the node supervisor end of file on stdin),
-then drains, shuts everything down and returns.
+then drains, shuts everything down and returns. Should its dispatch loop die, a blocking server
+instead exits the process with status 70, whether it is serving or draining, so the node supervisor
+sees the failure (and restarts the worker unless it is shutting down).
 
 To run every worker in a node file, one process per device, use `ReactantServerNode.supervise`.
 """
@@ -466,7 +468,9 @@ function serve(
     shm = SharedMemoryRegistry()   # client-facing SystemSharedMemory feature (decode/encode shm path)
     pool, registry, sched, watcher = _bring_up(cfg, backend)
     # A blocking serve is a worker process: should its dispatch loop die, exit nonzero for a restart.
-    blocking && on_dispatch_failure!(sched, _exit_on_dispatch_failure)
+    # `exiting` records that the hook fired, for the end of a blocking serve (see there).
+    exiting = Threads.Atomic{Bool}(false)
+    blocking && on_dispatch_failure!(sched, err -> (exiting[] = true; _exit_on_dispatch_failure(err)))
     # Local reuse pool for meta-model intermediates: plain Memory, never shared. With one meta at a time
     # (the gate below) the pool sees no cross-meta contention; it keeps large per-request intermediates
     # (e.g. an ROI feature tensor) off the allocation path and holds down GC pressure. Sized by env.
@@ -532,6 +536,12 @@ function serve(
     finally
         ReactantServerCore.end_serving!()
     end
+    # A dispatch loop that died while the worker served or drained has scheduled the exit with
+    # `_DISPATCH_FAILURE_EXIT_CODE` (`_exit_on_dispatch_failure`) after a grace for the replies just
+    # sent. A drain that ends inside that grace returns here first, and returning would let the
+    # process exit 0 in its place; exit with the failure's code now instead. (A loop that fails only
+    # once the shutdown has begun fires no hook, as the scheduler decides, and the exit stays 0.)
+    exiting[] && exit(_DISPATCH_FAILURE_EXIT_CODE)
     return nothing
 end
 

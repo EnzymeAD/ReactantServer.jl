@@ -5,6 +5,11 @@
 
 const _DRAINING_MESSAGE = "worker is draining for shutdown; retry on another worker"
 
+# A refusal is a `WorkerUnavailableError` taken through the status contract (`_as_grpc_error`), as a
+# refusal from a stopped scheduler is, so its code (UNAVAILABLE) and sanitized message come from the
+# one mapping in grpc.jl.
+_draining_error() = _as_grpc_error(WorkerUnavailableError(_DRAINING_MESSAGE), nothing, "ModelInfer")
+
 struct _DrainInterceptor <: gRPCServer.Interceptor
     gate::ReactantServerCore.DrainGate
 end
@@ -14,8 +19,7 @@ end
 function (d::_DrainInterceptor)(ctx, @nospecialize(request), info::gRPCServer.MethodInfo, @nospecialize(next))
     method = info.method_name
     if method == "ModelInfer"
-        ReactantServerCore.enter!(d.gate) ||
-            throw(gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, _DRAINING_MESSAGE))
+        ReactantServerCore.enter!(d.gate) || throw(_draining_error())
         try
             return next(ctx, request)
         finally
