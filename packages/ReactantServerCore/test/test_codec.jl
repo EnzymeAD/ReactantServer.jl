@@ -244,3 +244,82 @@ end
     # An already-expired deadline yields a past deadline on the monotonic clock.
     @test ReactantServer.deadline_to_time_ns(Dates.now() - Dates.Second(1), -1.0) < Int64(time_ns())
 end
+
+import InterProcessCommunication as IPC
+
+@testset "codec reads shared-memory parameters strictly (CORE-6)" begin
+    sp(s) = _Inf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:string_param, String(s)))
+    ip(i) = _Inf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:int64_param, Int64(i)))
+    bp(b) = _Inf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:bool_param, b))
+    nop = _Inf.InferParameter()                                 # a parameter with no value at all
+
+    # A real region whose first 16 bytes differ from bytes 16:32, so a read that silently fell back
+    # to offset 0 would be visible in the decoded values.
+    key = string("/rsc6-", string(getpid(); base = 36), "-", string(rand(UInt32); base = 36))
+    shm = IPC.SharedMemory(key, 32)
+    reg = ReactantServer.SharedMemoryRegistry()
+    try
+        bytes = unsafe_wrap(Array, convert(Ptr{UInt8}, pointer(shm)), 32; own = false)
+        copyto!(bytes, reinterpret(UInt8, Float32[1, 2, 3, 4, 5, 6, 7, 8]))
+        ReactantServer.shm_register!(reg, "r", key, 0, 32)
+        inmsg(params) = _Inf.ModelInferRequest(;
+            model_name = "m",
+            inputs = [_Inf.var"ModelInferRequest.InferInputTensor"(; name = "x", datatype = "FP32", shape = Int64[4], parameters = params)]
+        )
+        decode(params) = ReactantServer.decode_infer_request(inmsg(params), reg)
+        function rejects(params, needle)
+            err = try
+                decode(params)
+                nothing
+            catch e
+                e
+            end
+            return err isa ErrorException && occursin(needle, err.msg)
+        end
+
+        # Well-typed: reads at the given offset.
+        good = Dict("shared_memory_region" => sp("r"), "shared_memory_offset" => ip(16), "shared_memory_byte_size" => ip(16))
+        @test decode(good).request.inputs[1].data == Float32[5, 6, 7, 8]
+        # The offset is optional and defaults to 0.
+        @test decode(Dict("shared_memory_region" => sp("r"), "shared_memory_byte_size" => ip(16))).request.inputs[1].data ==
+            Float32[1, 2, 3, 4]
+
+        # An offset of the wrong type used to read as absent, i.e. offset 0. Every wrong type fails.
+        for bad in (sp("16"), bp(true), nop)
+            @test rejects(merge(good, Dict("shared_memory_offset" => bad)), "invalid value type for 'shared_memory_offset'")
+        end
+        for bad in (sp("16"), bp(true), nop)
+            @test rejects(merge(good, Dict("shared_memory_byte_size" => bad)), "invalid value type for 'shared_memory_byte_size'")
+        end
+        for bad in (ip(1), bp(false), nop)
+            @test rejects(merge(good, Dict("shared_memory_region" => bad)), "invalid value type for 'shared_memory_region'")
+        end
+        # A missing byte size, an empty region name, negative values, and offset or byte size
+        # without a region are all errors, never an inline read or an access at offset 0.
+        @test rejects(Dict("shared_memory_region" => sp("r"), "shared_memory_offset" => ip(16)), "must be specified along with")
+        @test rejects(merge(good, Dict("shared_memory_region" => sp(""))), "is empty")
+        @test rejects(merge(good, Dict("shared_memory_offset" => ip(-1))), "must be non-negative")
+        @test rejects(merge(good, Dict("shared_memory_byte_size" => ip(-16))), "must be non-negative")
+        @test rejects(Dict("shared_memory_offset" => ip(16)), "can not be specified without")
+        @test rejects(Dict("shared_memory_byte_size" => ip(16)), "can not be specified without")
+
+        # Requested outputs are read by the same rules.
+        outmsg(params) = _Inf.ModelInferRequest(;
+            model_name = "m",
+            inputs = [_Inf.var"ModelInferRequest.InferInputTensor"(; name = "x", datatype = "FP32", shape = Int64[4])],
+            outputs = [_Inf.var"ModelInferRequest.InferRequestedOutputTensor"(; name = "y", parameters = params)],
+            raw_input_contents = [collect(reinterpret(UInt8, Float32[1, 2, 3, 4]))]
+        )
+        tgt = ReactantServer.decode_infer_request(outmsg(good), reg).output_targets["y"]
+        @test (tgt.offset, tgt.byte_size) == (16, 16)
+        for (k, bad) in (("shared_memory_offset", sp("16")), ("shared_memory_byte_size", bp(true)), ("shared_memory_region", ip(3)))
+            @test_throws ErrorException ReactantServer.decode_infer_request(outmsg(merge(good, Dict(k => bad))), reg)
+        end
+        @test_throws ErrorException ReactantServer.decode_infer_request(
+            outmsg(Dict("shared_memory_region" => sp("r"), "shared_memory_offset" => ip(0))), reg
+        )
+    finally
+        ReactantServer.shm_teardown!(reg)
+        finalize(shm)
+    end
+end

@@ -145,16 +145,49 @@ function _array_from_contents(dt::DType, wire_shape::Vector{Int}, c)
     return arr
 end
 
-# Read a typed parameter out of a tensor's parameters map, or nothing if absent/mismatched.
-function _param_string(params, key)
-    haskey(params, key) || return nothing
-    p = params[key].parameter_choice
-    return (p !== nothing && p.name === :string_param) ? p[]::String : nothing
-end
+# Read a typed parameter out of a parameters map, or nothing if absent/mismatched.
 function _param_int(params, key)
     haskey(params, key) || return nothing
     p = params[key].parameter_choice
     return (p !== nothing && p.name === :int64_param) ? Int(p[]) : nothing
+end
+
+# Read `key` from a parameters map, insisting on the parameter type `kind` (:string_param or
+# :int64_param). Absent is `nothing`; present with any other type (or no value) is an error, never
+# silently "absent". `what` names the tensor for the message.
+function _strict_param(params, key::AbstractString, kind::Symbol, what::AbstractString)
+    haskey(params, key) || return nothing
+    p = params[key].parameter_choice
+    (p !== nothing && p.name === kind) ||
+        error("invalid value type for '$key' parameter for $what, expected $kind")
+    return p[]
+end
+
+# A tensor's shared-memory reference `(region, offset, byte_size)`, or `nothing` when it does not
+# reference shared memory. Read strictly, as Triton and the KServe system shared-memory extension
+# define it: `shared_memory_region` is a string_param, `shared_memory_offset` and
+# `shared_memory_byte_size` are int64_params; the offset defaults to 0, the byte size is required,
+# and neither may appear without a region. A parameter of any other type used to read as absent, so
+# an offset sent as a string read from (or wrote to) offset 0; every such case is now a client error
+# (INVALID_ARGUMENT at the transport).
+function _shm_reference(params, what::AbstractString)
+    region = _strict_param(params, _SHM_REGION, :string_param, what)
+    offset = _strict_param(params, _SHM_OFFSET, :int64_param, what)
+    bsize = _strict_param(params, _SHM_BYTE_SIZE, :int64_param, what)
+    if region === nothing
+        offset === nothing ||
+            error("'$_SHM_OFFSET' can not be specified without '$_SHM_REGION' for $what")
+        bsize === nothing ||
+            error("'$_SHM_BYTE_SIZE' can not be specified without '$_SHM_REGION' for $what")
+        return nothing
+    end
+    isempty(region) && error("'$_SHM_REGION' for $what is empty")
+    bsize === nothing &&
+        error("'$_SHM_BYTE_SIZE' must be specified along with '$_SHM_REGION' for $what")
+    off = something(offset, Int64(0))
+    off >= 0 || error("'$_SHM_OFFSET' for $what must be non-negative, got $off")
+    bsize >= 0 || error("'$_SHM_BYTE_SIZE' for $what must be non-negative, got $bsize")
+    return String(region), Int(off), Int(bsize)
 end
 
 # Where a requested output's data should be written.
@@ -203,12 +236,10 @@ function decode_infer_request(
         t = msg.inputs[i]
         dt = dtype_from_kserve(t.datatype)
         shape = Int[Int(s) for s in t.shape]
-        region = _param_string(t.parameters, _SHM_REGION)
-        data = if region !== nothing
+        ref = _shm_reference(t.parameters, "input '$(t.name)'")
+        data = if ref !== nothing
             registry === nothing && error("input '$(t.name)' references shared memory but the server has no registry")
-            offset = something(_param_int(t.parameters, _SHM_OFFSET), 0)
-            bsize = _param_int(t.parameters, _SHM_BYTE_SIZE)
-            bsize === nothing && error("input '$(t.name)' is missing $_SHM_BYTE_SIZE")
+            region, offset, bsize = ref
             _array_from_raw(dt, shape, shm_read(registry, region, offset, bsize))
         elseif use_raw
             _array_from_raw(dt, shape, msg.raw_input_contents[i])
@@ -223,12 +254,9 @@ function decode_infer_request(
     requested = String[o.name for o in msg.outputs]
     targets = Dict{String, OutputTarget}()
     for o in msg.outputs
-        region = _param_string(o.parameters, _SHM_REGION)
-        region === nothing && continue
-        offset = something(_param_int(o.parameters, _SHM_OFFSET), 0)
-        bsize = _param_int(o.parameters, _SHM_BYTE_SIZE)
-        bsize === nothing && error("output '$(o.name)' references shared memory but is missing $_SHM_BYTE_SIZE")
-        targets[o.name] = OutputTarget(region, offset, bsize)
+        ref = _shm_reference(o.parameters, "output '$(o.name)'")
+        ref === nothing && continue
+        targets[o.name] = OutputTarget(ref...)
     end
 
     deadline_ns = _decode_deadline_ns(msg.parameters)

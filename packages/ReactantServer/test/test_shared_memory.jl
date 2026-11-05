@@ -195,6 +195,31 @@ end
             # the server wrote the result into the region at offset 16
             @test reinterpret(Float32, view(vio, 17:32)) == Float32[6, 8, 10, 12]
 
+            # A shared-memory parameter of the wrong type is a client error (INVALID_ARGUMENT): an
+            # offset sent as a string must not be read as offset 0 and overwrite the input.
+            for (k, bad) in (
+                    ("shared_memory_offset", _sp("16")), ("shared_memory_byte_size", _sp("16")),
+                    ("shared_memory_region", _ip(1)),
+                )
+                outBad = _ShmInf.var"ModelInferRequest.InferRequestedOutputTensor"(;
+                    name = "y", parameters = merge(outB.parameters, Dict(k => bad))
+                )
+                fill!(view(vio, 17:32), 0x00)
+                try
+                    grpc_call(
+                        WorkerRPC.ModelInfer, port,
+                        _ShmInf.ModelInferRequest(; model_name = "scale4", inputs = [inB], outputs = [outBad])
+                    )
+                    @test false
+                catch ex
+                    @test ex isa gRPCClient.gRPCServiceCallException
+                    @test ex.grpc_status == Int(ReactantServer._G.StatusCode.INVALID_ARGUMENT)
+                    @test occursin("invalid value type", ex.message)
+                end
+                @test reinterpret(Float32, view(vio, 1:16)) == Float32[3, 4, 5, 6]   # input untouched
+                @test all(==(0x00), view(vio, 17:32))                                # nothing written
+            end
+
             # --- unregister one, then confirm it is gone ---
             ru = grpc_call(
                 WorkerRPC.SystemSharedMemoryUnregister, port, _ShmInf.SystemSharedMemoryUnregisterRequest(; name = "rin")
