@@ -110,14 +110,25 @@ end
 # failure included); every other status reaches the client verbatim. A worker NOT_FOUND means the
 # model was unloaded there since discovery, so kick an async route refresh to drop the stale route
 # (the request itself still fails over / returns the error; it is not retried after refresh).
+#
+# A request that references shared memory is never moved to another replica: the worker that
+# failed it may still be running it (an abandoned or reset call is not a stopped one), and a second
+# worker writing the same output slot, or reading an input slot the client has since reused, would
+# corrupt the client's data. Its failure reaches the client as UNAVAILABLE, the client's cue to retry.
 function _try_replicas(st::GatewayState, urls, model, id, body, deadline_ns::Int64)
     last_status = STATUS_UNAVAILABLE
     last_exc = gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, "no replica available")
+    shm = nothing           # read from the body only once a worker has failed the request
     for url in urls
         resp, status, exc = _post_infer(st, url, model, id, body, deadline_ns)
         exc === nothing && return resp, status, nothing
         status == STATUS_NOT_FOUND && request_refresh!(st.refresher)
         _fails_over(status) || return nothing, status, exc
+        shm === nothing && (shm = peek_uses_shared_memory(body))
+        if shm
+            msg = "$(exc.message) (the request uses shared memory, so it is not retried on another worker)"
+            return nothing, STATUS_UNAVAILABLE, _server_exc(STATUS_UNAVAILABLE, msg)
+        end
         last_status, last_exc = status, exc
     end
     return nothing, last_status, last_exc

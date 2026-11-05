@@ -76,6 +76,27 @@ const GWInf = ReactantServerGateway.inference
     @test ReactantServerGateway.peek_model_name_and_id(det) == ("det", "r1")
 end
 
+@testset "peek_uses_shared_memory: any input or requested output in a shared-memory region" begin
+    enc(msg) = (io = IOBuffer(); TPB.encode(TPB.ProtoEncoder(io), msg); take!(io))
+    param(s) = GWInf.InferParameter(; parameter_choice = TPB.OneOf(:string_param, s))
+    peek = ReactantServerGateway.peek_uses_shared_memory
+    tensor(params) = GWInf.var"ModelInferRequest.InferInputTensor"(;
+        name = "x", datatype = "FP32", shape = Int64[2], parameters = params,
+        contents = GWInf.InferTensorContents(; fp32_contents = Float32[1, 2])
+    )
+    out(params) = GWInf.var"ModelInferRequest.InferRequestedOutputTensor"(; name = "y", parameters = params)
+    shm = Dict("shared_memory_region" => param("r"), "shared_memory_byte_size" => GWInf.InferParameter(; parameter_choice = TPB.OneOf(:int64_param, Int64(8))))
+    other = Dict("binary_data" => param("true"))
+    @test !peek(enc(GWInf.ModelInferRequest(; model_name = "m")))
+    @test !peek(enc(GWInf.ModelInferRequest(; model_name = "m", inputs = [tensor(other)], outputs = [out(other)])))
+    @test peek(enc(GWInf.ModelInferRequest(; model_name = "m", inputs = [tensor(other), tensor(shm)])))
+    @test peek(enc(GWInf.ModelInferRequest(; model_name = "m", inputs = [tensor(other)], outputs = [out(shm)])))
+    # A request-level parameter of the same name is not a tensor in shared memory.
+    @test !peek(enc(GWInf.ModelInferRequest(; model_name = "m", parameters = Dict("shared_memory_region" => param("r")))))
+    # A body that cannot be read that far counts as shared memory: never run it twice.
+    @test peek(enc(GWInf.ModelInferRequest(; model_name = "m", inputs = [tensor(other)]))[1:(end - 3)])
+end
+
 @testset "invoke_infer: a transport failure is UNAVAILABLE" begin
     GW = ReactantServerGateway
     body = UInt8[0x0a, 0x01, 0x61]
@@ -392,6 +413,55 @@ end
                 # A replica that is merely unavailable is skipped for a healthy one.
                 w0.fail_code, w1.fail_code = S.UNAVAILABLE, nothing
                 @test all(_ -> outcome("replicated") === nothing, 1:4)
+            finally
+                w0.fail_code = w1.fail_code = nothing
+            end
+        end
+
+        @testset "a request that uses shared memory is never retried on another worker" begin
+            # The failed worker may still be running it, and a second worker writing the same output
+            # slot, or reading an input slot the client has reused, would corrupt the client's data.
+            S = gRPCServer.StatusCode
+            shm_params() = Dict(
+                "shared_memory_region" => GWInf.InferParameter(; parameter_choice = TPB.OneOf(:string_param, "client-slot-0"))
+            )
+            in_shm = GWInf.ModelInferRequest(;
+                model_name = "replicated",
+                inputs = [GWInf.var"ModelInferRequest.InferInputTensor"(; name = "x", datatype = "FP32", shape = Int64[1], parameters = shm_params())]
+            )
+            out_shm = GWInf.ModelInferRequest(;
+                model_name = "replicated",
+                outputs = [GWInf.var"ModelInferRequest.InferRequestedOutputTensor"(; name = "y", parameters = shm_params())]
+            )
+            plain = GWInf.ModelInferRequest(; model_name = "replicated")
+            calls() = w0.infer_calls + w1.infer_calls
+            outcome(req) = try
+                grpc_call(GWInf.GRPCInferenceService.ModelInfer, gw_port, req)
+                nothing
+            catch e
+                e
+            end
+            try
+                for code in (S.UNAVAILABLE, S.NOT_FOUND)
+                    w0.fail_code = w1.fail_code = code
+                    for req in (in_shm, out_shm)
+                        w0.infer_calls = w1.infer_calls = 0
+                        err = outcome(req)
+                        @test err isa gRPCClient.gRPCServiceCallException
+                        @test err.grpc_status == gRPCClient.GRPC_UNAVAILABLE
+                        @test occursin("shared memory", err.message)
+                        @test calls() == 1
+                    end
+                    w0.infer_calls = w1.infer_calls = 0
+                    @test outcome(plain).grpc_status == Int(code)   # without shared memory it fails over
+                    @test calls() == 2
+                end
+                # A worker's own verdict on a shared-memory request still reaches the client as is
+                # (here a stale registration, which the client answers by re-registering).
+                w0.fail_code = w1.fail_code = S.FAILED_PRECONDITION
+                @test outcome(in_shm).grpc_status == gRPCClient.GRPC_FAILED_PRECONDITION
+                w0.fail_code = w1.fail_code = nothing
+                @test outcome(in_shm) === nothing
             finally
                 w0.fail_code = w1.fail_code = nothing
             end

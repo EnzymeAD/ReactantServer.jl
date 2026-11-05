@@ -111,3 +111,84 @@ function peek_shm_name(body::AbstractVector{UInt8})
     msg = PB.decode(PB.ProtoDecoder(IOBuffer(body)), SystemSharedMemoryUnregisterRequest)
     return msg.name
 end
+
+# The tensor parameter that places a tensor in a registered shared-memory region (KServe's system
+# shared-memory extension).
+const _SHM_REGION_PARAM = "shared_memory_region"
+
+# Partial schema for one entry of a tensor's `parameters` map (`map<string, InferParameter>` is a
+# repeated entry message with the key as field 1 and the value as field 2): its key only.
+struct ParameterKey
+    key::String
+end
+PB.default_values(::Type{ParameterKey}) = (; key = "")
+PB.field_numbers(::Type{ParameterKey}) = (; key = 1)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ParameterKey}, _endpos::Int = 0, _group::Bool = false)
+    key = ""
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            key = PB.decode(d, String)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return ParameterKey(key)
+end
+
+# Partial schema for an input tensor (`parameters` is field 4) or a requested output (field 2, so
+# `F` is the field number): whether any parameter names a shared-memory region. Everything else in
+# the tensor, its inline contents included, is skipped.
+struct TensorShmRef{F}
+    shm::Bool
+end
+PB.default_values(::Type{TensorShmRef{F}}) where {F} = (; shm = false)
+PB.field_numbers(::Type{TensorShmRef{F}}) where {F} = (; shm = F)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:TensorShmRef{F}}, _endpos::Int = 0, _group::Bool = false) where {F}
+    shm = false
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == F
+            entry = Ref{Union{Nothing, ParameterKey}}(nothing)   # a fresh Ref per entry (see peek_batch_size)
+            PB.decode!(d, entry)
+            entry[] !== nothing && entry[].key == _SHM_REGION_PARAM && (shm = true)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return TensorShmRef{F}(shm)
+end
+
+"""
+    peek_uses_shared_memory(body) -> Bool
+
+Whether a serialized `ModelInferRequest` reads any input from, or writes any requested output to,
+a registered shared-memory region (a `shared_memory_region` parameter on the tensor). Only the
+tensors' parameter keys are read; the payloads are skipped, as everywhere in the gateway. A body
+that cannot be read this far counts as using shared memory, the safe answer for the caller (which
+then never runs the request twice).
+"""
+function peek_uses_shared_memory(body::AbstractVector{UInt8})
+    try
+        d = PB.ProtoDecoder(IOBuffer(body))
+        while !PB.message_done(d, 0, false)
+            field_number, wire_type = PB.decode_tag(d)
+            if field_number == 5          # inputs
+                t = Ref{Union{Nothing, TensorShmRef{4}}}(nothing)
+                PB.decode!(d, t)
+                t[] !== nothing && t[].shm && return true
+            elseif field_number == 6      # outputs
+                o = Ref{Union{Nothing, TensorShmRef{2}}}(nothing)
+                PB.decode!(d, o)
+                o[] !== nothing && o[].shm && return true
+            else
+                Base.skip(d, wire_type)
+            end
+        end
+        return false
+    catch
+        return true
+    end
+end

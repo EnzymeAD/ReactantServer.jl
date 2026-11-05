@@ -24,8 +24,8 @@ that serves the model. On a multi-worker node it also serves the node's merged m
   [Scheduling modes](#Scheduling-modes) below. A third mode, `least_outstanding`, spreads by
   live occupancy. Either way, a request fails over to the remaining replicas when a worker
   returns `NotFound` or `Unavailable`, or the call to it fails in the transport; every other
-  status reaches the client as the worker sent it (see
-  [Status codes and failover](#Status-codes-and-failover)).
+  status reaches the client as the worker sent it, and a request that uses shared memory is
+  never retried on another worker (see [Status codes and failover](#Status-codes-and-failover)).
 - **Readiness probe:** a background loop calls each worker's KServe `ServerReady` RPC; `/readyz`
   is ready when at least one worker reports ready.
 - **Raw passthrough:** the `ModelInfer` hot path never decodes or re-marshals the protobuf body.
@@ -476,6 +476,15 @@ A deterministic failure (`INTERNAL`) or the request's own mistake (`INVALID_ARGU
 repeat on another replica, a passed deadline cannot be met there either, and `RESOURCE_EXHAUSTED`
 and `FAILED_PRECONDITION` are signals the client acts on (back off; re-register shared memory).
 When every replica fails over, the client gets the last worker's status.
+
+A request that reads an input from, or writes an output to, a registered shared-memory region
+(a `shared_memory_region` parameter on any input or requested output) is never retried on another
+replica: the worker that failed it may still be running it, and a second worker writing the same
+output slot, or reading an input slot the client has since reused, would corrupt the client's
+data. Whatever ends its attempt (`NOT_FOUND`, `UNAVAILABLE`, an abandoned or reset call, a
+transport failure) reaches the client as `UNAVAILABLE`, which `ReactantServerClient` retries. Its
+other statuses pass through like any request's. The gateway reads only the tensors' parameter
+keys to tell, never their payloads.
 
 ## What the gateway does not do
 
