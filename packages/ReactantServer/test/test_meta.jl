@@ -534,10 +534,14 @@ end
     pool = sched.scratch_pool
     G = _RS.gRPCServer
     dl(s = 10.0) = Int64(time_ns()) + round(Int64, s * 1.0e9)
+    # The orchestration's own failure is INTERNAL, which the default error detail redacts to a request
+    # id; a `full` context shows its text, so the check sees that failure and not some other.
+    full = _RS.InferContext(sched, ctx.registry, ctx.shm, "mock", nothing, _RS.ERROR_DETAIL_FULL, "worker0")
     try
         for i in 1:3
-            err = _meta_err(() -> _RS._handle_infer_raw(ctx, _meta_req_body("fail", i), dl()))
-            @test err !== nothing && occursin("meta failed after taking scratch", sprint(showerror, err))
+            err = _meta_err(() -> _RS._handle_infer_raw(full, _meta_req_body("fail", i), dl()))
+            @test err isa G.GRPCError && err.code == G.StatusCode.INTERNAL &&
+                occursin("meta failed after taking scratch", err.message)
             @test all(pool.free)
         end
         for i in 1:3
