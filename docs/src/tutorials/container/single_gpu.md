@@ -40,7 +40,7 @@ same. In order:
 - `--pids-limit=-1` lifts podman's thread limit, which a worker can cross while loading models.
 - The model repository is mounted writable, because each bundle caches its compiled programs.
 - The `reactant-compile-cache` volume keeps XLA's autotuning results across restarts.
-- `--stop-timeout 30` gives the workers time to drain on stop.
+- `--stop-timeout 30` gives the node time to finish the requests in flight when it stops.
 
 [Container settings](../../deployment.md#Container-settings) in Deployment explains each one and
 the alternatives when `--ipc=host` is not an option.
@@ -110,7 +110,9 @@ every key and its environment variable.
 podman stop reactantserver
 ```
 
-The supervisor drains its workers on SIGTERM before exiting.
+On SIGTERM the worker stops accepting requests (new ones get UNAVAILABLE and `/readyz` reports
+503), finishes the ones in flight, and exits; [Stopping](../../deployment.md#Stopping) in
+Deployment describes the sequence and its time limits.
 
 ## Next
 

@@ -134,7 +134,8 @@ occursin("worker=\"worker1\"", metrics)          # true
 # ## Stop
 #
 # SIGTERM, which is what `kill` sends and what a container runtime sends on stop, makes the
-# supervisor drain its workers and the gateway, then exit with status 0:
+# supervisor drain the gateway (it stops accepting requests and finishes the ones in flight), then
+# the workers, and exit with status 0:
 
 kserve_shutdown()
 kill(node)

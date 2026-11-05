@@ -76,6 +76,36 @@ node, and `REACTANT_CPU_WORKERS` sets its worker count. `REACTANT_ROLE` selects 
 supervisor runs: the default `all`, or only the `workers` or only the `gateway`, for splitting a
 node across machines.
 
+### Stopping
+
+On SIGTERM (or a SIGINT sent to the supervisor alone; Ctrl-C in a terminal also reaches its
+children and stops them at once) the supervisor drains the node from the outside in, so requests
+already accepted finish instead of failing:
+
+1. The gateway stops accepting requests: `/readyz` reports 503, and a new ModelInfer gets
+   UNAVAILABLE. The requests it has already forwarded finish on the workers, which are still
+   serving, for up to 60 seconds; then the gateway exits.
+2. The workers are then asked to stop, all at once. Each one refuses new inference with
+   UNAVAILABLE, reports not ready (`ServerReady`, `ModelReady`, `RepositoryIndex` and `/readyz`), so
+   a gateway elsewhere routes around it, and finishes its queued and in-flight requests for up to
+   15 seconds (60 when a sole worker serves the public ports itself, with no gateway). Then it shuts
+   down and exits with status 0.
+3. The supervisor exits with status 0 once every child has.
+
+An idle node stops in a few seconds; the budgets only matter while requests are in flight. A child
+that does not exit within its budget plus its grace window (10 seconds for the gateway, 15 for a
+worker) is sent SIGKILL, and one that does not acknowledge the request within 10 seconds, typically
+a worker still compiling its models at startup, is sent SIGTERM instead. The drain is best effort:
+if the container runtime's stop timeout runs out first, the runtime kills the node.
+
+The supervisor does not ask its children to drain with a signal. The worker and the gateway run
+more than one thread, which requires Julia's own signal handling, and under it SIGTERM ends the
+process at once. So the supervisor gives each child a pipe on stdin and asks it to drain by closing
+that pipe (`REACTANT_STDIN_DRAIN_SECONDS` in the child's environment carries the budget). A worker
+or gateway run without the supervisor still exits at once on SIGTERM; in your own process, drain
+one with `stop!(server; drain_seconds = 30)`, or call `request_drain!(30)` to make a blocking
+`serve` drain and return.
+
 ## The container image
 
 The image is published as `ghcr.io/enzymead/reactantserver`, tagged with each ReactantServer
@@ -102,8 +132,9 @@ Reactant, CUDA) and the driver it requires.
 Every model compiles on every worker before the gRPC port accepts traffic, so the first start
 is slow; later starts load the compiled programs from each bundle's cache
 (`runtime.executable_cache` in [Node Configuration](node_config.md)). Watch readiness with `curl -sf http://127.0.0.1:8002/readyz` or the container's health status,
-not the container state. On stop, the supervisor drains its workers on SIGTERM; give it room
-before the runtime escalates to SIGKILL (`--stop-timeout`, or `stop_grace_period` in compose).
+not the container state. On stop, the supervisor drains the gateway and then the workers on
+SIGTERM ([Stopping](#Stopping)); give it room before the runtime escalates to SIGKILL
+(`--stop-timeout`, or `stop_grace_period` in compose).
 
 ### Container settings
 
@@ -186,11 +217,11 @@ and healthcheck scripts.
 ## Outside the image
 
 The supervisor runs the same way from a Julia environment, as in [Run a Node](tutorials/julia/node.md).
-Start it with `julia --handle-signals=no --threads=1,0` so its own handler runs and it shuts its
-workers down on SIGTERM. Turning off Julia's signal handling is only safe on one thread, so the
-supervisor refuses to start with more. Unlike the image, such an environment resolves its
-dependencies itself, so it does not get the image's locked versions or its precompiled caches.
-On a GPU host, select the Reactant CUDA build before the environment precompiles, with
+Start it with `julia --handle-signals=no --threads=1,0` so its own handler runs and it drains its
+children on SIGTERM ([Stopping](#Stopping)). Turning off Julia's signal handling is only safe on
+one thread, so the supervisor refuses to start with more. Unlike the image, such an environment
+resolves its dependencies itself, so it does not get the image's locked versions or its precompiled
+caches. On a GPU host, select the Reactant CUDA build before the environment precompiles, with
 `REACTANT_GPU=cuda` and `REACTANT_GPU_VERSION` (`12.9` or `13.1`), and make sure the host provides
 the CUDA libraries Reactant loads by name (`libnvJitLink.so.13`, `libnvrtc.so.13`, `libcupti.so`).
 `INFERENCE_SERVER_MODEL_DIRS` overrides the node file's model repository (colon-separated). Use the
