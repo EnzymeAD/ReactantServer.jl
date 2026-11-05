@@ -185,6 +185,7 @@ end
 # routes from this readiness, so a control-plane pin/unpin flips routing on the next probe.
 function _model_ready(ctx::InferContext, name::AbstractString)
     sched = ctx.sched
+    dispatch_alive(sched) || return false
     externally_managed = sched.weight_cache !== nothing && sched.weight_cache.mode == EXTERNALLY_MANAGED
     # A meta runs its sub-models in-process, so it is ready only where they can run. In
     # externally-managed mode that means every sub's weights must be resident on this worker (the
@@ -208,13 +209,16 @@ _handle_model_ready(ctx::InferContext, req) =
 
 # The server is ready only once at least one model is registered and every registered model
 # has been compiled. Compilation finishes before the gRPC plane accepts traffic, so this
-# guards mainly against a misconfigured model_dirs that left the registry empty.
+# guards mainly against a misconfigured model_dirs that left the registry empty. A worker whose
+# dispatch loop has died is never ready (nor live, see `_handle_server_live`).
 function _handle_server_ready(ctx::InferContext)
     entries = values(ctx.registry.by_name)
     has_any = !isempty(entries) || !isempty(ctx.registry.meta)
-    ready = has_any && all(e -> e.executable !== nothing, entries)
+    ready = has_any && all(e -> e.executable !== nothing, entries) && dispatch_alive(ctx.sched)
     return inference.ServerReadyResponse(; ready = ready)
 end
+
+_handle_server_live(ctx::InferContext) = inference.ServerLiveResponse(; live = dispatch_alive(ctx.sched))
 
 _handle_server_metadata(::InferContext) =
     inference.ServerMetadataResponse(;
@@ -429,7 +433,7 @@ function build_grpc_server(
     # they are how a prober tells whether that thread is responsive. Everything else is offloaded.
     register_GRPCInferenceService!(
         server;
-        ServerLive = (ctx, req) -> inference.ServerLiveResponse(; live = true),
+        ServerLive = (ctx, req) -> _handle_server_live(ctx.payload),
         ServerReady = (ctx, req) -> _handle_server_ready(ctx.payload),
         ModelReady = _offloaded((ctx, req) -> _handle_model_ready(ctx.payload, req)),
         ServerMetadata = _offloaded((ctx, req) -> _handle_server_metadata(ctx.payload)),

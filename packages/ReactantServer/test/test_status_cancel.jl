@@ -1,5 +1,6 @@
-# The worker's status contract: every failure gets exactly one gRPC code, and the metrics label is
-# that code. Mock backend only.
+# The worker's status contract (every failure gets exactly one gRPC code, and the metrics label is
+# that code), and a dispatch loop that dies (the worker says so and rejects everything with
+# UNAVAILABLE instead of hanging while it reports ready). Mock backend only.
 
 const _SC = ReactantServer
 const _SCStatus = ReactantServer.gRPCServer.StatusCode
@@ -177,4 +178,73 @@ end
     sched.running = true
     entry.sched = nothing
     @test _sc_code(_sc_call(ctx, _sc_body("m"))) == _SCStatus.NOT_FOUND
+end
+
+_sc_req(model = "g") = _SC.InferRequest(model, ["y"], [_SC.NamedTensor("x", reshape(Float32[1, 2], 2, 1))])
+
+@testset "a dispatch loop that dies is fatal: logged, not live or ready, everything UNAVAILABLE" begin
+    # A shape-variant model whose variant is read from input "v". A request without it fails the
+    # variant lookup, which `infer` now catches for its own request...
+    e = _sc_entry("v"; variant_spec = [("v", 1)])
+    sched, ctx = _sc_sched(e, _sc_entry("m"))
+    failures = Any[]
+    _SC.on_dispatch_failure!(sched, err -> push!(failures, err))
+    _SC.start!(sched)
+    try
+        @test_throws ErrorException _SC.infer(sched, _sc_req("v"))
+        @test _SC.dispatch_alive(sched)
+        @test isempty(failures)
+
+        # ...but one that reaches the queue anyway (here by `submit!` directly) kills the loop in
+        # selection, where no single request can be held to it. Before, the loop died silently and
+        # every later request blocked forever while the worker reported ready.
+        qr = _SC.QueuedRequest(_sc_req("v"))
+        _SC.submit!(sched, qr)
+        r = take!(qr.reply)
+        @test r isa _SC.WorkerUnavailableError
+        @test _sc_code(_SC._as_grpc_error(r, nothing, "t")) == _SCStatus.UNAVAILABLE
+        @test !_SC.dispatch_alive(sched)
+        @test length(failures) == 1 && only(failures) isa KeyError
+        @test sched.failure isa KeyError
+
+        # Every later request and control command is rejected UNAVAILABLE rather than queued.
+        @test _sc_code(_sc_call(ctx, _sc_body("m"))) == _SCStatus.UNAVAILABLE
+        @test_throws _SC.WorkerUnavailableError _SC.evict!(sched, "m")
+
+        # The worker reports itself not live and not ready, everywhere it is asked.
+        @test !_SC._handle_server_live(ctx).live
+        @test !_SC._handle_server_ready(ctx).ready
+        @test !_SC._model_ready(ctx, "m")
+        @test !_SC._RegistryReady(sched.registry, sched)()
+        @test !_SC._DispatchLive(sched)()
+
+        # A hook installed after the death runs at once (a blocking serve installs the exit hook
+        # right after bring-up, so a loop that dies in between still exits the process).
+        late = Any[]
+        _SC.on_dispatch_failure!(sched, err -> push!(late, err))
+        @test length(late) == 1
+    finally
+        _SC.shutdown!(sched)
+    end
+
+    # A healthy worker says live and ready.
+    sched, ctx = _sc_sched(_sc_entry("m"))
+    _SC.start!(sched)
+    try
+        @test _SC._handle_server_live(ctx).live
+        @test _SC._handle_server_ready(ctx).ready
+        @test _SC._RegistryReady(sched.registry, sched)()
+    finally
+        _SC.shutdown!(sched)
+    end
+end
+
+@testset "a failure outside the execution fails only the requests still unanswered" begin
+    answered = _SC.QueuedRequest(_sc_req("m"))
+    put!(answered.reply, _SC.DeadlineExceeded("m"))
+    open_qr = _SC.QueuedRequest(_sc_req("m"))
+    _SC._fail_unanswered!([answered, open_qr], ErrorException("boom"))
+    @test take!(answered.reply) isa _SC.DeadlineExceeded
+    @test !isready(answered.reply)                 # not answered a second time
+    @test take!(open_qr.reply) isa ErrorException
 end

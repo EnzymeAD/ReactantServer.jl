@@ -85,7 +85,7 @@ using PrecompileTools: @setup_workload, @compile_workload
                     headers = headers, body = _pc_grpc_frame(msg)
                 )
             end
-            mserver = start_worker_metrics(metrics, "127.0.0.1", 0; ready_fn = _RegistryReady(reg), worker_name = "worker0", gpu = "0")
+            mserver = start_worker_metrics(metrics, "127.0.0.1", 0; ready_fn = _RegistryReady(reg, sched), live_fn = _DispatchLive(sched), worker_name = "worker0", gpu = "0")
             mport = HTTP.port(mserver)
             for path in ("/metrics", "/readyz")
                 HTTP.request("GET", "http://127.0.0.1:$mport$path"; client = client, protocol = :h1)

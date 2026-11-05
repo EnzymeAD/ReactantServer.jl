@@ -85,6 +85,11 @@ the gateway can act on it (back off, try another replica, give up, re-register s
 The worker's `worker_requests_total{status}` counts each request under the same status the
 client receives.
 
+If the dispatch loop itself fails with an error no single request can be held to, the worker
+logs it with its backtrace, reports itself not live and not ready (`ServerLive`, `ServerReady`,
+`ModelReady`, `/healthz`, `/readyz`), answers every queued and later request `UNAVAILABLE`, and
+exits with a nonzero code so the node supervisor restarts it.
+
 ## Decision order
 
 Each time the GPU frees up, the scheduler decides in this order:

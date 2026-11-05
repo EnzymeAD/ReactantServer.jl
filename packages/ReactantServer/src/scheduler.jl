@@ -121,13 +121,17 @@ mutable struct Scheduler
     residency_lock::ReentrantLock              # one residency change at a time (`set_residency!`)
     prefetched::Dict{String, Any}              # weights staged ahead of a placement change, by model
     # (`stage_weights!`); guarded by `cond`
+    failure::Any                               # the exception that killed the dispatch loop, or nothing
+    # while it serves (see `_dispatch_loop_died!`); guarded by `cond`
+    on_failure::Any                            # `f(err)` run once if the dispatch loop dies, or nothing
 end
 
 function Scheduler(registry::ModelRegistry, backend::AbstractBackend, pool::MemoryPool, cfg::SchedulerConfig)
     return Scheduler(
         registry, backend, pool, cfg,
         Threads.Condition(), false, nothing, nothing, nothing, ControlCommand[],
-        MetaGate(1), QueuedRequest[], 0, nothing, ReentrantLock(), Dict{String, Any}()
+        MetaGate(1), QueuedRequest[], 0, nothing, ReentrantLock(), Dict{String, Any}(),
+        nothing, nothing
     )
 end
 
@@ -870,26 +874,15 @@ end
 
 # Reject everything still pending at shutdown so no caller stays blocked on its reply channel:
 # queued requests across all models and any pending control commands, with `err` (UNAVAILABLE at
-# the transport). Caller holds `s.cond`.
+# the transport). Every caller is answered before any held weights are released, since a release
+# does shared-store I/O that can fail. Caller holds `s.cond`.
 function _reject_pending_locked!(s::Scheduler, err::Exception = _unavailable(s))
-    for (name, pf) in s.prefetched
-        entry = get(s.registry.by_name, name, nothing)
-        (pf.staged === nothing || entry === nothing || s.weight_cache === nothing) ||
-            release_staged!(s.weight_cache, entry, pf.staged; uploaded = false)
-    end
-    empty!(s.prefetched)
     for entry in values(s.registry.by_name)
         entry.sched === nothing && continue
         for qr in entry.sched.queue
             put!(qr.reply, err)
         end
         empty!(entry.sched.queue)
-        st = entry.sched
-        if st.host_stage === :staged && s.weight_cache !== nothing
-            release_staged!(s.weight_cache, entry, st.staged; uploaded = false)
-            st.staged = nothing
-            st.host_stage = :none
-        end
     end
     for entry in values(s.registry.meta)
         entry.sched === nothing && continue
@@ -903,11 +896,42 @@ function _reject_pending_locked!(s::Scheduler, err::Exception = _unavailable(s))
         put!(c.reply, err)
     end
     empty!(s.control)
+    for (name, pf) in s.prefetched
+        entry = get(s.registry.by_name, name, nothing)
+        (pf.staged === nothing || entry === nothing || s.weight_cache === nothing) ||
+            release_staged!(s.weight_cache, entry, pf.staged; uploaded = false)
+    end
+    empty!(s.prefetched)
+    for entry in values(s.registry.by_name)
+        st = entry.sched
+        if st !== nothing && st.host_stage === :staged && s.weight_cache !== nothing
+            release_staged!(s.weight_cache, entry, st.staged; uploaded = false)
+            st.staged = nothing
+            st.host_stage = :none
+        end
+    end
     return nothing
 end
 
-# The rejection a request or control command meets once the dispatch loop no longer runs.
-_unavailable(::Scheduler) = WorkerUnavailableError("server is shutting down")
+# The rejection a request or control command meets once the dispatch loop no longer runs: the
+# worker is shutting down, or the loop died.
+_unavailable(s::Scheduler) = WorkerUnavailableError(
+    s.failure === nothing ? "server is shutting down" :
+        "the worker's dispatch loop failed, so this worker serves no more requests until it restarts"
+)
+
+"""
+    dispatch_alive(scheduler) -> Bool
+
+Whether the dispatch loop can still serve: `false` once it has died with an unexpected error
+(the worker then reports not live and not ready, and rejects every request with `UNAVAILABLE`).
+"""
+function dispatch_alive(s::Scheduler)
+    s.failure === nothing || return false
+    t = s.task
+    # A loop task that ended while the scheduler still runs died some way the guard did not see.
+    return !(s.running && t !== nothing && istaskdone(t))
+end
 
 # Build zero-filled executable inputs at batch size `sz` (0 = unbatched) and input-shape `variant`
 # for warmup. The variant supplies the variable-axis sizes in the same (input, axis) order they were
@@ -1331,7 +1355,21 @@ function submit!(s::Scheduler, qr::QueuedRequest)
     return nothing
 end
 
+# The dispatch loop, guarded. A failure one request or one dispatch can be held to is answered to
+# just those callers (the execution's own catch, the guard around `execute_and_record!` below, and
+# each control command's), and serving goes on. An exception that escapes anyway (one in selecting
+# the next dispatch, say) means nothing will ever be dispatched again, so it is fatal to the worker
+# rather than a silent stop: see `_dispatch_loop_died!`.
 function dispatch_loop(s::Scheduler)
+    try
+        _dispatch_loop(s)
+    catch err
+        _dispatch_loop_died!(s, err, catch_backtrace())
+    end
+    return nothing
+end
+
+function _dispatch_loop(s::Scheduler)
     while true
         cmds, chosen = lock(s.cond) do
             while s.running && isempty(s.control) && !_has_queued(s)
@@ -1361,7 +1399,14 @@ function dispatch_loop(s::Scheduler)
         end
         (isempty(cmds) && chosen === nothing) && break
         if chosen !== nothing
-            execute_and_record!(s, chosen)
+            try
+                execute_and_record!(s, chosen)
+            catch err
+                # A failure outside the execution's own catch (the deadline admission, releasing an
+                # idle staged model) belongs to this dispatch alone: fail its requests, keep serving.
+                @error "a dispatch failed outside its execution; failing its requests" model = chosen.entry.name exception = (err, catch_backtrace())
+                _fail_unanswered!(chosen.taken, err)
+            end
             _maybe_compact!(s)
         end
         # A residency change or a compaction can leave queued models off the device.
@@ -1369,6 +1414,62 @@ function dispatch_loop(s::Scheduler)
         isempty(s.prefetched) || _sweep_prefetched!(s)
     end
     return nothing
+end
+
+# Answer with `err` each request that has no reply waiting. Only the dispatch loop replies to a taken
+# request, so an empty channel means it was never answered (or its caller has already taken the
+# reply, and the extra one is never read).
+function _fail_unanswered!(qrs::Vector{QueuedRequest}, err)
+    for qr in qrs
+        isready(qr.reply) || put!(qr.reply, err)
+    end
+    return nothing
+end
+
+# The dispatch loop died with `err`, which no single request can be held to, and nothing will be
+# dispatched again. Log it with its backtrace; mark the scheduler failed, so ServerLive, ServerReady,
+# ModelReady and `/readyz` say no from now on and every later request or control command is rejected
+# with `WorkerUnavailableError` (UNAVAILABLE); answer everything already queued the same way; then run
+# the `on_failure` hook once (a worker process exits nonzero there so its supervisor restarts it, see
+# `on_dispatch_failure!`). A failure during a shutdown already under way only logs.
+function _dispatch_loop_died!(s::Scheduler, err, bt)
+    @error "the dispatch loop failed; this worker no longer serves and reports not live" exception = (err, bt)
+    stopping = false
+    hook = lock(s.cond) do
+        stopping = !s.running
+        s.failure = err
+        s.running = false
+        try
+            _reject_pending_locked!(s)
+        catch e
+            @error "releasing held weights after the dispatch loop failed" exception = (e, catch_backtrace())
+        end
+        notify(s.cond)
+        return s.on_failure
+    end
+    (hook === nothing || stopping) && return nothing
+    try
+        hook(err)
+    catch e
+        @error "the dispatch-failure hook threw" exception = (e, catch_backtrace())
+    end
+    return nothing
+end
+
+"""
+    on_dispatch_failure!(scheduler, f) -> scheduler
+
+Run `f(err)` once if the dispatch loop dies with the unexpected error `err`, or right away if it
+already has. A blocking [`serve`](@ref) (a worker process) installs a hook that exits the process
+nonzero, so the node supervisor restarts it; an embedded server keeps running and reports not live.
+"""
+function on_dispatch_failure!(s::Scheduler, f)
+    failed = lock(s.cond) do
+        s.on_failure = f
+        return s.failure
+    end
+    failed === nothing || f(failed)
+    return s
 end
 
 # ---------------------------------------------------------------------------------------------
@@ -1880,6 +1981,17 @@ function remove_meta!(s::Scheduler, name::AbstractString)
     return nothing
 end
 
+# A preprocess that leaves out an input the shape variant is read from would fail the variant lookup
+# on the dispatch loop, where the failure cannot be pinned on this one request; fail it here instead.
+function _check_variant_inputs(entry::ModelEntry, prepared::Vector{NamedTensor})
+    entry.executable === nothing && return nothing
+    for (nm, _) in entry.executable.sig.variant_spec
+        any(t -> t.name == nm, prepared) ||
+            throw(ErrorException("preprocess of model '$(entry.name)' did not produce executable input '$nm'"))
+    end
+    return nothing
+end
+
 """
     infer(scheduler, request) -> Vector{NamedTensor}
 
@@ -1907,6 +2019,7 @@ function infer(s::Scheduler, req::InferRequest; committed::Bool = false)
     # preprocess/postprocess come from a bundle's model.jl, defined in a newer world age;
     # invokelatest crosses that boundary (harmless for identity).
     prepared = Base.invokelatest(entry.preprocess, req.inputs)
+    _check_variant_inputs(entry, prepared)
     # A request larger than the largest compiled batch is split into pieces the model can run and
     # the pieces' outputs are joined back, so a client that batches 32 against a bundle compiled for
     # `[1]` gets an answer rather than an INTERNAL error. The inverse of coalescing: the same batch

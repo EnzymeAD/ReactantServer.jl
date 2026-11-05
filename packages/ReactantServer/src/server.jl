@@ -382,15 +382,39 @@ function _meta_concurrency()
     return max(1, n)
 end
 
-# /readyz for the metrics listener: ready once every loaded model is compiled, the ServerReady rule.
-# A named callable rather than a closure so the precompile workload can start the listener with this
-# exact type; HTTP.jl specializes the listener's code on the handler, and through it on this.
+# /readyz for the metrics listener: ready once every loaded model is compiled, the ServerReady rule,
+# and never once the dispatch loop has died. A named callable rather than a closure so the precompile
+# workload can start the listener with this exact type; HTTP.jl specializes the listener's code on
+# the handler, and through it on this.
 struct _RegistryReady
     registry::ModelRegistry
+    sched::Scheduler
 end
 function (r::_RegistryReady)()
     es = values(r.registry.by_name)
-    return (!isempty(es) || !isempty(r.registry.meta)) && all(e -> e.executable !== nothing, es)
+    return (!isempty(es) || !isempty(r.registry.meta)) && all(e -> e.executable !== nothing, es) &&
+        dispatch_alive(r.sched)
+end
+
+# /healthz for the metrics listener: live while the dispatch loop serves, as ServerLive.
+struct _DispatchLive
+    sched::Scheduler
+end
+(l::_DispatchLive)() = dispatch_alive(l.sched)
+
+# A worker process whose dispatch loop has died serves nothing more, so it exits nonzero and its
+# node supervisor restarts it. The pause first lets the handlers just answered UNAVAILABLE send
+# their replies.
+const _DISPATCH_FAILURE_EXIT_CODE = 70      # EX_SOFTWARE
+const _DISPATCH_FAILURE_EXIT_GRACE_SECONDS = 2.0
+
+function _exit_on_dispatch_failure(_)
+    @error "exiting so the supervisor restarts this worker" exit_code = _DISPATCH_FAILURE_EXIT_CODE
+    Threads.@spawn :default begin
+        sleep(_DISPATCH_FAILURE_EXIT_GRACE_SECONDS)
+        exit(_DISPATCH_FAILURE_EXIT_CODE)
+    end
+    return nothing
 end
 
 function serve(
@@ -403,6 +427,8 @@ function serve(
     enable_compile_timing!()
     shm = SharedMemoryRegistry()   # client-facing SystemSharedMemory feature (decode/encode shm path)
     pool, registry, sched, watcher = _bring_up(cfg, backend)
+    # A blocking serve is a worker process: should its dispatch loop die, exit nonzero for a restart.
+    blocking && on_dispatch_failure!(sched, _exit_on_dispatch_failure)
     # Local reuse pool for meta-model intermediates: plain Memory, never shared. With one meta at a time
     # (the gate below) the pool sees no cross-meta contention; it keeps large per-request intermediates
     # (e.g. an ROI feature tensor) off the allocation path and holds down GC pressure. Sized by env.
@@ -439,7 +465,8 @@ function serve(
     if cfg.endpoints.metrics_port > 0
         metrics_server = start_worker_metrics(
             metrics, cfg.endpoints.host, cfg.endpoints.metrics_port;
-            ready_fn = _RegistryReady(registry), worker_name = worker_name, gpu = _gpu_identity(cfg)
+            ready_fn = _RegistryReady(registry, sched), live_fn = _DispatchLive(sched),
+            worker_name = worker_name, gpu = _gpu_identity(cfg)
         )
     end
     @info "Starting gRPC server" host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests models = model_names(registry)
