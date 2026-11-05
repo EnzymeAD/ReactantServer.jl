@@ -1217,14 +1217,268 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "description": "Expected requests in the system summed over the workers, as the last repack left it: from each worker's load (compute plus the weight uploads its budget forces). Lower is better; mean latency is this over the request rate.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 27
+      },
+      "id": 17,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "expr": "max(gateway_repack_objective)",
+          "format": "time_series",
+          "instant": false,
+          "legendFormat": "requests in system",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Placement objective",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "description": "Moves and swaps that waited for their weights to be read on the new worker: committed once staged, or dropped when the read failed, was deferred or timed out. Over 30-minute windows.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 35,
+            "gradientMode": "opacity",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 27
+      },
+      "id": 18,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "expr": "sum by (outcome) (rate(gateway_repack_staged_changes_total[30m])) * 3600",
+          "format": "time_series",
+          "instant": false,
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Staged placement changes, per hour",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "description": "Models a worker is reading into host memory before their dispatch (reading), waiting for a free read slot (waiting), or read and waiting to upload (staged).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 35,
+            "gradientMode": "opacity",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 27
+      },
+      "id": 19,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "expr": "sum by (state) (worker_weight_staging_models{worker=~'$worker'})",
+          "format": "time_series",
+          "instant": false,
+          "legendFormat": "{{state}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Weights being read ahead, by state",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 27
+        "y": 35
       },
-      "id": 17,
+      "id": 20,
       "panels": [],
       "title": "Load balance",
       "type": "row"
@@ -1307,9 +1561,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 28
+        "y": 36
       },
-      "id": 18,
+      "id": 21,
       "options": {
         "legend": {
           "calcs": [
@@ -1434,9 +1688,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 28
+        "y": 36
       },
-      "id": 19,
+      "id": 22,
       "options": {
         "legend": {
           "calcs": [
@@ -1535,9 +1789,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 28
+        "y": 36
       },
-      "id": 20,
+      "id": 23,
       "options": {
         "legend": {
           "calcs": [
@@ -1619,9 +1873,9 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 36
+        "y": 44
       },
-      "id": 21,
+      "id": 24,
       "options": {
         "legend": {
           "calcs": [
@@ -1704,9 +1958,9 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 36
+        "y": 44
       },
-      "id": 22,
+      "id": 25,
       "options": {
         "legend": {
           "calcs": [
@@ -1748,9 +2002,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 44
+        "y": 52
       },
-      "id": 23,
+      "id": 26,
       "panels": [],
       "title": "Placement",
       "type": "row"
@@ -1810,9 +2064,9 @@
         "h": 12,
         "w": 14,
         "x": 0,
-        "y": 45
+        "y": 53
       },
-      "id": 24,
+      "id": 27,
       "options": {
         "cellHeight": "sm",
         "showHeader": true
@@ -1881,9 +2135,9 @@
         "h": 12,
         "w": 10,
         "x": 14,
-        "y": 45
+        "y": 53
       },
-      "id": 25,
+      "id": 28,
       "options": {
         "displayMode": "gradient",
         "maxVizHeight": 300,
@@ -1924,9 +2178,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 57
+        "y": 65
       },
-      "id": 26,
+      "id": 29,
       "panels": [],
       "title": "Gateway to worker",
       "type": "row"
@@ -1978,9 +2232,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 58
+        "y": 66
       },
-      "id": 27,
+      "id": 30,
       "options": {
         "legend": {
           "calcs": [
@@ -2067,9 +2321,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 58
+        "y": 66
       },
-      "id": 28,
+      "id": 31,
       "options": {
         "legend": {
           "calcs": [
@@ -2157,9 +2411,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 58
+        "y": 66
       },
-      "id": 29,
+      "id": 32,
       "options": {
         "alignValue": "left",
         "legend": {

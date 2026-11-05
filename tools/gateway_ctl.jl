@@ -9,7 +9,8 @@
 #   julia --project=packages/ReactantServerGateway tools/gateway_ctl.jl [--gateway host:port] <cmd>
 #
 #     status                                          the whole scheduling state
-#     repack [--wait SECONDS]                         repack now (default waits 30s for it to land)
+#     repack [--wait SECONDS] [--full]                repack now (default waits 30s for it to land);
+#                                                     --full packs from scratch without staging moves
 #     set-replicas MODEL <n|all|default> [--fill-mode run|spread|inflight|inherit]
 #                                       [--fill-factor F] [--allow-unknown]
 #     set-policy KEY=VALUE [KEY=VALUE ...]            any SchedulingPolicy field (see --help)
@@ -32,7 +33,8 @@ const POLICY_KEYS = [
     "rebalance_compute_seconds", "first_rebalance_compute_seconds", "hysteresis",
     "ema_halflife_compute_seconds", "default_replicas", "routing_policy", "work_basis",
     "routing_fill_factor", "routing_fill_mode", "compaction_mode",
-    "compaction_interval", "forbid_memory_oversubscription",
+    "compaction_interval", "forbid_memory_oversubscription", "payback_seconds", "prime_moves",
+    "stage_timeout_seconds",
 ]
 
 usage() = print(
@@ -41,7 +43,7 @@ usage() = print(
 
     Commands:
       status
-      repack [--wait SECONDS]
+      repack [--wait SECONDS] [--full]
       set-replicas MODEL <n|all|default> [--fill-mode MODE] [--fill-factor F] [--allow-unknown]
       set-policy KEY=VALUE ...
 
@@ -99,6 +101,8 @@ function print_status(resp)
         @printf("  routing_fill_factor              %s\n", p.routing_fill_factor)
         @printf("  compaction                       %s every %d repack(s)\n", p.compaction_mode, p.compaction_interval)
         @printf("  forbid_memory_oversubscription   %s\n", p.forbid_memory_oversubscription)
+        @printf("  payback_seconds                  %s\n", p.payback_seconds)
+        @printf("  prime_moves                      %s (stage_timeout_seconds %s)\n", p.prime_moves, p.stage_timeout_seconds)
     end
     r = resp.repack
     if r !== nothing
@@ -114,6 +118,15 @@ function print_status(resp)
         @printf(
             "  operator repacks                 %d requested, %d served\n",
             r.operator_repacks_requested, r.operator_repacks_completed
+        )
+        @printf(
+            "  last repack's changes            %d planned, %d committed, %d dropped%s\n",
+            r.last_changes_planned, r.last_changes_committed, r.last_changes_dropped,
+            r.staging_in_progress ? " (staging weights now)" : ""
+        )
+        @printf(
+            "  objective (requests in system)   %.3f before, %.3f after\n",
+            r.last_objective_before, r.last_objective_after
         )
     end
     if !isempty(resp.models)
@@ -178,7 +191,7 @@ end
 
 function coerce_policy_value(k, v)
     k in ("routing_policy", "work_basis", "routing_fill_mode", "compaction_mode") && return v
-    k == "forbid_memory_oversubscription" && return parse(Bool, v)
+    k in ("forbid_memory_oversubscription", "prime_moves") && return parse(Bool, v)
     k == "default_replicas" && return parse_replicas(v)
     k == "compaction_interval" && return Int64(parse(Int, v))
     return parse(Float64, v)
@@ -226,9 +239,10 @@ function dispatch(cmd, rest, host, port)
         wait = 30.0
         j = findfirst(==("--wait"), rest)
         j === nothing || (wait = parse(Float64, rest[j + 1]))
+        full = "--full" in rest
         resp = call(
             GatewayControlService.Repack, host, port,
-            RepackRequest(; wait_seconds = wait); deadline = ceil(Int, wait) + 30
+            RepackRequest(; wait_seconds = wait, full = full); deadline = ceil(Int, wait) + 30
         )
         println(
             resp.completed ?
@@ -236,7 +250,11 @@ function dispatch(cmd, rest, host, port)
                 "repack $(resp.sequence) queued (not observed within $(round(resp.waited_seconds; digits = 2))s)"
         )
         r = resp.repack
-        r === nothing || println("  now $(r.repack_count) repack(s) total, last trigger '$(r.last_trigger)', $(r.last_models_moved) model(s) moved")
+        r === nothing || println(
+            "  now $(r.repack_count) repack(s) total, last trigger '$(r.last_trigger)', $(r.last_models_moved) model(s) moved, " *
+                "$(r.last_changes_committed) of $(r.last_changes_planned) change(s) committed" *
+                (r.staging_in_progress ? " (still staging weights)" : "")
+        )
         print_warnings(resp.warnings)
     elseif cmd == "set-replicas"
         length(rest) >= 2 || (usage(); return 2)

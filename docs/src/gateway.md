@@ -72,7 +72,10 @@ scheduling:
   rebalance_compute_seconds: 300 # fleet GPU-seconds consumed that triggers a repack
   first_rebalance_compute_seconds: 60 # smaller budget for the first repack (0 = use rebalance_compute_seconds)
   ema_halflife_compute_seconds: 0 # demand-EMA halflife in fleet compute-seconds (0 = track rebalance_compute_seconds)
-  hysteresis: 0.05              # least relative gain a repack needs to move a model (0 = move on any gain)
+  hysteresis: 0.05              # least relative gain a placement change needs, a floor against noisy estimates
+  payback_seconds: 600          # a change must save more latency over this window than its uploads cost
+  prime_moves: true             # stage a moving model's weights on its new GPU before routing switches
+  stage_timeout_seconds: 120    # a change whose weights are not staged by then is dropped from that repack
   default_replicas: 1           # GPUs per model unless overridden below (a number, or "all")
   routing_fill_factor: 1.0      # fill quantum as a multiple of max batch size (lpt_packing only)
   routing_policy: fill_least    # fill_least (default) | fill_rr  (lpt_packing only)
@@ -187,17 +190,75 @@ halflife is measured in fleet compute-seconds (`ema_halflife_compute_seconds`, d
 `rebalance_compute_seconds` interval, so the signal decays about half per repack and ages with
 how busy the fleet is rather than with wall-clock).
 
-Only the startup placement packs from scratch. Every later repack starts from the current placement
-and moves as few models as it can, because each move is a weight load on the GPU it lands on (often a
-read from disk) and fragments that GPU's memory, and batching depends on traffic staying where the
-queues are. A repack places what is new or lost its worker, then, with
-`forbid_memory_oversubscription`, moves models off any worker over its weight budget (the smallest
-model that clears the overflow first), and then repeatedly moves the one model off the
-highest-pressure worker that relieves it most per byte moved, stopping once no move would lower that
-worker's pressure by at least `hysteresis` (a fraction, default `0.05`). With a settled fleet a
-repack therefore moves nothing. A worker that misses the poll for less than 30 s (three probe rounds)
-keeps its models: the repack waits rather than moving them onto the rest of the fleet and back. (`max_worker_share` is accepted but does not affect a model's GPU
-count.)
+#### What a repack optimizes
+
+A repack weighs throughput, latency and memory against each other by reducing all three to one
+resource, device time, and one objective, mean latency. A worker's **load** is the device time it
+spends per second:
+
+```text
+load(w) = sum of u_m over the models routed to w            (compute: arrival rate x cost per request)
+        + sum of f_m x U_m over those its budget cannot hold   (upload churn)
+```
+
+`u_m` is a model's compute demand, `f_m` its request rate, and `U_m` the seconds one upload of its
+weights holds a GPU, which the workers measure and report. A worker keeps the models with the most
+upload seconds saved per byte held, which is how its own eviction ranks them; since upload time grows
+with size, that is close to keeping the most often requested models whatever their size. Memory
+therefore costs nothing until it overflows, and then costs exactly the uploads the overflow causes,
+in the same units as compute. A large model that is rarely called is cheap to leave out; one that is
+called often is expensive to miss, and the load says by how much.
+
+A queue at utilization `rho` holds `rho / (1 - rho)` requests on average, so by Little's law mean
+latency is that summed over the workers, divided by the request rate. The repack minimizes that sum
+(`gateway_repack_objective`). It rises steeply as a worker nears saturation, which is why relieving a
+saturated GPU is worth a weight upload and reshuffling an idle fleet is not.
+
+Reading a weights file from disk is not part of this. The worker reads in the background, never on
+the loop that runs the GPU (see [On-demand Weights](on_demand_weights.md)), so a slow disk costs the
+requests that wait for a cold model latency but never costs device time. That latency is decided
+where a model's copy in host RAM is evicted, not by placement.
+
+#### Moves and swaps
+
+Only the startup placement packs from scratch, and it is then improved by the same objective with
+uploads priced at zero, since nothing is loaded yet. Every later repack starts from the current
+placement and changes only what it must or what pays for itself:
+
+1. Place what is new or lost its worker, and adjust replica counts.
+2. With `forbid_memory_oversubscription`, move models off any worker over its weight budget (the
+   smallest model that clears the overflow first).
+3. Repeatedly make the best change off the most loaded worker: move one of its models to another
+   worker, or **swap** one for a model of another worker. A swap is the only change that fits when
+   every worker is at its weight budget, which is how a node whose weights outgrow its GPUs runs.
+
+A change is made when the latency it saves, held for `payback_seconds`, exceeds the latency its
+uploads cost (each upload delays the requests already waiting on that GPU, plus the one that
+triggers it), and when it lowers the objective by at least `hysteresis` of the two workers' share of
+it, a floor against noise in the rate estimates. The change with the most net saving goes first, and
+a move beats a swap that saves the same, since it is one upload instead of two. There is no fixed
+number of changes per repack: it makes every change that pays and stops. `payback_seconds: 0` never
+moves a model for balance. With a settled fleet a repack changes nothing. A worker that misses the
+poll for less than 30 s (three probe rounds) keeps its models: the repack waits rather than moving
+them onto the rest of the fleet and back. (`max_worker_share` is accepted but does not affect a
+model's GPU count.)
+
+Without `forbid_memory_oversubscription` a worker may be placed more weights than its budget, and the
+overflow is priced by the uploads it causes. With it (the default), the budget is a hard limit on
+every change.
+
+#### Primed moves
+
+With `prime_moves` (the default), a change that moves a model off a GPU still serving it does not
+switch routing straight away. The gateway first asks the new worker to read the model's weights
+into host memory (the worker's `StageWeights` RPC, which reads off its GPU loop and holds the weights
+for the model's first dispatch), and switches routing only once they are there. The model keeps
+serving from its old GPU meanwhile, and its first request on the new one waits for an upload from
+RAM, never for a read from disk. A change whose read fails, is deferred (the worker caps the bytes it
+holds this way at half its host weight budget) or takes longer than `stage_timeout_seconds` is
+dropped from that repack and planned again by the next one. A swap commits only when both of its
+models are staged, since half a swap could overfill a GPU. The prober keeps running while the reads
+do, and no other repack starts until they end.
 
 Repacks are driven by accumulated compute, not wall-clock: the gateway polls the workers every
 probe round and recomputes the placement once the fleet has consumed `rebalance_compute_seconds`
@@ -370,7 +431,7 @@ without a restart:
 | `GetSchedulingStatus` | The mode, every runtime knob, repack bookkeeping, and one row per model and per worker (placement, in-flight and routed counts, resolved fill mode and quantum, measured demand and cost, assigned weights against each worker's budget). Answers in every scheduling mode. |
 | `SetSchedulingPolicy` | Change any knob in the `scheduling:` block except `mode`. `update_mask` names the fields to apply; one invalid value rejects the whole request and nothing changes. |
 | `SetModelPlacement` | Set, change, or clear one model's `replicas`, `fill_mode`, and `fill_factor`. The three are independent, so one call can promote a model and change how it uses its GPUs. Effective at the next repack. |
-| `Repack` | Repack now, bypassing the accumulated-compute budget, optionally waiting a bounded time for it to land. |
+| `Repack` | Repack now, bypassing the accumulated-compute budget, optionally waiting a bounded time for it to land (a repack staging its moves lands when it commits them). `full` packs from scratch and installs the result at once, without staging: an escape hatch that can move most models. |
 
 `tools/gateway_ctl.jl` is the operator front end, run against the gateway's gRPC port:
 
@@ -378,6 +439,7 @@ without a restart:
 julia --project=packages/ReactantServerGateway tools/gateway_ctl.jl --gateway HOST:8001 status
 ... set-replicas big-model 2 --fill-mode spread
 ... repack --wait 30
+... repack --full               # pack from scratch; reloads most models at once
 ... set-policy hysteresis=0.15 routing_policy=fill_least compaction_interval=4
 ```
 
@@ -458,11 +520,15 @@ returning whether it reported ready.
   `scheduling.first_rebalance_compute_seconds` when set). Each repack logs a `lpt_packing: repack`
   line with the number of models placed, how many `moved` workers and the weight bytes that
   move puts on their new workers (`moved_weights`), whether it was `incremental` (every repack
-  after the startup placement), the largest available `max_improvement` against the `hysteresis`
-  threshold (a relative gain the repack judged not worth a move), and the
+  after the startup placement), the `changes` it planned and how many are `staging`, the objective
+  before and after (`objective_before`, `objective_after`), the largest relative improvement any
+  change offered (`max_improvement`, against the `hysteresis` floor), and the
   `compute_seconds`/`wall_seconds` since the last repack, useful for watching placement churn and
-  the trigger cadence. A repack that comes due while a placed worker is missing from the poll logs
-  `repack deferred` instead and runs once the worker answers or 30 s have passed.
+  the trigger cadence. A repack that stages its moves then logs `staged placement changes
+  committed` with how many it committed and dropped (also counted by
+  `gateway_repack_staged_changes_total{outcome}`). A repack that comes due while a placed worker is
+  missing from the poll logs `repack deferred` instead and runs once the worker answers or 30 s have
+  passed.
 - If a probe to a worker hangs (times out, rather than failing fast), the gateway drops and
   recreates that worker's gRPC connection before the next attempt. This recovers from a
   half-open connection (for example one caught during a worker's brief silent-accept window at

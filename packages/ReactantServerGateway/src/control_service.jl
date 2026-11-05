@@ -63,13 +63,17 @@ _require_packing(s::LptPackingState) = s
 # --- the forced-repack handshake --------------------------------------------------------------
 
 """
-    request_repack!(s::LptPackingState) -> Int
+    request_repack!(s::LptPackingState; full=false) -> Int
 
 Ask the prober to repack on its next round regardless of the accumulated-compute budget, returning
 the sequence number assigned to this request. Requests that arrive inside one tick window coalesce
-into a single repack, and every one of them is satisfied by it.
+into a single repack, and every one of them is satisfied by it. `full` packs from scratch and installs
+the result without staging its moves (any coalesced request asking for it makes the repack full).
 """
-request_repack!(s::LptPackingState) = @atomic s.repack_requested += 1
+function request_repack!(s::LptPackingState; full::Bool = false)
+    full && @atomic s.full_requested = true
+    return @atomic s.repack_requested += 1
+end
 
 """
     await_repack(s::LptPackingState, seq, budget) -> (completed, waited)
@@ -118,6 +122,9 @@ _policy_to_wire(k::PackingKnobs) = _CTRL_GW.SchedulingPolicy(;
     compaction_mode = String(k.compaction_mode),
     compaction_interval = Int64(k.compaction_interval),
     forbid_memory_oversubscription = k.forbid_memory_oversubscription,
+    payback_seconds = k.payback_seconds,
+    prime_moves = k.prime_moves,
+    stage_timeout_seconds = k.stage_timeout_seconds,
     generation = UInt64(k.generation)
 )
 
@@ -136,6 +143,9 @@ const _POLICY_WIRE_FIELDS = Dict{String, Symbol}(
     "compaction_mode" => :compaction_mode,
     "compaction_interval" => :compaction_interval,
     "forbid_memory_oversubscription" => :forbid_memory_oversubscription,
+    "payback_seconds" => :payback_seconds,
+    "prime_moves" => :prime_moves,
+    "stage_timeout_seconds" => :stage_timeout_seconds,
 )
 
 # Settings that exist but cannot change without a restart, named so the error can say why rather than
@@ -277,7 +287,13 @@ _repack_status(s::LptPackingState) = begin
         last_tick_unix_seconds = tick.unix_seconds,
         repacks_since_compaction = Int64(s.repacks_since_compact),
         operator_repacks_requested = UInt64(@atomic s.repack_requested),
-        operator_repacks_completed = UInt64(@atomic s.repack_completed)
+        operator_repacks_completed = UInt64(@atomic s.repack_completed),
+        last_changes_planned = Int64(rep.changes_planned),
+        last_changes_committed = Int64(rep.changes_committed),
+        last_changes_dropped = Int64(rep.changes_dropped),
+        staging_in_progress = rep.staging,
+        last_objective_before = rep.objective_before,
+        last_objective_after = rep.objective_after
     )
 end
 
@@ -343,7 +359,7 @@ end
 # A compact one-line rendering of the knobs for the audit log (the full struct is noisy and the log is
 # the only record a change happened).
 _knob_digest(k::PackingKnobs) =
-    "rebalance=$(k.rebalance_compute_seconds) first=$(k.first_rebalance_compute_seconds) hyst=$(k.hysteresis) halflife=$(k.ema_halflife_compute) replicas=$(k.default_replicas == REPLICAS_ALL ? "all" : k.default_replicas) policy=$(k.routing_policy) fill=$(k.routing_fill_mode)x$(k.routing_fill_factor) compaction=$(k.compaction_mode)/$(k.compaction_interval) noover=$(k.forbid_memory_oversubscription) gen=$(k.generation)"
+    "rebalance=$(k.rebalance_compute_seconds) first=$(k.first_rebalance_compute_seconds) hyst=$(k.hysteresis) halflife=$(k.ema_halflife_compute) replicas=$(k.default_replicas == REPLICAS_ALL ? "all" : k.default_replicas) policy=$(k.routing_policy) fill=$(k.routing_fill_mode)x$(k.routing_fill_factor) compaction=$(k.compaction_mode)/$(k.compaction_interval) noover=$(k.forbid_memory_oversubscription) payback=$(k.payback_seconds) prime=$(k.prime_moves)/$(k.stage_timeout_seconds) gen=$(k.generation)"
 
 # Project the memory effect of a placement change: the model's footprint lands on every replica, so
 # promoting it can push a worker past its on-demand budget. The packer degrades gracefully (its LRU
@@ -454,10 +470,10 @@ function _gw_repack(req::_CTRL_GW.RepackRequest, st::GatewayState)
                 )
             )
         end
-        seq = request_repack!(s)
+        seq = request_repack!(s; full = req.full)
         completed, waited = await_repack(s, seq, budget)
         completed || push!(warnings, "repack queued but not observed within $(round(waited; digits = 2))s; it will run on the next prober round")
-        @info "gateway control: repack requested" sequence = seq completed = completed waited_seconds = round(waited; digits = 2)
+        @info "gateway control: repack requested" sequence = seq full = req.full completed = completed waited_seconds = round(waited; digits = 2)
         _CTRL_GW.RepackResponse(;
             sequence = UInt64(seq),
             completed_sequence = UInt64(@atomic s.repack_completed),

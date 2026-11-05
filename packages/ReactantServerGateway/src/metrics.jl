@@ -36,6 +36,8 @@ struct GatewayMetrics
     repack_moved_bytes::Prometheus.Counter
     assigned_weight_bytes::Prometheus.Family{Prometheus.Gauge}
     weight_budget_bytes::Prometheus.Family{Prometheus.Gauge}
+    repack_objective::Prometheus.Gauge
+    staged_changes::Prometheus.Family{Prometheus.Counter}
     # Maps a worker endpoint url (gRPC or metrics) to its friendly name (worker0..N), so every
     # worker-labelled gateway series matches the workers' own self-tagged `worker` label instead of
     # showing a host:port. Empty for a standalone gateway given no names: labels fall back to the url.
@@ -128,12 +130,25 @@ function GatewayMetrics(worker_names::Dict{String, String} = Dict{String, String
         "The worker's on-demand weight budget as the last repack saw it (0 = unconstrained).",
         (:worker,); registry = reg
     )
+    repack_objective = Prometheus.Gauge(
+        "gateway_repack_objective",
+        "The placement objective after the last repack: expected requests in the system summed over " *
+            "the workers, from each one's load (compute plus the upload churn its weight budget causes). " *
+            "Lower is better; mean latency is this over the request rate.";
+        registry = reg
+    )
+    staged_changes = Prometheus.Family{Prometheus.Counter}(
+        "gateway_repack_staged_changes_total",
+        "Placement changes that waited for their weights to be staged on the new worker: committed once " *
+            "staged, or dropped when staging failed, was deferred or timed out.",
+        (:outcome,); registry = reg
+    )
     return GatewayMetrics(
         reg, requests_total, request_latency, worker_latency,
         routing_table_size, worker_ready, placement_weight, model_utilization,
         model_replicas, replica_outstanding, model_fill_quantum, repacks_total,
         worker_metrics_up, probe_latency, repack_moved_models, repack_moved_bytes,
-        assigned_weight_bytes, weight_budget_bytes, worker_names
+        assigned_weight_bytes, weight_budget_bytes, repack_objective, staged_changes, worker_names
     )
 end
 
@@ -178,6 +193,14 @@ observe_probe!(m::GatewayMetrics, worker, secs) =
 function inc_repack_moves!(m::GatewayMetrics, models, bytes)
     Prometheus.inc(m.repack_moved_models, Float64(models))
     Prometheus.inc(m.repack_moved_bytes, Float64(bytes))
+    return nothing
+end
+
+set_repack_objective!(m::GatewayMetrics, n) = Prometheus.set(m.repack_objective, Float64(n))
+
+function inc_staged_changes!(m::GatewayMetrics, committed, dropped)
+    Prometheus.inc(Prometheus.labels(m.staged_changes, ("committed",)), Float64(committed))
+    Prometheus.inc(Prometheus.labels(m.staged_changes, ("dropped",)), Float64(dropped))
     return nothing
 end
 

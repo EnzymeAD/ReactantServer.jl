@@ -1022,6 +1022,24 @@ function placement()
             ]; w = 8, overrides = [dashed(".*file reads")]
         ),
     )
+    line!(
+        b,
+        ts(
+            "Placement objective", q("max(gateway_repack_objective)"; legend = "requests in system");
+            w = 8, decimals = 2,
+            desc = "Expected requests in the system summed over the workers, as the last repack left it: from each worker's load (compute plus the weight uploads its budget forces). Lower is better; mean latency is this over the request rate."
+        ),
+        ts(
+            "Staged placement changes, per hour", q("sum by (outcome) (rate(gateway_repack_staged_changes_total[30m])) * 3600"; legend = "{{outcome}}");
+            w = 8, stack = true,
+            desc = "Moves and swaps that waited for their weights to be read on the new worker: committed once staged, or dropped when the read failed, was deferred or timed out. Over 30-minute windows."
+        ),
+        ts(
+            "Weights being read ahead, by state", q("sum by (state) (worker_weight_staging_models{%W})"; legend = "{{state}}");
+            w = 8, stack = true, decimals = 0,
+            desc = "Models a worker is reading into host memory before their dispatch (reading), waiting for a free read slot (waiting), or read and waiting to upload (staged)."
+        ),
+    )
 
     row!(b, "Load balance")
     line!(

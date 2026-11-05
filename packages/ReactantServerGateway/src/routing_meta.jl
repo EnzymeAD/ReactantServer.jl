@@ -151,6 +151,13 @@ function poll_workers(pool::ClientPool, ready_urls::Vector{String})
     batch_at = Dict{String, Tuple{String, Int}}()  # model -> (wire input name, 1-based batch axis)
     polled = String[]
     worker_compute = Dict{String, Float64}()      # worker -> its cumulative compute (all models)
+    # What loading a model costs, for pricing placement changes: the seconds one upload holds a
+    # device (the largest any worker reports), the seconds a read from the weights file takes, and
+    # which workers hold a copy in host memory to upload from.
+    upload = Dict{String, Float64}()
+    read = Dict{String, Float64}()
+    host_copy = Set{Tuple{String, String}}()      # (worker, model)
+    host_budget = Dict{String, Float64}()         # worker -> its host weight budget (0 = none)
     lk = ReentrantLock()
     @sync for url in ready_urls
         wc = get_clients(pool, url)
@@ -172,6 +179,7 @@ function poll_workers(pool::ClientPool, ready_urls::Vector{String})
                 push!(polled, url)
                 worker_compute[url] = sum((ms.total_compute_seconds for ms in resp.models); init = 0.0)
                 mem_cap[url] = Float64(resp.weight_cache_max_bytes)
+                host_budget[url] = Float64(resp.host_weight_budget_bytes)
                 for ms in resp.models
                     tc, rq, rw = get(sums, ms.name, (0.0, UInt64(0), UInt64(0)))
                     sums[ms.name] = (
@@ -185,6 +193,9 @@ function poll_workers(pool::ClientPool, ready_urls::Vector{String})
                     isempty(ms.batch_input_name) || haskey(batch_at, ms.name) ||
                         (batch_at[ms.name] = (ms.batch_input_name, Int(ms.batch_axis)))
                     push!(get!(permodel_workers, ms.name, String[]), url)
+                    upload[ms.name] = max(get(upload, ms.name, 0.0), Float64(ms.upload_seconds))
+                    read[ms.name] = max(get(read, ms.name, 0.0), Float64(ms.read_seconds))
+                    ms.host_copy && push!(host_copy, (url, ms.name))
                 end
             end
         end
@@ -193,7 +204,10 @@ function poll_workers(pool::ClientPool, ready_urls::Vector{String})
     for (tc, _, _) in values(sums)
         fleet_compute += tc
     end
-    return (; sums, permodel_workers, mem, mem_cap, max_batch, batch_at, polled, fleet_compute, worker_compute)
+    return (;
+        sums, permodel_workers, mem, mem_cap, max_batch, batch_at, polled, fleet_compute, worker_compute,
+        upload, read, host_copy, host_budget,
+    )
 end
 
 """

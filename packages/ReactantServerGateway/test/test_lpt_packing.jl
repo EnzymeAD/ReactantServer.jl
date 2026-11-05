@@ -124,7 +124,7 @@ end
     cfg = GW.GatewayConfig(
         "0.0.0.0:0", "0.0.0.0:0", ["127.0.0.1:1"], String[], String[], 1, 1, 1, "info",
         "json", "lpt_packing", "compute", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr", "run",
-        Dict{String, GW.GatewayModelConfig}(), 32, 64, :off, 0, false
+        Dict{String, GW.GatewayModelConfig}(), 32, 64, :off, 0, false, 600.0, true, 120.0
     )
     pool = GW.ClientPool(cfg)
     # Default (wait_seconds = 0) fails fast when a worker is unreachable.
@@ -297,21 +297,88 @@ end
     end
 end
 
-@testset "rebalance_assignment: a hot worker is relieved only when the gain clears min_gain" begin
+@testset "queue_term: requests in the system of a single-server queue, finite past saturation" begin
+    @test GW.queue_term(0.0) == 0.0 && GW.queue_term(-0.1) == 0.0
+    @test GW.queue_term(0.5) ≈ 1.0
+    @test GW.queue_term(0.9) ≈ 9.0
+    @test isfinite(GW.queue_term(1.5)) && GW.queue_term(1.5) > GW.queue_term(1.2) > GW.queue_term(0.95)
+end
+
+@testset "rebalance_assignment: a hot worker is relieved when the change pays for itself" begin
     W = ["w0", "w1"]
     prev = Dict{String, GW.Placement}("hot" => [("w0", 1.0)], "warm" => [("w0", 1.0)], "cool" => [("w1", 1.0)])
     u = Dict("hot" => 0.6, "warm" => 0.3, "cool" => 0.1)
-    # Moving warm takes w0 from 0.9 to 0.6 (w1 to 0.4): a third off the busiest worker.
-    asn = GW.rebalance_assignment(u, W, prev; min_gain = 0.05)
-    @test _moved(prev, asn) == ["warm"] && asn["warm"] == [("w1", 1.0)]
-    # The same move is not worth it at a higher bar, and the repack reports how close it came.
+    # Moving warm takes w0 from 0.9 to 0.6 and w1 to 0.4: the requests in the system fall from
+    # 9.11 to 2.17. Swapping hot and cool would land in the same place, but costs two uploads.
     st = GW.RepackStats()
-    held = GW.rebalance_assignment(u, W, prev; min_gain = 0.5, stats = st)
+    asn = GW.rebalance_assignment(u, W, prev; min_gain = 0.05, stats = st)
+    @test _moved(prev, asn) == ["warm"] && asn["warm"] == [("w1", 1.0)]
+    @test st.changes == [["warm"]]
+    @test st.objective_before ≈ 9.0 + 0.1 / 0.9 && st.objective_after ≈ 1.5 + 0.4 / 0.6
+    # Under a noise floor above the 76% the move gains, nothing moves, and the repack says how close it came.
+    st = GW.RepackStats()
+    held = GW.rebalance_assignment(u, W, prev; min_gain = 0.9, stats = st)
     @test held == prev
-    @test st.max_improvement ≈ 0.3 / 0.9
-    # A move never hands the destination more pressure than the source had.
+    @test st.max_improvement ≈ (9.0 + 0.1 / 0.9 - 1.5 - 0.4 / 0.6) / (9.0 + 0.1 / 0.9)
+    # Nor when the upload costs more latency than the move saves within the payback window.
+    mem = Dict("hot" => 1.0e9, "warm" => 1.0e9, "cool" => 1.0e9)
+    slow = Dict("hot" => 100.0, "warm" => 100.0, "cool" => 100.0)
+    @test GW.rebalance_assignment(u, W, prev; mem = mem, upload = slow, payback_seconds = 1.0) == prev
+    @test _moved(prev, GW.rebalance_assignment(u, W, prev; mem = mem, upload = slow, payback_seconds = 600.0)) == ["warm"]
+    # A move never makes the fleet worse.
     tight = GW.rebalance_assignment(Dict("hot" => 0.6, "cool" => 0.5), W, Dict{String, GW.Placement}("hot" => [("w0", 1.0)], "cool" => [("w1", 1.0)]))
     @test _moved(Dict{String, GW.Placement}("hot" => [("w0", 1.0)], "cool" => [("w1", 1.0)]), tight) == String[]
+end
+
+@testset "rebalance_assignment: with every worker at its budget, a swap balances compute" begin
+    W = ["w0", "w1"]
+    GB = 1.0e9
+    caps = Dict("w0" => 8GB, "w1" => 8GB)
+    mem = Dict("hot" => 4GB, "busy" => 4GB, "idle1" => 4GB, "idle2" => 4GB)
+    prev = Dict{String, GW.Placement}(
+        "hot" => [("w0", 1.0)], "busy" => [("w0", 1.0)], "idle1" => [("w1", 1.0)], "idle2" => [("w1", 1.0)]
+    )
+    u = Dict("hot" => 0.5, "busy" => 0.4, "idle1" => 0.05, "idle2" => 0.05)
+    st = GW.RepackStats()
+    asn = GW.rebalance_assignment(u, W, prev; mem = mem, mem_cap = caps, forbid_memory_oversubscription = true, stats = st)
+    @test length(st.changes) == 1 && length(only(st.changes)) == 2      # one swap: no single move fits
+    load(w) = sum((u[m] for (m, pl) in asn for (ww, _) in pl if ww == w); init = 0.0)
+    bytes(w) = sum((mem[m] for (m, pl) in asn for (ww, _) in pl if ww == w); init = 0.0)
+    @test all(w -> bytes(w) <= caps[w], W)
+    @test max(load("w0"), load("w1")) <= 0.55 + 1.0e-9
+    # Settled: a second pass changes nothing.
+    @test GW.rebalance_assignment(u, W, asn; mem = mem, mem_cap = caps, forbid_memory_oversubscription = true) == asn
+end
+
+@testset "rebalance_assignment: memory overflow is priced by the uploads it causes" begin
+    # Without the hard budget, a worker may hold more weights than fit; it then re-uploads the models
+    # it cannot keep about as often as they are requested. Three often-requested models on w0, room
+    # for two: the overflow costs w0 4 device-seconds per second, so one moves to the empty w1.
+    W = ["w0", "w1"]
+    GB = 1.0e9
+    caps = Dict("w0" => 8GB, "w1" => 8GB)
+    mem = Dict("a" => 4GB, "b" => 4GB, "c" => 4GB)
+    prev = Dict{String, GW.Placement}(m => [("w0", 1.0)] for m in keys(mem))
+    u = Dict(m => 0.01 for m in keys(mem))
+    up = Dict(m => 0.4 for m in keys(mem))
+    hot = Dict(m => 10.0 for m in keys(mem))
+    asn = GW.rebalance_assignment(u, W, prev; mem = mem, mem_cap = caps, rate = hot, upload = up)
+    @test length(_moved(prev, asn)) == 1
+    # A rarely requested overflow costs almost nothing: not worth an upload to fix.
+    rare = Dict("a" => 10.0, "b" => 10.0, "c" => 1.0e-4)
+    @test GW.rebalance_assignment(u, W, prev; mem = mem, mem_cap = caps, rate = rare, upload = up) == prev
+end
+
+@testset "rebalance_assignment: free moves improve a placement nothing has loaded yet" begin
+    W = ["w0", "w1"]
+    prev = Dict{String, GW.Placement}("hot" => [("w0", 1.0)], "warm" => [("w0", 1.0)], "cool" => [("w1", 1.0)])
+    u = Dict("hot" => 0.6, "warm" => 0.3, "cool" => 0.1)
+    mem = Dict(m => 1.0e9 for m in keys(u))
+    slow = Dict(m => 1.0e6 for m in keys(u))
+    @test GW.rebalance_assignment(u, W, prev; mem = mem, upload = slow) == prev
+    @test _moved(prev, GW.rebalance_assignment(u, W, prev; mem = mem, upload = slow, free_moves = true)) == ["warm"]
+    # A payback window of 0 means never move for balance.
+    @test GW.rebalance_assignment(u, W, prev; payback_seconds = 0.0) == prev
 end
 
 @testset "repack accounting: compute is counted per worker; a missing worker holds the repack" begin
@@ -429,7 +496,7 @@ end
     mk(mode, interval) = GW.GatewayConfig(
         "0.0.0.0:0", "0.0.0.0:0", String[], String[], String[], 60, 1, 1,
         "info", "json", "lpt_packing", "compute", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr", "run",
-        Dict{String, GW.GatewayModelConfig}(), 32, 64, mode, interval, false
+        Dict{String, GW.GatewayModelConfig}(), 32, 64, mode, interval, false, 600.0, true, 120.0
     )
     cfg = mk(:lazy, 2)
     s = GW.LptPackingState(cfg)
@@ -488,7 +555,7 @@ function _pk_state(;
     cfg = GW.GatewayConfig(
         "0.0.0.0:0", "0.0.0.0:0", String[], String[], String[], 60, 1, 1, "info", "json",
         "lpt_packing", work_basis, 30.0, 0.0, 0.8, 0.1, 30.0, 1, fill_factor, routing_policy, fill_mode,
-        Dict{String, GW.GatewayModelConfig}(), 32, 64, :off, 0, false
+        Dict{String, GW.GatewayModelConfig}(), 32, 64, :off, 0, false, 600.0, true, 120.0
     )
     meta = GW.RoutingMeta(30.0)
     if item_costs !== nothing
@@ -932,7 +999,7 @@ end
             "pinned" => GW.GatewayModelConfig(2, :inflight, 0.0),
             "short" => GW.GatewayModelConfig(2, :inherit, 0.25)
         ),
-        32, 64, :off, 0, false
+        32, 64, :off, 0, false, 600.0, true, 120.0
     )
     s = GW.LptPackingState(cfg)
     mb = Dict("pinned" => 8, "short" => 8, "plain" => 8)
@@ -1123,11 +1190,16 @@ mutable struct AffMockWorker
     rows::Dict{String, Int}
     rows_per_request::Int
     batch_at::Tuple{String, Int}
+    # StageWeights: each request's names, the state every model is answered with, and how long the
+    # "read" takes.
+    staged::Vector{Vector{String}}
+    stage_state::String
+    stage_delay::Float64
 end
 AffMockWorker(name, models; discipline = "fifo", rows_per_request = 1, batch_at = ("IN", 1)) =
     AffMockWorker(
     name, models, discipline, Dict{String, Int}(), Dict{String, Float64}(),
-    Dict{String, Int}(), rows_per_request, batch_at
+    Dict{String, Int}(), rows_per_request, batch_at, Vector{String}[], "staged", 0.0
 )
 
 function _aff_server(port::Integer, w::AffMockWorker)
@@ -1175,6 +1247,17 @@ function _aff_server(port::Integer, w::AffMockWorker)
         # Eager compaction is the default now, so the gateway may fan CompactMemory out after a
         # placement-changing repack; answer it so the call never hits the generous client deadline.
         CompactMemory = (ctx, req) -> ACtl.CompactMemoryResponse(; reloaded_models = Int64(0)),
+        StageWeights = (ctx, req) -> begin
+            w = ctx.payload
+            push!(w.staged, collect(String, req.names))
+            w.stage_delay > 0 && sleep(w.stage_delay)
+            ACtl.StageWeightsResponse(;
+                models = [
+                    ACtl.StagedModel(; name = n, state = w.stage_state, read = true, weight_nbytes = Int64(256 * 1024 * 1024))
+                        for n in req.names
+                ]
+            )
+        end,
     )
     return server
 end
@@ -1321,6 +1404,86 @@ end
         @test occursin("# TYPE gateway_worker_inflight_work gauge", body)
         @test occursin("gateway_worker_inflight_work{worker=", body)
         @test occursin("basis=\"compute\"", body)
+    finally
+        GW.stop!(gw)
+        close(s0)
+        close(s1)
+        rm(gatewayfile; force = true)
+    end
+end
+
+@testset "lpt_packing gateway: a move waits for its weights to be staged on the new worker" begin
+    models = ["hot", "warm", "cool"]
+    w0 = AffMockWorker("worker0", copy(models))
+    w1 = AffMockWorker("worker1", copy(models))
+    s0 = _aff_server(0, w0); p0 = grpc_start_ephemeral!(s0)
+    s1 = _aff_server(0, w1); p1 = grpc_start_ephemeral!(s1)
+    gatewayfile = _aff_gatewayfile(0, 0, [p0, p1])
+    gw = GW.serve_gateway(gatewayfile; blocking = false)
+    try
+        aff = gw.prober.scheduler
+        u0, u1 = "127.0.0.1:$p0", "127.0.0.1:$p1"
+        t_end = time() + 20
+        while length((@atomic aff.tick).ready_workers) < 2 && time() < t_end
+            sleep(0.1)
+        end
+        GW.set_knobs!(aff; rebalance_compute_seconds = 1.0e9, first_rebalance_compute_seconds = 0.0)
+        # hot and warm share w0 (0.9 busy) while w1 idles at 0.1: moving warm pays for itself.
+        function setup!()
+            asn = Dict{String, GW.Placement}("hot" => [(u0, 1.0)], "warm" => [(u0, 1.0)], "cool" => [(u1, 1.0)])
+            @atomic aff.assignment = asn
+            GW._swap_outstanding!(aff, asn)
+            for (m, r) in ("hot" => 6.0, "warm" => 3.0, "cool" => 1.0)
+                aff.rate_ewma[m] = r
+                aff.cost_ewma[m] = 0.1
+            end
+            empty!(w0.staged); empty!(w1.staged)
+            return
+        end
+        repack!() = GW._repack!(
+            aff, GW.poll_workers(gw.pool, [u0, u1]), gw.metrics; trigger = :operator, pool = gw.pool
+        )
+        await_transition() = (
+            t = time() + 15; while aff.transition !== nothing && time() < t
+                sleep(0.05)
+            end
+        )
+
+        setup!()
+        w1.stage_delay = 1.0
+        repack!()
+        # Planned, but routing has not switched: warm's weights are being read on w1.
+        @test aff.transition !== nothing
+        @test (@atomic aff.assignment)["warm"] == [(u0, 1.0)]
+        @test (@atomic aff.report).staging
+        await_transition()
+        @test aff.transition === nothing
+        @test w1.staged == [["warm"]] && isempty(w0.staged)
+        @test (@atomic aff.assignment)["warm"] == [(u1, 1.0)]
+        rep = @atomic aff.report
+        @test !rep.staging && rep.changes_committed == rep.changes_planned == 1 && rep.changes_dropped == 0
+        @test rep.objective_after < rep.objective_before
+
+        # A worker that cannot stage the weights: the change is dropped and warm stays where it is.
+        setup!()
+        w1.stage_delay = 0.0
+        w1.stage_state = "failed"
+        repack!()
+        await_transition()
+        @test (@atomic aff.assignment)["warm"] == [(u0, 1.0)]
+        rep = @atomic aff.report
+        @test rep.changes_dropped == 1 && rep.changes_committed == 0
+
+        # With priming off the move installs at once, and a full repack never stages.
+        setup!()
+        GW.set_knobs!(aff; prime_moves = false)
+        repack!()
+        @test aff.transition === nothing && isempty(w1.staged)
+        @test (@atomic aff.assignment)["warm"] == [(u1, 1.0)]
+        body = String(HTTP.get("http://127.0.0.1:$(GW.bound_ports(gw)[2])/metrics"; retry = false).body)
+        @test occursin("gateway_repack_staged_changes_total{outcome=\"committed\"} 1", body)
+        @test occursin("gateway_repack_staged_changes_total{outcome=\"dropped\"} 1", body)
+        @test occursin(r"\ngateway_repack_objective \S+\n", body)
     finally
         GW.stop!(gw)
         close(s0)
