@@ -68,7 +68,7 @@ export pool_base_pointer, pool_region_name, pool_slot_bytes
 
 # ---- weight store ----
 export WeightStore, PrivateWeightStore, SharedWeightStore
-export materialize_host_weights!, release_host_weights!, rename_host_weights!, weights_digest,
+export materialize_host_weights!, release_host_weights!, weights_digest,
     weights_file_token, WeightsFileId, NO_WEIGHTS_FILE, weights_file_id, SharedStoreFull,
     with_cached_host_weights, trim_host_cache!, host_cache_bytes, bump_load_rank,
     HOST_CACHE_HALFLIFE_SECONDS,

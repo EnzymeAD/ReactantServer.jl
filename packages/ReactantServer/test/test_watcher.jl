@@ -8,7 +8,7 @@ using Logging: with_logger
 using Test: TestLogger
 
 # Run one poll under a captured logger and return the watcher's decided action
-# (:load/:reload/:unload/:rename), or `nothing` when the poll applied no change (e.g. the
+# (:load/:reload/:unload), or `nothing` when the poll applied no change (e.g. the
 # debounce's first observation). The "watcher: change detected" log fires on this (the test) task, inside
 # `_apply_change!`, so it is captured here; the load/unload summaries run on the dispatch thread.
 function _poll_action(w)
@@ -201,7 +201,7 @@ end
     end
 end
 
-@testset "renamed bundle directory: renamed in place, no recompile (CPU)" begin
+@testset "renamed bundle directory: an unload of the old name and a load of the new one (CPU)" begin
     mktempdir() do root
         backend = ReactantServer.ReactantBackend()
         runtime = ReactantServer.RuntimeConfig(ReactantServer.CPU_BACKEND, 0, 0.9, true, true)
@@ -215,82 +215,47 @@ end
             ReactantServer.EndpointsConfig("127.0.0.1", 0)
         )
         w = BundleWatcher(sched, backend, pool, cfg; interval = 0.1, on_demand = false)
-
-        try
-            _write_scale_bundle(root, "m-staging")
-            @test _poll_action(w) === nothing
-            @test _poll_action(w) === :load
-            entry = get_model(reg, "m-staging")
-            lm = entry.executable
-            @test lm !== nothing
-
-            # The registry promotion: one atomic directory rename, contents untouched.
-            mv(joinpath(root, "m-staging"), joinpath(root, "m-production"))
-            @test _poll_action(w) === nothing        # add + remove both debounce one poll
-            @test _poll_action(w) === :rename        # paired by (device, inode) + unchanged signature
-            @test get_model(reg, "m-staging") === nothing
-            e2 = get_model(reg, "m-production")
-            @test e2 === entry                       # the same entry object: nothing was reloaded
-            @test e2.executable === lm               # the same compiled runtime: nothing recompiled
-            @test e2.name == "m-production" && e2.sched.name == "m-production"
-
-            # It serves under the new name and rejects the old one.
-            out = infer(sched, InferRequest("m-production", ["y"], [NamedTensor("x", Float32[1, 2, 3, 4])]))
-            @test out[1].data == Float32[2, 4, 6, 8]
-            @test_throws Exception infer(
-                sched,
-                InferRequest("m-staging", ["y"], [NamedTensor("x", Float32[1, 2, 3, 4])])
-            )
-
-            # The registry promotion chain: `-production` -> `-production-old` AND a new
-            # `-staging` -> `-production` land between two polls. The second rename's target is
-            # occupied until the first applies; both must resolve as renames, nothing recompiles.
-            _write_scale_bundle(root, "m-staging"; w = Float32[3, 3, 3, 3])
-            @test _poll_action(w) === nothing
-            @test _poll_action(w) === :load
-            prod = get_model(reg, "m-production"); prod_lm = prod.executable
-            stag = get_model(reg, "m-staging");    stag_lm = stag.executable
-            mv(joinpath(root, "m-production"), joinpath(root, "m-production-old"))
-            mv(joinpath(root, "m-staging"), joinpath(root, "m-production"))
-            @test _poll_action(w) === nothing                  # all three diffs debounce one poll
+        x1 = [NamedTensor("x", Float32[1, 1, 1, 1])]
+        # Every action one poll decided, by model name.
+        function poll_actions()
             logger = TestLogger()
             with_logger(logger) do
                 _watch_once!(w)
             end
             recs = filter(r -> r.message == "watcher: change detected", logger.logs)
-            @test length(recs) == 2
-            @test all(r -> r.kwargs[:action] === :rename, recs)
-            @test get_model(reg, "m-staging") === nothing
-            @test get_model(reg, "m-production") === stag      # promoted in place
-            @test get_model(reg, "m-production").executable === stag_lm
-            @test get_model(reg, "m-production-old") === prod  # demoted in place
-            @test get_model(reg, "m-production-old").executable === prod_lm
-            out = infer(sched, InferRequest("m-production", ["y"], [NamedTensor("x", Float32[1, 1, 1, 1])]))
-            @test out[1].data == Float32[3, 3, 3, 3]           # the promoted staging weights
-            out = infer(sched, InferRequest("m-production-old", ["y"], [NamedTensor("x", Float32[1, 1, 1, 1])]))
-            @test out[1].data == Float32[2, 2, 2, 2]           # the demoted production weights
+            return Dict(String(r.kwargs[:name]) => r.kwargs[:action] for r in recs)
+        end
 
-            # rm + rename: DELETE the production model, then move a new staging model onto its
-            # name. The name never vacates in the diff (it reads as a content change), so the
-            # occupant must be unloaded first and the rename still applies: no compile.
-            _write_scale_bundle(root, "m-staging"; w = Float32[5, 5, 5, 5])
+        try
+            _write_scale_bundle(root, "m-staging")
             @test _poll_action(w) === nothing
             @test _poll_action(w) === :load
-            stag2 = get_model(reg, "m-staging"); stag2_lm = stag2.executable
-            rm(joinpath(root, "m-production"); recursive = true)
+            staging = get_model(reg, "m-staging")
+
             mv(joinpath(root, "m-staging"), joinpath(root, "m-production"))
-            @test _poll_action(w) === nothing                  # both diffs debounce one poll
-            logger2 = TestLogger()
-            with_logger(logger2) do
-                _watch_once!(w)
-            end
-            acts = [r.kwargs[:action] for r in filter(r -> r.message == "watcher: change detected", logger2.logs)]
-            @test acts == [:unload, :rename]                   # evict the occupant, rename in place
+            @test isempty(poll_actions())                       # both diffs debounce one poll
+            @test poll_actions() == Dict("m-staging" => :unload, "m-production" => :load)
             @test get_model(reg, "m-staging") === nothing
-            @test get_model(reg, "m-production") === stag2     # the staging entry, not a recompile
-            @test get_model(reg, "m-production").executable === stag2_lm
-            out = infer(sched, InferRequest("m-production", ["y"], [NamedTensor("x", Float32[1, 1, 1, 1])]))
-            @test out[1].data == Float32[5, 5, 5, 5]
+            prod = get_model(reg, "m-production")
+            @test prod !== nothing && prod !== staging          # loaded and compiled afresh
+            @test infer(sched, InferRequest("m-production", ["y"], x1))[1].data == Float32[2, 2, 2, 2]
+            @test_throws Exception infer(sched, InferRequest("m-staging", ["y"], x1))
+
+            # A promotion chain in one poll: `-production` -> `-production-old` and a new `-staging`
+            # -> `-production`. Each name serves the bundle now under it.
+            _write_scale_bundle(root, "m-staging"; w = Float32[3, 3, 3, 3])
+            write(joinpath(root, "m-staging", "manifest.yaml"), _w_manifest("m-staging") * "\n# v3\n")
+            @test _poll_action(w) === nothing
+            @test _poll_action(w) === :load
+            mv(joinpath(root, "m-production"), joinpath(root, "m-production-old"))
+            mv(joinpath(root, "m-staging"), joinpath(root, "m-production"))
+            @test isempty(poll_actions())
+            @test poll_actions() == Dict(
+                "m-staging" => :unload, "m-production" => :reload, "m-production-old" => :load
+            )
+            @test get_model(reg, "m-staging") === nothing
+            @test infer(sched, InferRequest("m-production", ["y"], x1))[1].data == Float32[3, 3, 3, 3]
+            @test infer(sched, InferRequest("m-production-old", ["y"], x1))[1].data == Float32[2, 2, 2, 2]
         finally
             ReactantServer.shutdown!(sched)
         end

@@ -536,29 +536,6 @@ function release_all!(cache::WeightCache, entry::ModelEntry)
 end
 
 """
-    rename!(cache, old, new) -> nothing
-
-Rekey a model's residency bookkeeping from `old` to `new` after a model rename: the LRU entry
-(when the model is device-resident and non-pinned) and the host-weight store key. No device or
-host memory moves; the weights themselves are untouched. Runs on the dispatch thread (sole
-residency mutator), like every other cache mutation.
-"""
-function rename!(cache::WeightCache, old::AbstractString, new::AbstractString)
-    lock(cache.lock) do
-        i = findfirst(==(String(old)), cache.lru)
-        i === nothing || (cache.lru[i] = String(new))
-        fp = pop!(cache.footprints, String(old), nothing)
-        fp === nothing || (cache.footprints[String(new)] = fp)
-        arrays = pop!(cache.host_cached, String(old), nothing)
-        arrays === nothing || (cache.host_cached[String(new)] = arrays)
-        rank = pop!(cache.host_rank, String(old), nothing)
-        rank === nothing || (cache.host_rank[String(new)] = rank)
-    end
-    host_rename!(cache.store, old, new)
-    return nothing
-end
-
-"""
     compact!(cache, registry; reload) -> Int
 
 Defragment the device arena. Frees every resident *non-pinned* device weight buffer at once so the

@@ -25,8 +25,8 @@ A bundle is a directory containing:
 The directory name is the model name: renaming the directory renames the model, with no edits to
 the manifest or `model.jl` (a `name` declared in either is informational and ignored). Each
 immediate subdirectory of `model_repo` that contains a `manifest.yaml` is a bundle. In `dynamic`
-mode a renamed bundle directory (same contents) is detected by the watcher and renamed in place,
-keeping the compiled executables and resident weights; only new or changed bundles are compiled.
+mode the watcher sees a renamed bundle directory as the old name removed and a new name added: it
+unloads the old name and loads and compiles the bundle under the new one.
 
 ## Manifest shape encoding
 

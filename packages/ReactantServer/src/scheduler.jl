@@ -2019,62 +2019,6 @@ Alias for [`evict!`](@ref): remove a model from the live system. Provided for sy
 """
 unload_model!(s::Scheduler, name::AbstractString) = evict!(s, name)
 
-# Body assuming it already runs on the dispatch thread (mirrors `_admit_entry!`/`_evict_entry!`).
-function _rename_entry!(
-        sch::Scheduler, old::String, new::String,
-        residency::Union{ResidencyState, Nothing}
-    )
-    old == new && return new
-    entry = lock(sch.cond) do
-        (haskey(sch.registry.by_name, new) || haskey(sch.registry.meta, new)) &&
-            throw(ErrorException("cannot rename '$old' to '$new': that name is already registered"))
-        e = pop!(sch.registry.meta, old, nothing)
-        e === nothing && (e = pop!(sch.registry.by_name, old, nothing))
-        e === nothing && throw(ModelNotFoundError(old))
-        e.name = new
-        e.sched === nothing || (e.sched.name = new)
-        (e isa MetaEntry ? sch.registry.meta : sch.registry.by_name)[new] = e
-        return e
-    end
-    if entry isa ModelEntry
-        # Residency bookkeeping (LRU, host store) is keyed by name; rekey it. The cache has its own
-        # lock and this is the dispatch thread, the sole residency mutator, so ordering is safe.
-        sch.weight_cache === nothing || rename!(sch.weight_cache, old, new)
-        # The residency floor is operator config keyed by model name, so the new name may resolve
-        # to a different floor (e.g. `-production` is pinned where `-staging` was not). Apply it.
-        if residency !== nothing && sch.weight_cache !== nothing &&
-                entry.executable !== nothing && entry.executable.state != residency
-            set_residency_state!(sch.weight_cache, entry, residency)
-        end
-        # A meta calls its sub-models by name; a callee renamed out from under a meta will fail at
-        # call time. Surface it (the registry-driven rename flow renames whole suffix families, so
-        # this indicates a stale meta bundle).
-        refs = [m.name for m in values(sch.registry.meta) if old in m.calls]
-        isempty(refs) ||
-            @warn "renamed model is declared in meta.calls under its old name; those metas will fail to call it" old = old new = new metas = refs
-    end
-    log_model_renamed(old, new)
-    return new
-end
-
-"""
-    rename_model!(scheduler, old, new; residency=nothing) -> String
-
-Rename a live model (regular or meta) in place: rekey the registry, its scheduling state, and its
-residency bookkeeping. The compiled executables, device weights, and host floor are untouched, so
-a rename never recompiles or moves memory. This is the dynamic watcher's fast path for a renamed
-bundle directory (a model-registry promotion such as `-staging` -> `-production`). `residency`,
-when given, is the residency floor resolved for the NEW name; it is applied if it differs from
-the model's current floor. Queued requests ride along: they hold the entry itself. Raises when
-`old` is not registered or `new` already is. Returns the new name.
-"""
-function rename_model!(
-        s::Scheduler, old::AbstractString, new::AbstractString;
-        residency::Union{ResidencyState, Nothing} = nothing
-    )
-    return _run_control(s, sch -> _rename_entry!(sch, String(old), String(new), residency))
-end
-
 """
     put_meta!(scheduler, entry::MetaEntry) -> String
 

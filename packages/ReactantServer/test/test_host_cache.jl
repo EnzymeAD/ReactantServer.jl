@@ -131,13 +131,11 @@ end
     @test _reads(sched, "A") == n               # and serves the next load
 end
 
-@testset "host cache: removing or renaming a model updates its cached copy" begin
+@testset "host cache: removing a model drops its cached copy" begin
     sched = _hc_scheduler("A", "B"; device_models = 2, host_budget = 4 * sizeof(_W))
     wc = sched.weight_cache
     _served(sched, "A")
     _served(sched, "B")
-    ReactantServer.rename!(wc, "A", "A2")
-    @test haskey(wc.host_cached, "A2") && haskey(wc.host_rank, "A2") && !haskey(wc.host_rank, "A")
     ReactantServer.release_all!(wc, sched.registry.by_name["B"])
     @test !haskey(wc.host_cached, "B") && wc.host_cached_bytes == sizeof(_W)
 end

@@ -2,10 +2,9 @@
 #
 # When `model_poll_seconds > 0` a background task polls the worker's `model_dirs` on that interval
 # and hot-swaps bundles whose files changed on disk: a new bundle directory is loaded, a removed
-# one is unloaded, and a changed one is reloaded. A renamed directory (same inode, unchanged
-# contents) is detected as such and renames the live model in place, with no unload or recompile.
-# This avoids a full server restart (which would recompile every model at every batch size) when
-# a single model is added, updated, or promoted to a new name.
+# one is unloaded, and a changed one is reloaded. A renamed directory is an unload of the old name
+# and a load of the new one. This avoids a full server restart (which would recompile every model
+# at every batch size) when a single model is added or updated.
 #
 # All filesystem work (scanning, signatures, parsing) happens on this task; the actual swap goes
 # through the scheduler's control queue (`load_model!`/`evict!`), which runs the compile and the
@@ -21,12 +20,6 @@
 # A bundle's on-disk fingerprint: (filename, mtime, size) for each file that defines it. Two equal
 # signatures mean the bundle is unchanged.
 const BundleSig = Vector{Tuple{String, Float64, Int}}
-
-# A bundle directory's filesystem identity (device, inode). rename(2) preserves it (and every file
-# mtime inside), so a removed name and an added name with the same DirId and an equal BundleSig
-# are one atomic directory rename, servable without recompiling.
-const DirId = Tuple{UInt64, UInt64}
-_dir_id(dir::AbstractString) = (st = stat(dir); (UInt64(st.device), UInt64(st.inode)))
 
 # The files that actually define a bundle (and thus affect compilation/serving). Other files in the
 # directory are ignored so unrelated touches do not trigger a reload; in particular everything the
@@ -49,17 +42,16 @@ function bundle_signature(dir::AbstractString)::BundleSig
 end
 
 """
-    scan_repository(model_dirs, include) -> Dict{String,Tuple{String,BundleSig,DirId}}
+    scan_repository(model_dirs, include) -> Dict{String,Tuple{String,BundleSig}}
 
-Discover the current bundle directories under `model_dirs`, mapping model name to its directory,
-[`BundleSig`](@ref), and directory identity (`DirId`, used for rename detection). Uses the same
-discovery rule as `load_bundles` (a subdirectory containing `manifest.yaml`; the model name is the
+Discover the current bundle directories under `model_dirs`, mapping model name to its directory
+and [`BundleSig`](@ref). Uses the same discovery rule as `load_bundles` (a subdirectory containing `manifest.yaml`; the model name is the
 directory's basename) and honors the `include` allowlist (`nothing` = load all). Unlike
 `load_bundles`, a missing root is skipped rather than raising, since the watcher must keep running
 across a transiently absent mount.
 """
 function scan_repository(model_dirs, include::Union{Set{String}, Nothing})
-    out = Dict{String, Tuple{String, BundleSig, DirId}}()
+    out = Dict{String, Tuple{String, BundleSig}}()
     for root in model_dirs
         isdir(root) || continue
         for child in readdir(root; join = true)
@@ -67,7 +59,7 @@ function scan_repository(model_dirs, include::Union{Set{String}, Nothing})
             isfile(joinpath(child, "manifest.yaml")) || continue
             name = basename(normpath(child))
             include === nothing || name in include || continue
-            out[name] = (child, bundle_signature(child), _dir_id(child))
+            out[name] = (child, bundle_signature(child))
         end
     end
     return out
@@ -92,7 +84,6 @@ mutable struct BundleWatcher
     store::WeightStore
     interval::Float64
     seen::Dict{String, BundleSig}                       # last-applied signatures (loaded models)
-    dir_ids::Dict{String, DirId}                        # last-applied directory identities (rename detection)
     pending::Dict{String, Union{BundleSig, Nothing}}     # candidate change awaiting a stable second poll
     running::Bool
     task::Union{Task, Nothing}
@@ -109,10 +100,9 @@ function BundleWatcher(
     # poll is a no-op for the startup models and only later changes are acted on.
     initial = scan_repository(cfg.model_dirs, inc)
     seen = Dict{String, BundleSig}(name => cs[2] for (name, cs) in initial)
-    dir_ids = Dict{String, DirId}(name => cs[3] for (name, cs) in initial)
     return BundleWatcher(
         sched, backend, pool, cfg, copy(cfg.model_dirs), inc, on_demand, store,
-        Float64(interval), seen, dir_ids,
+        Float64(interval), seen,
         Dict{String, Union{BundleSig, Nothing}}(), false, nothing
     )
 end
@@ -135,7 +125,6 @@ function _apply_change!(
             is_meta_name(w.scheduler.registry, name) ? remove_meta!(w.scheduler, name) :
                 unload_model!(w.scheduler, name)
             delete!(w.seen, name)
-            delete!(w.dir_ids, name)
         else
             # named by its directory basename, i.e. `name`
             entry = load_bundle_entry(
@@ -157,7 +146,6 @@ function _apply_change!(
             # rewrites its files, and the pre-migration signature would make the next poll see that
             # as a change and reload the model a second time.
             w.seen[name] = bundle_signature(dir)
-            w.dir_ids[name] = _dir_id(dir)
         end
         # On the heartbeat as well as in the log: a hot-load is an event a supervisor wants to see
         # (it is the server doing work), and a log line is not something another process can
@@ -167,32 +155,6 @@ function _apply_change!(
         @warn "watcher: failed to apply model change; will retry next poll" name exception = (err, catch_backtrace())
     end
     return nothing
-end
-
-# Apply a confirmed rename: the bundle directory moved from `old` to `new` (same filesystem
-# identity, unchanged signature), so rename the live model in place. Nothing is unloaded, freed,
-# or compiled; only the residency floor is re-resolved for the new name (operator config is keyed
-# by model name). Returns true when applied; false means the caller should fall back to the
-# generic unload + load path.
-function _apply_rename!(
-        w::BundleWatcher, old::AbstractString, new::AbstractString,
-        sig::BundleSig, id::DirId
-    )
-    @info "watcher: change detected" name = String(new) action = :rename from = String(old)
-    try
-        rename_model!(
-            w.scheduler, old, new;
-            residency = _resolve_residency(w.cfg, new, w.on_demand)
-        )
-        delete!(w.seen, old)
-        delete!(w.dir_ids, old)
-        w.seen[new] = sig
-        w.dir_ids[new] = id
-        return true
-    catch err
-        @warn "watcher: rename failed; falling back to unload + load" old = old new = new exception = (err, catch_backtrace())
-        return false
-    end
 end
 
 # One poll: diff the current repository against the last-applied state and act on each change that
@@ -214,67 +176,7 @@ function _watch_once!(w::BundleWatcher)
             next_pending[name] = d
         end
     end
-    # Rename detection, by directory identity: a loaded model whose directory (device, inode) now
-    # sits under a different name, contents unchanged, was renamed with rename(2) and is renamed in
-    # place instead of unloaded and recompiled. Matching by identity (not by add/remove pairing)
-    # also covers the model-registry promotion chain, where `-production` -> `-production-old` and
-    # `-staging` -> `-production` land in the same poll: the second rename's target name is
-    # occupied until the first is applied, so renames are applied in collision order below. A
-    # moved directory whose contents also changed matches nothing here and falls through to the
-    # generic unload + load, which must compile anyway.
-    adds = Dict{String, BundleSig}(name => d for (name, d) in confirmed if d !== nothing)
-    removes = Set{String}(name for (name, d) in confirmed if d === nothing)
-    renames = Pair{String, String}[]                            # old name => new name
-    claimed = Set{String}()                                    # rename sources already matched
-    for (new, d) in adds
-        haskey(current, new) || continue
-        id = current[new][3]
-        get(w.dir_ids, new, nothing) == id && continue         # same dir, same name: a plain reload
-        old = nothing
-        for (o, oid) in w.dir_ids
-            (oid == id && o != new) && (old = o; break)        # identities are unique per name
-        end
-        (old === nothing || old in claimed) && continue
-        get(w.seen, old, nothing) == d || continue             # contents changed: not a pure rename
-        # `old` must be leaving its name this round: its directory disappeared, or was replaced by
-        # a different directory (the promotion chain's occupied-name case).
-        (old in removes || (haskey(adds, old) && current[old][3] != w.dir_ids[old])) || continue
-        push!(renames, old => new)
-        push!(claimed, old)
-    end
-    # Apply renames whose target name is free, unlocking any rename chained behind it. An occupied
-    # target whose occupant is itself a pending rename source waits its turn; an occupied target
-    # whose occupant's directory is simply gone (the rm-then-rename flow) unloads the occupant
-    # first. A cycle (a swap with no vacant name) never unblocks and falls back to the generic
-    # unload + load path.
-    handled = Set{String}()
-    progress = true
-    while progress && !isempty(renames)
-        progress = false
-        i = 1
-        while i <= length(renames)
-            (old, new) = renames[i]
-            if haskey(w.seen, new)
-                if any(r -> first(r) == new, renames)          # occupant renames away; retry later
-                    i += 1
-                    continue
-                end
-                _apply_change!(w, new, nothing, nothing)       # occupant's directory is gone: unload
-                if haskey(w.seen, new)                         # unload failed; retry next poll
-                    i += 1
-                    continue
-                end
-            end
-            if _apply_rename!(w, old, new, adds[new], current[new][3])
-                push!(handled, old)
-                push!(handled, new)
-            end
-            deleteat!(renames, i)                              # applied or fell back: stop retrying
-            progress = true
-        end
-    end
     for (name, d) in confirmed
-        name in handled && continue
         _apply_change!(w, name, d, d === nothing ? nothing : current[name][1])
     end
     w.pending = next_pending
