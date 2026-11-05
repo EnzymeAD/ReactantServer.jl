@@ -452,6 +452,83 @@ end
         end
     end
 
+    @testset "rehydrate accepts positional and compressed raw_output_contents" begin
+        # Older workers sent raw_output_contents compressed (inline outputs only); the KServe proto
+        # (and Triton) put one entry per output in `outputs` order, empty for a shared-memory
+        # output. The client must read both, for every ordering, with outputs of equal byte size so
+        # a misaligned read would return the wrong tensor rather than fail.
+        p = InferenceBufferPool(1 << 16; n_slots = 4, use_shm = true, name = "rsc_test_pool4")
+        try
+            s = acquire_slot!(p)
+            value(name) = Float32[sum(codeunits(name)) + k for k in 1:4]
+            # The previous client's algorithm, kept here to show why the client had to ship first:
+            # it takes every raw entry as the next inline output.
+            function old_rehydrate(resp, subs)
+                outs, raw, k = inference.var"ModelInferResponse.InferOutputTensor"[], Vector{UInt8}[], 1
+                for o in resp.outputs
+                    if haskey(o.parameters, "shared_memory_region")
+                        push!(raw, copy(pool_view(subs[o.name], UInt8, 16)))
+                    else
+                        push!(raw, resp.raw_output_contents[k])
+                        k += 1
+                    end
+                    push!(outs, inference.var"ModelInferResponse.InferOutputTensor"(; name = o.name, datatype = o.datatype, shape = o.shape))
+                end
+                return inference.ModelInferResponse(; outputs = outs, raw_output_contents = raw)
+            end
+            for layout in ([:shm, :inline, :inline], [:inline, :shm, :inline], [:inline, :inline, :shm], [:shm, :shm, :inline], [:shm, :inline, :shm])
+                ReactantServerCore.reset_slot!(s)
+                names = ["O$i" for i in eachindex(layout)]
+                subs = Dict{String, ReactantServerClient.PoolSlot}()
+                outs = inference.var"ModelInferResponse.InferOutputTensor"[]
+                for (name, kind) in zip(names, layout)
+                    if kind === :shm
+                        sub = subslot(s, 16)
+                        pool_view(sub, Float32, 4) .= value(name)
+                        subs[name] = sub
+                        params = Dict(
+                            "shared_memory_region" => _strp(ReactantServerClient.pool_name(p)),
+                            "shared_memory_offset" => _intp(sub.offset), "shared_memory_byte_size" => _intp(16)
+                        )
+                        push!(outs, inference.var"ModelInferResponse.InferOutputTensor"(; name = name, datatype = "FP32", shape = Int64[4], parameters = params))
+                    else
+                        push!(outs, inference.var"ModelInferResponse.InferOutputTensor"(; name = name, datatype = "FP32", shape = Int64[4]))
+                    end
+                end
+                inline_raw(name) = collect(reinterpret(UInt8, value(name)))
+                compressed = [inline_raw(n) for (n, k) in zip(names, layout) if k === :inline]
+                positional = [k === :inline ? inline_raw(n) : UInt8[] for (n, k) in zip(names, layout)]
+                for raw in (compressed, positional)
+                    resp = inference.ModelInferResponse(; model_name = "m", id = "1", outputs = outs, raw_output_contents = raw)
+                    norm = ReactantServerClient._rehydrate_response(resp, subs)
+                    @test length(norm.raw_output_contents) == length(layout)
+                    for name in names
+                        @test vec(InferOutput(name, norm, Float32)) == value(name)
+                        @test vec(InferOutput(name, norm)) == value(name)
+                    end
+                end
+                # The old client reads the old (compressed) form correctly and misreads the new one
+                # whenever an inline output follows a shared-memory output.
+                old_ok(raw) =
+                try
+                    old = old_rehydrate(inference.ModelInferResponse(; outputs = outs, raw_output_contents = raw), subs)
+                    all(vec(InferOutput(n, old, Float32)) == value(n) for n in names)
+                catch
+                    false   # an empty placeholder read as an inline output fails to reshape
+                end
+                @test old_ok(compressed)
+                inline_after_shm = any(layout[j] === :inline && any(==(:shm), layout[1:(j - 1)]) for j in eachindex(layout))
+                @test old_ok(positional) == !inline_after_shm
+                # A length that matches neither form is rejected rather than guessed at.
+                bad = inference.ModelInferResponse(; outputs = outs, raw_output_contents = Vector{UInt8}[UInt8[] for _ in 1:(length(layout) + 1)])
+                @test_throws ErrorException ReactantServerClient._rehydrate_response(bad, subs)
+            end
+            release_slot!(s)
+        finally
+            rm(p.pool.backing)
+        end
+    end
+
     @testset "_chunk_geometry spans slots for oversized items" begin
         p = InferenceBufferPool(4096; n_slots = 4, use_shm = false)    # 1024-byte slots
         m = KServeModel("grpc://h:1", "x"; max_batch_size = 100000)

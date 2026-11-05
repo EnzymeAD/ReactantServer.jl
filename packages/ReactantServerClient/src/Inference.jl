@@ -480,16 +480,31 @@ end
 # Normalize a response so its `raw_output_contents` is full-length and aligned to `outputs`,
 # making the SHM transport invisible to `InferOutput` / `infer_decode_chunk!`. For each output
 # the server wrote to shared memory (carries a region parameter), copy the bytes it actually
-# wrote out of our pool slot (before the slot is released) and strip the SHM parameters; inline
-# outputs are taken from the original `raw_output_contents` in order, because the server's encoder
-# only appends a raw entry per inline output (codec.jl), so positions are compressed there.
+# wrote out of our pool slot (before the slot is released) and strip the SHM parameters.
+#
+# Inline outputs come from the response's `raw_output_contents`, which arrives in one of two forms.
+# The KServe proto requires one entry per output in `outputs` order, with an empty placeholder for
+# each shared-memory output (positional; what Triton sends and what Triton clients index). Older
+# ReactantServer workers appended an entry for inline outputs only (compressed). The two are told
+# apart by length: positional has exactly one entry per output, compressed one per inline output,
+# and the lengths coincide only when no output went to shared memory, where the forms are the same.
 function _rehydrate_response(response, subslots)
     isempty(subslots) && return response
 
+    outputs = response.outputs
+    raw_in = response.raw_output_contents
+    positional = length(raw_in) == length(outputs)
+    if !positional
+        n_inline = count(o -> !_is_shm_output(o.parameters), outputs)
+        length(raw_in) == n_inline || error(
+            "response has $(length(raw_in)) raw_output_contents entries for $(length(outputs)) " *
+                "outputs ($n_inline inline); expected one per output or one per inline output",
+        )
+    end
     new_outputs = var"ModelInferResponse.InferOutputTensor"[]
     raw = Vector{UInt8}[]
     inline_idx = 1
-    for o in response.outputs
+    for (i, o) in enumerate(outputs)
         if _is_shm_output(o.parameters)
             sub = subslots[o.name]
             nbytes = something(_shm_byte_size(o.parameters), _output_bytes_from_shape(o))
@@ -503,7 +518,7 @@ function _rehydrate_response(response, subslots)
                 ),
             )
         else
-            push!(raw, response.raw_output_contents[inline_idx])
+            push!(raw, raw_in[positional ? i : inline_idx])
             inline_idx += 1
             push!(new_outputs, o)
         end
