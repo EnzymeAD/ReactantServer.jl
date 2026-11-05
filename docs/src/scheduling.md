@@ -205,9 +205,17 @@ request is also dropped if it cannot finish within this dispatch's learned compu
 GPU is not spent on work that will miss anyway (the classic EDF overload failure mode). Dropped
 requests receive a `DeadlineExceeded` error (gRPC `DEADLINE_EXCEEDED` upstream); only feasible
 requests run, and when none are feasible the execution is skipped entirely. The cost estimate is
-learned from prior dispatches and unseeded pairs default small, so the laxity drop is a no-op
-until a model has run once. Committed meta sub-calls skip the laxity drop (their earlier stages
-already spent GPU time) but still honor the hard deadline check.
+learned from prior dispatches of the same program (see "Cost learning" below), and the laxity
+drop is a no-op until the program has been measured. Committed meta sub-calls skip the laxity drop
+(their earlier stages already spent GPU time) but still honor the hard deadline check.
+
+A dropped request runs nothing, so it measures nothing: an estimate that had grown above every
+client's budget would shed the program for good. To prevent that, when the laxity margin alone
+would drop every request of a dispatch and the program's estimate has not been refreshed for
+10 seconds, the oldest of those requests runs anyway to measure the program again; the others are
+still dropped. This happens at most once per 10 seconds per program, so a model whose estimate is
+right and whose clients' budgets are genuinely too short costs at most one wasted dispatch per
+interval, while a model shed on an inflated estimate is back in service within one interval.
 
 Note that because `edf` derives urgency solely from the deadline, issuing different per-client
 deadlines for the same model reorders that model's service and therefore affects fairness across
@@ -320,22 +328,32 @@ A fleet with coalescing off should prefer `routing_fill_mode: spread`; see
 
 ## Cost learning
 
-The scheduler measures the real GPU time of each execution and refines a cost estimate for each
-compiled program, that is for each input-shape variant and batch size of a model, with an
-exponential moving average (`cost_ema_alpha`, default 0.2). Variants are kept apart because they
-can differ in cost far more than batch sizes do (a detector's aspect ratios, say), and one
-variant's cost says nothing about another's. The estimate initializes to the first measurement, so
-it converges immediately rather than drifting up from zero. It feeds the `edf` laxity check, and decides which programs are long enough (50 ms or more,
-or not yet measured) to run off the dispatch loop's thread so they do not hold up request intake.
-The fair discipline does not use it: it charges each dispatch the time it was measured to take.
+The scheduler measures the real GPU time of each execution and learns a cost estimate for each
+compiled program, that is for each input-shape variant and batch size of a model. Variants are
+kept apart because they can differ in cost far more than batch sizes do (a detector's aspect
+ratios, say), and one variant's cost says nothing about another's. The estimate feeds the `edf`
+laxity check, and decides which programs are long enough (50 ms or more, or not yet measured) to
+run off the dispatch loop's thread so they do not hold up request intake. The fair discipline does
+not use it: it charges each dispatch the time it was measured to take.
 
-Two things keep the estimate honest:
+The estimate is built to resist the outliers a laxity check would otherwise shed on:
 
-- **Warmup seeds it.** At startup, under the fair discipline, each compiled variant and size is
-  run once on zero-filled inputs and the measured time becomes its estimate. Failures are
-  non-fatal: the default cost covers any unseeded program until the first real dispatch measures
-  it. When the weight cache is enabled with auto-sizing, the startup isolation
-  probe doubles as this warmup.
+- **A program's first run is not used.** The first execution of a program in the worker process
+  pays one-time costs (lazy initialization, autotuning, cold caches), so it is not taken as the
+  program's cost: the second run seeds the estimate, at the smaller of the two times. At startup,
+  under the fair discipline, warmup runs each compiled variant and size twice on zero-filled
+  inputs for this reason; when the weight cache is enabled with auto-sizing, the startup isolation
+  probe does the same and doubles as this warmup. A program left unmeasured (a failed warmup, or
+  a discipline without warmup) is measured by its first real dispatches, and the `edf` laxity
+  check does not shed on it until then.
+- **One measurement moves it a bounded amount.** After seeding, the estimate moves toward each
+  measurement as an exponential moving average whose weight depends on time, not on the number of
+  runs: `cost_ema_alpha` (default 0.2) for back-to-back runs, rising toward 1 as the estimate ages
+  (the old value's weight halves every 2 s since it was last refreshed), so a program measured
+  once a minute does not hold on to a value from many minutes ago. A rise is capped at a quarter
+  of the estimate per measurement, however slow the run or old the estimate, so one GC pause or
+  cold cache moves it by 25% at most. A fall is not capped, since timing noise makes runs slower,
+  not faster; the estimate never drops below the measurement.
 - **Weight load time is excluded.** The measured `compute_time` covers only the model execution,
   not the on-demand weight load that preceded it, so the estimate reflects steady-state
   (resident) execution rather than cold-call latency. The fair discipline still charges the
@@ -421,7 +439,7 @@ global:
     ema_halflife_seconds: 30.0     # half-life of the reported recent-compute EMA (no scheduling effect)
     recency_penalty_cap: 0.25      # accepted for compatibility; no effect
     coalescing_discount: 0.10      # accepted for compatibility; no effect
-    cost_ema_alpha: 0.2            # smoothing for the learned per-program cost (edf laxity)
+    cost_ema_alpha: 0.2            # weight of a new measurement in the learned per-program cost
     max_queue_depth: 1024          # per-model queue cap; a full model rejects new requests
     dispatch_timeout_seconds: 30.0 # longest a caller waits for its result; 0 = no limit
     compaction_interval: 0         # worker-local memory compaction every N on-demand loads

@@ -103,6 +103,21 @@ LoadedModel(
 # detector's aspect ratios), so an estimate keyed by batch size alone mixes them.
 const CostKey = Tuple{VariantKey, Int}
 
+# The learned execution time of one compiled program, updated by `_update_cost!` in scheduler.jl.
+# `runs` counts the executions measured. The first is the program's cold run in this process and is
+# not trusted: until a second run, `seconds` holds that cold time and the estimate counts as
+# unmeasured. `refreshed` is when a measurement last moved the estimate, and `remeasured` when the
+# EDF laxity check last ran a request it would have shed, to measure the program again (`time()`
+# values; -Inf for never).
+mutable struct CostEstimate
+    seconds::Float64
+    runs::Int
+    refreshed::Float64
+    remeasured::Float64
+end
+
+CostEstimate() = CostEstimate(0.0, 0, -Inf, -Inf)
+
 # Per-model scheduler state. `vtime` orders the fair discipline; the cost estimate feeds the EDF
 # laxity check and the choice to run a long program off the interactive thread; the recent-compute
 # EMA is reported for observability and does not affect scheduling. The EMA fields are always
@@ -116,7 +131,7 @@ mutable struct ModelSchedState
     vtime::Float64                        # fair discipline: device seconds charged / weight (see `_select_fair!`)
     recent_compute_ema::Float64
     ema_last_update::Float64
-    cost_estimate::Dict{CostKey, Float64}  # (variant, batch size) -> estimated GPU time (seconds)
+    cost_estimate::Dict{CostKey, CostEstimate}   # (variant, batch size) -> learned execution time
     # observability
     dispatch_count::Int                   # coalesced batch executions
     requests_served::Int                  # individual requests served (>= dispatch_count under coalescing)
@@ -137,7 +152,7 @@ end
 function ModelSchedState(name::AbstractString, mc::ModelSchedConfig, now::Float64)
     return ModelSchedState(
         String(name), mc.weight, mc.max_batch_size, QueuedRequest[],
-        0.0, 0.0, now, Dict{CostKey, Float64}(), 0, 0, 0, 0.0, Float64[], Dict{Int, Int}(),
+        0.0, 0.0, now, Dict{CostKey, CostEstimate}(), 0, 0, 0, 0.0, Float64[], Dict{Int, Int}(),
         :none, nothing, nothing
     )
 end

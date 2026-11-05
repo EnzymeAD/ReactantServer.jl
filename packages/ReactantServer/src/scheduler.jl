@@ -22,10 +22,17 @@
 # producers keep enqueuing during GPU work, then the lock is re-taken briefly to record the
 # dispatch.
 
-# Cost the EDF laxity check assumes for a program (model, shape variant, batch size) with no
-# measurement yet. Warmup normally seeds real values before traffic arrives.
-const _DEFAULT_COST = 0.01            # seconds
 const _WAIT_SAMPLE_CAP = 1024         # bounded ring of recent queue-wait samples per model
+
+# How the learned cost of a compiled program moves (see `_update_cost!`). One measurement raises an
+# estimate by at most `_COST_MAX_RISE` of itself. A new measurement's weight is `cost_ema_alpha` for
+# back-to-back runs and grows toward 1 as the estimate ages, the estimate's own weight halving every
+# `_COST_HALFLIFE_SECONDS` since it was last refreshed. Under EDF, an estimate not refreshed for
+# `_COST_STALE_SECONDS` is measured again before the laxity check sheds a whole dispatch on it (see
+# `execute_and_record!`).
+const _COST_MAX_RISE = 0.25
+const _COST_HALFLIFE_SECONDS = 2.0
+const _COST_STALE_SECONDS = 10.0
 
 # `ModelSchedState` (the per-model scheduling state) is defined in `runtime/model_types.jl` so
 # that `ModelEntry` can hold it; its methods live here.
@@ -166,13 +173,58 @@ function _decay_ema!(st::ModelSchedState, halflife::Float64, now::Float64)
     return st.recent_compute_ema
 end
 
-# Refine the cost estimate of one compiled program (shape variant, batch size) toward the measured
-# time. Initializes to the first measurement so the estimate converges immediately rather than
-# drifting up from zero.
-function _update_cost!(st::ModelSchedState, variant::VariantKey, B::Int, measured::Float64, alpha::Float64)
-    key = (variant, B)
-    old = get(st.cost_estimate, key, measured)
-    st.cost_estimate[key] = alpha * measured + (1 - alpha) * old
+# Fold one measured run of a compiled program (shape variant, batch size) into its cost estimate.
+#
+# - The program's first run in this process is cold (lazy initialization, autotuning, caches) and is
+#   not used: the second run seeds the estimate, at the smaller of the two times.
+# - After that the estimate moves toward each measurement with weight
+#   `w = 1 - (1 - alpha) * 2^(-age / _COST_HALFLIFE_SECONDS)`, where `age` is the time since the
+#   estimate was last refreshed: `alpha` for back-to-back runs, approaching 1 for an estimate so old
+#   that it says little about the program now. Weighting by elapsed time rather than by count keeps a
+#   program measured once a minute from holding on to a value from many minutes ago.
+# - A rise is capped at `_COST_MAX_RISE` of the estimate per measurement, however slow the run or old
+#   the estimate, so one outlier (a GC pause, a cold cache, a co-tenant on the device) moves it by at
+#   most that much. A fall is not capped: timing noise makes runs slower, not faster, so a fast run
+#   is evidence of what the program costs, and the estimate never drops below the measurement.
+#
+# A model's estimates are written only on the dispatch thread, or at startup before it runs; a meta's
+# own record is written under `s.cond`.
+function _update_cost!(
+        st::ModelSchedState, variant::VariantKey, B::Int, measured::Float64, alpha::Float64, now::Float64
+    )
+    isfinite(measured) || return nothing
+    m = max(measured, 0.0)
+    c = get!(CostEstimate, st.cost_estimate, (variant, B))
+    c.runs += 1
+    if c.runs == 1
+        c.seconds = m                          # held, untrusted, until the second run
+        return nothing
+    elseif c.runs == 2
+        c.seconds = min(c.seconds, m)
+    else
+        w = 1 - (1 - alpha) * 2.0^(-max(now - c.refreshed, 0.0) / _COST_HALFLIFE_SECONDS)
+        c.seconds += min(w * (m - c.seconds), _COST_MAX_RISE * c.seconds)
+    end
+    c.refreshed = now
+    return nothing
+end
+
+# The learned cost of one compiled program, or `nothing` until it has been measured warm.
+function _cost_seconds(st::ModelSchedState, variant::VariantKey, B::Integer)
+    c = get(st.cost_estimate, (variant, Int(B)), nothing)
+    return (c === nothing || c.runs < 2) ? nothing : c.seconds
+end
+
+# Run one compiled program to measure its cost (warmup and the startup probe): twice for a program
+# never run before, whose first run is cold and not used (see `_update_cost!`), once otherwise. A
+# failed run propagates to the caller.
+function _measure_program!(s::Scheduler, entry::ModelEntry, variant::VariantKey, sz::Int, inputs)
+    st = entry.sched
+    runs = (st !== nothing && !haskey(st.cost_estimate, (variant, sz))) ? 2 : 1
+    for _ in 1:runs
+        _, dt = _timed_run(s, entry.executable, inputs; offload = true)
+        st === nothing || _update_cost!(st, variant, sz, dt, s.cfg.cost_ema_alpha, time())
+    end
     return nothing
 end
 
@@ -547,7 +599,7 @@ end
 const _OFFLOAD_EXEC_SECONDS = 0.05
 
 _offload_execution(st::ModelSchedState, variant::VariantKey, B::Integer) =
-    get(st.cost_estimate, (variant, Int(B)), Inf) >= _OFFLOAD_EXEC_SECONDS
+    something(_cost_seconds(st, variant, B), Inf) >= _OFFLOAD_EXEC_SECONDS
 
 # Run one execution, timed where it runs, so the measured compute excludes any task hand-off.
 function _timed_run(s::Scheduler, model::LoadedModel, inputs; offload::Bool)
@@ -582,16 +634,22 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
     # burn GPU on work that will miss anyway (the classic EDF overload failure mode). Dropped requests
     # get a DeadlineExceeded reply (mapped to gRPC DEADLINE_EXCEEDED upstream); only feasible ones run,
     # and when none are feasible we skip run_model entirely. The cost estimate is learned from prior
-    # dispatches; unseeded it defaults small, so the laxity drop is a no-op until the model has run once.
+    # dispatches of this program; until it has been measured warm the laxity drop is a no-op.
     # A request its caller has withdrawn (`_withdraw!`) is dropped here too, without a reply: nobody
     # waits for one.
+    #
+    # A drop leaves nothing measured, so an inflated estimate would shed every request whose budget it
+    # exceeds for good. When the laxity margin alone would drop every request of the dispatch and the
+    # estimate has not been refreshed for `_COST_STALE_SECONDS`, the oldest such request runs anyway
+    # to measure the program again, at most once per that interval.
     now_ns = Int64(time_ns())
     # Every taken request shares the front request's shape variant (plan_batch coalesces within one),
     # and the cost of the program that runs is that variant's at B.
     variant = _request_variant(entry, taken[1].prepared)
-    laxity_ns = s.cfg.discipline == EDF ?
-        round(Int64, get(st.cost_estimate, (variant, B), _DEFAULT_COST) * 1.0e9) : Int64(0)
+    est = s.cfg.discipline == EDF ? _cost_seconds(st, variant, B) : nothing
+    laxity_ns = est === nothing ? Int64(0) : round(Int64, est * 1.0e9)
     live = QueuedRequest[]
+    remeasure = nothing          # the oldest request only the laxity margin drops
     for qr in taken
         # A committed request is an in-flight meta's continuation: skip the laxity drop (we already
         # spent GPU on its earlier stages, so we do not abandon it on a prediction), but still honor
@@ -600,9 +658,23 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
         if _withdrawn(qr)
             continue          # its caller stopped waiting (dispatch timeout, cancellation): never run it
         elseif qr.req.deadline_ns != 0 && now_ns + margin_ns >= qr.req.deadline_ns
-            put!(qr.reply, DeadlineExceeded(qr.req.model_name))
+            if remeasure === nothing && now_ns < qr.req.deadline_ns
+                remeasure = qr
+            else
+                put!(qr.reply, DeadlineExceeded(qr.req.model_name))
+            end
         else
             push!(live, qr)
+        end
+    end
+    if remeasure !== nothing
+        c = st.cost_estimate[(variant, B)]       # exists: only a measured estimate has a margin
+        if isempty(live) && time() - max(c.refreshed, c.remeasured) >= _COST_STALE_SECONDS
+            c.remeasured = time()
+            push!(live, remeasure)
+            @debug "EDF: running a request its stale cost estimate would shed, to measure the program again" model = entry.name variant = variant size = B estimate = est
+        else
+            put!(remeasure.reply, DeadlineExceeded(remeasure.req.model_name))
         end
     end
     if length(live) != length(taken)
@@ -650,7 +722,7 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
             _decay_ema!(st, s.cfg.ema_halflife_seconds, now)
             st.recent_compute_ema += compute_time
             _charge_fair!(st, max(compute_time, 0.0) + max(load_time, 0.0))
-            _update_cost!(st, variant, B, compute_time, s.cfg.cost_ema_alpha)
+            _update_cost!(st, variant, B, compute_time, s.cfg.cost_ema_alpha, now)
             st.dispatch_count += 1
             st.requests_served += length(taken)
             st.rows_served += total
@@ -698,7 +770,7 @@ function _run_meta_request(s::Scheduler, meta::MetaEntry, req::InferRequest)
             now = time()
             _decay_ema!(st, s.cfg.ema_halflife_seconds, now)
             st.recent_compute_ema += compute
-            _update_cost!(st, VariantKey(), 0, compute, s.cfg.cost_ema_alpha)
+            _update_cost!(st, VariantKey(), 0, compute, s.cfg.cost_ema_alpha, now)
             st.dispatch_count += 1
             st.requests_served += 1
             st.rows_served += 1
@@ -799,11 +871,10 @@ function _probe_entry_scratch!(s::Scheduler, entry::ModelEntry, resettable::Bool
             inputs = _zero_inputs(entry, variant, sz)
             inputs === nothing && continue
             try
-                _, dt = _timed_run(s, model, inputs; offload = true)
-                entry.sched === nothing || (entry.sched.cost_estimate[(variant, sz)] = max(dt, eps()))
+                _measure_program!(s, entry, variant, sz, inputs)
                 ran = true
             catch err
-                @warn "memory probe / warmup run failed; using default cost" model = entry.name variant = variant size = sz exception = err
+                @warn "memory probe / warmup run failed; the program stays unmeasured until it dispatches" model = entry.name variant = variant size = sz exception = err
             end
         end
     end
@@ -1004,8 +1075,9 @@ function _zero_inputs(entry::ModelEntry, variant::VariantKey, sz::Int)
     return inputs
 end
 
-# Seed one entry's cost_estimate by running each compiled (variant, size) once. Failures are
-# non-fatal: the default cost covers any unseeded program until the first real dispatch measures it.
+# Seed one entry's cost_estimate by running each compiled (variant, size) twice, the first run being
+# cold (see `_measure_program!`). Failures are non-fatal: a program left unmeasured is measured by its
+# first real dispatches, and until then the EDF laxity check does not shed on it.
 function _warmup_entry!(s::Scheduler, entry::ModelEntry)
     (entry.executable === nothing || entry.sched === nothing) && return nothing
     isempty(entry.manifest.executable_inputs) && return nothing   # cannot synthesize inputs
@@ -1015,10 +1087,9 @@ function _warmup_entry!(s::Scheduler, entry::ModelEntry)
             inputs === nothing && continue
             try
                 s.weight_cache === nothing || acquire!(s.weight_cache, entry)
-                _, dt = _timed_run(s, entry.executable, inputs; offload = true)
-                entry.sched.cost_estimate[(variant, sz)] = max(dt, eps())
+                _measure_program!(s, entry, variant, sz, inputs)
             catch err
-                @warn "scheduler cost warmup failed; using default cost" model = entry.name variant = variant size = sz exception = err
+                @warn "scheduler cost warmup failed; the program stays unmeasured until it dispatches" model = entry.name variant = variant size = sz exception = err
             end
         end
     end

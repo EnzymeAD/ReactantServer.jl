@@ -304,7 +304,7 @@ end
             wait(hb)
             @test worst[] < 0.5                         # timers kept firing through the 1.5 s run
             # The cost is measured where the program ran, so it reflects the run, not the hand-off.
-            @test 1.4 < S.sched.cost_estimate[(ReactantServer.VariantKey(), 1)] < 3.0
+            @test 1.4 < ReactantServer._cost_seconds(S.sched, ReactantServer.VariantKey(), 1) < 3.0
         finally
             ReactantServer.shutdown!(sched)
         end

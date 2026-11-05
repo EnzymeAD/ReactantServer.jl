@@ -69,15 +69,36 @@ end
     @test st.recent_compute_ema ≈ 0.25 atol = 1.0e-9
 end
 
-@testset "cost estimate converges toward measurement" begin
+@testset "cost estimate: cold run unused, bounded rise, time-weighted fall" begin
     st = ModelSchedState("m", ModelSchedConfig(1.0), 0.0)
     v = ReactantServer.VariantKey()
-    _update_cost!(st, v, 1, 0.04, 0.2)          # first measurement seeds the estimate
-    @test st.cost_estimate[(v, 1)] == 0.04
-    for _ in 1:50
-        _update_cost!(st, v, 1, 0.01, 0.2)
+    est() = ReactantServer._cost_seconds(st, v, 1)
+    # The first run is cold and does not count; the second seeds, at the smaller of the two (SCH-4).
+    _update_cost!(st, v, 1, 0.5, 0.2, 0.0)
+    @test est() === nothing
+    _update_cost!(st, v, 1, 0.04, 0.2, 0.1)
+    @test est() == 0.04
+    # Back-to-back measurements converge.
+    for i in 1:50
+        _update_cost!(st, v, 1, 0.01, 0.2, 0.1 + i * 1.0e-3)
     end
-    @test st.cost_estimate[(v, 1)] ≈ 0.01 atol = 1.0e-3
+    @test est() ≈ 0.01 atol = 1.0e-3
+    # One outlier raises the estimate by a quarter at most, however slow and however old the estimate.
+    e0 = est()
+    _update_cost!(st, v, 1, 10.0, 0.2, 1000.0)
+    @test est() ≈ 1.25 * e0
+    # A faster run pulls it down with weight alpha when back to back...
+    st.cost_estimate[(v, 1)] = ReactantServer.CostEstimate(1.0, 5, 100.0, -Inf)
+    _update_cost!(st, v, 1, 0.5, 0.2, 100.0)
+    @test est() ≈ 0.9
+    # ...and almost all the way once the estimate is ten half-lives old.
+    st.cost_estimate[(v, 1)] = ReactantServer.CostEstimate(1.0, 5, 100.0, -Inf)
+    _update_cost!(st, v, 1, 0.1, 0.2, 100.0 + 10 * ReactantServer._COST_HALFLIFE_SECONDS)
+    @test est() ≈ 0.1 + 0.9 * 0.8 * 2.0^-10
+    # A non-finite measurement (a clock step) is ignored.
+    before = est()
+    _update_cost!(st, v, 1, NaN, 0.2, 200.0)
+    @test est() == before
 end
 
 # A model compiled at batch size 1 for two input shapes: input "img" is (w, h, n) with w and h
@@ -112,13 +133,13 @@ end
     _install!(s, e, ModelSchedState("ms", ModelSchedConfig(1.0), 0.0))
     st = e.sched
     ReactantServer._warmup_entry!(s, e)
-    @test st.cost_estimate[(large, 1)] >= 0.25
-    @test st.cost_estimate[(small, 1)] < 0.25
+    @test ReactantServer._cost_seconds(st, large, 1) >= 0.25
+    @test ReactantServer._cost_seconds(st, small, 1) < 0.25
     @test !haskey(st.cost_estimate, (ReactantServer.VariantKey(), 1))
 
     # The choice to run a program off the interactive thread reads that program's own estimate.
-    st.cost_estimate[(small, 1)] = 0.001
-    st.cost_estimate[(large, 1)] = 1.0
+    st.cost_estimate[(small, 1)] = ReactantServer.CostEstimate(0.001, 2, time(), -Inf)
+    st.cost_estimate[(large, 1)] = ReactantServer.CostEstimate(1.0, 2, time(), -Inf)
     @test !ReactantServer._offload_execution(st, small, 1)
     @test ReactantServer._offload_execution(st, large, 1)
     @test ReactantServer._offload_execution(st, [9, 9], 1)        # never measured: could be long
@@ -134,13 +155,84 @@ end
         ReactantServer.execute_and_record!(s2, select_dispatch!(s2, 0.0))
         @test !(take!(qr.reply) isa Exception)
     end
-    @test haskey(e2.sched.cost_estimate, (large, 1))
+    @test ReactantServer._cost_seconds(e2.sched, large, 1) >= 0.25
     qr = _ms_qr("ms2", 2, 3; deadline_ns = Int64(time_ns()) + 100_000_000)
     push!(e2.sched.queue, qr)
     ReactantServer.execute_and_record!(s2, select_dispatch!(s2, 0.0))
     out = take!(qr.reply)
     @test !(out isa Exception)
     @test size(only(out).data) == (2, 3, 1)
+end
+
+# A coalescable model compiled only at batch size 4, whose program is `run` (args -> outputs).
+function _sched_run_entry(name, run)
+    sig = ModelSignature(["x"], DataType[Float32], String[], 1, ["y"], DataType[Float32], 1)
+    model = LoadedModel(sig, Dict{Int, Any}(4 => ReactantServer.MockExecutable(run, 1)), Any[])
+    return ModelEntry(name, _sched_batched_manifest(name), Dict{Int, Vector{UInt8}}(), "", nothing, model, nothing, identity, identity)
+end
+
+@testset "warmup seeds a program's cost from a warm run, not its cold first run" begin
+    # SCH-4: the first execution pays one-time costs, and seeding from it alone left EDF an estimate
+    # far above what the program takes.
+    calls = Threads.Atomic{Int}(0)
+    e = _sched_run_entry("cold", args -> (Threads.atomic_add!(calls, 1) == 0 && sleep(0.3); [args[1]]))
+    s = _empty_sched()
+    _install!(s, e, ModelSchedState("cold", ModelSchedConfig(1.0), 0.0))
+    ReactantServer._warmup_entry!(s, e)
+    @test calls[] == 2
+    @test ReactantServer._cost_seconds(e.sched, ReactantServer.VariantKey(), 4) < 0.1
+end
+
+@testset "EDF: an inflated cost estimate is measured again instead of shedding a model for good" begin
+    # SCH-4: the laxity check drops a request that cannot finish within the learned cost, and a drop
+    # runs nothing, so an estimate above every client's budget was never measured again: the model
+    # was shed permanently. Here the program takes microseconds, the estimate says 0.5 s, and every
+    # client allows 0.1 s.
+    fail = Ref(false)
+    e = _sched_run_entry("m", args -> (fail[] && error("boom"); [args[1]]))
+    s = _empty_sched(; discipline = ReactantServer.EDF)
+    _install!(s, e, ModelSchedState("m", ModelSchedConfig(1.0), 0.0))
+    st = e.sched
+    key = (ReactantServer.VariantKey(), 4)
+    st.cost_estimate[key] = ReactantServer.CostEstimate(0.5, 2, time(), -Inf)
+    function dispatch3()
+        qrs = [_qr("m"; deadline_ns = Int64(time_ns()) + 100_000_000) for _ in 1:3]
+        append!(st.queue, qrs)
+        d = select_dispatch!(s, 0.0)
+        @test length(d.taken) == 3                 # the three coalesce into one batch-4 dispatch
+        ReactantServer.execute_and_record!(s, d)
+        return [take!(qr.reply) for qr in qrs]
+    end
+    shed(r) = r isa ReactantServer.DeadlineExceeded
+
+    # While the estimate is fresh it is believed: every request is shed and nothing runs.
+    for _ in 1:2
+        @test all(shed, dispatch3())
+    end
+    @test st.dispatch_count == 0
+    @test ReactantServer._cost_seconds(st, key...) == 0.5
+
+    # Once it has not been refreshed for the stale interval, the oldest request runs to measure the
+    # program again; the others are still shed. The measurement replaces the old estimate...
+    st.cost_estimate[key].refreshed -= ReactantServer._COST_STALE_SECONDS + 1
+    r = dispatch3()
+    @test !(r[1] isa Exception)
+    @test all(shed, r[2:3])
+    @test ReactantServer._cost_seconds(st, key...) < 0.05
+    # ...and the model serves again.
+    @test !any(r -> r isa Exception, dispatch3())
+
+    # At most one such run per interval, even when it fails and so refreshes nothing.
+    st.cost_estimate[key] = ReactantServer.CostEstimate(0.5, 5, time() - ReactantServer._COST_STALE_SECONDS - 1, -Inf)
+    fail[] = true
+    r = dispatch3()
+    @test r[1] isa ErrorException
+    @test all(shed, r[2:3])
+    fail[] = false
+    @test all(shed, dispatch3())
+    st.cost_estimate[key].remeasured -= ReactantServer._COST_STALE_SECONDS + 1
+    r = dispatch3()
+    @test !(r[1] isa Exception)
 end
 
 @testset "plan_batch coalescing rules" begin
