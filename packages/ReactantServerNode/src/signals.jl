@@ -4,10 +4,13 @@
 # IMPORTANT: this only works when Julia is started with `--handle-signals=no`. With the default
 # signal handling, the runtime consumes SIGTERM on its own signal thread (printing a crash
 # report and exiting 143) before any user handler is consulted; signal()/sigaction dispositions
-# are never reached. The supervisor is a light single-threaded orchestrator (no Reactant, @async
-# only), so disabling the runtime handlers is safe; the entrypoint passes the flag. Children set
-# PR_SET_PDEATHSIG as the kernel-level backstop, so even an ungraceful supervisor death can not
-# orphan them.
+# are never reached. Disabling the runtime handlers is safe only with a single thread: they also
+# serve the GC safepoints, so with a second thread running Julia code a collection segfaults.
+# Julia 1.12 starts one interactive thread by default (`-t1,1`), so the supervisor must be started
+# with `--threads=1,0` as well; `check_signal_threads` refuses to run otherwise. The supervisor is
+# a light orchestrator (no Reactant, @async only), so one thread is all it needs; the entrypoint
+# passes both flags. Children set PR_SET_PDEATHSIG as the kernel-level backstop, so even an
+# ungraceful supervisor death can not orphan them.
 
 const _SHUTDOWN_COND = Ref{Base.AsyncCondition}()
 
@@ -34,4 +37,27 @@ function install_term_handlers!(cond::Base.AsyncCondition)
     ccall(:signal, Ptr{Cvoid}, (Cint, Ptr{Cvoid}), 15, h)   # SIGTERM
     ccall(:signal, Ptr{Cvoid}, (Cint, Ptr{Cvoid}), 2, h)    # SIGINT
     return nothing
+end
+
+"""
+    check_signal_threads(handle_signals=Base.JLOptions().handle_signals,
+                         nthreads=Threads.nthreads(:default) + Threads.nthreads(:interactive))
+
+Refuse to run with Julia's signal handling turned off (`--handle-signals=no`) and more than one
+thread: the runtime's signal handlers also serve the GC safepoints, so a collection while a second
+thread runs Julia code crashes the process (a segfault, often at exit). Throws a `ConfigError`
+naming the fix, `--threads=1,0`; returns `nothing` otherwise.
+"""
+function check_signal_threads(
+        handle_signals::Integer = Base.JLOptions().handle_signals,
+        nthreads::Integer = Threads.nthreads(:default) + Threads.nthreads(:interactive)
+    )
+    (handle_signals == 0 && nthreads > 1) || return nothing
+    throw(
+        ConfigError(
+            "the supervisor runs with --handle-signals=no and $nthreads threads; without Julia's " *
+                "signal handlers a garbage collection with more than one thread crashes the process. " *
+                "Start it with --threads=1,0 (Julia 1.12 adds an interactive thread by default)."
+        )
+    )
 end

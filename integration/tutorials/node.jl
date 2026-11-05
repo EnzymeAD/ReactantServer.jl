@@ -68,16 +68,18 @@ write(
 #
 # ```sh
 # REACTANT_GPUS=0 REACTANT_CPU_WORKERS=2 \
-#   julia --project --handle-signals=no -e 'using ReactantServerNode; exit(supervise("node.yaml"))'
+#   julia --project --handle-signals=no --threads=1,0 \
+#   -e 'using ReactantServerNode; exit(supervise("node.yaml"))'
 # ```
 #
 # `--handle-signals=no` lets the supervisor handle SIGTERM and Ctrl-C itself, so it stops its
-# workers before exiting. To keep this page one runnable script, it starts the same command from
-# Julia, in this environment, with its output shown in this session (`run` without `wait` would
-# otherwise discard it):
+# workers before exiting. That is only safe on a single thread, so `--threads=1,0` turns off the
+# interactive thread Julia adds by default; the supervisor refuses to start otherwise. To keep this
+# page one runnable script, it starts the same command from Julia, in this environment, with its
+# output shown in this session (`run` without `wait` would otherwise discard it):
 
 supervise_cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) --handle-signals=no
-    -e 'using ReactantServerNode; exit(supervise("node.yaml"))'`
+    --threads=1,0 -e 'using ReactantServerNode; exit(supervise("node.yaml"))'`
 supervise_cmd = addenv(supervise_cmd, "REACTANT_GPUS" => "0", "REACTANT_CPU_WORKERS" => "2")
 node = run(pipeline(supervise_cmd; stdout, stderr); wait = false)
 atexit(() -> process_running(node) && kill(node)) #src

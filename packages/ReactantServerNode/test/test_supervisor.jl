@@ -104,3 +104,16 @@ end
     @test any(l -> occursin("sending SIGKILL", l), _sink_lines(sink))
     @test !process_running(sup.children[1].proc)
 end
+
+@testset "supervisor: refuses --handle-signals=no with more than one thread" begin
+    @test RSN.check_signal_threads(1, 8) === nothing     # Julia's own signal handling: any threads
+    @test RSN.check_signal_threads(0, 1) === nothing     # handling off, one thread: the entrypoint
+    @test_throws ReactantServerCore.ConfigError RSN.check_signal_threads(0, 2)
+    err = try
+        RSN.check_signal_threads(0, 2)
+    catch e
+        e
+    end
+    @test occursin("--threads=1,0", sprint(showerror, err))
+    @test RSN.check_signal_threads() === nothing         # this test process keeps its handlers
+end

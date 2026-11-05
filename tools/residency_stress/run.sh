@@ -130,7 +130,7 @@ else
         export REACTANT_GPUS=0
         export REACTANT_CPU_WORKERS="${RS_GPUS:-2}"
     fi
-    "${LEASE[@]}" julia --handle-signals=no --project="$REPO_ROOT/packages/ReactantServerNode" -e '
+    "${LEASE[@]}" julia --handle-signals=no --threads=1,0 --project="$REPO_ROOT/packages/ReactantServerNode" -e '
         using ReactantServerNode
         exit(ReactantServerNode.supervise(ARGS[1]; runtime_dir = ARGS[2]))
     ' "$RUN/node.yaml" "$RUN/supervisor" > >(stamp > "$RUN/worker.log") 2>&1 &

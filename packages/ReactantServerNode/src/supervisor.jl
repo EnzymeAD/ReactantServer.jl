@@ -158,9 +158,11 @@ end
 
 Run every child's supervision loop and block until shutdown is requested (SIGTERM/SIGINT, a
 crash-loop budget breach, or `request_shutdown!`). Children are terminated gracefully before it
-returns the exit code.
+returns the exit code. Refuses to run (`check_signal_threads`) with Julia's signal handling off and
+more than one thread.
 """
 function run_supervisor!(sup::Supervisor; install_signal_handlers::Bool = true)
+    check_signal_threads()
     cond = Base.AsyncCondition()
     if install_signal_handlers
         install_term_handlers!(cond)

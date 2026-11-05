@@ -88,7 +88,7 @@ REACTANT_CPU_WORKERS=2 \
 REACTANT_WORKSPACE_ROOT="$REPO_ROOT" \
 REACTANT_GATEWAY_LISTEN_GRPC="127.0.0.1:$GW_PORT" \
 REACTANT_GATEWAY_LISTEN_METRICS="127.0.0.1:$GW_METRICS_PORT" \
-julia --handle-signals=no --project=packages/ReactantServerNode -e '
+julia --handle-signals=no --threads=1,0 --project=packages/ReactantServerNode -e '
     using ReactantServerNode
     exit(ReactantServerNode.supervise(ARGS[1]; runtime_dir = ARGS[2]))
 ' "$WORK/node.yaml" "$WORK/run" > "$WORK/supervisor.log" 2>&1 &

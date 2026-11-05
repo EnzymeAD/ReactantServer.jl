@@ -186,13 +186,15 @@ and healthcheck scripts.
 ## Outside the image
 
 The supervisor runs the same way from a Julia environment, as in [Run a Node](tutorials/julia/node.md).
-Start it with `julia --handle-signals=no` so its own handler runs and it shuts its workers down on
-SIGTERM. Unlike the image, such an environment resolves its dependencies itself, so it does not get
-the image's locked versions or its precompiled caches. On a GPU host, select the Reactant CUDA build
-before the environment precompiles, with `REACTANT_GPU=cuda` and `REACTANT_GPU_VERSION` (`12.9` or
-`13.1`), and make sure the host provides the CUDA libraries Reactant loads by name
-(`libnvJitLink.so.13`, `libnvrtc.so.13`, `libcupti.so`). `INFERENCE_SERVER_MODEL_DIRS` overrides the
-node file's model repository (colon-separated). Use the container for anything long-running.
+Start it with `julia --handle-signals=no --threads=1,0` so its own handler runs and it shuts its
+workers down on SIGTERM. Turning off Julia's signal handling is only safe on one thread, so the
+supervisor refuses to start with more. Unlike the image, such an environment resolves its
+dependencies itself, so it does not get the image's locked versions or its precompiled caches.
+On a GPU host, select the Reactant CUDA build before the environment precompiles, with
+`REACTANT_GPU=cuda` and `REACTANT_GPU_VERSION` (`12.9` or `13.1`), and make sure the host provides
+the CUDA libraries Reactant loads by name (`libnvJitLink.so.13`, `libnvrtc.so.13`, `libcupti.so`).
+`INFERENCE_SERVER_MODEL_DIRS` overrides the node file's model repository (colon-separated). Use the
+container for anything long-running.
 
 ## Where the children load from
 
