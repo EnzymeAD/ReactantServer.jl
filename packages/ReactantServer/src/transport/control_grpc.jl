@@ -20,8 +20,9 @@ _from_core_residency(s::ResidencyState) =
 
 # Run a control action, mapping a thrown error to NOT_FOUND for an unknown model
 # (`ModelNotFoundError`), to UNAVAILABLE when the worker is shutting down or its dispatch loop died
-# (`WorkerUnavailableError`), and to FAILED_PRECONDITION otherwise (e.g. residency control on a
-# self-managed worker).
+# (`WorkerUnavailableError`), to INVALID_ARGUMENT for a client's bad value (`InvalidInputError`,
+# such as a fair weight that is not positive and finite), and to FAILED_PRECONDITION otherwise
+# (e.g. residency control on a self-managed worker).
 function _as_control(f)
     try
         return f()
@@ -30,6 +31,7 @@ function _as_control(f)
         msg = sprint(showerror, e)
         e isa ModelNotFoundError && _not_found(msg)
         e isa WorkerUnavailableError && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, msg))
+        _client_data_error(e) && _invalid(msg)
         throw(gRPCServer.GRPCError(gRPCServer.StatusCode.FAILED_PRECONDITION, msg))
     end
 end
@@ -94,9 +96,8 @@ function _handle_set_model_residency(ctx::InferContext, req)
 end
 
 function _handle_set_model_policy(ctx::InferContext, req)
-    # A client's bad value, so INVALID_ARGUMENT rather than the FAILED_PRECONDITION `_as_control` gives.
-    req.has_weight && !(isfinite(req.weight) && req.weight > 0) &&
-        _invalid("weight must be a positive finite number, got $(req.weight)")
+    # A weight that is not positive and finite raises `InvalidInputError` in `set_policy!`, a client's
+    # bad value, which `_as_control` answers with INVALID_ARGUMENT.
     return _as_control() do
         set_policy!(ctx.sched, req.name; weight = req.has_weight ? req.weight : nothing)
         _CTRL.SetModelPolicyResponse()

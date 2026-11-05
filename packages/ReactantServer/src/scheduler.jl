@@ -641,7 +641,8 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
     # A drop leaves nothing measured, so an inflated estimate would shed every request whose budget it
     # exceeds for good. When the laxity margin alone would drop every request of the dispatch and the
     # estimate has not been refreshed for `_COST_STALE_SECONDS`, the oldest such request runs anyway
-    # to measure the program again, at most once per that interval.
+    # to measure the program again, at most once per that interval. A withdrawn request is never that
+    # run.
     now_ns = Int64(time_ns())
     # Every taken request shares the front request's shape variant (plan_batch coalesces within one),
     # and the cost of the program that runs is that variant's at B.
@@ -667,7 +668,9 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
             push!(live, qr)
         end
     end
-    if remeasure !== nothing
+    # Withdrawal is set from the caller's task, so check it again before the re-measure decision: a
+    # request withdrawn since the scan is neither run to measure the program nor answered.
+    if remeasure !== nothing && !_withdrawn(remeasure)
         c = st.cost_estimate[(variant, B)]       # exists: only a measured estimate has a margin
         if isempty(live) && time() - max(c.refreshed, c.remeasured) >= _COST_STALE_SECONDS
             c.remeasured = time()
@@ -1701,14 +1704,15 @@ end
     set_policy!(scheduler, name; weight=nothing) -> nothing
 
 Update a model's live scheduler policy. `weight` is consulted only by the fair discipline and must
-be a positive finite number. Available in both residency modes. Raises on an unknown model, and
-throws an `ArgumentError` for a weight that is zero, negative, infinite or NaN.
+be a positive finite number. Available in both residency modes. Raises a `ModelNotFoundError` on an
+unknown model, and an [`InvalidInputError`](@ref) for a weight that is zero, negative, infinite or
+NaN (the `SetModelPolicy` RPC answers it with `INVALID_ARGUMENT`).
 """
 function set_policy!(s::Scheduler, name::AbstractString; weight::Union{Real, Nothing} = nothing)
     # The fair discipline charges a dispatch as its seconds over the weight, so only a positive,
     # finite weight orders models: Inf charges nothing, and NaN fails every comparison.
     weight === nothing || (isfinite(weight) && weight > 0) ||
-        throw(ArgumentError("weight must be a positive finite number, got $weight"))
+        throw(InvalidInputError("weight must be a positive finite number, got $weight"))
     lock(s.cond) do
         entry = get(s.registry.by_name, String(name), nothing)
         (entry === nothing || entry.sched === nothing) && throw(ModelNotFoundError(name))

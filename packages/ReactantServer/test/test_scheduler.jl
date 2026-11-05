@@ -235,6 +235,35 @@ end
     @test !(r[1] isa Exception)
 end
 
+@testset "EDF: a withdrawn request is never the run that measures a stale estimate" begin
+    # A withdrawn request's caller has stopped waiting (dispatch timeout, cancellation), so it never
+    # runs and gets no reply, also when it is the oldest request the stale-estimate rule would run.
+    e = _sched_run_entry("w", args -> [args[1]])
+    s = _empty_sched(; discipline = ReactantServer.EDF)
+    _install!(s, e, ModelSchedState("w", ModelSchedConfig(1.0), 0.0))
+    st = e.sched
+    key = (ReactantServer.VariantKey(), 4)
+    st.cost_estimate[key] = ReactantServer.CostEstimate(0.5, 5, time() - ReactantServer._COST_STALE_SECONDS - 1, -Inf)
+    qrs = [_qr("w"; deadline_ns = Int64(time_ns()) + 100_000_000) for _ in 1:3]
+    ReactantServer._withdraw!(qrs[1])
+    append!(st.queue, qrs)
+    ReactantServer.execute_and_record!(s, select_dispatch!(s, 0.0))
+    @test !isready(qrs[1].reply)                   # withdrawn: neither run nor answered
+    @test !(take!(qrs[2].reply) isa Exception)     # the oldest live request measures instead
+    @test take!(qrs[3].reply) isa ReactantServer.DeadlineExceeded
+    @test st.dispatch_count == 1
+
+    # With every request withdrawn nothing runs, and the interval is not spent.
+    st.cost_estimate[key] = ReactantServer.CostEstimate(0.5, 5, time() - ReactantServer._COST_STALE_SECONDS - 1, -Inf)
+    qrs = [_qr("w"; deadline_ns = Int64(time_ns()) + 100_000_000) for _ in 1:2]
+    foreach(ReactantServer._withdraw!, qrs)
+    append!(st.queue, qrs)
+    ReactantServer.execute_and_record!(s, select_dispatch!(s, 0.0))
+    @test !any(qr -> isready(qr.reply), qrs)
+    @test st.dispatch_count == 1
+    @test st.cost_estimate[key].remeasured == -Inf
+end
+
 @testset "plan_batch coalescing rules" begin
     # full fill: rows 2+2+2 with sizes [1,4,8] picks B=4 and takes two requests; the third stays
     e = _sched_entry("c", [1, 4, 8]; coalescable = true)
@@ -648,7 +677,7 @@ end
     ctx = ReactantServer.InferContext(s, s.registry, ReactantServer.SharedMemoryRegistry(), "mock")
     GE = ReactantServer.gRPCServer.GRPCError
     for bad in (0.0, -1.0, NaN, Inf, -Inf)
-        @test_throws ArgumentError ReactantServer.set_policy!(s, "m"; weight = bad)
+        @test_throws ReactantServer.InvalidInputError ReactantServer.set_policy!(s, "m"; weight = bad)
         err = try
             ReactantServer._handle_set_model_policy(
                 ctx, ReactantServer.control.SetModelPolicyRequest(; name = "m", has_weight = true, weight = bad)

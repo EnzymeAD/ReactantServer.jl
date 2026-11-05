@@ -81,7 +81,8 @@ Throw this from a bundle's `preprocess` hook (see [`register_model`](@ref)) to r
 whose data the hook cannot accept, such as text that is not valid UTF-8 or a length tensor that
 does not match its batch. The gRPC layer maps it to `INVALID_ARGUMENT`, so the client is told
 the request itself is wrong and the gateway does not retry it on another replica. Any other
-exception a hook throws is a server-side failure and maps to `INTERNAL`.
+exception a hook throws is a server-side failure and maps to `INTERNAL`. [`set_policy!`](@ref)
+raises it too, for a fair weight that is not positive and finite.
 """
 struct InvalidInputError <: Exception
     msg::String
