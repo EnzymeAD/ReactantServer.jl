@@ -97,8 +97,11 @@ export JULIA_LOAD_PATH="$WORK/prefs:@:@v#.#:@stdlib"
 # supervisor reads /etc/reactantserver/gateway.yml whenever that file exists (a mounted config wins
 # in the image), so on a host with a deployment's file there the test gateway would route to that
 # deployment's workers. This lists what the supervisor would otherwise synthesize: worker i on
-# BASE_PORT + i, with metrics on METRICS_BASE_PORT + i.
-cat > "$WORK/gateway.yml" << EOF
+# BASE_PORT + i, with metrics on METRICS_BASE_PORT + i. Every node this script starts gets one.
+# A gateway file owns its gRPC settings (the supervisor mirrors the node's global.grpc only into an
+# env-configured gateway), so it also states the node's `grpc.error_detail` (argument 2).
+write_gateway_config() {
+    cat > "$1" << EOF
 listen:
   grpc: "127.0.0.1:$GW_PORT"
   metrics: "127.0.0.1:$GW_METRICS_PORT"
@@ -109,7 +112,11 @@ metrics_endpoints:
   - "127.0.0.1:$METRICS_BASE_PORT"
   - "127.0.0.1:$((METRICS_BASE_PORT + 1))"
 worker_names: [worker0, worker1]
+grpc:
+  error_detail: $2
 EOF
+}
+write_gateway_config "$WORK/gateway.yml" redacted
 
 echo "== [3/7] starting supervisor (2 CPU workers + embedded gateway) =="
 REACTANT_GPUS=0 \
@@ -198,25 +205,30 @@ sup_rc=0
 wait "$SUP_PID" || sup_rc=$?
 
 echo "== [6/7] exit codes =="
-if ((sup_rc != 0)); then
-    echo "ERROR: supervisor exited $sup_rc on SIGTERM; recent log:"
-    tail -80 "$WORK/supervisor.log"
-    exit 1
-fi
-# Every child drained and exited 0 on its own: no SIGTERM or SIGKILL fallback was needed.
-for child in gateway worker0 worker1; do
-    if ! grep -q "^\[supervisor\] $child stopped (code=0, signal=0)" "$WORK/supervisor.log"; then
-        echo "ERROR: $child did not exit 0 after its drain; supervisor lines:"
-        grep "^\[supervisor\]" "$WORK/supervisor.log" | tail -40
+# The supervisor exited 0 (argument 1) and every child drained and exited 0 on its own: no SIGTERM
+# or SIGKILL fallback was needed. Argument 2 is the node's log.
+check_clean_exit() {
+    local rc="$1" log="$2"
+    if ((rc != 0)); then
+        echo "ERROR: supervisor exited $rc on SIGTERM; recent log:"
+        tail -80 "$log"
         exit 1
     fi
-done
-if grep -q "^\[supervisor\] .*sending SIG" "$WORK/supervisor.log"; then
-    echo "ERROR: the supervisor had to signal a child:"
-    grep "^\[supervisor\] .*sending SIG" "$WORK/supervisor.log"
-    exit 1
-fi
-echo "   supervisor and every child exited 0."
+    for child in gateway worker0 worker1; do
+        if ! grep -q "^\[supervisor\] $child stopped (code=0, signal=0)" "$log"; then
+            echo "ERROR: $child did not exit 0 after its drain; supervisor lines:"
+            grep "^\[supervisor\]" "$log" | tail -40
+            exit 1
+        fi
+    done
+    if grep -q "^\[supervisor\] .*sending SIG" "$log"; then
+        echo "ERROR: the supervisor had to signal a child:"
+        grep "^\[supervisor\] .*sending SIG" "$log"
+        exit 1
+    fi
+    echo "   supervisor and every child exited 0."
+}
+check_clean_exit "$sup_rc" "$WORK/supervisor.log"
 
 # Smoke-check the multiplexed log: every child line carries its prefix.
 for tag in worker0 worker1 gateway supervisor; do
@@ -229,7 +241,8 @@ done
 
 echo "== [7/7] full INTERNAL error detail (node global.grpc.error_detail: full) =="
 # A second node, identical but for `global.grpc.error_detail: full`, which reaches the workers through
-# their config and the embedded gateway through the supervisor's mirror.
+# their config and the embedded gateway through its pinned gateway config (the Node unit tests cover
+# the supervisor's mirror of global.grpc into an env-configured gateway).
 BASE_PORT="$(free_port)"
 METRICS_BASE_PORT="$(free_port)"
 GW_PORT="$(free_port)"
@@ -237,12 +250,14 @@ GW_METRICS_PORT="$(free_port)"
 sed -e "s/^base_port: .*/base_port: $BASE_PORT/" -e "s/^metrics_base_port: .*/metrics_base_port: $METRICS_BASE_PORT/" \
     "$WORK/node.yaml" > "$WORK/node_full.yaml"
 printf '  grpc:\n    error_detail: full\n' >> "$WORK/node_full.yaml"
+write_gateway_config "$WORK/gateway_full.yml" full
 REACTANT_GPUS=0 \
 REACTANT_CPU_WORKERS=2 \
 REACTANT_WORKSPACE_ROOT="$REPO_ROOT" \
+REACTANT_GATEWAY_FILE="$WORK/gateway_full.yml" \
 REACTANT_GATEWAY_LISTEN_GRPC="127.0.0.1:$GW_PORT" \
 REACTANT_GATEWAY_LISTEN_METRICS="127.0.0.1:$GW_METRICS_PORT" \
-julia --handle-signals=no --project=packages/ReactantServerNode -e '
+julia --handle-signals=no --threads=1,0 --project=packages/ReactantServerNode -e '
     using ReactantServerNode
     exit(ReactantServerNode.supervise(ARGS[1]; runtime_dir = ARGS[2]))
 ' "$WORK/node_full.yaml" "$WORK/run_full" > "$WORK/supervisor_full.log" 2>&1 &
@@ -270,10 +285,6 @@ check_forced_log full "$WORK/supervisor_full.log"
 kill -TERM "$SUP_PID"
 sup_rc=0
 wait "$SUP_PID" || sup_rc=$?
-if ((sup_rc != 0)); then
-    echo "ERROR: the full-detail supervisor exited $sup_rc on SIGTERM; recent log:"
-    tail -80 "$WORK/supervisor_full.log"
-    exit 1
-fi
+check_clean_exit "$sup_rc" "$WORK/supervisor_full.log"
 
 echo "CPU e2e: PASS (workers synthesized, gateway routed, graceful drain, clean exit, INTERNAL error detail)"
