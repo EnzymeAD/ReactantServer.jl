@@ -429,6 +429,13 @@ end
         # A mounted gateway.yml suppresses synthesis (the gateway reads its own file).
         gwf = RSN.gateway_spec("/opt/rs"; gateway_path = "/etc/x/gateway.yml", grpc_max_recv = 111)
         @test _envval(gwf.cmd, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES") === nothing
+
+        # The INTERNAL error detail is mirrored the same way.
+        withenv("REACTANT_GATEWAY_GRPC_ERROR_DETAIL" => nothing) do
+            gwd = RSN.gateway_spec("/opt/rs"; endpoints = ["127.0.0.1:8080"], grpc_error_detail = "full")
+            @test _envval(gwd.cmd, "REACTANT_GATEWAY_GRPC_ERROR_DETAIL") == "full"
+            @test _envval(gw0.cmd, "REACTANT_GATEWAY_GRPC_ERROR_DETAIL") === nothing
+        end
     end
 
     # An explicit process env wins over the synthesized value.
@@ -452,11 +459,13 @@ end
               grpc:
                 max_recv_msg_bytes: 111
                 max_send_msg_bytes: 222
+                error_detail: full
             """
         )
         withenv(
             "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES" => nothing,
-            "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES" => nothing
+            "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES" => nothing,
+            "REACTANT_GATEWAY_GRPC_ERROR_DETAIL" => nothing
         ) do
             sup = RSN.build_supervisor(
                 path; env = Dict("REACTANT_GPUS" => "2"),
@@ -465,6 +474,14 @@ end
             gw = sup.children[end].spec.cmd   # the gateway is the last child
             @test _envval(gw, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES") == "111"
             @test _envval(gw, "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES") == "222"
+            # One node-level error_detail reaches the gateway (the workers read global.grpc directly).
+            @test _envval(gw, "REACTANT_GATEWAY_GRPC_ERROR_DETAIL") == "full"
         end
+        # A value that is neither mode is refused at startup rather than silently ignored.
+        write(path, replace(read(path, String), "error_detail: full" => "error_detail: verbose"))
+        @test_throws ArgumentError RSN.build_supervisor(
+            path; env = Dict("REACTANT_GPUS" => "2"),
+            sink = IOBuffer(), workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "run")
+        )
     end
 end

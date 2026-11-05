@@ -15,6 +15,60 @@ struct GatewayState{P <: ClientPool, S <: GatewayScheduler}
     metrics::GatewayMetrics
     refresher::RouteRefresher
     scheduler::S
+    error_detail::ErrorDetail          # how much an INTERNAL error tells the client (`grpc.error_detail`)
+    labels::Dict{String, String}       # worker url -> the name client-visible messages use for it
+end
+GatewayState(pool, routes, gate, metrics, refresher, scheduler) = GatewayState(
+    pool, routes, gate, metrics, refresher, scheduler, ERROR_DETAIL_REDACTED, Dict{String, String}()
+)
+
+"""
+    worker_labels(cfg) -> Dict{String, String}
+
+The name each worker goes by in client-visible messages, by url: its configured name
+(`worker_names`, which the supervisor sets to worker0..N), else `worker <i>` by its 0-based position
+in the endpoint list. A redacted gateway names workers this way and never by host:port (GW-15).
+"""
+function worker_labels(cfg::GatewayConfig)
+    return Dict(
+        url => (i <= length(cfg.worker_names) && !isempty(cfg.worker_names[i]) ? cfg.worker_names[i] : "worker $(i - 1)")
+            for (i, url) in enumerate(cfg.workers)
+    )
+end
+
+# How a client-visible message names the worker at `url`: by host:port in `full` mode, by its label
+# in `redacted` mode.
+_shown(st::GatewayState, url::AbstractString) =
+    st.error_detail == ERROR_DETAIL_FULL ? String(url) : get(st.labels, url, "a worker")
+
+# The gateway's own INTERNAL failure `e` (an exception, or a message) as the GRPCError the client
+# receives: logged with its backtrace under a request id (the client's KServe `id`, else a generated
+# one), and reported by that id only (`redacted`) or with its text (`full`).
+function _gw_internal(st::GatewayState, what::AbstractString, id::AbstractString, e, bt = nothing)
+    rid = error_request_id(id)
+    text = e isa AbstractString ? String(e) : sprint(showerror, e)
+    if bt === nothing
+        @error "$what failed" request_id = rid message = text
+    else
+        @error "$what failed" request_id = rid exception = (e, bt)
+    end
+    ncodeunits(text) <= 1024 || (text = text[1:prevind(text, 1025)] * " ...")
+    msg = st.error_detail == ERROR_DETAIL_FULL ? "$text (request id $rid, gateway)" :
+        "internal error (request id $rid, gateway); see the gateway log"
+    return gRPCServer.GRPCError(gRPCServer.StatusCode.INTERNAL, sanitize_status_message(msg))
+end
+
+# Run a gateway handler so every status it ends with leaves sanitized (`sanitize_status_message`):
+# a GRPCError keeps its code, and any other exception is the gateway's own INTERNAL failure
+# (`_gw_internal`). Every registered handler runs through this.
+function _gw_status(f, st::GatewayState, what::AbstractString, id::AbstractString = "")
+    try
+        return f()
+    catch e
+        e isa gRPCServer.GRPCError &&
+            throw(gRPCServer.GRPCError(e.code, sanitize_status_message(e.message), e.details))
+        throw(_gw_internal(st, what, id, e, catch_backtrace()))
+    end
 end
 
 # Gateway status string -> the gRPC code the client receives: the worker's own code, verbatim. A
@@ -71,9 +125,8 @@ _is_cancelled(cancelled) = cancelled !== nothing && (
 function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64, cancelled = nothing)
     wc = get_clients(st.pool, url)
     if wc === nothing
-        @error "infer: routing table referenced unknown worker" worker = url model
         return nothing, STATUS_INTERNAL,
-            gRPCServer.GRPCError(gRPCServer.StatusCode.INTERNAL, "routing table referenced unknown worker")
+            _gw_internal(st, "infer for model \"$model\"", id, "routing table referenced unknown worker $url")
     end
     gate_wait(st.gate, url)
     if _is_cancelled(cancelled)
@@ -96,8 +149,13 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64,
         deadline_s = max(1, cld(rem, 1_000_000_000))
     end
     t0 = time()
+    # In `full` mode a failure names the worker by host:port, prefixed to whatever the call ended
+    # with. In `redacted` mode a worker's own status message passes through verbatim (the worker has
+    # already redacted it), and a failure of the call itself is described by `invoke_infer` under the
+    # worker's label, never with the transport's text (which names hosts and ports).
+    full = st.error_detail == ERROR_DETAIL_FULL
     try
-        resp = invoke_infer(wc, body; deadline = deadline_s, cancelled = cancelled)
+        resp = invoke_infer(wc, body; deadline = deadline_s, cancelled = cancelled, label = full ? nothing : _shown(st, url))
         observe_worker!(st.metrics, "ModelInfer", url, time() - t0)
         # A worker's reply always carries model_name, so an empty body is a call that ended without
         # a response: gRPCClient before 1.1.2 returned one when `reset_clients!` aborted the call.
@@ -105,7 +163,7 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64,
         if isempty(resp)
             @warn "infer: worker returned an empty response" model worker = url request_id = id
             return nothing, STATUS_UNAVAILABLE,
-                _server_exc(STATUS_UNAVAILABLE, "worker $url: empty response (connection reset?)")
+                _server_exc(STATUS_UNAVAILABLE, "$(full ? "worker $url" : _shown(st, url)): empty response (connection reset?)")
         end
         return resp, STATUS_OK, nothing
     catch e
@@ -113,7 +171,7 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64,
         e isa gRPCClient.gRPCServiceCallException || rethrow()
         status = client_status(e)
         @warn "infer: worker error" model worker = url request_id = id status = status msg = e.message
-        return nothing, status, _server_exc(status, "worker $url: $(e.message)")
+        return nothing, status, _server_exc(status, full ? "worker $url: $(e.message)" : e.message)
     end
 end
 
@@ -306,7 +364,7 @@ function _gw_shm_register(body::Vector{UInt8}, st::GatewayState)
     throw(
         gRPCServer.GRPCError(
             gRPCServer.StatusCode.FAILED_PRECONDITION,
-            "SHM register failed on workers: $(failed)"
+            "SHM register failed on workers: $([_shown(st, u) for u in failed])"
         )
     )
 end
@@ -335,7 +393,7 @@ function _gw_shm_unregister(body::Vector{UInt8}, st::GatewayState)
         throw(
             gRPCServer.GRPCError(
                 gRPCServer.StatusCode.UNAVAILABLE,
-                "SHM unregister failed on all workers: $(failed)"
+                "SHM unregister failed on all workers: $([_shown(st, u) for u in failed])"
             )
         )
     end
@@ -428,7 +486,7 @@ function _gw_compact(req::CompactMemoryRequest, st::GatewayState)
         throw(
             gRPCServer.GRPCError(
                 gRPCServer.StatusCode.UNAVAILABLE,
-                "compaction failed on all workers: $(failed)"
+                "compaction failed on all workers: $([_shown(st, u) for u in failed])"
             )
         )
     end
@@ -464,7 +522,7 @@ _call_status(e) = e isa gRPCClient.gRPCServiceCallException ? e.grpc_status : -1
 
 # The error for a fan-out every worker failed: UNIMPLEMENTED when they all lack the RPC (workers older
 # than the gateway, which a client should hear about as such), UNAVAILABLE otherwise.
-function _all_workers_failed(rpc::AbstractString, workers, answers)
+function _all_workers_failed(st::GatewayState, rpc::AbstractString, workers, answers)
     if !isempty(answers) && all(a -> _call_status(a) == gRPCClient.GRPC_UNIMPLEMENTED, answers)
         return STATUS_UNAVAILABLE, gRPCServer.GRPCError(
                 gRPCServer.StatusCode.UNIMPLEMENTED, "no worker implements $rpc; the workers are older than the gateway"
@@ -473,7 +531,7 @@ function _all_workers_failed(rpc::AbstractString, workers, answers)
     return STATUS_UNAVAILABLE, gRPCServer.GRPCError(
             gRPCServer.StatusCode.UNAVAILABLE,
             isempty(workers) ? "$rpc: the gateway has no workers" :
-            "$rpc failed on every worker: $(join((wc.url for wc in workers), ", "))"
+            "$rpc failed on every worker: $(join((_shown(st, wc.url) for wc in workers), ", "))"
         )
 end
 
@@ -505,7 +563,7 @@ function _gw_describe_models(req::DescribeModelsRequest, st::GatewayState)
     merged = Dict{String, ModelDescription}()
     workers, answers, answered = _merge_descriptions!(merged, st, String[])
     if isempty(answered)
-        status, err = _all_workers_failed("DescribeModels", workers, answers)
+        status, err = _all_workers_failed(st, "DescribeModels", workers, answers)
         _record_metadata!(st, "DescribeModels", status, t0)
         throw(err)
     end
@@ -548,7 +606,7 @@ function _gw_model_metadata(req::ModelMetadataRequest, st::GatewayState)
         _record_metadata!(st, "ModelMetadata", STATUS_NOT_FOUND, t0)
         throw(gRPCServer.GRPCError(gRPCServer.StatusCode.NOT_FOUND, "unknown model: $(req.name)"))
     end
-    status, err = _all_workers_failed("ModelMetadata", all_clients(st.pool), errors)
+    status, err = _all_workers_failed(st, "ModelMetadata", all_clients(st.pool), errors)
     _record_metadata!(st, "ModelMetadata", status, t0)
     throw(err)
 end
@@ -569,7 +627,7 @@ function _gw_repository_index(req::RepositoryIndexRequest, st::GatewayState)
         end
     end
     if nanswered == 0
-        status, err = _all_workers_failed("RepositoryIndex", workers, answers)
+        status, err = _all_workers_failed(st, "RepositoryIndex", workers, answers)
         _record_metadata!(st, "RepositoryIndex", status, t0)
         throw(err)
     end
@@ -584,6 +642,9 @@ end
 # DateTime; the shared ReactantServerCore.deadline_to_time_ns converts ctx.deadline back onto
 # the local clock the gateway compares against (deadline_ns - time_ns() in _post_infer).
 
+# A registered handler `f(req, state)` run through `_gw_status`, as gRPCServer calls it.
+_gw_handler(f, what::AbstractString) = (ctx, req) -> _gw_status(() -> f(req, ctx.payload), ctx.payload, what)
+
 # Whether the client has cancelled one inbound call, the probe `_gw_infer` passes down to the worker
 # call. gRPCServer 0.1.2 never marks a call cancelled, so with that release this never fires; it
 # takes effect once gRPCServer sets `ServerContext.cancelled`.
@@ -592,9 +653,9 @@ struct _CallCancelled
 end
 (c::_CallCancelled)() = gRPCServer.is_cancelled(c.ctx)
 
-_model_infer_rpc(ctx, body) = _gw_infer(
-    body, ctx.payload, deadline_to_time_ns(ctx.deadline, gRPCServer.remaining_time(ctx)), _CallCancelled(ctx)
-)
+_model_infer_rpc(ctx, body) = _gw_status(ctx.payload, "ModelInfer") do
+    _gw_infer(body, ctx.payload, deadline_to_time_ns(ctx.deadline, gRPCServer.remaining_time(ctx)), _CallCancelled(ctx))
+end
 
 """
     build_gateway_server(state, cfg, host, port) -> GRPCServer
@@ -623,25 +684,22 @@ function build_gateway_server(
     register_GRPCInferenceService_ModelInfer!(server, _model_infer_rpc; raw_request = true, raw_response = true)
     register_GRPCInferenceService_SystemSharedMemoryRegister!(
         server,
-        (ctx, body) -> _gw_shm_register(body, ctx.payload);
+        _gw_handler(_gw_shm_register, "SystemSharedMemoryRegister");
         raw_request = true, raw_response = true
     )
     register_GRPCInferenceService_SystemSharedMemoryUnregister!(
         server,
-        (ctx, body) -> _gw_shm_unregister(body, ctx.payload);
+        _gw_handler(_gw_shm_unregister, "SystemSharedMemoryUnregister");
         raw_request = true, raw_response = true
     )
-    register_GRPCInferenceService_IsSameIPCNamespace!(
-        server,
-        (ctx, req) -> _gw_is_same_ipc_namespace(req, ctx.payload)
-    )
-    register_GRPCInferenceService_ModelMetadata!(server, (ctx, req) -> _gw_model_metadata(req, ctx.payload))
-    register_GRPCInferenceService_RepositoryIndex!(server, (ctx, req) -> _gw_repository_index(req, ctx.payload))
+    register_GRPCInferenceService_IsSameIPCNamespace!(server, _gw_handler(_gw_is_same_ipc_namespace, "IsSameIPCNamespace"))
+    register_GRPCInferenceService_ModelMetadata!(server, _gw_handler(_gw_model_metadata, "ModelMetadata"))
+    register_GRPCInferenceService_RepositoryIndex!(server, _gw_handler(_gw_repository_index, "RepositoryIndex"))
     # Control plane: CompactMemory fans out to every worker, and DescribeModels merges every worker's.
     register_ControlService!(
         server;
-        CompactMemory = (ctx, req) -> _gw_compact(req, ctx.payload),
-        DescribeModels = (ctx, req) -> _gw_describe_models(req, ctx.payload)
+        CompactMemory = _gw_handler(_gw_compact, "CompactMemory"),
+        DescribeModels = _gw_handler(_gw_describe_models, "DescribeModels")
     )
     # The gateway's own scheduling control plane (see control_service.jl). A distinct service, so the
     # worker-facing ControlService above keeps its meaning.

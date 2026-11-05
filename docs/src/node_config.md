@@ -90,6 +90,7 @@ global:
   grpc:                        # -> GrpcConfig
     max_recv_msg_bytes: 536870912  # 512 MiB; max inbound gRPC message
     max_send_msg_bytes: 536870912  # 512 MiB; max outbound gRPC message
+    error_detail: redacted     # what an INTERNAL error tells clients: redacted | full
 ```
 
 Each sub-block corresponds to a typed config struct ([`RuntimeConfig`](@ref),
@@ -186,6 +187,22 @@ Per-component environment overrides still apply, with the gateway's own
 `INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES` for a worker, `REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES`
 for the gateway.
 
+`global.grpc.error_detail` decides what a client is told when a request fails inside the server
+(`INTERNAL`), and like the message sizes it reaches every worker directly and the embedded gateway
+through the supervisor's mirror (`REACTANT_GATEWAY_GRPC_ERROR_DETAIL`). Under `redacted`, the
+default and the production setting, the client gets only `internal error (request id <id>, worker
+<name>); see the worker log` (from the gateway's own failures, `gateway` and the gateway log). The
+id is the KServe request `id` when the client sent one, otherwise one the server generates, and
+the server logs the full exception and backtrace under that same id and name, so a client report
+can be traced to its log line. Under `full`, for development and testing, the message also carries
+the exception text (at most 1 KiB). In `redacted` mode the gateway also names workers by their
+worker name (or position), never by host and port. Only `INTERNAL` is redacted: every other status
+keeps its explanation. In both modes every status message is sanitized: `grpc-status:` and
+`grpc-message:` in it become `grpc-status=` and `grpc-message=`, since a client library that finds
+them in an error message can misread the call's status. The per-component overrides are
+`INFERENCE_SERVER_GRPC_ERROR_DETAIL` (a worker) and `REACTANT_GATEWAY_GRPC_ERROR_DETAIL` (the
+gateway).
+
 `scheduler.discipline` selects the dispatch policy: `fair` (the default), `fifo`, or `edf`. Workers
 behind a gateway in `lpt_packing` mode must run `fifo` or `edf`. [Scheduling](scheduling.md)
 describes each discipline and when to use it.
@@ -268,6 +285,7 @@ listen:
 grpc:
   max_recv_msg_bytes: 536870912   # 512 MiB
   max_send_msg_bytes: 536870912
+  error_detail: redacted          # what an INTERNAL error tells clients: redacted | full
   max_concurrent_requests_per_worker: 64  # inbound cap is this x worker count; 0 = uncapped.
                                           # Sized above the outbound stream limit so a startup
                                           # burst has headroom rather than being shed early
@@ -351,3 +369,4 @@ overrides were applied, is logged at startup.
 | `INFERENCE_SERVER_ENDPOINTS_MAX_CONCURRENT_REQUESTS` | `endpoints.max_concurrent_requests` | integer |
 | `INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES` | `grpc.max_recv_msg_bytes` | bytes |
 | `INFERENCE_SERVER_GRPC_MAX_SEND_MSG_BYTES` | `grpc.max_send_msg_bytes` | bytes |
+| `INFERENCE_SERVER_GRPC_ERROR_DETAIL` | `grpc.error_detail` | `redacted`, `full` |

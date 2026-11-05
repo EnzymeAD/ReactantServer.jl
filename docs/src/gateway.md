@@ -475,7 +475,12 @@ the next replica only when the worker it tried could not serve it:
 A deterministic failure (`INTERNAL`) or the request's own mistake (`INVALID_ARGUMENT`) would only
 repeat on another replica, a passed deadline cannot be met there either, and `RESOURCE_EXHAUSTED`
 and `FAILED_PRECONDITION` are signals the client acts on (back off; re-register shared memory).
-When every replica fails over, the client gets the last worker's status.
+When every replica fails over, the client gets the last worker's status. Status messages follow
+`grpc.error_detail` (see [Node Configuration](node_config.md)): under `redacted`, the default, a
+worker's message passes through as the worker sent it, a failure of the call to a worker names the
+worker by its name or position and never by host and port, and the gateway's own `INTERNAL`
+failures are reported by request id and logged in full on the gateway; under `full`, messages also
+name the worker by host and port and carry the exception text.
 
 A request that reads an input from, or writes an output to, a registered shared-memory region
 (a `shared_memory_region` parameter on any input or requested output) is never retried on another

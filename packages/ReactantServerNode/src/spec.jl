@@ -201,6 +201,7 @@ function gateway_spec(
         worker_names::Union{Vector{String}, Nothing} = nothing,
         grpc_max_recv::Union{Integer, Nothing} = nothing,
         grpc_max_send::Union{Integer, Nothing} = nothing,
+        grpc_error_detail::Union{AbstractString, Nothing} = nothing,
         grace_seconds::Real = 10.0
     )
     ce = children isa ChildEnvironment ? children : workspace_environment(children)
@@ -236,6 +237,9 @@ function gateway_spec(
             push!(pairs, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES" => string(grpc_max_recv))
         grpc_max_send === nothing || haskey(ENV, "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES") ||
             push!(pairs, "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES" => string(grpc_max_send))
+        # Likewise how much an INTERNAL error tells clients (global.grpc.error_detail).
+        grpc_error_detail === nothing || haskey(ENV, "REACTANT_GATEWAY_GRPC_ERROR_DETAIL") ||
+            push!(pairs, "REACTANT_GATEWAY_GRPC_ERROR_DETAIL" => String(grpc_error_detail))
     end
     isempty(pairs) || (cmd = addenv(cmd, pairs...))
     return ChildSpec("gateway", cmd, Float64(grace_seconds))

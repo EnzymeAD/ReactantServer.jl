@@ -448,7 +448,10 @@ function serve(
     )
     # Measure the interactive thread from here on: it is the one request handling shares with dispatch.
     monitor = start_interactive_monitor!(InteractiveMonitor(metrics.registry))
-    server.context = InferContext(sched, registry, shm, pool.platform, metrics)   # swap before start!
+    # An INTERNAL error names this worker (the node's worker name, else REACTANT_WORKER_NAME, else its
+    # port) and tells the client as much as `grpc.error_detail` allows.
+    name = _worker_name(worker_name; fallback = "port $(cfg.endpoints.port)")
+    server.context = InferContext(sched, registry, shm, pool.platform, metrics, cfg.grpc.error_detail, name)   # swap before start!
     # Optional Prometheus metrics endpoint (opt-in via endpoints.metrics_port > 0). Request counting
     # is always on (the InferContext carries `metrics`); only the HTTP listener is gated.
     metrics_server = nothing

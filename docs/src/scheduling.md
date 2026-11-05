@@ -94,7 +94,7 @@ the gateway can act on it (back off, try another replica, give up, re-register s
 | `CANCELLED` | the client cancelled the call |
 | `INVALID_ARGUMENT` | the request itself is wrong: malformed, an input that does not match the model, a requested output the model does not produce, an output larger than its shared-memory slot, or data a `preprocess` hook rejects with [`InvalidInputError`](@ref) |
 | `FAILED_PRECONDITION` | a shared-memory region this worker does not know (it restarted since the client registered): re-register and retry |
-| `INTERNAL` | anything else: a failure on the server's side, logged on the worker with its backtrace |
+| `INTERNAL` | anything else: a failure on the server's side, logged on the worker with its backtrace under a request id; the client is told that id (and the exception text only under `grpc.error_detail: full`, see [Node Configuration](node_config.md)) |
 
 The worker's `worker_requests_total{status}` counts each request under the same status the
 client receives.

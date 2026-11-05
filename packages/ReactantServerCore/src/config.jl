@@ -428,19 +428,42 @@ EndpointsConfig(host, port, metrics_port) = EndpointsConfig(host, port, metrics_
 const DEFAULT_GRPC_MSG_BYTES = 512 * 1024 * 1024
 
 """
+    ErrorDetail
+
+How much an `INTERNAL` error tells the client: the `grpc.error_detail` key of the worker and the
+gateway. `ERROR_DETAIL_REDACTED` (`redacted`, the default) sends only a generic message naming a
+request id and the server, and logs the full exception and backtrace under that same id, so a
+production client learns nothing about the server's internals but an operator can still find the
+failure. `ERROR_DETAIL_FULL` (`full`) also sends the exception text (capped at 1 KiB), for
+development and testing. Every other status code always carries its explanation.
+"""
+@enum ErrorDetail ERROR_DETAIL_REDACTED ERROR_DETAIL_FULL
+
+function _parse_error_detail(s)
+    ls = lowercase(strip(s))
+    ls == "redacted" && return ERROR_DETAIL_REDACTED
+    ls == "full" && return ERROR_DETAIL_FULL
+    throw(ConfigError("grpc.error_detail must be 'redacted' or 'full', got '$s'"))
+end
+
+"""
     GrpcConfig
 
-gRPC transport limits for a worker's server. `max_recv_msg_bytes` / `max_send_msg_bytes` bound a
-single gRPC message in each direction (decode/encode caps, not allocations). Configured under the
+gRPC transport settings for a worker's server. `max_recv_msg_bytes` / `max_send_msg_bytes` bound a
+single gRPC message in each direction (decode/encode caps, not allocations); `error_detail` (an
+[`ErrorDetail`](@ref)) is how much an `INTERNAL` error tells the client. Configured under the
 `grpc:` block of a worker (or node `global:`) config, with `INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES`
-/ `INFERENCE_SERVER_GRPC_MAX_SEND_MSG_BYTES` environment overrides. Default `DEFAULT_GRPC_MSG_BYTES`
-(512 MiB).
+/ `INFERENCE_SERVER_GRPC_MAX_SEND_MSG_BYTES` / `INFERENCE_SERVER_GRPC_ERROR_DETAIL` environment
+overrides. Defaults: `DEFAULT_GRPC_MSG_BYTES` (512 MiB) and `redacted`.
 """
 struct GrpcConfig
     max_recv_msg_bytes::Int
     max_send_msg_bytes::Int
+    error_detail::ErrorDetail
 end
 
+GrpcConfig(max_recv_msg_bytes::Integer, max_send_msg_bytes::Integer) =
+    GrpcConfig(max_recv_msg_bytes, max_send_msg_bytes, ERROR_DETAIL_REDACTED)
 GrpcConfig() = GrpcConfig(DEFAULT_GRPC_MSG_BYTES, DEFAULT_GRPC_MSG_BYTES)
 
 """
@@ -534,6 +557,7 @@ const ENV_PATHS = Tuple{String, Vector{String}, DataType}[
     ("ENDPOINTS_MAX_CONCURRENT_REQUESTS", ["endpoints", "max_concurrent_requests"], Int),
     ("GRPC_MAX_RECV_MSG_BYTES", ["grpc", "max_recv_msg_bytes"], Int),
     ("GRPC_MAX_SEND_MSG_BYTES", ["grpc", "max_send_msg_bytes"], Int),
+    ("GRPC_ERROR_DETAIL", ["grpc", "error_detail"], String),
 ]
 
 _parse_env(::Type{Int}, s) = parse(Int, s)
@@ -878,6 +902,7 @@ function build_config(raw::AbstractDict)
     grpc = GrpcConfig(
         _opt(gc, "max_recv_msg_bytes", Int, DEFAULT_GRPC_MSG_BYTES),
         _opt(gc, "max_send_msg_bytes", Int, DEFAULT_GRPC_MSG_BYTES),
+        _parse_error_detail(_opt(gc, "error_detail", String, "redacted")),
     )
 
     return ServerConfig(

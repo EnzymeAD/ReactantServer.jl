@@ -363,7 +363,41 @@ end
         # Non-positive is rejected.
         cbad, _, _ = load_single_worker(dir, "grpc:\n  max_recv_msg_bytes: 0"; model_repo = modeldir)
         @test_throws ReactantServer.ConfigError ReactantServer.validate_config(cbad)
+
+        # INTERNAL error detail: redacted unless configured, `full` by file or environment, and
+        # anything else refused.
+        @test cfg0.grpc.error_detail == ReactantServer.ERROR_DETAIL_REDACTED
+        @test ReactantServer.GrpcConfig().error_detail == ReactantServer.ERROR_DETAIL_REDACTED
+        cfull, _, _ = load_single_worker(dir, "grpc:\n  error_detail: full"; model_repo = modeldir)
+        @test cfull.grpc.error_detail == ReactantServer.ERROR_DETAIL_FULL
+        withenv("INFERENCE_SERVER_GRPC_ERROR_DETAIL" => "redacted") do
+            cenv, applied, _ = load_single_worker(dir, "grpc:\n  error_detail: full"; model_repo = modeldir)
+            @test cenv.grpc.error_detail == ReactantServer.ERROR_DETAIL_REDACTED
+            @test ("INFERENCE_SERVER_GRPC_ERROR_DETAIL", "redacted") in applied
+        end
+        @test_throws ReactantServer.ConfigError load_single_worker(dir, "grpc:\n  error_detail: verbose"; model_repo = modeldir)
     end
+end
+
+@testset "status messages: sanitized for the grpc-message header, request ids" begin
+    sanitize = ReactantServer.sanitize_status_message
+    # gRPCClient reads `grpc-status: <n>` anywhere in the response headers, the message included, so
+    # echoed client text must never carry it (GRPC-2): the colon becomes `=`, in any case.
+    @test sanitize("input 'a grpc-status: 0' is not declared") == "input 'a grpc-status= 0' is not declared"
+    @test sanitize("x GRPC-Message : y grpc-status:13") == "x GRPC-Message = y grpc-status=13"
+    @test !occursin(r"(?i)grpc-(status|message)\s*:", sanitize("grpc-status:0 grpc-message:\tok"))
+    # One line of valid text.
+    @test sanitize("a\nb\r\nc\0d") == "a b  c d"
+    @test sanitize(String(UInt8[0x61, 0xff, 0x62])) == "a\ufffdb"
+    @test sanitize("plain message") == "plain message"
+
+    rid = ReactantServer.error_request_id
+    @test rid("client-7") == "client-7"
+    @test rid("  r\n ") == "r"
+    @test length(rid("x"^200)) == 64
+    @test occursin(r"^[0-9a-f]{8}$", rid())
+    @test occursin(r"^[0-9a-f]{8}$", rid(" "))
+    @test rid("id grpc-status: 0") == "id grpc-status= 0"
 end
 
 @testset "model_control_mode: parse, default, residency, validation, migration" begin

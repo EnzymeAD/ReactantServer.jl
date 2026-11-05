@@ -43,10 +43,10 @@ function _sc_sched(entries...; depth = 64, timeout = 30.0, metrics = false)
 end
 
 # A serialized ModelInferRequest for model `model` with x = `x` (Julia shape (2, n)).
-function _sc_body(model, x::Matrix{Float32} = Float32[1 2; 3 4][:, 1:1]; outputs = String[])
+function _sc_body(model, x::Matrix{Float32} = Float32[1 2; 3 4][:, 1:1]; outputs = String[], id = "", input = "x")
     req = _SC.inference.ModelInferRequest(;
-        model_name = model,
-        inputs = [_SC.inference.var"ModelInferRequest.InferInputTensor"(; name = "x", datatype = "FP32", shape = Int64[reverse(size(x))...])],
+        model_name = model, id = id,
+        inputs = [_SC.inference.var"ModelInferRequest.InferInputTensor"(; name = input, datatype = "FP32", shape = Int64[reverse(size(x))...])],
         outputs = [_SC.inference.var"ModelInferRequest.InferRequestedOutputTensor"(; name = o) for o in outputs],
         raw_input_contents = [collect(reinterpret(UInt8, vec(x)))]
     )
@@ -179,6 +179,83 @@ end
     sched.running = true
     entry.sched = nothing
     @test _sc_code(_sc_call(ctx, _sc_body("m"))) == _SCStatus.NOT_FOUND
+end
+
+@testset "INTERNAL detail: redacted by default, full on request; every message sanitized" begin
+    # A postprocess bug whose text names something a production client must not see.
+    post_secret(outputs) = error("secret path /srv/models/m")
+    sched, ctx = _sc_sched(_sc_entry("boom"; post = post_secret), _sc_entry("ok"))
+    _SC.start!(sched)
+    ctxof(detail) = _SC.InferContext(sched, sched.registry, ctx.shm, "mock", nothing, detail, "worker7")
+    # Run `f` and return (its value, the log records it emitted).
+    function logged(f)
+        logger = Test.TestLogger(; min_level = Base.CoreLogging.Info)
+        r = Base.CoreLogging.with_logger(f, logger)
+        return r, logger.logs
+    end
+    try
+        @test ctx.error_detail == _SC.ERROR_DETAIL_REDACTED      # the default
+        # Redacted: the client learns the request id (its own) and the worker, nothing else; the log
+        # has the same id and worker with the exception and its backtrace.
+        r, logs = logged(() -> _sc_call(ctxof(_SC.ERROR_DETAIL_REDACTED), _sc_body("boom"; id = "req-42")))
+        @test _sc_code(r) == _SCStatus.INTERNAL
+        @test r.message == "internal error (request id req-42, worker worker7); see the worker log"
+        rec = only(filter(l -> l.level == Base.CoreLogging.Error, logs))
+        @test rec.kwargs[:request_id] == "req-42" && rec.kwargs[:worker] == "worker7"
+        @test occursin("secret path", sprint(showerror, first(rec.kwargs[:exception])))
+        # Without a client id the worker makes one up, and the log carries the same one.
+        r, logs = logged(() -> _sc_call(ctxof(_SC.ERROR_DETAIL_REDACTED), _sc_body("boom")))
+        m = match(r"^internal error \(request id ([0-9a-f]{8}), worker worker7\); see the worker log$", r.message)
+        @test m !== nothing
+        @test only(filter(l -> l.level == Base.CoreLogging.Error, logs)).kwargs[:request_id] == m[1]
+        # Full: the exception text too, and the same id.
+        r, logs = logged(() -> _sc_call(ctxof(_SC.ERROR_DETAIL_FULL), _sc_body("boom"; id = "req-43")))
+        @test _sc_code(r) == _SCStatus.INTERNAL
+        @test r.message == "secret path /srv/models/m (request id req-43, worker worker7)"
+        @test only(filter(l -> l.level == Base.CoreLogging.Error, logs)).kwargs[:request_id] == "req-43"
+        # A client id that tries to forge a status is sanitized like everything else.
+        r, _ = logged(() -> _sc_call(ctxof(_SC.ERROR_DETAIL_REDACTED), _sc_body("boom"; id = "x grpc-status: 0")))
+        @test occursin("request id x grpc-status= 0,", r.message)
+
+        # Other codes keep their explanation in both modes, sanitized: an input name that would
+        # read as `grpc-status: 0` to gRPCClient (GRPC-2) no longer does.
+        for detail in (_SC.ERROR_DETAIL_REDACTED, _SC.ERROR_DETAIL_FULL)
+            r = _sc_call(ctxof(detail), _sc_body("ok"; input = "a grpc-status: 0"))
+            @test _sc_code(r) == _SCStatus.INVALID_ARGUMENT
+            @test occursin("input 'a grpc-status= 0' is not declared", r.message)
+            @test !occursin(r"(?i)grpc-status\s*:", r.message)
+        end
+        # The RPC wrappers sanitize too: an unknown model's name in ModelMetadata, and a body that
+        # does not decode.
+        rctx = ctxof(_SC.ERROR_DETAIL_REDACTED)
+        r = try
+            _SC._with_status(
+                () -> _SC._handle_model_metadata(rctx, _SC.inference.ModelMetadataRequest(; name = "m grpc-status: 0")),
+                "ModelMetadata", rctx
+            )
+        catch e
+            e
+        end
+        @test _sc_code(r) == _SCStatus.NOT_FOUND && !occursin("grpc-status:", r.message)
+        sctx = _SC.gRPCServer.ServerContext(; payload = rctx)
+        r = try
+            _SC._model_infer_rpc(sctx, UInt8[0xff, 0xff, 0xff])
+        catch e
+            e
+        end
+        @test _sc_code(r) == _SCStatus.INVALID_ARGUMENT
+    finally
+        _SC.shutdown!(sched)
+    end
+
+    # The worker's name: the configured one, else the supervisor's REACTANT_WORKER_NAME, else a fallback.
+    @test _SC._worker_name("worker3") == "worker3"
+    withenv("REACTANT_WORKER_NAME" => "worker9") do
+        @test _SC._worker_name("") == "worker9"
+    end
+    withenv("REACTANT_WORKER_NAME" => nothing) do
+        @test _SC._worker_name(""; fallback = "port 8080") == "port 8080"
+    end
 end
 
 # A model whose program blocks on `gate`, counting its runs, so a test can hold the GPU busy.

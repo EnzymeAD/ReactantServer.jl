@@ -31,17 +31,31 @@ const _H2_CONNECTION_WINDOW_BYTES = 32 * 1024 * 1024  # connection-level receive
 
 # Per-request state threaded through gRPCServer's context payload. `metrics` is `nothing` only for
 # control-plane-only contexts (e.g. tests that never serve inference); `serve` always supplies it.
+# `error_detail` is how much an INTERNAL error tells the client (`grpc.error_detail`), and `name` is
+# the worker's name as INTERNAL messages and their log lines give it.
 struct InferContext
     sched::Scheduler
     registry::ModelRegistry
     shm::SharedMemoryRegistry
     platform::String
     metrics::Union{WorkerMetrics, Nothing}
+    error_detail::ErrorDetail
+    name::String
 end
 # Meta sub-calls are not routed from here: `infer` runs a meta's orchestration on this request task and
 # its sub-calls re-enter the scheduler in-process (see scheduler.jl `_run_meta_request`), so the context
 # needs no caller. The 4-arg form is used by control-plane-only contexts (tests) that never serve inference.
 InferContext(sched, registry, shm, platform) = InferContext(sched, registry, shm, platform, nothing)
+InferContext(sched, registry, shm, platform, metrics) =
+    InferContext(sched, registry, shm, platform, metrics, ERROR_DETAIL_REDACTED, _worker_name())
+
+# This worker's name in INTERNAL messages and logs: the configured worker name, else the
+# supervisor's REACTANT_WORKER_NAME, else `fallback`.
+function _worker_name(configured::AbstractString = ""; fallback::AbstractString = "worker")
+    isempty(configured) || return String(configured)
+    env = strip(get(ENV, "REACTANT_WORKER_NAME", ""))
+    return isempty(env) ? String(fallback) : String(env)
+end
 
 # gRPC status code -> Prometheus label string, for worker_requests_total.
 # Re-keyed from the old gRPCServer GRPC_* Int constants to the merged StatusCode enum
@@ -106,23 +120,35 @@ function _status_message(e)
         msg[1:prevind(msg, _STATUS_MESSAGE_MAX + 1)] * " ..."
 end
 
-# `e` as the GRPCError the client receives, with the contract's code. A server-side failure
-# (INTERNAL) is logged here with its backtrace `bt`, since the client sees only its message.
-function _as_grpc_error(e, bt, what::AbstractString)
-    e isa gRPCServer.GRPCError && return e
+# `e` as the GRPCError the client receives: the contract's code, and a message that is always
+# sanitized (`sanitize_status_message`). A server-side failure (INTERNAL) is logged here with its
+# backtrace `bt` under a request id (the client's KServe `id`, else a generated one) and this worker's
+# name; the client is told only that id and name (`ERROR_DETAIL_REDACTED`), or the exception text as
+# well (`ERROR_DETAIL_FULL`). Every other code keeps its explanation in either mode.
+function _as_grpc_error(
+        e, bt, what::AbstractString; detail::ErrorDetail = ERROR_DETAIL_REDACTED,
+        worker::AbstractString = _worker_name(), id::AbstractString = ""
+    )
+    e isa gRPCServer.GRPCError &&
+        return gRPCServer.GRPCError(e.code, sanitize_status_message(e.message), e.details)
     code = _grpc_status(e)
-    code == gRPCServer.StatusCode.INTERNAL && @error "$what failed" exception = (e, bt)
-    return gRPCServer.GRPCError(code, _status_message(e))
+    code == gRPCServer.StatusCode.INTERNAL ||
+        return gRPCServer.GRPCError(code, sanitize_status_message(_status_message(e)))
+    rid = error_request_id(id)
+    @error "$what failed" request_id = rid worker = worker exception = (e, bt)
+    msg = detail == ERROR_DETAIL_FULL ? "$(_status_message(e)) (request id $rid, worker $worker)" :
+        "internal error (request id $rid, worker $worker); see the worker log"
+    return gRPCServer.GRPCError(code, sanitize_status_message(msg))
 end
 
 # Run a handler body with every exception it throws mapped through the status contract, rather than
 # left to gRPCServer, which reads a server-side KeyError as NOT_FOUND, an ArgumentError as
-# INVALID_ARGUMENT and a BoundsError as OUT_OF_RANGE.
-function _with_status(f, what::AbstractString)
+# INVALID_ARGUMENT and a BoundsError as OUT_OF_RANGE (and sends no message through the sanitizer).
+function _with_status(f, what::AbstractString, ctx::InferContext)
     try
         return f()
     catch e
-        throw(_as_grpc_error(e, catch_backtrace(), what))
+        throw(_as_grpc_error(e, catch_backtrace(), what; detail = ctx.error_detail, worker = ctx.name))
     end
 end
 
@@ -297,7 +323,10 @@ function _handle_infer(
         end
         return resp
     catch e
-        err = _as_grpc_error(e, catch_backtrace(), "ModelInfer for model '$name'")
+        err = _as_grpc_error(
+            e, catch_backtrace(), "ModelInfer for model '$name'";
+            detail = ctx.error_detail, worker = ctx.name, id = req.id
+        )
         if ctx.metrics !== nothing
             observe_request!(ctx.metrics, name, time() - t0)
             inc_request!(ctx.metrics, name, _status_label(err))
@@ -419,15 +448,20 @@ package's per-direction caps).
 # dispatch loop until it finishes. `_offloaded` wraps a handler so its body runs on a default-pool task
 # while the interactive task only waits; a GRPCError propagates unchanged, and any other error leaves
 # with the status contract's code (`_with_status`).
-_offloaded(handler) = (ctx, req) -> off_interactive(() -> _with_status(() -> handler(ctx, req), ctx.method))
+_offloaded(handler) = (ctx, req) -> off_interactive(() -> _with_status(() -> handler(ctx, req), ctx.method, ctx.payload))
 
 # The ModelInfer RPC: raw bytes in and out (see `_handle_infer_raw`), offloaded like the rest. The
 # deadline is read here, on entry, as gRPCServer computes it, and the call's cancellation probe is
-# handed down to the wait for its result.
+# handed down to the wait for its result. A failure before the request is decoded (a malformed body)
+# leaves through the status contract too.
 function _model_infer_rpc(ctx, body)
     deadline_ns = deadline_to_time_ns(ctx.deadline, gRPCServer.remaining_time(ctx))
     cancelled = _CallCancelled(ctx)
-    return off_interactive(() -> _handle_infer_raw(ctx.payload, body, deadline_ns; cancelled = cancelled))
+    return off_interactive() do
+        _with_status("ModelInfer", ctx.payload) do
+            _handle_infer_raw(ctx.payload, body, deadline_ns; cancelled = cancelled)
+        end
+    end
 end
 
 function build_grpc_server(

@@ -17,3 +17,9 @@ following before exposing any endpoint:
   node-shared host-weight store live in `/dev/shm`; the shared weight regions default to mode
   `666` (world-writable) for friction-free sharing. Set `runtime.shared_host_weights_mode: "660"`
   on production or multi-user systems.
+- **Internal errors are redacted by default.** With `grpc.error_detail: redacted` (the default,
+  set node-wide under `global.grpc`), a client is told of a failure inside the server only by a
+  request id and the worker's (or gateway's) name, and the gateway never names a worker by host
+  and port; the exception and backtrace go to that server's log under the same id. Keep
+  `full`, which sends the exception text to clients, to development and testing. See
+  [Node Configuration](node_config.md).

@@ -40,7 +40,8 @@ import ReactantServerCore:
     _opt,
     _set_nested!,
     _parse_env,
-    _parse_env_var
+    _parse_env_var,
+    _parse_error_detail
 
 # gRPC codegen: the generated modules carry client constructors and the per-service
 # registration functions, but `using` does not re-export them, so re-export the three
@@ -167,7 +168,9 @@ function serve_gateway(gateway_path::Union{AbstractString, Nothing} = nothing; b
     cfg.scheduling_mode == "round_robin" ?
         (@info "gateway scheduling" mode = cfg.scheduling_mode) :
         (@info "gateway scheduling" mode = cfg.scheduling_mode work_basis = cfg.work_basis)
-    state = GatewayState(pool, routes, gate, metrics, refresher, scheduler)
+    state = GatewayState(
+        pool, routes, gate, metrics, refresher, scheduler, cfg.error_detail, worker_labels(cfg)
+    )
 
     admin = start_admin(metrics, cfg.listen_metrics; worker_metrics = cfg.worker_metrics)
     # Discover routes once synchronously so the table is populated before we accept traffic;

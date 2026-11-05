@@ -49,6 +49,18 @@ function _node_grpc_bytes(node::AbstractDict, key::AbstractString)
     return Int(v)
 end
 
+# The node-level `global.grpc.error_detail` (`redacted` or `full`), or nothing when absent. Workers
+# read it through their own config; the supervisor mirrors it into the embedded gateway, so one
+# setting decides how much an INTERNAL error tells clients on the whole node.
+function _node_grpc_error_detail(node::AbstractDict)
+    gc = _node_grpc(node)
+    haskey(gc, "error_detail") || return nothing
+    v = gc["error_detail"]
+    (v isa AbstractString && lowercase(strip(v)) in ("redacted", "full")) ||
+        throw(ArgumentError("node config 'global.grpc.error_detail' must be \"redacted\" or \"full\", got $(repr(v))"))
+    return lowercase(strip(String(v)))
+end
+
 # Write the materialized (workers synthesized, devices assigned) node file where children and
 # the healthcheck can read it. /run/reactantserver in the container; a temp dir elsewhere.
 function _write_materialized(node::AbstractDict, runtime_dir::Union{AbstractString, Nothing})
@@ -197,7 +209,8 @@ function build_supervisor(
                     metrics_endpoints = gw_path === nothing ? worker_metrics_endpoints(node) : nothing,
                     worker_names = gw_path === nothing ? String[_worker_name(w) for w in ws] : nothing,
                     grpc_max_recv = gw_path === nothing ? _node_grpc_bytes(node, "max_recv_msg_bytes") : nothing,
-                    grpc_max_send = gw_path === nothing ? _node_grpc_bytes(node, "max_send_msg_bytes") : nothing
+                    grpc_max_send = gw_path === nothing ? _node_grpc_bytes(node, "max_send_msg_bytes") : nothing,
+                    grpc_error_detail = gw_path === nothing ? _node_grpc_error_detail(node) : nothing
                 )
             )
         end

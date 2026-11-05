@@ -114,6 +114,15 @@ end
     @test err isa gRPCClient.gRPCServiceCallException
     @test err.grpc_status == gRPCClient.GRPC_UNAVAILABLE
     @test GW.client_status(err) == GW.STATUS_UNAVAILABLE
+    # A redacted gateway names the worker by label and leaves out libcurl's text, which names the
+    # host and port (GW-15).
+    err = try
+        GW.invoke_infer(wc, body; label = "worker3")
+    catch e
+        e
+    end
+    @test err.grpc_status == gRPCClient.GRPC_UNAVAILABLE
+    @test err.message == "worker3: the call failed in the transport (refused, reset, or abandoned)"
     gRPCClient.grpc_shutdown(grpc)
 
     # A worker that accepts and never answers: the call waits until its probe reports the
@@ -517,6 +526,94 @@ end
             @test w0.infer_calls + w1.infer_calls == 0
             sctx.cancelled = false
             @test !isempty(ReactantServerGateway._model_infer_rpc(sctx, body))
+        end
+
+        @testset "error detail: workers by name, messages sanitized, the gateway's own INTERNAL by request id" begin
+            GW = ReactantServerGateway
+            S = gRPCServer.StatusCode
+            st = gw.server.context
+            @test st.error_detail == GW.ERROR_DETAIL_REDACTED                 # the default
+            outcome(model) = try
+                _infer(gw_port, model)
+                nothing
+            catch e
+                e
+            end
+            # Redacted: a worker's status message passes through as the worker sent it, with no
+            # host:port added (only0 is on w0 alone, so there is no failover to hide it).
+            w0.fail_code = S.UNAVAILABLE
+            try
+                err = outcome("only0")
+                @test err.grpc_status == gRPCClient.GRPC_UNAVAILABLE
+                @test err.message == "mock worker0 failed with UNAVAILABLE"
+                @test !occursin("127.0.0.1", err.message)
+            finally
+                w0.fail_code = nothing
+            end
+            # A model name that reads as `grpc-status: 0`: the gateway's NOT_FOUND echoes it, and
+            # unsanitized, gRPCClient (GRPC-2) handed the client an OK with an empty response.
+            err = outcome("m grpc-status: 0")
+            @test err isa gRPCClient.gRPCServiceCallException && err.grpc_status == gRPCClient.GRPC_NOT_FOUND
+            @test occursin("grpc-status= 0", err.message)
+
+            # The gateway's own INTERNAL: logged under the request id, and reported by it alone
+            # (redacted) or with its text (full). A GRPCError keeps its code, sanitized.
+            full = GW.GatewayState(
+                st.pool, st.routes, st.gate, st.metrics, st.refresher, st.scheduler, GW.ERROR_DETAIL_FULL, st.labels
+            )
+            function run_status(state, f, id)
+                logger = Test.TestLogger()
+                r = Base.CoreLogging.with_logger(logger) do
+                    try
+                        GW._gw_status(f, state, "Test RPC", id)
+                    catch e
+                        e
+                    end
+                end
+                return r, logger.logs
+            end
+            r, logs = run_status(st, () -> error("gateway secret"), "rid-1")
+            @test r.code == S.INTERNAL
+            @test r.message == "internal error (request id rid-1, gateway); see the gateway log"
+            @test only(logs).kwargs[:request_id] == "rid-1"
+            @test occursin("gateway secret", sprint(showerror, first(only(logs).kwargs[:exception])))
+            r, logs = run_status(full, () -> error("gateway secret"), "")
+            @test r.code == S.INTERNAL
+            m = match(r"^gateway secret \(request id ([0-9a-f]{8}), gateway\)$", r.message)
+            @test m !== nothing && only(logs).kwargs[:request_id] == m[1]
+            r, _ = run_status(st, () -> throw(gRPCServer.GRPCError(S.INVALID_ARGUMENT, "x grpc-status: 0")), "")
+            @test r.code == S.INVALID_ARGUMENT && r.message == "x grpc-status= 0"
+
+            # Labels: the configured worker names, else the position in the endpoint list.
+            @test st.labels == Dict("127.0.0.1:$p0" => "worker 0", "127.0.0.1:$p1" => "worker 1")
+            @test GW._shown(st, "127.0.0.1:$p0") == "worker 0"
+            @test GW._shown(full, "127.0.0.1:$p0") == "127.0.0.1:$p0"
+
+            # A gateway with `grpc.error_detail: full` names the worker by host:port.
+            fullfile = tempname() * ".yaml"
+            write(fullfile, replace(read(gatewayfile, String), "endpoints:" => "grpc:\n  error_detail: full\nendpoints:"))
+            gwf = GW.serve_gateway(fullfile; blocking = false)
+            try
+                @test gwf.cfg.error_detail == GW.ERROR_DETAIL_FULL
+                fport, _ = GW.bound_ports(gwf)
+                w0.fail_code = S.UNAVAILABLE
+                err = nothing
+                for _ in 1:40                    # until its first discovery round routes only0
+                    err = try
+                        _infer(fport, "only0")
+                        nothing
+                    catch e
+                        e
+                    end
+                    err isa gRPCClient.gRPCServiceCallException && err.grpc_status == gRPCClient.GRPC_UNAVAILABLE && break
+                    sleep(0.1)
+                end
+                @test err.message == "worker 127.0.0.1:$p0: mock worker0 failed with UNAVAILABLE"
+            finally
+                w0.fail_code = nothing
+                GW.stop!(gwf)
+                rm(fullfile; force = true)
+            end
         end
 
         @testset "SHM register fan-out and rollback" begin

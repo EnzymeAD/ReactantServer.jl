@@ -143,23 +143,51 @@ end
 # `cancelled` (a zero-argument function, or nothing) is polled while the call is in flight: once
 # it returns true (the gateway's own inbound call was cancelled), the worker call is cancelled with
 # `grpc_cancel` and fails with CANCELLED.
+#
+# `label`, when given, is how a client-visible message names this worker: a failure of the call
+# itself (not a status the worker sent) is then described as "<label>: <what happened>" instead of
+# with gRPCClient's text, which can name the worker's host and port (a redacted gateway, GW-15).
 function invoke_infer(
         wc::WorkerClients, body::Vector{UInt8};
-        deadline::Union{Real, Nothing} = nothing, cancelled = nothing
+        deadline::Union{Real, Nothing} = nothing, cancelled = nothing,
+        label::Union{AbstractString, Nothing} = nothing
     )
-    rpc = deadline === nothing ? GRPCInferenceService.ModelInfer(wc.chan, body, gRPCClient.gRPCAsync()) :
-        GRPCInferenceService.ModelInfer(wc.chan, body, gRPCClient.gRPCAsync(); deadline = deadline)
+    rpc = try
+        deadline === nothing ? GRPCInferenceService.ModelInfer(wc.chan, body, gRPCClient.gRPCAsync()) :
+            GRPCInferenceService.ModelInfer(wc.chan, body, gRPCClient.gRPCAsync(); deadline = deadline)
+    catch e
+        (label !== nothing && e isa gRPCClient.gRPCServiceCallException) && throw(_relabel(e, label))
+        rethrow()
+    end
     req = rpc.req
     watch = cancelled === nothing ? nothing : _cancel_when(req, cancelled)
     try
         return gRPCClient.grpc_async_await(req, Vector{UInt8})
     catch e
         e isa gRPCClient.gRPCServiceCallException || rethrow()
-        _transport_failure(req, e) || rethrow()
-        throw(gRPCClient.gRPCServiceCallException(gRPCClient.GRPC_UNAVAILABLE, "transport error: $(e.message)"))
+        if _transport_failure(req, e)
+            e = gRPCClient.gRPCServiceCallException(gRPCClient.GRPC_UNAVAILABLE, "transport error: $(e.message)")
+        end
+        (label === nothing || _worker_sent(req)) || (e = _relabel(e, label))
+        throw(e)
     finally
         watch === nothing || close(watch)
     end
+end
+
+# Whether a finished call's status is one the worker sent (as opposed to one recorded locally: a
+# deadline, a cancellation, a reset handle, a transport failure).
+_worker_sent(req::gRPCClient.gRPCRequest) = req.ex === nothing && req.grpc_status != gRPCClient.GRPC_OK
+
+# A local failure of the call to the worker `label`, described without gRPCClient's own text.
+function _relabel(e::gRPCClient.gRPCServiceCallException, label::AbstractString)
+    c = e.grpc_status
+    what = c == gRPCClient.GRPC_DEADLINE_EXCEEDED ? "the call reached its deadline" :
+        c == gRPCClient.GRPC_CANCELLED ? "the call was cancelled" :
+        c == gRPCClient.GRPC_UNAVAILABLE ? "the call failed in the transport (refused, reset, or abandoned)" :
+        c == gRPCClient.GRPC_RESOURCE_EXHAUSTED ? "the message exceeded the gateway's size limit" :
+        "the call failed ($(get(gRPCClient.GRPC_CODE_TABLE, c, "status $c")))"
+    return gRPCClient.gRPCServiceCallException(c, "$label: $what")
 end
 
 # How often an in-flight worker call checks whether the gateway's inbound call was cancelled.
@@ -184,7 +212,7 @@ end
 # records none and has no status, and libcurl's error comes back as INTERNAL. A call failed locally for
 # any other reason (its deadline, a cancellation, a shut-down handle) keeps the code it was given.
 _transport_failure(req::gRPCClient.gRPCRequest, e::gRPCClient.gRPCServiceCallException) =
-    e.grpc_status == gRPCClient.GRPC_INTERNAL && req.ex === nothing && req.grpc_status == gRPCClient.GRPC_OK
+    e.grpc_status == gRPCClient.GRPC_INTERNAL && req.ex === nothing && !_worker_sent(req)
 invoke_shm_register(wc::WorkerClients, body::Vector{UInt8}) =
     GRPCInferenceService.SystemSharedMemoryRegister(wc.chan, body, Vector{UInt8})
 invoke_shm_unregister(wc::WorkerClients, body::Vector{UInt8}) =

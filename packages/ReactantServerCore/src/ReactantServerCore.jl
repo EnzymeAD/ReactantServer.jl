@@ -36,6 +36,8 @@ include("manifest.jl")
 include("signature.jl")
 include("config.jl")
 include("node.jl")
+# The text of an error status, as the worker and the gateway send it.
+include("status_message.jl")
 
 # Server-side shared-memory registry and the wire <-> boundary codec.
 include("shared_memory.jl")
@@ -95,6 +97,7 @@ export BatchSizeMode, BATCH_SIZES_ALL, BATCH_SIZES_LARGEST
 export WeightsMigration, MIGRATE_OFF, MIGRATE_COPY, MIGRATE_REPLACE
 export RuntimeProfile, PROFILE_DEFAULT, PROFILE_REGULATED
 export RuntimeConfig, ModelSchedConfig, SchedulerConfig, EndpointsConfig, GrpcConfig, ServerConfig
+export ErrorDetail, ERROR_DETAIL_REDACTED, ERROR_DETAIL_FULL, sanitize_status_message, error_request_id
 export build_config, validate_config, apply_env_overrides!, log_effective_config, parse_byte_size
 
 # ---- node ----
