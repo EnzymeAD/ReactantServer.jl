@@ -296,8 +296,9 @@ function _validate_inputs(entry, request::InferRequest)
 end
 
 # Run a request through the scheduler: the handlers' one way into `infer`, with its keywords passed
-# through. A failure keeps its type; `_handle_infer` maps it to the contract's code (`_grpc_status`),
-# which replaced the message matching this helper once did.
+# through (the handlers' `cancelled`, and the meta handler's `scratch_out`). A failure keeps its type;
+# `_handle_infer` maps it to the contract's code (`_grpc_status`), which replaced the message matching
+# this helper once did.
 _infer_or_not_found(ctx::InferContext, request; kw...) = infer(ctx.sched, request; kw...)
 
 # Time and count every ModelInfer for the worker's Prometheus export (worker_requests_total by
@@ -378,13 +379,22 @@ end
 # one-meta-at-a-time gate; its in-process sub-calls dispatch on the loop. Input validation reuses the
 # regular path (it reads only `manifest`, which MetaEntry also carries). A deadline bail and an
 # unknown or unloaded sub-model keep their types, and `_handle_infer` maps them as on the regular path.
+# The outputs may alias the pool slots the meta's `call.scratch` acquired, so `infer` hands those slots
+# here (`scratch_out`) rather than releasing them when the orchestration returns, and they go back to
+# the pool only after the response is encoded, on every path. `encode_infer_response` copies each
+# output's bytes (inline, or into the client's shared-memory region), so its message holds no alias.
 function _handle_meta_infer(ctx::InferContext, meta, req, grpc_deadline_ns::Integer = 0; cancelled = nothing)
     decoded = _as_invalid(() -> decode_infer_request(inference, req, ctx.shm))
     deadline_ns = _effective_deadline(decoded.request.deadline_ns, grpc_deadline_ns)
     request = InferRequest(meta.name, decoded.request.requested_outputs, decoded.request.inputs, deadline_ns)
     _validate_inputs(meta, request)
-    outputs = _infer_or_not_found(ctx, request; cancelled = cancelled)
-    return _as_encode_error(() -> encode_infer_response(inference, meta.name, decoded, outputs, ctx.shm))
+    scratch = PoolSlot[]
+    try
+        outputs = _infer_or_not_found(ctx, request; cancelled = cancelled, scratch_out = scratch)
+        return _as_encode_error(() -> encode_infer_response(inference, meta.name, decoded, outputs, ctx.shm))
+    finally
+        release_scratch!(scratch)
+    end
 end
 
 # List models with per-model readiness reflecting residency. `req.ready` filters to ready models

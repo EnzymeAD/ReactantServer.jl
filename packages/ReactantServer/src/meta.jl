@@ -38,7 +38,8 @@ call_model(
 
 # The injected `call` handed to a meta model's `run(inputs, call)`. Callable to dispatch a sub-call
 # (`call(name, inputs)`), and exposes `call.scratch(...)` to request reuse buffers. Tracks the pool
-# slots acquired this request so `run_meta` releases them when the orchestration returns.
+# slots acquired this request, which stay held until the request's outputs are no longer read (see
+# `run_meta`).
 mutable struct MetaCall{C <: ModelCaller}
     caller::C
     name::String
@@ -49,8 +50,10 @@ mutable struct MetaCall{C <: ModelCaller}
     call_ns::Int64           # nanoseconds spent inside sub-calls this request; the Julia glue between
     # calls is deliberately NOT counted (see `run_meta` / `_run_meta_request`)
 end
-MetaCall(caller::ModelCaller, name::AbstractString, declared; deadline_ns::Integer = 0) =
-    MetaCall(caller, String(name), Set{String}(declared), PoolSlot[], false, Int64(deadline_ns), Int64(0))
+MetaCall(
+    caller::ModelCaller, name::AbstractString, declared;
+    deadline_ns::Integer = 0, slots::Vector{PoolSlot} = PoolSlot[]
+) = MetaCall(caller, String(name), Set{String}(declared), slots, false, Int64(deadline_ns), Int64(0))
 
 # `call(name, inputs)` — dispatch a sub-call, rejecting undeclared callees. Bail before issuing if
 # the orchestration's deadline has passed (no point starting more GPU work the caller has abandoned),
@@ -85,12 +88,13 @@ end
     call.scratch([dims1 => T1, dims2 => T2, ...]) -> Vector{Array}
 
 Request reuse buffers for this request. With a pool, all requested buffers are carved from ONE
-contiguous acquired block (released when the orchestration returns); without a pool, plain heap
-arrays are returned. Identical model.jl code either way: each buffer is an `Array` that can be
-handed straight to the next stage as a `NamedTensor` by reference. The pool exists purely to keep large
-intermediates (e.g. an ROI feature tensor) off the per-request allocation path and hold down GC
-pressure: a meta writes into the pooled buffer and hands it to the next stage by reference (the call
-is in-process, so there is no copy). The pool is plain `Memory`, local to the worker, never shared.
+contiguous acquired block, held for the whole request: until its response has been encoded, so a meta
+may return a scratch buffer as an output. Without a pool, plain heap arrays are returned. Identical
+model.jl code either way: each buffer is an `Array` that can be handed straight to the next stage
+as a `NamedTensor` by reference. The pool exists purely to keep large intermediates (e.g. an ROI
+feature tensor) off the per-request allocation path and hold down GC pressure: a meta writes into the
+pooled buffer and hands it to the next stage by reference (the call is in-process, so there is no
+copy). The pool is plain `Memory`, local to the worker, never shared.
 
 Call this at most once per request — ask for ALL buffers up front in a single call (pass a vector of
 `dims => T`). One call carves N buffers from ONE block (O(1) waste); N separate calls would grab N
@@ -110,9 +114,9 @@ function _scratch(mc::MetaCall, reqs::AbstractVector)
     if pool === nothing
         return Any[Array{T}(undef, d...) for (d, T) in specs]
     end
-    # One contiguous block fits everything (simple by design; revisit for fragmentation later). Since
-    # metas run exclusively, the pool sees no cross-meta contention; the deadline-bounded acquire is a
-    # harmless guard rather than a load-bearing back-pressure mechanism.
+    # One contiguous block fits everything (simple by design; revisit for fragmentation later). Several
+    # metas can hold slots at once (the gate admits more than one, and compute-only metas bypass it),
+    # so the acquire is deadline-bounded: a starved meta fails with DeadlineExceeded.
     total = sum(sizeof(T) * prod(d) for (d, T) in specs)
     span = max(1, cld(total, pool_slot_bytes(pool)))
     slot = try
@@ -127,33 +131,71 @@ function _scratch(mc::MetaCall, reqs::AbstractVector)
 end
 
 """
-    run_meta(entry, caller, inputs; deadline_ns=0) -> Vector{NamedTensor}
+    run_meta(entry, caller, inputs; deadline_ns=0, call_ns_out=nothing, scratch_out=nothing) -> Vector{NamedTensor}
 
 Run a meta model's orchestration. The injected `call` (a [`MetaCall`](@ref)) dispatches sub-calls
 through `caller` (a [`QueueingCaller`](@ref) that re-enters the local scheduler), rejecting any callee
 not declared in `meta.calls`, and offers `call.scratch` for reuse buffers. `deadline_ns` is an absolute
 local `time_ns()` deadline for the whole orchestration (0 = none): once it passes, the next
 `call(...)` (or a slot acquire) bails with [`DeadlineExceeded`](@ref) rather than starting more GPU
-work. Any pool slots acquired via `scratch` are released here when it returns (request-scoped). If
-`call_ns_out` is given, the total nanoseconds spent inside sub-calls (the meta's GPU/model-call cost,
-excluding the Julia glue between calls) is written to it, even when the orchestration throws.
+work. If `call_ns_out` is given, the total nanoseconds spent inside sub-calls (the meta's GPU/model-call
+cost, excluding the Julia glue between calls) is written to it, even when the orchestration throws.
+
+Pool slots acquired via `scratch` are request-scoped, and the returned outputs may alias them (a meta
+may return a scratch buffer). With `scratch_out`, each slot is recorded there as it is acquired and is
+NOT released here, whether `run` returns or throws: the caller owns the slots and releases them with
+`release_scratch!` once it no longer reads the outputs (the gRPC handler does so after encoding the
+response, so a scratch-backed output is sent without a copy). Without `scratch_out`, any output that
+aliases a slot is copied before the slots are released here, so the caller never holds memory that
+the next meta's `scratch` can overwrite.
 """
 function run_meta(
         entry::MetaEntry, caller::ModelCaller, inputs::Vector{NamedTensor};
-        deadline_ns::Integer = 0, call_ns_out::Union{Base.RefValue{Int64}, Nothing} = nothing
+        deadline_ns::Integer = 0, call_ns_out::Union{Base.RefValue{Int64}, Nothing} = nothing,
+        scratch_out::Union{Vector{PoolSlot}, Nothing} = nothing
     )
-    mc = MetaCall(caller, entry.name, entry.calls; deadline_ns = deadline_ns)
+    owned = scratch_out === nothing   # no caller takes the slots, so they are released here
+    mc = MetaCall(
+        caller, entry.name, entry.calls;
+        deadline_ns = deadline_ns, slots = owned ? PoolSlot[] : scratch_out
+    )
     try
         # The orchestration is defined in a sandboxed model.jl (a newer world age), so cross it with
         # invokelatest, exactly as infer() does for pre/post hooks.
         out = Base.invokelatest(entry.run, inputs, mc)
         out isa Vector{NamedTensor} ||
             error("meta model '$(entry.name)' returned $(typeof(out)); expected Vector{NamedTensor}")
-        return out
+        return owned ? _detach_scratch(out, getfield(mc, :slots)) : out
     finally
-        for s in getfield(mc, :slots)
-            release_slot!(s)
-        end
+        owned && release_scratch!(getfield(mc, :slots))
         call_ns_out === nothing || (call_ns_out[] = getfield(mc, :call_ns))
     end
 end
+
+# Return a meta request's scratch slots to the pool, emptying `slots` as it goes so a slot is never
+# released twice. Any output that aliased one may be overwritten by the next meta from then on.
+function release_scratch!(slots::Vector{PoolSlot})
+    while !isempty(slots)
+        release_slot!(pop!(slots))
+    end
+    return nothing
+end
+
+# Whether `data`'s bytes overlap any of `slots`' byte ranges in their pool.
+function _aliases_scratch(data::Array, slots::Vector{PoolSlot})
+    lo = UInt(pointer(data))
+    hi = lo + UInt(sizeof(data))
+    for s in slots
+        base = UInt(pool_base_pointer(s.pool)) + UInt(s.offset)
+        lo < base + UInt(s.capacity) && base < hi && return true
+    end
+    return false
+end
+
+# Copy every output that aliases one of `slots`, for a caller that does not take the slots: they go
+# back to the pool when `run_meta` returns, and the next meta's `scratch` would overwrite the output.
+_detach_scratch(out::Vector{NamedTensor}, slots::Vector{PoolSlot}) =
+    isempty(slots) ? out : NamedTensor[
+        _aliases_scratch(t.data, slots) ? NamedTensor(t.name, t.dtype, t.shape, copy(t.data)) : t
+        for t in out
+    ]

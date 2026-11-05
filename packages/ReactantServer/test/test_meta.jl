@@ -400,3 +400,161 @@ end
     @test isempty(sched.committed)
     @test _RS.select_dispatch!(sched, time()) === nothing                # nothing left to dispatch
 end
+
+# A started scheduler whose scratch pool has ONE slot, so every meta's `call.scratch` lands on the same
+# bytes, and its gRPC context. Each meta stamps the request id (x[1]) into an `n`-element scratch buffer:
+# `stamp` is compute-only (it bypasses the gate) and returns the buffer itself as its output, without a
+# copy; `stamp_gpu` calls the backbone first, under a gate of 2 (the worker default), then does the
+# same; `fail` throws after taking the slot; `late` takes the slot and then waits out its deadline, so
+# its next sub-call bails.
+function _meta_scratch_server(; n::Int = 1 << 18)
+    backend = _RS.MockBackend()
+    pool = _RS.MemoryPool(backend, _RS.MockClient(), _RS.MockDevice(0), "mock", nothing)
+    reg = _RS.ModelRegistry()
+    reg.by_name["scale"] = _RS.ModelEntry(
+        "scale", _trivial_manifest("scale"), Dict{Int, Vector{UInt8}}(),
+        "", nothing, _meta_scale_model(), nothing, identity, identity
+    )
+    stamp = function (inputs, call)
+        buf = call.scratch((n,), Float32)
+        fill!(buf, inputs[1].data[1])
+        return [_RS.NamedTensor("OUT", buf)]
+    end
+    stamp_gpu = (inputs, call) -> (call("scale", inputs); stamp(inputs, call))
+    fail = (inputs, call) -> (call.scratch((n,), Float32); error("meta failed after taking scratch"))
+    late = function (inputs, call)
+        call.scratch((n,), Float32)
+        while Int64(time_ns()) < call.deadline_ns
+            sleep(0.01)
+        end
+        return call("scale", inputs)
+    end
+    for (name, calls, run) in (
+            ("stamp", String[], stamp), ("stamp_gpu", ["scale"], stamp_gpu),
+            ("fail", String[], fail), ("late", ["scale"], late),
+        )
+        reg.meta[name] = _RS.MetaEntry(name, _meta_manifest(name, calls), calls, run)
+    end
+    sched = _RS.Scheduler(reg, backend, pool, _RS.SchedulerConfig(30.0, 64, 30.0))
+    sched.scratch_pool = _RS.BufferPool(4n; n_slots = 1, use_shm = false)
+    sched.meta_gate = _RS.MetaGate(2)
+    _RS.start!(sched)
+    return sched, _RS.InferContext(sched, reg, _RS.SharedMemoryRegistry(), "mock")
+end
+
+# A serialized ModelInferRequest for `model` whose x is filled with `id`, as the worker receives it.
+function _meta_req_body(model, id; requested = String[])
+    inp = _RS.inference.var"ModelInferRequest.InferInputTensor"(; name = "x", datatype = "FP32", shape = Int64[4])
+    Out = _RS.inference.var"ModelInferRequest.InferRequestedOutputTensor"
+    return _RS._encode_message(
+        _RS.inference.ModelInferRequest(;
+            model_name = model, inputs = [inp],
+            raw_input_contents = [collect(reinterpret(UInt8, fill(Float32(id), 4)))],
+            outputs = Out[Out(; name = r) for r in requested]
+        )
+    )
+end
+
+# The values of the first output in a serialized ModelInferResponse.
+function _meta_resp_values(bytes::Vector{UInt8})
+    PB = _RS.ProtoBuf
+    resp = PB.decode(PB.ProtoDecoder(IOBuffer(bytes)), _RS.inference.ModelInferResponse)
+    return collect(reinterpret(Float32, resp.raw_output_contents[1]))
+end
+
+_meta_err(f) = try
+    f()
+    nothing
+catch e
+    e
+end
+
+@testset "in-process infer of a meta: scratch-backed outputs outlive the slot release" begin
+    # With no caller to own the slots, `infer` copies a scratch-backed output before its slot goes back
+    # to the pool; with `scratch_out`, the output comes back by reference and the slot stays held until
+    # the caller releases it, even when the orchestration throws.
+    sched, _ = _meta_scratch_server(; n = 4)
+    pool = sched.scratch_pool
+    req(model, id) = _RS.InferRequest(model, String[], [_RS.NamedTensor("x", fill(Float32(id), 4))])
+    try
+        a = _RS.infer(sched, req("stamp", 1))
+        b = _RS.infer(sched, req("stamp", 2))    # takes the same (only) slot and stamps it with 2
+        @test a[1].data == fill(1.0f0, 4)
+        @test b[1].data == fill(2.0f0, 4)
+        @test all(pool.free)
+
+        held = _RS.PoolSlot[]
+        c = _RS.infer(sched, req("stamp", 3); scratch_out = held)
+        @test length(held) == 1 && !pool.free[1]                          # handed over, still held
+        @test pointer(c[1].data) == Ptr{Float32}(_RS.pool_base_pointer(pool))   # not copied
+        @test c[1].data == fill(3.0f0, 4)
+        _RS.release_scratch!(held)
+        @test isempty(held) && all(pool.free)
+
+        @test _meta_err(() -> _RS.infer(sched, req("fail", 4); scratch_out = held)) !== nothing
+        @test length(held) == 1 && !pool.free[1]
+        _RS.release_scratch!(held)
+        @test all(pool.free)
+    finally
+        _RS.shutdown!(sched)
+    end
+end
+
+@testset "meta scratch output stays intact until its response is encoded" begin
+    # A meta returns its scratch buffer as the output, and the handler encodes it without a copy, so
+    # the slot must stay held until the response is encoded. Released any earlier, the next meta (one
+    # slot: always the same bytes) takes it and stamps its own id over the bytes still being encoded.
+    # Many concurrent requests on several threads overlap one request's encode with the next one's fill.
+    sched, ctx = _meta_scratch_server()
+    pool = sched.scratch_pool
+    try
+        ids = 1:200
+        tasks = map(ids) do i
+            Threads.@spawn begin
+                model = isodd(i) ? "stamp" : "stamp_gpu"
+                dl = Int64(time_ns()) + Int64(60_000_000_000)   # a leaked slot fails instead of hanging
+                vals = _meta_resp_values(_RS._handle_infer_raw(ctx, _meta_req_body(model, i), dl))
+                all(==(Float32(i)), vals)
+            end
+        end
+        own = fetch.(tasks)
+        @test count(!, own) == 0                 # every response carries its own id
+        @test all(pool.free)
+    finally
+        _RS.shutdown!(sched)
+    end
+end
+
+@testset "meta scratch slots are released when a request fails" begin
+    # The only slot must come back on every failing path, or the next meta could never get it: the
+    # orchestration throws after taking it (INTERNAL), the deadline passes mid-orchestration
+    # (DEADLINE_EXCEEDED), or encoding rejects the outputs it returned (INVALID_ARGUMENT). Each runs
+    # more often than the pool has slots, and the requests carry a deadline so a leak fails, not hangs.
+    sched, ctx = _meta_scratch_server()
+    pool = sched.scratch_pool
+    G = _RS.gRPCServer
+    dl(s = 10.0) = Int64(time_ns()) + round(Int64, s * 1.0e9)
+    try
+        for i in 1:3
+            err = _meta_err(() -> _RS._handle_infer_raw(ctx, _meta_req_body("fail", i), dl()))
+            @test err !== nothing && occursin("meta failed after taking scratch", sprint(showerror, err))
+            @test all(pool.free)
+        end
+        for i in 1:3
+            err = _meta_err(() -> _RS._handle_infer_raw(ctx, _meta_req_body("late", i), dl(0.1)))
+            @test err isa G.GRPCError && err.code == G.StatusCode.DEADLINE_EXCEEDED
+            @test all(pool.free)
+        end
+        for i in 1:3
+            body = _meta_req_body("stamp", i; requested = ["NOPE"])   # not an output the meta produces
+            err = _meta_err(() -> _RS._handle_infer_raw(ctx, body, dl()))
+            @test err isa G.GRPCError && err.code == G.StatusCode.INVALID_ARGUMENT
+            @test all(pool.free)
+        end
+        # The pool is not exhausted: the next request gets the slot and its own id.
+        @test all(==(7.0f0), _meta_resp_values(_RS._handle_infer_raw(ctx, _meta_req_body("stamp", 7), dl())))
+        @test all(pool.free)
+    finally
+        _RS.shutdown!(sched)
+    end
+end

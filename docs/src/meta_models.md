@@ -162,10 +162,17 @@ reference; either way the `model.jl` is identical. The pool is plain memory, loc
 and never shared across processes. It exists purely to keep large intermediates off the per-request
 allocation path; because the sub-call runs in-process, the buffer is handed to the next stage by
 reference, with no copy. A meta that never calls `scratch` just allocates normally. The pool
-defaults to 1 GiB across 16 slots, configured per worker, and the acquired slots are released when
-the orchestration returns. Concurrent metas share the pool, so size it for that many in-flight
-metas; the deadline-bounded acquire degrades gracefully if it is ever starved. The client driver
-exposes the same `scratch` interface for staging inference inputs (see [Client Usage](client.md)).
+defaults to 1 GiB across 16 slots, configured per worker. Concurrent metas share the pool, so size it
+for that many in-flight metas (compute-only metas included, since they bypass the gate); the
+deadline-bounded acquire degrades gracefully if it is ever starved. The client driver exposes the
+same `scratch` interface for staging inference inputs (see [Client Usage](client.md)).
+
+Scratch buffers are request-scoped. The slots a request acquired stay held until the worker has
+encoded that request's response, and are released then, whether the request succeeded or failed. A
+meta can therefore return a scratch buffer as an output tensor: it is encoded without an extra copy,
+and no other request can write into it first. A buffer must not outlive its request, though: once
+the response is encoded its slot goes to the next meta, so do not keep a reference to it (in a
+global, a cache, or a task that outlives `run`).
 
 Request every buffer in one `call.scratch` call (pass a vector of `dims => T` pairs to get several
 at once); calling it more than once per request is rejected, and a scratch buffer must reach the

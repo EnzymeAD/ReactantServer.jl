@@ -758,7 +758,11 @@ end
 # GPU/model-call cost), NOT its wall time: the data-dependent Julia glue between stages is excluded, so
 # the control plane (lpt_packing) balances on the meta's real device work rather than its CPU glue. A
 # compute-only meta therefore reports ~0 compute, which is correct — it consumes no GPU.
-function _run_meta_request(s::Scheduler, meta::MetaEntry, req::InferRequest)
+# `scratch_out` goes to `run_meta`: when given, the meta's scratch slots outlive this call (see `infer`).
+function _run_meta_request(
+        s::Scheduler, meta::MetaEntry, req::InferRequest;
+        scratch_out::Union{Vector{PoolSlot}, Nothing} = nothing
+    )
     # Base deadline check first: no point starting already-expired work (no GPU spent yet).
     req.deadline_ns != 0 && Int64(time_ns()) >= req.deadline_ns && throw(DeadlineExceeded(meta.name))
     gated = !isempty(meta.calls)   # compute-only metas (no sub-calls) skip the gate
@@ -766,7 +770,10 @@ function _run_meta_request(s::Scheduler, meta::MetaEntry, req::InferRequest)
     caller = QueueingCaller(s, s.scratch_pool)
     call_ns = Ref(Int64(0))
     try
-        out = run_meta(meta, caller, req.inputs; deadline_ns = req.deadline_ns, call_ns_out = call_ns)
+        out = run_meta(
+            meta, caller, req.inputs;
+            deadline_ns = req.deadline_ns, call_ns_out = call_ns, scratch_out = scratch_out
+        )
         compute = call_ns[] / 1.0e9     # sub-call (model) time only; the Julia glue between stages is excluded
         st = meta.sched
         lock(s.cond) do
@@ -2199,8 +2206,17 @@ request is withdrawn (it never runs if still queued; a running one's result is d
 [`DispatchTimeoutError`](@ref) is thrown. `cancelled`, a zero-argument function that returns `true`
 once the caller's client has cancelled the call, is polled while waiting; it withdraws the request
 the same way and throws [`RequestCancelledError`](@ref). A meta's sub-calls inherit it.
+
+`scratch_out` applies to a meta only (a regular model acquires no scratch). When given, the pool slots
+the meta's `call.scratch` acquires are collected there and stay held after `infer` returns or throws,
+because the outputs may alias them; the caller releases them with `release_scratch!` once it no longer
+reads the outputs (the gRPC handler does, after encoding the response). Without it, an output that
+aliases a slot is copied before the slot is released.
 """
-function infer(s::Scheduler, req::InferRequest; committed::Bool = false, cancelled = _CANCEL_PROBE[])
+function infer(
+        s::Scheduler, req::InferRequest; committed::Bool = false, cancelled = _CANCEL_PROBE[],
+        scratch_out::Union{Vector{PoolSlot}, Nothing} = nothing
+    )
     # Under the lock: the dispatch loop and the watcher insert and remove entries concurrently.
     entry, meta = lock(s.cond) do
         e = get(s.registry.by_name, req.model_name, nothing)
@@ -2211,7 +2227,9 @@ function infer(s::Scheduler, req::InferRequest; committed::Bool = false, cancell
         # sub-calls re-enter `infer` (committed) for the sub-models. A meta is never itself a committed
         # sub-call (metas cannot call metas), so `committed` is irrelevant on this branch.
         (meta === nothing || meta.sched === nothing) && throw(ModelNotFoundError(req.model_name))
-        return Base.ScopedValues.with(() -> _run_meta_request(s, meta, req), _CANCEL_PROBE => cancelled)
+        return Base.ScopedValues.with(
+            () -> _run_meta_request(s, meta, req; scratch_out = scratch_out), _CANCEL_PROBE => cancelled
+        )
     end
     entry.sched === nothing && throw(ModelNotFoundError(req.model_name))
     # A call whose client is already gone is neither preprocessed nor queued.
