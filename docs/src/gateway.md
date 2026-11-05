@@ -42,8 +42,12 @@ that serves the model. On a multi-worker node it also serves the node's merged m
   that.
 - **SHM broadcast:** `SystemSharedMemoryRegister` / `Unregister` are fanned out to every worker.
   POSIX SHM regions are host-local; every worker attaches via `shm_open` independently. Register
-  succeeds only if all workers succeed (it rolls back partial success); unregister succeeds if
-  any worker does.
+  succeeds only if all workers succeed. On a partial failure it rolls back only the registrations
+  this call created: each worker is first asked (`SystemSharedMemoryStatus`) whether it already
+  holds the name, and one that did (a client re-registering after another worker restarted) keeps
+  it. A worker that holds the name for another client's live object answers `ALREADY_EXISTS`, and
+  the gateway returns `ALREADY_EXISTS`; other failures return `FAILED_PRECONDITION`. Unregister
+  succeeds if any worker does.
 - **SHM namespace probe:** `IsSameIPCNamespace` is fanned out to every worker and the gateway
   returns `true` only if all of them can see the client's region (any worker may service a later
   `ModelInfer`). A worker that errors or does not implement the RPC counts as `false`.

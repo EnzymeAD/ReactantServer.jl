@@ -32,15 +32,46 @@ mutable struct BufferPool
     token_counter::UInt64
     closed::Bool                 # close() was called: no new slots (guarded by alloc_lock)
     released::Bool               # the SHM mapping has been released (guarded by alloc_lock)
+    fd::Union{ShmFd, Nothing}    # the SHM object's descriptor, kept open; nothing for inline pools
+end
+
+# How many freshly minted names a SHM pool tries before giving up when each one already exists.
+const _SHM_CREATE_ATTEMPTS = 8
+
+# Create a SHM pool's object of `len` bytes, exclusively (O_CREAT | O_EXCL, so a name collision
+# never shares memory). An explicit `key` is tried once; otherwise every attempt mints a fresh key
+# from `name` (see `_fresh_shm_key`), and a name that already exists, such as one a crashed process
+# with the same pid left in /dev/shm, is retried under a new token. The object is mapped through
+# the descriptor that created it, which the pool keeps; IPC's `SharedMemory` owns the mapping.
+# `mint` is the key generator (a test hook).
+function _create_pool_object(
+        name::AbstractString, key::Union{AbstractString, Nothing}, len::Int;
+        mint = _fresh_shm_key
+    )
+    attempts = key === nothing ? _SHM_CREATE_ATTEMPTS : 1
+    for _ in 1:attempts
+        k = key === nothing ? String(mint(String(name))) : String(key)
+        made = shm_create_exclusive(k, len)
+        made === nothing && continue
+        fd, ptr, _ = made
+        # volatile: the name is unlinked when the mapping is finalized (also at process exit), as
+        # IPC's own constructor does for an object it creates.
+        shm = SharedMemory{String}(convert(Ptr{Cvoid}, ptr), len, true, k)
+        return shm, (startswith(k, "/") ? k[2:end] : k), fd
+    end
+    key === nothing || throw(SystemError("shm_open (create) of shared memory object '$key'", Libc.EEXIST))
+    error("BufferPool: $attempts freshly minted shared memory names for '$name' all exist already")
 end
 
 """
-    BufferPool(n_bytes; n_slots=8, use_shm=true, name="reactant_server_pool")
+    BufferPool(n_bytes; n_slots=8, use_shm=true, name="reactant_server_pool", key=nothing)
 
 Allocate a staging pool of `n_bytes` divided into `n_slots` equal slots. `slot_bytes` is fixed
 at construction (`n_bytes ÷ n_slots`), not recomputed per request, so the allocator can hand
 disjoint slots to concurrent callers. A SHM-backed pool can be registered with a server; an
-inline pool (`use_shm=false`) is the fallback transport.
+inline pool (`use_shm=false`) is the fallback transport. A SHM pool's object name is minted per
+pool from `name` with a fresh random token (two pools never share a name, even one after the other
+in one process), unless an explicit `key` is given.
 """
 function BufferPool(
         n_bytes::Integer; n_slots::Integer = 8, use_shm::Bool = true,
@@ -54,21 +85,19 @@ function BufferPool(
         throw(ArgumentError("BufferPool: n_bytes ($n_bytes) too small for $n_slots slots"))
     usable = slot_bytes * Int(n_slots)
 
-    backing, region_name = if use_shm
+    backing, region_name, fd = if use_shm
         # An explicit `key` (e.g. one the supervisor minted and injected so peer workers can attach
-        # the same region) is used verbatim; otherwise derive a per-process key from `name`.
-        k = key === nothing ? shm_key(String(name)) : String(key)
-        shm = SharedMemory(k, usable)
-        shm, (startswith(k, "/") ? k[2:end] : k)
+        # the same region) is used verbatim; otherwise a fresh key is minted from `name`.
+        _create_pool_object(name, key, usable)
     else
-        Memory{UInt8}(undef, usable), ""
+        Memory{UInt8}(undef, usable), "", nothing
     end
 
     alloc_lock = ReentrantLock()
     return BufferPool(
         backing, usable, region_name, slot_bytes, Int(n_slots),
         trues(Int(n_slots)), alloc_lock, Threads.Condition(alloc_lock),
-        UInt64[], UInt64(0), false, false
+        UInt64[], UInt64(0), false, false, fd
     )
 end
 
@@ -104,6 +133,9 @@ function Base.close(pool::BufferPool)
         if pool.backing isa SharedMemory
             try
                 rm(pool.backing)            # shm_unlink by name; the mapping is untouched
+                # Unlinked once, here: the finalizer must not unlink the name a second time, when it
+                # could already belong to another object.
+                pool.backing.volatile = false
             catch ex
                 @warn "Failed to unlink SHM region $(pool.name)" exception = ex
             end
@@ -125,6 +157,7 @@ function _release_if_idle!(pool::BufferPool)
     _has_pinned_alias(pool) && return
     pool.released = true
     finalize(pool.backing)
+    pool.fd === nothing || close(pool.fd)
     return
 end
 

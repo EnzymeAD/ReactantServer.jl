@@ -217,6 +217,12 @@ invoke_shm_register(wc::WorkerClients, body::Vector{UInt8}) =
     GRPCInferenceService.SystemSharedMemoryRegister(wc.chan, body, Vector{UInt8})
 invoke_shm_unregister(wc::WorkerClients, body::Vector{UInt8}) =
     GRPCInferenceService.SystemSharedMemoryUnregister(wc.chan, body, Vector{UInt8})
+# Ask the worker which regions named `name` it has registered; returns its
+# SystemSharedMemoryStatusResponse. Used by the register fan-out to learn what existed before it.
+invoke_shm_status(wc::WorkerClients, name::AbstractString) =
+    GRPCInferenceService.SystemSharedMemoryStatus(
+    wc.chan, SystemSharedMemoryStatusRequest(; name = String(name)); deadline = wc.probe_deadline
+)
 
 # Forward a CompactMemory request to the worker; returns its CompactMemoryResponse.
 invoke_compact(wc::WorkerClients, req::CompactMemoryRequest) =

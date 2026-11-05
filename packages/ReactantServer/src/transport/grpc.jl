@@ -185,6 +185,9 @@ function _as_invalid(f)
         e isa OutOfMemoryError && rethrow()
         e isa UnregisteredRegionError &&
             throw(gRPCServer.GRPCError(gRPCServer.StatusCode.FAILED_PRECONDITION, sprint(showerror, e)))
+        # A name registered for another client's live object (CORE-2), as Triton reports it.
+        e isa ShmRegionExistsError &&
+            throw(gRPCServer.GRPCError(gRPCServer.StatusCode.ALREADY_EXISTS, sprint(showerror, e)))
         _invalid(sprint(showerror, e))
     end
 end

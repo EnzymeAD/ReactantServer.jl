@@ -16,7 +16,11 @@ following before exposing any endpoint:
 - **Shared memory is a local trust boundary.** Client-registered regions and the optional
   node-shared host-weight store live in `/dev/shm`; the shared weight regions default to mode
   `666` (world-writable) for friction-free sharing. Set `runtime.shared_host_weights_mode: "660"`
-  on production or multi-user systems.
+  on production or multi-user systems. A worker identifies a registered region by the object it
+  mapped (device and inode), not by its name: registering a name that is held by another client's
+  object that still exists fails with `ALREADY_EXISTS` instead of redirecting that client's
+  traffic, and registrations whose object was unlinked or recreated are dropped. An object a
+  crashed client left behind stays registered until it is removed from `/dev/shm`.
 - **Internal errors are redacted by default.** With `grpc.error_detail: redacted` (the default,
   set node-wide under `global.grpc`), a client is told of a failure inside the server only by a
   request id and the worker's (or gateway's) name, and the gateway never names a worker by host

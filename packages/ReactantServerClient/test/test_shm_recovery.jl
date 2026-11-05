@@ -31,10 +31,12 @@ mutable struct MockState
     register_calls::Threads.Atomic{Int}  # total SystemSharedMemoryRegister invocations
     infer_calls::Threads.Atomic{Int}
     lock::ReentrantLock
+    unregister_calls::Threads.Atomic{Int}
+    registered_names::Vector{String}     # every name a register call carried, in order
 end
 MockState() = MockState(
     Set{String}(), true, false, 0.0, Threads.Atomic{Int}(0),
-    Threads.Atomic{Int}(0), ReentrantLock()
+    Threads.Atomic{Int}(0), ReentrantLock(), Threads.Atomic{Int}(0), String[]
 )
 
 # Extract a tensor's shared_memory_region string parameter, or nothing when the tensor is inline.
@@ -65,6 +67,7 @@ function _mk_server(st::MockState, port::Integer)
     _reg(
         "SystemSharedMemoryRegister", inf.SystemSharedMemoryRegisterRequest, inf.SystemSharedMemoryRegisterResponse, (ctx, req) -> begin
             Threads.atomic_add!(st.register_calls, 1)
+            @lock st.lock push!(st.registered_names, req.name)
             st.reject_register &&
                 throw(gRPCServer.GRPCError(gRPCServer.StatusCode.INTERNAL, "register rejected"))
             @lock st.lock push!(st.regions, req.name)
@@ -73,6 +76,7 @@ function _mk_server(st::MockState, port::Integer)
     )
     _reg(
         "SystemSharedMemoryUnregister", inf.SystemSharedMemoryUnregisterRequest, inf.SystemSharedMemoryUnregisterResponse, (ctx, req) -> begin
+            Threads.atomic_add!(st.unregister_calls, 1)
             @lock st.lock (isempty(req.name) ? empty!(st.regions) : delete!(st.regions, req.name))
             inf.SystemSharedMemoryUnregisterResponse()
         end
@@ -198,6 +202,42 @@ end
         io6 = RecoveryIO(1)
         infer_sync(m, io6)
         @test io6.decoded[] == 1
+        # No (re)registration above sent an Unregister first: re-registering the same object is
+        # idempotent on the worker, and a pre-emptive unregister failed requests in flight (CLI-8).
+        @test st.unregister_calls[] == 0
+        # Every registration carried the one pool's name.
+        @test length(unique(st.registered_names)) == 1
+    finally
+        kserve_shutdown()
+        close(server)
+    end
+end
+
+@testset "kserve_init again gives the pool a new name (CLI-2)" begin
+    st = MockState()
+    port = free_port()
+    server = _mk_server(st, port); gRPCServer.start!(server)
+    try
+        names = String[]
+        keys = String[]
+        for _ in 1:3
+            kserve_init(; pool_bytes = 1 << 20, n_slots = 4, shm_reprobe_interval = 0.0)
+            m = KServeModel("127.0.0.1", port, "m"; shared_memory = :on, max_batch_size = 1, deadline = 60.0, retry = _noretry())
+            io = RecoveryIO(2)
+            infer_sync(m, io)
+            @test io.decoded[] == 2
+            pool = RSC._shm_pool[]
+            push!(names, RSC.pool_name(pool))
+            push!(keys, RSC.shmid(pool.pool.backing))
+        end
+        # Each generation has its own name and key, so a chunk still in flight from an earlier
+        # generation can never re-register its name onto a later generation's memory, and an older
+        # pool's unlink can never remove a newer pool's name.
+        @test allunique(names) && allunique(keys)
+        @test names == [k[2:end] for k in keys]
+        # The earlier generations' objects are gone; only the current one exists.
+        @test all(k -> ReactantServerCore.shm_key_identity(k) === :gone, keys[1:(end - 1)])
+        @test ReactantServerCore.shm_key_identity(keys[end]) isa ReactantServerCore.ShmIdentity
     finally
         kserve_shutdown()
         close(server)

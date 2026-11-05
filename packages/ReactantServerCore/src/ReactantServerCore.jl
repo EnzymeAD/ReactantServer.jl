@@ -23,8 +23,10 @@ include("proto/inference/inference.jl")
 # ReactantServer ControlService protobuf messages (ProtoBuf only; worker control plane).
 include("proto/control/control.jl")
 
-# Shared-memory primitives: aliasing helpers (vendored MMISHM) and the slot-allocated pool.
+# Shared-memory primitives: aliasing helpers (vendored MMISHM), objects mapped through a retained
+# descriptor, and the slot-allocated pool.
 include("shm_helpers.jl")
+include("shm_object.jl")
 include("buffer_pool.jl")
 
 # Host-weight residency store (private, or node-shared via POSIX SHM + flock).
@@ -113,6 +115,7 @@ export request_drain!
 # ---- shared-memory registry ----
 export ShmRegion, SharedMemoryRegistry, shm_register!, shm_unregister!, shm_read, shm_write!
 export shm_regions, shm_teardown!, same_ipc_namespace, UnregisteredRegionError
+export ShmRegionExistsError, shm_reap!, SHM_REAP_INTERVAL_SECONDS
 
 # ---- codec ----
 export OutputTarget, DecodedRequest, decode_infer_request, encode_infer_response, encode_model_metadata

@@ -278,11 +278,13 @@ function _encode_unregister(region::AbstractString)
 end
 
 # Invoke `op` (a function of WorkerClients) on every worker concurrently, holding the per-worker
-# register gate. Returns (first_response, succeeded_urls, failed_urls).
+# register gate. Returns (first_response, succeeded_urls, failed_urls, errors), where `errors` maps
+# each failed worker's URL to what it threw.
 function _broadcast_shm(st::GatewayState, op, region, rpc_label)
     workers = all_clients(st.pool)
     succeeded = String[]
     failed = String[]
+    errors = Dict{String, Any}()
     first_body = Ref{Union{Nothing, Vector{UInt8}}}(nothing)
     lk = ReentrantLock()
     @sync for wc in workers
@@ -300,6 +302,7 @@ function _broadcast_shm(st::GatewayState, op, region, rpc_label)
                 observe_worker!(st.metrics, rpc_label, wc.url, time() - t0)
                 lock(lk) do
                     push!(failed, wc.url)
+                    errors[wc.url] = e
                 end
                 @warn "shm: worker failed" region worker = wc.url exception = e
             finally
@@ -307,8 +310,23 @@ function _broadcast_shm(st::GatewayState, op, region, rpc_label)
             end
         end
     end
-    return first_body[], succeeded, failed
+    return first_body[], succeeded, failed, errors
 end
+
+# Whether `wc` has `region` registered right now: true, false, or `nothing` when the status call
+# failed. NOT_FOUND counts as absent (Triton answers an unknown name that way; this repo's worker
+# returns an empty map).
+function _shm_registered_on(wc::WorkerClients, region::AbstractString)
+    try
+        return haskey(invoke_shm_status(wc, region).regions, region)
+    catch e
+        (e isa gRPCClient.gRPCServiceCallException && e.grpc_status == gRPCClient.GRPC_NOT_FOUND) && return false
+        @warn "shm.register: status pre-check failed; the registration will not be rolled back on this worker" region worker = wc.url exception = e
+        return nothing
+    end
+end
+
+_already_exists(e) = e isa gRPCClient.gRPCServiceCallException && e.grpc_status == gRPCClient.GRPC_ALREADY_EXISTS
 
 function _fanout_unregister(st::GatewayState, urls, body)
     @sync for url in urls
@@ -347,7 +365,22 @@ function _gw_shm_register(body::Vector{UInt8}, st::GatewayState)
         )
     end
 
-    resp, succeeded, failed = _broadcast_shm(st, wc -> invoke_shm_register(wc, body), region, "SystemSharedMemory")
+    # A worker that already holds the registration (the same client re-registering after another
+    # worker restarted) succeeds idempotently, so a rollback must not remove it: that would break a
+    # registration that worked before this call. Each worker is asked first, under the same gate as
+    # the register, whether it holds the name; only the registrations this call created are rolled
+    # back. An unanswered pre-check counts as "held" (never roll back what may have existed). A
+    # registration created concurrently by another call for the same object can still be rolled
+    # back; that client then sees FAILED_PRECONDITION on its next request and re-registers.
+    created = Set{String}()
+    created_lock = ReentrantLock()
+    register_op = function (wc)
+        held = _shm_registered_on(wc, region)
+        resp = invoke_shm_register(wc, body)
+        held === false && @lock created_lock push!(created, wc.url)
+        return resp
+    end
+    resp, succeeded, failed, errors = _broadcast_shm(st, register_op, region, "SystemSharedMemory")
     observe_request!(st.metrics, "SystemSharedMemoryRegister", region, time() - t0)
 
     if isempty(failed)
@@ -356,9 +389,22 @@ function _gw_shm_register(body::Vector{UInt8}, st::GatewayState)
         return resp === nothing ? UInt8[] : resp
     end
 
+    rollback = filter(in(created), succeeded)
     if !isempty(succeeded)
-        @warn "shm.register: partial failure, rolling back" region ok_workers = succeeded failed_workers = failed
-        _fanout_unregister(st, succeeded, _encode_unregister(region))
+        @warn "shm.register: partial failure, rolling back what this call created" region ok_workers = succeeded failed_workers = failed rolled_back = rollback
+        isempty(rollback) || _fanout_unregister(st, rollback, _encode_unregister(region))
+    end
+    # The name belongs to another client's live object on some worker: say so, as Triton does, so
+    # the client does not mistake it for a stale registration.
+    if any(_already_exists, values(errors))
+        inc_requests!(st.metrics, "SystemSharedMemoryRegister", region, "AlreadyExists")
+        throw(
+            gRPCServer.GRPCError(
+                gRPCServer.StatusCode.ALREADY_EXISTS,
+                "SHM region \"$region\" is already registered for a different object on workers: " *
+                    "$(sort!([_shown(st, u) for (u, e) in errors if _already_exists(e)]))"
+            )
+        )
     end
     inc_requests!(st.metrics, "SystemSharedMemoryRegister", region, STATUS_FAILED_PRE)
     throw(
@@ -384,7 +430,7 @@ function _gw_shm_unregister(body::Vector{UInt8}, st::GatewayState)
         )
     end
 
-    resp, succeeded, failed = _broadcast_shm(st, wc -> invoke_shm_unregister(wc, body), region, "SystemSharedMemory")
+    resp, succeeded, failed, _ = _broadcast_shm(st, wc -> invoke_shm_unregister(wc, body), region, "SystemSharedMemory")
     observe_request!(st.metrics, "SystemSharedMemoryUnregister", region, time() - t0)
 
     if isempty(succeeded) && !isempty(failed)

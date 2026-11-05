@@ -190,12 +190,16 @@ function _shm_reference(params, what::AbstractString)
     return String(region), Int(off), Int(bsize)
 end
 
-# Where a requested output's data should be written.
+# Where a requested output's data should be written. `mapping` is the registration `region` resolved
+# to when the request was decoded (nothing when decoded without a registry): the output goes to
+# that object or nowhere, even if the name is registered again, for another object, meanwhile.
 struct OutputTarget
     region::String
     offset::Int
     byte_size::Int
+    mapping::Union{ShmRegion, Nothing}
 end
+OutputTarget(region, offset, byte_size) = OutputTarget(region, offset, byte_size, nothing)
 
 struct DecodedRequest
     request::InferRequest
@@ -256,7 +260,10 @@ function decode_infer_request(
     for o in msg.outputs
         ref = _shm_reference(o.parameters, "output '$(o.name)'")
         ref === nothing && continue
-        targets[o.name] = OutputTarget(ref...)
+        # Resolve the region now: an unknown one fails before any compute (FAILED_PRECONDITION), and
+        # the write later goes to exactly this registration.
+        mapping = registry === nothing ? nothing : _lookup_region(registry, first(ref))
+        targets[o.name] = OutputTarget(ref..., mapping)
     end
 
     deadline_ns = _decode_deadline_ns(msg.parameters)
@@ -359,11 +366,12 @@ function encode_infer_response(
             push!(out_tensors, _output_tensor(PB, t))
             push!(raw, _raw_from_array(t.data))
         else
-            registry === nothing && error("output '$(t.name)' targets shared memory but the server has no registry")
+            (registry === nothing || tgt.mapping === nothing) &&
+                error("output '$(t.name)' targets shared memory but the server has no registry")
             bytes = _raw_from_array(t.data)
             length(bytes) <= tgt.byte_size ||
                 error("output '$(t.name)' produced $(length(bytes)) bytes but region slot is $(tgt.byte_size)")
-            shm_write!(registry, tgt.region, tgt.offset, bytes)
+            shm_write!(tgt.mapping, tgt.offset, bytes)
             params = Dict(
                 _SHM_REGION => _string_param(PB, tgt.region),
                 _SHM_OFFSET => _int_param(PB, tgt.offset),

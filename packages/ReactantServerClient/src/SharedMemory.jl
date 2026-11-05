@@ -67,23 +67,20 @@ acquire_slot!(p::InferenceBufferPool, span::Integer = 1) = acquire_slot!(p.pool,
 
 # Register the pool's SHM region with the model's server. No-op for inline pools and for models
 # whose (host, port) is already registered. Register failures propagate so the lazy-creation
-# path can fall back to an inline pool. The pre-emptive unregister is best-effort and quiet.
+# path can fall back to an inline pool.
+#
+# There is no unregister first. A worker treats registering the same name for the same object as an
+# idempotent success, replaces a registration whose object is gone, and refuses (ALREADY_EXISTS) a
+# name held by another live object (CORE-2). So a re-registration after one worker behind a gateway
+# restarted re-creates it there and leaves the healthy workers' registration, and the requests in
+# flight against it, untouched; the unregister used to fail those requests at encode (CLI-8), and
+# against a name held by another client it would have removed that client's registration.
 function register_pool_with_model!(p::InferenceBufferPool, model::KServeModel)
     is_shm_backed(p) || return
 
     key = (model.host, model.port)
     lock(p.register_lock) do
         key in p.registered_keys && return
-
-        try
-            GRPCInferenceService.SystemSharedMemoryUnregister(
-                model.chan,
-                SystemSharedMemoryUnregisterRequest(name = pool_name(p));
-                deadline = SHM_CONTROL_DEADLINE,
-            )
-        catch ex
-            @info ex
-        end
 
         GRPCInferenceService.SystemSharedMemoryRegister(
             model.chan,
