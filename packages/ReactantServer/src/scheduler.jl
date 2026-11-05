@@ -1459,10 +1459,16 @@ function submit!(s::Scheduler, qr::QueuedRequest; expected::Union{ModelEntry, No
             return
         end
         # A reload replaced the model while this request was in preprocess. Run here, its inputs
-        # would meet the new program and its outputs the old postprocess, so it fails instead; the
-        # message reads as unloaded, which the transport maps to the retryable NOT_FOUND.
+        # would meet the new program and its outputs the old postprocess, so it fails instead, as a
+        # `ModelNotFoundError`: the version it was prepared for is unloaded, which the transport
+        # maps to the retryable NOT_FOUND.
         if expected !== nothing && entry !== expected
-            put!(qr.reply, ErrorException("model '$(qr.req.model_name)' was replaced during the request (the version that preprocessed it was unloaded); retry"))
+            name = qr.req.model_name
+            put!(
+                qr.reply, ModelNotFoundError(
+                    name, "model '$name' was replaced during the request (the version that preprocessed it was unloaded); retry"
+                )
+            )
             return
         end
         if length(entry.sched.queue) >= s.cfg.max_queue_depth

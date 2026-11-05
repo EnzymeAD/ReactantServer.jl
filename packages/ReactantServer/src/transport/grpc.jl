@@ -95,7 +95,7 @@ function _grpc_status(e)
     e isa gRPCServer.GRPCError && return e.code
     e isa QueueFullError && return S.RESOURCE_EXHAUSTED
     (e isa WorkerUnavailableError || e isa NotResidentError) && return S.UNAVAILABLE
-    (e isa ModelNotFoundError || _replaced_during_request(e)) && return S.NOT_FOUND
+    e isa ModelNotFoundError && return S.NOT_FOUND
     (e isa DeadlineExceeded || e isa DispatchTimeoutError) && return S.DEADLINE_EXCEEDED
     e isa RequestCancelledError && return S.CANCELLED
     _client_data_error(e) && return S.INVALID_ARGUMENT
@@ -105,12 +105,6 @@ end
 
 # Errors a bundle hook raises for client data it cannot accept.
 _client_data_error(e) = e isa InvalidInputError || e isa BertText.TextInputError
-
-# A request whose model was replaced while it was in preprocess, which the reload path rejects with
-# a plain ErrorException ("model 'X' was replaced during the request ..."). It is retryable like any
-# model unloaded under a request, so NOT_FOUND. Raised as a `ModelNotFoundError` instead, it needs
-# no match here.
-_replaced_during_request(e) = e isa ErrorException && occursin("was replaced during the request", e.msg)
 
 # gRPC carries the message in a header, so keep it to a line's worth.
 const _STATUS_MESSAGE_MAX = 1024

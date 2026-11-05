@@ -74,11 +74,11 @@ _sc_until(f; timeout = 5.0) = timedwait(f, timeout; pollint = 0.01) === :ok
     @test code(_SC.NotResidentError("m")) == _SCStatus.UNAVAILABLE
     @test code(_SC.ModelNotFoundError("m")) == _SCStatus.NOT_FOUND
     @test code(_SC.ModelNotFoundError("m", "model 'm' was unloaded")) == _SCStatus.NOT_FOUND
-    # The reload path's rejection of a request whose model was replaced in preprocess, still a
-    # plain ErrorException there, is retryable NOT_FOUND too; any other ErrorException is INTERNAL.
-    @test code(
-        ErrorException("model 'm' was replaced during the request (the version that preprocessed it was unloaded); retry")
-    ) == _SCStatus.NOT_FOUND
+    # The reload path's rejection of a request whose model was replaced in preprocess is retryable
+    # NOT_FOUND too, by its type: the same text in a plain ErrorException is INTERNAL like any other.
+    replaced = "model 'm' was replaced during the request (the version that preprocessed it was unloaded); retry"
+    @test code(_SC.ModelNotFoundError("m", replaced)) == _SCStatus.NOT_FOUND
+    @test code(ErrorException(replaced)) == _SCStatus.INTERNAL
     @test code(_SC.DeadlineExceeded("m")) == _SCStatus.DEADLINE_EXCEEDED
     @test code(_SC.DispatchTimeoutError("m", 1.0)) == _SCStatus.DEADLINE_EXCEEDED
     @test code(_SC.RequestCancelledError("m")) == _SCStatus.CANCELLED

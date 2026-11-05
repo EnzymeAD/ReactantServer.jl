@@ -395,9 +395,9 @@ end
             catch e
                 e isa TaskFailedException ? e.task.result : e
             end
-            @test err isa Exception
+            @test err isa ReactantServer.ModelNotFoundError          # the transport's NOT_FOUND
+            @test ReactantServer._grpc_status(err) == ReactantServer.gRPCServer.StatusCode.NOT_FOUND
             @test occursin("was replaced during the request", sprint(showerror, err))
-            @test occursin("was unloaded", sprint(showerror, err))   # the transport's NOT_FOUND match
             @test v2_rows[] == 0                 # nothing of it ran on v2
             @test isempty(v2.sched.queue)
             # A fresh request runs on v2.
