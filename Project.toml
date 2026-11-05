@@ -1,7 +1,7 @@
 # Workspace root for the ReactantServer monorepo. This environment is not itself a package;
 # it lists the member packages under [workspace] (they share the single root Manifest) and
-# declares the [sources] for the inter-package ReactantServerCore dependency, so every member
-# resolves it consistently.
+# declares the [sources] for the inter-package ReactantServerCore dependency (and, for now, git
+# pins of gRPCServer and gRPCClient), so every member resolves them consistently.
 
 # packages/ReactantServerExport is intentionally NOT listed here: it is the offline export
 # tooling, kept out of the shared workspace manifest so its Lux/PythonCall weakdeps never get
@@ -26,6 +26,12 @@ gRPCServer = "608c6337-0d7d-447f-bb69-0f5674ee3959"
 
 [sources]
 ReactantServerCore = {path = "packages/ReactantServerCore"}
+# Temporary: gRPCServer from the perf/request-handoff branch (one-allocation request buffer and
+# copy-free raw unary requests, released as 0.1.2 once reviewed). Drop this entry when 0.1.2 is
+# on the General registry.
+gRPCServer = {url = "https://github.com/JuliaIO/gRPCServer.jl", rev = "420d0d0f6e9e25e79787af3b323167e6050abb5a"}
+# Temporary: gRPCClient 1.2.1, the commit General registered, until the package server serves it.
+gRPCClient = {url = "https://github.com/JuliaIO/gRPCClient.jl", rev = "e43503d7905a7bc043a8d6ef34a58c42cc5c0e6a"}
 
 [compat]
 HTTP = "2.5.0"
