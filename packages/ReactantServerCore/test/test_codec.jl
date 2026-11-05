@@ -323,3 +323,49 @@ import InterProcessCommunication as IPC
         finalize(shm)
     end
 end
+
+@testset "raw_output_contents is positional with shared-memory outputs (CORE-1)" begin
+    sp(s) = _Inf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:string_param, String(s)))
+    ip(i) = _Inf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:int64_param, Int64(i)))
+    key = string("/rsc1-", string(getpid(); base = 36), "-", string(rand(UInt32); base = 36))
+    shm = IPC.SharedMemory(key, 64)
+    reg = ReactantServer.SharedMemoryRegistry()
+    try
+        ReactantServer.shm_register!(reg, "r", key, 0, 64)
+        mapped = unsafe_wrap(Array, convert(Ptr{UInt8}, pointer(shm)), 64; own = false)
+        # Three outputs of equal byte size, so a misaligned positional read returns the wrong tensor
+        # rather than failing on a size mismatch.
+        produced = [ReactantServer.NamedTensor(n, Float32[k, k, k, k]) for (k, n) in enumerate(["a", "b", "c"])]
+        rawx = collect(reinterpret(UInt8, Float32[0]))
+        inp = _Inf.var"ModelInferRequest.InferInputTensor"(; name = "x", datatype = "FP32", shape = Int64[1])
+        for layout in ([:shm, :inline, :inline], [:inline, :shm, :inline], [:inline, :inline, :shm], [:shm, :inline, :shm], [:shm, :shm, :shm])
+            fill!(mapped, 0x00)
+            outs = map(enumerate(["a", "b", "c"])) do (k, n)
+                layout[k] === :inline && return _Inf.var"ModelInferRequest.InferRequestedOutputTensor"(; name = n)
+                params = Dict(
+                    "shared_memory_region" => sp("r"), "shared_memory_offset" => ip(16 * (k - 1)),
+                    "shared_memory_byte_size" => ip(16)
+                )
+                _Inf.var"ModelInferRequest.InferRequestedOutputTensor"(; name = n, parameters = params)
+            end
+            msg = _Inf.ModelInferRequest(; model_name = "m", inputs = [inp], outputs = outs, raw_input_contents = [rawx])
+            rmsg = ReactantServer.encode_infer_response("m", ReactantServer.decode_infer_request(msg, reg), produced, reg)
+            @test length(rmsg.raw_output_contents) == length(rmsg.outputs) == 3
+            # A positional reader (tritonclient's as_numpy): entry k is output k's bytes when inline,
+            # and an empty placeholder when the output went to shared memory.
+            for (k, o) in enumerate(rmsg.outputs)
+                @test o.name == ["a", "b", "c"][k]
+                if layout[k] === :inline
+                    @test collect(reinterpret(Float32, rmsg.raw_output_contents[k])) == Float32[k, k, k, k]
+                    @test !haskey(o.parameters, "shared_memory_region")
+                else
+                    @test isempty(rmsg.raw_output_contents[k])
+                    @test reinterpret(Float32, mapped[(16 * (k - 1) + 1):(16 * k)]) == Float32[k, k, k, k]
+                end
+            end
+        end
+    finally
+        ReactantServer.shm_teardown!(reg)
+        finalize(shm)
+    end
+end

@@ -332,8 +332,10 @@ end
 
 Build the response message, writing any output whose requested entry named a shared-memory
 region into that region (and referencing it in the response) instead of inline.
-raw_output_contents holds the inline outputs in order. The PB-first form builds the message
-from pb module `PB` (consumer packages pass their own generated module).
+raw_output_contents holds one entry per output in `outputs` order, as the KServe proto requires:
+the bytes of an inline output, or an empty placeholder for a shared-memory output, so a client
+that indexes it by output position (as Triton clients do) reads the right tensor. The PB-first
+form builds the message from pb module `PB` (consumer packages pass their own generated module).
 """
 function encode_infer_response(
         model_name::AbstractString, decoded::DecodedRequest,
@@ -368,6 +370,7 @@ function encode_infer_response(
                 _SHM_BYTE_SIZE => _int_param(PB, length(bytes)),
             )
             push!(out_tensors, _output_tensor(PB, t; parameters = params))
+            push!(raw, UInt8[])   # placeholder keeps raw_output_contents aligned with outputs
         end
     end
     return _build_response(PB, model_name, id_of(decoded), out_tensors, raw)

@@ -190,7 +190,8 @@ end
                 WorkerRPC.ModelInfer, port,
                 _ShmInf.ModelInferRequest(; model_name = "scale4", inputs = [inB], outputs = [outB])
             )
-            @test isempty(mB.raw_output_contents)                 # output went to shm, not inline
+            # output went to shm, not inline: an empty placeholder keeps raw_output_contents positional
+            @test mB.raw_output_contents == [UInt8[]]
             @test mB.outputs[1].name == "y"
             # the server wrote the result into the region at offset 16
             @test reinterpret(Float32, view(vio, 17:32)) == Float32[6, 8, 10, 12]
