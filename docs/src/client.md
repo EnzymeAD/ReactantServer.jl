@@ -71,6 +71,13 @@ slots (8 by default), which bounds how many chunks can be in flight against one 
 `subslot`, `pool_view` it, and return an `InferInput(name, sub, shape, T)` descriptor; both
 forms may be mixed in the returned vector.
 
+Slot boundaries are aligned (to a page for slots of at least a page, otherwise to 64 bytes), and
+`scratch` places every buffer at an offset aligned for its element type: within one call it lays
+the buffers out by alignment, largest first, which leaves no padding, so the buffers fill exactly
+`item_input_bytes` per item whatever the dtypes and chunk size. A `subslot` is carved at the cursor
+as is; pass `align = sizeof(T)` before viewing it as `T` (`pool_view` refuses a misaligned offset
+with an error that says so).
+
 Outputs can also be read back through shared memory: return a non-empty
 [`output_specs`](@ref) vector of [`OutputSpec`](@ref)`(name, dtype, per_item_dims)` entries and
 the driver asks the server to write each declared output into the staging slot, then copies the

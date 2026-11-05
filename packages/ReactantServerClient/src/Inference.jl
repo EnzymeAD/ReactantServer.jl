@@ -223,13 +223,19 @@ scratch(slot::PoolSlot, name::AbstractString, dims, ::Type{T}) where {T} =
     first(scratch(slot, [String(name) => (dims, T)]))
 
 function scratch(slot::PoolSlot, specs::AbstractVector{<:Pair{<:AbstractString}})
-    return PoolInferInput[_scratch_input(slot, first(s), last(s)) for s in specs]
+    # Laid out by element alignment, largest first, so every buffer is aligned for its type with no
+    # padding between them; the descriptors come back in the requested order (CORE-15).
+    out = Vector{PoolInferInput}(undef, length(specs))
+    for i in ReactantServerCore._scratch_order([last(last(s)) for s in specs])
+        out[i] = _scratch_input(slot, first(specs[i]), last(specs[i]))
+    end
+    return out
 end
 
 function _scratch_input(slot::PoolSlot, name::AbstractString, spec)
     dims, T = first(spec), last(spec)
     d = dims isa Tuple ? dims : (dims,)
-    sub = subslot(slot, sizeof(T) * prod(d))
+    sub = subslot(slot, sizeof(T) * prod(d); align = Base.datatype_alignment(T))
     return PoolInferInput(String(name), sub, Int[d...], T)
 end
 

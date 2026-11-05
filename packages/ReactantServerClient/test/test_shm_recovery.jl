@@ -244,6 +244,50 @@ end
     end
 end
 
+# Mixed dtypes with an odd per-item size (37 bytes), staged through typed views: before CORE-15 a
+# Float32 buffer after the UInt8 one was misaligned for odd chunk sizes, and every slot but the
+# first of a 10^6-byte, 3-slot pool started at an odd offset.
+mutable struct MixedIO <: AbstractInferenceIO
+    n::Int
+    decoded::Threads.Atomic{Int}
+end
+Base.length(io::MixedIO) = io.n
+ReactantServerClient.item_input_bytes(::MixedIO) = 3 + 4 * 4 + 8 + 5 * 2
+function ReactantServerClient.infer_encode_chunk!(io::MixedIO, r, slot)
+    k = length(r)
+    ins = scratch(slot, ["m" => ((3, k), UInt8), "x" => ((4, k), Float32), "d" => ((k,), Float64), "h" => ((5, k), Float16)])
+    m, x, d, h = pool_view(ins...)
+    m .= 0x01
+    x .= 2.0f0
+    d .= 3.0
+    h .= Float16(4)
+    return ins
+end
+ReactantServerClient.infer_decode_chunk!(io::MixedIO, r, response) = (Threads.atomic_add!(io.decoded, length(r)); nothing)
+
+@testset "mixed-dtype IO on an odd pool geometry (CORE-15)" begin
+    st = MockState()
+    port = free_port()
+    server = _mk_server(st, port); gRPCServer.start!(server)
+    try
+        for mode in (:on, :off), mbs in (1, 3, 1000)
+            kserve_init(; pool_bytes = 10^6, n_slots = 3, shm_reprobe_interval = 0.0)
+            m = KServeModel("127.0.0.1", port, "m"; shared_memory = mode, max_batch_size = mbs, deadline = 60.0, retry = _noretry())
+            n = mbs == 1000 ? 20_000 : 10                # 1000: chunks of slot_bytes ÷ 37, then a remainder
+            io = MixedIO(n, Threads.Atomic{Int}(0))
+            infer_sync(m, io)
+            @test io.decoded[] == n
+            io2 = MixedIO(n, Threads.Atomic{Int}(0))
+            infer_async(m, io2)
+            @test io2.decoded[] == n
+            @test RSC.is_shm_backed(RSC.get_or_create_pool!(m)) == (mode === :on)
+        end
+    finally
+        kserve_shutdown()
+        close(server)
+    end
+end
+
 @testset "re-probe poller lifecycle" begin
     # A positive interval starts a single background task; kserve_shutdown retires it.
     kserve_init(; shm_reprobe_interval = 0.1)

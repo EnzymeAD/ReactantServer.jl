@@ -35,6 +35,19 @@ mutable struct BufferPool
     fd::Union{ShmFd, Nothing}    # the SHM object's descriptor, kept open; nothing for inline pools
 end
 
+# Slot boundaries are aligned (CORE-15): `unsafe_wrap` refuses a pointer misaligned for its element
+# type, so a slot at an odd offset (n_bytes ÷ n_slots odd, e.g. 10^6 ÷ 3) failed for every typed
+# view in it. A slot of at least a page starts on a page boundary, a smaller one on a 64-byte line,
+# and a tiny one on 8 bytes (the largest element alignment). A lone slot sits at the base and keeps
+# its exact size.
+const _MIN_SLOT_ALIGN = 64
+_page_size() = Int(ccall(:getpagesize, Cint, ()))
+function _aligned_slot_bytes(per_slot::Int, n_slots::Int)
+    n_slots == 1 && return per_slot
+    a = per_slot >= _page_size() ? _page_size() : per_slot >= _MIN_SLOT_ALIGN ? _MIN_SLOT_ALIGN : 8
+    return per_slot - per_slot % a
+end
+
 # How many freshly minted names a SHM pool tries before giving up when each one already exists.
 const _SHM_CREATE_ATTEMPTS = 8
 
@@ -67,11 +80,14 @@ end
     BufferPool(n_bytes; n_slots=8, use_shm=true, name="reactant_server_pool", key=nothing)
 
 Allocate a staging pool of `n_bytes` divided into `n_slots` equal slots. `slot_bytes` is fixed
-at construction (`n_bytes ÷ n_slots`), not recomputed per request, so the allocator can hand
-disjoint slots to concurrent callers. A SHM-backed pool can be registered with a server; an
-inline pool (`use_shm=false`) is the fallback transport. A SHM pool's object name is minted per
-pool from `name` with a fresh random token (two pools never share a name, even one after the other
-in one process), unless an explicit `key` is given.
+at construction, not recomputed per request, so the allocator can hand disjoint slots to concurrent
+callers: `n_bytes ÷ n_slots` rounded down to a multiple of the page size when that is at least a
+page, otherwise to a multiple of 64 bytes (8 below that; a single slot keeps its size), so every
+slot boundary keeps any element type aligned.
+A SHM-backed pool can be registered with a server; an inline pool (`use_shm=false`) is the
+fallback transport. A SHM pool's object name is minted per pool from `name` with a fresh random
+token (two pools never share a name, even one after the other in one process), unless an explicit
+`key` is given.
 """
 function BufferPool(
         n_bytes::Integer; n_slots::Integer = 8, use_shm::Bool = true,
@@ -80,7 +96,7 @@ function BufferPool(
     )
     n_bytes > 0 || throw(ArgumentError("BufferPool: n_bytes must be positive (got $n_bytes)"))
     n_slots > 0 || throw(ArgumentError("BufferPool: n_slots must be positive (got $n_slots)"))
-    slot_bytes = Int(n_bytes) ÷ Int(n_slots)
+    slot_bytes = _aligned_slot_bytes(Int(n_bytes) ÷ Int(n_slots), Int(n_slots))
     slot_bytes > 0 ||
         throw(ArgumentError("BufferPool: n_bytes ($n_bytes) too small for $n_slots slots"))
     usable = slot_bytes * Int(n_slots)
@@ -92,6 +108,9 @@ function BufferPool(
     else
         Memory{UInt8}(undef, usable), "", nothing
     end
+    # Slot offsets are aligned relative to the base, so the base must be aligned too: mmap returns a
+    # page, and Julia allocates Memory at least 16-byte aligned, more than any staged element needs.
+    UInt(pointer(backing)) % 16 == 0 || error("BufferPool: the backing memory is not 16-byte aligned")
 
     alloc_lock = ReentrantLock()
     return BufferPool(
@@ -335,26 +354,53 @@ function release_slot!(slot::PoolSlot)
     return nothing
 end
 
-# Carve a child slot of `n_bytes` from the next cursor position of `parent`. The parent's
-# cursor advances; the child starts with a fresh cursor at zero and index 0 (not separately
-# releasable, its lifetime is bounded by the parent's).
-function subslot(parent::PoolSlot, n_bytes::Integer)
+"""
+    subslot(parent, n_bytes; align = 1) -> PoolSlot
+
+Carve a child slot of `n_bytes` from the next cursor position of `parent`, first moving the cursor
+forward to a multiple of `align` bytes from the pool's base (a power of two, at most 64). The
+parent's cursor advances; the child starts with a fresh cursor at zero and index 0 (not separately
+releasable, its lifetime is bounded by the parent's). A typed view of the child (`pool_view(child,
+T, ...)`) needs `align` to be at least `T`'s alignment; [`scratch`](@ref) carves that way.
+"""
+function subslot(parent::PoolSlot, n_bytes::Integer; align::Integer = 1)
     n = Int(n_bytes)
     n >= 0 || throw(ArgumentError("subslot byte count must be non-negative (got $n)"))
-    parent.cursor + n <= parent.capacity ||
+    a = Int(align)
+    (ispow2(a) && a <= _MIN_SLOT_ALIGN) ||
+        throw(ArgumentError("subslot alignment must be a power of two up to $_MIN_SLOT_ALIGN (got $a)"))
+    # Slot offsets are multiples of _MIN_SLOT_ALIGN from the base, so aligning the offset aligns
+    # the address.
+    start = parent.cursor + mod(-(parent.offset + parent.cursor), a)
+    # Subtraction form: `start + n` wraps for a huge `n` and would pass the check (CORE-15).
+    (start <= parent.capacity && n <= parent.capacity - start) ||
         throw(
         ArgumentError(
             "subslot of $n bytes exceeds parent slot capacity " *
-                "($(parent.capacity - parent.cursor) bytes remaining)"
+                "($(max(0, parent.capacity - start)) bytes remaining)"
         )
     )
-    child = PoolSlot(parent.pool, 0, parent.offset + parent.cursor, n, 0, 0)
-    parent.cursor += n
+    child = PoolSlot(parent.pool, 0, parent.offset + start, n, 0, 0)
+    parent.cursor = start + n
     return child
 end
 
 # Reset a slot's cursor so it can be re-partitioned when recycled.
 reset_slot!(slot::PoolSlot) = (slot.cursor = 0; slot)
+
+# A typed pointer to `slot`'s first byte, refused with a clear error rather than by `unsafe_wrap`
+# when the offset does not suit `T`.
+function _typed_slot_pointer(slot::PoolSlot, ::Type{T}, who) where {T}
+    ptr = Ptr{T}(_pool_base_pointer(slot.pool) + slot.offset)
+    a = Base.datatype_alignment(T)
+    UInt(ptr) % a == 0 || throw(
+        ArgumentError(
+            "$who: offset $(slot.offset) is not aligned for $T; carve typed buffers with `scratch`, " *
+                "or with `subslot(slot, n_bytes; align = $a)`"
+        )
+    )
+    return ptr
+end
 
 # A Julia array view of the slot's bytes typed as T. The pool owns the memory; the view is
 # ephemeral.
@@ -362,8 +408,7 @@ function pool_view(slot::PoolSlot, ::Type{T}, dims::Integer...) where {T}
     n_bytes = Base.checked_mul(Int(sizeof(T)), reduce(Base.checked_mul, Int.(dims); init = 1))
     n_bytes <= slot.capacity ||
         throw(ArgumentError("pool_view ($n_bytes bytes) exceeds slot capacity ($(slot.capacity) bytes)"))
-    ptr = Ptr{T}(_pool_base_pointer(slot.pool) + slot.offset)
-    return unsafe_wrap(Array, ptr, dims)
+    return unsafe_wrap(Array, _typed_slot_pointer(slot, T, "pool_view"), dims)
 end
 
 # Pinned pool references keyed by the aliased Memory's objectid. Same rationale as
@@ -381,7 +426,7 @@ function pool_memory(slot::PoolSlot, ::Type{T}, n_elem::Integer) where {T}
     n_bytes <= slot.capacity ||
         throw(ArgumentError("pool_memory ($n_bytes bytes) exceeds slot capacity ($(slot.capacity) bytes)"))
     pool = slot.pool
-    ptr = Ptr{T}(_pool_base_pointer(pool) + slot.offset)
+    ptr = _typed_slot_pointer(slot, T, "pool_memory")
     mem = unsafe_wrap(Memory{T}, ptr, n; own = false)
     return _pin_alias!(_POOL_KEEPALIVE, _POOL_KEEPALIVE_LOCK, mem, pool)
 end
@@ -411,15 +456,31 @@ directly. `dims` is a shape tuple (or a bare integer for a vector).
 This is the buffer-request interface shared by the meta-model `call.scratch` and the client driver:
 ask for ALL buffers up front in one call. The carved buffers' lifetime is bounded by `slot` (and by
 the pool, which the caller keeps alive); they become invalid once it is released.
+
+Every buffer starts at an offset aligned for its element type. Within one call the buffers are laid
+out by element alignment, largest first (the returned order is the requested one): each buffer's
+size is a multiple of its element size, so that order leaves no padding between them and the call
+uses exactly the sum of the buffer sizes, which is what a caller sizes the slot for.
 """
 scratch(slot::PoolSlot, dims, ::Type{T}) where {T} =
     first(scratch(slot, Pair[(dims isa Tuple ? dims : (dims,)) => T]))
 
 function scratch(slot::PoolSlot, specs::AbstractVector)
-    return Any[_carve_scratch(slot, first(s), last(s)) for s in specs]
+    out = Vector{Any}(undef, length(specs))
+    for i in _scratch_order([last(s) for s in specs])
+        out[i] = _carve_scratch(slot, first(specs[i]), last(specs[i]))
+    end
+    return out
 end
+
+# The order to carve buffers of element types `types` in: by alignment, largest first, stable. With
+# power-of-two alignments that each divide the element size, every buffer then starts where the
+# previous one ended (no padding), given an aligned start (CORE-15).
+_scratch_order(types) =
+    sortperm(collect(types); by = T -> -Base.datatype_alignment(T), alg = Base.Sort.MergeSort)
 
 function _carve_scratch(slot::PoolSlot, dims, ::Type{T}) where {T}
     d = dims isa Tuple ? dims : (dims,)
-    return pool_view(subslot(slot, sizeof(T) * prod(d)), T, d...)
+    sub = subslot(slot, sizeof(T) * prod(d); align = Base.datatype_alignment(T))
+    return pool_view(sub, T, d...)
 end

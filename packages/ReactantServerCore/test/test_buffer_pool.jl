@@ -390,3 +390,67 @@ using InterProcessCommunication: SharedMemory
         finalize(p.backing)                        # what the GC would now do
     end
 end
+
+@testset "slot boundaries and scratch buffers stay aligned (CORE-15)" begin
+    RSC = ReactantServerCore
+    page = RSC._page_size()
+    # Odd totals and odd slot counts: 10^6 ÷ 3 put slot 2 at an odd offset, so every typed view in it
+    # failed; 1000 ÷ 3 is below a page and aligns to 64 bytes.
+    for (bytes, n) in ((10^6, 3), (7 * page + 13, 7), (1000, 3), (3 * page + 100, 3)), use_shm in (false, true)
+        p = RSC.BufferPool(bytes; n_slots = n, use_shm = use_shm)
+        try
+            @test p.slot_bytes % (p.slot_bytes >= page ? page : 64) == 0
+            @test 0 < p.slot_bytes * n <= bytes
+            slots = [RSC.acquire_slot!(p) for _ in 1:n]
+            for s in slots, k in (1, 2, 3, 5, 7)            # odd chunk sizes
+                RSC.reset_slot!(s)
+                specs = Pair[(3, k) => UInt8, (4, k) => Float32, (k,) => Float64, (5, k) => Float16, (k,) => Int16, (2, k) => Bool]
+                total = sum(sizeof(last(sp)) * prod(first(sp)) for sp in specs)
+                total <= s.capacity || continue
+                bufs = RSC.scratch(s, specs)
+                for (b, sp) in zip(bufs, specs)
+                    T = last(sp)
+                    @test b isa Array{T} && size(b) == first(sp)
+                    @test UInt(pointer(b)) % Base.datatype_alignment(T) == 0
+                    fill!(b, one(T))
+                end
+                @test s.cursor == total                     # aligned with no padding at all
+                ranges = sort!([UInt(pointer(b)):(UInt(pointer(b)) + sizeof(b) - 1) for b in bufs]; by = first)
+                @test all(last(ranges[i]) < first(ranges[i + 1]) for i in 1:(length(ranges) - 1))
+                @test all(b -> all(==(one(eltype(b))), b), bufs)   # no buffer overwrote another
+            end
+            foreach(RSC.release_slot!, slots)
+        finally
+            close(p)
+        end
+    end
+
+    # The tracker's case: a 3-byte-per-item UInt8 input before a Float32 one, on a final chunk of 3.
+    p = RSC.BufferPool(4096; n_slots = 1, use_shm = false)
+    s = RSC.acquire_slot!(p)
+    m, x = RSC.scratch(s, Pair[(3, 3) => UInt8, (4, 3) => Float32])
+    @test size(m) == (3, 3) && size(x) == (4, 3) && UInt(pointer(x)) % 4 == 0
+
+    # subslot: an explicit alignment, a clear error for a misaligned typed view, and no wraparound in
+    # the bounds check.
+    RSC.reset_slot!(s)
+    RSC.subslot(s, 3)
+    b = RSC.subslot(s, 8; align = 8)
+    @test b.offset == s.offset + 8 && s.cursor == 16
+    RSC.subslot(s, 1)
+    c = RSC.subslot(s, 4)                                   # offset 17, misaligned for Float32
+    err = try
+        RSC.pool_view(c, Float32, 1)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError && occursin("not aligned for Float32", err.msg)
+    @test_throws ArgumentError RSC.subslot(s, 8; align = 3)
+    cur = s.cursor
+    @test_throws ArgumentError RSC.subslot(s, typemax(Int))
+    @test_throws ArgumentError RSC.subslot(s, typemax(Int) - 7)
+    @test_throws ArgumentError RSC.subslot(s, s.capacity; align = 8)
+    @test s.cursor == cur                                   # a refused carve moves nothing
+    RSC.release_slot!(s)
+end
