@@ -94,6 +94,9 @@ function _handle_set_model_residency(ctx::InferContext, req)
 end
 
 function _handle_set_model_policy(ctx::InferContext, req)
+    # A client's bad value, so INVALID_ARGUMENT rather than the FAILED_PRECONDITION `_as_control` gives.
+    req.has_weight && !(isfinite(req.weight) && req.weight > 0) &&
+        _invalid("weight must be a positive finite number, got $(req.weight)")
     return _as_control() do
         set_policy!(ctx.sched, req.name; weight = req.has_weight ? req.weight : nothing)
         _CTRL.SetModelPolicyResponse()

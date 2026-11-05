@@ -105,7 +105,7 @@ LoadedModel(
 # scheduling methods live in `scheduler.jl`.
 mutable struct ModelSchedState
     name::String
-    weight::Float64                       # relative compute share (fair discipline); share = weight / Σ weights
+    weight::Float64                       # relative compute share (fair discipline), positive and finite
     max_batch_size::Union{Int, Nothing}    # coalescing cap (rows per dispatch); nothing = uncapped
     queue::Vector{QueuedRequest}          # FIFO: front is oldest
     vtime::Float64                        # fair discipline: device seconds charged / weight (see `_select_fair!`)

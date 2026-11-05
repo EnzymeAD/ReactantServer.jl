@@ -354,7 +354,8 @@ global:
         max_batch_size: 8     # cap on rows coalesced per dispatch (default uncapped)
 ```
 
-`weight` sets the model's fair share. `residency` is also settable per model (the initial
+`weight` sets the model's fair share; it must be a positive finite number, and the worker refuses
+the node file otherwise. `residency` is also settable per model (the initial
 residency floor); see [On-demand Weights](on_demand_weights.md) for what the floors mean.
 `max_batch_size` caps coalescing rows per dispatch, as described above; it does not change
 compiled shapes and never splits a request. The full node-file surface, including the global
@@ -368,7 +369,9 @@ worker.
 
 The control plane can adjust scheduling policy on a running worker. `ReactantServer.set_policy!`
 updates
-a model's live `weight` (consulted by the fair discipline; it raises on an unknown model). `ReactantServer.set_residency!` moves a model to a target
+a model's live `weight` (consulted by the fair discipline; it raises on an unknown model, and on a
+weight that is not positive and finite, which the `SetModelPolicy` RPC answers with
+`INVALID_ARGUMENT`). `ReactantServer.set_residency!` moves a model to a target
 residency
 floor; the worker accepts it only under `model_control_mode: explicit`. Both
 run on the dispatch thread, the sole mutator of residency, and block until applied; control

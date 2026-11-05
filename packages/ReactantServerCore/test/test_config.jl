@@ -180,11 +180,14 @@ end
             c, _, _ = load_single_worker(dir, "scheduler:\n  $key: $val"; model_repo = modeldir)
             @test_throws ReactantServer.ConfigError ReactantServer.validate_config(c)
         end
-        cw, _, _ = load_single_worker(
-            dir,
-            "scheduler:\n  models:\n    m:\n      weight: -1.0"; model_repo = modeldir
-        )
-        @test_throws ReactantServer.ConfigError ReactantServer.validate_config(cw)
+        # A weight must be positive and finite: the fair discipline divides by it (SCH-18).
+        for bad in ("-1.0", "0", ".inf", ".nan")
+            cw, _, _ = load_single_worker(
+                dir,
+                "scheduler:\n  models:\n    m:\n      weight: $bad"; model_repo = modeldir
+            )
+            @test_throws ReactantServer.ConfigError ReactantServer.validate_config(cw)
+        end
         cm, _, _ = load_single_worker(
             dir,
             "scheduler:\n  models:\n    m:\n      max_batch_size: 0"; model_repo = modeldir

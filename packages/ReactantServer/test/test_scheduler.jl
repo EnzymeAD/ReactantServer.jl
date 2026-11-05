@@ -481,6 +481,34 @@ end
     @test worst.share <= 1.0e-9
 end
 
+@testset "fair: set_policy! and SetModelPolicy refuse a weight that is not positive and finite" begin
+    # A charge divides by the weight: 0 or Inf would stop or freeze a model's virtual time, a
+    # negative weight would run it backwards, and NaN fails every comparison (SCH-18).
+    s = _empty_sched()
+    _install!(s, _sched_entry("m", [1]), ModelSchedState("m", ModelSchedConfig(1.0), 0.0))
+    st = s.registry.by_name["m"].sched
+    ReactantServer.set_policy!(s, "m"; weight = 2.5)
+    @test st.weight == 2.5
+    ctx = ReactantServer.InferContext(s, s.registry, ReactantServer.SharedMemoryRegistry(), "mock")
+    GE = ReactantServer.gRPCServer.GRPCError
+    for bad in (0.0, -1.0, NaN, Inf, -Inf)
+        @test_throws ArgumentError ReactantServer.set_policy!(s, "m"; weight = bad)
+        err = try
+            ReactantServer._handle_set_model_policy(
+                ctx, ReactantServer.control.SetModelPolicyRequest(; name = "m", has_weight = true, weight = bad)
+            )
+            nothing
+        catch e
+            e
+        end
+        @test err isa GE && err.code == ReactantServer.gRPCServer.StatusCode.INVALID_ARGUMENT
+        @test st.weight == 2.5
+    end
+    # Without has_weight the weight field is not read, so its zero default is not an error.
+    ReactantServer._handle_set_model_policy(ctx, ReactantServer.control.SetModelPolicyRequest(; name = "m"))
+    @test st.weight == 2.5
+end
+
 @testset "FIFO discipline serves the globally oldest request, still coalescing" begin
     s = _empty_sched(; discipline = ReactantServer.FIFO)
     now = 1000.0

@@ -305,10 +305,10 @@ RuntimeConfig(
     ModelSchedConfig
 
 Per-model scheduler overrides (an entry under `scheduler.models`). `weight` is the model's
-relative compute share (default `1.0`, so all-default weights yield uniform shares; consulted
-only by the fair discipline). `residency` is the model's initial residency floor (see
-[`ResidencyState`](@ref)); `nothing` means unspecified, which the server resolves at startup
-to `UNPINNED` (swapped on demand, with host RAM copies within `runtime.host_weight_budget`), or to
+relative compute share, a positive finite number (default `1.0`, so all-default weights yield
+uniform shares; consulted only by the fair discipline). `residency` is the model's initial
+residency floor (see [`ResidencyState`](@ref)); `nothing` means unspecified, which the server
+resolves at startup to `UNPINNED` (swapped on demand, with host RAM copies within `runtime.host_weight_budget`), or to
 `PINNED_SYSTEM` when the on-demand weight cache is enabled and the budget is unlimited. `max_batch_size` caps how many rows the scheduler coalesces into one
 dispatch of this model; `nothing` means uncapped. The cap does not change compiled shapes:
 a partial fill still pads up to the smallest compiled batch size, and a single request larger
@@ -941,7 +941,10 @@ function validate_config(cfg::ServerConfig)
     cfg.scheduler.compaction_interval >= 0 ||
         throw(ConfigError("scheduler.compaction_interval must be non-negative (0 = disabled)"))
     for (name, mc) in cfg.scheduler.models
-        mc.weight > 0 || throw(ConfigError("scheduler.models.$name.weight must be positive"))
+        # The fair discipline charges a dispatch as its seconds over the weight, so only a positive,
+        # finite weight orders models: Inf charges nothing, and NaN fails every comparison.
+        isfinite(mc.weight) && mc.weight > 0 ||
+            throw(ConfigError("scheduler.models.$name.weight must be a positive finite number, got $(mc.weight)"))
         mc.max_batch_size === nothing || mc.max_batch_size >= 1 ||
             throw(ConfigError("scheduler.models.$name.max_batch_size must be >= 1"))
     end
