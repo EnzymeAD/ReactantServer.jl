@@ -1442,8 +1442,10 @@ end
 # (`ModelNotFoundError`), a stopped scheduler (`WorkerUnavailableError`), and a full queue
 # (`QueueFullError`) are reported immediately through the reply channel (the caller sees the
 # exception). `max_queue_depth` caps each model's queue independently, so one backlogged model
-# cannot starve admission for the others.
-function submit!(s::Scheduler, qr::QueuedRequest)
+# cannot starve admission for the others. `expected` is the entry whose preprocess made
+# `qr.prepared` (see `infer`); when another entry holds the name by now, the request is refused
+# rather than run on a version it was not prepared for.
+function submit!(s::Scheduler, qr::QueuedRequest; expected::Union{ModelEntry, Nothing} = nothing)
     lock(s.cond) do
         if !s.running
             put!(qr.reply, _unavailable(s))
@@ -1454,6 +1456,13 @@ function submit!(s::Scheduler, qr::QueuedRequest)
         entry = get(s.registry.by_name, qr.req.model_name, nothing)
         if entry === nothing || entry.sched === nothing
             put!(qr.reply, ModelNotFoundError(qr.req.model_name))
+            return
+        end
+        # A reload replaced the model while this request was in preprocess. Run here, its inputs
+        # would meet the new program and its outputs the old postprocess, so it fails instead; the
+        # message reads as unloaded, which the transport maps to the retryable NOT_FOUND.
+        if expected !== nothing && entry !== expected
+            put!(qr.reply, ErrorException("model '$(qr.req.model_name)' was replaced during the request (the version that preprocessed it was unloaded); retry"))
             return
         end
         if length(entry.sched.queue) >= s.cfg.max_queue_depth
@@ -2154,7 +2163,9 @@ dispatch loop: preprocess before the request is queued, postprocess on the raw d
 loop hands back. Because each gRPC request runs on its own task, many requests' hook work
 proceeds in parallel and overlaps the single, serialized GPU execution. The dispatch loop coalesces
 and runs `qr.prepared` and never executes a request whose preprocess has not finished, since a
-request is only enqueued (made visible to the loop) after preprocess returns.
+request is only enqueued (made visible to the loop) after preprocess returns. A request runs on
+the version of the model whose preprocess it went through: if a reload replaces the model in the
+meantime, the request fails (NOT_FOUND on the wire, which a client or gateway retries).
 
 The wait is bounded by `scheduler.dispatch_timeout_seconds` (0 waits indefinitely): past it the
 request is withdrawn (it never runs if still queued; a running one's result is discarded) and
@@ -2163,12 +2174,15 @@ once the caller's client has cancelled the call, is polled while waiting; it wit
 the same way and throws [`RequestCancelledError`](@ref). A meta's sub-calls inherit it.
 """
 function infer(s::Scheduler, req::InferRequest; committed::Bool = false, cancelled = _CANCEL_PROBE[])
-    entry = get(s.registry.by_name, req.model_name, nothing)
+    # Under the lock: the dispatch loop and the watcher insert and remove entries concurrently.
+    entry, meta = lock(s.cond) do
+        e = get(s.registry.by_name, req.model_name, nothing)
+        return (e, e === nothing ? get(s.registry.meta, req.model_name, nothing) : nothing)
+    end
     if entry === nothing
         # A meta has no executable: it runs its orchestration on this task under the meta gate, and its
         # sub-calls re-enter `infer` (committed) for the sub-models. A meta is never itself a committed
         # sub-call (metas cannot call metas), so `committed` is irrelevant on this branch.
-        meta = get(s.registry.meta, req.model_name, nothing)
         (meta === nothing || meta.sched === nothing) && throw(ModelNotFoundError(req.model_name))
         return Base.ScopedValues.with(() -> _run_meta_request(s, meta, req), _CANCEL_PROBE => cancelled)
     end
@@ -2191,7 +2205,7 @@ function infer(s::Scheduler, req::InferRequest; committed::Bool = false, cancell
         return _infer_split(s, entry, req, prepared, rows, maxB; committed, cancelled)
     end
     qr = QueuedRequest(req, prepared; committed = committed)
-    submit!(s, qr)
+    submit!(s, qr; expected = entry)        # only onto the version whose preprocess ran
     raw = only(_await_replies(s, [qr], cancelled))
     raw isa Exception && throw(raw)
     return Base.invokelatest(entry.postprocess, raw)
@@ -2261,7 +2275,7 @@ function _infer_split(
     for rng in ranges
         piece = _take_rows(prepared, in_specs, rng)
         qr = QueuedRequest(req, piece; committed = committed)
-        submit!(s, qr)
+        submit!(s, qr; expected = entry)    # every piece onto the version that preprocessed them
         push!(qrs, qr)
     end
     replies = _await_replies(s, qrs, cancelled)

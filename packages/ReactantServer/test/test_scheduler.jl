@@ -356,6 +356,60 @@ end
     end
 end
 
+@testset "a request whose model is replaced during its preprocess never runs on the new version" begin
+    # A reload swaps the entry under the same name while a request is in the old version's
+    # preprocess. Enqueued on the new entry it would run the new program on inputs prepared for the
+    # old one, and its outputs would go through the old postprocess; it must fail instead, and so
+    # must every piece of an oversize request.
+    backend = MockBackend()
+    pool = MemoryPool(backend, MockClient(), MockDevice(0), "mock", nothing)
+    reg = ModelRegistry()
+    sig = ModelSignature(["x"], DataType[Float32], String[], 1, ["y"], DataType[Float32], 1)
+    v2_rows = Ref(0)
+    function model_version(scale; pre = identity, count = false)
+        scaled(args) = (count && (v2_rows[] += size(args[1], 2)); [args[1] .* scale])
+        execs = Dict{Int, Any}(1 => ReactantServer.MockExecutable(scaled, 1))
+        return ModelEntry(
+            "m", _sched_batched_manifest("m"), Dict{Int, Vector{UInt8}}(), "", nothing,
+            LoadedModel(sig, execs, Any[]), nothing, pre, identity
+        )
+    end
+    s = Scheduler(reg, backend, pool, SchedulerConfig(30.0, 64, 30.0))
+    ReactantServer.start!(s)
+    try
+        for rows in (1, 3)                       # one piece, and three split pieces
+            entered, release = Channel{Nothing}(1), Channel{Nothing}(1)
+            blocking(inputs) = (put!(entered, nothing); take!(release); inputs)
+            ReactantServer.admit!(s, model_version(2.0f0; pre = blocking))
+            req = InferRequest("m", ["y"], [NamedTensor("x", ones(Float32, 2, rows))], Int64(0))
+            t = Threads.@spawn ReactantServer.infer(s, req)
+            take!(entered)                       # in v1's preprocess
+            ReactantServer.evict!(s, "m")        # the reload: v1 out, v2 in under the same name
+            v2 = model_version(3.0f0; count = true)
+            ReactantServer.admit!(s, v2)
+            v2_rows[] = 0                        # admission's warmup ran v2; count requests only
+            put!(release, nothing)
+            err = try
+                fetch(t)
+                nothing
+            catch e
+                e isa TaskFailedException ? e.task.result : e
+            end
+            @test err isa Exception
+            @test occursin("was replaced during the request", sprint(showerror, err))
+            @test occursin("was unloaded", sprint(showerror, err))   # the transport's NOT_FOUND match
+            @test v2_rows[] == 0                 # nothing of it ran on v2
+            @test isempty(v2.sched.queue)
+            # A fresh request runs on v2.
+            out = ReactantServer.infer(s, InferRequest("m", ["y"], [NamedTensor("x", ones(Float32, 2, 1))], Int64(0)))
+            @test only(out).data == fill(3.0f0, 2, 1)
+            ReactantServer.evict!(s, "m")
+        end
+    finally
+        ReactantServer.shutdown!(s)
+    end
+end
+
 @testset "plan_batch respects per-model max_batch_size" begin
     # the cap limits coalescing: four 2-row requests with sizes [1,4,8] and cap 4 pick B=4 and
     # take two requests (uncapped this queue would fill B=8 with all four)
