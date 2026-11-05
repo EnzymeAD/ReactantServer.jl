@@ -88,7 +88,7 @@ the gateway can act on it (back off, try another replica, give up, re-register s
 | Status | When |
 | --- | --- |
 | `RESOURCE_EXHAUSTED` | the model's queue holds `max_queue_depth` requests, or the worker is at its `max_concurrent_requests` cap |
-| `UNAVAILABLE` | the worker is shutting down, its dispatch loop has died, or (externally managed residency) the model is not resident on this worker |
+| `UNAVAILABLE` | the worker is shutting down or draining (see [Stopping](deployment.md#Stopping)), its dispatch loop has died, or (externally managed residency) the model is not resident on this worker |
 | `NOT_FOUND` | the model is not served here: never loaded, or unloaded or replaced while the request waited |
 | `DEADLINE_EXCEEDED` | the deadline passed before dispatch (the `edf` laxity drop included), or the dispatch timeout did |
 | `CANCELLED` | the client cancelled the call |

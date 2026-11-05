@@ -468,7 +468,7 @@ the next replica only when the worker it tried could not serve it:
 | The worker call ended with | The gateway |
 | --- | --- |
 | `NOT_FOUND` (the model was unloaded there since the last discovery round) | tries the next replica and refreshes its routes |
-| `UNAVAILABLE` (the worker is shutting down, its dispatch loop died, or the model is not resident there) | tries the next replica |
+| `UNAVAILABLE` (the worker is shutting down or draining, its dispatch loop died, or the model is not resident there) | tries the next replica |
 | a transport failure (connection refused or reset, a response that broke off, a client handle reset after a hung probe) | tries the next replica, as `UNAVAILABLE` |
 | any other status: `DEADLINE_EXCEEDED`, `INTERNAL`, `INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`, `FAILED_PRECONDITION`, `CANCELLED`, ... | returns it to the client as is |
 
