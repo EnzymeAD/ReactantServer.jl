@@ -169,6 +169,7 @@ function build_supervisor(
         # all-in-one role it becomes the node's public endpoint directly, binding the gateway's
         # ports (8001/8002) so the external interface is identical to the multi-worker case but
         # without the extra process or hop. The gateway is spawned only for two or more workers.
+        # Being the public endpoint, a sole worker also gets the gateway's drain budget on shutdown.
         gpub, mpub = public_ports(env)
         sole_public = r === :all && length(ws) == 1
         # Size each worker's compute-thread pool to its share of the host (cores ÷ workers, capped),
@@ -188,7 +189,7 @@ function build_supervisor(
                     worker_spec(
                         _worker_name(w), node_file, selectors[i], children;
                         compute_threads = worker_threads, grpc_port = gpub, metrics_port = mpub,
-                        node_workers = length(ws)
+                        node_workers = length(ws), drain_seconds = PUBLIC_DRAIN_SECONDS
                     ) :
                     worker_spec(
                         _worker_name(w), node_file, selectors[i], children;

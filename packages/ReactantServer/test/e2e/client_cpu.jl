@@ -39,15 +39,21 @@ md = grpc_call(
     Inf.GRPCInferenceService.ModelMetadata, GATEWAY_PORT, Inf.ModelMetadataRequest(; name = "scale4")
 )
 check("gateway ModelMetadata", md.name == "scale4" && md.inputs[1].shape == md0.inputs[1].shape)
+# The repository also holds slow4 (scale4 with a sleeping preprocess hook) for the drain check.
 idx = grpc_call(Inf.GRPCInferenceService.RepositoryIndex, GATEWAY_PORT, Inf.RepositoryIndexRequest())
-check("gateway RepositoryIndex", [(m.name, m.state) for m in idx.models] == [("scale4", "READY")])
+check(
+    "gateway RepositoryIndex",
+    sort([(m.name, m.state) for m in idx.models]) == [("scale4", "READY"), ("slow4", "READY")];
+    detail = "got $([(m.name, m.state) for m in idx.models])"
+)
 # DescribeModels merges both workers' answers into one description per model.
 desc = grpc_call(Ctl.ControlService.DescribeModels, GATEWAY_PORT, Ctl.DescribeModelsRequest())
+scale4_desc = filter(m -> m.name == "scale4", desc.models)
 check(
-    "gateway DescribeModels", [m.name for m in desc.models] == ["scale4"] &&
-        desc.models[1].inputs[1].shape == Int64[4] &&
-        desc.models[1].inputs[1].axes == [Ctl.AxisKind.AXIS_FIXED] &&
-        desc.models[1].batch_sizes == Int64[1];
+    "gateway DescribeModels", sort([m.name for m in desc.models]) == ["scale4", "slow4"] &&
+        scale4_desc[1].inputs[1].shape == Int64[4] &&
+        scale4_desc[1].inputs[1].axes == [Ctl.AxisKind.AXIS_FIXED] &&
+        scale4_desc[1].batch_sizes == Int64[1];
     detail = "got $(desc.models)"
 )
 in_shape = Int64[d <= 0 ? 1 : d for d in md.inputs[1].shape]

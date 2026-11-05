@@ -172,6 +172,14 @@ end
     @test RSN._worker_thread_count(100, 1) == 16   # capped
     @test RSN._worker_thread_count(1, 4) == 1      # floored
 
+    # A drain budget of 0 opts a child out of the stdin drain protocol (SIGTERM at once).
+    nodrain = RSN.worker_spec("worker1", "/run/node.yaml", "1", "/opt/rs"; drain_seconds = 0)
+    @test nodrain.drain_seconds == 0
+    @test _envval(nodrain.cmd, ReactantServerCore.STDIN_DRAIN_ENV) === nothing
+    # The three-argument form (a plain child) neither drains nor is staged after anything.
+    plain = RSN.ChildSpec("plain", `true`, 3)
+    @test (plain.grace_seconds, plain.drain_seconds, plain.stage) == (3.0, 0.0, 1)
+
     # A CPU worker gets explicit empty GPU visibility (never the container's
     # CUDA_VISIBLE_DEVICES). Bind hosts stay the node file's concern.
     spec = RSN.worker_spec("worker0", "/run/node.yaml", nothing, "/opt/rs")
@@ -260,6 +268,14 @@ end
         # Worker metrics endpoints feed the gateway's aggregated /metrics.
         @test _envval(sup.children[3].spec.cmd, "REACTANT_GATEWAY_WORKER_METRICS") ==
             "127.0.0.1:9100,127.0.0.1:9101"
+        # Shutdown: the gateway (stage 1) drains for up to a minute before the workers (stage 2)
+        # are asked; each child reads the drain budget from the variable its stdin protocol uses.
+        gw, w0 = sup.children[3].spec, sup.children[1].spec
+        @test (gw.stage, gw.drain_seconds) == (1, RSN.PUBLIC_DRAIN_SECONDS)
+        @test (w0.stage, w0.drain_seconds) == (2, RSN.WORKER_DRAIN_SECONDS)
+        @test RSN.PUBLIC_DRAIN_SECONDS == 60
+        @test _envval(gw.cmd, ReactantServerCore.STDIN_DRAIN_ENV) == "60.0"
+        @test _envval(w0.cmd, ReactantServerCore.STDIN_DRAIN_ENV) == string(RSN.WORKER_DRAIN_SECONDS)
         @test occursin("role=all", String(take!(sink)))
     end
 end
@@ -278,6 +294,9 @@ end
         @test _envval(w, "INFERENCE_SERVER_ENDPOINTS_PORT") == "8001"
         @test _envval(w, "INFERENCE_SERVER_ENDPOINTS_METRICS_PORT") == "8002"
         @test _envval(w, "CUDA_VISIBLE_DEVICES") == "0"
+        # As the public endpoint, the sole worker drains as long as a gateway would.
+        @test sup.children[1].spec.drain_seconds == RSN.PUBLIC_DRAIN_SECONDS
+        @test _envval(w, ReactantServerCore.STDIN_DRAIN_ENV) == "60.0"
         @test occursin("no gateway", String(take!(sink)))
 
         # The public ports honor the gateway listen overrides.
