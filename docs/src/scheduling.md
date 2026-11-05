@@ -76,6 +76,10 @@ but its result is discarded. This is the bound that holds when nothing else does
 model whose weights read hangs. A client deadline is enforced separately, before dispatch (see
 [edf](#edf)).
 
+A gRPC call whose client cancels it withdraws its request the same way and is answered
+`CANCELLED`, so cancelled work is not run. That depends on gRPCServer reporting the cancellation;
+gRPCServer 0.1.2 does not yet, so until a release that does, a cancelled call runs as before.
+
 ### Status codes
 
 Every way a request can fail has one gRPC status, chosen by the kind of failure, so a client and

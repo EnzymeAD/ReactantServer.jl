@@ -53,6 +53,14 @@ _server_exc(status::AbstractString, msg::AbstractString) =
 # status is the request's own outcome and would only repeat on another replica.
 _fails_over(status::AbstractString) = status == STATUS_NOT_FOUND || status == STATUS_UNAVAILABLE
 
+_is_cancelled(cancelled) = cancelled !== nothing && (
+    try
+        cancelled() === true
+    catch
+        false
+    end
+)
+
 # --- ModelInfer -------------------------------------------------------------------------------
 
 # `deadline_ns` is the request's absolute deadline in the gateway's clock (0 = none). We recompute the
@@ -60,7 +68,7 @@ _fails_over(status::AbstractString) = status == STATUS_NOT_FOUND || status == ST
 # any failover retries — and forward it as the worker's grpc-timeout, so the budget shrinks for time
 # burned at the gateway instead of resetting to a fresh full budget at the worker. If it is already
 # gone, shed here (DEADLINE_EXCEEDED) rather than forward doomed work into the worker's queue.
-function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64)
+function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64, cancelled = nothing)
     wc = get_clients(st.pool, url)
     if wc === nothing
         @error "infer: routing table referenced unknown worker" worker = url model
@@ -68,6 +76,10 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64)
             gRPCServer.GRPCError(gRPCServer.StatusCode.INTERNAL, "routing table referenced unknown worker")
     end
     gate_wait(st.gate, url)
+    if _is_cancelled(cancelled)
+        return nothing, STATUS_CANCELLED,
+            gRPCServer.GRPCError(gRPCServer.StatusCode.CANCELLED, "request for model \"$model\" was cancelled by the client")
+    end
     deadline_s = nothing
     if deadline_ns != 0
         rem = deadline_ns - Int64(time_ns())
@@ -85,7 +97,7 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64)
     end
     t0 = time()
     try
-        resp = invoke_infer(wc, body; deadline = deadline_s)
+        resp = invoke_infer(wc, body; deadline = deadline_s, cancelled = cancelled)
         observe_worker!(st.metrics, "ModelInfer", url, time() - t0)
         # A worker's reply always carries model_name, so an empty body is a call that ended without
         # a response: gRPCClient before 1.1.2 returned one when `reset_clients!` aborted the call.
@@ -115,12 +127,12 @@ end
 # failed it may still be running it (an abandoned or reset call is not a stopped one), and a second
 # worker writing the same output slot, or reading an input slot the client has since reused, would
 # corrupt the client's data. Its failure reaches the client as UNAVAILABLE, the client's cue to retry.
-function _try_replicas(st::GatewayState, urls, model, id, body, deadline_ns::Int64)
+function _try_replicas(st::GatewayState, urls, model, id, body, deadline_ns::Int64, cancelled = nothing)
     last_status = STATUS_UNAVAILABLE
     last_exc = gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, "no replica available")
     shm = nothing           # read from the body only once a worker has failed the request
     for url in urls
-        resp, status, exc = _post_infer(st, url, model, id, body, deadline_ns)
+        resp, status, exc = _post_infer(st, url, model, id, body, deadline_ns, cancelled)
         exc === nothing && return resp, status, nothing
         status == STATUS_NOT_FOUND && request_refresh!(st.refresher)
         _fails_over(status) || return nothing, status, exc
@@ -134,7 +146,7 @@ function _try_replicas(st::GatewayState, urls, model, id, body, deadline_ns::Int
     return nothing, last_status, last_exc
 end
 
-function _dispatch_infer(st::GatewayState, model, id, body, deadline_ns::Int64)
+function _dispatch_infer(st::GatewayState, model, id, body, deadline_ns::Int64, cancelled = nothing)
     # Ask the scheduler which replicas to try (urls[1] is its choice; the rest are failover order)
     # and for an opaque reservation to release once the request completes. `nothing` means the
     # scheduler has no route for the model: it may have just been loaded on a worker, so refresh the
@@ -159,13 +171,15 @@ function _dispatch_infer(st::GatewayState, model, id, body, deadline_ns::Int64)
     # Release the reservation exactly once, on every path (success, retryable error, hard error, or
     # timeout), so a scheduler's outstanding counters never leak.
     try
-        return _try_replicas(st, urls, model, id, body, deadline_ns)
+        return _try_replicas(st, urls, model, id, body, deadline_ns, cancelled)
     finally
         release!(st.scheduler, reservation)
     end
 end
 
-function _gw_infer(body::Vector{UInt8}, st::GatewayState, deadline_ns::Integer = 0)
+# `cancelled` is the inbound call's cancellation probe (see `_CallCancelled`): a cancelled call stops
+# trying replicas and cancels its in-flight worker call.
+function _gw_infer(body::Vector{UInt8}, st::GatewayState, deadline_ns::Integer = 0, cancelled = nothing)
     t0 = time()
     local model, id
     try
@@ -189,7 +203,7 @@ function _gw_infer(body::Vector{UInt8}, st::GatewayState, deadline_ns::Integer =
         )
     end
     record_arrival!(st.scheduler, model)
-    resp, status, exc = _dispatch_infer(st, model, id, body, Int64(deadline_ns))
+    resp, status, exc = _dispatch_infer(st, model, id, body, Int64(deadline_ns), cancelled)
     observe_request!(st.metrics, "ModelInfer", model, time() - t0)
     inc_requests!(st.metrics, "ModelInfer", model, status)
     exc === nothing || throw(exc)
@@ -570,6 +584,18 @@ end
 # DateTime; the shared ReactantServerCore.deadline_to_time_ns converts ctx.deadline back onto
 # the local clock the gateway compares against (deadline_ns - time_ns() in _post_infer).
 
+# Whether the client has cancelled one inbound call, the probe `_gw_infer` passes down to the worker
+# call. gRPCServer 0.1.2 never marks a call cancelled, so with that release this never fires; it
+# takes effect once gRPCServer sets `ServerContext.cancelled`.
+struct _CallCancelled
+    ctx::gRPCServer.ServerContext
+end
+(c::_CallCancelled)() = gRPCServer.is_cancelled(c.ctx)
+
+_model_infer_rpc(ctx, body) = _gw_infer(
+    body, ctx.payload, deadline_to_time_ns(ctx.deadline, gRPCServer.remaining_time(ctx)), _CallCancelled(ctx)
+)
+
 """
     build_gateway_server(state, cfg, host, port) -> GRPCServer
 
@@ -594,11 +620,7 @@ function build_gateway_server(
         h2_connection_window_size = h2_connection_window_size
     )
     # Raw-byte passthrough RPCs: the generated register functions take the raw_* kwargs.
-    register_GRPCInferenceService_ModelInfer!(
-        server,
-        (ctx, body) -> _gw_infer(body, ctx.payload, deadline_to_time_ns(ctx.deadline, gRPCServer.remaining_time(ctx)));
-        raw_request = true, raw_response = true
-    )
+    register_GRPCInferenceService_ModelInfer!(server, _model_infer_rpc; raw_request = true, raw_response = true)
     register_GRPCInferenceService_SystemSharedMemoryRegister!(
         server,
         (ctx, body) -> _gw_shm_register(body, ctx.payload);

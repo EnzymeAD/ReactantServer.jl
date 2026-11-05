@@ -97,7 +97,7 @@ end
     @test peek(enc(GWInf.ModelInferRequest(; model_name = "m", inputs = [tensor(other)]))[1:(end - 3)])
 end
 
-@testset "invoke_infer: a transport failure is UNAVAILABLE" begin
+@testset "invoke_infer: a transport failure is UNAVAILABLE; a cancelled inbound call cancels the worker call" begin
     GW = ReactantServerGateway
     body = UInt8[0x0a, 0x01, 0x61]
     # Nothing listens: libcurl's connect error comes back from gRPCClient as INTERNAL, the code a
@@ -115,6 +115,38 @@ end
     @test err.grpc_status == gRPCClient.GRPC_UNAVAILABLE
     @test GW.client_status(err) == GW.STATUS_UNAVAILABLE
     gRPCClient.grpc_shutdown(grpc)
+
+    # A worker that accepts and never answers: the call waits until its probe reports the
+    # gateway's own call cancelled, then ends CANCELLED rather than at its 20 s deadline.
+    srv = Sockets.listen(Sockets.localhost, 0)
+    hport = Int(Sockets.getsockname(srv)[2])
+    held = Any[]
+    acceptor = @async try
+        while isopen(srv)
+            push!(held, Sockets.accept(srv))
+        end
+    catch
+    end
+    grpc = gRPCClient.gRPCCURL(; sticky = true)
+    chan = gRPCClient.gRPCChannel("127.0.0.1", hport; grpc = grpc, deadline = 30)
+    wc = GW.WorkerClients("127.0.0.1:$hport", grpc, chan, 30.0, 30.0)
+    flag = Threads.Atomic{Bool}(false)
+    t = @async try
+        GW.invoke_infer(wc, body; deadline = 20, cancelled = () -> flag[])
+    catch e
+        e
+    end
+    sleep(0.5)
+    @test !istaskdone(t)
+    flag[] = true
+    @test timedwait(() -> istaskdone(t), 3.0) == :ok
+    r = fetch(t)
+    @test r isa gRPCClient.gRPCServiceCallException
+    @test r.grpc_status == gRPCClient.GRPC_CANCELLED
+    @test GW.client_status(r) == GW.STATUS_CANCELLED
+    gRPCClient.grpc_shutdown(grpc)
+    close(srv)
+    foreach(close, held)
 end
 
 mutable struct MockWorker
@@ -465,6 +497,26 @@ end
             finally
                 w0.fail_code = w1.fail_code = nothing
             end
+        end
+
+        @testset "a cancelled inbound call is answered CANCELLED and tries no worker" begin
+            # gRPCServer 0.1.2 never marks a call cancelled; this drives the handler with a context
+            # whose flag is set, the plumbing that takes effect once gRPCServer sets it.
+            state = gw.server.context
+            body = (io = IOBuffer(); TPB.encode(TPB.ProtoEncoder(io), GWInf.ModelInferRequest(; model_name = "replicated")); take!(io))
+            w0.infer_calls = w1.infer_calls = 0
+            sctx = gRPCServer.ServerContext(; payload = state)
+            sctx.cancelled = true
+            err = try
+                ReactantServerGateway._model_infer_rpc(sctx, body)
+                nothing
+            catch e
+                e
+            end
+            @test err isa gRPCServer.GRPCError && err.code == gRPCServer.StatusCode.CANCELLED
+            @test w0.infer_calls + w1.infer_calls == 0
+            sctx.cancelled = false
+            @test !isempty(ReactantServerGateway._model_infer_rpc(sctx, body))
         end
 
         @testset "SHM register fan-out and rollback" begin

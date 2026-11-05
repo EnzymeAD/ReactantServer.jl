@@ -1986,18 +1986,23 @@ function remove_meta!(s::Scheduler, name::AbstractString)
 end
 
 # ---------------------------------------------------------------------------------------------
-# Waiting for a reply: the dispatch timeout
+# Waiting for a reply: the dispatch timeout and cancellation
 # ---------------------------------------------------------------------------------------------
 #
-# A caller waits on its request's reply channel for at most `scheduler.dispatch_timeout_seconds`
-# from submission. Past it the caller WITHDRAWS the request: the dispatch loop drops a withdrawn
-# request where it drops expired ones (`execute_and_record!`), so one still queued never runs, and
-# the result of one already executing is put on a channel nobody reads. The caller's wake-up is a
-# sentinel its own timer puts on the reply channel, which has room for it beside the scheduler's one
-# reply, so neither side ever blocks.
+# A caller waits on its request's reply channel, bounded by `scheduler.dispatch_timeout_seconds`
+# from submission and, for a gRPC call, by the client cancelling it. Either way out WITHDRAWS the
+# request: the dispatch loop drops a withdrawn request where it drops expired ones
+# (`execute_and_record!`), so one still queued never runs, and the result of one already executing
+# is put on a channel nobody reads. The caller's wake-up is a sentinel its own timer puts on the reply
+# channel, which has room for it beside the scheduler's one reply, so neither side ever blocks.
 
-# How often a waiting caller's timer checks its dispatch timeout.
+# How often a waiting caller's timer checks its dispatch timeout and its cancellation probe.
 const _WAIT_POLL_SECONDS = 0.1
+
+# The cancellation probe of the request being served: a zero-argument function that returns true
+# once the client has cancelled the call, or nothing. `infer` sets it around a meta's orchestration,
+# so the meta's sub-calls (which re-enter `infer`, on the same task or tasks it spawns) inherit it.
+const _CANCEL_PROBE = Base.ScopedValues.ScopedValue{Any}(nothing)
 
 # Put on a request's reply channel by its own caller's timer, never by the scheduler.
 struct _StopWaiting
@@ -2010,21 +2015,38 @@ _withdraw!(qr::QueuedRequest) = (qr.withdrawn[] = true; nothing)
 # Whether the dispatch loop must drop `qr` rather than run it: its caller stopped waiting.
 _withdrawn(qr::QueuedRequest) = qr.withdrawn[]
 
+_is_cancelled(probe) = probe !== nothing && (
+    try
+        probe() === true
+    catch
+        false
+    end
+)
+
 # Wait for the reply to each of `qrs` (one request, or the pieces of a split one) and return them in
-# order. Past the dispatch timeout every piece is withdrawn and `DispatchTimeoutError` is thrown.
-function _await_replies(s::Scheduler, qrs::Vector{QueuedRequest})
+# order. Past the dispatch timeout, or once `cancelled` reports the call cancelled, every piece is
+# withdrawn and `DispatchTimeoutError` or `RequestCancelledError` is thrown.
+function _await_replies(s::Scheduler, qrs::Vector{QueuedRequest}, cancelled)
     timeout = s.cfg.dispatch_timeout_seconds
-    (timeout > 0 && isfinite(timeout)) || return Any[take!(qr.reply) for qr in qrs]
+    timed = timeout > 0 && isfinite(timeout)
+    (timed || cancelled !== nothing) || return Any[take!(qr.reply) for qr in qrs]
     model = qrs[1].req.model_name
     t0 = time()
-    poll = min(_WAIT_POLL_SECONDS, timeout)
+    poll = timed ? min(_WAIT_POLL_SECONDS, timeout) : _WAIT_POLL_SECONDS
     # A Timer runs its callback on one task, one firing at a time, and this one closes itself when it
     # fires, so each channel gets at most one wake-up.
     timer = Timer(poll; interval = poll) do t
-        time() - t0 >= timeout || return
+        err = if timed && time() - t0 >= timeout
+            DispatchTimeoutError(model, timeout)
+        elseif _is_cancelled(cancelled)
+            RequestCancelledError(model)
+        else
+            nothing
+        end
+        err === nothing && return
         close(t)
         for qr in qrs
-            put!(qr.reply, _StopWaiting(DispatchTimeoutError(model, timeout)))
+            put!(qr.reply, _StopWaiting(err))
         end
     end
     try
@@ -2055,7 +2077,7 @@ function _check_variant_inputs(entry::ModelEntry, prepared::Vector{NamedTensor})
 end
 
 """
-    infer(scheduler, request) -> Vector{NamedTensor}
+    infer(scheduler, request; cancelled=nothing) -> Vector{NamedTensor}
 
 Submit a request and block until the scheduler returns the result. Re-raises any error
 captured during dispatch.
@@ -2069,9 +2091,11 @@ request is only enqueued (made visible to the loop) after preprocess returns.
 
 The wait is bounded by `scheduler.dispatch_timeout_seconds` (0 waits indefinitely): past it the
 request is withdrawn (it never runs if still queued; a running one's result is discarded) and
-[`DispatchTimeoutError`](@ref) is thrown.
+[`DispatchTimeoutError`](@ref) is thrown. `cancelled`, a zero-argument function that returns `true`
+once the caller's client has cancelled the call, is polled while waiting; it withdraws the request
+the same way and throws [`RequestCancelledError`](@ref). A meta's sub-calls inherit it.
 """
-function infer(s::Scheduler, req::InferRequest; committed::Bool = false)
+function infer(s::Scheduler, req::InferRequest; committed::Bool = false, cancelled = _CANCEL_PROBE[])
     entry = get(s.registry.by_name, req.model_name, nothing)
     if entry === nothing
         # A meta has no executable: it runs its orchestration on this task under the meta gate, and its
@@ -2079,9 +2103,11 @@ function infer(s::Scheduler, req::InferRequest; committed::Bool = false)
         # sub-call (metas cannot call metas), so `committed` is irrelevant on this branch.
         meta = get(s.registry.meta, req.model_name, nothing)
         (meta === nothing || meta.sched === nothing) && throw(ModelNotFoundError(req.model_name))
-        return _run_meta_request(s, meta, req)
+        return Base.ScopedValues.with(() -> _run_meta_request(s, meta, req), _CANCEL_PROBE => cancelled)
     end
     entry.sched === nothing && throw(ModelNotFoundError(req.model_name))
+    # A call whose client is already gone is neither preprocessed nor queued.
+    _is_cancelled(cancelled) && throw(RequestCancelledError(req.model_name))
     # preprocess/postprocess come from a bundle's model.jl, defined in a newer world age;
     # invokelatest crosses that boundary (harmless for identity).
     prepared = Base.invokelatest(entry.preprocess, req.inputs)
@@ -2095,11 +2121,11 @@ function infer(s::Scheduler, req::InferRequest; committed::Bool = false)
     maxB = _max_compiled_rows(entry, prepared)
     rows = _executable_rows(entry, prepared)
     if maxB !== nothing && rows > maxB
-        return _infer_split(s, entry, req, prepared, rows, maxB; committed)
+        return _infer_split(s, entry, req, prepared, rows, maxB; committed, cancelled)
     end
     qr = QueuedRequest(req, prepared; committed = committed)
     submit!(s, qr)
-    raw = only(_await_replies(s, [qr]))
+    raw = only(_await_replies(s, [qr], cancelled))
     raw isa Exception && throw(raw)
     return Base.invokelatest(entry.postprocess, raw)
 end
@@ -2154,7 +2180,7 @@ end
 
 function _infer_split(
         s::Scheduler, entry::ModelEntry, req::InferRequest, prepared::Vector{NamedTensor},
-        rows::Int, maxB::Int; committed::Bool
+        rows::Int, maxB::Int; committed::Bool, cancelled = nothing
     )
     in_specs = entry.manifest.executable_inputs
     ranges = _split_ranges(rows, maxB)
@@ -2168,7 +2194,7 @@ function _infer_split(
         submit!(s, qr)
         push!(qrs, qr)
     end
-    replies = _await_replies(s, qrs)
+    replies = _await_replies(s, qrs, cancelled)
     raws = Vector{Vector{NamedTensor}}(undef, length(qrs))
     failure = nothing
     for (i, r) in enumerate(replies)

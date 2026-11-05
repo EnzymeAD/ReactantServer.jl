@@ -1,7 +1,7 @@
 # The worker's status contract (every failure gets exactly one gRPC code, and the metrics label is
-# that code), the dispatch timeout (a caller that stops waiting withdraws its request, which then
-# never runs), and a dispatch loop that dies (the worker says so and rejects everything with
-# UNAVAILABLE instead of hanging while it reports ready). Mock backend only.
+# that code), the dispatch timeout and cancellation (a caller that stops waiting withdraws its
+# request, which then never runs), and a dispatch loop that dies (the worker says so and rejects
+# everything with UNAVAILABLE instead of hanging while it reports ready). Mock backend only.
 
 const _SC = ReactantServer
 const _SCStatus = ReactantServer.gRPCServer.StatusCode
@@ -54,9 +54,9 @@ function _sc_body(model, x::Matrix{Float32} = Float32[1 2; 3 4][:, 1:1]; outputs
 end
 
 # Run the raw ModelInfer handler and return the GRPCError it throws (or the response bytes).
-function _sc_call(ctx, body)
+function _sc_call(ctx, body; cancelled = nothing)
     return try
-        _SC._handle_infer_raw(ctx, body, 0)
+        _SC._handle_infer_raw(ctx, body, 0; cancelled = cancelled)
     catch e
         e
     end
@@ -237,6 +237,58 @@ _sc_req(model = "g") = _SC.InferRequest(model, ["y"], [_SC.NamedTensor("x", resh
     try
         @test _SC.infer(sched, _sc_req("s"))[1].data == reshape(Float32[2, 6], 2, 1)
     finally
+        _SC.shutdown!(sched)
+    end
+end
+
+@testset "cancellation: a cancelled call withdraws its request and is answered CANCELLED" begin
+    gate = Base.Event()
+    ran = Threads.Atomic{Int}(0)
+    sched, ctx = _sc_sched(_sc_gated(gate, ran))
+    _SC.start!(sched)
+    try
+        a = Threads.@spawn _SC.infer(sched, _sc_req())
+        @test _sc_until(() -> ran[] == 1)
+        flag = Threads.Atomic{Bool}(false)
+        b = Threads.@spawn try
+            _SC.infer(sched, _sc_req(); cancelled = () -> flag[])
+        catch e
+            e
+        end
+        @test _sc_until(() -> length(sched.registry.by_name["g"].sched.queue) == 1)
+        sleep(0.2)
+        @test !istaskdone(b)                       # waits while its client is still there
+        flag[] = true
+        @test _sc_until(() -> istaskdone(b); timeout = 2.0)
+        @test fetch(b) isa _SC.RequestCancelledError
+        notify(gate)
+        @test fetch(a)[1].data == reshape(Float32[2, 6], 2, 1)   # A, not cancelled, completes
+        @test _sc_until(() -> isempty(sched.registry.by_name["g"].sched.queue))
+        sleep(0.2)
+        @test ran[] == 1                           # B never ran
+
+        # A call already cancelled is neither preprocessed nor queued.
+        @test_throws _SC.RequestCancelledError _SC.infer(sched, _sc_req(); cancelled = () -> true)
+        # A meta's sub-calls re-enter `infer` with the call's probe in scope, and inherit it.
+        @test_throws _SC.RequestCancelledError Base.ScopedValues.with(
+            () -> _SC.infer(sched, _sc_req()), _SC._CANCEL_PROBE => () -> true
+        )
+        @test ran[] == 1
+
+        # Through the registered ModelInfer RPC, with a ServerContext whose cancelled flag is set
+        # (gRPCServer 0.1.2 never sets it; this is the plumbing that takes effect once it does).
+        sctx = _SC.gRPCServer.ServerContext(; payload = ctx)
+        sctx.cancelled = true
+        r = try
+            _SC._model_infer_rpc(sctx, _sc_body("g"))
+        catch e
+            e
+        end
+        @test _sc_code(r) == _SCStatus.CANCELLED
+        sctx.cancelled = false
+        @test _SC._model_infer_rpc(sctx, _sc_body("g")) isa Vector{UInt8}
+    finally
+        notify(gate)
         _SC.shutdown!(sched)
     end
 end

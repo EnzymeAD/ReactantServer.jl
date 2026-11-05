@@ -139,16 +139,43 @@ end
 # transport failed (a refused or reset connection, a response that broke off): gRPCClient reports
 # those as INTERNAL, the same code a worker sends for its own failures, so they are told apart
 # here, where the call itself is at hand, and only the worker's INTERNAL reaches the client as such.
-function invoke_infer(wc::WorkerClients, body::Vector{UInt8}; deadline::Union{Real, Nothing} = nothing)
+#
+# `cancelled` (a zero-argument function, or nothing) is polled while the call is in flight: once
+# it returns true (the gateway's own inbound call was cancelled), the worker call is cancelled with
+# `grpc_cancel` and fails with CANCELLED.
+function invoke_infer(
+        wc::WorkerClients, body::Vector{UInt8};
+        deadline::Union{Real, Nothing} = nothing, cancelled = nothing
+    )
     rpc = deadline === nothing ? GRPCInferenceService.ModelInfer(wc.chan, body, gRPCClient.gRPCAsync()) :
         GRPCInferenceService.ModelInfer(wc.chan, body, gRPCClient.gRPCAsync(); deadline = deadline)
     req = rpc.req
+    watch = cancelled === nothing ? nothing : _cancel_when(req, cancelled)
     try
         return gRPCClient.grpc_async_await(req, Vector{UInt8})
     catch e
         e isa gRPCClient.gRPCServiceCallException || rethrow()
         _transport_failure(req, e) || rethrow()
         throw(gRPCClient.gRPCServiceCallException(gRPCClient.GRPC_UNAVAILABLE, "transport error: $(e.message)"))
+    finally
+        watch === nothing || close(watch)
+    end
+end
+
+# How often an in-flight worker call checks whether the gateway's inbound call was cancelled.
+const _CANCEL_POLL_SECONDS = 0.1
+
+# A repeating timer that cancels `req` once `cancelled()` returns true. Close it when the call ends.
+function _cancel_when(req::gRPCClient.gRPCRequest, cancelled)
+    return Timer(_CANCEL_POLL_SECONDS; interval = _CANCEL_POLL_SECONDS) do t
+        fired = try
+            cancelled() === true
+        catch
+            false
+        end
+        fired || return
+        close(t)
+        gRPCClient.grpc_cancel(req)
     end
 end
 

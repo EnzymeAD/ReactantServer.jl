@@ -486,6 +486,11 @@ transport failure) reaches the client as `UNAVAILABLE`, which `ReactantServerCli
 other statuses pass through like any request's. The gateway reads only the tensors' parameter
 keys to tell, never their payloads.
 
+When a client cancels its call, the gateway cancels its in-flight worker call (with gRPCClient's
+`grpc_cancel`) and the worker withdraws the queued request, so cancelled work is not run. Both
+hops depend on gRPCServer reporting a cancelled call (`is_cancelled`); gRPCServer 0.1.2 does not
+yet, so until a release that does, a cancelled call runs to completion as before.
+
 ## What the gateway does not do
 
 - Streaming RPCs.

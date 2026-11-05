@@ -126,6 +126,14 @@ function _with_status(f, what::AbstractString)
     end
 end
 
+# The cancellation probe for one call: whether its client has cancelled it, polled while the
+# request waits (see `infer`). gRPCServer 0.1.2 never marks a call cancelled, so with that release
+# this never fires; it takes effect once gRPCServer sets `ServerContext.cancelled`.
+struct _CallCancelled
+    ctx::gRPCServer.ServerContext
+end
+(c::_CallCancelled)() = gRPCServer.is_cancelled(c.ctx)
+
 # A request's effective absolute deadline (local time_ns()): the TIGHTEST of the in-body KV timeout
 # (carried through the gateway's raw-byte forwarding) and the grpc-timeout (which the gateway
 # recomputes per hop, so it reflects time already burned reaching this worker). Both are absolute
@@ -275,14 +283,14 @@ _infer_or_not_found(ctx::InferContext, request; kw...) = infer(ctx.sched, reques
 # applied to the response inside the timed region (the raw path encodes there), and `t0` lets a
 # caller start the clock before its own work (the raw path starts it before decoding). Every
 # failure leaves as a GRPCError carrying the status contract's code (`_grpc_status`), and the
-# status label counted is that same code.
+# status label counted is that same code. `cancelled` is the call's cancellation probe (see `infer`).
 function _handle_infer(
         ctx::InferContext, req, grpc_deadline_ns::Integer = 0;
-        finish = identity, t0::Float64 = time()
+        finish = identity, t0::Float64 = time(), cancelled = nothing
     )
     name = req.model_name
     try
-        resp = finish(_handle_infer_impl(ctx, req, grpc_deadline_ns))
+        resp = finish(_handle_infer_impl(ctx, req, grpc_deadline_ns; cancelled = cancelled))
         if ctx.metrics !== nothing
             observe_request!(ctx.metrics, name, time() - t0)
             inc_request!(ctx.metrics, name, "OK")
@@ -305,7 +313,9 @@ end
 # protobuf decode and encode run with the rest of the request on a default-pool task (see
 # `_offloaded`). Decoding a large request or encoding a large response is a copy of the tensor data,
 # and the first decode of the process compiles; neither belongs on the interactive thread.
-function _handle_infer_raw(ctx::InferContext, body::Vector{UInt8}, grpc_deadline_ns::Integer = 0)
+function _handle_infer_raw(
+        ctx::InferContext, body::Vector{UInt8}, grpc_deadline_ns::Integer = 0; cancelled = nothing
+    )
     t0 = time()
     req = try
         ProtoBuf.decode(ProtoBuf.ProtoDecoder(IOBuffer(body)), inference.ModelInferRequest)
@@ -313,7 +323,7 @@ function _handle_infer_raw(ctx::InferContext, body::Vector{UInt8}, grpc_deadline
         err isa OutOfMemoryError && rethrow()
         _invalid("malformed ModelInferRequest: " * sprint(showerror, err))
     end
-    return _handle_infer(ctx, req, grpc_deadline_ns; finish = _encode_message, t0 = t0)
+    return _handle_infer(ctx, req, grpc_deadline_ns; finish = _encode_message, t0 = t0, cancelled = cancelled)
 end
 
 function _encode_message(msg)
@@ -322,18 +332,18 @@ function _encode_message(msg)
     return take!(io)
 end
 
-function _handle_infer_impl(ctx::InferContext, req, grpc_deadline_ns::Integer = 0)
+function _handle_infer_impl(ctx::InferContext, req, grpc_deadline_ns::Integer = 0; cancelled = nothing)
     name = req.model_name
     isempty(name) && _invalid("ModelInferRequest.model_name is empty")
     meta = get_meta(ctx.registry, name)
-    meta === nothing || return _handle_meta_infer(ctx, meta, req, grpc_deadline_ns)
+    meta === nothing || return _handle_meta_infer(ctx, meta, req, grpc_deadline_ns; cancelled = cancelled)
     entry = get_model(ctx.registry, name)
     entry === nothing && _not_found("unknown model: $name")
     decoded = _as_invalid(() -> decode_infer_request(inference, req, ctx.shm))
     deadline_ns = _effective_deadline(decoded.request.deadline_ns, grpc_deadline_ns)
     request = InferRequest(name, decoded.request.requested_outputs, decoded.request.inputs, deadline_ns)
     _validate_inputs(entry, request)
-    outputs = _infer_or_not_found(ctx, request)
+    outputs = _infer_or_not_found(ctx, request; cancelled = cancelled)
     # Encoding rejects a requested output the model does not produce: a client mistake, so
     # surface it as INVALID_ARGUMENT (matching the codec's documented contract).
     return _as_encode_error(() -> encode_infer_response(inference, name, decoded, outputs, ctx.shm))
@@ -343,12 +353,12 @@ end
 # one-meta-at-a-time gate; its in-process sub-calls dispatch on the loop. Input validation reuses the
 # regular path (it reads only `manifest`, which MetaEntry also carries). A deadline bail and an
 # unknown or unloaded sub-model keep their types, and `_handle_infer` maps them as on the regular path.
-function _handle_meta_infer(ctx::InferContext, meta, req, grpc_deadline_ns::Integer = 0)
+function _handle_meta_infer(ctx::InferContext, meta, req, grpc_deadline_ns::Integer = 0; cancelled = nothing)
     decoded = _as_invalid(() -> decode_infer_request(inference, req, ctx.shm))
     deadline_ns = _effective_deadline(decoded.request.deadline_ns, grpc_deadline_ns)
     request = InferRequest(meta.name, decoded.request.requested_outputs, decoded.request.inputs, deadline_ns)
     _validate_inputs(meta, request)
-    outputs = _infer_or_not_found(ctx, request)
+    outputs = _infer_or_not_found(ctx, request; cancelled = cancelled)
     return _as_encode_error(() -> encode_infer_response(inference, meta.name, decoded, outputs, ctx.shm))
 end
 
@@ -411,6 +421,15 @@ package's per-direction caps).
 # with the status contract's code (`_with_status`).
 _offloaded(handler) = (ctx, req) -> off_interactive(() -> _with_status(() -> handler(ctx, req), ctx.method))
 
+# The ModelInfer RPC: raw bytes in and out (see `_handle_infer_raw`), offloaded like the rest. The
+# deadline is read here, on entry, as gRPCServer computes it, and the call's cancellation probe is
+# handed down to the wait for its result.
+function _model_infer_rpc(ctx, body)
+    deadline_ns = deadline_to_time_ns(ctx.deadline, gRPCServer.remaining_time(ctx))
+    cancelled = _CallCancelled(ctx)
+    return off_interactive(() -> _handle_infer_raw(ctx.payload, body, deadline_ns; cancelled = cancelled))
+end
+
 function build_grpc_server(
         sched::Scheduler, registry::ModelRegistry, platform::AbstractString,
         shm::SharedMemoryRegistry, host::AbstractString, port::Integer, ctx::InferContext;
@@ -444,15 +463,9 @@ function build_grpc_server(
         SystemSharedMemoryUnregister = _offloaded((ctx, req) -> _handle_shm_unregister(ctx.payload.shm, req.name)),
         IsSameIPCNamespace = _offloaded((ctx, req) -> _handle_is_same_ipc_namespace(req.name))
     )
-    # ModelInfer takes and returns raw bytes so its protobuf decode and encode are offloaded too. The
-    # deadline is read here, on entry, as gRPCServer computes it.
+    # ModelInfer takes and returns raw bytes so its protobuf decode and encode are offloaded too.
     inference.register_GRPCInferenceService_ModelInfer!(
-        server,
-        (ctx, body) -> begin
-            deadline_ns = deadline_to_time_ns(ctx.deadline, gRPCServer.remaining_time(ctx))
-            off_interactive(() -> _handle_infer_raw(ctx.payload, body, deadline_ns))
-        end;
-        raw_request = true, raw_response = true
+        server, _model_infer_rpc; raw_request = true, raw_response = true
     )
     register_control_service!(server)
     return server
