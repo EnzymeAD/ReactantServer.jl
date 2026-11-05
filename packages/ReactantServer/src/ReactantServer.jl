@@ -96,9 +96,13 @@ include("meta.jl")
 # ReactantServerCore) and top-level server. Worker Prometheus metrics are defined before grpc.jl
 # (InferContext holds a WorkerMetrics) and reuse the scheduler/observe snapshot functions above.
 include("transport/metrics.jl")
+include("transport/responsiveness.jl")   # the interactive-thread lag monitor
 include("transport/grpc.jl")
 include("transport/control_grpc.jl")
 include("server.jl")
+
+# Build-time workload over the request path (mock backend, no sockets); see the file.
+include("precompile.jl")
 
 export serve, serve_worker, stop!, register_model, register_meta_model
 export register_heartbeat!, register_serve_guard!

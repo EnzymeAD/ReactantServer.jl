@@ -95,13 +95,15 @@ end
 # Register the ControlService handlers on an existing gRPC server (the inference server),
 # reusing the InferContext payload so both services share the scheduler.
 function register_control_service!(server::gRPCServer.GRPCServer)
+    # Every control RPC takes the scheduler lock or does residency work, so none runs on the
+    # interactive thread (see `_offloaded`).
     register_ControlService!(
         server;
-        ModelControlStatus = (ctx, req) -> _handle_model_control_status(ctx.payload),
-        SetModelResidency = (ctx, req) -> _handle_set_model_residency(ctx.payload, req),
-        SetModelPolicy = (ctx, req) -> _handle_set_model_policy(ctx.payload, req),
-        CompactMemory = (ctx, req) -> _handle_compact_memory(ctx.payload, req),
-        DescribeModels = (ctx, req) -> _handle_describe_models(ctx.payload, req)
+        ModelControlStatus = _offloaded((ctx, req) -> _handle_model_control_status(ctx.payload)),
+        SetModelResidency = _offloaded((ctx, req) -> _handle_set_model_residency(ctx.payload, req)),
+        SetModelPolicy = _offloaded((ctx, req) -> _handle_set_model_policy(ctx.payload, req)),
+        CompactMemory = _offloaded((ctx, req) -> _handle_compact_memory(ctx.payload, req)),
+        DescribeModels = _offloaded((ctx, req) -> _handle_describe_models(ctx.payload, req))
     )
     return server
 end

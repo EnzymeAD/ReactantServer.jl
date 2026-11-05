@@ -172,11 +172,14 @@ end
                 @ccall gc_safe = true usleep(50_000::Cuint)::Cint
             end
         )
-        # The worst lateness of a 10 ms timer on the default pool while `f` runs on the interactive pool.
+        # The worst lateness of a 10 ms timer on the interactive pool while `f` runs there. The timer
+        # shares the interactive thread with `f`, so it measures exactly what must stay free; on the
+        # default pool it would share a thread with the offloaded work itself whenever that pool has
+        # one thread (Julia 1.12's default without --threads), and be starved by design.
         function worst_lag(f)
             done = Threads.Atomic{Bool}(false)
             worst = Threads.Atomic{Float64}(0.0)
-            hb = Threads.@spawn :default while !done[]
+            hb = Threads.@spawn :interactive while !done[]
                 t = time()
                 sleep(0.01)
                 Threads.atomic_max!(worst, time() - t - 0.01)
@@ -232,9 +235,11 @@ end
         S.sched = ReactantServer.ModelSchedState("S", ReactantServer.ModelSchedConfig(1.0), 0.0)
         ReactantServer.start!(sched)
         try
+            # The timer runs on the interactive thread, beside the dispatch loop, which is what must
+            # stay free; the offloaded run may well occupy the only default-pool thread.
             done = Threads.Atomic{Bool}(false)
             worst = Threads.Atomic{Float64}(0.0)
-            hb = Threads.@spawn :default while !done[]
+            hb = Threads.@spawn :interactive while !done[]
                 t = time()
                 sleep(0.01)
                 Threads.atomic_max!(worst, time() - t - 0.01)

@@ -113,4 +113,7 @@ export deadline_to_time_ns
 export encode_infer_request, encode_infer_request_shm, decode_infer_response
 export deadline_params, TIMEOUT_NS_PARAM
 
+# Build-time workload over node and manifest parsing; see the file.
+include("precompile.jl")
+
 end # module ReactantServerCore

@@ -62,6 +62,7 @@ include("lpt_packing.jl")
 include("server.jl")
 include("control_service.jl")   # the gateway's own GatewayControlService handlers
 include("health.jl")
+include("responsiveness.jl")   # the event-loop lag monitor
 
 """
     RunningGateway
@@ -78,6 +79,7 @@ struct RunningGateway{S}
     metrics::GatewayMetrics
     admin::AdminServer
     prober::HealthProber
+    monitor::LoopMonitor
     server::S          # the gRPC server handle (GRPCServer)
 end
 
@@ -145,6 +147,9 @@ function serve_gateway(gateway_path::Union{AbstractString, Nothing} = nothing; b
     end
     metrics = GatewayMetrics(name_by_url)
     register_process_metrics!(metrics)
+    # Measure the event loop from the start, so a stall during startup (compilation, the initial
+    # discovery) is recorded too.
+    monitor = start_loop_monitor!(LoopMonitor(metrics))
     refresher = RouteRefresher(pool, routes, metrics)
     # Build the gateway scheduler for the configured mode and run its startup hook before anything
     # else starts: lpt_packing verifies hard preconditions (all workers reachable, FIFO discipline,
@@ -190,7 +195,7 @@ function serve_gateway(gateway_path::Union{AbstractString, Nothing} = nothing; b
         return nothing
     end
     gRPCServer.start!(server)
-    return RunningGateway(cfg, pool, routes, gate, metrics, admin, prober, server)
+    return RunningGateway(cfg, pool, routes, gate, metrics, admin, prober, monitor, server)
 end
 
 """
@@ -202,6 +207,7 @@ halt the readiness prober, and close the admin HTTP server.
 function stop!(g::RunningGateway)
     close(g.server)
     stop_prober!(g.prober)
+    stop_loop_monitor!(g.monitor)
     close(g.admin.server)
     close_pool!(g.pool)
     return nothing
@@ -238,5 +244,8 @@ function probe_worker_ready(node_path::AbstractString, worker::Union{AbstractStr
 end
 
 export serve_gateway, probe_worker_ready
+
+# Build-time workload: the real gateway against an in-process mock worker; see the file.
+include("precompile.jl")
 
 end # module ReactantServerGateway

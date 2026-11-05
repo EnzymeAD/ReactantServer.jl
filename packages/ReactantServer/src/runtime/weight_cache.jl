@@ -256,9 +256,16 @@ upload, held for seconds) stops the whole worker from handling requests, health 
 Waiting on a task instead yields that thread for the duration. The caller still waits, so the work
 stays serialized exactly as before: the dispatch loop remains the only task mutating residency. An
 error is rethrown as itself, not wrapped, so callers still see `AdmissionError` and the like.
+
+Compiling `off_interactive` for a new `f` does not compile `f` on the calling thread: the in-place
+branch calls `f` through an inference barrier, so type inference does not follow it from here, and
+`f` is compiled where it first runs (on the default-pool task, when called from the interactive
+thread). Without the barrier, the first call of a request handler wrapped in `off_interactive`
+inferred the whole request path on the interactive thread, seconds of work for the first request
+of a process.
 """
 function off_interactive(f)
-    Threads.threadpool() === :interactive || return f()
+    Threads.threadpool() === :interactive || return Base.inferencebarrier(f)()
     t = Threads.@spawn :default f()
     try
         return fetch(t)

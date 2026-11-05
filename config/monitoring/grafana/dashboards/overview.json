@@ -2068,7 +2068,7 @@
       },
       "id": 28,
       "panels": [],
-      "title": "Readiness",
+      "title": "Readiness and responsiveness",
       "type": "row"
     },
     {
@@ -2121,7 +2121,7 @@
       },
       "gridPos": {
         "h": 6,
-        "w": 12,
+        "w": 8,
         "x": 0,
         "y": 43
       },
@@ -2208,8 +2208,8 @@
       },
       "gridPos": {
         "h": 6,
-        "w": 12,
-        "x": 12,
+        "w": 8,
+        "x": 8,
         "y": 43
       },
       "id": 30,
@@ -2244,6 +2244,102 @@
       ],
       "title": "Worker metrics answering",
       "type": "state-timeline"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "description": "How often each responsiveness monitor woke. A free thread ticks 10 times a second; fewer means it was held by other work (a blocking call, code compiling on first use) and every request, probe and scrape on it waited. Gateway: its single event loop. Workers: the interactive thread request handling shares with the dispatch loop.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "mappings": [],
+          "max": 11,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 9
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 43
+      },
+      "id": 31,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "expr": "sum(rate(gateway_event_loop_lag_seconds_count{job=~'$job',worker=''}[$__rate_interval]))",
+          "format": "time_series",
+          "instant": false,
+          "legendFormat": "gateway",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "expr": "sum by (worker) (rate(worker_interactive_lag_seconds_count{worker=~'$worker'}[$__rate_interval]))",
+          "format": "time_series",
+          "instant": false,
+          "legendFormat": "{{worker}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Responsiveness monitor tick rate",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",

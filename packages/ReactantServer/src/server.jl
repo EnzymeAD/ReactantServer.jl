@@ -22,6 +22,7 @@ struct RunningServer
     port::Int
     watcher::Union{BundleWatcher, Nothing}
     metrics_server::Any        # HTTP metrics listener, or nothing when metrics_port == 0
+    monitor::InteractiveMonitor
 end
 
 # ── Heartbeat registration ──────────────────────────────────────────────────────────────────────
@@ -106,6 +107,7 @@ dispatch loop, and tears down any registered shared-memory regions. Returns `not
 """
 function stop!(s::RunningServer)
     s.watcher === nothing || stop_watching!(s.watcher)
+    stop_interactive_monitor!(s.monitor)
     s.metrics_server === nothing || close(s.metrics_server)
     close(s.server)
     shutdown!(s.scheduler)
@@ -380,11 +382,25 @@ function _meta_concurrency()
     return max(1, n)
 end
 
+# /readyz for the metrics listener: ready once every loaded model is compiled, the ServerReady rule.
+# A named callable rather than a closure so the precompile workload can start the listener with this
+# exact type; HTTP.jl specializes the listener's code on the handler, and through it on this.
+struct _RegistryReady
+    registry::ModelRegistry
+end
+function (r::_RegistryReady)()
+    es = values(r.registry.by_name)
+    return (!isempty(es) || !isempty(r.registry.meta)) && all(e -> e.executable !== nothing, es)
+end
+
 function serve(
         cfg::ServerConfig; backend::AbstractBackend = ReactantBackend(), blocking::Bool = true,
         worker_name::AbstractString = ""
     )
     _check_serve_guards(cfg)
+    # Count JIT time from here on (julia_compile_seconds_total), so model loading, the startup probe
+    # and each model's first requests all show up.
+    enable_compile_timing!()
     shm = SharedMemoryRegistry()   # client-facing SystemSharedMemory feature (decode/encode shm path)
     pool, registry, sched, watcher = _bring_up(cfg, backend)
     # Local reuse pool for meta-model intermediates: plain Memory, never shared. With one meta at a time
@@ -414,18 +430,16 @@ function serve(
         sched, backend, pool, cfg; worker_name = worker_name,
         inflight = inflight, shed = shed
     )
+    # Measure the interactive thread from here on: it is the one request handling shares with dispatch.
+    monitor = start_interactive_monitor!(InteractiveMonitor(metrics.registry))
     server.context = InferContext(sched, registry, shm, pool.platform, metrics)   # swap before start!
     # Optional Prometheus metrics endpoint (opt-in via endpoints.metrics_port > 0). Request counting
     # is always on (the InferContext carries `metrics`); only the HTTP listener is gated.
     metrics_server = nothing
     if cfg.endpoints.metrics_port > 0
-        ready_fn = () -> (
-            es = values(registry.by_name);
-            (!isempty(es) || !isempty(registry.meta)) && all(e -> e.executable !== nothing, es)
-        )
         metrics_server = start_worker_metrics(
             metrics, cfg.endpoints.host, cfg.endpoints.metrics_port;
-            ready_fn = ready_fn, worker_name = worker_name, gpu = _gpu_identity(cfg)
+            ready_fn = _RegistryReady(registry), worker_name = worker_name, gpu = _gpu_identity(cfg)
         )
     end
     @info "Starting gRPC server" host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests models = model_names(registry)
@@ -434,11 +448,12 @@ function serve(
         try
             run(server)
         finally
+            stop_interactive_monitor!(monitor)
             _beat(:down, cfg)
         end
         return nothing
     end
     gRPCServer.start!(server)
     _beat(:up, cfg)
-    return RunningServer(cfg, registry, sched, pool, shm, server, cfg.endpoints.port, watcher, metrics_server)
+    return RunningServer(cfg, registry, sched, pool, shm, server, cfg.endpoints.port, watcher, metrics_server, monitor)
 end
