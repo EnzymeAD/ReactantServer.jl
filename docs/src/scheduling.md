@@ -320,19 +320,21 @@ A fleet with coalescing off should prefer `routing_fill_mode: spread`; see
 
 ## Cost learning
 
-The scheduler measures the real GPU time of each execution and refines a per-batch-size cost
-estimate with an exponential moving average (`cost_ema_alpha`, default 0.2). The estimate
-initializes to the first measurement, so it converges immediately rather than drifting up from
-zero. It feeds the `edf` laxity check, and decides which programs are long enough (50 ms or more,
+The scheduler measures the real GPU time of each execution and refines a cost estimate for each
+compiled program, that is for each input-shape variant and batch size of a model, with an
+exponential moving average (`cost_ema_alpha`, default 0.2). Variants are kept apart because they
+can differ in cost far more than batch sizes do (a detector's aspect ratios, say), and one
+variant's cost says nothing about another's. The estimate initializes to the first measurement, so
+it converges immediately rather than drifting up from zero. It feeds the `edf` laxity check, and decides which programs are long enough (50 ms or more,
 or not yet measured) to run off the dispatch loop's thread so they do not hold up request intake.
 The fair discipline does not use it: it charges each dispatch the time it was measured to take.
 
 Two things keep the estimate honest:
 
-- **Warmup seeds it.** At startup, under the fair discipline, each compiled size is run once on
-  zero-filled inputs and the measured time becomes the estimate. Failures are non-fatal: the
-  default cost covers any unseeded (model, batch size) pair until the first real dispatch
-  measures it. When the weight cache is enabled with auto-sizing, the startup isolation
+- **Warmup seeds it.** At startup, under the fair discipline, each compiled variant and size is
+  run once on zero-filled inputs and the measured time becomes its estimate. Failures are
+  non-fatal: the default cost covers any unseeded program until the first real dispatch measures
+  it. When the weight cache is enabled with auto-sizing, the startup isolation
   probe doubles as this warmup.
 - **Weight load time is excluded.** The measured `compute_time` covers only the model execution,
   not the on-demand weight load that preceded it, so the estimate reflects steady-state
@@ -419,7 +421,7 @@ global:
     ema_halflife_seconds: 30.0     # half-life of the reported recent-compute EMA (no scheduling effect)
     recency_penalty_cap: 0.25      # accepted for compatibility; no effect
     coalescing_discount: 0.10      # accepted for compatibility; no effect
-    cost_ema_alpha: 0.2            # smoothing for the learned per-batch-size cost (edf laxity)
+    cost_ema_alpha: 0.2            # smoothing for the learned per-program cost (edf laxity)
     max_queue_depth: 1024          # per-model queue cap; a full model rejects new requests
     dispatch_timeout_seconds: 30.0 # longest a caller waits for its result; 0 = no limit
     compaction_interval: 0         # worker-local memory compaction every N on-demand loads

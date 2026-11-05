@@ -71,12 +71,76 @@ end
 
 @testset "cost estimate converges toward measurement" begin
     st = ModelSchedState("m", ModelSchedConfig(1.0), 0.0)
-    _update_cost!(st, 1, 0.04, 0.2)          # first measurement seeds the estimate
-    @test st.cost_estimate[1] == 0.04
+    v = ReactantServer.VariantKey()
+    _update_cost!(st, v, 1, 0.04, 0.2)          # first measurement seeds the estimate
+    @test st.cost_estimate[(v, 1)] == 0.04
     for _ in 1:50
-        _update_cost!(st, 1, 0.01, 0.2)
+        _update_cost!(st, v, 1, 0.01, 0.2)
     end
-    @test st.cost_estimate[1] ≈ 0.01 atol = 1.0e-3
+    @test st.cost_estimate[(v, 1)] ≈ 0.01 atol = 1.0e-3
+end
+
+# A model compiled at batch size 1 for two input shapes: input "img" is (w, h, n) with w and h
+# variable, so the variant key is [w, h]. Each variant's program sleeps for its own time, so the two
+# cost different amounts at the same batch size, as a detector's aspect ratios do.
+function _sched_ms_entry(name, seconds::Dict{Vector{Int}, Float64})
+    dims = Dim[Dim(ReactantServer.VARIABLE), Dim(ReactantServer.VARIABLE), Dim(BATCH)]
+    manifest = Manifest(
+        "2.0", name, "", TensorSpec[TensorSpec("img", F32, dims, 3)], TensorSpec[TensorSpec("y", F32, dims, 3)],
+        nothing, nothing, BatchingSpec(Int[1]), Provenance(Dict{String, Any}()),
+        2, "model", String[], collect(keys(seconds))
+    )
+    sig = ModelSignature(["img"], DataType[Float32], String[], 1, ["y"], DataType[Float32], 2, [("img", 1), ("img", 2)])
+    execs = Dict{ReactantServer.VariantKey, Dict{Int, Any}}(
+        v => Dict{Int, Any}(1 => ReactantServer.MockExecutable(args -> (sleep(c); [args[1]]), 1))
+            for (v, c) in seconds
+    )
+    return ModelEntry(name, manifest, Dict{Int, Vector{UInt8}}(), "", nothing, LoadedModel(sig, execs, Any[]), nothing, identity, identity)
+end
+
+function _ms_qr(name, w, h; deadline_ns = 0)
+    req = InferRequest(name, ["y"], [NamedTensor("img", zeros(Float32, w, h, 1))], Int64(deadline_ns))
+    return QueuedRequest(req, req.inputs, time(), Channel{Any}(1))
+end
+
+@testset "cost estimates are kept per (shape variant, batch size)" begin
+    # Before (SCH-10) the estimate was keyed by batch size alone: warmup let the last variant it ran
+    # overwrite the others, and one variant's dispatches set the cost every variant was judged by.
+    small, large = [2, 3], [4, 2]
+    e = _sched_ms_entry("ms", Dict(small => 0.0, large => 0.25))
+    s = _empty_sched()
+    _install!(s, e, ModelSchedState("ms", ModelSchedConfig(1.0), 0.0))
+    st = e.sched
+    ReactantServer._warmup_entry!(s, e)
+    @test st.cost_estimate[(large, 1)] >= 0.25
+    @test st.cost_estimate[(small, 1)] < 0.25
+    @test !haskey(st.cost_estimate, (ReactantServer.VariantKey(), 1))
+
+    # The choice to run a program off the interactive thread reads that program's own estimate.
+    st.cost_estimate[(small, 1)] = 0.001
+    st.cost_estimate[(large, 1)] = 1.0
+    @test !ReactantServer._offload_execution(st, small, 1)
+    @test ReactantServer._offload_execution(st, large, 1)
+    @test ReactantServer._offload_execution(st, [9, 9], 1)        # never measured: could be long
+
+    # Under EDF, a small-shape request is judged by the small program's cost: two dispatches of the
+    # slow shape (0.25 s each) do not make a 0.1 s budget look infeasible for the fast one.
+    s2 = _empty_sched(; discipline = ReactantServer.EDF)
+    e2 = _sched_ms_entry("ms2", Dict(small => 0.0, large => 0.25))
+    _install!(s2, e2, ModelSchedState("ms2", ModelSchedConfig(1.0), 0.0))
+    for _ in 1:2
+        qr = _ms_qr("ms2", 4, 2)
+        push!(e2.sched.queue, qr)
+        ReactantServer.execute_and_record!(s2, select_dispatch!(s2, 0.0))
+        @test !(take!(qr.reply) isa Exception)
+    end
+    @test haskey(e2.sched.cost_estimate, (large, 1))
+    qr = _ms_qr("ms2", 2, 3; deadline_ns = Int64(time_ns()) + 100_000_000)
+    push!(e2.sched.queue, qr)
+    ReactantServer.execute_and_record!(s2, select_dispatch!(s2, 0.0))
+    out = take!(qr.reply)
+    @test !(out isa Exception)
+    @test size(only(out).data) == (2, 3, 1)
 end
 
 @testset "plan_batch coalescing rules" begin
@@ -514,14 +578,12 @@ end
     now = 1000.0
     # "hot" would dominate on fairness, but FIFO ignores fairness and serves the oldest arrival.
     hot = ModelSchedState("hot", ModelSchedConfig(1.0), now)
-    hot.recent_compute_ema = 0.0
-    hot.cost_estimate[1] = 0.001
+    hot.vtime = 0.0
     push!(hot.queue, _qr("hot"; arrival = now))                        # newer
     _install!(s, _sched_entry("hot", [1]; coalescable = false), hot)
 
     old = ModelSchedState("old", ModelSchedConfig(1.0), now)
-    old.recent_compute_ema = 100.0
-    old.cost_estimate[1] = 1.0
+    old.vtime = 100.0
     push!(old.queue, _qr("old"; arrival = now - 1.0))                  # older arrival wins under FIFO
     _install!(s, _sched_entry("old", [1]; coalescable = false), old)
 

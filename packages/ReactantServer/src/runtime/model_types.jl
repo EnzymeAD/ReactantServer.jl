@@ -98,6 +98,11 @@ LoadedModel(
 ) =
     LoadedModel(sig, _as_variant_execs(execs), weights, state, Int(nbytes), host_weights)
 
+# A cost estimate's key: the input-shape variant and the compiled batch size (0 = unbatched) of one
+# compiled program. Variants of one model can differ in cost by far more than batch sizes do (a
+# detector's aspect ratios), so an estimate keyed by batch size alone mixes them.
+const CostKey = Tuple{VariantKey, Int}
+
 # Per-model scheduler state. `vtime` orders the fair discipline; the cost estimate feeds the EDF
 # laxity check and the choice to run a long program off the interactive thread; the recent-compute
 # EMA is reported for observability and does not affect scheduling. The EMA fields are always
@@ -111,7 +116,7 @@ mutable struct ModelSchedState
     vtime::Float64                        # fair discipline: device seconds charged / weight (see `_select_fair!`)
     recent_compute_ema::Float64
     ema_last_update::Float64
-    cost_estimate::Dict{Int, Float64}      # batch size -> estimated GPU time (seconds)
+    cost_estimate::Dict{CostKey, Float64}  # (variant, batch size) -> estimated GPU time (seconds)
     # observability
     dispatch_count::Int                   # coalesced batch executions
     requests_served::Int                  # individual requests served (>= dispatch_count under coalescing)
@@ -132,7 +137,7 @@ end
 function ModelSchedState(name::AbstractString, mc::ModelSchedConfig, now::Float64)
     return ModelSchedState(
         String(name), mc.weight, mc.max_batch_size, QueuedRequest[],
-        0.0, 0.0, now, Dict{Int, Float64}(), 0, 0, 0, 0.0, Float64[], Dict{Int, Int}(),
+        0.0, 0.0, now, Dict{CostKey, Float64}(), 0, 0, 0, 0.0, Float64[], Dict{Int, Int}(),
         :none, nothing, nothing
     )
 end

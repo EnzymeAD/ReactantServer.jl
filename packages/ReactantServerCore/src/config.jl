@@ -338,7 +338,7 @@ half-life of the per-model recent-compute moving average the worker reports, whi
 schedules by; `recency_penalty_cap` and `coalescing_discount` are accepted and validated for
 compatibility but have no effect, since the fair discipline charges measured device time rather
 than ranking by a clamped recency deficit over a discounted cost; `cost_ema_alpha` is the
-smoothing factor for the learned per-batch-size cost;
+smoothing factor for the learned cost of each compiled program (shape variant and batch size);
 `max_queue_depth` caps each model's queue independently (a full model rejects new requests
 without affecting admission for the others); `dispatch_timeout_seconds` is the per-request
 execution timeout, how long a request may wait for its result from submission (queueing and
