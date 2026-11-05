@@ -14,4 +14,5 @@ const ReactantServer = ReactantServerCore
     include("test_codec.jl")
     include("test_buffer_pool.jl")
     include("test_weight_store.jl")
+    include("test_drain.jl")
 end

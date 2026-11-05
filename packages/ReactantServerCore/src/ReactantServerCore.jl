@@ -39,6 +39,9 @@ include("node.jl")
 # The text of an error status, as the worker and the gateway send it.
 include("status_message.jl")
 
+# Cooperative drain requests for a blocking worker or gateway (the supervisor's stop protocol).
+include("drain.jl")
+
 # Server-side shared-memory registry and the wire <-> boundary codec.
 include("shared_memory.jl")
 include("codec.jl")
@@ -103,6 +106,9 @@ export build_config, validate_config, apply_env_overrides!, log_effective_config
 # ---- node ----
 export load_node, load_node_raw, validate_node, worker_names, worker_raw_config, node_server_config
 export node_gpus, materialize_node!
+
+# ---- drain ----
+export request_drain!
 
 # ---- shared-memory registry ----
 export ShmRegion, SharedMemoryRegistry, shm_register!, shm_unregister!, shm_read, shm_write!
