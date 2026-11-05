@@ -1,11 +1,11 @@
 # Scheduling & Coalescing
 
 The worker's scheduler decides which model runs next whenever the GPU is free, and how many
-queued requests one execution should serve. It is a deficit-weighted, cost-aware, coalescing
-dispatch engine: concurrent requests land on per-model queues, a single dispatch loop runs
-exactly one GPU execution at a time, same-model requests are merged into one batched execution
-at a compiled size, and GPU time is shared by relative model weight and a learned per-batch-size
-cost estimate. It holds the model registry, the backend, the device memory pool, the
+queued requests one execution should serve. It is a weighted-fair, coalescing dispatch engine:
+concurrent requests land on per-model queues, a single dispatch loop runs exactly one GPU
+execution at a time, same-model requests are merged into one batched execution at a compiled
+size, and GPU time is shared by relative model weight, each model charged the device time it is
+measured to use. It holds the model registry, the backend, the device memory pool, the
 [`SchedulerConfig`](@ref), per-model dispatch state, and the optional weight cache.
 Submit work with `ReactantServer.infer` and read observability counters with
 `ReactantServer.scheduler_metrics`.
@@ -52,10 +52,10 @@ in parallel and overlaps the single, serialized GPU execution: while the loop ru
 the GPU, other requests are being pre/post-processed on other threads.
 
 A single `Threads.Condition` guards all mutable scheduler state (the per-model queues and the
-EMA/cost fields) and signals the dispatch loop when work arrives. The loop holds the lock only
-to select and dequeue; the actual execution runs outside the lock, so producers keep enqueuing
-during GPU work, and the lock is re-taken briefly afterwards to record the dispatch. Only one
-execution runs at a time by design, which keeps memory and concurrency reasoning simple.
+virtual-time, EMA and cost fields) and signals the dispatch loop when work arrives. The loop holds
+the lock only to select and dequeue; the actual execution runs outside the lock, so producers keep
+enqueuing during GPU work, and the lock is re-taken briefly afterwards to record the dispatch. Only
+one execution runs at a time by design, which keeps memory and concurrency reasoning simple.
 
 ### The dispatch loop runs on its own thread
 
@@ -114,8 +114,8 @@ Each time the GPU frees up, the scheduler decides in this order:
    discipline scan, at most one per in-flight meta, so a meta already in progress is not stalled
    behind newly arrived work.
 2. **Otherwise select the next model**, according to the configured `discipline`: `fair`
-   (deficit-weighted and cost-aware, the default), `fifo` (oldest queued request), or `edf`
-   (soonest deadline).
+   (the least device time used for its weight, the default), `fifo` (oldest queued request), or
+   `edf` (soonest deadline).
 3. **Coalesce the winner.** The selected model's queued requests are taken in FIFO order and
    packed into the largest compiled batch size that fits, padding a partial batch up to the
    smallest size when needed and always making forward progress on at least the oldest request.
@@ -128,22 +128,57 @@ whichever model wins, its queue is coalesced in FIFO order.
 
 ### fair (default)
 
-Each model has a relative `weight` that defines its share of compute:
-`share = weight / sum(weights)`. The scheduler tracks a decaying exponential moving average
-of how much GPU time each model has recently consumed (decayed to "now" with a half-life of
-`ema_halflife_seconds` before every read or write), and scores every model with a non-empty
-queue by how far below its share it is, divided by its estimated cost:
+Each model has a relative `weight` (default 1.0), and the models that have work queued share the
+device's time in proportion to their weights. The scheduler does this with start-time fair queueing
+over measured device time:
 
-```text
-priority = clamp(share - recent_compute_ema, -cap, cap) / effective_cost
-```
+- Every dispatch charges its model the time it held the dispatch loop (the measured execution, plus
+  any on-demand weight upload that preceded it) divided by the model's weight. The running total
+  is the model's virtual time.
+- When the device frees up, the model with queued work and the least virtual time is dispatched
+  next. Ties go to the model with the oldest queued request, then to the lower name.
+- A model that joins the competition (it was idle, is newly loaded, or was waiting for its weights
+  to be read into host memory) starts at the virtual time of the most recent dispatch, never below
+  it. It neither banks credit for the time it was away nor pays for capacity it used while it ran
+  alone.
 
-A model that has consumed less than its share recently scores higher. Dividing by cost stops an
-expensive model from blocking cheaper ones on a marginal fairness edge. The clamp
-(`recency_penalty_cap`, default 0.25) bounds both lockout and domination: a quiet model cannot
-run away with the worker, and a saturated one cannot be starved entirely. When every model's
-recent-compute EMA is zero (quiet or newly loaded models), the deficit equals the share, so those
-models stay schedulable rather than normalizing to zero.
+The discipline is work-conserving: only models with queued work compete, so a model alone in the
+queue is always served, however much it used before. Because each dispatch is charged its measured
+time, differences in cost between models are accounted for exactly: a 1 ms model and a 100 ms model
+of equal weight each get half of the device while both are busy, the cheap one in many short
+dispatches. Batch size is accounted for the same way: a coalesced dispatch is charged its measured
+time at the compiled size, padding included.
+
+**Guarantees.** Let `C_i` be model `i`'s longest single dispatch and `w_i` its weight, and let `S`
+be the total weight of the models with work queued. While model `i` has work queued:
+
+- Its wait for its next dispatch is at most `sum over j != i of (C_j + (w_j / w_i) * C_i)`: one
+  dispatch of each other model, plus the time the others need to catch up with `i`'s own last
+  charge.
+- Over a stretch of `T` seconds it receives at least
+  `(w_i / S) * T - (w_i / S) * sum over j != i of ((w_j / w_i) * C_i + C_j)` seconds of device
+  time: its share, less about one dispatch per competing model.
+- For any two models `i` and `j` that both stay backlogged, the device times `W_i` and `W_j` they
+  receive satisfy `|W_i / w_i - W_j / w_j| <= C_i / w_i + C_j / w_j`, whatever either did before.
+
+The bounds have limits worth knowing:
+
+- They cover only the dispatch-loop time the discipline controls. A committed meta sub-call runs
+  ahead of the discipline (it is charged to its sub-model afterwards, so the sub-model pays for it
+  in later contention), and control commands (residency changes, hot loads, compaction), a weight
+  upload whose dispatch then fails, and anything else that holds the loop uncharged come out of
+  every model's share.
+- Selection does not consider the size of the dispatch about to run, so the lag above is up to one
+  dispatch at the model's largest compiled batch; `max_batch_size` bounds it.
+- Dispatches are not preemptible, so a model with a long program delays every other model by up
+  to that program's length; `C_i` in the wait bound is the longest dispatch of each model.
+- Shares are relative to the models with work queued, not to every loaded model: the share of an
+  idle model goes to the busy ones and cannot be reclaimed later.
+
+`recency_penalty_cap` and `coalescing_discount`, the knobs of the recency-deficit ranking this
+discipline replaced, are still accepted and validated so existing node files load unchanged, but
+they have no effect. `ema_halflife_seconds` now only sets the half-life of the recent-compute moving
+average that `ReactantServer.scheduler_metrics` reports.
 
 ### fifo
 
@@ -277,35 +312,32 @@ queued, which is what a validated deployment needs; see
 [Reproducibility & Regulated Use](reproducibility.md). A client's own pre-batched request still runs
 as one dispatch, and an oversize request is still split into pieces, each of which runs alone.
 
-The cost is the throughput lever above: concurrent requests to a model are served one dispatch each,
-and `coalescing_discount` has no effect. The gateway does not yet know whether its workers coalesce,
-so under `lpt_packing` it still concentrates a model's requests on one replica at a time to feed
-coalescing that no longer happens. A fleet with coalescing off should prefer
-`routing_fill_mode: spread`; see [Multi-GPU Gateway](gateway.md).
+The cost is the throughput lever above: concurrent requests to a model are served one dispatch each.
+The gateway does not yet know whether its workers coalesce, so under `lpt_packing` it still
+concentrates a model's requests on one replica at a time to feed coalescing that no longer happens.
+A fleet with coalescing off should prefer `routing_fill_mode: spread`; see
+[Multi-GPU Gateway](gateway.md).
 
 ## Cost learning
 
 The scheduler measures the real GPU time of each execution and refines a per-batch-size cost
 estimate with an exponential moving average (`cost_ema_alpha`, default 0.2). The estimate
 initializes to the first measurement, so it converges immediately rather than drifting up from
-zero. It feeds the fair discipline (the cost divisor, so an expensive model does not crowd out
-cheaper ones on a marginal fairness edge) and the `edf` laxity check.
+zero. It feeds the `edf` laxity check, and decides which programs are long enough (50 ms or more,
+or not yet measured) to run off the dispatch loop's thread so they do not hold up request intake.
+The fair discipline does not use it: it charges each dispatch the time it was measured to take.
 
 Two things keep the estimate honest:
 
 - **Warmup seeds it.** At startup, under the fair discipline, each compiled size is run once on
   zero-filled inputs and the measured time becomes the estimate. Failures are non-fatal: the
   default cost covers any unseeded (model, batch size) pair until the first real dispatch
-  measures it. While every candidate is unseeded they all share the default, so the deficit term
-  decides. When the weight cache is enabled with auto-sizing, the startup isolation
+  measures it. When the weight cache is enabled with auto-sizing, the startup isolation
   probe doubles as this warmup.
 - **Weight load time is excluded.** The measured `compute_time` covers only the model execution,
   not the on-demand weight load that preceded it, so the estimate reflects steady-state
-  (resident) execution rather than cold-call latency.
-
-Coalescing is also priced fairly: a `coalescing_discount` (default 0.10) is applied to the
-effective cost of a coalesced batch, so a larger dispatch is not penalized for being larger when
-it competes against an unbatched one.
+  (resident) execution rather than cold-call latency. The fair discipline still charges the
+  load to the model, since it held the dispatch loop.
 
 ## Per-model configuration
 
@@ -381,10 +413,10 @@ The `scheduler:` block in the node file maps to [`SchedulerConfig`](@ref), and e
 global:
   scheduler:
     discipline: fair               # fair | fifo | edf (fair is the default)
-    ema_halflife_seconds: 30.0     # fair: half-life of the recent-compute EMA
-    recency_penalty_cap: 0.25      # fair: clamp on the share-vs-EMA deficit
-    coalescing_discount: 0.10      # fair: cost discount applied to coalesced batches
-    cost_ema_alpha: 0.2            # fair/edf: smoothing for the learned per-batch-size cost
+    ema_halflife_seconds: 30.0     # half-life of the reported recent-compute EMA (no scheduling effect)
+    recency_penalty_cap: 0.25      # accepted for compatibility; no effect
+    coalescing_discount: 0.10      # accepted for compatibility; no effect
+    cost_ema_alpha: 0.2            # smoothing for the learned per-batch-size cost (edf laxity)
     max_queue_depth: 1024          # per-model queue cap; a full model rejects new requests
     dispatch_timeout_seconds: 30.0 # longest a caller waits for its result; 0 = no limit
     compaction_interval: 0         # worker-local memory compaction every N on-demand loads

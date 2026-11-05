@@ -1,4 +1,4 @@
-# The scheduler: a deficit-weighted, cost-aware, coalescing dispatch policy.
+# The scheduler: a weighted-fair, coalescing dispatch policy.
 #
 # Requests arrive concurrently and are placed in per-model queues. Whenever the GPU is free
 # the scheduler decides which model to dispatch next, coalesces that model's queued requests
@@ -7,9 +7,9 @@
 # its own threading. Only one execution runs at a time by design.
 #
 # Decision order each time the GPU frees up:
-#   1. Score every model with a non-empty queue by a deficit-weighted, cost-aware
-#      priority and pick the highest (or, under the FIFO discipline, pick the model
-#      with the oldest queued request).
+#   1. Pick the model with a non-empty queue that has been charged the least device time
+#      for its weight (or, under the FIFO discipline, the model with the oldest queued
+#      request; under EDF, the soonest deadline).
 #   2. Coalesce the selected model's queued requests (FIFO) into one compiled-batch-size
 #      dispatch; the remainder stays queued.
 #
@@ -17,13 +17,13 @@
 # they are not implemented.
 #
 # A single Threads.Condition guards all mutable scheduler state (the per-model queues and the
-# EMA/cost fields) and signals the dispatch loop when work arrives. The loop holds the lock
-# only to select and dequeue; the actual execution runs outside the lock so producers keep
-# enqueuing during GPU work, then the lock is re-taken briefly to record the dispatch.
+# virtual-time, EMA and cost fields) and signals the dispatch loop when work arrives. The loop
+# holds the lock only to select and dequeue; the actual execution runs outside the lock so
+# producers keep enqueuing during GPU work, then the lock is re-taken briefly to record the
+# dispatch.
 
-# Effective cost used for scoring when a (model, batch size) pair has no measurement yet. The
-# absolute value does not matter: while every candidate is unseeded they share it, so the
-# deficit term decides. Warmup normally seeds real values before traffic arrives.
+# Cost the EDF laxity check assumes for a (model, batch size) pair with no measurement yet. Warmup
+# normally seeds real values before traffic arrives.
 const _DEFAULT_COST = 0.01            # seconds
 const _WAIT_SAMPLE_CAP = 1024         # bounded ring of recent queue-wait samples per model
 
@@ -89,10 +89,10 @@ end
 """
     Scheduler
 
-The deficit-weighted, cost-aware, coalescing dispatch engine. Concurrent
+The weighted-fair, coalescing dispatch engine. Concurrent
 requests land on per-model queues; a single dispatch loop runs one GPU execution at a time,
 coalescing same-model requests into one batched execution at a compiled size and sharing GPU
-time by relative model weight and a learned per-batch-size cost estimate. It holds the
+time by relative model weight, charged in measured device seconds. It holds the
 model registry, the backend, the device memory pool, the [`SchedulerConfig`](@ref),
 per-model dispatch state, and an optional on-demand `WeightCache`. Submit work with
 [`infer`](@ref) and read observability counters with [`scheduler_metrics`](@ref).
@@ -124,6 +124,8 @@ mutable struct Scheduler
     failure::Any                               # the exception that killed the dispatch loop, or nothing
     # while it serves (see `_dispatch_loop_died!`); guarded by `cond`
     on_failure::Any                            # `f(err)` run once if the dispatch loop dies, or nothing
+    vfloor::Float64                            # virtual time of the most recent fair dispatch; never
+    # decreases (see `_select_fair!`); guarded by `cond`
 end
 
 function Scheduler(registry::ModelRegistry, backend::AbstractBackend, pool::MemoryPool, cfg::SchedulerConfig)
@@ -131,7 +133,7 @@ function Scheduler(registry::ModelRegistry, backend::AbstractBackend, pool::Memo
         registry, backend, pool, cfg,
         Threads.Condition(), false, nothing, nothing, nothing, ControlCommand[],
         MetaGate(1), QueuedRequest[], 0, nothing, ReentrantLock(), Dict{String, Any}(),
-        nothing, nothing
+        nothing, nothing, 0.0
     )
 end
 
@@ -145,11 +147,16 @@ end
 
 
 # ---------------------------------------------------------------------------------------------
-# EMA and cost-estimate updates
+# Fair charging, EMA and cost-estimate updates
 # ---------------------------------------------------------------------------------------------
 
+# Charge `seconds` of dispatch-loop time to a model's fair-discipline virtual time, scaled by its
+# weight: a model of weight 2 is charged half as much per second, so it gets twice the share.
+_charge_fair!(st::ModelSchedState, seconds::Real) = (st.vtime += max(Float64(seconds), 0.0) / st.weight; nothing)
+
 # Decay the recent-compute EMA to `now` by the configured half-life. Applied consistently
-# before any read or write so the stored value is always current.
+# before any read or write so the stored value is always current. The EMA is reported
+# (`scheduler_metrics`); no discipline schedules by it.
 function _decay_ema!(st::ModelSchedState, halflife::Float64, now::Float64)
     dt = now - st.ema_last_update
     if dt > 0
@@ -166,15 +173,6 @@ function _update_cost!(st::ModelSchedState, B::Int, measured::Float64, alpha::Fl
     st.cost_estimate[B] = alpha * measured + (1 - alpha) * old
     return nothing
 end
-
-effective_cost(st::ModelSchedState, B::Int, discount::Float64) =
-    get(st.cost_estimate, B, _DEFAULT_COST) * (1 - discount)
-
-# Deficit-weighted, cost-aware priority. A model that has consumed less than its share recently
-# scores higher; dividing by cost stops an expensive model from blocking cheaper ones on a
-# marginal fairness edge. The clamp bounds both lockout and domination.
-priority(share::Float64, normalized_ema::Float64, cap::Float64, eff_cost::Float64) =
-    clamp(share - normalized_ema, -cap, cap) / eff_cost
 
 # ---------------------------------------------------------------------------------------------
 # Batch contribution and coalescing plan
@@ -386,7 +384,7 @@ function select_dispatch!(s::Scheduler, now::Float64)
     end
     s.cfg.discipline == FIFO && return _select_fifo!(s)
     s.cfg.discipline == EDF && return _select_edf!(s)
-    return _select_fair!(s, now)
+    return _select_fair!(s)
 end
 
 # FIFO: serve the model whose oldest queued request is the oldest overall, then coalesce its queue.
@@ -445,37 +443,34 @@ function _select_edf!(s::Scheduler)
     return _finalize(chosen, plan_batch(chosen, chosen.sched; coalesce = s.cfg.coalescing))
 end
 
-# Fair: deficit-weighted, cost-aware priority. Decay every EMA to now before reading, then normalize.
-# (Metas are not scheduled here; they run under the meta gate and their sub-calls compete as ordinary
-# requests for the sub-models.)
-function _select_fair!(s::Scheduler, now::Float64)
-    for entry in values(s.registry.by_name)
-        entry.sched === nothing || _decay_ema!(entry.sched, s.cfg.ema_halflife_seconds, now)
-    end
-    total_ema = sum(e.sched.recent_compute_ema for e in values(s.registry.by_name) if e.sched !== nothing; init = 0.0)
-    total_w = sum(e.sched.weight for e in values(s.registry.by_name) if e.sched !== nothing; init = 0.0)
-
+# Fair: start-time fair queueing over measured device seconds. Each dispatch charges its model the
+# loop time it took over the model's weight (`_charge_fair!`), and the schedulable model with the
+# least virtual time `vtime` goes next, so while models stay backlogged each one's device time
+# tracks its weight share, whatever the models cost per dispatch. `s.vfloor` is the virtual time of
+# the most recent fair dispatch, and a candidate below it is lifted to it before comparing: a model
+# that was idle, newly loaded, or waiting for its weights to be read rejoins level with the busy
+# ones, neither banking credit for the time it was away nor paying for capacity it used while it
+# ran alone. Candidates are exactly the schedulable models with a plan, so the selector stays
+# work-conserving: a model alone in the queue is served whatever its virtual time. Ties break by
+# the oldest front request, then by name. (Metas are not scheduled here; they run under the meta
+# gate and their sub-calls compete as ordinary requests for the sub-models.)
+function _select_fair!(s::Scheduler)
     chosen = nothing
     chosen_plan = nothing
-    best_p = -Inf
     for entry in values(s.registry.by_name)
         _schedulable(entry) || continue
         st = entry.sched
         plan = plan_batch(entry, st; coalesce = s.cfg.coalescing)
         plan === nothing && continue
-        B = plan[1]
-        share = total_w == 0 ? 0.0 : st.weight / total_w
-        # All-zero case: every model normalizes to zero, so the deficit equals the share and
-        # quiet or newly loaded models stay schedulable.
-        nema = total_ema == 0 ? 0.0 : st.recent_compute_ema / total_ema
-        p = priority(share, nema, s.cfg.recency_penalty_cap, effective_cost(st, B, s.cfg.coalescing_discount))
-        if chosen === nothing || p > best_p ||
-                (p == best_p && st.queue[1].enqueued_at < chosen.sched.queue[1].enqueued_at) ||
-                (p == best_p && st.queue[1].enqueued_at == chosen.sched.queue[1].enqueued_at && entry.name < chosen.name)
-            chosen, chosen_plan, best_p = entry, plan, p
+        st.vtime = max(st.vtime, s.vfloor)
+        if chosen === nothing || st.vtime < chosen.sched.vtime ||
+                (st.vtime == chosen.sched.vtime && st.queue[1].enqueued_at < chosen.sched.queue[1].enqueued_at) ||
+                (st.vtime == chosen.sched.vtime && st.queue[1].enqueued_at == chosen.sched.queue[1].enqueued_at && entry.name < chosen.name)
+            chosen, chosen_plan = entry, plan
         end
     end
     chosen === nothing && return nothing
+    s.vfloor = chosen.sched.vtime     # every candidate was lifted to the floor, so it never decreases
     return _finalize(chosen, chosen_plan)
 end
 
@@ -623,8 +618,11 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
 
         # Ensure the model's weights are resident before running (loads on demand and evicts
         # LRU under budget pressure). Load time is excluded from compute_time, which feeds the
-        # cost estimate, so the estimate reflects steady-state (resident) execution.
+        # cost estimate, so the estimate reflects steady-state (resident) execution. The load
+        # still held the dispatch loop, so the fair discipline charges it to the model.
+        t_load = time()
         _acquire_for_dispatch!(s, entry)
+        load_time = time() - t_load
         out, compute_time = _timed_run(
             s, entry.executable, merged; offload = _offload_execution(st, B)
         )
@@ -645,6 +643,7 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
             now = time()
             _decay_ema!(st, s.cfg.ema_halflife_seconds, now)
             st.recent_compute_ema += compute_time
+            _charge_fair!(st, max(compute_time, 0.0) + max(load_time, 0.0))
             _update_cost!(st, B, compute_time, s.cfg.cost_ema_alpha)
             st.dispatch_count += 1
             st.requests_served += length(taken)
@@ -720,7 +719,7 @@ end
 # Measure the worst-case execution scratch (transient device memory beyond resident weights) by
 # probing each model in ISOLATION: free all non-pinned device weights so only pinned + the probed
 # model are resident, run every compiled (variant,size), and read the allocator's peak. The
-# per-model run also seeds the fair discipline's cost estimates. Returns max scratch in bytes (0 when
+# per-model run also seeds the cost estimates. Returns max scratch in bytes (0 when
 # the backend reports no device stats, e.g. CPU/mock).
 #
 # Two measurement modes, chosen by whether the backend can reset the allocator's high-water mark
@@ -770,7 +769,7 @@ function _probe_max_scratch!(s::Scheduler, pinned_bytes::Int)
     return max(0, max_scratch)
 end
 
-# Run every compiled (variant, size) of one resident model, seeding its FAIR cost estimates, and
+# Run every compiled (variant, size) of one resident model, seeding its cost estimates, and
 # return its scratch estimate in bytes. Resettable: the peak is reset first and the result is
 # `peak - in_use_before`, exact for this model. Otherwise `peak - resident_floor`, the monotone-peak
 # formula (`resident_floor` = pinned + the heaviest weight set resident so far). When the model
@@ -845,7 +844,7 @@ end
 # Prepare every registered entry's scheduling state, then spawn the dispatch loop. Entries are
 # already in the registry (loaded and compiled by `serve`). When `autosize_arena > 0` (set by the
 # worker when the on-demand cache is enabled), the isolation probe runs every model regardless of
-# discipline, doubling as the FAIR cost warmup and the scratch measurement, and the cache is sized
+# discipline, doubling as the cost warmup and the scratch measurement, and the cache is sized
 # before serving begins.
 function start!(
         s::Scheduler; autosize_arena::Integer = 0, autosize_fraction::Real = 0.0,
@@ -860,11 +859,11 @@ function start!(
     end
     s.weight_cache === nothing || preload_pinned!(s.weight_cache, s.registry)
     if autosize_arena > 0 && s.weight_cache !== nothing
-        # The probe runs every model (seeding FAIR costs too) and sizes the cache.
+        # The probe runs every model (seeding the cost estimates too) and sizes the cache.
         _autosize_weight_cache!(s, Int(autosize_arena), Float64(autosize_fraction), Float64(autosize_wiggle))
         _fill_device!(s)
     elseif s.cfg.discipline == FAIR
-        # No auto-size (cache off, or no device stats): just seed FAIR costs.
+        # No auto-size (cache off, or no device stats): just seed the cost estimates.
         for entry in values(s.registry.by_name)
             _warmup_entry!(s, entry)
         end

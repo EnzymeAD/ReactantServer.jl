@@ -1,13 +1,15 @@
-# Deterministic unit tests for the scheduler policy: priority math, EMA decay, cost learning,
-# coalescing batch selection, fairness selection (the spec's worked example), and the FIFO
-# discipline. These exercise the pure helpers and select_dispatch! directly, with no spawned
-# dispatch loop and no real clock, so they are fully deterministic.
+# Deterministic unit tests for the scheduler policy: EMA decay, cost learning, coalescing batch
+# selection, the fair discipline (selection rules, simulated scenarios and randomized checks of its
+# guarantees), and the FIFO and EDF disciplines. These exercise the pure helpers and
+# select_dispatch! directly, with no spawned dispatch loop and no real clock, so they are fully
+# deterministic.
 
 using ReactantServer: ModelSchedState, ModelSchedConfig, ModelEntry, ModelRegistry, ModelSignature,
     LoadedModel, Manifest, TensorSpec, Dim, BatchingSpec, Provenance, BATCH, FIXED, F32,
     Scheduler, SchedulerConfig, MockBackend, MockClient, MockDevice, MemoryPool, QueuedRequest,
-    InferRequest, NamedTensor, priority, effective_cost, plan_batch, select_dispatch!,
-    _decay_ema!, _update_cost!
+    InferRequest, NamedTensor, plan_batch, select_dispatch!, _decay_ema!, _update_cost!,
+    _charge_fair!
+using Random: MersenneTwister, randexp
 
 # A manifest with no batch axis (not coalescable): plan_batch serves one request per dispatch.
 _sched_trivial_manifest(name) = Manifest(
@@ -58,21 +60,6 @@ function _qr(model; rows = 1, arrival = 0.0, deadline_ns = 0)
     return QueuedRequest(req, req.inputs, arrival, Channel{Any}(1))
 end
 
-@testset "priority: spec worked example" begin
-    # Three equal-weight models, EMAs 0.7/0.2/0.1, cap 0.25, discount 0.10, batch-1 costs in ms.
-    share = 1 / 3
-    pa = priority(share, 0.7, 0.25, 10 * 0.9)
-    pb = priority(share, 0.2, 0.25, 30 * 0.9)
-    pc = priority(share, 0.1, 0.25, 100 * 0.9)
-    @test pa ≈ -0.0278 atol = 1.0e-4
-    @test pb ≈ 0.00493 atol = 1.0e-4
-    @test pc ≈ 0.00259 atol = 1.0e-4
-    @test pb > pc > pa            # B wins; the recently-busy A is penalized to negative
-    # the deficit is clamped: A's raw deficit is -0.367 but the penalty caps at -0.25
-    @test priority(share, 0.7, 0.25, 1.0) == -0.25
-    @test priority(share, 0.0, 0.25, 1.0) == 0.25
-end
-
 @testset "EMA decay halves over a half-life" begin
     st = ModelSchedState("m", ModelSchedConfig(1.0), 0.0)
     st.recent_compute_ema = 1.0
@@ -90,7 +77,6 @@ end
         _update_cost!(st, 1, 0.01, 0.2)
     end
     @test st.cost_estimate[1] ≈ 0.01 atol = 1.0e-3
-    @test effective_cost(st, 1, 0.1) ≈ 0.01 * 0.9 atol = 1.0e-4
 end
 
 @testset "plan_batch coalescing rules" begin
@@ -253,22 +239,246 @@ end
     end
 end
 
-@testset "select_dispatch! picks the fair winner (worked example)" begin
+@testset "fair: the least virtual time goes next, and a returning model is lifted to the floor" begin
     s = _empty_sched()
     now = 1000.0
-    specs = (("A", 0.7, 0.01), ("B", 0.2, 0.03), ("C", 0.1, 0.1))
-    for (name, ema, cost) in specs
+    for (name, vt) in (("A", 0.3), ("B", 0.1), ("C", 0.2))
         st = ModelSchedState(name, ModelSchedConfig(1.0), now)
-        st.recent_compute_ema = ema
-        st.cost_estimate[1] = cost
+        st.vtime = vt
         push!(st.queue, _qr(name; arrival = now))
         _install!(s, _sched_entry(name, [1]; coalescable = false), st)
     end
     d = select_dispatch!(s, now)
     @test d.entry.name == "B"
     @test length(d.taken) == 1
-    @test length(s.registry.by_name["B"].sched.queue) == 0      # the taken request was dequeued
+    @test isempty(s.registry.by_name["B"].sched.queue)            # the taken request was dequeued
     @test length(s.registry.by_name["A"].sched.queue) == 1
+    @test s.vfloor == 0.1
+
+    # A charge is the seconds over the weight; a negative measurement (a clock step) charges nothing.
+    stw = ModelSchedState("w", ModelSchedConfig(2.0), now)
+    _charge_fair!(stw, 0.5)
+    @test stw.vtime == 0.25
+    _charge_fair!(stw, -1.0)
+    @test stw.vtime == 0.25
+
+    # A model that was idle while the others ran rejoins at the floor: it banked no credit, so it
+    # does not get a run of dispatches, and its old virtual time is gone.
+    s2 = _empty_sched()
+    s2.vfloor = 5.0
+    busy = ModelSchedState("busy", ModelSchedConfig(1.0), now)
+    busy.vtime = 5.0
+    push!(busy.queue, _qr("busy"; arrival = now - 1.0))         # older front request
+    _install!(s2, _sched_entry("busy", [1]), busy)
+    back = ModelSchedState("back", ModelSchedConfig(1.0), now)
+    back.vtime = 0.5                                             # last ran long ago
+    push!(back.queue, _qr("back"; arrival = now))
+    _install!(s2, _sched_entry("back", [1]), back)
+    @test select_dispatch!(s2, now).entry.name == "busy"         # tie at the floor: oldest request
+    @test back.vtime == 5.0
+    _charge_fair!(busy, 0.01)
+    push!(busy.queue, _qr("busy"; arrival = now))
+    @test select_dispatch!(s2, now).entry.name == "back"
+
+    # Equal virtual time and arrival break by name, for determinism.
+    s3 = _empty_sched()
+    for name in ("y", "x")
+        st = ModelSchedState(name, ModelSchedConfig(1.0), now)
+        push!(st.queue, _qr(name; arrival = now))
+        _install!(s3, _sched_entry(name, [1]), st)
+    end
+    @test select_dispatch!(s3, now).entry.name == "x"
+
+    # Work-conserving: a model alone in the queue is served however far ahead it is.
+    s4 = _empty_sched()
+    solo = ModelSchedState("solo", ModelSchedConfig(1.0), now)
+    solo.vtime = 1.0e6
+    push!(solo.queue, _qr("solo"; arrival = now))
+    _install!(s4, _sched_entry("solo", [1]), solo)
+    _install!(s4, _sched_entry("quiet", [1]), ModelSchedState("quiet", ModelSchedConfig(1.0), now))
+    @test select_dispatch!(s4, now).entry.name == "solo"
+    @test s4.vfloor == 1.0e6
+end
+
+# A simulated fair run: the real `select_dispatch!` chooses every dispatch, which is recorded as
+# `execute_and_record!` records it (the virtual-time charge and the recent-compute EMA) on a
+# simulated clock, so the run is deterministic and no time passes. Each model is
+# `(name, weight, seconds per dispatch, on, off)`: saturated, one request always queued, while
+# `on <= t < off`, and idle otherwise. Over the window `[w0, w1]` it returns each model's share of
+# the device time and its longest wait between dispatches, measured as the audit's simulation
+# (`sims/fair_fix_sim.jl`) measures them.
+function _fair_scenario(models; T, w0 = 0.0, w1 = T)
+    s = _empty_sched()
+    for (name, w, _, _, _) in models
+        _install!(s, _sched_entry(name, [1]), ModelSchedState(name, ModelSchedConfig(w), 0.0))
+    end
+    spec = Dict(m[1] => m for m in models)
+    served = Dict(m[1] => 0.0 for m in models)
+    last = Dict(m[1] => NaN for m in models)
+    gap = Dict(m[1] => 0.0 for m in models)
+    t = 0.0
+    while t < T
+        for (name, _, _, on, off) in models
+            q = s.registry.by_name[name].sched.queue
+            if on <= t < off
+                isempty(q) && push!(q, _qr(name; arrival = t))
+            else
+                empty!(q)
+            end
+        end
+        d = select_dispatch!(s, t)
+        d === nothing && (t += 0.001; continue)
+        name, st = d.entry.name, d.entry.sched
+        c = spec[name][3]
+        t += c
+        _decay_ema!(st, s.cfg.ema_halflife_seconds, t)
+        st.recent_compute_ema += c
+        _charge_fair!(st, c)
+        if w0 <= t <= w1
+            served[name] += c
+            start = isnan(last[name]) ? max(w0, spec[name][4]) : last[name]
+            gap[name] = max(gap[name], t - c - start)
+            last[name] = t
+        end
+    end
+    total = sum(values(served))
+    return Dict(name => (share = served[name] / total, gap = gap[name]) for name in keys(served))
+end
+
+@testset "fair: no lockout from history, idle models, cost or a model rejoining (simulated)" begin
+    # The scenarios the old EMA-deficit ranking failed (SCH-3); its result is in each comment. The
+    # wait bounds are the discipline's guarantee: at most one dispatch of each other model plus
+    # the weight-scaled cost of this model's own.
+    idle8 = [("i$i", 1.0, 0.01, Inf, Inf) for i in 1:8]
+
+    # 1: A alone for 200 s, then B. Was: A got nothing for 29.8 s while B caught up.
+    r = _fair_scenario([("A", 1.0, 0.01, 0.0, Inf), ("B", 1.0, 0.01, 200.0, Inf)]; T = 400.0, w0 = 200.0)
+    @test r["A"].share ≈ 0.5 atol = 0.01
+    @test r["B"].share ≈ 0.5 atol = 0.01
+    @test r["A"].gap <= 0.02 + 1.0e-9
+    @test r["B"].gap <= 0.02 + 1.0e-9
+
+    # 2: A at 1 ms and B at 100 ms, both busy, with 8 idle models loaded. Was: B took 65% of the
+    # device over this minute (90% over 300 s), the cost division ranking the cheap model last
+    # once both were over their share.
+    r = _fair_scenario(vcat([("A", 1.0, 0.001, 0.0, Inf), ("B", 1.0, 0.1, 0.0, Inf)], idle8); T = 60.0)
+    @test r["A"].share ≈ 0.5 atol = 0.01
+    @test r["B"].share ≈ 0.5 atol = 0.01
+    @test r["A"].gap <= 0.101 + 1.0e-9
+    @test r["B"].gap <= 0.101 + 1.0e-9
+
+    # 3: as 2, but A alone first and B joining at 50 s. Was: A locked out for 13.6 s (98 s after
+    # 200 s alone).
+    r = _fair_scenario(
+        vcat([("A", 1.0, 0.001, 0.0, Inf), ("B", 1.0, 0.1, 50.0, Inf)], idle8); T = 110.0, w0 = 50.0
+    )
+    @test r["A"].share ≈ 0.5 atol = 0.01
+    @test r["B"].share ≈ 0.5 atol = 0.01
+    @test r["A"].gap <= 0.101 + 1.0e-9
+
+    # 4: weights 2:1 at equal cost split the device 2:1.
+    r = _fair_scenario([("A", 2.0, 0.01, 0.0, Inf), ("B", 1.0, 0.01, 0.0, Inf)]; T = 300.0)
+    @test r["A"].share ≈ 2 / 3 atol = 0.01
+    @test r["B"].share ≈ 1 / 3 atol = 0.01
+    @test r["A"].gap <= 0.015 + 1.0e-9
+    @test r["B"].gap <= 0.03 + 1.0e-9
+
+    # 5: A and B busy; C idle until 200 s, then busy. Was: C took 72% for the next 30 s and A and B
+    # each went 17.4 s without a dispatch. An idle model must not hoard credit.
+    r = _fair_scenario(
+        [("A", 1.0, 0.01, 0.0, Inf), ("B", 1.0, 0.01, 0.0, Inf), ("C", 1.0, 0.01, 200.0, Inf)];
+        T = 300.0, w0 = 200.0, w1 = 230.0
+    )
+    for m in ("A", "B", "C")
+        @test r[m].share ≈ 1 / 3 atol = 0.01
+        @test r[m].gap <= 0.04 + 1.0e-9
+    end
+end
+
+# One randomized fair run, ported from the audit's bounds check (`sims/fair_bounds_check.jl`) to
+# the real selector: random weights, a random longest dispatch C_i per model, each dispatch costing
+# uniform(0.2, 1.0) * C_i, and models switching between backlogged and idle at random (model 1
+# stays backlogged throughout). Returns the worst margin of each guarantee, each <= 0 when it holds:
+#   inv    floor <= vtime_j <= floor + C_j / w_j for every backlogged model j, at every decision
+#   wait   a model's wait for its next dispatch over sum_{j != i} (C_j + (w_j / w_i) C_i), minus 1
+#   lag    |dW_i / w_i - dW_j / w_j| - (C_i / w_i + C_j / w_j), for the device time dW each of a
+#          pair got while both stayed backlogged
+#   share  the device time guaranteed to model 1 over the run, minus the time it got:
+#          (w_1 / S) T - (w_1 / S) sum_{j != 1} ((w_j / w_1) C_1 + C_j), S the total weight of the
+#          models that were ever backlogged
+function _fair_property_run(rng; T = 100.0)
+    n = rand(rng, 2:8)
+    w = rand(rng, n) .* 3.5 .+ 0.5
+    C = rand(rng, n) .* 0.199 .+ 0.001
+    names = ["m$i" for i in 1:n]
+    s = _empty_sched()
+    states = [ModelSchedState(names[i], ModelSchedConfig(w[i]), 0.0) for i in 1:n]
+    for i in 1:n
+        _install!(s, _sched_entry(names[i], [1]), states[i])
+    end
+    index = Dict(names[i] => i for i in 1:n)
+    busy = [i == 1 || rand(rng, Bool) for i in 1:n]
+    next_flip = [i == 1 ? Inf : randexp(rng) * 5 for i in 1:n]
+    ever = copy(busy)
+    wait_start = [busy[i] ? 0.0 : NaN for i in 1:n]
+    run_start = zeros(Int, n)              # decision at which the current backlogged run began
+    served = zeros(n)
+    history = Vector{Float64}[]            # `served` as it stood at each decision
+    worst_inv, worst_wait, worst_lag = -Inf, -Inf, -Inf
+    t = 0.0
+    while t < T
+        for i in 1:n                       # backlog changes take effect between dispatches
+            if t >= next_flip[i]
+                busy[i] = !busy[i]
+                next_flip[i] = t + randexp(rng) * 5
+                busy[i] && (ever[i] = true; wait_start[i] = t)
+                busy[i] || (wait_start[i] = NaN)
+            end
+            q = states[i].queue
+            busy[i] ? (isempty(q) && push!(q, _qr(names[i]; arrival = t))) : empty!(q)
+        end
+        push!(history, copy(served))
+        k = length(history)
+        for i in 1:n
+            run_start[i] = busy[i] ? (run_start[i] == 0 ? k : run_start[i]) : 0
+        end
+        d = select_dispatch!(s, t)
+        c = index[d.entry.name]
+        F = s.vfloor
+        for j in 1:n
+            busy[j] || continue
+            worst_inv = max(worst_inv, F - states[j].vtime, states[j].vtime - F - C[j] / w[j])
+        end
+        bound = sum(C[j] + (w[j] / w[c]) * C[c] for j in 1:n if j != c; init = 0.0)
+        worst_wait = max(worst_wait, (t - wait_start[c]) / bound - 1)
+        for i in 1:n, j in (i + 1):n
+            (busy[i] && busy[j]) || continue
+            k0 = max(run_start[i], run_start[j])
+            dWi, dWj = served[i] - history[k0][i], served[j] - history[k0][j]
+            worst_lag = max(worst_lag, abs(dWi / w[i] - dWj / w[j]) - (C[i] / w[i] + C[j] / w[j]))
+        end
+        cost = (0.2 + 0.8 * rand(rng)) * C[c]
+        _charge_fair!(d.entry.sched, cost)
+        t += cost
+        served[c] += cost
+        wait_start[c] = busy[c] ? t : NaN
+    end
+    S = sum(w[j] for j in 1:n if ever[j])
+    guaranteed = (w[1] / S) * t - (w[1] / S) * sum((w[j] / w[1]) * C[1] + C[j] for j in 2:n if ever[j]; init = 0.0)
+    return (inv = worst_inv, wait = worst_wait, lag = worst_lag, share = guaranteed - served[1])
+end
+
+@testset "fair: the wait bound, the share floor and the pairwise lag hold (randomized)" begin
+    rng = MersenneTwister(20261105)
+    worst = (inv = -Inf, wait = -Inf, lag = -Inf, share = -Inf)
+    for _ in 1:40
+        r = _fair_property_run(rng)
+        worst = map(max, worst, r)
+    end
+    @test worst.inv <= 1.0e-9
+    @test worst.wait <= 1.0e-9
+    @test worst.lag <= 1.0e-9
+    @test worst.share <= 1.0e-9
 end
 
 @testset "FIFO discipline serves the globally oldest request, still coalescing" begin

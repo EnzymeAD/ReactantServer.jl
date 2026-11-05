@@ -49,10 +49,10 @@ control plane pins them.
 """
     SchedulingDiscipline
 
-The inter-model dispatch ordering. `FAIR` is the deficit-weighted, cost-aware policy with
-per-model weights and the coalescing discount; `FIFO` serves in global arrival order; `EDF`
-(earliest-deadline-first) serves the model whose most-urgent queued request has the soonest
-deadline. Coalescing runs underneath all three.
+The inter-model dispatch ordering. `FAIR` shares the device by per-model weight, charging each
+dispatch the device time it measured (start-time fair queueing); `FIFO` serves in global arrival
+order; `EDF` (earliest-deadline-first) serves the model whose most-urgent queued request has the
+soonest deadline. Coalescing runs underneath all three.
 
 Guidance: `FAIR` is for deployments where models share this worker with no upstream placement
 authority, a single-GPU worker or a multi-GPU fleet behind the round-robin gateway, where the
@@ -334,9 +334,11 @@ ModelSchedConfig(
     SchedulerConfig
 
 Global scheduler settings (the `scheduler:` config block). `ema_halflife_seconds` is the
-half-life of the recent-compute moving average that drives fairness; `recency_penalty_cap`
-bounds the recency adjustment; `coalescing_discount` is the cost discount applied to coalesced
-batches; `cost_ema_alpha` is the smoothing factor for the learned per-batch-size cost;
+half-life of the per-model recent-compute moving average the worker reports, which no discipline
+schedules by; `recency_penalty_cap` and `coalescing_discount` are accepted and validated for
+compatibility but have no effect, since the fair discipline charges measured device time rather
+than ranking by a clamped recency deficit over a discounted cost; `cost_ema_alpha` is the
+smoothing factor for the learned per-batch-size cost;
 `max_queue_depth` caps each model's queue independently (a full model rejects new requests
 without affecting admission for the others); `dispatch_timeout_seconds` is the per-request
 execution timeout, how long a request may wait for its result from submission (queueing and

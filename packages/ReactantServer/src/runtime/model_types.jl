@@ -98,15 +98,17 @@ LoadedModel(
 ) =
     LoadedModel(sig, _as_variant_execs(execs), weights, state, Int(nbytes), host_weights)
 
-# Per-model scheduler state. The EMA and cost fields drive the fair discipline only; under FIFO
-# they are left untouched. The EMA fields are always decayed to "now" before being read or
-# written so the value is current as of the read time. The scheduling methods live in
-# `scheduler.jl`.
+# Per-model scheduler state. `vtime` orders the fair discipline; the cost estimate feeds the EDF
+# laxity check and the choice to run a long program off the interactive thread; the recent-compute
+# EMA is reported for observability and does not affect scheduling. The EMA fields are always
+# decayed to "now" before being read or written so the value is current as of the read time. The
+# scheduling methods live in `scheduler.jl`.
 mutable struct ModelSchedState
     name::String
     weight::Float64                       # relative compute share (fair discipline); share = weight / Σ weights
     max_batch_size::Union{Int, Nothing}    # coalescing cap (rows per dispatch); nothing = uncapped
     queue::Vector{QueuedRequest}          # FIFO: front is oldest
+    vtime::Float64                        # fair discipline: device seconds charged / weight (see `_select_fair!`)
     recent_compute_ema::Float64
     ema_last_update::Float64
     cost_estimate::Dict{Int, Float64}      # batch size -> estimated GPU time (seconds)
@@ -130,7 +132,7 @@ end
 function ModelSchedState(name::AbstractString, mc::ModelSchedConfig, now::Float64)
     return ModelSchedState(
         String(name), mc.weight, mc.max_batch_size, QueuedRequest[],
-        0.0, now, Dict{Int, Float64}(), 0, 0, 0, 0.0, Float64[], Dict{Int, Int}(),
+        0.0, 0.0, now, Dict{Int, Float64}(), 0, 0, 0, 0.0, Float64[], Dict{Int, Int}(),
         :none, nothing, nothing
     )
 end

@@ -38,8 +38,8 @@ share a GPU, such as computer vision and scientific computing.
 - **Batch coalescing.** Concurrent same-model requests are merged into one execution at a compiled
   batch size, amortizing per-launch overhead and the one-time weight transfer across the batch.
   → [Scheduling](https://enzymead.github.io/ReactantServer.jl/dev/scheduling/)
-- **Scheduling modes for single and multi-GPU.** On a worker, `fair` (deficit-weighted,
-  cost-aware), `fifo`, or `edf`; across GPUs, the gateway offers `round_robin`,
+- **Scheduling modes for single and multi-GPU.** On a worker, `fair` (weighted fair queueing
+  over measured GPU time), `fifo`, or `edf`; across GPUs, the gateway offers `round_robin`,
   `least_outstanding`, or memory-aware `lpt_packing` that concentrates each model's traffic to fill
   batches, with a gRPC control plane for retuning placement without a restart.
   → [Scheduling](https://enzymead.github.io/ReactantServer.jl/dev/scheduling/), [Multi-GPU Gateway](https://enzymead.github.io/ReactantServer.jl/dev/gateway/)
