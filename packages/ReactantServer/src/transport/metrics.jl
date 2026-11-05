@@ -313,13 +313,15 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
         state_ln = Prometheus.LabelNames(("state",))
         nstaging = count(m -> m.host_stage === :staging, values(sm))
         nstaged = count(m -> m.host_stage === :staged, values(sm))
+        npending = count(m -> m.host_stage === :pending, values(sm))
         push!(
             metrics, Prometheus.Metric(
                 "gauge", "worker_weight_staging_models",
                 "Models whose weights are being read into host memory ahead of their dispatch (reading), " *
-                    "or are read and waiting for it (staged).",
+                    "wait for a free read slot (waiting), or are read and waiting for the dispatch (staged).",
                 Prometheus.Sample[
                     Prometheus.Sample(nothing, state_ln, Prometheus.LabelValues(("reading",)), Float64(nstaging)),
+                    Prometheus.Sample(nothing, state_ln, Prometheus.LabelValues(("waiting",)), Float64(npending)),
                     Prometheus.Sample(nothing, state_ln, Prometheus.LabelValues(("staged",)), Float64(nstaged)),
                 ]
             )

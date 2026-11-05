@@ -225,7 +225,7 @@ integrates against, and what answers depends on the port:
 - **Each worker's own port** serves the full KServe V2 data plane, including `ModelInfer`,
   `RepositoryIndex`, `ServerReady`, and `ModelMetadata`, plus the worker control RPCs
   (`ModelControlStatus`, `SetModelResidency`, `SetModelPolicy`, `CompactMemory`,
-  `DescribeModels`). A control plane discovers which models a worker serves with
+  `StageWeights`, `DescribeModels`). A control plane discovers which models a worker serves with
   `RepositoryIndex`.
 - **A multi-worker node's public port** is the gateway, which forwards `ModelInfer` and the
   shared-memory RPCs, answers the metadata RPCs (`ModelMetadata`, `RepositoryIndex`,

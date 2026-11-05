@@ -33,6 +33,8 @@ end
 
 function _handle_model_control_status(ctx::InferContext)
     snap = control_status(ctx.sched)
+    costs = load_costs(ctx.sched, keys(snap.models))
+    nocost = (host_copy = false, upload_seconds = 0.0, read_seconds = 0.0, loads = 0)
     models = [
         _CTRL.ModelStatus(;
             name = String(name),
@@ -49,7 +51,12 @@ function _handle_model_control_status(ctx::InferContext)
             # counting requests, which is indistinguishable from working.
             batch_input_name = String(m.batch_input_name),
             batch_axis = Int64(m.batch_axis),
-            rows_served = UInt64(m.rows_served)
+            rows_served = UInt64(m.rows_served),
+            # What loading the model here costs, for a gateway pricing a placement change.
+            host_copy = get(costs, name, nocost).host_copy,
+            upload_seconds = get(costs, name, nocost).upload_seconds,
+            read_seconds = get(costs, name, nocost).read_seconds,
+            loads = UInt64(max(get(costs, name, nocost).loads, 0))
         )
             for (name, m) in snap.models
     ]
@@ -57,7 +64,23 @@ function _handle_model_control_status(ctx::InferContext)
         residency_mode = (snap.residency_mode == SELF_MANAGED ? "self_managed" : "externally_managed"),
         discipline = lowercase(string(snap.discipline)),
         models = models,
-        weight_cache_max_bytes = UInt64(snap.weight_cache_max_bytes)
+        weight_cache_max_bytes = UInt64(snap.weight_cache_max_bytes),
+        host_weight_budget_bytes = UInt64(snap.host_weight_budget_bytes),
+        host_cached_bytes = UInt64(snap.host_cached_bytes)
+    )
+end
+
+function _handle_stage_weights(ctx::InferContext, req)
+    rows = _as_control(
+        () -> stage_weights!(ctx.sched, collect(String, req.names); hold_seconds = req.hold_seconds > 0 ? req.hold_seconds : 60.0)
+    )
+    return _CTRL.StageWeightsResponse(;
+        models = [
+            _CTRL.StagedModel(;
+                name = r.name, state = r.state, read = r.read, weight_nbytes = Int64(r.nbytes),
+                seconds = Float64(r.seconds), error = r.error
+            ) for r in rows
+        ]
     )
 end
 
@@ -103,6 +126,7 @@ function register_control_service!(server::gRPCServer.GRPCServer)
         SetModelResidency = _offloaded((ctx, req) -> _handle_set_model_residency(ctx.payload, req)),
         SetModelPolicy = _offloaded((ctx, req) -> _handle_set_model_policy(ctx.payload, req)),
         CompactMemory = _offloaded((ctx, req) -> _handle_compact_memory(ctx.payload, req)),
+        StageWeights = _offloaded((ctx, req) -> _handle_stage_weights(ctx.payload, req)),
         DescribeModels = _offloaded((ctx, req) -> _handle_describe_models(ctx.payload, req))
     )
     return server

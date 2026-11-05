@@ -147,11 +147,15 @@ which suits a deployment whose models all stay on the GPU. `unlimited` keeps eve
 with no cap (the behavior before 0.2).
 
 The host tier is a cache. A GPU load uses the model's cached host copy when there is one, and
-otherwise reads the weights file and keeps the copy if the budget has room, evicting the least
-recently *loaded* copies first. Only a load from the cache counts as use: requests served by a model already on the
-device do not, so a model that stays on a GPU for hours ages out of host RAM (nothing needs its
-host copy while it sits on the device), and the models the GPUs load most often stay cached.
-Being on a device gives no protection. A model with `residency: system` keeps its guarantee: it
+otherwise reads the weights file and keeps the copy if the budget has room. When it is full, the
+copies that go first are the ones the GPUs load least often. Each copy carries a count of the
+model's loads onto a GPU that halves every hour, and a new copy only displaces copies with a lower
+count than its own. This is where a slow disk's cost is weighed: a copy is worth a read saved for
+each load it serves, so a model the GPUs evict and reload every few minutes keeps its copy, and a
+model loaded once does not push it out. Only loads count: requests served by a model already on the
+device do not, so a model that stays on a GPU for hours ages out of host RAM (nothing needs its host
+copy while it sits on the device). Being on a device gives no protection. With shared host weights
+the count is the node's, kept with each copy in `/dev/shm` and raised by whichever worker loads it. A model with `residency: system` keeps its guarantee: it
 stays in RAM, is never evicted, and counts against the budget. When pinned models alone exceed the
 budget they load anyway and the worker warns that it is overcommitted. A load that misses the cache
 reads the whole model and queues every transfer at once, the same as an unbudgeted load; those
@@ -162,8 +166,24 @@ is not on the GPU, a background task reads its weights (from the cache, or from 
 while the worker keeps serving the models already on the GPU; once the read finishes, the model's
 turn in the queue evicts what it must and transfers the weights, exactly as any load does, so a
 model being read never takes GPU memory ahead of requests queued before it. Up to two models per
-worker are read ahead at a time, oldest request first. Workers on the same node read different
-models at once; two workers wanting the same model share one read.
+worker are read ahead at a time, oldest request first; a third waits for a free slot rather than
+being read on the loop that runs the GPU. The worker never reads a weights file on that loop: a
+read there would hold the GPU idle for every model for as long as the disk takes. If a background
+read fails, the requests waiting for it get the error, and the next request starts a fresh read.
+Workers on the same node read different models at once; two workers wanting the same model share
+one read.
+
+The same holds for every other load. Compaction, and the fallback compaction admission runs, reload
+only models with a host copy to upload from; a model without one stays evicted until its next request
+reads it in the background. A hot reload from the directory watcher reads the new version's weights
+before it takes the GPU loop (and attaches a `residency: system` floor after), and a residency change
+on an externally managed worker reads before its control step.
+
+A gateway moving a model onto a worker can read it there ahead of time: the worker's
+`StageWeights` RPC reads the named models into host memory on background tasks, holds what it read
+until each model's first dispatch uploads it (or the hold expires, at most 10 minutes), and returns
+once the reads end. Held bytes are capped at half the host weight budget (4 GiB without one); past
+the cap a model is reported `deferred`. See [primed moves](gateway.md#Primed-moves).
 
 How the budget is shared depends on `shared_host_weights`:
 
@@ -231,16 +251,18 @@ uploads because a refused device allocation is slow to discover: XLA's allocator
    largest scratch of every resident model, the new one included, so every resident model
    can run. Admission evicts until it does.
 
-Which models to evict is a cost decision. Each model's priority is its expected reload time
-per byte, scaled by how often it has been dispatched since it was loaded and aged by how
+Which models to evict is a cost decision. Each model's priority is the device time a reload would
+cost per byte, scaled by how often it has been dispatched since it was loaded and aged by how
 long ago it was last used (GreedyDual-Size-Frequency). A costly, frequently used model
 stays; one nobody has called in a while goes, and among equals the least recently used goes
-first, as with LRU. The reload time is judged at the moment of the decision, not from history
-alone: it is the model's measured upload time, plus its measured weights-file read time only when
-no host copy would be there to upload from (a `residency: system` floor, a cached copy, or its
-region in `/dev/shm` with shared host weights). So of two equally used models, the one still in
-host RAM is evicted first, and a fallback compaction prefers to reload the ones that would otherwise need a
-file read. The worker exports the two halves of its load time as
+first, as with LRU. The device time is the model's measured upload time (its bytes over the
+worker's measured upload bandwidth before it has one). Reading the weights file is not counted,
+because that read runs in the background and never holds the GPU: what a slow read costs is latency
+for the requests that wait for a model with no host copy, and that is decided when the host copy is
+evicted, not the device copy. Since upload time grows with size, the priority comes down to how
+often a model is used, whatever its size: a large model called often stays, and a large model
+called rarely gives way to the smaller ones it would crowd out. The worker exports the two halves of
+its load time as
 `worker_weight_upload_seconds_total` and `worker_weight_read_seconds_total`, with
 `worker_weight_read_bytes_total`. `worker_weight_evicts_total` carries a `reason`: `bytes` for a
 byte deficit, `contiguity` when enough bytes were free but no block could hold the weights
@@ -266,7 +288,9 @@ device statistics (the CPU backend) only the byte budget applies.
 Whatever drives compaction frees the on-demand region the same way; what differs is *when*
 it fires and *what* gets reloaded eagerly. Underneath, compaction is a worker control RPC,
 `CompactMemory` on the `ControlService`, that frees the on-demand region and reloads a list
-of models (empty means free only); both the standalone trigger and the gateway use it.
+of models (empty means free only; a listed model with no host copy to upload from is left for its
+next request to read in the background, since compaction never reads a weights file on the GPU
+loop); both the standalone trigger and the gateway use it.
 There are two ways to drive it, matched to the two deployment shapes.
 
 ### Standalone worker (no gateway)

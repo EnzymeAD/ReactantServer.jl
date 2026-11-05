@@ -20,7 +20,7 @@ function build_loaded_model(
         backend::AbstractBackend, pool::MemoryPool, entry::ModelEntry;
         state::ResidencyState = UNPINNED, on_demand::Bool = false,
         store::WeightStore = PrivateWeightStore(), source::Symbol = :startup,
-        executable_cache::Bool = false
+        executable_cache::Bool = false, host_arrays = nothing, defer_floor::Bool = false
     )
     m = entry.manifest
     input_names = String[t.name for t in m.executable_inputs]
@@ -57,15 +57,20 @@ function build_loaded_model(
     # evicted (the original behavior), regardless of state. With on-demand on, the floor follows
     # `state`: PINNED_SYSTEM materializes the host floor and starts device-evicted; UNPINNED holds
     # nothing and loads from the file on first dispatch; PINNED_DEVICE loads to the device.
+    #
+    # `host_arrays` are the weights already read into host memory (a hot load reads them before its
+    # control op, so the dispatch loop only uploads them); `defer_floor` leaves a system-pinned
+    # model's floor for the caller to attach once it is read off the loop.
     host_weights = nothing
     weights = nothing
     if !on_demand
-        weights = load_pinned_weights(backend, pool, entry.weights, wnames)
+        weights = host_arrays === nothing ? load_pinned_weights(backend, pool, entry.weights, wnames) :
+            transfer_to_device(backend, pool, host_arrays)
     elseif state == PINNED_DEVICE
-        host_weights = materialize_host_weights(entry.weights, wnames)
+        host_weights = host_arrays === nothing ? materialize_host_weights(entry.weights, wnames) : host_arrays
         weights = transfer_to_device(backend, pool, host_weights)
         host_weights = nothing                       # device-pinned never evicts; no host floor needed
-    elseif state == PINNED_SYSTEM
+    elseif state == PINNED_SYSTEM && !defer_floor
         host_weights = host_materialize(store, entry, wnames)
     end
     np = num_parameters(sig)

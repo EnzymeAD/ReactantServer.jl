@@ -58,11 +58,23 @@ function _od_scheduler(
     return sched
 end
 
+# What the dispatch loop does before it selects a model whose weights must be read: read them into
+# host memory off the loop (`_kick_staging!` and `_run_stage!`), so the dispatch only uploads.
+function _stage_for_dispatch!(sched, entry)
+    wc = sched.weight_cache
+    (wc === nothing || !ReactantServer.needs_host_stage(wc, entry)) && return nothing
+    entry.sched.staged = ReactantServer.stage_host_weights(wc, entry)
+    entry.sched.host_stage = :staged
+    return nothing
+end
+
 # Dispatch a single one-row request to `name` and return the per-caller result.
 function _dispatch1!(sched, name; val::Float32 = 1.0f0)
     wreq = ReactantServer.InferRequest(name, ["y"], [ReactantServer.NamedTensor("x", reshape(Float32[val, val], 2, 1))])
     qr = ReactantServer.QueuedRequest(wreq, wreq.inputs, 0.0, Channel{Any}(1))
-    push!(sched.registry.by_name[name].sched.queue, qr)
+    entry = sched.registry.by_name[name]
+    push!(entry.sched.queue, qr)
+    _stage_for_dispatch!(sched, entry)
     d = ReactantServer.select_dispatch!(sched, 0.0)
     ReactantServer.execute_and_record!(sched, d)
     return take!(qr.reply)
@@ -273,6 +285,7 @@ end
     A = sched.registry.by_name["A"].executable
     B = sched.registry.by_name["B"].executable
     @test A.weights !== nothing && B.weights !== nothing
+    A.host_weights = Any[copy(_W)]                       # a host copy to upload from
 
     n = ReactantServer.compact!(sched.weight_cache, sched.registry; reload = ["A"])
     @test n == 1
@@ -280,6 +293,24 @@ end
     @test B.weights === nothing                          # unlisted: left for lazy reload
     @test "A" in sched.weight_cache.lru
     @test sched.weight_cache.resident_bytes == _WBYTES
+end
+
+@testset "compaction never reads a weights file: a requested model with no host copy stays evicted" begin
+    sched = _od_scheduler(
+        _od_entry("A"; pinned = false, nbytes = _WBYTES),
+        _od_entry("B"; pinned = false, nbytes = _WBYTES); budget = _WBYTES * 4
+    )
+    _dispatch1!(sched, "A"); _dispatch1!(sched, "B")
+    A = sched.registry.by_name["A"].executable
+    B = sched.registry.by_name["B"].executable
+    B.host_weights = Any[copy(_W)]
+    loads = sched.weight_cache.loads
+    n = ReactantServer.compact!(sched.weight_cache, sched.registry; reload = ["A", "B"])
+    @test n == 1
+    @test A.weights === nothing                          # no host copy: read in the background on its next request
+    @test B.weights !== nothing
+    @test sched.weight_cache.loads == loads + 1
+    @test _dispatch1!(sched, "A")[1].data == reshape(Float32[10, 100], 2, 1)
 end
 
 @testset "compaction is a no-op without the on-demand weight cache" begin
