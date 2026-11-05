@@ -1,5 +1,6 @@
 # The worker's status contract (every failure gets exactly one gRPC code, and the metrics label is
-# that code), and a dispatch loop that dies (the worker says so and rejects everything with
+# that code), the dispatch timeout (a caller that stops waiting withdraws its request, which then
+# never runs), and a dispatch loop that dies (the worker says so and rejects everything with
 # UNAVAILABLE instead of hanging while it reports ready). Mock backend only.
 
 const _SC = ReactantServer
@@ -180,7 +181,65 @@ end
     @test _sc_code(_sc_call(ctx, _sc_body("m"))) == _SCStatus.NOT_FOUND
 end
 
+# A model whose program blocks on `gate`, counting its runs, so a test can hold the GPU busy.
+function _sc_gated(gate, ran)
+    return _sc_entry(
+        "g"; fn = a -> begin
+            Threads.atomic_add!(ran, 1)
+            wait(gate)
+            [a[1] .* a[2]]
+        end
+    )
+end
+
 _sc_req(model = "g") = _SC.InferRequest(model, ["y"], [_SC.NamedTensor("x", reshape(Float32[1, 2], 2, 1))])
+
+@testset "dispatch timeout: a caller waiting too long is answered DEADLINE_EXCEEDED; its request never runs" begin
+    gate = Base.Event()
+    ran = Threads.Atomic{Int}(0)
+    sched, _ = _sc_sched(_sc_gated(gate, ran); timeout = 0.5)
+    _SC.start!(sched)
+    try
+        # A occupies the (mock) GPU; B queues behind it. Both waits pass the 0.5 s timeout.
+        a = Threads.@spawn try
+            _SC.infer(sched, _sc_req())
+        catch e
+            e
+        end
+        @test _sc_until(() -> ran[] == 1)
+        t0 = time()
+        b = try
+            _SC.infer(sched, _sc_req())
+        catch e
+            e
+        end
+        @test b isa _SC.DispatchTimeoutError
+        @test 0.4 <= time() - t0 < 3.0
+        # B is still queued, now withdrawn, so the loop will drop it rather than run it.
+        @test only(sched.registry.by_name["g"].sched.queue).withdrawn[]
+        @test fetch(a) isa _SC.DispatchTimeoutError     # executing: its result will be discarded
+        notify(gate)
+        # The loop comes to B, finds it withdrawn and drops it: the program ran for A only.
+        @test _sc_until(() -> isempty(sched.registry.by_name["g"].sched.queue))
+        sleep(0.2)
+        @test ran[] == 1
+        # And the worker serves on.
+        @test _SC.infer(sched, _sc_req())[1].data == reshape(Float32[2, 6], 2, 1)
+    finally
+        notify(gate)
+        _SC.shutdown!(sched)
+    end
+
+    # 0 disables the timeout: a slow request simply completes.
+    slow = _sc_entry("s"; fn = a -> (sleep(0.3); [a[1] .* a[2]]))
+    sched, _ = _sc_sched(slow; timeout = 0.0)
+    _SC.start!(sched)
+    try
+        @test _SC.infer(sched, _sc_req("s"))[1].data == reshape(Float32[2, 6], 2, 1)
+    finally
+        _SC.shutdown!(sched)
+    end
+end
 
 @testset "a dispatch loop that dies is fatal: logged, not live or ready, everything UNAVAILABLE" begin
     # A shape-variant model whose variant is read from input "v". A request without it fails the

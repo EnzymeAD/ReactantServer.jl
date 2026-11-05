@@ -66,6 +66,16 @@ dispatch is scheduled promptly and is never starved by the hook tasks that satur
 pool. With no interactive thread the default pool is used; correctness is unaffected, only the
 overlap.
 
+### How long a caller waits
+
+A caller waits for its request's result for at most `scheduler.dispatch_timeout_seconds` (30 s
+by default; 0 disables it), counted from submission, so queueing and execution together. Past it
+the request is withdrawn and the call fails with `DEADLINE_EXCEEDED`: a request still queued is
+dropped when the dispatch loop reaches it, without running, and one already executing finishes
+but its result is discarded. This is the bound that holds when nothing else does, for example a
+model whose weights read hangs. A client deadline is enforced separately, before dispatch (see
+[edf](#edf)).
+
 ### Status codes
 
 Every way a request can fail has one gRPC status, chosen by the kind of failure, so a client and
@@ -360,7 +370,7 @@ global:
     coalescing_discount: 0.10      # fair: cost discount applied to coalesced batches
     cost_ema_alpha: 0.2            # fair/edf: smoothing for the learned per-batch-size cost
     max_queue_depth: 1024          # per-model queue cap; a full model rejects new requests
-    dispatch_timeout_seconds: 30.0 # per-request execution timeout
+    dispatch_timeout_seconds: 30.0 # longest a caller waits for its result; 0 = no limit
     compaction_interval: 0         # worker-local memory compaction every N on-demand loads
     coalescing: true               # merge queued requests per dispatch (false under regulated)
     models: {}                     # per-model overrides (weight, residency, max_batch_size)

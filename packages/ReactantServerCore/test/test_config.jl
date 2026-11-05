@@ -175,7 +175,7 @@ end
         # validation rejects out-of-range knobs and bad per-model values
         for (key, val) in (
                 ("recency_penalty_cap", "1.5"), ("coalescing_discount", "1.0"),
-                ("cost_ema_alpha", "0"),
+                ("cost_ema_alpha", "0"), ("dispatch_timeout_seconds", "-1.0"),
             )
             c, _, _ = load_single_worker(dir, "scheduler:\n  $key: $val"; model_repo = modeldir)
             @test_throws ReactantServer.ConfigError ReactantServer.validate_config(c)

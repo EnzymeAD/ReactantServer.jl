@@ -139,15 +139,6 @@ function _resolve_residency(cfg::ServerConfig, name::AbstractString, on_demand::
     return on_demand && cfg.runtime.host_weight_budget === nothing ? PINNED_SYSTEM : UNPINNED
 end
 
-# The per-request execution timeout is parsed and validated but not enforced by the dispatch
-# loop (a mid-execution watchdog is out of scope). Warn operators who tuned it so the silence
-# is not mistaken for an effect.
-function _warn_unenforced_config(cfg::ServerConfig)
-    cfg.scheduler.dispatch_timeout_seconds != 30.0 &&
-        @warn "scheduler.dispatch_timeout_seconds is set but not enforced (no mid-execution watchdog)" value = cfg.scheduler.dispatch_timeout_seconds
-    return nothing
-end
-
 # The regulated profile deliberately leaves `numerics` alone, so it states the precision actually in
 # effect instead, prominently, for the deployment record. `f32` and `tf32` are both attested at
 # startup (tf32_probe throws otherwise), so they get a bannered info line naming the precision. Under
@@ -203,7 +194,6 @@ function _assert_tf32_not_overridden(env = ENV)
 end
 
 function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
-    _warn_unenforced_config(cfg)
     # numerics=f32 defense in depth: NVIDIA_TF32_OVERRIDE must be in the environment before the
     # CUDA client (and its cuBLAS/cuDNN handles) exists. It covers library-internal matmul paths
     # the op-level precision pin cannot see; it does NOT govern XLA's Triton GEMMs, which the pin

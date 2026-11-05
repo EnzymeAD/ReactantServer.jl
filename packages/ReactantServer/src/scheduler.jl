@@ -547,6 +547,8 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
     # get a DeadlineExceeded reply (mapped to gRPC DEADLINE_EXCEEDED upstream); only feasible ones run,
     # and when none are feasible we skip run_model entirely. The cost estimate is learned from prior
     # dispatches; unseeded it defaults small, so the laxity drop is a no-op until the model has run once.
+    # A request its caller has withdrawn (`_withdraw!`) is dropped here too, without a reply: nobody
+    # waits for one.
     now_ns = Int64(time_ns())
     laxity_ns = s.cfg.discipline == EDF ?
         round(Int64, get(st.cost_estimate, B, _DEFAULT_COST) * 1.0e9) : Int64(0)
@@ -556,7 +558,9 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
         # spent GPU on its earlier stages, so we do not abandon it on a prediction), but still honor
         # the base deadline-passed check, so a meta that has genuinely run out of time stops here.
         margin_ns = qr.committed ? Int64(0) : laxity_ns
-        if qr.req.deadline_ns != 0 && now_ns + margin_ns >= qr.req.deadline_ns
+        if _withdrawn(qr)
+            continue          # its caller stopped waiting (dispatch timeout, cancellation): never run it
+        elseif qr.req.deadline_ns != 0 && now_ns + margin_ns >= qr.req.deadline_ns
             put!(qr.reply, DeadlineExceeded(qr.req.model_name))
         else
             push!(live, qr)
@@ -1981,6 +1985,64 @@ function remove_meta!(s::Scheduler, name::AbstractString)
     return nothing
 end
 
+# ---------------------------------------------------------------------------------------------
+# Waiting for a reply: the dispatch timeout
+# ---------------------------------------------------------------------------------------------
+#
+# A caller waits on its request's reply channel for at most `scheduler.dispatch_timeout_seconds`
+# from submission. Past it the caller WITHDRAWS the request: the dispatch loop drops a withdrawn
+# request where it drops expired ones (`execute_and_record!`), so one still queued never runs, and
+# the result of one already executing is put on a channel nobody reads. The caller's wake-up is a
+# sentinel its own timer puts on the reply channel, which has room for it beside the scheduler's one
+# reply, so neither side ever blocks.
+
+# How often a waiting caller's timer checks its dispatch timeout.
+const _WAIT_POLL_SECONDS = 0.1
+
+# Put on a request's reply channel by its own caller's timer, never by the scheduler.
+struct _StopWaiting
+    err::Exception
+end
+
+# Withdraw a request its caller no longer waits for; see `_withdrawn`.
+_withdraw!(qr::QueuedRequest) = (qr.withdrawn[] = true; nothing)
+
+# Whether the dispatch loop must drop `qr` rather than run it: its caller stopped waiting.
+_withdrawn(qr::QueuedRequest) = qr.withdrawn[]
+
+# Wait for the reply to each of `qrs` (one request, or the pieces of a split one) and return them in
+# order. Past the dispatch timeout every piece is withdrawn and `DispatchTimeoutError` is thrown.
+function _await_replies(s::Scheduler, qrs::Vector{QueuedRequest})
+    timeout = s.cfg.dispatch_timeout_seconds
+    (timeout > 0 && isfinite(timeout)) || return Any[take!(qr.reply) for qr in qrs]
+    model = qrs[1].req.model_name
+    t0 = time()
+    poll = min(_WAIT_POLL_SECONDS, timeout)
+    # A Timer runs its callback on one task, one firing at a time, and this one closes itself when it
+    # fires, so each channel gets at most one wake-up.
+    timer = Timer(poll; interval = poll) do t
+        time() - t0 >= timeout || return
+        close(t)
+        for qr in qrs
+            put!(qr.reply, _StopWaiting(DispatchTimeoutError(model, timeout)))
+        end
+    end
+    try
+        replies = Vector{Any}(undef, length(qrs))
+        for (i, qr) in enumerate(qrs)
+            r = take!(qr.reply)
+            if r isa _StopWaiting
+                foreach(_withdraw!, qrs)
+                throw(r.err)
+            end
+            replies[i] = r
+        end
+        return replies
+    finally
+        close(timer)
+    end
+end
+
 # A preprocess that leaves out an input the shape variant is read from would fail the variant lookup
 # on the dispatch loop, where the failure cannot be pinned on this one request; fail it here instead.
 function _check_variant_inputs(entry::ModelEntry, prepared::Vector{NamedTensor})
@@ -2004,6 +2066,10 @@ loop hands back. Because each gRPC request runs on its own task, many requests' 
 proceeds in parallel and overlaps the single, serialized GPU execution. The dispatch loop coalesces
 and runs `qr.prepared` and never executes a request whose preprocess has not finished, since a
 request is only enqueued (made visible to the loop) after preprocess returns.
+
+The wait is bounded by `scheduler.dispatch_timeout_seconds` (0 waits indefinitely): past it the
+request is withdrawn (it never runs if still queued; a running one's result is discarded) and
+[`DispatchTimeoutError`](@ref) is thrown.
 """
 function infer(s::Scheduler, req::InferRequest; committed::Bool = false)
     entry = get(s.registry.by_name, req.model_name, nothing)
@@ -2033,7 +2099,7 @@ function infer(s::Scheduler, req::InferRequest; committed::Bool = false)
     end
     qr = QueuedRequest(req, prepared; committed = committed)
     submit!(s, qr)
-    raw = take!(qr.reply)
+    raw = only(_await_replies(s, [qr]))
     raw isa Exception && throw(raw)
     return Base.invokelatest(entry.postprocess, raw)
 end
@@ -2102,10 +2168,10 @@ function _infer_split(
         submit!(s, qr)
         push!(qrs, qr)
     end
+    replies = _await_replies(s, qrs)
     raws = Vector{Vector{NamedTensor}}(undef, length(qrs))
     failure = nothing
-    for (i, qr) in enumerate(qrs)
-        r = take!(qr.reply)
+    for (i, r) in enumerate(replies)
         if r isa Exception
             failure === nothing && (failure = r)
         else

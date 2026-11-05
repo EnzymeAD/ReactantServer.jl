@@ -339,7 +339,9 @@ bounds the recency adjustment; `coalescing_discount` is the cost discount applie
 batches; `cost_ema_alpha` is the smoothing factor for the learned per-batch-size cost;
 `max_queue_depth` caps each model's queue independently (a full model rejects new requests
 without affecting admission for the others); `dispatch_timeout_seconds` is the per-request
-execution timeout; `discipline` selects the inter-model ordering (see
+execution timeout, how long a request may wait for its result from submission (queueing and
+execution together) before it is withdrawn and fails with `DEADLINE_EXCEEDED` (0 disables it);
+`discipline` selects the inter-model ordering (see
 [`SchedulingDiscipline`](@ref)); `compaction_interval` runs worker-local memory compaction every N
 on-demand weight-cache loads (0 disables), the standalone (no-gateway) trigger, off by default so a
 gateway-fronted worker never self-compacts; and `models` holds the per-model
@@ -903,6 +905,8 @@ function validate_config(cfg::ServerConfig)
     0 <= cfg.scheduler.coalescing_discount < 1 || throw(ConfigError("scheduler.coalescing_discount must be in [0, 1)"))
     0 < cfg.scheduler.cost_ema_alpha <= 1 || throw(ConfigError("scheduler.cost_ema_alpha must be in (0, 1]"))
     cfg.scheduler.max_queue_depth > 0 || throw(ConfigError("scheduler.max_queue_depth must be positive"))
+    cfg.scheduler.dispatch_timeout_seconds >= 0 ||
+        throw(ConfigError("scheduler.dispatch_timeout_seconds must be non-negative (0 = no timeout)"))
     cfg.scheduler.compaction_interval >= 0 ||
         throw(ConfigError("scheduler.compaction_interval must be non-negative (0 = disabled)"))
     for (name, mc) in cfg.scheduler.models
