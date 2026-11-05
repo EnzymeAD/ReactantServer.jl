@@ -504,3 +504,26 @@ end
         )
     end
 end
+
+@testset "gateway file: explicit, REACTANT_GATEWAY_FILE, then the mount point" begin
+    mktempdir() do dir
+        mounted = joinpath(dir, "mounted.yml")
+        envfile = joinpath(dir, "env.yml")
+        explicit = joinpath(dir, "explicit.yml")
+        foreach(f -> write(f, "endpoints: []\n"), (mounted, envfile))
+        saved = RSN._DEFAULT_GATEWAY_FILE[]
+        RSN._DEFAULT_GATEWAY_FILE[] = mounted
+        try
+            @test RSN._resolve_gateway_path(nothing, Dict{String, String}()) == mounted
+            @test RSN._resolve_gateway_path(nothing, Dict("REACTANT_GATEWAY_FILE" => envfile)) == envfile
+            @test RSN._resolve_gateway_path(explicit, Dict("REACTANT_GATEWAY_FILE" => envfile)) == explicit
+            @test_throws ReactantServerCore.ConfigError RSN._resolve_gateway_path(
+                nothing, Dict("REACTANT_GATEWAY_FILE" => joinpath(dir, "missing.yml"))
+            )
+            rm(mounted)
+            @test RSN._resolve_gateway_path(nothing, Dict{String, String}()) === nothing
+        finally
+            RSN._DEFAULT_GATEWAY_FILE[] = saved
+        end
+    end
+end

@@ -82,6 +82,10 @@ function _write_materialized(node::AbstractDict, runtime_dir::Union{AbstractStri
     end
 end
 
+# The conventional gateway.yml mount point in the image. A Ref only so the tests can point it
+# elsewhere: on a host that has this file (a deployment's), build_supervisor would read it.
+const _DEFAULT_GATEWAY_FILE = Ref("/etc/reactantserver/gateway.yml")
+
 # An explicitly configured gateway file must exist; the conventional mount point is picked up
 # opportunistically. `nothing` means env-only gateway config (endpoints synthesized by us).
 function _resolve_gateway_path(gateway_path::Union{AbstractString, Nothing}, env::AbstractDict)
@@ -91,7 +95,7 @@ function _resolve_gateway_path(gateway_path::Union{AbstractString, Nothing}, env
         isfile(p) || throw(ConfigError("REACTANT_GATEWAY_FILE points at a missing file: $p"))
         return p
     end
-    p = "/etc/reactantserver/gateway.yml"
+    p = _DEFAULT_GATEWAY_FILE[]
     return isfile(p) ? p : nothing
 end
 

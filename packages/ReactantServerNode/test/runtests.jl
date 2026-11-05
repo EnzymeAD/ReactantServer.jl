@@ -17,6 +17,16 @@ end
 
 @testset "ReactantServerNode" begin
     include("test_gpus.jl")
-    include("test_spec.jl")
+    # build_supervisor falls back to the image's gateway.yml mount point whenever that file exists,
+    # and a host running a deployment may have one. Point the fallback at a path that does not exist
+    # so the spec tests see the env-only gateway on any host, then restore the production default.
+    default_gateway_file = RSN._DEFAULT_GATEWAY_FILE[]
+    RSN._DEFAULT_GATEWAY_FILE[] = joinpath(mktempdir(), "gateway.yml")
+    try
+        include("test_spec.jl")
+    finally
+        RSN._DEFAULT_GATEWAY_FILE[] = default_gateway_file
+    end
+    @test RSN._DEFAULT_GATEWAY_FILE[] == "/etc/reactantserver/gateway.yml"
     include("test_supervisor.jl")
 end
