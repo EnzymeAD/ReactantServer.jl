@@ -2,11 +2,11 @@
 # CPU end-to-end test of the supervised single-container layout, with no containers: the
 # ReactantServerNode supervisor spawns two CPU workers plus the embedded gateway as host
 # subprocesses, the client drives scale4 through the gateway, and SIGTERM drains the tree down.
-# Verifies worker synthesis (no workers list in the node file), the env-only embedded gateway,
-# prefixed log multiplexing, the graceful drain (with requests held in flight (slow4), the gateway
-# and then the workers refuse new requests with UNAVAILABLE, finish the admitted ones, and every
-# process exits 0), and what a client is told of an INTERNAL error in each `grpc.error_detail` mode
-# (a second node runs with `full`). Needs no GPU.
+# Verifies worker synthesis (no workers list in the node file), the embedded gateway, prefixed log
+# multiplexing, the graceful drain (with requests held in flight (slow4), the gateway and then the
+# workers refuse new requests with UNAVAILABLE, finish the admitted ones, and every process exits
+# 0), and what a client is told of an INTERNAL error in each `grpc.error_detail` mode (a second
+# node runs with `full`). Needs no GPU.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
@@ -65,7 +65,7 @@ register_model("slow4"; preprocess = function (inputs)
 end)
 EOF
 
-echo "== [2/7] writing node file and Reactant preference override =="
+echo "== [2/7] writing node file, gateway config and Reactant preference override =="
 # No workers list: the supervisor synthesizes them (REACTANT_CPU_WORKERS below).
 cat > "$WORK/node.yaml" << EOF
 model_repo: $WORK/models
@@ -93,10 +93,29 @@ persistent_cache_enabled = false
 EOF
 export JULIA_LOAD_PATH="$WORK/prefs:@:@v#.#:@stdlib"
 
+# The embedded gateway's config, pinned to this test's workers. Without REACTANT_GATEWAY_FILE the
+# supervisor reads /etc/reactantserver/gateway.yml whenever that file exists (a mounted config wins
+# in the image), so on a host with a deployment's file there the test gateway would route to that
+# deployment's workers. This lists what the supervisor would otherwise synthesize: worker i on
+# BASE_PORT + i, with metrics on METRICS_BASE_PORT + i.
+cat > "$WORK/gateway.yml" << EOF
+listen:
+  grpc: "127.0.0.1:$GW_PORT"
+  metrics: "127.0.0.1:$GW_METRICS_PORT"
+endpoints:
+  - "127.0.0.1:$BASE_PORT"
+  - "127.0.0.1:$((BASE_PORT + 1))"
+metrics_endpoints:
+  - "127.0.0.1:$METRICS_BASE_PORT"
+  - "127.0.0.1:$((METRICS_BASE_PORT + 1))"
+worker_names: [worker0, worker1]
+EOF
+
 echo "== [3/7] starting supervisor (2 CPU workers + embedded gateway) =="
 REACTANT_GPUS=0 \
 REACTANT_CPU_WORKERS=2 \
 REACTANT_WORKSPACE_ROOT="$REPO_ROOT" \
+REACTANT_GATEWAY_FILE="$WORK/gateway.yml" \
 REACTANT_GATEWAY_LISTEN_GRPC="127.0.0.1:$GW_PORT" \
 REACTANT_GATEWAY_LISTEN_METRICS="127.0.0.1:$GW_METRICS_PORT" \
 julia --handle-signals=no --threads=1,0 --project=packages/ReactantServerNode -e '
