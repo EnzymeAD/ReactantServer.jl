@@ -118,13 +118,16 @@ mutable struct Scheduler
     autosize::Union{Nothing, NamedTuple{(:arena, :fraction, :wiggle), Tuple{Int, Float64, Float64}}}
     # the arena and knobs the startup auto-sizing ran with, kept so a hot-loaded
     # model can be probed and the weight budget re-resolved without a restart
+    residency_lock::ReentrantLock              # one residency change at a time (`set_residency!`)
+    prefetched::Dict{String, Any}              # weights staged ahead of a placement change, by model
+    # (`stage_weights!`); guarded by `cond`
 end
 
 function Scheduler(registry::ModelRegistry, backend::AbstractBackend, pool::MemoryPool, cfg::SchedulerConfig)
     return Scheduler(
         registry, backend, pool, cfg,
         Threads.Condition(), false, nothing, nothing, nothing, ControlCommand[],
-        MetaGate(1), QueuedRequest[], 0, nothing
+        MetaGate(1), QueuedRequest[], 0, nothing, ReentrantLock(), Dict{String, Any}()
     )
 end
 
@@ -300,11 +303,14 @@ _schedulable(entry::ModelEntry) =
     entry.sched !== nothing && entry.executable !== nothing && !isempty(entry.sched.queue) &&
     !_awaiting_stage(entry)
 
-# A model whose weights a background task is reading into host memory waits for that read instead
-# of repeating it on the dispatch loop, which meanwhile serves the other models. A model already on
-# the device is never held back. See `_kick_staging!`.
+# A model whose weights must be read from the weights file waits for a background task to read them
+# (`:staging`), or for a free staging slot (`:pending`), instead of reading on the dispatch loop: a
+# read there holds the device idle for as long as the disk takes, which no request on any model
+# should pay for. Meanwhile the loop serves the other models. A model already on the device is never
+# held back. See `_kick_staging!`.
 _awaiting_stage(entry::ModelEntry) =
-    entry.sched.host_stage === :staging && entry.executable.weights === nothing
+    (entry.sched.host_stage === :staging || entry.sched.host_stage === :pending) &&
+    entry.executable.weights === nothing
 
 # There is work when any model has a queued request. A committed meta sub-call is pushed onto its
 # sub-model's queue, so it is covered by this scan (and `s.committed` is only ever set with that push).
@@ -865,6 +871,12 @@ end
 # Reject everything still pending at shutdown so no caller stays blocked on its reply channel:
 # queued requests across all models and any pending control commands. Caller holds `s.cond`.
 function _reject_pending_locked!(s::Scheduler)
+    for (name, pf) in s.prefetched
+        entry = get(s.registry.by_name, name, nothing)
+        (pf.staged === nothing || entry === nothing || s.weight_cache === nothing) ||
+            release_staged!(s.weight_cache, entry, pf.staged; uploaded = false)
+    end
+    empty!(s.prefetched)
     err = ErrorException("server is shutting down")
     for entry in values(s.registry.by_name)
         entry.sched === nothing && continue
@@ -955,11 +967,18 @@ end
 #
 # The read is host memory only, so at most `_MAX_HOST_STAGES` models per worker are read ahead
 # (counting those read and waiting for their dispatch), oldest queued request first. Each one
-# waiting holds its shared-store region against eviction until it is uploaded.
+# waiting holds its shared-store region against eviction until it is uploaded. A model past the cap
+# is `:pending`: it waits for a slot rather than reading on the dispatch loop. Its requests wait for
+# the read either way; on the loop they would also hold up every other model's.
+#
+# This runs after every pass of the dispatch loop and on every submission, so whatever left a queued
+# model off the device (an eviction, a compaction, a residency change) has marked it before the next
+# selection.
 
 const _MAX_HOST_STAGES = 2
 
-# Start background reads for models that need one, up to the cap. Caller holds `s.cond`.
+# Start background reads for models that need one, up to the cap, and mark the rest `:pending`.
+# Caller holds `s.cond`.
 function _kick_staging!(s::Scheduler)
     wc = s.weight_cache
     (wc === nothing || !s.running) && return nothing
@@ -970,17 +989,35 @@ function _kick_staging!(s::Scheduler)
         (st === nothing || e.executable === nothing) && continue
         if st.host_stage === :staging || st.host_stage === :staged
             busy += 1
-        elseif st.host_stage === :none && !isempty(st.queue) && needs_host_stage(wc, e)
-            push!(cands, e)
+        elseif st.host_stage === :none || st.host_stage === :pending
+            if !isempty(st.queue) && needs_host_stage(wc, e)
+                push!(cands, e)
+            else
+                st.host_stage = :none             # loaded meanwhile, or nothing left to read for
+            end
         end
     end
-    busy >= _MAX_HOST_STAGES && return nothing
     sort!(cands; by = e -> e.sched.queue[1].enqueued_at)
+    now = time()
     for e in cands
-        busy >= _MAX_HOST_STAGES && break
-        e.sched.host_stage = :staging
-        e.sched.stage_task = Threads.@spawn :default _run_stage!(s, e)
-        busy += 1
+        # Weights read ahead of a placement change (`stage_weights!`) need no second read.
+        pf = get(s.prefetched, e.name, nothing)
+        if pf !== nothing && pf.staged !== nothing && pf.expires > now
+            delete!(s.prefetched, e.name)
+            e.sched.staged = pf.staged
+            e.sched.host_stage = :staged
+            continue
+        elseif pf !== nothing && pf.staged === nothing
+            e.sched.host_stage = :pending         # its read is under way; `stage_weights!` kicks again after
+            continue
+        end
+        if busy < _MAX_HOST_STAGES
+            e.sched.host_stage = :staging
+            e.sched.stage_task = Threads.@spawn :default _run_stage!(s, e)
+            busy += 1
+        else
+            e.sched.host_stage = :pending
+        end
     end
     return nothing
 end
@@ -991,12 +1028,12 @@ end
 function _run_stage!(s::Scheduler, entry::ModelEntry)
     wc = s.weight_cache::WeightCache
     staged = nothing
-    failed = false
+    failure = nothing
     try
         staged = stage_host_weights(wc, entry)
     catch err
-        failed = true
-        @warn "reading weights ahead of the dispatch failed; the dispatch loads the model instead" model = entry.name exception = (err, catch_backtrace())
+        failure = err
+        @warn "reading weights ahead of the dispatch failed; failing the model's queued requests" model = entry.name exception = (err, catch_backtrace())
     end
     drop = nothing
     lock(s.cond) do
@@ -1007,9 +1044,17 @@ function _run_stage!(s::Scheduler, entry::ModelEntry)
             st.host_stage = :staged
         else
             drop = staged
-            # A failed read is not retried in the background: the dispatch loads the model and its
-            # requests see the error if there is one.
-            st.host_stage === :staging && (st.host_stage = failed ? :failed : :none)
+            # A failed read is not repeated on the dispatch loop: the requests waiting for it get the
+            # error, as they would have from a load that failed there, and the next request for the
+            # model starts a fresh read.
+            if failure !== nothing && st.host_stage === :staging
+                err = ErrorException("reading the weights of model '$(entry.name)' failed: $(sprint(showerror, failure))")
+                for qr in st.queue
+                    put!(qr.reply, err)
+                end
+                empty!(st.queue)
+            end
+            st.host_stage === :staging && (st.host_stage = :none)
         end
         st.stage_task = nothing
         _kick_staging!(s)
@@ -1017,6 +1062,174 @@ function _run_stage!(s::Scheduler, entry::ModelEntry)
     end
     drop === nothing || release_staged!(wc, entry, drop; uploaded = false)
     return nothing
+end
+
+# ---------------------------------------------------------------------------------------------
+# Staging ahead of a placement change (the StageWeights RPC)
+# ---------------------------------------------------------------------------------------------
+#
+# A gateway that moves a model onto this worker first asks for its weights to be read into host
+# memory, and switches routing only once they are, so the model's first request here waits for an
+# upload from RAM and never for a read from disk. The read runs on a default-pool task, never on the
+# dispatch loop. What it read is held (a shared-store region is kept from eviction) until the
+# model's first dispatch takes it, its hold expires, or the model is unloaded. The held bytes are
+# capped so a large plan cannot crowd out the host cache it relies on.
+
+const _PREFETCH_HOLD_MAX_SECONDS = 600.0
+const _PREFETCH_UNBUDGETED_CAP = 4 * 2^30     # held bytes with no host budget to size from
+
+mutable struct Prefetched
+    staged::Any                       # StagedWeights once read, nothing while reading
+    task::Union{Task, Nothing}        # the read while it runs
+    expires::Float64
+    nbytes::Int
+end
+
+# The most host memory held for reads ahead of placement changes: half the host budget, or a fixed
+# cap without one.
+function _prefetch_cap(wc::WeightCache)
+    b = host_budget(wc)
+    return b === nothing || b <= 0 ? _PREFETCH_UNBUDGETED_CAP : b ÷ 2
+end
+
+# Release holds that expired. Takes `s.cond` briefly; the releases run outside it.
+function _sweep_prefetched!(s::Scheduler; now::Float64 = time())
+    wc = s.weight_cache
+    expired = lock(s.cond) do
+        out = Tuple{String, Any}[]
+        for (name, pf) in s.prefetched
+            (pf.staged !== nothing && pf.expires <= now) && push!(out, (name, pf.staged))
+        end
+        for (name, _) in out
+            delete!(s.prefetched, name)
+        end
+        return out
+    end
+    for (name, staged) in expired
+        entry = get(s.registry.by_name, name, nothing)
+        (entry === nothing || wc === nothing) || release_staged!(wc, entry, staged; uploaded = false)
+    end
+    return nothing
+end
+
+"""
+    stage_weights!(scheduler, names; hold_seconds=60) -> Vector{NamedTuple}
+
+Read the weights of each model in `names` (each sub-model of a meta) into host memory ahead of a
+placement change, and hold them for `hold_seconds` (at most $(_PREFETCH_HOLD_MAX_SECONDS) s) or
+until the model's first dispatch uploads them. Runs the reads on default-pool tasks, never on the
+dispatch loop, and returns once they end. One row per requested name (a meta's combines its
+sub-models', taking the worst state):
+
+- `state`: `"resident"` (on the device, or with a host floor: nothing to read), `"staged"` (held
+  in host memory now), `"deferred"` (the held bytes would pass the cap; ask again later),
+  `"skipped"` (a CPU or externally-managed worker, where the gateway does not place weights), or
+  `"failed"` (the read failed, `error` says why)
+- `read`: whether the weights came from the weights file rather than a host copy
+- `nbytes`, `seconds`: the model's weight bytes, and how long the read took
+"""
+function stage_weights!(s::Scheduler, names::Vector{String}; hold_seconds::Real = 60.0)
+    wc = s.weight_cache
+    hold = clamp(Float64(hold_seconds), 0.0, _PREFETCH_HOLD_MAX_SECONDS)
+    wc === nothing || _sweep_prefetched!(s)
+    # The models each requested name stands for: itself, or a meta's sub-models.
+    groups = lock(s.cond) do
+        out = Pair{String, Vector{ModelEntry}}[]
+        for name in names
+            meta = get(s.registry.meta, name, nothing)
+            if meta !== nothing
+                push!(out, name => ModelEntry[s.registry.by_name[c] for c in meta.calls if haskey(s.registry.by_name, c)])
+            else
+                e = get(s.registry.by_name, name, nothing)
+                e === nothing && throw(ErrorException("unknown model: $name"))
+                push!(out, name => ModelEntry[e])
+            end
+        end
+        return out
+    end
+    entries = unique!(ModelEntry[e for (_, es) in groups for e in es])
+    rows = _stage_entries!(s, wc, entries, hold)
+    byname = Dict(r.name => r for r in rows)
+    # One row per requested name; a meta's is the worst of its sub-models' states.
+    rank = Dict("failed" => 5, "deferred" => 4, "staged" => 3, "resident" => 2, "skipped" => 1)
+    return map(groups) do (name, es)
+        rs = [byname[e.name] for e in es]
+        isempty(rs) && return (name = name, state = "resident", read = false, nbytes = 0, seconds = 0.0, error = "")
+        worst = rs[argmax([rank[r.state] for r in rs])]
+        return (
+            name = name, state = worst.state, read = any(r -> r.read, rs),
+            nbytes = sum(r -> r.nbytes, rs), seconds = maximum(r -> r.seconds, rs),
+            error = join(filter(!isempty, [r.error for r in rs]), "; "),
+        )
+    end
+end
+
+function _stage_entries!(s::Scheduler, wc, entries::Vector{ModelEntry}, hold::Float64)
+    row(e, state; read = false, seconds = 0.0, error = "") = (
+        name = e.name, state = state, read = read,
+        nbytes = e.executable === nothing ? 0 : Int(e.executable.nbytes), seconds = seconds, error = error,
+    )
+    rows = NamedTuple[]
+    pending = Tuple{ModelEntry, Prefetched}[]
+    for e in entries
+        if wc === nothing || wc.mode != SELF_MANAGED
+            push!(rows, row(e, "skipped"))
+            continue
+        end
+        m = e.executable
+        if m === nothing || is_device_pinned(m) || m.weights !== nothing || m.host_weights !== nothing
+            push!(rows, row(e, "resident"))
+            continue
+        end
+        state = lock(s.cond) do
+            pf = get(s.prefetched, e.name, nothing)
+            if pf !== nothing
+                pf.expires = max(pf.expires, time() + hold)      # an earlier request's read covers it
+                return "staged"
+            end
+            e.sched !== nothing && e.sched.host_stage in (:staging, :staged) && return "staged"
+            held = sum((p.nbytes for p in values(s.prefetched)); init = 0)
+            held + m.nbytes > _prefetch_cap(wc) && return "deferred"
+            pf = Prefetched(nothing, nothing, Inf, Int(m.nbytes))
+            pf.task = Threads.@spawn :default stage_host_weights(wc, e)
+            s.prefetched[e.name] = pf
+            push!(pending, (e, pf))
+            return ""
+        end
+        isempty(state) || push!(rows, row(e, state))
+    end
+    for (e, pf) in pending
+        t0 = time()
+        staged = nothing
+        err = ""
+        try
+            staged = fetch(pf.task::Task)
+        catch ex
+            err = sprint(showerror, ex isa TaskFailedException ? ex.task.result : ex)
+        end
+        dt = time() - t0
+        keep = lock(s.cond) do
+            pf.task = nothing
+            live = get(s.prefetched, e.name, nothing) === pf && get(s.registry.by_name, e.name, nothing) === e
+            if staged !== nothing && live
+                pf.staged = staged
+                pf.expires = time() + hold
+                return true
+            end
+            live && delete!(s.prefetched, e.name)
+            return false
+        end
+        keep || staged === nothing || release_staged!(wc, e, staged; uploaded = false)
+        if staged === nothing
+            @warn "reading weights ahead of a placement change failed" model = e.name exception = err
+            push!(rows, row(e, "failed"; seconds = dt, error = err))
+        else
+            push!(rows, row(e, keep ? "staged" : "resident"; read = !staged.hit, seconds = staged.host_seconds))
+        end
+    end
+    # The dispatch loop may already have requests waiting for one of these models.
+    isempty(pending) || lock(() -> (_kick_staging!(s); notify(s.cond)), s.cond)
+    return rows
 end
 
 # Make the dispatched model's weights resident, uploading its staged weights when it has them.
@@ -1034,9 +1247,15 @@ function _acquire_for_dispatch!(s::Scheduler, entry::ModelEntry)
             staged = st.staged
             st.staged = nothing
             st.host_stage = :loading
-        elseif st.host_stage === :none || st.host_stage === :failed
+        elseif st.host_stage === :none
             st.host_stage = :loading          # keeps a background read from starting for it now
         end
+    end
+    # Selection never picks a model whose weights still have to be read (`_awaiting_stage`), so a
+    # load here uploads from host memory. Refuse rather than read the file on the dispatch loop.
+    if staged === nothing && model.weights === nothing && needs_host_stage(wc, entry)
+        lock(() -> (st.host_stage === :loading && (st.host_stage = :none)), s.cond)
+        throw(ErrorException("internal: model '$(entry.name)' was dispatched before its weights were read into host memory"))
     end
     try
         acquire!(wc, entry; staged = staged)
@@ -1056,7 +1275,6 @@ function _release_idle_stage!(s::Scheduler, entry::ModelEntry)
     wc === nothing && return nothing
     staged = lock(s.cond) do
         st = entry.sched
-        st.host_stage === :failed && isempty(st.queue) && (st.host_stage = :none)
         (st.host_stage === :staged && isempty(st.queue)) || return nothing
         h = st.staged
         st.staged = nothing
@@ -1144,6 +1362,7 @@ function dispatch_loop(s::Scheduler)
         end
         # A residency change or a compaction can leave queued models off the device.
         lock(() -> _kick_staging!(s), s.cond)
+        isempty(s.prefetched) || _sweep_prefetched!(s)
     end
     return nothing
 end
@@ -1175,6 +1394,52 @@ worker rejects it otherwise. Runs on the dispatch thread (the sole residency mut
 until applied. Raises on an unknown model or in self-managed mode.
 """
 function set_residency!(s::Scheduler, name::AbstractString, target::ResidencyState)
+    # One residency change at a time, so the weights read ahead below are still what the op needs.
+    return lock(s.residency_lock) do
+        pre = _preread_for_residency(s, String(name), target)
+        try
+            _set_residency_op!(s, name, target, pre)
+        catch
+            for (nm, p) in pre
+                p.floor === nothing || host_release!(s.weight_cache.store, nm)
+            end
+            rethrow()
+        finally
+            for (_, p) in pre
+                p.staged === nothing || release_staged!(s.weight_cache, p.entry, p.staged; uploaded = false)
+            end
+        end
+    end
+end
+
+# Read, off the dispatch loop, what moving `name` (each sub-model, for a meta) to `target` would
+# otherwise read on it: a host floor for PINNED_SYSTEM, the weights to upload for PINNED_DEVICE.
+# A model with a host copy to take them from needs nothing read.
+function _preread_for_residency(s::Scheduler, name::String, target::ResidencyState)
+    pre = Dict{String, NamedTuple{(:entry, :floor, :staged), Tuple{ModelEntry, Any, Any}}}()
+    wc = s.weight_cache
+    (wc === nothing || wc.mode != EXTERNALLY_MANAGED || target == UNPINNED) && return pre
+    entries = lock(s.cond) do
+        meta = get(s.registry.meta, name, nothing)
+        meta === nothing && return ModelEntry[e for e in (get(s.registry.by_name, name, nothing),) if e !== nothing]
+        return ModelEntry[s.registry.by_name[c] for c in meta.calls if haskey(s.registry.by_name, c)]
+    end
+    for e in entries
+        m = e.executable
+        (m === nothing || m.state == target || m.host_weights !== nothing) && continue
+        if target == PINNED_SYSTEM
+            has_host_copy(wc, e) && !(wc.store isa SharedWeightStore) && continue   # taken from the private cache
+            pre[e.name] = (entry = e, floor = host_materialize(wc.store, e, m.sig.weight_names), staged = nothing)
+        elseif target == PINNED_DEVICE && m.weights === nothing
+            pre[e.name] = (entry = e, floor = nothing, staged = stage_host_weights(wc, e))
+        end
+    end
+    return pre
+end
+
+function _set_residency_op!(s::Scheduler, name::AbstractString, target::ResidencyState, pre)
+    floor_of(e) = (p = get(pre, e.name, nothing); p === nothing ? nothing : p.floor)
+    staged_of(e) = (p = get(pre, e.name, nothing); p === nothing ? nothing : p.staged)
     return _run_control(
         s, function (sch)
             sch.weight_cache === nothing &&
@@ -1198,13 +1463,13 @@ function set_residency!(s::Scheduler, name::AbstractString, target::ResidencySta
                         )
                         continue
                     end
-                    last = set_residency_state!(sch.weight_cache, e, target)
+                    last = set_residency_state!(sch.weight_cache, e, target; floor = floor_of(e), staged = staged_of(e))
                 end
                 return last
             end
             entry = get(sch.registry.by_name, nm, nothing)
             entry === nothing && throw(ErrorException("unknown model: $name"))
-            return set_residency_state!(sch.weight_cache, entry, target)
+            return set_residency_state!(sch.weight_cache, entry, target; floor = floor_of(entry), staged = staged_of(entry))
         end
     )
 end
@@ -1290,26 +1555,45 @@ end
 # ---------------------------------------------------------------------------------------------
 
 # Insert a compiled entry into the live registry and prepare it for dispatch. Runs on the dispatch
-# thread (warmup executes the model). Raises on a duplicate name. Returns the model name.
-function _admit_entry!(sch::Scheduler, entry::ModelEntry)
+# thread (warmup executes the model). Raises on a duplicate name. Returns the model name. `staged` is
+# the model's weights read into host memory before the control op (see `_prestage_for_admit`): the
+# first upload uses them, so warmup and the budget re-probe never read the weights file here.
+function _admit_entry!(sch::Scheduler, entry::ModelEntry; staged = nothing)
     lock(sch.cond) do
         haskey(sch.registry.by_name, entry.name) &&
             throw(ErrorException("model '$(entry.name)' is already registered"))
         sch.registry.by_name[entry.name] = entry
         init_sched_state!(sch, entry, time())
     end
+    staged === nothing || acquire!(sch.weight_cache, entry; staged = staged)
     # Warmup runs the model on this (the dispatch) thread, outside the lock.
     sch.cfg.discipline == FAIR && _warmup_entry!(sch, entry)
     return entry.name
 end
 
+# Whether admitting `entry` runs it, and so loads its weights, inside the control op: warmup under
+# the fair discipline, or the budget re-probe after a hot load.
+_admit_runs_model(sch::Scheduler) = sch.cfg.discipline == FAIR || sch.autosize !== nothing
+
+# Read an unpinned (or not yet floored) model's weights into host memory before its admission's
+# control op, when that op will run the model, so the op only uploads them. `nothing` when nothing
+# would be read there. Runs on the caller's task, off the dispatch loop.
+function _prestage_for_admit(
+        sch::Scheduler, entry::ModelEntry, names::Vector{String}; resident::Bool = false
+    )
+    wc = sch.weight_cache
+    (wc === nothing || wc.mode != SELF_MANAGED || resident || !_admit_runs_model(sch)) && return nothing
+    return stage_host_weights(wc, entry, names)
+end
+
 # Remove a model from the live registry, rejecting any queued requests, and release its residency.
 # Runs on the dispatch thread. Returns the removed entry, or `nothing` if it was not registered.
 function _evict_entry!(sch::Scheduler, name::AbstractString)
-    entry, reading, staged = lock(sch.cond) do
+    entry, reading, staged, pf = lock(sch.cond) do
         e = pop!(sch.registry.by_name, String(name), nothing)
         t = nothing
         h = nothing
+        p = e === nothing ? nothing : pop!(sch.prefetched, e.name, nothing)
         if e !== nothing && e.sched !== nothing
             for qr in e.sched.queue
                 put!(qr.reply, ErrorException("model '$name' was unloaded"))
@@ -1320,13 +1604,18 @@ function _evict_entry!(sch::Scheduler, name::AbstractString)
             e.sched.staged = nothing
             e.sched.host_stage = :none
         end
-        return (e, t, h)
+        return (e, t, h, p)
     end
     entry === nothing && return nothing
     # A background read of this model's weights must end before its weights file is closed below:
     # a descriptor closed under a running pread can be reused by another open, and the read would
     # then copy the wrong file's bytes. The read sees the model gone and drops what it read.
     reading === nothing || wait(reading)
+    if pf !== nothing
+        pf.task === nothing || wait(pf.task)       # a read ahead of a placement change, likewise
+        pf.staged === nothing || sch.weight_cache === nothing ||
+            release_staged!(sch.weight_cache, entry, pf.staged; uploaded = false)
+    end
     staged === nothing || sch.weight_cache === nothing ||
         release_staged!(sch.weight_cache, entry, staged; uploaded = false)
     # Release residency outside the lock (device frees can be slow).
@@ -1361,7 +1650,16 @@ Raises on a duplicate name or an uncompiled entry. Returns the model name.
 function admit!(s::Scheduler, entry::ModelEntry)
     entry.executable === nothing &&
         throw(ErrorException("model '$(entry.name)' has no compiled executable; compile before admit!"))
-    return _run_control(s, sch -> _admit_entry!(sch, entry))
+    m = entry.executable
+    staged = _prestage_for_admit(
+        s, entry, m.sig.weight_names;
+        resident = m.weights !== nothing || m.host_weights !== nothing || is_device_pinned(m)
+    )
+    try
+        return _run_control(s, sch -> _admit_entry!(sch, entry; staged = staged))
+    finally
+        staged === nothing || release_staged!(s.weight_cache, entry, staged; uploaded = false)
+    end
 end
 
 """
@@ -1390,19 +1688,58 @@ function load_model!(
         state::ResidencyState, on_demand::Bool, store::WeightStore = PrivateWeightStore(),
         executable_cache::Bool = false
     )
-    return _run_control(
+    # Read the weights before the control op, which runs on the dispatch loop: a device-resident
+    # model's host arrays (and a CPU worker's, which keeps every model resident), or an on-demand
+    # model's staged weights when admission will run it. A system-pinned model's host floor is
+    # materialized after the op instead (`_attach_floor!`): the old version's floor, which shares
+    # its name in the shared store, is released inside the op.
+    names = weight_order(entry.weights)
+    host_arrays = nothing
+    staged = nothing
+    if !on_demand || state == PINNED_DEVICE
+        host_arrays = materialize_host_weights(entry.weights, names)
+        _check_unmodified(entry)
+    else
+        staged = _prestage_for_admit(s, entry, names)
+    end
+    defer_floor = on_demand && state == PINNED_SYSTEM
+    name = try
+        _run_control(
+            s, function (sch)
+                _evict_entry!(sch, entry.name)          # no-op on a fresh load; frees device memory on reload
+                entry.executable = build_loaded_model(
+                    backend, pool, entry;
+                    state = state, on_demand = on_demand, store = store, source = :dynamic,
+                    executable_cache = executable_cache, host_arrays = host_arrays,
+                    defer_floor = defer_floor
+                )
+                n = _admit_entry!(sch, entry; staged = staged)
+                _reprobe_after_load!(sch, entry)
+                return n
+            end
+        )
+    finally
+        staged === nothing || release_staged!(s.weight_cache, entry, staged; uploaded = false)
+    end
+    defer_floor && _attach_floor!(s, entry, store, names)
+    return name
+end
+
+# Give a hot-loaded system-pinned model its host floor: read it off the dispatch loop, then commit
+# it in a control op. Until then the model serves like an unpinned one (staged on demand).
+function _attach_floor!(s::Scheduler, entry::ModelEntry, store::WeightStore, names::Vector{String})
+    floor = host_materialize(store, entry, names)
+    attached = _run_control(
         s, function (sch)
-            _evict_entry!(sch, entry.name)          # no-op on a fresh load; frees device memory on reload
-            entry.executable = build_loaded_model(
-                backend, pool, entry;
-                state = state, on_demand = on_demand, store = store, source = :dynamic,
-                executable_cache = executable_cache
-            )
-            name = _admit_entry!(sch, entry)
-            _reprobe_after_load!(sch, entry)
-            return name
+            live = get(sch.registry.by_name, entry.name, nothing) === entry
+            (live && entry.executable.host_weights === nothing) || return false
+            sch.weight_cache === nothing ? (entry.executable.host_weights = floor) :
+                attach_host_floor!(sch.weight_cache, entry, floor)
+            return true
         end
     )
+    attached || host_release!(store, entry.name)
+    return nothing
 end
 
 # After a hot load, fold the new model into the weight budget without a restart: reset the
@@ -1781,6 +2118,41 @@ function describe_models(s::Scheduler, names::AbstractVector{<:AbstractString})
 end
 
 """
+    load_costs(scheduler, names) -> Dict{String, NamedTuple}
+
+What loading each named model (a meta: its sub-models together) onto the device costs, for a
+gateway pricing placement changes: whether a host copy exists to upload from, the upload's device
+seconds, the weights-file read's seconds (off the device), and the model's device loads so far (not
+counting the startup probe's). Empty on a worker with no on-demand weight cache. Called outside
+`s.cond`: `has_host_copy` stats the shared store.
+"""
+function load_costs(s::Scheduler, names)
+    wc = s.weight_cache
+    out = Dict{String, NamedTuple{(:host_copy, :upload_seconds, :read_seconds, :loads), Tuple{Bool, Float64, Float64, Int}}}()
+    wc === nothing && return out
+    for name in names
+        entries = lock(s.cond) do
+            meta = get(s.registry.meta, name, nothing)
+            meta === nothing && return ModelEntry[e for e in (get(s.registry.by_name, name, nothing),) if e !== nothing]
+            return ModelEntry[s.registry.by_name[c] for c in meta.calls if haskey(s.registry.by_name, c)]
+        end
+        host, up, rd, loads = true, 0.0, 0.0, 0
+        any_weights = false
+        for e in entries
+            e.executable === nothing && continue
+            any_weights = true
+            fp = model_footprint(wc, e)
+            up += reload_seconds(wc, fp)
+            rd += read_seconds(wc, fp)
+            loads += fp.loads - fp.probe_loads
+            host &= has_host_copy(wc, e)
+        end
+        out[name] = (host_copy = any_weights && host, upload_seconds = up, read_seconds = rd, loads = loads)
+    end
+    return out
+end
+
+"""
     control_status(scheduler) -> NamedTuple
 
 A control-plane snapshot of the worker: its residency mode and scheduling discipline, plus a
@@ -1789,6 +2161,9 @@ weights; the internal sub-models are folded into it and not reported on their ow
 packs and routes the group as one unit and never sees the stages.
 """
 function control_status(s::Scheduler)
+    # Host-cache figures first, outside `s.cond`: with the shared store they read /dev/shm.
+    hb = s.weight_cache === nothing ? nothing : host_budget(s.weight_cache)
+    hcached = s.weight_cache === nothing ? 0 : host_cached_bytes(s.weight_cache)
     return lock(s.cond) do
         mode = s.weight_cache === nothing ? SELF_MANAGED : s.weight_cache.mode
         subs = internal_submodels(s.registry)
@@ -1830,6 +2205,8 @@ function control_status(s::Scheduler)
         return (
             residency_mode = mode, discipline = s.cfg.discipline, models = models,
             weight_cache_max_bytes = cache_max,
+            host_weight_budget_bytes = hb === nothing ? 0 : hb,
+            host_cached_bytes = hcached,
         )
     end
 end

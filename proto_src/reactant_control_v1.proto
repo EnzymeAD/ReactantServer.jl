@@ -29,6 +29,12 @@ service ControlService
   // pinned models (always) plus any named in reload_models. Used to defragment the device arena.
   rpc CompactMemory(CompactMemoryRequest) returns (CompactMemoryResponse) {}
 
+  // Read models' weights into host memory ahead of a placement change and hold them until each
+  // model's first dispatch uploads them (or the hold expires), so a request routed to this worker
+  // after the change waits for an upload from RAM, never for a read from disk. The reads run off the
+  // dispatch loop; the RPC returns once they end. Self-managed GPU workers only.
+  rpc StageWeights(StageWeightsRequest) returns (StageWeightsResponse) {}
+
   // Describe the served models: each one's client-facing inputs and outputs with the kind of every
   // axis, the batch sizes and input shapes it was compiled for, and the models a meta model calls.
   // KServe's ModelMetadata carries the tensors alone and writes -1 for a batch axis and a variable
@@ -86,6 +92,15 @@ message ModelStatus
   // that already embeds whatever batch sizes the client happened to send and so cannot be scaled by
   // an item count without double-counting.
   uint64 rows_served = 14;
+  // Costs of loading this model onto the device, for a gateway pricing a placement change. A load
+  // uploads its weights (`upload_seconds`, the device time it holds this worker for) and, when no
+  // copy is left in host memory (`host_copy` false), first reads the weights file (`read_seconds`,
+  // off the device's time: the latency a request waits for it). Each is the model's measured
+  // average, or its bytes over the worker's measured bandwidth before it was measured.
+  bool host_copy = 15;              // a host floor, a cached copy, or a shared-store region exists
+  double upload_seconds = 16;
+  double read_seconds = 17;
+  uint64 loads = 18;                // cumulative device loads of this model (evictions it recovered from)
 }
 
 message ModelControlStatusResponse
@@ -99,6 +114,10 @@ message ModelControlStatusResponse
   // gateway packs model weight footprints against. 0 when the on-demand cache is disabled
   // (every model stays device-resident), meaning memory is not a packing constraint.
   uint64 weight_cache_max_bytes = 4;
+  // The host weight budget this worker enforces (node-wide with the shared store; 0 = none) and what
+  // it currently counts against it.
+  uint64 host_weight_budget_bytes = 5;
+  uint64 host_cached_bytes = 6;
 }
 
 message SetModelResidencyRequest
@@ -111,6 +130,32 @@ message SetModelResidencyResponse
 {
   // The resulting residency state.
   Residency residency = 1;
+}
+
+message StageWeightsRequest
+{
+  repeated string names = 1;        // models (a meta stages each of its sub-models)
+  double hold_seconds = 2;          // how long to hold what was read for a dispatch; clamped by the worker
+}
+
+message StagedModel
+{
+  string name = 1;
+  // "resident"  on the device or with a host floor: nothing to read
+  // "staged"    held in host memory until its first dispatch or the hold expires
+  // "deferred"  not read: the worker's held bytes would pass its cap; ask again later
+  // "skipped"   a CPU or externally-managed worker, where placement does not load weights
+  // "failed"    the read failed (see error)
+  string state = 2;
+  bool read = 3;                    // the weights came from the weights file, not a host copy
+  int64 weight_nbytes = 4;
+  double seconds = 5;               // how long the read took
+  string error = 6;
+}
+
+message StageWeightsResponse
+{
+  repeated StagedModel models = 1;
 }
 
 message SetModelPolicyRequest
@@ -258,6 +303,14 @@ message SchedulingPolicy
   // "items", or "requests" (the model's measured cost per REQUEST, the behavior before this knob
   // existed). Only fill_least reads it; fill_rr is load-blind.
   string work_basis = 13;
+  // A repack makes a placement change only when the latency it saves over this many seconds exceeds
+  // the latency its weight uploads cost (see the lpt_packing docs).
+  double payback_seconds = 14;
+  // Read each moving model's weights into host memory on its new worker before routing switches,
+  // so no request waits for a read from disk (StageWeights). A change whose read fails or does not
+  // finish within stage_timeout_seconds is dropped from that repack.
+  bool prime_moves = 15;
+  double stage_timeout_seconds = 16;
 }
 
 message GetSchedulingStatusRequest {}
@@ -280,6 +333,16 @@ message RepackStatus
   // Operator-forced repack handshake counters (see Repack).
   uint64 operator_repacks_requested = 13;
   uint64 operator_repacks_completed = 14;
+  // The last repack's placement changes (a move or a swap each): planned, and of those, committed
+  // after their weights were staged, or dropped because staging failed, was deferred or timed out.
+  int64 last_changes_planned = 15;
+  int64 last_changes_committed = 16;
+  int64 last_changes_dropped = 17;
+  bool staging_in_progress = 18;     // a repack is waiting for its moves' weights to be staged
+  // The objective the last repack reached: the expected number of requests in the system, summed
+  // over workers (see the lpt_packing docs), before and after its changes.
+  double last_objective_before = 19;
+  double last_objective_after = 20;
 }
 
 message ReplicaPlacement
@@ -379,6 +442,9 @@ message RepackRequest
   // Bounded wait for the repack to land, in seconds. 0 returns as soon as the request is queued.
   // Clamped to a server maximum; the caller's own gRPC deadline still wins.
   double wait_seconds = 1;
+  // Pack from scratch instead of improving the live placement, and install the result without
+  // staging its moves first. Can move most models at once; an operator's escape hatch.
+  bool full = 2;
 }
 
 message RepackResponse

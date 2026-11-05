@@ -4,13 +4,15 @@
 # when every model is loaded on every worker; concentration is the point of this mode.
 #
 # Each model is placed on a fixed, operator-configured number of distinct GPUs (`replicas`,
-# default 1, never grown automatically under load). The packer chooses which GPUs by balancing two
-# dimensions: expected compute utilization u_m = lambda_m * c_m (lambda_m the gateway-measured
-# arrival rate EWMA, c_m the worker-reported per-request compute cost, both smoothed) and resident
-# weight memory (ModelStatus.weight_nbytes) against each worker's weight-memory budget
-# (ModelControlStatusResponse.weight_cache_max_bytes). The placement score is the max of the
-# normalized compute and memory loads, so the packer simultaneously minimizes weight
-# eviction/loading (memory pressure) and keeps every GPU busy (compute balance).
+# default 1, never grown automatically under load). The startup placement packs from scratch by
+# balancing expected compute utilization u_m = lambda_m * c_m (lambda_m the gateway-measured arrival
+# rate EWMA, c_m the worker-reported per-request compute cost, both smoothed) against resident weight
+# memory (ModelStatus.weight_nbytes) per worker budget (weight_cache_max_bytes). Every placement is
+# then improved, and every later repack changed, by one objective: mean latency, from each worker's
+# device time per second (its compute plus the uploads its weight budget forces), with each change
+# paying for its own weight uploads. See "the objective" below. A change that moves a model off a
+# GPU still serving it is primed: its weights are staged on the new worker before routing switches
+# (`_prime_and_commit!`).
 #
 # Within a model's replica set the gateway concentrates its requests on one replica at a time, so the
 # workers receive deep same-model groupings to coalesce. `routing_fill_mode` decides what the fill
@@ -109,8 +111,13 @@ guarantee finding a feasible packing that exists.
 mutable struct RepackStats
     held::Int
     max_improvement::Float64
+    # Filled by `rebalance_assignment`: each change it made (the models one move, swap or placement
+    # touched), and the objective before its improvement step and after.
+    changes::Vector{Vector{String}}
+    objective_before::Float64
+    objective_after::Float64
 end
-RepackStats() = RepackStats(0, 0.0)
+RepackStats() = RepackStats(0, 0.0, Vector{String}[], 0.0, 0.0)
 
 function compute_assignment(
         u::Dict{String, Float64}, workers::Vector{String},
@@ -194,29 +201,89 @@ function compute_assignment(
     return out
 end
 
+# --- the objective --------------------------------------------------------------------------------
+#
+# A repack weighs three things against each other: throughput (keep every GPU busy without
+# saturating any), latency (requests wait in a busy worker's queue, and for a model's weights to
+# load), and memory (a worker's weight budget holds only so many models at once). All three reduce
+# to one resource, device time, and one objective, mean latency.
+#
+# A worker's load is its device time per second:
+#
+#     rho_w = sum of u_m over the models routed to w          (compute: arrival rate x cost per request)
+#           + sum of f_m x U_m over those its budget cannot hold at once      (upload churn)
+#
+# where `f_m` is how often a model's requests arrive (each one that finds it evicted uploads it
+# again) and `U_m` its upload time. The worker keeps the models with the most upload seconds saved
+# per byte held, which is how its own eviction policy ranks them; since `U_m` grows with the bytes,
+# that is close to keeping the most often requested models whatever their size. Memory therefore
+# costs nothing until it overflows, and then costs exactly the uploads the overflow causes, in the
+# same units as compute.
+#
+# A queue's mean number of requests in the system is `rho / (1 - rho)` (a single-server queue), and by
+# Little's law mean latency is the total of that over the workers divided by the arrival rate. The
+# objective is that total, `N = sum_w queue_term(rho_w)`. It rises steeply as a worker nears
+# saturation, which is what makes relieving a saturated worker worth a load and churning an idle
+# fleet not.
+#
+# A change (moving one replica, or swapping two models between workers) is made only when it pays
+# for itself: the requests-in-system it removes, held for `payback_seconds`, must exceed the latency
+# its uploads add, `U x (1 + queue_term(rho))` per upload on the worker doing it (the requests already
+# waiting there, plus the one that triggers it). Reading the weights file is not counted: a primed
+# move reads it before routing switches, off the device and off every request's path.
+
+const _RHO_CAP = 0.95
+
+"""
+    queue_term(rho) -> Float64
+
+Mean number of requests in the system of a worker at utilization `rho` (`rho / (1 - rho)`), continued
+linearly past $(_RHO_CAP) with its slope there, so an overloaded worker still ranks by how overloaded
+it is instead of reading infinite.
+"""
+function queue_term(rho::Real)
+    r = Float64(rho)
+    r <= 0 && return 0.0
+    r < _RHO_CAP && return r / (1 - r)
+    return _RHO_CAP / (1 - _RHO_CAP) + (r - _RHO_CAP) / (1 - _RHO_CAP)^2
+end
+
+# The upload time assumed for a model no worker has reported one for: its bytes at this rate.
+const DEFAULT_UPLOAD_BYTES_PER_SECOND = 2.0^30
+
 """
     rebalance_assignment(u, workers, prev; mem=Dict(), mem_cap=Dict(), replicas=Dict(),
-                         default_replicas=1, min_gain=0.05,
-                         forbid_memory_oversubscription=false, stats=nothing)
+                         default_replicas=1, min_gain=0.05, forbid_memory_oversubscription=false,
+                         rate=Dict(), upload=Dict(), payback_seconds=600.0, free_moves=false,
+                         stats=nothing)
         -> Dict{String,Placement}
 
-Rebalance an existing placement with as few moves as possible, the counterpart of
-[`compute_assignment`](@ref) for every repack after the first. Every move costs a weight load (often a
-read from disk) and fragments the worker it lands on, so instead of packing from scratch, which on a
-memory-bound fleet reorders the whole pack and can move most models (68 of 95 on one measured repack),
-this keeps `prev` and changes only what it must:
+Improve an existing placement by the changes that pay for themselves (see "the objective" above).
+Every change is a weight upload on the worker it lands on, so instead of packing from scratch, which
+on a memory-bound fleet reorders the whole pack and can move most models (68 of 95 on one measured
+repack), this keeps `prev` and changes only what it must or what is worth it:
 
 1. Keep every placement whose workers are still present. A model whose worker left, a new model, or a
-   raised replica count gets the missing replicas on the lowest-pressure workers, largest demand
-   first; a lowered replica count drops the extra replicas.
+   raised replica count gets the missing replicas on the least loaded workers, largest demand first;
+   a lowered replica count drops the extra replicas.
 2. With `forbid_memory_oversubscription`, shed models from any worker over its weight budget onto
    workers where they fit, preferring the smallest model that clears the overflow.
-3. Repeatedly make the single move off the highest-pressure worker that lowers its pressure the most
-   per byte moved, as long as the gain is at least `min_gain` of that pressure and the destination
-   ends below the source's old pressure. Pressure is the same max-norm as the packer's: the larger of
-   a worker's compute load and its weight memory over budget.
+3. Repeatedly make the best change off the most loaded worker: move one of its models' replicas to
+   another worker, or swap one for a model of another worker, which is the only change that fits
+   when every worker is at its budget. A change is made when it lowers the objective by at least
+   `min_gain` of the two workers' share of it (a floor against noise in the rate estimates) and the
+   latency it saves over `payback_seconds` exceeds what its uploads cost; the best is the one with
+   the most net saving.
 
-With nothing to fix and no move worth `min_gain`, the result is `prev` (restricted to `u` and to the
+`u` is each model's compute (GPU-seconds per second), `rate` its request rate, `upload` the seconds
+one upload of its weights holds a device (`mem / DEFAULT_UPLOAD_BYTES_PER_SECOND` when absent), `mem`
+its weight bytes and `mem_cap` each worker's weight budget. With `forbid_memory_oversubscription`
+the budget is a hard constraint on every change (a worker already over it may not grow); without it,
+an overflow is allowed and priced by the uploads it causes. `free_moves` prices uploads at zero, for a
+placement nothing has loaded yet (the startup pack, a full repack). `stats` (a [`RepackStats`](@ref))
+receives each change made, as the models it moved, and the objective before and after.
+
+With nothing to fix and no change worth it, the result is `prev` (restricted to `u` and to the
 present workers). Weights are even across a model's replicas, as in the packer.
 """
 function rebalance_assignment(
@@ -227,6 +294,9 @@ function rebalance_assignment(
         replicas::Dict{String, Int} = Dict{String, Int}(),
         default_replicas::Int = 1, min_gain::Float64 = 0.05,
         forbid_memory_oversubscription::Bool = false,
+        rate::Dict{String, Float64} = Dict{String, Float64}(),
+        upload::Dict{String, Float64} = Dict{String, Float64}(),
+        payback_seconds::Float64 = 600.0, free_moves::Bool = false,
         stats::Union{Nothing, RepackStats} = nothing
     )
     out = Dict{String, Placement}()
@@ -234,20 +304,57 @@ function rebalance_assignment(
     present = Set(workers)
     capof(w) = (c = get(mem_cap, w, Inf); c <= 0 ? Inf : c)
     memof(m) = get(mem, m, 0.0)
+    upof(m) = (x = get(upload, m, 0.0); x > 0 ? x : memof(m) / DEFAULT_UPLOAD_BYTES_PER_SECOND)
     cload = Dict{String, Float64}(w => 0.0 for w in workers)
     mload = Dict{String, Float64}(w => 0.0 for w in workers)
-    pressure(w, c = cload[w], b = mload[w]) = max(c, capof(w) == Inf ? 0.0 : b / capof(w))
-    fits(w, b) = (c = capof(w); c == Inf || mload[w] + b <= c)
+    on = Dict{String, Set{String}}(w => Set{String}() for w in workers)
     members = Dict{String, Vector{String}}()
     share(m) = u[m] / length(members[m])
+    # A replica's request rate: its model's, split evenly over the replicas.
+    rshare(m, k = length(members[m])) = get(rate, m, 0.0) / max(k, 1)
     function charge!(m, sign)
         s = share(m)
         for w in members[m]
             cload[w] += sign * s
             mload[w] += sign * memof(m)
+            sign > 0 ? push!(on[w], m) : delete!(on[w], m)
         end
         return
     end
+    fits(w, b) = (c = capof(w); c == Inf || mload[w] + b <= c)
+    # A worker's weights after a change are acceptable within budget, or when they do not grow.
+    holds(w, b) = !forbid_memory_oversubscription || (c = capof(w); c == Inf || b <= c || b <= mload[w])
+
+    # Upload churn on `w` if it held `ms` (bytes `bytes`): the replicas its budget cannot hold, kept in
+    # order of upload seconds saved per byte, each re-uploaded about as often as its requests arrive.
+    function churn(w, ms, bytes)
+        cap = capof(w)
+        (cap == Inf || bytes <= cap) && return 0.0
+        order = sort!(collect(ms); by = m -> (-rshare(m) * upof(m) / max(memof(m), 1.0), m))
+        used = 0.0
+        c = 0.0
+        for m in order
+            b = memof(m)
+            if used + b <= cap
+                used += b
+            else
+                c += rshare(m) * upof(m)
+            end
+        end
+        return c
+    end
+    load(w) = cload[w] + churn(w, on[w], mload[w])
+    # The load `w` would carry after losing `out_m` and gaining `in_m` (either may be `nothing`), with
+    # compute `c` and weight bytes `b` already adjusted by the caller.
+    function load_after(w, c, b, out_m, in_m)
+        cap = capof(w)
+        (cap == Inf || b <= cap) && return c
+        ms = copy(on[w])
+        out_m === nothing || delete!(ms, out_m)
+        in_m === nothing || push!(ms, in_m)
+        return c + churn(w, ms, b)
+    end
+    objective() = sum(queue_term(load(w)) for w in workers)
 
     # 1. Keep what stands; collect the replicas that are missing.
     want = Dict{String, Int}()
@@ -266,11 +373,13 @@ function rebalance_assignment(
         need = want[m] - length(members[m])
         k = want[m]
         fitrank(w) = (forbid_memory_oversubscription && !fits(w, memof(m))) ? 1 : 0
+        after(w) = load_after(w, cload[w] + u[m] / k, mload[w] + memof(m), nothing, m)
         cands = [w for w in workers if !(w in members[m])]
-        sort!(cands; by = w -> (fitrank(w), pressure(w, cload[w] + u[m] / k, mload[w] + memof(m)), w))
+        sort!(cands; by = w -> (fitrank(w), after(w), w))
         append!(members[m], cands[1:need])
         sort!(members[m])
         charge!(m, 1)
+        stats === nothing || push!(stats.changes, [m])
     end
 
     # Move one replica of `m` from `src` to `dst`, keeping the loads current.
@@ -281,6 +390,15 @@ function rebalance_assignment(
         charge!(m, 1)
         return
     end
+    # Swap `m` (on `src`) with `m2` (on `dst`).
+    function swap!(m, src, m2, dst)
+        charge!(m, -1); charge!(m2, -1)
+        members[m][findfirst(==(src), members[m])] = dst
+        members[m2][findfirst(==(dst), members[m2])] = src
+        sort!(members[m]); sort!(members[m2])
+        charge!(m, 1); charge!(m2, 1)
+        return
+    end
 
     # 2. Shed models from workers over their weight budget.
     if forbid_memory_oversubscription
@@ -289,15 +407,15 @@ function rebalance_assignment(
                 over = mload[w] - capof(w)
                 best = nothing
                 bestkey = nothing
-                for (m, ws) in members
-                    w in ws || continue
+                for m in sort!(collect(on[w]))
+                    ws = members[m]
                     b = memof(m)
                     b > 0 || continue
                     for t in workers
                         (t in ws || !fits(t, b)) && continue
                         # Prefer a model that clears the overflow alone, the smallest such; otherwise
-                        # the largest one, so the fewest moves are made. Then the emptiest destination.
-                        key = (b >= over ? 0 : 1, b >= over ? b : -b, pressure(t, cload[t] + share(m), mload[t] + b), m, t)
+                        # the largest one, so the fewest moves are made. Then the least loaded destination.
+                        key = (b >= over ? 0 : 1, b >= over ? b : -b, load_after(t, cload[t] + share(m), mload[t] + b, nothing, m), m, t)
                         if bestkey === nothing || key < bestkey
                             best, bestkey = (m, t), key
                         end
@@ -305,42 +423,77 @@ function rebalance_assignment(
                 end
                 best === nothing && break        # nothing fits anywhere: leave it (the repack warns)
                 move!(best[1], w, best[2])
+                stats === nothing || push!(stats.changes, [best[1]])
             end
         end
     end
 
-    # 3. Improve: move off the highest-pressure worker while it is worth a load.
-    best_gain = 0.0
+    # 3. Improve: relieve the most loaded worker while a change pays for itself.
+    n_before = objective()
+    stats === nothing || (stats.objective_before = n_before)
+    best_ratio = 0.0
     for _ in 1:(4 * length(u) + 16)
-        src = argmax(w -> (pressure(w), w), workers)
-        psrc = pressure(src)
-        psrc <= 0 && break
+        rho = Dict{String, Float64}(w => load(w) for w in workers)
+        src = argmax(w -> (rho[w], w), workers)
+        rho[src] <= 0 && break
         best = nothing
-        bestscore = 0.0
-        best_gain = 0.0
-        for (m, ws) in members
-            src in ws || continue
+        bestkey = nothing
+        # Latency one upload of `m` adds on a worker that ends at load `r`: it holds the device for
+        # the requests waiting there and delays the one that triggered it.
+        upload_cost(m, r) = free_moves ? 0.0 : upof(m) * (1 + queue_term(r))
+        function consider!(t, rs, rt, cost, cand)
+            before = queue_term(rho[src]) + queue_term(rho[t])
+            gain = before - queue_term(rs) - queue_term(rt)
+            gain > 1.0e-12 || return
+            ratio = gain / before
+            ratio > best_ratio && (best_ratio = ratio)
+            ratio >= min_gain || return
+            net = free_moves ? gain : gain * payback_seconds - cost
+            net > 0 || return
+            # The most net saving; then the fewest uploads (a move before an equal swap).
+            key = (-net, isempty(cand[3]) ? 1 : 2, cand)
+            (bestkey === nothing || key < bestkey) && (best = cand; bestkey = key)
+            return
+        end
+        names_src = sort!(collect(on[src]))
+        for m in names_src
             s, b = share(m), memof(m)
             for t in workers
-                t in ws && continue
-                (forbid_memory_oversubscription && !fits(t, b)) && continue
-                after_src = pressure(src, cload[src] - s, mload[src] - b)
-                after_dst = pressure(t, cload[t] + s, mload[t] + b)
-                after_dst < psrc || continue
-                gain = psrc - max(after_src, after_dst)
-                gain > best_gain && (best_gain = gain)
-                gain >= min_gain * psrc && gain > 1.0e-12 || continue
-                score = gain / max(b, 1.0)
-                if best === nothing || score > bestscore
-                    best, bestscore = (m, t), score
+                t in members[m] && continue
+                # Move m to t.
+                if holds(t, mload[t] + b) && (!forbid_memory_oversubscription || fits(t, b))
+                    rs = load_after(src, cload[src] - s, mload[src] - b, m, nothing)
+                    rt = load_after(t, cload[t] + s, mload[t] + b, nothing, m)
+                    consider!(t, rs, rt, upload_cost(m, rt), (m, t, ""))
+                end
+                # Swap m for a model m2 of t: both workers keep a full set of weights, which is the
+                # only change possible when every worker is at its budget.
+                for m2 in sort!(collect(on[t]))
+                    (m2 == m || src in members[m2]) && continue
+                    s2, b2 = share(m2), memof(m2)
+                    bs, bt = mload[src] - b + b2, mload[t] - b2 + b
+                    (holds(src, bs) && holds(t, bt)) || continue
+                    rs = load_after(src, cload[src] - s + s2, bs, m, m2)
+                    rt = load_after(t, cload[t] - s2 + s, bt, m2, m)
+                    consider!(t, rs, rt, upload_cost(m, rt) + upload_cost(m2, rs), (m, t, m2))
                 end
             end
         end
         if best === nothing
-            stats === nothing || (stats.max_improvement = max(stats.max_improvement, best_gain / psrc))
             break
         end
-        move!(best[1], src, best[2])
+        m, t, m2 = best
+        if isempty(m2)
+            move!(m, src, t)
+            stats === nothing || push!(stats.changes, [m])
+        else
+            swap!(m, src, m2, t)
+            stats === nothing || push!(stats.changes, [m, m2])
+        end
+    end
+    if stats !== nothing
+        stats.max_improvement = max(stats.max_improvement, best_ratio)
+        stats.objective_after = objective()
     end
 
     for (m, ws) in members
@@ -449,6 +602,12 @@ mutable struct LptPackingState <: GatewayScheduler
     # repack and all N are satisfied by the single store, and neither side ever blocks the other.
     @atomic repack_requested::Int
     @atomic repack_completed::Int
+    # Whether the pending operator repack packs from scratch (RepackRequest.full). Set by a control
+    # handler before it bumps `repack_requested`; consumed by the prober.
+    @atomic full_requested::Bool
+    # A repack's primed second half while its moves' weights are staged (`_prime_and_commit!`), or
+    # nothing. No repack starts while one runs. Prober task and that task only (one thread).
+    transition::Union{Task, Nothing}
 end
 
 LptPackingState(cfg::GatewayConfig, meta::RoutingMeta = RoutingMeta(cfg)) = LptPackingState(
@@ -462,7 +621,7 @@ LptPackingState(cfg::GatewayConfig, meta::RoutingMeta = RoutingMeta(cfg)) = LptP
     Dict{String, Threads.Atomic{Float64}}(),
     Dict{String, ReentrantLock}(), Dict{String, FillRun}(), Dict{String, FillPlan}(),
     Set{Tuple{String, String}}(), Set{String}(), 0,
-    TickReport(), RepackReport(), 0, 0
+    TickReport(), RepackReport(), 0, 0, false, nothing
 )
 
 """
@@ -559,7 +718,8 @@ end
 # gets a uniform placement over the workers that do serve it, with a warning.
 function _repack!(
         s::LptPackingState, poll, metrics::Union{GatewayMetrics, Nothing};
-        trigger::Symbol = :compute, k::PackingKnobs = knobs(s)
+        trigger::Symbol = :compute, k::PackingKnobs = knobs(s),
+        pool::Union{ClientPool, Nothing} = nothing, full::Bool = false, complete_seq::Int = 0
     )
     # Never replace a live placement with one packed over no workers.
     (isempty(poll.polled) && !isempty(@atomic s.assignment)) && return Set{String}()
@@ -610,14 +770,14 @@ function _repack!(
     # yet, u = 0): they still occupy weight memory, so the packer gives each a concentrated home
     # placed by the memory dimension. A model missing from some polled workers (runtime drift)
     # routes uniformly over its actual replicas until the fleet converges.
-    full = Dict{String, Float64}()
+    utilization = Dict{String, Float64}()
     drifted = Dict{String, Placement}()
     nready = length(poll.polled)
     for (m, ws) in poll.permodel_workers
         if length(ws) == nready
             r = get(s.rate_ewma, m, 0.0)
             c = get(s.cost_ewma, m, 0.0)
-            full[m] = (r > 0 && c > 0) ? r * c : 0.0
+            utilization[m] = (r > 0 && c > 0) ? r * c : 0.0
         else
             @warn "lpt_packing: model not on all ready workers; routing uniformly over its replicas" model = m replicas = length(ws) ready = nready
             drifted[m] = [(w, 1.0 / length(ws)) for w in sort(ws)]
@@ -628,36 +788,95 @@ function _repack!(
     stats = RepackStats()
     polled = sort(poll.polled)
     # Pack from scratch only when there is nothing to keep (the startup placement, or a fleet whose
-    # workers were all replaced); every later repack moves as few models as it can, since each move is
-    # a weight load on the worker it lands on.
+    # workers were all replaced) or an operator asked for it; every later repack changes only what
+    # pays for itself, since each change is a weight upload on the worker it lands on. A placement
+    # packed from scratch is improved with uploads priced at zero: nothing is loaded yet, or the
+    # operator chose to reload.
     cold = !any(pl -> any(wv -> first(wv) in polled, pl), values(prev))
-    next = if cold
+    seed = if cold || full
         compute_assignment(
-            full, polled, prev;
+            utilization, polled, full ? Dict{String, Placement}() : prev;
             mem = poll.mem, mem_cap = poll.mem_cap,
             replicas = replica_overrides(k), default_replicas = k.default_replicas,
             hysteresis = k.hysteresis,
-            forbid_memory_oversubscription = k.forbid_memory_oversubscription,
-            stats = stats
+            forbid_memory_oversubscription = k.forbid_memory_oversubscription
         )
     else
-        rebalance_assignment(
-            full, polled, prev;
-            mem = poll.mem, mem_cap = poll.mem_cap,
-            replicas = replica_overrides(k), default_replicas = k.default_replicas,
-            min_gain = k.hysteresis,
-            forbid_memory_oversubscription = k.forbid_memory_oversubscription,
-            stats = stats
-        )
+        prev
     end
+    next = rebalance_assignment(
+        utilization, polled, seed;
+        mem = poll.mem, mem_cap = poll.mem_cap,
+        replicas = replica_overrides(k), default_replicas = k.default_replicas,
+        min_gain = k.hysteresis,
+        forbid_memory_oversubscription = k.forbid_memory_oversubscription,
+        rate = s.rate_ewma, upload = hasproperty(poll, :upload) ? poll.upload : Dict{String, Float64}(),
+        payback_seconds = k.payback_seconds, free_moves = cold || full,
+        stats = stats
+    )
     merge!(next, drifted)
-    @atomic s.assignment = next
-    _swap_outstanding!(s, next)
-
     s.compute_accum = 0.0
     for (w, c) in poll.worker_compute
         s.last_worker_compute[w] = c
     end
+
+    # Changes that move a model off a worker still serving it wait for their weights to be staged on
+    # the new one (see `_prime_and_commit!`); everything else installs now. A full repack installs
+    # everything at once, as asked.
+    primed = (k.prime_moves && !cold && !full && pool !== nothing) ?
+        _changes_to_prime(prev, next, stats.changes, Set(polled)) : Vector{String}[]
+    install = copy(next)
+    for c in primed, m in c
+        haskey(prev, m) ? (install[m] = prev[m]) : delete!(install, m)
+    end
+    outcome = (
+        planned = length(stats.changes), committed = length(stats.changes) - length(primed),
+        dropped = 0, staging = !isempty(primed),
+        objective_before = stats.objective_before, objective_after = stats.objective_after,
+    )
+    changed = _install_assignment!(
+        s, prev, install, poll, metrics, k;
+        trigger = trigger, now = now, wall_elapsed = wall_elapsed, compute_elapsed = compute_elapsed,
+        utilization = utilization, drifted = Set{String}(keys(drifted)), cold = cold, stats = stats, outcome = outcome,
+        new_repack = true
+    )
+    if !isempty(primed)
+        s.transition = @async _prime_and_commit!(s, pool, metrics, poll, prev, next, primed, k, complete_seq)
+    end
+    return changed
+end
+
+# The changes (as `rebalance_assignment` recorded them) that move a model onto a worker while it still
+# has a live home to serve from until the new one is ready: those wait for their weights to be staged.
+# A model with no live home (new, or its workers left) has nothing to protect and installs at once.
+function _changes_to_prime(prev, next, changes, polled::Set{String})
+    out = Vector{String}[]
+    for c in changes
+        any(c) do m
+            pl = get(prev, m, nothing)
+            pl === nothing && return false
+            live = Set(w for (w, _) in pl if w in polled)
+            !isempty(live) && haskey(next, m) && !issubset(Set(first.(next[m])), live)
+        end || continue
+        push!(out, c)
+    end
+    return out
+end
+
+# Install `next` as the live assignment and account for it: swap the routing counters, count and log
+# the models whose worker set changed against `prev`, warn about an oversubscribed worker, refresh the
+# placement metrics, and publish the repack report. Returns the workers that gained or lost a model.
+# `new_repack` is false for the second install of a primed repack (`_prime_and_commit!`), which
+# updates the same repack's report rather than counting a new one.
+function _install_assignment!(
+        s::LptPackingState, prev::Dict{String, Placement}, next::Dict{String, Placement}, poll,
+        metrics::Union{GatewayMetrics, Nothing}, k::PackingKnobs;
+        trigger::Symbol, now::Float64, wall_elapsed::Float64, compute_elapsed::Float64,
+        utilization::Dict{String, Float64}, drifted::Set{String}, cold::Bool, stats::RepackStats, outcome,
+        new_repack::Bool
+    )
+    @atomic s.assignment = next
+    _swap_outstanding!(s, next)
 
     # Count models whose worker set changed from the previous assignment (a model new this repack is
     # an initial placement, not a move, so it is not counted), and collect the workers affected by a
@@ -678,11 +897,13 @@ function _repack!(
         haskey(next, m) && continue
         union!(changed_workers, Set(first.(prevpl)))
     end
-    @info "lpt_packing: repack" models = length(next) moved = moved moved_weights = Base.format_bytes(round(Int, moved_bytes)) incremental = !cold held_by_hysteresis = stats.held max_improvement = round(stats.max_improvement; digits = 3) hysteresis = k.hysteresis compute_seconds = round(compute_elapsed; digits = 2) wall_seconds = round(wall_elapsed; digits = 1)
+    if new_repack
+        @info "lpt_packing: repack" models = length(next) moved = moved moved_weights = Base.format_bytes(round(Int, moved_bytes)) incremental = !cold changes = outcome.planned staging = outcome.planned - outcome.committed objective_before = round(outcome.objective_before; digits = 3) objective_after = round(outcome.objective_after; digits = 3) max_improvement = round(stats.max_improvement; digits = 3) payback_seconds = k.payback_seconds compute_seconds = round(compute_elapsed; digits = 2) wall_seconds = round(wall_elapsed; digits = 1)
+    end
 
     # Memory oversubscription warning: when a worker's assigned weight footprint exceeds its
     # on-demand budget the packing is infeasible (total weights outgrew the fleet); the worker's
-    # LRU cache degrades gracefully, but the operator should know.
+    # eviction degrades gracefully, but the operator should know.
     assigned_mem = Dict{String, Float64}(w => 0.0 for w in poll.polled)
     for (m, placement) in next, (w, _) in placement
         haskey(assigned_mem, w) && (assigned_mem[w] += get(poll.mem, m, 0.0))
@@ -694,8 +915,9 @@ function _repack!(
     end
 
     if metrics !== nothing
-        inc_repacks!(metrics, trigger)
+        new_repack && inc_repacks!(metrics, trigger)
         inc_repack_moves!(metrics, moved, moved_bytes)
+        set_repack_objective!(metrics, outcome.objective_after)
         for (w, bytes) in assigned_mem
             set_worker_weights!(metrics, w, bytes, get(poll.mem_cap, w, 0.0))
         end
@@ -718,7 +940,7 @@ function _repack!(
         end
         s.exported = live
         s.replicas_exported = live_models
-        for (m, um) in full
+        for (m, um) in utilization
             set_model_utilization!(metrics, m, um)
         end
     end
@@ -728,14 +950,103 @@ function _repack!(
     # for the same reason `cost_snapshot` is: the next repack folds them in place. `poll.mem` /
     # `poll.mem_cap` are freshly built by this poll and never mutated afterwards, so they can be
     # referenced directly.
+    last = @atomic s.report
     @atomic s.report = RepackReport(
         now, wall_elapsed, compute_elapsed, trigger,
-        (@atomic s.report).count + 1, length(next), moved,
-        copy(full), copy(s.rate_ewma), copy(s.cost_ewma),
+        new_repack ? last.count + 1 : last.count, length(next),
+        new_repack ? moved : last.models_moved + moved,
+        copy(utilization), copy(s.rate_ewma), copy(s.cost_ewma),
         poll.mem, poll.mem_cap, sort(poll.polled),
-        Set{String}(keys(drifted))
+        drifted,
+        outcome.planned, outcome.committed, outcome.dropped, outcome.staging,
+        outcome.objective_before, outcome.objective_after
     )
     return changed_workers
+end
+
+"""
+    _prime_and_commit!(s, pool, metrics, poll, prev, plan, primed, k, complete_seq)
+
+The second half of a repack whose changes move models off workers still serving them: ask each
+destination to read the arriving models' weights into host memory (StageWeights), then switch
+routing for the changes whose reads all succeeded, so the first request a model gets on its new
+worker waits for an upload from RAM and never for a read from disk. A change with a failed,
+deferred or timed-out read is dropped (the model stays where it was) and the next repack plans it
+again. A swap commits only when both of its models are staged, since half a swap can overfill a
+worker. Runs as its own task so the prober keeps ticking while the reads run; no repack starts
+until it ends.
+"""
+function _prime_and_commit!(
+        s::LptPackingState, pool::ClientPool, metrics::Union{GatewayMetrics, Nothing}, poll,
+        prev::Dict{String, Placement}, plan::Dict{String, Placement}, primed::Vector{Vector{String}},
+        k::PackingKnobs, complete_seq::Int
+    )
+    t0 = time()
+    try
+        arrivals = Dict{String, Vector{String}}()       # worker -> the models moving onto it
+        for c in primed, m in c
+            before = Set(first.(get(prev, m, Placement())))
+            for (w, _) in plan[m]
+                w in before || push!(get!(arrivals, w, String[]), m)
+            end
+        end
+        states = Dict{Tuple{String, String}, String}()
+        hold = k.stage_timeout_seconds + 60.0
+        @sync for (w, names) in arrivals
+            @async begin
+                wc = get_clients(pool, w)
+                resp = nothing
+                if wc !== nothing
+                    t1 = time()
+                    resp, _ = _bounded(
+                        () -> invoke_stage_weights(wc, unique(names), hold, k.stage_timeout_seconds),
+                        k.stage_timeout_seconds + 5.0, nothing, "StageWeights", w
+                    )
+                    metrics === nothing || observe_worker!(metrics, "StageWeights", w, time() - t1)
+                end
+                if resp === nothing
+                    @warn "lpt_packing: staging weights for a placement change failed; its changes stay unmade" worker = w models = names
+                else
+                    for r in resp.models
+                        states[(w, r.name)] = r.state
+                        r.state == "failed" &&
+                            @warn "lpt_packing: a worker could not read a moving model's weights" worker = w model = r.name error = r.error
+                    end
+                end
+            end
+        end
+        ready(w, m) = get(states, (w, m), "failed") in ("resident", "staged", "skipped")
+        arrived(m) = [w for (w, _) in plan[m] if !(w in Set(first.(get(prev, m, Placement()))))]
+        accepted = [c for c in primed if all(m -> all(w -> ready(w, m), arrived(m)), c)]
+        live = @atomic s.assignment
+        final = copy(live)
+        for c in accepted, m in c
+            final[m] = plan[m]
+        end
+        dropped = length(primed) - length(accepted)
+        last = @atomic s.report
+        outcome = (
+            planned = last.changes_planned, committed = last.changes_committed + length(accepted),
+            dropped = dropped, staging = false,
+            objective_before = last.objective_before, objective_after = last.objective_after,
+        )
+        changed = _install_assignment!(
+            s, live, final, poll, metrics, k;
+            trigger = last.trigger, now = last.unix_seconds, wall_elapsed = last.wall_elapsed,
+            compute_elapsed = last.compute_elapsed, utilization = last.utilization,
+            drifted = last.drifted, cold = false, stats = RepackStats(), outcome = outcome,
+            new_repack = false
+        )
+        metrics === nothing || inc_staged_changes!(metrics, length(accepted), dropped)
+        @info "lpt_packing: staged placement changes committed" committed = length(accepted) dropped = dropped staging_seconds = round(time() - t0; digits = 1)
+        _maybe_compact_fleet!(s, pool, metrics, changed; k = k)
+    catch err
+        @error "lpt_packing: committing staged placement changes failed; the placement is unchanged" exception = (err, catch_backtrace())
+    finally
+        complete_seq > 0 && @atomic s.repack_completed = max(@atomic(s.repack_completed), complete_seq)
+        s.transition = nothing
+    end
+    return nothing
 end
 
 # Refresh the gauges that describe live routing state on every prober tick, not only at a repack:
@@ -841,7 +1152,7 @@ function rebalance!(
         s::LptPackingState, pool::ClientPool, ready_urls::Vector{String},
         metrics::Union{GatewayMetrics, Nothing} = nothing; trigger::Symbol = :startup
     )
-    _repack!(s, poll_workers(pool, ready_urls), metrics; trigger = trigger)
+    _repack!(s, poll_workers(pool, ready_urls), metrics; trigger = trigger, pool = pool)
     return nothing
 end
 
@@ -921,15 +1232,26 @@ function tick_packing!(
     forced = requested > (@atomic s.repack_completed)
     if (forced || s.compute_accum >= threshold) && hold
         @info "lpt_packing: repack deferred while a placed worker is missing from the poll" missing = sort!(collect(keys(s.absent_since))) grace_seconds = _ABSENT_GRACE_SECONDS
+    elseif (forced || s.compute_accum >= threshold) && s.transition !== nothing
+        # The previous repack is still staging its moves' weights; the next one plans from what it
+        # commits, so it waits (the accumulated compute and any operator request carry over).
+        @debug "lpt_packing: repack deferred while the previous one stages its moves"
     elseif forced || s.compute_accum >= threshold
         # A forced repack does not consume the first-repack budget, for the same reason the startup
         # cold placement does not: that budget is about the first repack driven by real traffic.
         forced || (s.did_first_tick_repack = true)
-        changed = _repack!(s, poll, metrics; trigger = forced ? :operator : :compute, k = k)
-        _maybe_compact_fleet!(s, pool, metrics, changed; k = k)
-        # Stored LAST, after the assignment swap and the report publish, so a handler that sees its
-        # sequence is guaranteed to observe this repack's results.
-        forced && @atomic s.repack_completed = requested
+        full = forced && (@atomicswap s.full_requested = false)
+        changed = _repack!(
+            s, poll, metrics; trigger = forced ? :operator : :compute, k = k, pool = pool, full = full,
+            complete_seq = forced ? requested : 0
+        )
+        # A repack that stages its moves first compacts and reports completion when it commits.
+        if s.transition === nothing
+            _maybe_compact_fleet!(s, pool, metrics, changed; k = k)
+            # Stored LAST, after the assignment swap and the report publish, so a handler that sees
+            # its sequence is guaranteed to observe this repack's results.
+            forced && @atomic s.repack_completed = requested
+        end
     end
     # Published after any repack, so `compute_accum` reflects the reset and a reader never sees the
     # pre-repack accumulator paired with a post-repack assignment.

@@ -44,7 +44,7 @@ end
 _reads(sched, name) = sched.registry.by_name[name].weights.reads
 _served(sched, name) = _dispatch1!(sched, name)[1].data == reshape(Float32[10, 100], 2, 1)
 
-@testset "host cache (private): misses read the file, hits do not, least recently loaded is evicted" begin
+@testset "host cache (private): misses read the file, hits do not, the least loaded copy is evicted" begin
     sched = _hc_scheduler("A", "B", "C"; host_budget = 2 * sizeof(_W))
     wc = sched.weight_cache
     @test ReactantServer.host_budgeted(wc)
@@ -52,7 +52,7 @@ _served(sched, name) = _dispatch1!(sched, name)[1].data == reshape(Float32[10, 1
     @test _served(sched, "B") && _reads(sched, "B") == 1           # A leaves the device
     @test _served(sched, "A") && _reads(sched, "A") == 1           # reloaded from the host copy
     @test (wc.host_hits, wc.host_misses) == (1, 2)
-    @test _served(sched, "C") && _reads(sched, "C") == 1           # evicts B, the least recently loaded
+    @test _served(sched, "C") && _reads(sched, "C") == 1           # evicts B: one load, against A's two
     @test sort(collect(keys(wc.host_cached))) == ["A", "C"]
     @test _served(sched, "B") && _reads(sched, "B") == 2           # B was evicted, so a miss
     @test ReactantServer.host_cached_bytes(wc) == 2 * sizeof(_W)
@@ -69,11 +69,31 @@ end
     for _ in 1:5
         _served(sched, "A")                      # served from the device: not a load
     end
-    @test wc.host_lru == ["A", "B"]              # requests alone do not refresh A
+    @test wc.host_rank["A"] < wc.host_rank["B"]  # requests alone do not count for A
     ReactantServer.compact!(wc, sched.registry)  # frees the device copies; both reload from host
     _served(sched, "B")
-    _served(sched, "C")                          # needs room: evicts A, loaded least recently
+    _served(sched, "C")                          # needs room: evicts A, now loaded least
     @test !haskey(wc.host_cached, "A") && haskey(wc.host_cached, "B") && haskey(wc.host_cached, "C")
+end
+
+@testset "host cache: a model the GPU reloads often keeps its copy over one loaded once since" begin
+    # One model fits on the device, two copies in host RAM. A and B take turns on the device, each
+    # turn a load from its host copy; then C is loaded once.
+    sched = _hc_scheduler("A", "B", "C"; host_budget = 2 * sizeof(_W))
+    wc = sched.weight_cache
+    for _ in 1:3
+        _served(sched, "A")
+        _served(sched, "B")
+    end
+    @test _reads(sched, "A") == 1 && _reads(sched, "B") == 1
+    _served(sched, "C")
+    # Least recently loaded would have dropped A for C. A copy worth one load displaces none worth
+    # three: C is served from its read but not kept, and A and B stay.
+    @test haskey(wc.host_cached, "A") && haskey(wc.host_cached, "B") && !haskey(wc.host_cached, "C")
+    _served(sched, "A")
+    @test _reads(sched, "A") == 1                    # still a hit
+    _served(sched, "C")
+    @test _reads(sched, "C") == 2
 end
 
 @testset "host cache: a zero budget keeps no copies" begin
@@ -117,12 +137,12 @@ end
     _served(sched, "A")
     _served(sched, "B")
     ReactantServer.rename!(wc, "A", "A2")
-    @test haskey(wc.host_cached, "A2") && wc.host_lru == ["A2", "B"]
+    @test haskey(wc.host_cached, "A2") && haskey(wc.host_rank, "A2") && !haskey(wc.host_rank, "A")
     ReactantServer.release_all!(wc, sched.registry.by_name["B"])
     @test !haskey(wc.host_cached, "B") && wc.host_cached_bytes == sizeof(_W)
 end
 
-@testset "host cache (shared): one node budget in /dev/shm, least recently loaded evicted" begin
+@testset "host cache (shared): one node budget in /dev/shm, the least loaded copy evicted" begin
     if !(Sys.islinux() && isdir("/dev/shm"))
         @test_skip "shared weight store requires Linux /dev/shm"
     else
@@ -138,7 +158,7 @@ end
             @test isfile(region("A")) && isfile(region("B"))
             @test _served(sched, "A") && _reads(sched, "A") == 1   # a hit on the region
             sleep(0.02)
-            @test _served(sched, "C")                              # evicts B
+            @test _served(sched, "C")                              # evicts B: one load, against A's two
             @test !isfile(region("B")) && isfile(region("A")) && isfile(region("C"))
             @test (wc.host_hits, wc.host_misses) == (1, 3)
             @test ReactantServer.host_cached_bytes(wc) == 2R
@@ -238,7 +258,7 @@ end
     @test st.read_bytes == wc.read_bytes && st.footprints["A"].reads == 1
 end
 
-@testset "eviction: of two equally used models, the one still in host RAM goes first" begin
+@testset "eviction prices device time only: a slow file read does not keep a model resident" begin
     # Room on the device for two models, and in host RAM for one copy.
     sched = _hc_scheduler("A", "B", "C"; device_models = 2, host_budget = sizeof(_W))
     wc = sched.weight_cache
@@ -246,21 +266,21 @@ end
     _served(sched, "A")
     _served(sched, "B")                               # B's copy displaces A's
     @test ReactantServer.has_host_copy(wc, B) && !ReactantServer.has_host_copy(wc, A)
-    # Equal use and uploads, and B's history says its file reads are the slow ones: by history alone
-    # B is the costlier eviction. But B's reload would come from RAM, and A's from its file.
-    for (m, read) in (("A", 0.01), ("B", 1.0))
+    # A's reload would read its file, slowly; B's would come from RAM but take longer to upload. Only
+    # the upload holds the device (the read runs in the background), so B is the costlier eviction.
+    for (m, upload, read) in (("A", 0.1, 5.0), ("B", 0.3, 0.01))
         fp = wc.footprints[m]
-        fp.upload_seconds = 0.1
+        fp.upload_seconds = upload
         fp.read_seconds = read
         fp.hits = 5
         fp.prio_base = wc.inflation
     end
     fpA, fpB = wc.footprints["A"], wc.footprints["B"]
-    @test ReactantServer.reload_seconds(wc, fpB) > ReactantServer.reload_seconds(wc, fpA)
-    @test ReactantServer.reload_seconds(wc, fpB; host_copy = true) ≈ 0.1
+    @test ReactantServer.reload_seconds(wc, fpA) ≈ 0.1 && ReactantServer.reload_seconds(wc, fpB) ≈ 0.3
+    @test ReactantServer.read_seconds(wc, fpA) ≈ 5.0
     _served(sched, "C")
-    @test A.executable.weights !== nothing            # kept: its reload would read the file
-    @test B.executable.weights === nothing            # evicted: its reload is an upload from RAM
+    @test A.executable.weights === nothing            # evicted: cheaper to upload again, its read is off the device
+    @test B.executable.weights !== nothing
 end
 
 @testset "has_host_copy: the shared store's region, as /dev/shm shows it" begin

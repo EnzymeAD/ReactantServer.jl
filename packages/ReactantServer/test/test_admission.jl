@@ -316,11 +316,25 @@ end
     b = FragBackend(32 * _KiB)
     sched = _frag_scheduler(b, _frag_entry(b, "A"; kib = [4, 4]), _frag_entry(b, "B"; kib = [4, 4]))
     _frag_load!(sched, "A")
+    sched.registry.by_name["A"].executable.host_weights = Any[zeros(Float32, _KiB), zeros(Float32, _KiB)]
     b.fail_next_upload = true
     _frag_load!(sched, "B")
     @test _resident(sched, "B") && _resident(sched, "A")         # A, worth keeping, reloaded with B
     @test sched.weight_cache.fallback_compactions == 1
     @test isempty(setdiff(Set(keys(b.live)), Set(vcat(sched.registry.by_name["A"].executable.weights, sched.registry.by_name["B"].executable.weights))))
+end
+
+@testset "admission: the fallback compaction does not reload a former resident with no host copy" begin
+    # Reloading it would read its weights file on the dispatch loop; it is read in the background
+    # before its next dispatch instead.
+    b = FragBackend(32 * _KiB)
+    sched = _frag_scheduler(b, _frag_entry(b, "A"; kib = [4, 4]), _frag_entry(b, "B"; kib = [4, 4]))
+    _frag_load!(sched, "A")
+    b.fail_next_upload = true
+    _frag_load!(sched, "B")
+    @test _resident(sched, "B") && !_resident(sched, "A")
+    @test sched.weight_cache.fallback_compactions == 1
+    @test isempty(setdiff(Set(keys(b.live)), Set(sched.registry.by_name["B"].executable.weights)))
 end
 
 @testset "admission: a free block of exactly the weights' size is not enough under BFC's split rule" begin

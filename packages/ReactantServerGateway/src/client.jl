@@ -118,6 +118,14 @@ invoke_shm_unregister(wc::WorkerClients, body::Vector{UInt8}) =
 invoke_compact(wc::WorkerClients, req::CompactMemoryRequest) =
     ControlService.CompactMemory(wc.chan, req; deadline = wc.compact_deadline)
 
+# Ask the worker to read models' weights into host memory ahead of a placement change and hold them
+# for `hold` seconds (StageWeights); returns its StageWeightsResponse. The reads take as long as the
+# disk does, so the caller passes a deadline sized for them rather than the probe deadline.
+invoke_stage_weights(wc::WorkerClients, names::Vector{String}, hold::Real, deadline::Real) =
+    ControlService.StageWeights(
+    wc.chan, StageWeightsRequest(; names = names, hold_seconds = Float64(hold)); deadline = Float64(deadline)
+)
+
 # Forward an IsSameIPCNamespace probe to the worker; returns its IsSameIPCNamespaceResponse.
 invoke_is_same_ipc_namespace(wc::WorkerClients, req::IsSameIPCNamespaceRequest) =
     GRPCInferenceService.IsSameIPCNamespace(wc.chan, req; deadline = wc.probe_deadline)

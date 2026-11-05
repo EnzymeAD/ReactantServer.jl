@@ -44,7 +44,9 @@ mutable struct WeightCache
     # /dev/shm (`store.budget`); with the private store they are this worker's, below.
     host_budget::Union{Int, Nothing}       # this worker's share of the host budget (private store); nothing = unbudgeted
     host_cached::Dict{String, Vector{Any}} # private store: cached host copies of unpinned models
-    host_lru::Vector{String}               # private store: cached names, least recently loaded at front
+    # private store: each model's load rank (`bump_load_rank`), its decayed count of device loads,
+    # which orders eviction. Kept after a copy is evicted, so a model's standing outlives its copy.
+    host_rank::Dict{String, Float64}
     host_cached_bytes::Int                 # private store: bytes in host_cached
     host_hits::Int                         # observability: loads served from a cached host copy
     host_misses::Int                       # observability: loads that read the weights file
@@ -79,7 +81,7 @@ WeightCache(
     WeightCache(
     backend, pool, registry, mode, store, Int(max_bytes), 0, String[], 0, 0, 0.0, 0, 0, 0, 0, 0,
     Dict{String, ModelFootprint}(), 0.0, Float64(min_residency_seconds), VictimSearch(), 0, 0,
-    host_budget === nothing ? nothing : Int(host_budget), Dict{String, Vector{Any}}(), String[], 0, 0, 0,
+    host_budget === nothing ? nothing : Int(host_budget), Dict{String, Vector{Any}}(), Dict{String, Float64}(), 0, 0, 0,
     false, Set{String}(), 0.0, 0, 0.0, 0, Dict{Symbol, Int}(r => 0 for r in EVICT_REASONS), 0.0, 0, 0, 0.0,
     ReentrantLock()
 )
@@ -423,10 +425,15 @@ buffers (there is no autonomous evictor to reclaim them); in self-managed mode t
 resident but become evictable. The slow host/device work runs outside the lock; only the
 bookkeeping commit is locked.
 """
-set_residency_state!(cache::WeightCache, entry::ModelEntry, target::ResidencyState) =
-    off_interactive(() -> _set_residency_state!(cache, entry, target))
+set_residency_state!(
+    cache::WeightCache, entry::ModelEntry, target::ResidencyState; floor = nothing, staged = nothing
+) = off_interactive(() -> _set_residency_state!(cache, entry, target; floor = floor, staged = staged))
 
-function _set_residency_state!(cache::WeightCache, entry::ModelEntry, target::ResidencyState)
+# `floor` is a host floor and `staged` the model's weights in host memory, both read before the
+# control op by `set_residency!` so the dispatch loop never reads the weights file here.
+function _set_residency_state!(
+        cache::WeightCache, entry::ModelEntry, target::ResidencyState; floor = nothing, staged = nothing
+    )
     model = entry.executable
     cur = model.state
     cur == target && return target
@@ -438,6 +445,7 @@ function _set_residency_state!(cache::WeightCache, entry::ModelEntry, target::Re
     if target == PINNED_SYSTEM && model.host_weights === nothing
         # A cached host copy (private store) becomes the floor without rereading the file.
         new_host = _take_cached_host!(cache, entry.name)
+        new_host === nothing && (new_host = floor)
         new_host === nothing && (new_host = host_materialize(cache.store, entry, model.sig.weight_names))
     elseif target == UNPINNED && model.host_weights !== nothing
         new_host = nothing        # drop the host floor
@@ -447,7 +455,7 @@ function _set_residency_state!(cache::WeightCache, entry::ModelEntry, target::Re
     new_dev = model.weights
     free_dev = nothing
     if target == PINNED_DEVICE && model.weights === nothing
-        new_dev = _device_buffers(cache, entry, model)
+        new_dev = _device_buffers(cache, entry, model; staged = staged)
     elseif target != PINNED_DEVICE && cache.mode == EXTERNALLY_MANAGED && model.weights !== nothing
         # Externally-managed has no evictor, so unpinning from the device must free it here.
         free_dev = model.weights
@@ -476,7 +484,7 @@ function _set_residency_state!(cache::WeightCache, entry::ModelEntry, target::Re
     # Under a host budget a dropped floor stays cached (the shared store keeps the region; the
     # private store keeps the arrays if they fit), so the next load does not read the file.
     if host_budgeted(cache) && !(cache.store isa SharedWeightStore)
-        drop_host && _cache_host!(cache, entry.name, old_host)
+        drop_host && _cache_host!(cache, entry.name, old_host; load = false)
         target == PINNED_SYSTEM && _fit_floors!(cache)
     end
     log_residency_change(
@@ -484,6 +492,18 @@ function _set_residency_state!(cache::WeightCache, entry::ModelEntry, target::Re
         memory = memory_report(cache.backend, cache.pool; registry = cache.registry, weight_cache = cache)
     )
     return target
+end
+
+"""
+    attach_host_floor!(cache, entry, floor) -> nothing
+
+Give a system-pinned model that has no host floor the one read for it off the dispatch loop (a hot
+load defers it; see `load_model!`). Bookkeeping only, on the dispatch loop.
+"""
+function attach_host_floor!(cache::WeightCache, entry::ModelEntry, floor)
+    lock(() -> (entry.executable.host_weights = floor), cache.lock)
+    host_budgeted(cache) && !(cache.store isa SharedWeightStore) && _fit_floors!(cache)
+    return nothing
 end
 
 """
@@ -531,8 +551,8 @@ function rename!(cache::WeightCache, old::AbstractString, new::AbstractString)
         fp === nothing || (cache.footprints[String(new)] = fp)
         arrays = pop!(cache.host_cached, String(old), nothing)
         arrays === nothing || (cache.host_cached[String(new)] = arrays)
-        j = findfirst(==(String(old)), cache.host_lru)
-        j === nothing || (cache.host_lru[j] = String(new))
+        rank = pop!(cache.host_rank, String(old), nothing)
+        rank === nothing || (cache.host_rank[String(new)] = rank)
     end
     host_rename!(cache.store, old, new)
     return nothing
@@ -542,7 +562,8 @@ end
     compact!(cache, registry; reload) -> Int
 
 Defragment the device arena. Frees every resident *non-pinned* device weight buffer at once so the
-BFC allocator coalesces its free list, then reloads each non-pinned model named in `reload`.
+BFC allocator coalesces its free list, then reloads each non-pinned model named in `reload` that
+has a host copy to upload from (the dispatch loop never reads a weights file).
 Models not in `reload` are left freed; in self-managed mode they reload lazily through
 [`acquire!`](@ref) on their next dispatch. Host floors (`host_weights`) are never touched, so the
 reload is a pure host->device copy where a floor exists.
@@ -588,17 +609,24 @@ function _compact!(cache::WeightCache, registry::ModelRegistry, reload::Vector{S
     # empty region a descending-size fill packs each model against the last and cannot fragment,
     # whereas small models placed first leave gaps a later large model may not fit. Skipped in
     # externally-managed mode, where `acquire!` does not autonomously load.
+    #
+    # Only models with a host copy are reloaded: compaction runs on the dispatch loop, which never
+    # reads a weights file. A model without one stays evicted and is read in the background before
+    # its next dispatch, like any other evicted model.
     reloaded = 0
+    cold = 0
     if cache.mode != EXTERNALLY_MANAGED
         for name in _largest_first(cache, registry, reload)
             entry = get(registry.by_name, name, nothing)
             entry === nothing && continue
             model = entry.executable
             (model === nothing || is_device_pinned(model) || model.weights !== nothing) && continue
+            has_host_copy(cache, entry) || (cold += 1; continue)
             acquire!(cache, entry)
             reloaded += 1
         end
     end
+    cold > 0 && @info "compaction: left evicted the requested models with no host copy; their next request reads them in the background" models = cold
 
     lock(() -> cache.compaction_seconds += time() - t0, cache.lock)
     after = memory_report(cache.backend, cache.pool; registry = registry, weight_cache = cache)

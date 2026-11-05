@@ -147,6 +147,17 @@ struct GatewayConfig
     # decreasing) it is not guaranteed to find a feasible packing that exists, but it never strands a
     # model when the greedy pass can avoid it. Default on.
     forbid_memory_oversubscription::Bool
+    # Placement changes (lpt_packing only). A repack makes a change (a move, a swap, an extra
+    # replica) only when it pays for itself: the latency it saves over `payback_seconds` must exceed
+    # the latency its weight uploads cost. `payback_seconds` is how long a repack's rate estimates are
+    # trusted to hold, about the EWMA halflife in wall time. With `prime_moves` (default on) each
+    # moving model's weights are read into host memory on its new worker first (the StageWeights
+    # RPC), and routing switches only once they are, so no request waits for a read from disk; a
+    # change whose read fails, is deferred, or takes longer than `stage_timeout_seconds` is dropped
+    # from that repack and planned again by the next one.
+    payback_seconds::Float64
+    prime_moves::Bool
+    stage_timeout_seconds::Float64
 end
 
 const GW_ENV_PREFIX = "REACTANT_GATEWAY_"
@@ -167,6 +178,9 @@ const GW_ENV_PATHS = Tuple{String, Vector{String}, DataType}[
     ("SCHEDULING_ROUTING_FILL_MODE", ["scheduling", "routing_fill_mode"], String),
     ("SCHEDULING_COMPACTION_MODE", ["scheduling", "compaction_mode"], String),
     ("SCHEDULING_COMPACTION_INTERVAL", ["scheduling", "compaction_interval"], Int),
+    ("SCHEDULING_PAYBACK_SECONDS", ["scheduling", "payback_seconds"], Float64),
+    ("SCHEDULING_PRIME_MOVES", ["scheduling", "prime_moves"], Bool),
+    ("SCHEDULING_STAGE_TIMEOUT_SECONDS", ["scheduling", "stage_timeout_seconds"], Float64),
     ("WORKER_CLIENT_REQUEST_TIMEOUT_SECONDS", ["worker_client", "request_timeout_seconds"], Int),
     ("WORKER_CLIENT_MAX_CONCURRENT_STREAMS", ["worker_client", "max_concurrent_streams"], Int),
     ("GRPC_MAX_RECV_MSG_BYTES", ["grpc", "max_recv_msg_bytes"], Int),
@@ -314,6 +328,9 @@ function _build_gateway_config(raw::Dict{String, Any})
         compaction_mode,
         _opt(sched, "compaction_interval", Int, 1),
         _opt(sched, "forbid_memory_oversubscription", Bool, true),
+        _opt(sched, "payback_seconds", Float64, 600.0),
+        _opt(sched, "prime_moves", Bool, true),
+        _opt(sched, "stage_timeout_seconds", Float64, 120.0),
     )
     cfg.max_concurrent_streams_per_worker > 0 ||
         throw(ConfigError("worker_client.max_concurrent_streams must be positive"))
@@ -338,6 +355,8 @@ function _build_gateway_config(raw::Dict{String, Any})
     )
     _ck_positive("scheduling.routing_fill_factor", cfg.routing_fill_factor)
     _ck_nonneg_int("scheduling.compaction_interval", cfg.compaction_interval; hint = "0 = disabled")
+    _ck_nonneg("scheduling.payback_seconds", cfg.payback_seconds; hint = "0 = never move a model for balance")
+    _ck_positive("scheduling.stage_timeout_seconds", cfg.stage_timeout_seconds)
 
     if !isempty(_opt(tls, "cert_file", String, "")) || !isempty(_opt(tls, "key_file", String, ""))
         @warn "gateway TLS is configured but not yet enforced; serving cleartext h2c"

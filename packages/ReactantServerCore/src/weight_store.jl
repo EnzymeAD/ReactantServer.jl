@@ -37,10 +37,65 @@
 # holding that lock (so the next admitter counts it), then drops it before backing the region with
 # pages and filling it, so workers loading different models only serialize on the bookkeeping. A
 # worker holds a region's lock only while pinned (`residency: system`) or from reading a model into
-# the region until its upload ends, so a model that stays on a device ages out of the cache. "Recently loaded" is the region lock file's mtime,
-# touched on every load from the region. The creator holds the region's LOCK_EX while it waits for
-# the budget lock, and an evictor only ever tries region locks without blocking, so the two locks
-# cannot deadlock.
+# the region until its upload ends, so a model that stays on a device ages out of the cache. The
+# eviction order is each region's load rank (see `bump_load_rank`), kept as the region lock file's
+# mtime and raised on every load from the region by whichever worker loads it, so the count is the
+# node's, not one worker's. The least valuable copies go first, and a new region only displaces
+# regions that rank below it. The creator holds the region's LOCK_EX while it waits for the budget
+# lock, and an evictor only ever tries region locks without blocking, so the two locks cannot
+# deadlock.
+
+"""
+    HOST_CACHE_HALFLIFE_SECONDS
+
+How long a load keeps counting toward a host copy's place in the cache: each load of a model onto a
+device adds one to its count, and the count halves every this many seconds.
+"""
+const HOST_CACHE_HALFLIFE_SECONDS = 3600.0
+
+"""
+    bump_load_rank(rank, now=time(); halflife=HOST_CACHE_HALFLIFE_SECONDS) -> Float64
+
+Record one load in a host copy's load rank and return the new rank.
+
+The rank holds a decayed load count, `count(t) = 2^((rank - t) / halflife)`, as a single timestamp.
+A copy is worth keeping in host RAM in proportion to how often a device loads it (each load it
+serves saves a request the wait for a read from disk) times the read it saves per byte, and with
+one disk the read time grows with the bytes, so the worth comes down to the load rate. Ranks order
+copies by their counts at any shared `now`, so comparing ranks needs no clock, and a rank fits
+wherever a timestamp does (the shared store keeps it as the region lock file's mtime). A rank of 0
+means no loads. With a vanishing halflife this is least recently loaded; a model loaded often
+ranks ahead of one loaded once a moment ago, and one a device keeps resident (no loads) decays out.
+"""
+function bump_load_rank(rank::Real, now::Real = time(); halflife::Real = HOST_CACHE_HALFLIFE_SECONDS)
+    r, t, h = Float64(rank), Float64(now), Float64(halflife)
+    r <= 0 && return t
+    x = (r - t) / h
+    # count + 1, folded back into a rank, in the form that cannot overflow either way.
+    return x >= 0 ? r + h * log2(1 + exp2(-x)) : t + h * log2(1 + exp2(x))
+end
+
+# A region lock file's load rank: its mtime once a load has set it, 0 for a lock file no load has
+# ranked yet (creation leaves mtime equal to ctime; setting the rank moves ctime to the time of the
+# change, which never equals the rank set).
+function _lock_rank(path::AbstractString)
+    st = stat(path)
+    isfile(st) || return 0.0
+    return st.mtime == st.ctime ? 0.0 : st.mtime
+end
+
+# Set a file's mtime to `t` (and its atime to now), with microsecond resolution.
+function _set_mtime(path::AbstractString, t::Float64)
+    now = time()
+    tv = Ref((Clong(floor(now)), Clong(0), Clong(floor(t)), Clong(round((t - floor(t)) * 1.0e6))))
+    rc = ccall(:utimes, Cint, (Cstring, Ptr{NTuple{4, Clong}}), path, tv)
+    rc == 0 || throw(SystemError("setting the load rank of $path", Libc.errno()))
+    return nothing
+end
+
+# One load from the region behind `lockpath`: raise its load rank. Two workers loading at the same
+# instant can lose one of the two increments, which only costs the count a little accuracy.
+_record_load!(lockpath::AbstractString) = _set_mtime(lockpath, bump_load_rank(_lock_rank(lockpath)))
 
 """
     WeightStore
@@ -341,8 +396,8 @@ function _unlock_budget(fd::Cint)
     return nothing
 end
 
-# Every weight region in /dev/shm: (file name, bytes, last load time). The last load time is the
-# region lock file's mtime (0 when it has none, so an orphan is evicted first).
+# Every weight region in /dev/shm: (file name, bytes, load rank). The load rank is the region lock
+# file's (0 when it has none or no load has ranked it, so an orphan is evicted first).
 function _regions(store::SharedWeightStore)
     rx = Regex("^" * store.prefix * "-[A-Za-z0-9_]+-[0-9a-f]+\$")
     out = Tuple{String, Int, Float64}[]
@@ -355,8 +410,7 @@ function _regions(store::SharedWeightStore)
         match(rx, f) === nothing && continue
         st = stat("/dev/shm/" * f)
         isfile(st) || continue
-        lk = stat("/dev/shm/" * f * ".lock")
-        push!(out, (f, Int(st.size), isfile(lk) ? lk.mtime : 0.0))
+        push!(out, (f, Int(st.size), _lock_rank("/dev/shm/" * f * ".lock")))
     end
     return out
 end
@@ -370,13 +424,17 @@ private store.
 host_cache_bytes(::WeightStore) = 0
 host_cache_bytes(store::SharedWeightStore) = sum((r[2] for r in _regions(store)); init = 0)
 
-# Evict holder-free regions, least recently loaded first, until `need` more bytes fit the budget.
-# The caller holds the budget lock. `keep` (a region file name) is never evicted. Evicts nothing
-# unless that makes the bytes fit: every candidate is locked first (a non-blocking LOCK_EX succeeds
-# only with no holder and no creator), and the locks are dropped untouched when the evictable total
-# is short, unless `partial` (a trim), which evicts what it can. Returns whether the bytes fit, and
-# the number of regions evicted.
-function _make_room!(store::SharedWeightStore, need::Int; keep::AbstractString = "", partial::Bool = false)
+# Evict holder-free regions, lowest load rank first, until `need` more bytes fit the budget. The
+# caller holds the budget lock. `keep` (a region file name) is never evicted, nor is a region ranked
+# at or above `below` (the rank of the copy being admitted: it may only displace less valuable ones).
+# Evicts nothing unless that makes the bytes fit: every candidate is locked first (a non-blocking
+# LOCK_EX succeeds only with no holder and no creator), and the locks are dropped untouched when the
+# evictable total is short, unless `partial` (a trim), which evicts what it can. Returns whether the
+# bytes fit, and the number of regions evicted.
+function _make_room!(
+        store::SharedWeightStore, need::Int; keep::AbstractString = "", partial::Bool = false,
+        below::Float64 = Inf
+    )
     budget = store.budget::Int
     regions = _regions(store)
     total = sum((r[2] for r in regions); init = 0)
@@ -384,9 +442,10 @@ function _make_room!(store::SharedWeightStore, need::Int; keep::AbstractString =
     sort!(regions; by = r -> r[3])
     locked = Tuple{String, Int, Cint}[]
     freeable = 0
-    for (f, bytes, _) in regions
+    for (f, bytes, rank) in regions
         f == keep && continue
         total - freeable + need <= budget && break
+        rank >= below && break                       # ranked in order: the rest are worth more
         fd = _open_lock("/dev/shm/" * f * ".lock", store.mode)
         fd < 0 && continue
         if _flock(fd, _LOCK_EX | _LOCK_NB) == 0
@@ -473,7 +532,12 @@ function _acquire_region(store::SharedWeightStore, key, digest::UInt64, specs, f
                 end
                 if store.budget !== nothing
                     bfd = _lock_budget(store)
-                    fits, _ = _make_room!(store, total; keep = store.prefix * "-" * tag)
+                    # A pinned floor is admitted whatever it displaces; a cached copy only displaces
+                    # copies with a lower load rank than it will have once this load counts.
+                    fits, _ = _make_room!(
+                        store, total; keep = store.prefix * "-" * tag,
+                        below = pinned ? Inf : bump_load_rank(_lock_rank(lockpath))
+                    )
                     if !fits
                         if !pinned
                             _unlock_budget(bfd)
@@ -531,9 +595,9 @@ function _acquire_region(store::SharedWeightStore, key, digest::UInt64, specs, f
         _close_fd(fd)
         rethrow()
     end
-    # A load from this region: it becomes the most recently loaded for eviction.
+    # A load from this region: count it in the region's load rank.
     store.budget === nothing || try
-        touch(lockpath)
+        _record_load!(lockpath)
     catch
     end
     return (; shm, fd, name, lockpath, arrays, hit)

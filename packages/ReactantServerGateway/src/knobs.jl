@@ -59,6 +59,9 @@ struct PackingKnobs
     forbid_memory_oversubscription::Bool
     compaction_mode::Symbol                    # :off | :lazy | :preload
     compaction_interval::Int
+    payback_seconds::Float64                   # a change must save more latency over this than its uploads cost
+    prime_moves::Bool                          # stage a moving model's weights before routing switches
+    stage_timeout_seconds::Float64
     generation::Int
 end
 
@@ -78,6 +81,9 @@ function PackingKnobs(cfg::GatewayConfig)
         cfg.forbid_memory_oversubscription,
         cfg.compaction_mode,
         cfg.compaction_interval,
+        cfg.payback_seconds,
+        cfg.prime_moves,
+        cfg.stage_timeout_seconds,
         0,
     )
 end
@@ -161,6 +167,10 @@ function _validate_knob(field::Symbol, v)
     field === :compaction_interval &&
         return _ck_nonneg_int("scheduling.compaction_interval", v; hint = "0 = disabled")
     field === :forbid_memory_oversubscription && return Bool(v)
+    field === :payback_seconds &&
+        return _ck_nonneg("scheduling.payback_seconds", v; hint = "0 = never move a model for balance")
+    field === :prime_moves && return Bool(v)
+    field === :stage_timeout_seconds && return _ck_positive("scheduling.stage_timeout_seconds", v)
     field === :model_overrides && return v::Dict{String, ModelKnobs}
     field === :generation && return Int(v)
     throw(ConfigError("unknown scheduling knob '$field'"))
@@ -236,11 +246,22 @@ struct RepackReport
     mem_cap::Dict{String, Float64} # per-worker weight budget (0 = unconstrained)
     polled::Vector{String}
     drifted::Set{String}          # models not reported by every ready worker
+    # The repack's placement changes (moves, swaps, placements): planned, committed (installed at
+    # once, or after their weights were staged), dropped (staging failed or timed out), and whether
+    # some are still staging. The objective is the expected requests in the system summed over the
+    # workers, before the repack's improvements and after (see lpt_packing.jl).
+    changes_planned::Int
+    changes_committed::Int
+    changes_dropped::Int
+    staging::Bool
+    objective_before::Float64
+    objective_after::Float64
 end
 
 RepackReport() = RepackReport(
     0.0, 0.0, 0.0, :none, 0, 0, 0,
     Dict{String, Float64}(), Dict{String, Float64}(),
     Dict{String, Float64}(), Dict{String, Float64}(),
-    Dict{String, Float64}(), String[], Set{String}()
+    Dict{String, Float64}(), String[], Set{String}(),
+    0, 0, 0, false, 0.0, 0.0
 )

@@ -93,16 +93,71 @@ _st_infer(sched, name) = ReactantServer.infer(
     end
 end
 
-@testset "staging: a failed background read is not retried there; the dispatch loads the model" begin
+@testset "staging: a failed background read fails the waiting requests; the dispatch loop never reads" begin
     gw = GatedWeights()
     sched, A, B = _st_running(gw)
     try
         gw.armed = false
         gw.fail_next = true
-        @test _st_infer(sched, "B") == _ST_OUT          # the background read failed, the dispatch's succeeded
-        @test gw.reads[] == 2
+        err = try
+            _st_infer(sched, "B")
+        catch e
+            e
+        end
+        @test err isa ErrorException && occursin("reading the weights of model 'B' failed", err.msg)
+        @test gw.reads[] == 1                           # no second read on the dispatch loop
         @test B.sched.host_stage === :none
+        @test _st_infer(sched, "B") == _ST_OUT          # the next request starts a fresh read
+        @test gw.reads[] == 2
+        @test _st_infer(sched, "A") == _ST_OUT
     finally
+        ReactantServer.shutdown!(sched)
+    end
+end
+
+@testset "staging: past the staging cap a model waits for a slot instead of reading on the dispatch loop" begin
+    # Three models off the device, each read held at its own gate: two read in the background, and
+    # the third waits (`:pending`) rather than being read on the loop, which keeps serving A.
+    gws = [GatedWeights() for _ in 1:3]
+    A = _st_entry("A", CountingWeights())
+    Bs = [_st_entry("B$i", gws[i]) for i in 1:3]
+    backend = ReactantServer.MockBackend()
+    pool = ReactantServer.MemoryPool(backend, ReactantServer.MockClient(), ReactantServer.MockDevice(0), "mock", nothing)
+    reg = ReactantServer.ModelRegistry()
+    for e in (A, Bs...)
+        reg.by_name[e.name] = e
+    end
+    sched = ReactantServer.Scheduler(reg, backend, pool, ReactantServer.SchedulerConfig(30.0, 1024, 30.0))
+    for e in (A, Bs...)
+        e.sched = ReactantServer.ModelSchedState(e.name, ReactantServer.ModelSchedConfig(1.0), 0.0)
+    end
+    sched.weight_cache = ReactantServer.WeightCache(backend, pool, reg, 1 * _WBYTES)
+    ReactantServer.start!(sched)
+    try
+        @test _st_infer(sched, "A") == _ST_OUT
+        for g in gws
+            g.reads[] = 0
+            g.armed = true
+        end
+        tasks = [Threads.@spawn(_st_infer(sched, "B$i")) for i in 1:3]
+        t_end = time() + 10
+        while count(e -> e.sched.host_stage === :pending, Bs) < 1 && time() < t_end
+            sleep(0.01)
+        end
+        @test count(e -> e.sched.host_stage === :staging, Bs) == 2
+        @test count(e -> e.sched.host_stage === :pending, Bs) == 1
+        @test _st_infer(sched, "A") == _ST_OUT          # the loop is free meanwhile
+        for g in gws
+            g.armed = false
+            notify(g.gate)
+        end
+        @test all(t -> fetch(t) == _ST_OUT, tasks)
+        @test all(e -> e.sched.host_stage === :none, Bs)
+        @test all(g -> g.reads[] == 1, gws)            # each model read once, all in the background
+    finally
+        for g in gws
+            notify(g.gate)
+        end
         ReactantServer.shutdown!(sched)
     end
 end
@@ -253,5 +308,97 @@ end
         finally
             ReactantServer.shutdown!(sched)
         end
+    end
+end
+
+@testset "stage_weights: weights read ahead of a placement change are uploaded at the first dispatch, not read again" begin
+    gw = GatedWeights()
+    sched, A, B = _st_running(gw)
+    try
+        gw.armed = false
+        rows = ReactantServer.stage_weights!(sched, ["B", "A"]; hold_seconds = 30)
+        byname = Dict(r.name => r for r in rows)
+        @test byname["A"].state == "resident"            # on the device: nothing to read
+        @test byname["B"].state == "staged" && byname["B"].read
+        @test byname["B"].nbytes == _WBYTES
+        @test gw.reads[] == 1
+        @test B.executable.weights === nothing           # read into host memory only
+        @test haskey(sched.prefetched, "B")
+        # Asking again while the hold stands reads nothing.
+        @test only(ReactantServer.stage_weights!(sched, ["B"])).state == "staged"
+        @test gw.reads[] == 1
+        @test _st_infer(sched, "B") == _ST_OUT
+        @test gw.reads[] == 1                            # the dispatch uploaded what was staged
+        @test isempty(sched.prefetched)
+        @test_throws ErrorException ReactantServer.stage_weights!(sched, ["nope"])
+    finally
+        ReactantServer.shutdown!(sched)
+    end
+end
+
+@testset "stage_weights: an unclaimed hold is released when it expires" begin
+    gw = GatedWeights()
+    sched, A, B = _st_running(gw)
+    try
+        gw.armed = false
+        @test only(ReactantServer.stage_weights!(sched, ["B"]; hold_seconds = 0.5)).state == "staged"
+        ReactantServer._sweep_prefetched!(sched)
+        @test haskey(sched.prefetched, "B")
+        ReactantServer._sweep_prefetched!(sched; now = time() + 1.0)
+        @test isempty(sched.prefetched)
+        @test _st_infer(sched, "B") == _ST_OUT           # a request then reads it the usual way
+        @test gw.reads[] == 2
+    finally
+        ReactantServer.shutdown!(sched)
+    end
+end
+
+@testset "stage_weights: past the held-bytes cap a model is deferred" begin
+    es = [_st_entry(n, CountingWeights()) for n in ("A", "B", "C")]
+    backend = ReactantServer.MockBackend()
+    pool = ReactantServer.MemoryPool(backend, ReactantServer.MockClient(), ReactantServer.MockDevice(0), "mock", nothing)
+    reg = ReactantServer.ModelRegistry()
+    for e in es
+        reg.by_name[e.name] = e
+    end
+    sched = ReactantServer.Scheduler(reg, backend, pool, ReactantServer.SchedulerConfig(30.0, 1024, 30.0))
+    for e in es
+        e.sched = ReactantServer.ModelSchedState(e.name, ReactantServer.ModelSchedConfig(1.0), 0.0)
+    end
+    # A host budget of three models' weights: the cap on held bytes is half of it, one model. Room on
+    # the device for one, which startup fills.
+    sched.weight_cache = ReactantServer.WeightCache(backend, pool, reg, _WBYTES; host_budget = 3 * sizeof(_W))
+    ReactantServer.start!(sched)
+    try
+        off = [e.name for e in es if e.executable.weights === nothing]
+        @test length(off) == 2
+        rows = Dict(r.name => r.state for r in ReactantServer.stage_weights!(sched, off))
+        @test sort(collect(values(rows))) == ["deferred", "staged"]
+        @test length(sched.prefetched) == 1
+    finally
+        ReactantServer.shutdown!(sched)
+    end
+end
+
+@testset "load_costs: upload and read times, the host copy, and loads per model" begin
+    gw = GatedWeights()
+    sched, A, B = _st_running(gw)
+    try
+        gw.armed = false
+        c = ReactantServer.load_costs(sched, ["A", "B"])
+        @test c["A"].upload_seconds > 0 && c["A"].read_seconds > 0
+        @test c["A"].loads >= 1
+        @test !c["B"].host_copy && B.executable.weights === nothing
+        snap = ReactantServer.control_status(sched)
+        @test snap.host_weight_budget_bytes == 0
+        resp = ReactantServer._handle_model_control_status(ReactantServer.InferContext(sched, sched.registry, ReactantServer.SharedMemoryRegistry(), "mock"))
+        ms = Dict(m.name => m for m in resp.models)
+        @test ms["A"].upload_seconds ≈ c["A"].upload_seconds && ms["A"].loads == c["A"].loads
+        staged = ReactantServer._handle_stage_weights(
+            ReactantServer.InferContext(sched, sched.registry, ReactantServer.SharedMemoryRegistry(), "mock"), ReactantServer.control.StageWeightsRequest(; names = ["B"], hold_seconds = 10.0)
+        )
+        @test only(staged.models).state == "staged" && only(staged.models).weight_nbytes == _WBYTES
+    finally
+        ReactantServer.shutdown!(sched)
     end
 end

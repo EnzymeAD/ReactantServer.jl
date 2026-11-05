@@ -69,33 +69,48 @@ Base.showerror(io::IO, e::AdmissionError) =
 const DEFAULT_READ_BANDWIDTH = 1.0 * 2^30
 
 """
-    reload_seconds(cache, fp; host_copy=false) -> Float64
+    reload_seconds(cache, fp) -> Float64
 
-What evicting this model costs to undo: uploading its weights again, plus reading its weights file
-when no host copy will be there to upload from (`host_copy`, see `has_host_copy`). Each half is the
-model's measured average, or before it was measured, the model's bytes over the worker's measured
-bandwidth for that half (the default before any). A history-only average would price a model whose
-host copy was just evicted as cheaply as one whose copy is still cached, and the reverse.
+The device time that evicting this model costs to undo: uploading its weights again. The model's
+measured average, or before it was measured, its bytes over the worker's measured upload bandwidth
+(the default before any).
+
+Reading the weights file is not counted. That read runs on a background task before the dispatch
+(`stage_host_weights`), never on the dispatch loop, so it holds no device time; what it costs is
+latency for the requests that wait for it, and that cost is incurred when the model's host copy is
+evicted, not its device copy. See [`read_seconds`](@ref).
 """
-function reload_seconds(cache::WeightCache, fp::ModelFootprint; host_copy::Bool = false)
-    upload = fp.upload_seconds > 0 ? fp.upload_seconds :
+function reload_seconds(cache::WeightCache, fp::ModelFootprint)
+    return fp.upload_seconds > 0 ? fp.upload_seconds :
         fp.weight_bytes / _bandwidth(cache.upload_bytes, cache.upload_seconds, DEFAULT_LOAD_BANDWIDTH)
-    host_copy && return upload
-    read = fp.read_seconds > 0 ? fp.read_seconds :
+end
+
+"""
+    read_seconds(cache, fp) -> Float64
+
+How long reading this model's weights file takes: the latency a request for it waits when no host
+copy is left to upload from. The model's measured average, or its bytes over the worker's measured
+read bandwidth (the default before any). Off the device's time; reported to the gateway, which
+weighs it when planning which models to move.
+"""
+function read_seconds(cache::WeightCache, fp::ModelFootprint)
+    return fp.read_seconds > 0 ? fp.read_seconds :
         fp.weight_bytes / _bandwidth(cache.read_bytes, cache.read_seconds, DEFAULT_READ_BANDWIDTH)
-    return upload + read
 end
 
 _bandwidth(bytes, seconds, default) = (seconds > 0 && bytes > 0) ? bytes / seconds : default
 
-_priority_gain(cache::WeightCache, fp::ModelFootprint; host_copy::Bool = false) =
-    fp.hits * reload_seconds(cache, fp; host_copy = host_copy) / max(fp.weight_bytes, 1)
+# Device-seconds of upload saved per weight byte held, per use: the GreedyDual-Size-Frequency gain.
+# With uploads at a fixed bandwidth the size cancels, so the most often used models stay resident
+# whatever their size; a fixed cost per load tilts it slightly toward small models.
+_priority_gain(cache::WeightCache, fp::ModelFootprint) =
+    fp.hits * reload_seconds(cache, fp) / max(fp.weight_bytes, 1)
 
-# Recompute a resident model's priority from what reloading it would cost right now, keeping the
-# inflation it was last used at. Called where an eviction decision reads priorities, since whether
-# a host copy exists changes between a model's uses (another worker can evict a shared copy).
+# Recompute a resident model's priority from its current reload cost, keeping the inflation it was
+# last used at. Called where an eviction decision reads priorities, since measured upload times
+# change between a model's uses.
 function _refresh_priority!(cache::WeightCache, entry::ModelEntry, fp::ModelFootprint)
-    fp.priority = fp.prio_base + _priority_gain(cache, fp; host_copy = has_host_copy(cache, entry))
+    fp.priority = fp.prio_base + _priority_gain(cache, fp)
     return fp.priority
 end
 
@@ -109,8 +124,6 @@ function record_hit!(cache::WeightCache, entry::ModelEntry)
     fp = get(cache.footprints, entry.name, nothing)
     fp === nothing && (fp = model_footprint(cache, entry))
     fp.hits += 1
-    # Priced as a full reload here, to keep a dispatch free of host-cache lookups; an eviction
-    # decision reprices it from the host copy's current state (`_refresh_priority!`).
     fp.prio_base = cache.inflation
     fp.priority = fp.prio_base + _priority_gain(cache, fp)
     return nothing
@@ -287,8 +300,9 @@ function _reload_left(cache::WeightCache, block::Integer, entries)
 end
 
 # The fallback: free every evictable model (and `entry` if it got uploaded), then reload the most
-# valuable of the previously resident models that fit alongside `entry`, largest first so the
-# refill packs tightly, and check that the weights and the scratch block both fit. Runs at most
+# valuable of the previously resident models that fit alongside `entry` and have a host copy to
+# upload from, largest first so the refill packs tightly, and check that the weights and the scratch
+# block both fit. Runs at most
 # once per admission; a second failure is an AdmissionError.
 function _compact_and_retry!(cache::WeightCache, entry::ModelEntry; staged = nothing)
     fp = model_footprint(cache, entry)
@@ -322,6 +336,10 @@ function _compact_and_retry!(cache::WeightCache, entry::ModelEntry; staged = not
     for name in keep
         e = cache.registry.by_name[name]
         f = cache.footprints[name]
+        # Only a former resident with a host copy is reloaded here: this runs on the dispatch loop,
+        # which never reads a weights file. One without stays evicted and is read in the background
+        # before its next dispatch.
+        has_host_copy(cache, e) || continue
         extra = max(0, _scratch_of(cache, f) - scratch)    # a larger scratch block it would need
         (f.weight_bytes + extra <= room && e.executable.nbytes <= budget) || continue
         if lf !== nothing

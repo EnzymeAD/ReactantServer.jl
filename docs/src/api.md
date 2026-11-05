@@ -1,28 +1,22 @@
 # API reference
 
-Every exported name that carries a docstring across the five documented packages appears below,
-collected automatically. `ReactantServer` re-exports the whole `ReactantServerCore` substrate, so
-the shared API (dtypes, protobuf messages, boundary types, manifest, config, codec, shared memory,
-the staging `BufferPool`) is documented under its original bindings once. The guide pages give the
-worked context: [Tutorials](tutorials/export.md), [Bundles](bundles.md),
+The exported API is documented one package per page, collected automatically from the docstrings:
+
+- [Core](api_core.md): the shared substrate (dtypes, protobuf messages, boundary types, manifest,
+  config, codec, shared memory, the weight store, the staging `BufferPool`). `ReactantServer`
+  re-exports all of it, so it is documented once, under its original bindings.
+- [Worker](api_worker.md): `ReactantServer`, the inference worker.
+- [Gateway](api_gateway.md): `ReactantServerGateway`.
+- [Node](api_node.md): `ReactantServerNode`, the single-container supervisor.
+- [Client](api_client.md): `ReactantServerClient`.
+- [Export](api_export.md): `ReactantServerExport`, the offline export tooling.
+
+The guide pages give the worked context: [Tutorials](tutorials/export.md), [Bundles](bundles.md),
 [Node Configuration](node_config.md), [Scheduling](scheduling.md),
 [On-demand Weights](on_demand_weights.md), [Multi-GPU Gateway](gateway.md),
 [Client Usage](client.md), [Meta Models](meta_models.md),
 [Object Detection](object_detection.md), [Transformer Text Models](transformers.md), and
 [Deployment](deployment.md).
-
-```@autodocs
-Modules = [
-    ReactantServer,
-    ReactantServerClient,
-    ReactantServerExport,
-    ReactantServerGateway,
-    ReactantServerNode,
-    ReactantServerCore,
-]
-Public = true
-Private = false
-```
 
 ## Operational internals
 

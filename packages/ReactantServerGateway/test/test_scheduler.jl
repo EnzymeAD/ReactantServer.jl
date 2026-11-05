@@ -10,7 +10,7 @@ function _sched_cfg(mode; basis = "compute")
     return GW.GatewayConfig(
         "0.0.0.0:0", "0.0.0.0:0", ["127.0.0.1:7001", "127.0.0.1:7002"],
         String[], String[], 60, 1, 1, "info", "json", mode, basis, 30.0, 0.0, 0.8, 0.1, 30.0,
-        1, 1.0, "fill_rr", "run", Dict{String, GW.GatewayModelConfig}(), 32, 64, :off, 0, false
+        1, 1.0, "fill_rr", "run", Dict{String, GW.GatewayModelConfig}(), 32, 64, :off, 0, false, 600.0, true, 120.0
     )
 end
 

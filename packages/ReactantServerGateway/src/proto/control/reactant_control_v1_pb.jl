@@ -9,12 +9,13 @@ using ProtoBuf: OneOf
 using ProtoBuf.EnumX: @enumx
 
 export ReplicaPlacement, SetModelPlacementRequest, SetModelPlacementResponse
-export SetModelPolicyRequest, RepackStatus, RepackRequest, CompactMemoryRequest, AxisKind
-export SetModelPolicyResponse, DescribeModelsRequest, ModelControlStatusRequest
-export SchedulingPolicy, GetSchedulingStatusRequest, Residency, TensorShape
-export CompactMemoryResponse, WorkerSchedulingStatus, ModelSchedulingStatus, RepackResponse
-export TensorDescription, SetSchedulingPolicyResponse, SetSchedulingPolicyRequest
-export SetModelResidencyResponse, SetModelResidencyRequest, ModelStatus, ShapeVariant
+export StageWeightsRequest, SetModelPolicyRequest, RepackStatus, RepackRequest
+export CompactMemoryRequest, AxisKind, SetModelPolicyResponse, DescribeModelsRequest
+export ModelControlStatusRequest, SchedulingPolicy, GetSchedulingStatusRequest, Residency
+export TensorShape, StagedModel, CompactMemoryResponse, WorkerSchedulingStatus
+export ModelSchedulingStatus, RepackResponse, TensorDescription
+export SetSchedulingPolicyResponse, SetSchedulingPolicyRequest, SetModelResidencyResponse
+export SetModelResidencyRequest, ModelStatus, ShapeVariant, StageWeightsResponse
 export GetSchedulingStatusResponse, ModelControlStatusResponse, ModelDescription
 export DescribeModelsResponse
 
@@ -190,6 +191,43 @@ function PB._encoded_size(x::SetModelPlacementResponse)
     return encoded_size
 end
 
+struct StageWeightsRequest
+    names::Vector{String}
+    hold_seconds::Float64
+end
+StageWeightsRequest(; names = Vector{String}(), hold_seconds = zero(Float64)) = StageWeightsRequest(names, hold_seconds)
+PB.default_values(::Type{StageWeightsRequest}) = (; names = Vector{String}(), hold_seconds = zero(Float64))
+PB.field_numbers(::Type{StageWeightsRequest}) = (; names = 1, hold_seconds = 2)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:StageWeightsRequest}, _endpos::Int = 0, _group::Bool = false)
+    names = PB.BufferedVector{String}()
+    hold_seconds = zero(Float64)
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            PB.decode!(d, names)
+        elseif field_number == 2
+            hold_seconds = PB.decode(d, Float64)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return StageWeightsRequest(names[], hold_seconds)
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::StageWeightsRequest)
+    initpos = position(e.io)
+    !isempty(x.names) && PB.encode(e, 1, x.names)
+    x.hold_seconds !== zero(Float64) && PB.encode(e, 2, x.hold_seconds)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::StageWeightsRequest)
+    encoded_size = 0
+    !isempty(x.names) && (encoded_size += PB._encoded_size(x.names, 1))
+    x.hold_seconds !== zero(Float64) && (encoded_size += PB._encoded_size(x.hold_seconds, 2))
+    return encoded_size
+end
+
 struct SetModelPolicyRequest
     name::String
     has_weight::Bool
@@ -248,10 +286,16 @@ struct RepackStatus
     repacks_since_compaction::Int64
     operator_repacks_requested::UInt64
     operator_repacks_completed::UInt64
+    last_changes_planned::Int64
+    last_changes_committed::Int64
+    last_changes_dropped::Int64
+    staging_in_progress::Bool
+    last_objective_before::Float64
+    last_objective_after::Float64
 end
-RepackStatus(; last_repack_unix_seconds = zero(Float64), last_repack_wall_elapsed_seconds = zero(Float64), last_repack_compute_seconds = zero(Float64), last_trigger = "", last_models_placed = zero(Int64), last_models_moved = zero(Int64), repack_count = zero(UInt64), compute_accumulated_seconds = zero(Float64), active_threshold_seconds = zero(Float64), first_tick_repack_done = false, last_tick_unix_seconds = zero(Float64), repacks_since_compaction = zero(Int64), operator_repacks_requested = zero(UInt64), operator_repacks_completed = zero(UInt64)) = RepackStatus(last_repack_unix_seconds, last_repack_wall_elapsed_seconds, last_repack_compute_seconds, last_trigger, last_models_placed, last_models_moved, repack_count, compute_accumulated_seconds, active_threshold_seconds, first_tick_repack_done, last_tick_unix_seconds, repacks_since_compaction, operator_repacks_requested, operator_repacks_completed)
-PB.default_values(::Type{RepackStatus}) = (; last_repack_unix_seconds = zero(Float64), last_repack_wall_elapsed_seconds = zero(Float64), last_repack_compute_seconds = zero(Float64), last_trigger = "", last_models_placed = zero(Int64), last_models_moved = zero(Int64), repack_count = zero(UInt64), compute_accumulated_seconds = zero(Float64), active_threshold_seconds = zero(Float64), first_tick_repack_done = false, last_tick_unix_seconds = zero(Float64), repacks_since_compaction = zero(Int64), operator_repacks_requested = zero(UInt64), operator_repacks_completed = zero(UInt64))
-PB.field_numbers(::Type{RepackStatus}) = (; last_repack_unix_seconds = 1, last_repack_wall_elapsed_seconds = 2, last_repack_compute_seconds = 3, last_trigger = 4, last_models_placed = 5, last_models_moved = 6, repack_count = 7, compute_accumulated_seconds = 8, active_threshold_seconds = 9, first_tick_repack_done = 10, last_tick_unix_seconds = 11, repacks_since_compaction = 12, operator_repacks_requested = 13, operator_repacks_completed = 14)
+RepackStatus(; last_repack_unix_seconds = zero(Float64), last_repack_wall_elapsed_seconds = zero(Float64), last_repack_compute_seconds = zero(Float64), last_trigger = "", last_models_placed = zero(Int64), last_models_moved = zero(Int64), repack_count = zero(UInt64), compute_accumulated_seconds = zero(Float64), active_threshold_seconds = zero(Float64), first_tick_repack_done = false, last_tick_unix_seconds = zero(Float64), repacks_since_compaction = zero(Int64), operator_repacks_requested = zero(UInt64), operator_repacks_completed = zero(UInt64), last_changes_planned = zero(Int64), last_changes_committed = zero(Int64), last_changes_dropped = zero(Int64), staging_in_progress = false, last_objective_before = zero(Float64), last_objective_after = zero(Float64)) = RepackStatus(last_repack_unix_seconds, last_repack_wall_elapsed_seconds, last_repack_compute_seconds, last_trigger, last_models_placed, last_models_moved, repack_count, compute_accumulated_seconds, active_threshold_seconds, first_tick_repack_done, last_tick_unix_seconds, repacks_since_compaction, operator_repacks_requested, operator_repacks_completed, last_changes_planned, last_changes_committed, last_changes_dropped, staging_in_progress, last_objective_before, last_objective_after)
+PB.default_values(::Type{RepackStatus}) = (; last_repack_unix_seconds = zero(Float64), last_repack_wall_elapsed_seconds = zero(Float64), last_repack_compute_seconds = zero(Float64), last_trigger = "", last_models_placed = zero(Int64), last_models_moved = zero(Int64), repack_count = zero(UInt64), compute_accumulated_seconds = zero(Float64), active_threshold_seconds = zero(Float64), first_tick_repack_done = false, last_tick_unix_seconds = zero(Float64), repacks_since_compaction = zero(Int64), operator_repacks_requested = zero(UInt64), operator_repacks_completed = zero(UInt64), last_changes_planned = zero(Int64), last_changes_committed = zero(Int64), last_changes_dropped = zero(Int64), staging_in_progress = false, last_objective_before = zero(Float64), last_objective_after = zero(Float64))
+PB.field_numbers(::Type{RepackStatus}) = (; last_repack_unix_seconds = 1, last_repack_wall_elapsed_seconds = 2, last_repack_compute_seconds = 3, last_trigger = 4, last_models_placed = 5, last_models_moved = 6, repack_count = 7, compute_accumulated_seconds = 8, active_threshold_seconds = 9, first_tick_repack_done = 10, last_tick_unix_seconds = 11, repacks_since_compaction = 12, operator_repacks_requested = 13, operator_repacks_completed = 14, last_changes_planned = 15, last_changes_committed = 16, last_changes_dropped = 17, staging_in_progress = 18, last_objective_before = 19, last_objective_after = 20)
 
 function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:RepackStatus}, _endpos::Int = 0, _group::Bool = false)
     last_repack_unix_seconds = zero(Float64)
@@ -268,6 +312,12 @@ function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:RepackStatus}, _endpos::
     repacks_since_compaction = zero(Int64)
     operator_repacks_requested = zero(UInt64)
     operator_repacks_completed = zero(UInt64)
+    last_changes_planned = zero(Int64)
+    last_changes_committed = zero(Int64)
+    last_changes_dropped = zero(Int64)
+    staging_in_progress = false
+    last_objective_before = zero(Float64)
+    last_objective_after = zero(Float64)
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         if field_number == 1
@@ -298,11 +348,23 @@ function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:RepackStatus}, _endpos::
             operator_repacks_requested = PB.decode(d, UInt64)
         elseif field_number == 14
             operator_repacks_completed = PB.decode(d, UInt64)
+        elseif field_number == 15
+            last_changes_planned = PB.decode(d, Int64)
+        elseif field_number == 16
+            last_changes_committed = PB.decode(d, Int64)
+        elseif field_number == 17
+            last_changes_dropped = PB.decode(d, Int64)
+        elseif field_number == 18
+            staging_in_progress = PB.decode(d, Bool)
+        elseif field_number == 19
+            last_objective_before = PB.decode(d, Float64)
+        elseif field_number == 20
+            last_objective_after = PB.decode(d, Float64)
         else
             Base.skip(d, wire_type)
         end
     end
-    return RepackStatus(last_repack_unix_seconds, last_repack_wall_elapsed_seconds, last_repack_compute_seconds, last_trigger, last_models_placed, last_models_moved, repack_count, compute_accumulated_seconds, active_threshold_seconds, first_tick_repack_done, last_tick_unix_seconds, repacks_since_compaction, operator_repacks_requested, operator_repacks_completed)
+    return RepackStatus(last_repack_unix_seconds, last_repack_wall_elapsed_seconds, last_repack_compute_seconds, last_trigger, last_models_placed, last_models_moved, repack_count, compute_accumulated_seconds, active_threshold_seconds, first_tick_repack_done, last_tick_unix_seconds, repacks_since_compaction, operator_repacks_requested, operator_repacks_completed, last_changes_planned, last_changes_committed, last_changes_dropped, staging_in_progress, last_objective_before, last_objective_after)
 end
 
 function PB.encode(e::PB.AbstractProtoEncoder, x::RepackStatus)
@@ -321,6 +383,12 @@ function PB.encode(e::PB.AbstractProtoEncoder, x::RepackStatus)
     x.repacks_since_compaction != zero(Int64) && PB.encode(e, 12, x.repacks_since_compaction)
     x.operator_repacks_requested != zero(UInt64) && PB.encode(e, 13, x.operator_repacks_requested)
     x.operator_repacks_completed != zero(UInt64) && PB.encode(e, 14, x.operator_repacks_completed)
+    x.last_changes_planned != zero(Int64) && PB.encode(e, 15, x.last_changes_planned)
+    x.last_changes_committed != zero(Int64) && PB.encode(e, 16, x.last_changes_committed)
+    x.last_changes_dropped != zero(Int64) && PB.encode(e, 17, x.last_changes_dropped)
+    x.staging_in_progress != false && PB.encode(e, 18, x.staging_in_progress)
+    x.last_objective_before !== zero(Float64) && PB.encode(e, 19, x.last_objective_before)
+    x.last_objective_after !== zero(Float64) && PB.encode(e, 20, x.last_objective_after)
     return position(e.io) - initpos
 end
 function PB._encoded_size(x::RepackStatus)
@@ -339,37 +407,49 @@ function PB._encoded_size(x::RepackStatus)
     x.repacks_since_compaction != zero(Int64) && (encoded_size += PB._encoded_size(x.repacks_since_compaction, 12))
     x.operator_repacks_requested != zero(UInt64) && (encoded_size += PB._encoded_size(x.operator_repacks_requested, 13))
     x.operator_repacks_completed != zero(UInt64) && (encoded_size += PB._encoded_size(x.operator_repacks_completed, 14))
+    x.last_changes_planned != zero(Int64) && (encoded_size += PB._encoded_size(x.last_changes_planned, 15))
+    x.last_changes_committed != zero(Int64) && (encoded_size += PB._encoded_size(x.last_changes_committed, 16))
+    x.last_changes_dropped != zero(Int64) && (encoded_size += PB._encoded_size(x.last_changes_dropped, 17))
+    x.staging_in_progress != false && (encoded_size += PB._encoded_size(x.staging_in_progress, 18))
+    x.last_objective_before !== zero(Float64) && (encoded_size += PB._encoded_size(x.last_objective_before, 19))
+    x.last_objective_after !== zero(Float64) && (encoded_size += PB._encoded_size(x.last_objective_after, 20))
     return encoded_size
 end
 
 struct RepackRequest
     wait_seconds::Float64
+    full::Bool
 end
-RepackRequest(; wait_seconds = zero(Float64)) = RepackRequest(wait_seconds)
-PB.default_values(::Type{RepackRequest}) = (; wait_seconds = zero(Float64))
-PB.field_numbers(::Type{RepackRequest}) = (; wait_seconds = 1)
+RepackRequest(; wait_seconds = zero(Float64), full = false) = RepackRequest(wait_seconds, full)
+PB.default_values(::Type{RepackRequest}) = (; wait_seconds = zero(Float64), full = false)
+PB.field_numbers(::Type{RepackRequest}) = (; wait_seconds = 1, full = 2)
 
 function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:RepackRequest}, _endpos::Int = 0, _group::Bool = false)
     wait_seconds = zero(Float64)
+    full = false
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         if field_number == 1
             wait_seconds = PB.decode(d, Float64)
+        elseif field_number == 2
+            full = PB.decode(d, Bool)
         else
             Base.skip(d, wire_type)
         end
     end
-    return RepackRequest(wait_seconds)
+    return RepackRequest(wait_seconds, full)
 end
 
 function PB.encode(e::PB.AbstractProtoEncoder, x::RepackRequest)
     initpos = position(e.io)
     x.wait_seconds !== zero(Float64) && PB.encode(e, 1, x.wait_seconds)
+    x.full != false && PB.encode(e, 2, x.full)
     return position(e.io) - initpos
 end
 function PB._encoded_size(x::RepackRequest)
     encoded_size = 0
     x.wait_seconds !== zero(Float64) && (encoded_size += PB._encoded_size(x.wait_seconds, 1))
+    x.full != false && (encoded_size += PB._encoded_size(x.full, 2))
     return encoded_size
 end
 
@@ -489,10 +569,13 @@ struct SchedulingPolicy
     forbid_memory_oversubscription::Bool
     generation::UInt64
     work_basis::String
+    payback_seconds::Float64
+    prime_moves::Bool
+    stage_timeout_seconds::Float64
 end
-SchedulingPolicy(; rebalance_compute_seconds = zero(Float64), first_rebalance_compute_seconds = zero(Float64), hysteresis = zero(Float64), ema_halflife_compute_seconds = zero(Float64), default_replicas = zero(Int64), routing_policy = "", routing_fill_factor = zero(Float64), routing_fill_mode = "", compaction_mode = "", compaction_interval = zero(Int64), forbid_memory_oversubscription = false, generation = zero(UInt64), work_basis = "") = SchedulingPolicy(rebalance_compute_seconds, first_rebalance_compute_seconds, hysteresis, ema_halflife_compute_seconds, default_replicas, routing_policy, routing_fill_factor, routing_fill_mode, compaction_mode, compaction_interval, forbid_memory_oversubscription, generation, work_basis)
-PB.default_values(::Type{SchedulingPolicy}) = (; rebalance_compute_seconds = zero(Float64), first_rebalance_compute_seconds = zero(Float64), hysteresis = zero(Float64), ema_halflife_compute_seconds = zero(Float64), default_replicas = zero(Int64), routing_policy = "", routing_fill_factor = zero(Float64), routing_fill_mode = "", compaction_mode = "", compaction_interval = zero(Int64), forbid_memory_oversubscription = false, generation = zero(UInt64), work_basis = "")
-PB.field_numbers(::Type{SchedulingPolicy}) = (; rebalance_compute_seconds = 1, first_rebalance_compute_seconds = 2, hysteresis = 3, ema_halflife_compute_seconds = 4, default_replicas = 5, routing_policy = 6, routing_fill_factor = 7, routing_fill_mode = 8, compaction_mode = 9, compaction_interval = 10, forbid_memory_oversubscription = 11, generation = 12, work_basis = 13)
+SchedulingPolicy(; rebalance_compute_seconds = zero(Float64), first_rebalance_compute_seconds = zero(Float64), hysteresis = zero(Float64), ema_halflife_compute_seconds = zero(Float64), default_replicas = zero(Int64), routing_policy = "", routing_fill_factor = zero(Float64), routing_fill_mode = "", compaction_mode = "", compaction_interval = zero(Int64), forbid_memory_oversubscription = false, generation = zero(UInt64), work_basis = "", payback_seconds = zero(Float64), prime_moves = false, stage_timeout_seconds = zero(Float64)) = SchedulingPolicy(rebalance_compute_seconds, first_rebalance_compute_seconds, hysteresis, ema_halflife_compute_seconds, default_replicas, routing_policy, routing_fill_factor, routing_fill_mode, compaction_mode, compaction_interval, forbid_memory_oversubscription, generation, work_basis, payback_seconds, prime_moves, stage_timeout_seconds)
+PB.default_values(::Type{SchedulingPolicy}) = (; rebalance_compute_seconds = zero(Float64), first_rebalance_compute_seconds = zero(Float64), hysteresis = zero(Float64), ema_halflife_compute_seconds = zero(Float64), default_replicas = zero(Int64), routing_policy = "", routing_fill_factor = zero(Float64), routing_fill_mode = "", compaction_mode = "", compaction_interval = zero(Int64), forbid_memory_oversubscription = false, generation = zero(UInt64), work_basis = "", payback_seconds = zero(Float64), prime_moves = false, stage_timeout_seconds = zero(Float64))
+PB.field_numbers(::Type{SchedulingPolicy}) = (; rebalance_compute_seconds = 1, first_rebalance_compute_seconds = 2, hysteresis = 3, ema_halflife_compute_seconds = 4, default_replicas = 5, routing_policy = 6, routing_fill_factor = 7, routing_fill_mode = 8, compaction_mode = 9, compaction_interval = 10, forbid_memory_oversubscription = 11, generation = 12, work_basis = 13, payback_seconds = 14, prime_moves = 15, stage_timeout_seconds = 16)
 
 function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SchedulingPolicy}, _endpos::Int = 0, _group::Bool = false)
     rebalance_compute_seconds = zero(Float64)
@@ -508,6 +591,9 @@ function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SchedulingPolicy}, _endp
     forbid_memory_oversubscription = false
     generation = zero(UInt64)
     work_basis = ""
+    payback_seconds = zero(Float64)
+    prime_moves = false
+    stage_timeout_seconds = zero(Float64)
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         if field_number == 1
@@ -536,11 +622,17 @@ function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:SchedulingPolicy}, _endp
             generation = PB.decode(d, UInt64)
         elseif field_number == 13
             work_basis = PB.decode(d, String)
+        elseif field_number == 14
+            payback_seconds = PB.decode(d, Float64)
+        elseif field_number == 15
+            prime_moves = PB.decode(d, Bool)
+        elseif field_number == 16
+            stage_timeout_seconds = PB.decode(d, Float64)
         else
             Base.skip(d, wire_type)
         end
     end
-    return SchedulingPolicy(rebalance_compute_seconds, first_rebalance_compute_seconds, hysteresis, ema_halflife_compute_seconds, default_replicas, routing_policy, routing_fill_factor, routing_fill_mode, compaction_mode, compaction_interval, forbid_memory_oversubscription, generation, work_basis)
+    return SchedulingPolicy(rebalance_compute_seconds, first_rebalance_compute_seconds, hysteresis, ema_halflife_compute_seconds, default_replicas, routing_policy, routing_fill_factor, routing_fill_mode, compaction_mode, compaction_interval, forbid_memory_oversubscription, generation, work_basis, payback_seconds, prime_moves, stage_timeout_seconds)
 end
 
 function PB.encode(e::PB.AbstractProtoEncoder, x::SchedulingPolicy)
@@ -558,6 +650,9 @@ function PB.encode(e::PB.AbstractProtoEncoder, x::SchedulingPolicy)
     x.forbid_memory_oversubscription != false && PB.encode(e, 11, x.forbid_memory_oversubscription)
     x.generation != zero(UInt64) && PB.encode(e, 12, x.generation)
     !isempty(x.work_basis) && PB.encode(e, 13, x.work_basis)
+    x.payback_seconds !== zero(Float64) && PB.encode(e, 14, x.payback_seconds)
+    x.prime_moves != false && PB.encode(e, 15, x.prime_moves)
+    x.stage_timeout_seconds !== zero(Float64) && PB.encode(e, 16, x.stage_timeout_seconds)
     return position(e.io) - initpos
 end
 function PB._encoded_size(x::SchedulingPolicy)
@@ -575,6 +670,9 @@ function PB._encoded_size(x::SchedulingPolicy)
     x.forbid_memory_oversubscription != false && (encoded_size += PB._encoded_size(x.forbid_memory_oversubscription, 11))
     x.generation != zero(UInt64) && (encoded_size += PB._encoded_size(x.generation, 12))
     !isempty(x.work_basis) && (encoded_size += PB._encoded_size(x.work_basis, 13))
+    x.payback_seconds !== zero(Float64) && (encoded_size += PB._encoded_size(x.payback_seconds, 14))
+    x.prime_moves != false && (encoded_size += PB._encoded_size(x.prime_moves, 15))
+    x.stage_timeout_seconds !== zero(Float64) && (encoded_size += PB._encoded_size(x.stage_timeout_seconds, 16))
     return encoded_size
 end
 
@@ -633,6 +731,67 @@ function PB._encoded_size(x::TensorShape)
     encoded_size = 0
     !isempty(x.name) && (encoded_size += PB._encoded_size(x.name, 1))
     !isempty(x.shape) && (encoded_size += PB._encoded_size(x.shape, 2))
+    return encoded_size
+end
+
+struct StagedModel
+    name::String
+    state::String
+    read::Bool
+    weight_nbytes::Int64
+    seconds::Float64
+    error::String
+end
+StagedModel(; name = "", state = "", read = false, weight_nbytes = zero(Int64), seconds = zero(Float64), error = "") = StagedModel(name, state, read, weight_nbytes, seconds, error)
+PB.default_values(::Type{StagedModel}) = (; name = "", state = "", read = false, weight_nbytes = zero(Int64), seconds = zero(Float64), error = "")
+PB.field_numbers(::Type{StagedModel}) = (; name = 1, state = 2, read = 3, weight_nbytes = 4, seconds = 5, error = 6)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:StagedModel}, _endpos::Int = 0, _group::Bool = false)
+    name = ""
+    state = ""
+    read = false
+    weight_nbytes = zero(Int64)
+    seconds = zero(Float64)
+    error = ""
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            name = PB.decode(d, String)
+        elseif field_number == 2
+            state = PB.decode(d, String)
+        elseif field_number == 3
+            read = PB.decode(d, Bool)
+        elseif field_number == 4
+            weight_nbytes = PB.decode(d, Int64)
+        elseif field_number == 5
+            seconds = PB.decode(d, Float64)
+        elseif field_number == 6
+            error = PB.decode(d, String)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return StagedModel(name, state, read, weight_nbytes, seconds, error)
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::StagedModel)
+    initpos = position(e.io)
+    !isempty(x.name) && PB.encode(e, 1, x.name)
+    !isempty(x.state) && PB.encode(e, 2, x.state)
+    x.read != false && PB.encode(e, 3, x.read)
+    x.weight_nbytes != zero(Int64) && PB.encode(e, 4, x.weight_nbytes)
+    x.seconds !== zero(Float64) && PB.encode(e, 5, x.seconds)
+    !isempty(x.error) && PB.encode(e, 6, x.error)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::StagedModel)
+    encoded_size = 0
+    !isempty(x.name) && (encoded_size += PB._encoded_size(x.name, 1))
+    !isempty(x.state) && (encoded_size += PB._encoded_size(x.state, 2))
+    x.read != false && (encoded_size += PB._encoded_size(x.read, 3))
+    x.weight_nbytes != zero(Int64) && (encoded_size += PB._encoded_size(x.weight_nbytes, 4))
+    x.seconds !== zero(Float64) && (encoded_size += PB._encoded_size(x.seconds, 5))
+    !isempty(x.error) && (encoded_size += PB._encoded_size(x.error, 6))
     return encoded_size
 end
 
@@ -1116,10 +1275,14 @@ struct ModelStatus
     batch_input_name::String
     batch_axis::Int64
     rows_served::UInt64
+    host_copy::Bool
+    upload_seconds::Float64
+    read_seconds::Float64
+    loads::UInt64
 end
-ModelStatus(; name = "", residency = Residency.RESIDENCY_UNSPECIFIED, device_resident = false, host_resident = false, weight_nbytes = zero(Int64), weight = zero(Float64), queue_depth = zero(Int64), total_compute_seconds = zero(Float64), requests_served = zero(UInt64), dispatch_count = zero(UInt64), max_batch_size = zero(Int64), batch_input_name = "", batch_axis = zero(Int64), rows_served = zero(UInt64)) = ModelStatus(name, residency, device_resident, host_resident, weight_nbytes, weight, queue_depth, total_compute_seconds, requests_served, dispatch_count, max_batch_size, batch_input_name, batch_axis, rows_served)
-PB.default_values(::Type{ModelStatus}) = (; name = "", residency = Residency.RESIDENCY_UNSPECIFIED, device_resident = false, host_resident = false, weight_nbytes = zero(Int64), weight = zero(Float64), queue_depth = zero(Int64), total_compute_seconds = zero(Float64), requests_served = zero(UInt64), dispatch_count = zero(UInt64), max_batch_size = zero(Int64), batch_input_name = "", batch_axis = zero(Int64), rows_served = zero(UInt64))
-PB.field_numbers(::Type{ModelStatus}) = (; name = 1, residency = 2, device_resident = 3, host_resident = 4, weight_nbytes = 5, weight = 6, queue_depth = 7, total_compute_seconds = 8, requests_served = 9, dispatch_count = 10, max_batch_size = 11, batch_input_name = 12, batch_axis = 13, rows_served = 14)
+ModelStatus(; name = "", residency = Residency.RESIDENCY_UNSPECIFIED, device_resident = false, host_resident = false, weight_nbytes = zero(Int64), weight = zero(Float64), queue_depth = zero(Int64), total_compute_seconds = zero(Float64), requests_served = zero(UInt64), dispatch_count = zero(UInt64), max_batch_size = zero(Int64), batch_input_name = "", batch_axis = zero(Int64), rows_served = zero(UInt64), host_copy = false, upload_seconds = zero(Float64), read_seconds = zero(Float64), loads = zero(UInt64)) = ModelStatus(name, residency, device_resident, host_resident, weight_nbytes, weight, queue_depth, total_compute_seconds, requests_served, dispatch_count, max_batch_size, batch_input_name, batch_axis, rows_served, host_copy, upload_seconds, read_seconds, loads)
+PB.default_values(::Type{ModelStatus}) = (; name = "", residency = Residency.RESIDENCY_UNSPECIFIED, device_resident = false, host_resident = false, weight_nbytes = zero(Int64), weight = zero(Float64), queue_depth = zero(Int64), total_compute_seconds = zero(Float64), requests_served = zero(UInt64), dispatch_count = zero(UInt64), max_batch_size = zero(Int64), batch_input_name = "", batch_axis = zero(Int64), rows_served = zero(UInt64), host_copy = false, upload_seconds = zero(Float64), read_seconds = zero(Float64), loads = zero(UInt64))
+PB.field_numbers(::Type{ModelStatus}) = (; name = 1, residency = 2, device_resident = 3, host_resident = 4, weight_nbytes = 5, weight = 6, queue_depth = 7, total_compute_seconds = 8, requests_served = 9, dispatch_count = 10, max_batch_size = 11, batch_input_name = 12, batch_axis = 13, rows_served = 14, host_copy = 15, upload_seconds = 16, read_seconds = 17, loads = 18)
 
 function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelStatus}, _endpos::Int = 0, _group::Bool = false)
     name = ""
@@ -1136,6 +1299,10 @@ function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelStatus}, _endpos::I
     batch_input_name = ""
     batch_axis = zero(Int64)
     rows_served = zero(UInt64)
+    host_copy = false
+    upload_seconds = zero(Float64)
+    read_seconds = zero(Float64)
+    loads = zero(UInt64)
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         if field_number == 1
@@ -1166,11 +1333,19 @@ function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelStatus}, _endpos::I
             batch_axis = PB.decode(d, Int64)
         elseif field_number == 14
             rows_served = PB.decode(d, UInt64)
+        elseif field_number == 15
+            host_copy = PB.decode(d, Bool)
+        elseif field_number == 16
+            upload_seconds = PB.decode(d, Float64)
+        elseif field_number == 17
+            read_seconds = PB.decode(d, Float64)
+        elseif field_number == 18
+            loads = PB.decode(d, UInt64)
         else
             Base.skip(d, wire_type)
         end
     end
-    return ModelStatus(name, residency, device_resident, host_resident, weight_nbytes, weight, queue_depth, total_compute_seconds, requests_served, dispatch_count, max_batch_size, batch_input_name, batch_axis, rows_served)
+    return ModelStatus(name, residency, device_resident, host_resident, weight_nbytes, weight, queue_depth, total_compute_seconds, requests_served, dispatch_count, max_batch_size, batch_input_name, batch_axis, rows_served, host_copy, upload_seconds, read_seconds, loads)
 end
 
 function PB.encode(e::PB.AbstractProtoEncoder, x::ModelStatus)
@@ -1189,6 +1364,10 @@ function PB.encode(e::PB.AbstractProtoEncoder, x::ModelStatus)
     !isempty(x.batch_input_name) && PB.encode(e, 12, x.batch_input_name)
     x.batch_axis != zero(Int64) && PB.encode(e, 13, x.batch_axis)
     x.rows_served != zero(UInt64) && PB.encode(e, 14, x.rows_served)
+    x.host_copy != false && PB.encode(e, 15, x.host_copy)
+    x.upload_seconds !== zero(Float64) && PB.encode(e, 16, x.upload_seconds)
+    x.read_seconds !== zero(Float64) && PB.encode(e, 17, x.read_seconds)
+    x.loads != zero(UInt64) && PB.encode(e, 18, x.loads)
     return position(e.io) - initpos
 end
 function PB._encoded_size(x::ModelStatus)
@@ -1207,6 +1386,10 @@ function PB._encoded_size(x::ModelStatus)
     !isempty(x.batch_input_name) && (encoded_size += PB._encoded_size(x.batch_input_name, 12))
     x.batch_axis != zero(Int64) && (encoded_size += PB._encoded_size(x.batch_axis, 13))
     x.rows_served != zero(UInt64) && (encoded_size += PB._encoded_size(x.rows_served, 14))
+    x.host_copy != false && (encoded_size += PB._encoded_size(x.host_copy, 15))
+    x.upload_seconds !== zero(Float64) && (encoded_size += PB._encoded_size(x.upload_seconds, 16))
+    x.read_seconds !== zero(Float64) && (encoded_size += PB._encoded_size(x.read_seconds, 17))
+    x.loads != zero(UInt64) && (encoded_size += PB._encoded_size(x.loads, 18))
     return encoded_size
 end
 
@@ -1238,6 +1421,37 @@ end
 function PB._encoded_size(x::ShapeVariant)
     encoded_size = 0
     !isempty(x.inputs) && (encoded_size += PB._encoded_size(x.inputs, 1))
+    return encoded_size
+end
+
+struct StageWeightsResponse
+    models::Vector{StagedModel}
+end
+StageWeightsResponse(; models = Vector{StagedModel}()) = StageWeightsResponse(models)
+PB.default_values(::Type{StageWeightsResponse}) = (; models = Vector{StagedModel}())
+PB.field_numbers(::Type{StageWeightsResponse}) = (; models = 1)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:StageWeightsResponse}, _endpos::Int = 0, _group::Bool = false)
+    models = PB.BufferedVector{StagedModel}()
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            PB.decode!(d, models)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return StageWeightsResponse(models[])
+end
+
+function PB.encode(e::PB.AbstractProtoEncoder, x::StageWeightsResponse)
+    initpos = position(e.io)
+    !isempty(x.models) && PB.encode(e, 1, x.models)
+    return position(e.io) - initpos
+end
+function PB._encoded_size(x::StageWeightsResponse)
+    encoded_size = 0
+    !isempty(x.models) && (encoded_size += PB._encoded_size(x.models, 1))
     return encoded_size
 end
 
@@ -1307,16 +1521,20 @@ struct ModelControlStatusResponse
     discipline::String
     models::Vector{ModelStatus}
     weight_cache_max_bytes::UInt64
+    host_weight_budget_bytes::UInt64
+    host_cached_bytes::UInt64
 end
-ModelControlStatusResponse(; residency_mode = "", discipline = "", models = Vector{ModelStatus}(), weight_cache_max_bytes = zero(UInt64)) = ModelControlStatusResponse(residency_mode, discipline, models, weight_cache_max_bytes)
-PB.default_values(::Type{ModelControlStatusResponse}) = (; residency_mode = "", discipline = "", models = Vector{ModelStatus}(), weight_cache_max_bytes = zero(UInt64))
-PB.field_numbers(::Type{ModelControlStatusResponse}) = (; residency_mode = 1, discipline = 2, models = 3, weight_cache_max_bytes = 4)
+ModelControlStatusResponse(; residency_mode = "", discipline = "", models = Vector{ModelStatus}(), weight_cache_max_bytes = zero(UInt64), host_weight_budget_bytes = zero(UInt64), host_cached_bytes = zero(UInt64)) = ModelControlStatusResponse(residency_mode, discipline, models, weight_cache_max_bytes, host_weight_budget_bytes, host_cached_bytes)
+PB.default_values(::Type{ModelControlStatusResponse}) = (; residency_mode = "", discipline = "", models = Vector{ModelStatus}(), weight_cache_max_bytes = zero(UInt64), host_weight_budget_bytes = zero(UInt64), host_cached_bytes = zero(UInt64))
+PB.field_numbers(::Type{ModelControlStatusResponse}) = (; residency_mode = 1, discipline = 2, models = 3, weight_cache_max_bytes = 4, host_weight_budget_bytes = 5, host_cached_bytes = 6)
 
 function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelControlStatusResponse}, _endpos::Int = 0, _group::Bool = false)
     residency_mode = ""
     discipline = ""
     models = PB.BufferedVector{ModelStatus}()
     weight_cache_max_bytes = zero(UInt64)
+    host_weight_budget_bytes = zero(UInt64)
+    host_cached_bytes = zero(UInt64)
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         if field_number == 1
@@ -1327,11 +1545,15 @@ function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ModelControlStatusRespon
             PB.decode!(d, models)
         elseif field_number == 4
             weight_cache_max_bytes = PB.decode(d, UInt64)
+        elseif field_number == 5
+            host_weight_budget_bytes = PB.decode(d, UInt64)
+        elseif field_number == 6
+            host_cached_bytes = PB.decode(d, UInt64)
         else
             Base.skip(d, wire_type)
         end
     end
-    return ModelControlStatusResponse(residency_mode, discipline, models[], weight_cache_max_bytes)
+    return ModelControlStatusResponse(residency_mode, discipline, models[], weight_cache_max_bytes, host_weight_budget_bytes, host_cached_bytes)
 end
 
 function PB.encode(e::PB.AbstractProtoEncoder, x::ModelControlStatusResponse)
@@ -1340,6 +1562,8 @@ function PB.encode(e::PB.AbstractProtoEncoder, x::ModelControlStatusResponse)
     !isempty(x.discipline) && PB.encode(e, 2, x.discipline)
     !isempty(x.models) && PB.encode(e, 3, x.models)
     x.weight_cache_max_bytes != zero(UInt64) && PB.encode(e, 4, x.weight_cache_max_bytes)
+    x.host_weight_budget_bytes != zero(UInt64) && PB.encode(e, 5, x.host_weight_budget_bytes)
+    x.host_cached_bytes != zero(UInt64) && PB.encode(e, 6, x.host_cached_bytes)
     return position(e.io) - initpos
 end
 function PB._encoded_size(x::ModelControlStatusResponse)
@@ -1348,6 +1572,8 @@ function PB._encoded_size(x::ModelControlStatusResponse)
     !isempty(x.discipline) && (encoded_size += PB._encoded_size(x.discipline, 2))
     !isempty(x.models) && (encoded_size += PB._encoded_size(x.models, 3))
     x.weight_cache_max_bytes != zero(UInt64) && (encoded_size += PB._encoded_size(x.weight_cache_max_bytes, 4))
+    x.host_weight_budget_bytes != zero(UInt64) && (encoded_size += PB._encoded_size(x.host_weight_budget_bytes, 5))
+    x.host_cached_bytes != zero(UInt64) && (encoded_size += PB._encoded_size(x.host_cached_bytes, 6))
     return encoded_size
 end
 
@@ -1787,16 +2013,18 @@ baremodule ControlService
     # the version used to generate this module (1.2.0).
     gRPCClient.check_codegen_compat(Base.VersionNumber("1.2.0"))
 
-    const DescribeModelsResponse::DataType = Base.parentmodule(ControlService).DescribeModelsResponse
     const ModelControlStatusResponse::DataType = Base.parentmodule(ControlService).ModelControlStatusResponse
+    const DescribeModelsResponse::DataType = Base.parentmodule(ControlService).DescribeModelsResponse
     const SetModelResidencyResponse::DataType = Base.parentmodule(ControlService).SetModelResidencyResponse
+    const DescribeModelsRequest::DataType = Base.parentmodule(ControlService).DescribeModelsRequest
+    const ModelControlStatusRequest::DataType = Base.parentmodule(ControlService).ModelControlStatusRequest
+    const StageWeightsResponse::DataType = Base.parentmodule(ControlService).StageWeightsResponse
+    const StageWeightsRequest::DataType = Base.parentmodule(ControlService).StageWeightsRequest
     const SetModelPolicyRequest::DataType = Base.parentmodule(ControlService).SetModelPolicyRequest
     const CompactMemoryResponse::DataType = Base.parentmodule(ControlService).CompactMemoryResponse
-    const SetModelPolicyResponse::DataType = Base.parentmodule(ControlService).SetModelPolicyResponse
-    const DescribeModelsRequest::DataType = Base.parentmodule(ControlService).DescribeModelsRequest
-    const SetModelResidencyRequest::DataType = Base.parentmodule(ControlService).SetModelResidencyRequest
     const CompactMemoryRequest::DataType = Base.parentmodule(ControlService).CompactMemoryRequest
-    const ModelControlStatusRequest::DataType = Base.parentmodule(ControlService).ModelControlStatusRequest
+    const SetModelPolicyResponse::DataType = Base.parentmodule(ControlService).SetModelPolicyResponse
+    const SetModelResidencyRequest::DataType = Base.parentmodule(ControlService).SetModelResidencyRequest
 
     # ControlService.ModelControlStatus
     Base.@inline function ModelControlStatus(chan::gRPCClient.gRPCChannel, req::ModelControlStatusRequest, args...; kws...)
@@ -1880,6 +2108,27 @@ baremodule ControlService
     gRPCClient.response_type_displayname(::Type{typeof(CompactMemory)}) = "CompactMemoryResponse"
     Base.@doc gRPCClient.grpc_generate_rpc_docstring(typeof(CompactMemory)) CompactMemory
     export CompactMemory
+
+
+    # ControlService.StageWeights
+    Base.@inline function StageWeights(chan::gRPCClient.gRPCChannel, req::StageWeightsRequest, args...; kws...)
+        return gRPCClient.grpc_call_unary(chan, typeof(StageWeights), req, args...; kws...)
+    end
+    Base.@inline function StageWeights(chan::gRPCClient.gRPCChannel, req::Base.Vector{UInt8}, args...; kws...)
+        return gRPCClient.grpc_call_unary(chan, typeof(StageWeights), req, args...; kws...)
+    end
+    Base.@inline function StageWeights(host::AbstractString, port::Integer, args...; kws...)
+        return StageWeights(gRPCClient.gRPCChannel(host, port), args...; kws...)
+    end
+    gRPCClient.rpc_path(::Type{typeof(StageWeights)}) = "/reactant_control.ControlService/StageWeights"
+    gRPCClient.isstreaming_request(::Type{typeof(StageWeights)}) = false
+    gRPCClient.isstreaming_response(::Type{typeof(StageWeights)}) = false
+    gRPCClient.request_type(::Type{typeof(StageWeights)}) = StageWeightsRequest
+    gRPCClient.response_type(::Type{typeof(StageWeights)}) = StageWeightsResponse
+    gRPCClient.request_type_displayname(::Type{typeof(StageWeights)}) = "StageWeightsRequest"
+    gRPCClient.response_type_displayname(::Type{typeof(StageWeights)}) = "StageWeightsResponse"
+    Base.@doc gRPCClient.grpc_generate_rpc_docstring(typeof(StageWeights)) StageWeights
+    export StageWeights
 
 
     # ControlService.DescribeModels
@@ -2084,6 +2333,50 @@ end
 register_ControlService_CompactMemory!(handler::Function, server::GRPCServer; kwargs...) = register_ControlService_CompactMemory!(server, handler; kwargs...)
 export register_ControlService_CompactMemory!
 
+# reactant_control.ControlService.StageWeights (unary)
+"""
+    ControlService_StageWeights_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
+
+Build the [`gRPCServer.MethodDescriptor`](@ref) for the unary RPC `/reactant_control.ControlService/StageWeights`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::StageWeightsRequest) -> StageWeightsResponse
+
+`raw_request=true` passes the undecoded payload as `req::Vector{UInt8}`;
+`raw_response=true` takes an already-encoded `Vector{UInt8}` return verbatim.
+Throwing a [`gRPCServer.GRPCError`](@ref) sets the response status; any other
+exception maps to INTERNAL.
+"""
+ControlService_StageWeights_Method(handler; raw_request::Bool = false, raw_response::Bool = false) =
+    gRPCServer.MethodDescriptor("StageWeights", gRPCServer.MethodType.UNARY, StageWeightsRequest, StageWeightsResponse, handler; raw_request = raw_request, raw_response = raw_response)
+export ControlService_StageWeights_Method
+
+"""
+    register_ControlService_StageWeights!(server::GRPCServer, handler; raw_request=false, raw_response=false) -> server
+    register_ControlService_StageWeights!(handler::Function, server::GRPCServer; kwargs...) -> server
+
+Register the unary RPC `/reactant_control.ControlService/StageWeights` on `server`.
+
+# Handler contract
+    (ctx::gRPCServer.ServerContext, req::StageWeightsRequest) -> StageWeightsResponse
+
+The handler signature is validated at registration time; a mismatched shape
+throws `ArgumentError`. See [`ControlService_StageWeights_Method`](@ref) for the raw variants.
+
+# Example
+```julia
+register_ControlService_StageWeights!(server) do ctx, req
+    # compute and return a StageWeightsResponse
+end
+```
+"""
+function register_ControlService_StageWeights!(server::GRPCServer, handler; raw_request::Bool = false, raw_response::Bool = false)
+    gRPCServer.register_method!(server.dispatcher, "reactant_control.ControlService", ControlService_StageWeights_Method(handler; raw_request = raw_request, raw_response = raw_response))
+    return server
+end
+register_ControlService_StageWeights!(handler::Function, server::GRPCServer; kwargs...) = register_ControlService_StageWeights!(server, handler; kwargs...)
+export register_ControlService_StageWeights!
+
 # reactant_control.ControlService.DescribeModels (unary)
 """
     ControlService_DescribeModels_Method(handler; raw_request=false, raw_response=false) -> gRPCServer.MethodDescriptor
@@ -2129,7 +2422,7 @@ register_ControlService_DescribeModels!(handler::Function, server::GRPCServer; k
 export register_ControlService_DescribeModels!
 
 """
-    register_ControlService!(server::GRPCServer; ModelControlStatus=nothing, SetModelResidency=nothing, SetModelPolicy=nothing, CompactMemory=nothing, DescribeModels=nothing) -> server
+    register_ControlService!(server::GRPCServer; ModelControlStatus=nothing, SetModelResidency=nothing, SetModelPolicy=nothing, CompactMemory=nothing, StageWeights=nothing, DescribeModels=nothing) -> server
 
 Register the `reactant_control.ControlService` service on `server`: every non-`nothing` keyword
 registers its RPC. Each keyword accepts a handler or a `(handler,
@@ -2137,7 +2430,7 @@ raw_request, raw_response)` tuple (raw flags per method). All-nothing is a
 no-op. Equivalent to calling the per-RPC `register_<Service>_<Rpc>!`
 functions individually.
 """
-function register_ControlService!(server::GRPCServer; ModelControlStatus = nothing, SetModelResidency = nothing, SetModelPolicy = nothing, CompactMemory = nothing, DescribeModels = nothing)
+function register_ControlService!(server::GRPCServer; ModelControlStatus = nothing, SetModelResidency = nothing, SetModelPolicy = nothing, CompactMemory = nothing, StageWeights = nothing, DescribeModels = nothing)
     if ModelControlStatus !== nothing
         handler, raw_request, raw_response = ModelControlStatus isa Tuple ? ModelControlStatus : (ModelControlStatus, false, false)
         register_ControlService_ModelControlStatus!(server, handler; raw_request = raw_request, raw_response = raw_response)
@@ -2153,6 +2446,10 @@ function register_ControlService!(server::GRPCServer; ModelControlStatus = nothi
     if CompactMemory !== nothing
         handler, raw_request, raw_response = CompactMemory isa Tuple ? CompactMemory : (CompactMemory, false, false)
         register_ControlService_CompactMemory!(server, handler; raw_request = raw_request, raw_response = raw_response)
+    end
+    if StageWeights !== nothing
+        handler, raw_request, raw_response = StageWeights isa Tuple ? StageWeights : (StageWeights, false, false)
+        register_ControlService_StageWeights!(server, handler; raw_request = raw_request, raw_response = raw_response)
     end
     if DescribeModels !== nothing
         handler, raw_request, raw_response = DescribeModels isa Tuple ? DescribeModels : (DescribeModels, false, false)

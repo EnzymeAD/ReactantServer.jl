@@ -50,8 +50,8 @@ global:
 
 - `host_weight_budget` is the setting that matters. Size it to hold the weights of the models
   that get swapped (roughly the sum of their `weights.safetensors` files), within the RAM the
-  machine can spare. When it is too small, the least recently loaded copies are dropped and those
-  models are read from disk on their next reload.
+  machine can spare. When it is too small, the copies of the models reloaded least often are
+  dropped and those models are read from disk on their next reload.
 - `shared_host_weights: true` makes the budget one pool for the whole node, holding each model
   once however many GPUs load it. Without it, each worker keeps its own copies and gets an equal
   share of the budget.

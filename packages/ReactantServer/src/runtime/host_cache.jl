@@ -3,9 +3,12 @@
 #
 # Without a budget nothing here runs: an unpinned model reads its weights file on every load, as
 # before. With one, a load first looks for a cached copy and, on a miss, keeps the copy it read when
-# the budget has room, evicting the least recently LOADED copies first. Only a load from the cache
-# (or the copy's creation) counts as use; requests served by a model already on the device do not,
-# so a model that stays on a GPU ages out of host RAM and the most often loaded models stay cached.
+# the budget has room, evicting the copies with the lowest load rank first: a count of the model's
+# device loads that halves every `HOST_CACHE_HALFLIFE_SECONDS` (see `bump_load_rank`). A new copy
+# only displaces copies ranked below it. This is where the cost of a read from disk belongs: a copy
+# is worth what it saves, a read for each load it serves, and with one disk that comes down to how
+# often the model is loaded. Requests served by a model already on the device do not count, so a
+# model that stays on a GPU ages out of host RAM, and a model the GPUs evict and reload often stays.
 # Pinned floors (`residency: system`) count against the budget but are never evicted; when they
 # alone exceed it they load anyway, with a warning.
 #
@@ -106,8 +109,7 @@ function _load_via_host_cache(
         bufs = _timed_transfer(cache, arrays, timing)
         lock(cache.lock) do
             cache.host_hits += 1
-            j = findfirst(==(entry.name), cache.host_lru)
-            j === nothing || (deleteat!(cache.host_lru, j); push!(cache.host_lru, entry.name))
+            _rank_load!(cache, entry.name)
         end
         return bufs
     end
@@ -122,21 +124,51 @@ function _load_via_host_cache(
     return bufs
 end
 
+# Count one device load of `name` in its load rank (`bump_load_rank`), which orders the private
+# cache's eviction. The rank outlives the copy, so a model reloaded often keeps its standing after
+# its copy is evicted. Caller holds `cache.lock`.
+_rank_load!(cache::WeightCache, name::AbstractString) =
+    (cache.host_rank[String(name)] = bump_load_rank(get(cache.host_rank, String(name), 0.0)))
+
+# The cached copies to evict, lowest load rank first, to free `need` bytes, taking only copies ranked
+# below `below`; `nothing` when those cannot free enough. Caller holds `cache.lock`.
+function _host_victims(cache::WeightCache, need::Int; below::Float64 = Inf)
+    need <= 0 && return String[]
+    order = sort!(collect(keys(cache.host_cached)); by = n -> (get(cache.host_rank, n, 0.0), n))
+    out = String[]
+    freed = 0
+    for n in order
+        freed >= need && break
+        get(cache.host_rank, n, 0.0) >= below && break
+        push!(out, n)
+        freed += _host_bytes(cache.host_cached[n])
+    end
+    return freed >= need ? out : nothing
+end
+
+function _evict_host!(cache::WeightCache, names)
+    for n in names
+        cache.host_cached_bytes -= _host_bytes(pop!(cache.host_cached, n))
+    end
+    return nothing
+end
+
 # Keep `arrays` as `name`'s cached host copy (private store) if the budget can make room for them,
-# evicting the least recently loaded copies. Evicts nothing unless that makes them fit.
-function _cache_host!(cache::WeightCache, name::String, arrays::Vector{Any})
+# evicting the copies with the lowest load rank, and only copies ranked below this one: a copy loaded
+# less often never displaces one loaded more. `load` counts this as a device load of `name` (false
+# for a dropped host floor, which is not a load). Evicts nothing unless that makes them fit.
+function _cache_host!(cache::WeightCache, name::String, arrays::Vector{Any}; load::Bool = true)
     budget = cache.host_budget::Int
     nb = _host_bytes(arrays)
     floors = _host_floor_bytes(cache)
     return lock(cache.lock) do
+        rank = load ? _rank_load!(cache, name) : get(cache.host_rank, name, 0.0)
         haskey(cache.host_cached, name) && return true
         floors + nb > budget && return false          # would not fit even with every copy evicted
-        while floors + cache.host_cached_bytes + nb > budget
-            victim = popfirst!(cache.host_lru)
-            cache.host_cached_bytes -= _host_bytes(pop!(cache.host_cached, victim))
-        end
+        victims = _host_victims(cache, floors + cache.host_cached_bytes + nb - budget; below = rank)
+        victims === nothing && return false
+        _evict_host!(cache, victims)
         cache.host_cached[name] = arrays
-        push!(cache.host_lru, name)
         cache.host_cached_bytes += nb
         return true
     end
@@ -148,8 +180,6 @@ function _uncache_host!(cache::WeightCache, name::AbstractString)
         arrays = pop!(cache.host_cached, String(name), nothing)
         arrays === nothing && return
         cache.host_cached_bytes -= _host_bytes(arrays)
-        j = findfirst(==(String(name)), cache.host_lru)
-        j === nothing || deleteat!(cache.host_lru, j)
     end
     return nothing
 end
@@ -161,22 +191,18 @@ function _take_cached_host!(cache::WeightCache, name::AbstractString)
         arrays = pop!(cache.host_cached, String(name), nothing)
         arrays === nothing && return nothing
         cache.host_cached_bytes -= _host_bytes(arrays)
-        j = findfirst(==(String(name)), cache.host_lru)
-        j === nothing || deleteat!(cache.host_lru, j)
         return arrays
     end
 end
 
-# After a new pinned floor (private store): evict cached copies, least recently loaded first, until
+# After a new pinned floor (private store): evict cached copies, lowest load rank first, until
 # floors and copies fit the budget again, and warn if the floors alone do not.
 function _fit_floors!(cache::WeightCache)
     budget = cache.host_budget::Int
     floors = _host_floor_bytes(cache)
     lock(cache.lock) do
-        while !isempty(cache.host_lru) && floors + cache.host_cached_bytes > budget
-            victim = popfirst!(cache.host_lru)
-            cache.host_cached_bytes -= _host_bytes(pop!(cache.host_cached, victim))
-        end
+        victims = _host_victims(cache, floors + cache.host_cached_bytes - budget)
+        _evict_host!(cache, victims === nothing ? collect(keys(cache.host_cached)) : victims)
     end
     check_host_budget(cache)
     return nothing
@@ -263,7 +289,7 @@ function needs_host_stage(cache::WeightCache, entry::ModelEntry)
 end
 
 """
-    stage_host_weights(cache, entry) -> StagedWeights
+    stage_host_weights(cache, entry, names=entry's weight names) -> StagedWeights
 
 Do every host step of loading `entry` and no device step: take its region from the node cache
 (shared store, reading the file into it on a miss), its cached copy (private store), or read the
@@ -272,10 +298,13 @@ with `pread`, which keeps no file position, and takes `cache.lock` for the cache
 miss counters are left to the upload (`_device_buffers`), so they count loads, as before, and the
 time taken is recorded on the result so the load's full cost still reaches the eviction policy.
 """
-function stage_host_weights(cache::WeightCache, entry::ModelEntry)
+function stage_host_weights(
+        cache::WeightCache, entry::ModelEntry,
+        names::Vector{String} = (entry.executable::LoadedModel).sig.weight_names
+    )
     t0 = time()
     staged = try
-        _stage_host_weights(cache, entry)
+        _stage_host_weights(cache, entry, names)
     catch
         lock(cache.lock) do
             cache.stages += 1
@@ -292,9 +321,7 @@ function stage_host_weights(cache::WeightCache, entry::ModelEntry)
     return staged
 end
 
-function _stage_host_weights(cache::WeightCache, entry::ModelEntry)
-    model = entry.executable::LoadedModel
-    names = model.sig.weight_names
+function _stage_host_weights(cache::WeightCache, entry::ModelEntry, names::Vector{String})
     st = entry.weights
     if host_budgeted(cache) && cache.store isa SharedWeightStore
         specs = [weight_spec(st, n) for n in names]
@@ -338,10 +365,7 @@ function _note_staged_load!(cache::WeightCache, entry::ModelEntry, staged::Stage
     if host_budgeted(cache)
         lock(cache.lock) do
             staged.hit ? (cache.host_hits += 1) : (cache.host_misses += 1)
-            if staged.hit && !(cache.store isa SharedWeightStore)
-                j = findfirst(==(entry.name), cache.host_lru)
-                j === nothing || (deleteat!(cache.host_lru, j); push!(cache.host_lru, entry.name))
-            end
+            staged.hit && !(cache.store isa SharedWeightStore) && _rank_load!(cache, entry.name)
         end
     end
     staged.hit || _note_disk_load!(cache, entry)

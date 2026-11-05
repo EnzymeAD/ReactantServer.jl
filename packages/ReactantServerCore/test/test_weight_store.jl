@@ -263,7 +263,58 @@ _budget_cleanup(prefix) = for f in readdir("/dev/shm"; join = true)
     startswith(basename(f), prefix * "-") && rm(f; force = true)
 end
 
-@testset "SharedWeightStore node budget: admit, evict least recently loaded, keep held regions" begin
+@testset "bump_load_rank: a decayed load count kept as a timestamp" begin
+    h = 100.0
+    count(rank, t) = rank <= 0 ? 0.0 : exp2((rank - t) / h)
+    t = 1.0e9
+    r1 = bump_load_rank(0.0, t; halflife = h)
+    @test r1 == t && count(r1, t) ≈ 1                 # one load
+    r2 = bump_load_rank(r1, t; halflife = h)
+    @test count(r2, t) ≈ 2                            # a second at the same instant
+    @test count(r2, t + h) ≈ 1                        # halved a halflife later
+    r3 = bump_load_rank(r2, t + h; halflife = h)
+    @test count(r3, t + h) ≈ 2
+    # Loaded twice a halflife ago is worth one load now.
+    @test bump_load_rank(bump_load_rank(0.0, t - h; halflife = h), t - h; halflife = h) ≈ t
+    # Large counts and old ranks stay finite.
+    big = foldl((r, _) -> bump_load_rank(r, t; halflife = h), 1:100_000; init = 0.0)
+    @test isfinite(big)
+    @test count(big, t) ≈ 100_000 rtol = 1.0e-6
+    @test bump_load_rank(1.0, t; halflife = h) ≈ t
+end
+
+@testset "SharedWeightStore node budget: a new copy displaces only copies loaded less" begin
+    if !(Sys.islinux() && isdir("/dev/shm"))
+        @test_skip "shared weight store requires Linux /dev/shm"
+    else
+        prefix = "tr" * string(getpid())
+        specs = [(Float32, (1024,))]
+        R = ReactantServerCore._layout(specs)[2]
+        region(k) = "/dev/shm/" * prefix * "-" * k * "-" * string(weights_digest(k, specs); base = 16)
+        store = SharedWeightStore(; budget = 2R, prefix = prefix)
+        load(k) = with_cached_host_weights(a -> 1, store, k, weights_digest(k, specs), specs, a -> (a[1] .= 1))
+        try
+            for _ in 1:3
+                load("often")                              # loaded three times
+            end
+            load("once")
+            sleep(0.02)
+            @test load("new") !== nothing                  # displaces "once" (equal worth, older), not "often"
+            @test isfile(region("often")) && isfile(region("new")) && !isfile(region("once"))
+            # A copy may not displace ones worth more: "often" outranks a first load, and so does
+            # "new" by now (a second load).
+            load("new")
+            @test load("rare") === nothing
+            @test isfile(region("often")) && isfile(region("new")) && !isfile(region("rare"))
+            @test ReactantServerCore._lock_rank(region("often") * ".lock") >
+                ReactantServerCore._lock_rank(region("new") * ".lock") > 0
+        finally
+            _budget_cleanup(prefix)
+        end
+    end
+end
+
+@testset "SharedWeightStore node budget: admit, evict the least loaded, keep held regions" begin
     if !(Sys.islinux() && isdir("/dev/shm"))
         @test_skip "shared weight store requires Linux /dev/shm"
     else
@@ -289,17 +340,18 @@ end
             @test load("m1")[1] == true                    # a hit: m1 is now the most recently loaded
             @test fills == ["m1", "m22"]                   # the hit did not refill
             sleep(0.02)
-            @test load("m333")[1] == false                 # evicts m22, the least recently loaded
+            @test load("m333")[1] == false                 # evicts m22: loaded once, before m333's load
             @test !isfile(region("m22")) && isfile(region("m1")) && isfile(region("m333"))
             @test host_cache_bytes(store) == 2R
 
-            # A pinned floor is admitted like any region but held, so it is never evicted.
+            # A pinned floor is admitted like any region but held, so it is never evicted. It
+            # displaces the copy loaded least: m333 (once), ahead of m1 (twice).
             sleep(0.02)
             p1 = materialize_host_weights!(store, "p1", weights_digest("p1", specs), specs, a -> (a[1] .= 7))
-            @test p1[1][1] == 7 && !isfile(region("m1")) && isfile(region("m333"))
+            @test p1[1][1] == 7 && isfile(region("m1")) && !isfile(region("m333"))
             sleep(0.02)
             materialize_host_weights!(store, "p2", weights_digest("p2", specs), specs, a -> (a[1] .= 8))
-            @test !isfile(region("m333")) && host_cache_bytes(store) == 2R
+            @test !isfile(region("m1")) && host_cache_bytes(store) == 2R
             # Pinned floors past the budget still load (a guarantee), with a warning.
             @test_logs (:warn, r"overcommitted") match_mode = :any materialize_host_weights!(
                 store, "p3", weights_digest("p3", specs), specs, a -> (a[1] .= 9)
