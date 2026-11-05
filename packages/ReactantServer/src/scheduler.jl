@@ -183,7 +183,9 @@ priority(share::Float64, normalized_ema::Float64, cap::Float64, eff_cost::Float6
 # Rows present along the executable batch axis after preprocessing. Used to size output slices.
 # Each executable input carries its OWN batch axis (per-input, batch-last), so read the count at
 # each matched input's own `sp.batch_axis` rather than one shared position. The batch size comes
-# from the first executable input that has a batch axis.
+# from the first executable input that has a batch axis; a request whose batched inputs disagree on
+# it is never coalesced or split (see `_batch_extents_agree`), so the count stands for every input
+# of any request that shares a dispatch.
 function _executable_rows(entry::ModelEntry, inputs::AbstractVector{NamedTensor})
     m = entry.manifest
     m.input_batch_dim === nothing && return 1
@@ -194,6 +196,29 @@ function _executable_rows(entry::ModelEntry, inputs::AbstractVector{NamedTensor}
         end
     end
     return 1
+end
+
+# Whether a request's batched executable inputs all have the same extent, each read along its own
+# batch axis. Only such a request may share a dispatch or be split. `_executable_rows` counts the
+# first batched input alone, so a request whose inputs disagree (three rows of one input, two of
+# another), merged with other requests, would pair its rows with a neighbor's while the merged
+# shapes still match: the program runs and returns mixed rows to innocent callers. It dispatches
+# alone instead and fails on its own. A missing batched input counts as a disagreement too, since
+# merging it would fail every request in the dispatch. Validation cannot catch either: it sees the
+# client's inputs, and preprocess may change an input's row count. Evaluated as the queue is
+# planned rather than cached at enqueue; it reads a few sizes per request, beside the variant and
+# row reads plan_batch already makes.
+function _batch_extents_agree(entry::ModelEntry, inputs::AbstractVector{NamedTensor})
+    rows = nothing
+    for sp in entry.manifest.executable_inputs
+        sp.batch_axis === nothing && continue
+        k = findfirst(t -> t.name == sp.name, inputs)
+        k === nothing && return false
+        r = size(inputs[k].data, sp.batch_axis)
+        rows === nothing && (rows = r)
+        r == rows || return false
+    end
+    return true
 end
 
 # A model can coalesce multiple requests only when EVERY executable input carries a batch axis and
@@ -229,7 +254,8 @@ _smallest_ge(sizes::Vector{Int}, n::Int) = (i = findfirst(>=(n), sizes); i === n
 # shape may still be larger and padded); a single request over the cap is never split, so it
 # dispatches alone. For non-coalescable models exactly one request is taken at its own size, and so
 # is it for every model when `coalesce` is false (`scheduler.coalescing`), so a request's rows always
-# occupy the same slots of the same program whatever else is queued.
+# occupy the same slots of the same program whatever else is queued. A request whose batched inputs
+# disagree on their batch extent is never coalesced either: it dispatches alone.
 function plan_batch(entry::ModelEntry, st::ModelSchedState; coalesce::Bool = true)
     isempty(st.queue) && return nothing
     front = st.queue[1]
@@ -256,11 +282,18 @@ function plan_batch(entry::ModelEntry, st::ModelSchedState; coalesce::Bool = tru
         return (key, QueuedRequest[front])
     end
 
+    # A front request whose batched inputs disagree on their batch extent never shares a dispatch
+    # (see `_batch_extents_agree`). Planned at its own row count, it runs alone with its inputs
+    # passed straight through, unpadded, so the execution fails for that caller only.
+    _batch_extents_agree(entry, front.prepared) || return (rows(front), QueuedRequest[front])
+
     # The leading run of same-variant requests is the only window we may coalesce within (keeps
     # `taken` a contiguous front prefix so _finalize can deleteat! it, and preserves FIFO order).
+    # A request whose batch extents disagree also ends it; it leads a later dispatch, alone.
     nprefix = 0
     for qr in st.queue
         _request_variant(entry, qr.prepared) == variant || break
+        _batch_extents_agree(entry, qr.prepared) || break
         nprefix += 1
     end
     prefix = view(st.queue, 1:nprefix)
@@ -452,7 +485,10 @@ end
 
 # Concatenate the per-request executable inputs along the batch axis into one set sized to B,
 # padding with zeros when the real rows fall short of B. Inputs without a batch axis are taken
-# from the first request (they do not vary across the batch).
+# from the first request (they do not vary across the batch). Every batched input must come to
+# `total_rows`: plan_batch merges only requests whose inputs agree on their batch extent, and an
+# input that did not would be padded out of step with the others, pairing one request's rows with
+# another's, so it is refused here rather than run.
 function _coalesce_inputs(entry::ModelEntry, pres::Vector{Vector{NamedTensor}}, total_rows::Int, B::Int)
     m = entry.manifest
     merged = NamedTensor[]
@@ -464,6 +500,8 @@ function _coalesce_inputs(entry::ModelEntry, pres::Vector{Vector{NamedTensor}}, 
         end
         axis = sp.batch_axis
         data = length(arrays) == 1 ? arrays[1] : cat(arrays...; dims = axis)
+        size(data, axis) == total_rows ||
+            error("input '$(sp.name)' has $(size(data, axis)) rows along its batch axis, expected $total_rows")
         if total_rows < B
             padshape = collect(size(data))
             padshape[axis] = B - total_rows
@@ -2138,8 +2176,11 @@ end
 # uncompiled (then the ordinary path raises the precise error) or the model is unbatched (key 0).
 # Only a coalescable model splits: every executable output then carries a batch axis, so the join
 # has an axis to join along rather than silently taking an unbatched output from the first piece.
+# A request whose batched inputs disagree on their batch extent is never split either: there is no
+# one row count to cut every input by, so it runs whole and alone (see `_batch_extents_agree`).
 function _max_compiled_rows(entry::ModelEntry, prepared::Vector{NamedTensor})
     _coalescable(entry) || return nothing
+    _batch_extents_agree(entry, prepared) || return nothing
     execs = entry.executable.execs
     variant = _request_variant(entry, prepared)
     haskey(execs, variant) || return nothing

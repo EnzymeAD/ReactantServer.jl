@@ -215,6 +215,16 @@ which keeps the taken set a contiguous prefix (so it can be removed in one step)
 FIFO order. A request whose shape has no compiled executable dispatches alone so that the caller
 gets the precise "no compiled program for input shape" error.
 
+A request also coalesces only when its batched inputs agree on their batch extent, each measured
+along its own batch axis after preprocessing. A request that sends three rows of one input and two
+of another (or whose `preprocess` hook drops a batched input) never shares a dispatch: merged with
+other requests, its rows would pair with a neighbor's, and the merged shapes could still line up,
+so the program would run and hand other callers mixed rows. Such a request ends the coalescing
+window and dispatches alone, with its inputs passed through unpadded, so it fails its own
+execution with a shape error and the requests queued around it are unaffected. Request validation
+does not reject it, because `preprocess` may change an input's row count; the check reads the
+preprocessed inputs.
+
 ### Sizing the batch
 
 The scheduler chooses the largest compiled batch size that the queued rows can fill; a partial
@@ -243,9 +253,11 @@ coalescing run in the other direction: a client that batches 32 against a bundle
 
 Splitting is only sound when the bundle's `preprocess` hook keeps one client row per executable
 row (a hook that changes the row count, cropping per image say, breaks the correspondence) and
-every executable output carries a batch axis to join along. A request that cannot be split runs
-whole and fails at execution with the shape error, as before. This mechanism is separate from
-`max_batch_size`, which caps how many rows coalesce into one dispatch and never splits a request.
+every executable output carries a batch axis to join along. A request whose batched inputs disagree
+on their batch extent (see above) is never split either, since no one row count cuts every input.
+A request that cannot be split runs whole and fails at execution with the shape error, as before.
+This mechanism is separate from `max_batch_size`, which caps how many rows coalesce into one
+dispatch and never splits a request.
 
 ### Why coalescing is the throughput lever
 

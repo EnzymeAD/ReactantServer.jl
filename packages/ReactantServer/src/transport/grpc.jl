@@ -274,7 +274,9 @@ end
 # rejected as INVALID_ARGUMENT here, before it is queued. Failing later, inside the dispatch,
 # would surface as INTERNAL and also fail the innocent requests coalesced into the same batch.
 # Batch and variable axes accept any extent; fixed axes must match exactly. Shapes are Julia
-# (column-major) order on both sides.
+# (column-major) order on both sides. Inputs whose batch extents disagree are accepted too, since
+# preprocess may change an input's row count; the scheduler checks the preprocessed inputs and
+# dispatches such a request alone (`_batch_extents_agree`), so it fails without touching others.
 function _validate_inputs(entry, request::InferRequest)
     specs = client_input_spec(entry.manifest)
     byname = Dict(sp.name => sp for sp in specs)
