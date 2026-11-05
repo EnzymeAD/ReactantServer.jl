@@ -8,7 +8,8 @@
 # Phase B (CORE-2): after the script restarts one worker (it waits for <marker dir>/restarted), the
 # same client process, with the same region name and key, keeps working: the restarted worker
 # answers FAILED_PRECONDITION, the client re-registers through the gateway, and the workers that
-# kept the registration keep it.
+# kept the registration keep it. Every request also answers promptly, although phase A gave up on
+# about a thousand requests over this client's connection to the gateway (GW-18).
 #
 #   julia --project=packages/ReactantServerClient client_shm_cpu.jl <gateway_port> <worker0_port> <marker_dir>
 
@@ -93,17 +94,33 @@ while !isfile(joinpath(MARKERS, "restarted"))
     time() - t0 > 1800 && (println("FAIL  restart marker never appeared"); exit(1))
     sleep(1)
 end
+# Each request must answer within PROMPT_SECONDS, not merely within its 60 s deadline. The slowest
+# one normally takes about 1.3 s, even with two of these tests running at once: the first to reach
+# the restarted worker, which answers FAILED_PRECONDITION, so the client re-registers the region
+# through the gateway and retries. 5 s leaves room for a slower or busier host. A request that
+# instead waits out its deadline is GW-18: the gateway cut this client's connection off for phase
+# A's give-ups, and libcurl parked the next requests behind the replacement connection.
+const PROMPT_SECONDS = 5.0
+seconds = Float64[]
 results = map(1:20) do k
     io = OneIO(Float32[k, -k, 2k, 0.5])
-    try
+    t = time()
+    ok = try
         infer_sync(slow, io)
         io.y == 2 .* io.x
     catch e
         println("phase B request $k failed: ", sprint(showerror, e))
         false
     end
+    push!(seconds, time() - t)
+    println("phase B request $k: ", ok ? "ok" : "failed", " in $(round(seconds[end]; digits = 3)) s")
+    ok
 end
 check("phase B: every request after the restart succeeds with its own outputs", all(results); detail = "$(count(results))/20")
+check(
+    "phase B: every request after the restart answers within $(PROMPT_SECONDS) s", maximum(seconds) <= PROMPT_SECONDS;
+    detail = "slowest $(round(maximum(seconds); digits = 1)) s"
+)
 check("phase B: still on shared memory, same region", ReactantServerClient.pool_name(ReactantServerClient.get_or_create_pool!(slow)) == name)
 after = status_on_worker0(name)
 check("phase B: worker0 kept the same registration", after == before; detail = "before $(before), after $(after)")

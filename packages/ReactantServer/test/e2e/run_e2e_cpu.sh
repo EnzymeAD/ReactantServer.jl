@@ -292,8 +292,9 @@ echo "== [8/8] shared memory: short deadlines, then a worker restart under the s
 # Phase A drives shared-memory outputs with deadlines short enough that clients give up while
 # requests run (CORE-3). Then worker1 is killed; once the supervisor has restarted it and the
 # gateway reports it ready again, phase B checks that the same client process re-registers the
-# same region and keeps getting correct answers (CORE-2). It runs on this second node so that
-# any failure reaches the client with its full error text.
+# same region and keeps getting correct answers (CORE-2), each within a few seconds although phase
+# A gave up on about a thousand requests over its connection to the gateway (GW-18). It runs on
+# this second node so that any failure reaches the client with its full error text.
 mkdir -p "$WORK/markers"
 julia --project=packages/ReactantServerClient --threads=4 "$E2E_DIR/client_shm_cpu.jl" \
     "$GW_PORT" "$BASE_PORT" "$WORK/markers" > "$WORK/shm_client.log" 2>&1 &
