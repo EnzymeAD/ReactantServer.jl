@@ -15,24 +15,60 @@
 # re-parks. Head-of-line blocking is deliberate — it guarantees a large-span waiter cannot be
 # starved by a stream of span-1 acquisitions (a bypass scheme can livelock the large waiter
 # forever through fragmentation), and it preserves the FIFO order span-1 callers had under the
-# previous Channel-based free list.
+# previous Channel-based free list. `try_acquire_slot!` never waits and never passes a waiter.
+#
+# A SHM pool also carries a control area after its data slots: one control word per slot, through
+# which the client and a server agree on who may write the slot (see slot_control.jl, CORE-3). A
+# run released while a server may still be writing it is quarantined, not freed, until the word
+# says the writer is done (or the writer is found dead); one whose writer is alive but stuck is
+# retired the same way and rejoins when that writer finishes.
 
 const PoolBacking = Union{SharedMemory, Memory{UInt8}}
 
+# Bytes per slot control word: one 8-byte word padded to 128 bytes, so no two slots' words share a
+# cache line or an adjacent-line prefetch pair (Apple M-series lines are 128 bytes; Intel prefetches
+# 64-byte lines in pairs). 32 slots fill one 4 KiB page.
+const SLOT_CONTROL_STRIDE = 128
+
+"""
+    SLOT_RETIRE_SECONDS
+
+How long (seconds) a released slot may stay under a live writer before the client checks whether
+that writer still exists: a writer that died is reclaimed at once, one that is alive but stuck has
+its slot retired (never reused while it may still write) until it finishes.
+"""
+const SLOT_RETIRE_SECONDS = 30.0
+
+# A run released while a server held its control word in WRITING(token).
+mutable struct QuarantinedRun
+    index::Int
+    span::Int
+    token::UInt64
+    since_ns::Int64
+    retired::Bool                # a live writer was found still holding it after the retire delay
+    probed_ns::Int64             # last liveness probe
+end
+
 mutable struct BufferPool
     backing::PoolBacking
-    n_bytes::Int
+    n_bytes::Int                 # data bytes: n_slots * slot_bytes
     name::String          # SHM region name (the basename clients register); "" for inline pools
     slot_bytes::Int
     n_slots::Int
     free::BitVector              # true = the 1-based slot index is free
-    alloc_lock::ReentrantLock    # guards free / waitq / token_counter
+    alloc_lock::ReentrantLock    # guards free / waitq / token_counter / quarantine
     freed::Threads.Condition     # tied to alloc_lock; signaled on release and waiter exit
     waitq::Vector{UInt64}        # FIFO of waiter tokens; only the head may allocate
     token_counter::UInt64
     closed::Bool                 # close() was called: no new slots (guarded by alloc_lock)
     released::Bool               # the SHM mapping has been released (guarded by alloc_lock)
     fd::Union{ShmFd, Nothing}    # the SHM object's descriptor, kept open; nothing for inline pools
+    region_bytes::Int            # the object's whole length (what a client registers)
+    ctl_offset::Int              # offset of the slot control area; 0 when the pool has none
+    control_tokens::Threads.Atomic{UInt64}   # next slot control token; never repeats in this pool
+    quarantine::Vector{QuarantinedRun}       # runs a writer may still write (guarded by alloc_lock)
+    quarantined::BitVector       # slot indices held by a quarantined run
+    retire_after_ns::Int64
 end
 
 # Slot boundaries are aligned (CORE-15): `unsafe_wrap` refuses a pointer misaligned for its element
@@ -88,11 +124,16 @@ A SHM-backed pool can be registered with a server; an inline pool (`use_shm=fals
 fallback transport. A SHM pool's object name is minted per pool from `name` with a fresh random
 token (two pools never share a name, even one after the other in one process), unless an explicit
 `key` is given.
+
+A SHM pool's object also holds the slot control area after the data slots (page aligned, one
+128-byte word per slot), so its length, [`pool_region_bytes`](@ref), is what a client registers.
+`retire_after` is [`SLOT_RETIRE_SECONDS`](@ref) unless a test shortens it.
 """
 function BufferPool(
         n_bytes::Integer; n_slots::Integer = 8, use_shm::Bool = true,
         name::AbstractString = "reactant_server_pool",
-        key::Union{AbstractString, Nothing} = nothing
+        key::Union{AbstractString, Nothing} = nothing,
+        retire_after::Real = SLOT_RETIRE_SECONDS
     )
     n_bytes > 0 || throw(ArgumentError("BufferPool: n_bytes must be positive (got $n_bytes)"))
     n_slots > 0 || throw(ArgumentError("BufferPool: n_slots must be positive (got $n_slots)"))
@@ -100,11 +141,16 @@ function BufferPool(
     slot_bytes > 0 ||
         throw(ArgumentError("BufferPool: n_bytes ($n_bytes) too small for $n_slots slots"))
     usable = slot_bytes * Int(n_slots)
+    # The control area starts on the page after the data and spans whole pages.
+    page = _page_size()
+    ctl_offset = use_shm ? cld(usable, page) * page : 0
+    region_bytes = use_shm ? ctl_offset + cld(Int(n_slots) * SLOT_CONTROL_STRIDE, page) * page : usable
 
     backing, region_name, fd = if use_shm
         # An explicit `key` (e.g. one the supervisor minted and injected so peer workers can attach
-        # the same region) is used verbatim; otherwise a fresh key is minted from `name`.
-        _create_pool_object(name, key, usable)
+        # the same region) is used verbatim; otherwise a fresh key is minted from `name`. A new
+        # object is zero filled: every control word starts FREE.
+        _create_pool_object(name, key, region_bytes)
     else
         Memory{UInt8}(undef, usable), "", nothing
     end
@@ -116,14 +162,29 @@ function BufferPool(
     return BufferPool(
         backing, usable, region_name, slot_bytes, Int(n_slots),
         trues(Int(n_slots)), alloc_lock, Threads.Condition(alloc_lock),
-        UInt64[], UInt64(0), false, false, fd
+        UInt64[], UInt64(0), false, false, fd,
+        region_bytes, ctl_offset, Threads.Atomic{UInt64}(_control_token_seed()),
+        QuarantinedRun[], falses(Int(n_slots)), round(Int64, Float64(retire_after) * 1.0e9)
     )
 end
+
+# A random start for a pool's control tokens, in [1, 2^60), so tokens never repeat within the pool
+# and a token from one pool generation is not expected in another.
+_control_token_seed() = (reinterpret(UInt64, Libc.getrandom!(Vector{UInt8}(undef, 8)))[1] >> 4) | UInt64(1)
 
 Base.sizeof(pool::BufferPool) = pool.n_bytes
 is_shm_backed(pool::BufferPool) = pool.backing isa SharedMemory
 pool_region_name(pool::BufferPool) = pool.name
 pool_slot_bytes(pool::BufferPool) = pool.slot_bytes
+
+"""
+    pool_region_bytes(pool) -> Int
+
+The whole length of a SHM pool's object: the data slots and then the slot control area. This, not
+`sizeof(pool)` (the data bytes), is the window a client registers, so a server can reach the
+control words. Equal to `sizeof(pool)` for an inline pool.
+"""
+pool_region_bytes(pool::BufferPool) = pool.region_bytes
 
 function _pool_base_pointer(pool::BufferPool)
     return pool.backing isa SharedMemory ? convert(Ptr{UInt8}, pointer(pool.backing)) : pointer(pool.backing)
@@ -168,13 +229,16 @@ end
 Base.isopen(pool::BufferPool) = !(@lock pool.alloc_lock pool.closed)
 
 # Release a closed SHM pool's mapping once nothing can still touch it: no slot outstanding and no
-# pool_memory alias alive. Caller holds alloc_lock. `finalize` runs InterProcessCommunication's
-# _destroy (munmap) now instead of at some later GC, and unregisters it so it never runs twice.
+# pool_memory alias alive. A quarantined run counts as idle: nothing in this process reads it, and a
+# server's late write lands in its own mapping, not ours. Caller holds alloc_lock. `finalize` runs
+# InterProcessCommunication's _destroy (munmap) now instead of at some later GC, and unregisters it
+# so it never runs twice.
 function _release_if_idle!(pool::BufferPool)
     (pool.closed && !pool.released && pool.backing isa SharedMemory) || return
-    all(pool.free) || return
+    all(i -> pool.free[i] || pool.quarantined[i], 1:pool.n_slots) || return
     _has_pinned_alias(pool) && return
     pool.released = true
+    empty!(pool.quarantine)
     finalize(pool.backing)
     pool.fd === nothing || close(pool.fd)
     return
@@ -189,10 +253,13 @@ mutable struct PoolSlot
     capacity::Int    # span * slot_bytes for top-level slots
     span::Int        # physical slots covered; 0 for a derived subslot
     cursor::Int
+    token::UInt64    # the slot control token of the current attempt (`slot_arm!`); 0 when unarmed
 end
 
 PoolSlot(pool::BufferPool, index::Integer, offset::Integer, capacity::Integer, span::Integer) =
-    PoolSlot(pool, Int(index), Int(offset), Int(capacity), Int(span), 0)
+    PoolSlot(pool, Int(index), Int(offset), Int(capacity), Int(span), 0, UInt64(0))
+PoolSlot(pool::BufferPool, index::Integer, offset::Integer, capacity::Integer, span::Integer, cursor::Integer) =
+    PoolSlot(pool, Int(index), Int(offset), Int(capacity), Int(span), Int(cursor), UInt64(0))
 
 Base.sizeof(slot::PoolSlot) = slot.capacity
 
@@ -286,6 +353,7 @@ function acquire_slot!(pool::BufferPool, span::Integer = 1; deadline_ns::Integer
                 throw(PoolAcquireTimeout(s, Int64(time_ns()) - t0))
             end
             if first(pool.waitq) == token
+                _reclaim_quarantined!(pool)
                 start = _find_free_run(pool.free, s)
                 if start != 0
                     for i in start:(start + s - 1)
@@ -313,7 +381,20 @@ function acquire_slot!(pool::BufferPool, span::Integer = 1; deadline_ns::Integer
                     ), rem
                 )
             end
-            wait(pool.freed)   # releases alloc_lock while parked, reacquires on wake
+            # A quarantined run frees when its writer finishes, which signals nothing here, so poll.
+            poll = isempty(pool.quarantine) ? nothing : Timer(
+                    _ -> (
+                        try
+                            @lock pool.alloc_lock notify(pool.freed)
+                    catch
+                    end
+                    ), _QUARANTINE_POLL_SECONDS
+                )
+            try
+                wait(pool.freed)   # releases alloc_lock while parked, reacquires on wake
+            finally
+                poll === nothing || close(poll)
+            end
         end
     finally
         timer === nothing || close(timer)
@@ -330,22 +411,64 @@ function acquire_slot!(pool::BufferPool, span::Integer = 1; deadline_ns::Integer
 end
 
 """
+    try_acquire_slot!(pool, span=1) -> Union{PoolSlot, Nothing}
+
+Like [`acquire_slot!`](@ref) without waiting: the slot when `span` contiguous slots are free right
+now, otherwise `nothing`. It never passes a caller parked in `acquire_slot!`, so it returns
+`nothing` while anyone waits. Throws [`PoolClosedError`](@ref) on a closed pool and `ArgumentError`
+for a span the pool can never satisfy.
+"""
+function try_acquire_slot!(pool::BufferPool, span::Integer = 1)
+    s = Int(span)
+    (1 <= s <= pool.n_slots) ||
+        throw(ArgumentError("try_acquire_slot!: span $s is outside 1:$(pool.n_slots)"))
+    @lock pool.alloc_lock begin
+        pool.closed && throw(PoolClosedError())
+        _reclaim_quarantined!(pool)
+        isempty(pool.waitq) || return nothing
+        start = _find_free_run(pool.free, s)
+        start == 0 && return nothing
+        for i in start:(start + s - 1)
+            pool.free[i] = false
+        end
+        return PoolSlot(pool, start, (start - 1) * pool.slot_bytes, s * pool.slot_bytes, s)
+    end
+end
+
+"""
     release_slot!(slot)
 
 Return a slot acquired with `acquire_slot!` to the pool's free set, freeing every physical
 slot in its span. Releasing a derived subslot (`index == 0`) is a no-op. Throws if any slot
 in the span is already free (double release).
+
+A slot armed for the slot control protocol ([`slot_arm!`](@ref)) first has its control word moved
+out of OWNED, so no server can begin writing it any more. If a server is writing it at that moment
+(WRITING), the run is quarantined instead of freed: it rejoins the free set once the writer is done,
+or once the writer is found dead after [`SLOT_RETIRE_SECONDS`](@ref); a live writer stuck past that
+keeps it retired until it finishes. Nothing ever waits here.
 """
 function release_slot!(slot::PoolSlot)
     slot.index == 0 && return nothing
     pool = slot.pool
     @lock pool.alloc_lock begin
         for i in slot.index:(slot.index + slot.span - 1)
-            pool.free[i] && throw(
+            (pool.free[i] || pool.quarantined[i]) && throw(
                 ArgumentError(
                     "release_slot!: slot index $i is already free (double release?)"
                 )
             )
+        end
+        token = slot.token
+        slot.token = UInt64(0)
+        if token != 0 && !pool.released && _close_control_word!(pool, slot.index, token) === :writing
+            pool.quarantined[slot.index:(slot.index + slot.span - 1)] .= true
+            push!(pool.quarantine, QuarantinedRun(slot.index, slot.span, token, Int64(time_ns()), false, 0))
+            @debug "slot quarantined: a server is still writing it" pool = pool.name index = slot.index
+            _release_if_idle!(pool)
+            return nothing
+        end
+        for i in slot.index:(slot.index + slot.span - 1)
             pool.free[i] = true
         end
         _release_if_idle!(pool)

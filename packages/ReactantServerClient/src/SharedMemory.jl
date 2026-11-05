@@ -63,6 +63,9 @@ n_slots(p::InferenceBufferPool) = p.pool.n_slots
 # allocator. `span` requests that many physically contiguous slots as one range.
 acquire_slot!(p::InferenceBufferPool, span::Integer = 1) = acquire_slot!(p.pool, span)
 
+# Whether chunks staged in this pool run the slot control protocol (CORE-3): a SHM pool on Linux.
+_slot_controlled(p::InferenceBufferPool) = has_slot_control(p.pool)
+
 # ---- Triton/KServe SHM registration ----
 
 # Register the pool's SHM region with the model's server. No-op for inline pools and for models
@@ -88,7 +91,8 @@ function register_pool_with_model!(p::InferenceBufferPool, model::KServeModel)
                 name = pool_name(p),
                 key = shmid(p.pool.backing),
                 offset = 0,
-                byte_size = sizeof(p),
+                # The whole object: the data slots and the slot control area after them.
+                byte_size = pool_region_bytes(p.pool),
             );
             deadline = SHM_CONTROL_DEADLINE,
         )

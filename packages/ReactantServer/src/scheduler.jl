@@ -658,6 +658,10 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
         margin_ns = qr.committed ? Int64(0) : laxity_ns
         if _withdrawn(qr)
             continue          # its caller stopped waiting (dispatch timeout, cancellation): never run it
+        elseif request_cancelled(qr.req)
+            # Its client gave up its shared-memory slot (CORE-3). Checked before the deadline branch so
+            # such a request is answered here, once, and is never picked as the re-measure run.
+            put!(qr.reply, RequestCancelled(qr.req.model_name, "its client gave up the shared-memory slot"))
         elseif qr.req.deadline_ns != 0 && now_ns + margin_ns >= qr.req.deadline_ns
             if remeasure === nothing && now_ns < qr.req.deadline_ns
                 remeasure = qr
@@ -669,10 +673,13 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
         end
     end
     # Withdrawal is set from the caller's task, so check it again before the re-measure decision: a
-    # request withdrawn since the scan is neither run to measure the program nor answered.
+    # request withdrawn since the scan is neither run to measure the program nor answered. A slot
+    # its client gave up on since the scan (CORE-3) is answered CANCELLED instead of being run.
     if remeasure !== nothing && !_withdrawn(remeasure)
         c = st.cost_estimate[(variant, B)]       # exists: only a measured estimate has a margin
-        if isempty(live) && time() - max(c.refreshed, c.remeasured) >= _COST_STALE_SECONDS
+        if request_cancelled(remeasure.req)
+            put!(remeasure.reply, RequestCancelled(remeasure.req.model_name, "its client gave up the shared-memory slot"))
+        elseif isempty(live) && time() - max(c.refreshed, c.remeasured) >= _COST_STALE_SECONDS
             c.remeasured = time()
             push!(live, remeasure)
             @debug "EDF: running a request its stale cost estimate would shed, to measure the program again" model = entry.name variant = variant size = B estimate = est

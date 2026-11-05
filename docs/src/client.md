@@ -87,6 +87,47 @@ vector also opts the IO into explicit-output mode: the request asks for exactly 
 so declare every output the IO consumes. Outputs with data-dependent shapes cannot be sized
 ahead of time and must stay inline.
 
+### Slot ownership
+
+A chunk that gives up (its deadline passed, the call failed, or the connection dropped) returns
+its slot at once, while the server may still be running the request. So that a late server can
+never write that request's outputs into a slot another chunk is now using, every slot of the
+shared-memory pool has a control word in a control area after the data slots (one 8-byte word
+per slot, padded to 128 bytes), and every request staged in the pool carries three request
+parameters naming it: `reactant_shm_control_region`, `reactant_shm_control_offset` and
+`reactant_shm_control_token`. The word holds a state and a token that is new for every attempt,
+retries included:
+
+- the client sets it to `OWNED(t)` before sending attempt `t`;
+- before writing shared-memory outputs, the worker takes an open-file-description lock on the
+  word, moves it from `OWNED(t)` to `WRITING(t)`, checks before every 1 MiB of the copy that it
+  still reads `WRITING(t)`, then stores `DONE(t)` and unlocks; if the word no longer reads
+  `OWNED(t)` it writes nothing and the request fails with `CANCELLED`;
+- a client that gives up moves `OWNED(t)` to `CANCELLED(t)` and reuses the slot immediately; if
+  the word already reads `WRITING(t)` the slot is set aside (quarantined) until it reads
+  `DONE(t)`;
+- the worker also drops, at dispatch and with `CANCELLED`, a queued request whose word no longer
+  reads `OWNED(t)`.
+
+Nothing waits on the other side. A slot whose writer still holds `WRITING` after 30 seconds is
+checked through the writer's lock: if the lock is free the writer died (the kernel releases it)
+and the slot is reclaimed; if it is held the writer is alive but stuck, and the slot stays retired,
+never reused, until that writer finishes. Requests from clients that send no control parameters
+(third-party KServe clients) behave as before, except that a worker no longer writes shared-memory
+outputs once the request's deadline has passed. The protocol needs Linux; where it is unavailable
+the client sends no control parameters (on macOS shared memory is off anyway) and a worker refuses
+them with `INVALID_ARGUMENT`. The registered window is the whole object, control area included.
+
+A chunk never waits for a slot. When none is free (all in flight, quarantined or retired) it is
+sent inline at once through a private buffer, and `ReactantServerClient.inline_fallback_count()`
+counts these; a count that keeps growing means the pool has too few slots for the concurrency.
+`infer_async` keeps at most as many chunks in flight as the pool has slots, so one call alone does
+not fall back, and an inference started from inside `infer_decode_chunk!` of another (which used to
+deadlock when the outer call held every slot) runs inline. Only a chunk too large to send in one
+gRPC message (by the model's `max_send_message_length` or `max_receive_message_length`) waits for
+a shared-memory slot, for at most the model's `deadline`, and then fails with an error that says
+so.
+
 ## Validating an IO against a model
 
 Because an IO hard-codes a model's tensor names, dtypes, and shapes, it can silently drift

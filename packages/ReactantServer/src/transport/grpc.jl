@@ -83,9 +83,11 @@ _status_label(e) = get(_GRPC_STATUS_NAME, Int(_grpc_status(e)), "UNKNOWN")
 # - NOT_FOUND: the model is unknown here, or was unloaded or replaced while the request waited
 # - DEADLINE_EXCEEDED: the deadline passed before dispatch (EDF laxity drops included), or the
 #   dispatch timeout did
-# - CANCELLED: the client cancelled the call
+# - CANCELLED: the client cancelled the call, or gave up the shared-memory slot the request writes
+#   (`RequestCancelled`, CORE-3: dropped at dispatch, or its output write was refused)
 # - INVALID_ARGUMENT: the request's own data is wrong (a hook's `InvalidInputError`, bad text)
 # - FAILED_PRECONDITION: a shared-memory region the registry does not know (re-register and retry)
+# - ALREADY_EXISTS: a shared-memory region name registered for another client's live object
 # - INTERNAL: anything else, a failure on the server's side
 #
 # Decode, input validation and encode classify the codec's client errors themselves (see
@@ -97,9 +99,10 @@ function _grpc_status(e)
     (e isa WorkerUnavailableError || e isa NotResidentError) && return S.UNAVAILABLE
     e isa ModelNotFoundError && return S.NOT_FOUND
     (e isa DeadlineExceeded || e isa DispatchTimeoutError) && return S.DEADLINE_EXCEEDED
-    e isa RequestCancelledError && return S.CANCELLED
+    (e isa RequestCancelledError || e isa RequestCancelled) && return S.CANCELLED
     _client_data_error(e) && return S.INVALID_ARGUMENT
     e isa UnregisteredRegionError && return S.FAILED_PRECONDITION
+    e isa ShmRegionExistsError && return S.ALREADY_EXISTS
     return S.INTERNAL
 end
 
@@ -205,6 +208,11 @@ function _as_encode_error(f)
         e isa gRPCServer.GRPCError && rethrow()
         e isa UnregisteredRegionError &&
             throw(gRPCServer.GRPCError(gRPCServer.StatusCode.FAILED_PRECONDITION, sprint(showerror, e)))
+        # A shared-memory output write skipped because its client is gone (CORE-3): the slot was
+        # given up (CANCELLED), or, for a client without slot control, the deadline had passed.
+        e isa RequestCancelled && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.CANCELLED, sprint(showerror, e)))
+        e isa DeadlineExceeded &&
+            throw(gRPCServer.GRPCError(gRPCServer.StatusCode.DEADLINE_EXCEEDED, sprint(showerror, e)))
         (e isa ErrorException || e isa ArgumentError) && _invalid(sprint(showerror, e))
         rethrow()
     end
@@ -370,12 +378,15 @@ function _handle_infer_impl(ctx::InferContext, req, grpc_deadline_ns::Integer = 
     entry === nothing && _not_found("unknown model: $name")
     decoded = _as_invalid(() -> decode_infer_request(inference, req, ctx.shm))
     deadline_ns = _effective_deadline(decoded.request.deadline_ns, grpc_deadline_ns)
-    request = InferRequest(name, decoded.request.requested_outputs, decoded.request.inputs, deadline_ns)
+    request = InferRequest(
+        name, decoded.request.requested_outputs, decoded.request.inputs, deadline_ns,
+        decoded.request.slot_control
+    )
     _validate_inputs(entry, request)
     outputs = _infer_or_not_found(ctx, request; cancelled = cancelled)
     # Encoding rejects a requested output the model does not produce: a client mistake, so
     # surface it as INVALID_ARGUMENT (matching the codec's documented contract).
-    return _as_encode_error(() -> encode_infer_response(inference, name, decoded, outputs, ctx.shm))
+    return _as_encode_error(() -> encode_infer_response(inference, name, decoded, outputs, ctx.shm; deadline_ns = deadline_ns))
 end
 
 # A meta's orchestration runs on this request task (`infer` -> `_run_meta_request`), under the worker's
@@ -389,12 +400,17 @@ end
 function _handle_meta_infer(ctx::InferContext, meta, req, grpc_deadline_ns::Integer = 0; cancelled = nothing)
     decoded = _as_invalid(() -> decode_infer_request(inference, req, ctx.shm))
     deadline_ns = _effective_deadline(decoded.request.deadline_ns, grpc_deadline_ns)
-    request = InferRequest(meta.name, decoded.request.requested_outputs, decoded.request.inputs, deadline_ns)
+    request = InferRequest(
+        meta.name, decoded.request.requested_outputs, decoded.request.inputs, deadline_ns,
+        decoded.request.slot_control
+    )
     _validate_inputs(meta, request)
     scratch = PoolSlot[]
     try
         outputs = _infer_or_not_found(ctx, request; cancelled = cancelled, scratch_out = scratch)
-        return _as_encode_error(() -> encode_infer_response(inference, meta.name, decoded, outputs, ctx.shm))
+        return _as_encode_error(
+            () -> encode_infer_response(inference, meta.name, decoded, outputs, ctx.shm; deadline_ns = deadline_ns)
+        )
     finally
         release_scratch!(scratch)
     end

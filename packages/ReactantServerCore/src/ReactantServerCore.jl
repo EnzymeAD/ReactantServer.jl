@@ -29,6 +29,11 @@ include("shm_helpers.jl")
 include("shm_object.jl")
 include("buffer_pool.jl")
 
+# Server-side shared-memory registry, and the per-slot control words both sides use (CORE-3).
+# Before the boundary types, which carry a request's slot control.
+include("shared_memory.jl")
+include("slot_control.jl")
+
 # Host-weight residency store (private, or node-shared via POSIX SHM + flock).
 include("weight_store.jl")
 
@@ -44,8 +49,7 @@ include("status_message.jl")
 # Cooperative drain requests for a blocking worker or gateway (the supervisor's stop protocol).
 include("drain.jl")
 
-# Server-side shared-memory registry and the wire <-> boundary codec.
-include("shared_memory.jl")
+# The wire <-> boundary codec.
 include("codec.jl")
 
 function __init__()
@@ -70,6 +74,12 @@ export memory_from_shm, memory_from_bytes, fsa_from_memory
 export BufferPool, PoolSlot, acquire_slot!, release_slot!, subslot, reset_slot!, PoolAcquireTimeout, PoolClosedError
 export pool_view, pool_memory, pool_fsa, is_shm_backed, scratch
 export pool_base_pointer, pool_region_name, pool_slot_bytes
+export try_acquire_slot!, pool_region_bytes, SLOT_RETIRE_SECONDS
+
+# ---- slot control (CORE-3) ----
+export SlotControl, SlotWriteInProgress, slot_arm!, slot_seal!, slot_control_offset, has_slot_control
+export slot_control_supported, request_cancelled, RequestCancelled
+export SLOT_CONTROL_REGION_PARAM, SLOT_CONTROL_OFFSET_PARAM, SLOT_CONTROL_TOKEN_PARAM
 
 # ---- weight store ----
 export WeightStore, PrivateWeightStore, SharedWeightStore

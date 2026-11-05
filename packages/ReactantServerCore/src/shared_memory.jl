@@ -86,7 +86,7 @@ const SHM_REAP_INTERVAL_SECONDS = 60.0
 
 The registry of client shared-memory regions. Once something is registered, a timer re-checks
 every `reap_interval` seconds that each registration's object still exists under its key and drops
-those that do not (see [`shm_reap!`](@ref)); [`shm_teardown!`](@ref) stops it. A non-positive
+those that do not (see [`shm_reap!`](@ref)); `shm_teardown!` stops it. A non-positive
 interval disables the timer (registrations still sweep).
 """
 struct SharedMemoryRegistry

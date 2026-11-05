@@ -6,7 +6,8 @@
 # multiplexing, the graceful drain (with requests held in flight (slow4), the gateway and then the
 # workers refuse new requests with UNAVAILABLE, finish the admitted ones, and every process exits
 # 0), and what a client is told of an INTERNAL error in each `grpc.error_detail` mode (a second
-# node runs with `full`). Needs no GPU.
+# node runs with `full`), and, on that node, shared-memory outputs under client give-ups and a
+# worker restart under one client. Needs no GPU.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
@@ -15,7 +16,11 @@ E2E_DIR="packages/ReactantServer/test/e2e"
 
 WORK="$(mktemp -d)"
 SUP_PID=""
+SHM_CLIENT_PID=""
 cleanup() {
+    if [[ -n "$SHM_CLIENT_PID" ]] && kill -0 "$SHM_CLIENT_PID" 2>/dev/null; then
+        kill -TERM "$SHM_CLIENT_PID" 2>/dev/null || true
+    fi
     # TERM, not KILL: the supervisor drains its children and waits for them; SIGKILL would orphan
     # every worker and the gateway.
     if [[ -n "$SUP_PID" ]] && kill -0 "$SUP_PID" 2>/dev/null; then
@@ -41,7 +46,7 @@ GW_METRICS_PORT="$(free_port)"
 # below (a different preferences hash forces a full Reactant recompile, CPU-only and slow).
 READY_TIMEOUT="${E2E_CPU_READY_TIMEOUT:-1800}"
 
-echo "== [1/7] generating scale4 bundle =="
+echo "== [1/8] generating scale4 bundle =="
 julia --project=packages/ReactantServer "$E2E_DIR/gen_scale4.jl"
 
 mkdir -p "$WORK/models"
@@ -65,7 +70,7 @@ register_model("slow4"; preprocess = function (inputs)
 end)
 EOF
 
-echo "== [2/7] writing node file, gateway config and Reactant preference override =="
+echo "== [2/8] writing node file, gateway config and Reactant preference override =="
 # No workers list: the supervisor synthesizes them (REACTANT_CPU_WORKERS below).
 cat > "$WORK/node.yaml" << EOF
 model_repo: $WORK/models
@@ -118,7 +123,7 @@ EOF
 }
 write_gateway_config "$WORK/gateway.yml" redacted
 
-echo "== [3/7] starting supervisor (2 CPU workers + embedded gateway) =="
+echo "== [3/8] starting supervisor (2 CPU workers + embedded gateway) =="
 REACTANT_GPUS=0 \
 REACTANT_CPU_WORKERS=2 \
 REACTANT_WORKSPACE_ROOT="$REPO_ROOT" \
@@ -148,7 +153,7 @@ until curl -fsS "http://127.0.0.1:${GW_METRICS_PORT}/readyz" >/dev/null 2>&1; do
 done
 echo "   gateway ready."
 
-echo "== [4/7] running CPU e2e client =="
+echo "== [4/8] running CPU e2e client =="
 set +e
 julia --project=packages/ReactantServerGateway "$E2E_DIR/client_cpu.jl" "$GW_PORT" "$BASE_PORT" redacted |
     tee "$WORK/client_redacted.out"
@@ -188,7 +193,7 @@ check_forced_log() {
 }
 check_forced_log redacted "$WORK/supervisor.log"
 
-echo "== [5/7] SIGTERM under load: the node drains =="
+echo "== [5/8] SIGTERM under load: the node drains =="
 # The drain client holds requests in flight, sends the supervisor SIGTERM itself, and checks both
 # drain stages (gateway, then workers) from the outside.
 set +e
@@ -204,7 +209,7 @@ fi
 sup_rc=0
 wait "$SUP_PID" || sup_rc=$?
 
-echo "== [6/7] exit codes =="
+echo "== [6/8] exit codes =="
 # The supervisor exited 0 (argument 1) and every child drained and exited 0 on its own: no SIGTERM
 # or SIGKILL fallback was needed. Argument 2 is the node's log.
 check_clean_exit() {
@@ -239,7 +244,7 @@ for tag in worker0 worker1 gateway supervisor; do
     fi
 done
 
-echo "== [7/7] full INTERNAL error detail (node global.grpc.error_detail: full) =="
+echo "== [7/8] full INTERNAL error detail (node global.grpc.error_detail: full) =="
 # A second node, identical but for `global.grpc.error_detail: full`, which reaches the workers through
 # their config and the embedded gateway through its pinned gateway config (the Node unit tests cover
 # the supervisor's mirror of global.grpc into an env-configured gateway).
@@ -282,9 +287,56 @@ if ((client_rc != 0)); then
     exit "$client_rc"
 fi
 check_forced_log full "$WORK/supervisor_full.log"
+
+echo "== [8/8] shared memory: short deadlines, then a worker restart under the same client =="
+# Phase A drives shared-memory outputs with deadlines short enough that clients give up while
+# requests run (CORE-3). Then worker1 is killed; once the supervisor has restarted it and the
+# gateway reports it ready again, phase B checks that the same client process re-registers the
+# same region and keeps getting correct answers (CORE-2). It runs on this second node so that
+# any failure reaches the client with its full error text.
+mkdir -p "$WORK/markers"
+julia --project=packages/ReactantServerClient --threads=4 "$E2E_DIR/client_shm_cpu.jl" \
+    "$GW_PORT" "$BASE_PORT" "$WORK/markers" > "$WORK/shm_client.log" 2>&1 &
+SHM_CLIENT_PID=$!
+until [[ -f "$WORK/markers/phase_a_done" ]]; do
+    if ! kill -0 "$SHM_CLIENT_PID" 2>/dev/null; then
+        echo "ERROR: shared-memory client exited during phase A; its log:"
+        tail -60 "$WORK/shm_client.log"
+        exit 1
+    fi
+    sleep 1
+done
+log="$WORK/supervisor_full.log"
+old_pid="$(grep -oE 'started worker1 \(pid [0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$')"
+seen_ready="$(grep -c "health: worker ready again" "$log" || true)"
+echo "   killing worker1 (pid $old_pid) with SIGKILL"
+kill -KILL "$old_pid"
+deadline=$((SECONDS + READY_TIMEOUT))
+until new_pid="$(grep -oE 'started worker1 \(pid [0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$')" &&
+    [[ -n "$new_pid" && "$new_pid" != "$old_pid" ]] &&
+    (($(grep -c "health: worker ready again" "$log" || true) > seen_ready)); do
+    if ((SECONDS >= deadline)); then
+        echo "ERROR: worker1 did not come back within ${READY_TIMEOUT}s"
+        exit 1
+    fi
+    sleep 2
+done
+echo "   worker1 restarted (pid $new_pid) and the gateway reports it ready"
+touch "$WORK/markers/restarted"
+set +e
+wait "$SHM_CLIENT_PID"
+shm_rc=$?
+set -e
+grep -E "^(PASS|FAIL|phase|CPU e2e)" "$WORK/shm_client.log" || true
+if ((shm_rc != 0)); then
+    echo "== shared-memory client failed (rc=${shm_rc}); its log and recent supervisor log: =="
+    tail -60 "$WORK/shm_client.log"
+    tail -120 "$log"
+    exit "$shm_rc"
+fi
 kill -TERM "$SUP_PID"
 sup_rc=0
 wait "$SUP_PID" || sup_rc=$?
 check_clean_exit "$sup_rc" "$WORK/supervisor_full.log"
 
-echo "CPU e2e: PASS (workers synthesized, gateway routed, graceful drain, clean exit, INTERNAL error detail)"
+echo "CPU e2e: PASS (workers synthesized, gateway routed, graceful drain, clean exit, INTERNAL error detail, shared memory)"

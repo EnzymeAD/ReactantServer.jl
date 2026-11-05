@@ -47,14 +47,23 @@ A decoded inference request, the scheduler's unit of work. It names the target m
 (0 means none): a remaining-budget timeout carried over the wire is converted to this local
 absolute form at decode, so cross-process monotonic-clock differences never matter. The codec
 produces it from a wire `ModelInferRequest`; the scheduler and runtime consume only this
-transport-agnostic form.
+transport-agnostic form. `slot_control` is the client's shared-memory slot control for the
+request (see [`SlotControl`](@ref)), or `nothing`; the scheduler consults it at dispatch through
+[`request_cancelled`](@ref).
 """
 struct InferRequest
     model_name::String
     requested_outputs::Vector{String}
     inputs::Vector{NamedTensor}
     deadline_ns::Int64
+    slot_control::Union{SlotControl, Nothing}
 end
+
+# No slot control: every in-process caller (the scheduler unit tests, meta sub-calls).
+InferRequest(
+    model_name::AbstractString, requested_outputs::Vector{String},
+    inputs::Vector{NamedTensor}, deadline_ns::Integer
+) = InferRequest(String(model_name), requested_outputs, inputs, Int64(deadline_ns), nothing)
 
 # Deadline defaults to 0 (none): the form the scheduler unit tests and most in-process callers
 # build. The codec and meta sub-call path pass an explicit deadline.
@@ -63,6 +72,16 @@ InferRequest(
     inputs::Vector{NamedTensor}
 ) =
     InferRequest(String(model_name), requested_outputs, inputs, Int64(0))
+
+"""
+    request_cancelled(req::InferRequest) -> Bool
+
+Whether `req`'s client has given up on it, as its shared-memory slot control word shows (CORE-3):
+the predicate the scheduler checks before starting a request's work. Never waits; `false` for a
+request without slot control.
+"""
+request_cancelled(req::InferRequest) =
+    req.slot_control !== nothing && slot_control_cancelled(req.slot_control)
 
 struct QueuedRequest
     req::InferRequest
