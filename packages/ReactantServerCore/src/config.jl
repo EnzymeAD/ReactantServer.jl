@@ -423,8 +423,10 @@ EndpointsConfig(host, port, metrics_port) = EndpointsConfig(host, port, metrics_
 
 # Default gRPC message-size cap, shared by the worker, gateway, and client. The 4 MiB gRPC default
 # is far below what inference tensors routinely need, so the whole stack sizes generously; 512 MiB
-# is the common default. These are decode/encode caps, not allocations: raising them costs nothing
-# until a message that large actually arrives.
+# is the common default. The send cap is only a check, but the receive cap is not free: the gRPC
+# server allocates a buffer of a request message's full declared length as soon as its 5-byte
+# length prefix arrives, so each request being received can hold up to the cap (see
+# docs/src/security.md).
 const DEFAULT_GRPC_MSG_BYTES = 512 * 1024 * 1024
 
 """
@@ -450,11 +452,13 @@ end
     GrpcConfig
 
 gRPC transport settings for a worker's server. `max_recv_msg_bytes` / `max_send_msg_bytes` bound a
-single gRPC message in each direction (decode/encode caps, not allocations); `error_detail` (an
-[`ErrorDetail`](@ref)) is how much an `INTERNAL` error tells the client. Configured under the
-`grpc:` block of a worker (or node `global:`) config, with `INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES`
-/ `INFERENCE_SERVER_GRPC_MAX_SEND_MSG_BYTES` / `INFERENCE_SERVER_GRPC_ERROR_DETAIL` environment
-overrides. Defaults: `DEFAULT_GRPC_MSG_BYTES` (512 MiB) and `redacted`.
+single gRPC message in each direction. The server allocates a received message's full declared
+length as soon as its length prefix arrives, so the receive cap also bounds that buffer per request.
+`error_detail` (an [`ErrorDetail`](@ref)) is how much an `INTERNAL` error tells the client.
+Configured under the `grpc:` block of a worker (or node `global:`) config, with
+`INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES` / `INFERENCE_SERVER_GRPC_MAX_SEND_MSG_BYTES` /
+`INFERENCE_SERVER_GRPC_ERROR_DETAIL` environment overrides. Defaults: `DEFAULT_GRPC_MSG_BYTES`
+(512 MiB) and `redacted`.
 """
 struct GrpcConfig
     max_recv_msg_bytes::Int

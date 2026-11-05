@@ -185,8 +185,15 @@ single device through its own `CUDA_VISIBLE_DEVICES`.
 The `global.grpc` block is the single node-level place for gRPC message-size limits: every
 worker reads it directly, and the supervisor also mirrors it into the embedded gateway (as
 `REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES` / `REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES`), so one
-block sizes the whole node. The defaults are 512 MiB each, and these are decode/encode caps, not
-allocations: raising them costs nothing until a message that large actually arrives.
+block sizes the whole node. The defaults are 512 MiB each. `max_send_msg_bytes` is only a check
+on each outgoing message, but `max_recv_msg_bytes` also sizes memory: the gRPC server allocates a
+buffer of a request message's full declared length as soon as the message's 5-byte length prefix
+arrives, before any of the payload, so every request being received can hold up to
+`max_recv_msg_bytes` however few bytes its client has sent. Size it to the largest inline message
+the deployment needs (tensors passed through shared memory do not count): the largest request for
+a worker, and for the gateway, which applies the same limit to the responses it receives from
+workers, the larger of the largest request and the largest response. Lower it wherever untrusted
+clients can connect; see [Security](security.md).
 Per-component environment overrides still apply, with the gateway's own
 `REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES` winning over the mirrored value:
 `INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES` for a worker, `REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES`

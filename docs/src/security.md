@@ -23,3 +23,14 @@ following before exposing any endpoint:
   and port; the exception and backtrace go to that server's log under the same id. Keep
   `full`, which sends the exception text to clients, to development and testing. See
   [Node Configuration](node_config.md).
+- **The receive size limit is a memory commitment.** The worker and gateway gRPC servers allocate a
+  buffer of a request message's full declared length as soon as its 5-byte length prefix arrives,
+  before the payload. A client that sends a length prefix and nothing more therefore makes the
+  process hold a buffer of up to `grpc.max_recv_msg_bytes` (512 MiB by default) for as long as the
+  request stays open, and can do so on as many requests at once as the server admits. Where
+  untrusted or unauthenticated clients can reach a worker or the gateway, lower
+  `grpc.max_recv_msg_bytes` on both to the largest inline message the deployment needs (see
+  [Node Configuration](node_config.md); tensors sent through shared memory do not count). On a node
+  set it in `global.grpc`, which the supervisor mirrors into the embedded gateway. An environment
+  override wins over the YAML value, so also set or clear `INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES`
+  (workers) and `REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES` (gateway).
