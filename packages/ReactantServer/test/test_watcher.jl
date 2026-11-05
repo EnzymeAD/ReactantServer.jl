@@ -321,6 +321,50 @@ end
     end
 end
 
+@testset "a hot reload under a host weight budget serves the new version's weights (CPU)" begin
+    # On-demand weights, unpinned, fair discipline (admission runs the model, so `load_model!` reads
+    # the new version's weights ahead of its control op), with a finite host budget. The private
+    # store still holds v1's copy under the model's name then; it must not reach v2's program.
+    stores = Any[nothing]
+    Sys.islinux() && isdir("/dev/shm") && push!(stores, "trl" * string(getpid()))
+    for prefix in stores
+        mktempdir() do root
+            env = _cpu_watch_env(root)
+            store, budget = prefix === nothing ? (ReactantServer.PrivateWeightStore(), 1 << 20) :
+                (ReactantServer.SharedWeightStore(; budget = 1 << 20, prefix = prefix), nothing)
+            env.sched.weight_cache = ReactantServer.WeightCache(
+                env.backend, env.pool, env.reg, 1 << 20; store = store, host_budget = budget
+            )
+            ReactantServer.start!(env.sched)
+            dir = _write_scale_bundle(root, "m")
+            load() = ReactantServer.load_model!(
+                env.sched, env.backend, env.pool, ReactantServer.load_bundle_entry(dir);
+                state = ReactantServer.UNPINNED, on_demand = true, store = store
+            )
+            try
+                @test ReactantServer.host_budgeted(env.sched.weight_cache)
+                @test load() == "m"
+                @test _y(env.sched, "m") == Float32[2, 4, 6, 8]
+                prefix === nothing && @test haskey(env.sched.weight_cache.host_cached, "m")
+                # Deploy new weights of the same shape: a new file renamed over the old one.
+                staging = mktempdir(root)
+                _write_scale_bundle(staging, "m"; w = Float32[5, 5, 5, 5])
+                Base.Filesystem.rename(joinpath(staging, "m", "weights.safetensors"), joinpath(dir, "weights.safetensors"))
+                @test load() == "m"
+                @test _y(env.sched, "m") == Float32[5, 10, 15, 20]
+                prefix === nothing && @test env.sched.weight_cache.host_cached["m"].entry === get_model(env.reg, "m")
+            finally
+                ReactantServer.shutdown!(env.sched)
+                if prefix !== nothing
+                    for f in readdir("/dev/shm"; join = true)
+                        startswith(basename(f), prefix * "-") && rm(f; force = true)
+                    end
+                end
+            end
+        end
+    end
+end
+
 @testset "model name comes from the bundle directory, not the manifest" begin
     mktempdir() do root
         # A manifest whose `name` disagrees with the directory: the directory wins.

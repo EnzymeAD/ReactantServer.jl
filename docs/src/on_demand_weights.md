@@ -196,7 +196,9 @@ How the budget is shared depends on `shared_host_weights`:
   restarts, so the cache is warm after a restart, and each worker trims the node to the budget at
   startup.
 - **Private** (`false`): each worker keeps its own copies and gets an even share,
-  `host_weight_budget ÷ host_weight_budget_workers`, with no coordination.
+  `host_weight_budget ÷ host_weight_budget_workers`, with no coordination. A copy belongs to the
+  loaded version of its model: a hot reload reads the new version's weights file and never uploads
+  the copy the previous version left.
   `host_weight_budget_workers` defaults to 1; the node supervisor sets it to the node's worker
   count, so set it yourself only when running several workers without the supervisor.
 

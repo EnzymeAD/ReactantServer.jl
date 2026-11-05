@@ -104,7 +104,7 @@ end
 function _load_via_host_cache(
         cache::WeightCache, ::WeightStore, entry::ModelEntry, model::LoadedModel; timing = nothing
     )
-    arrays = lock(() -> get(cache.host_cached, entry.name, nothing), cache.lock)
+    arrays = lock(() -> _cached_host(cache, entry), cache.lock)
     if arrays !== nothing
         bufs = _timed_transfer(cache, arrays, timing)
         lock(cache.lock) do
@@ -120,8 +120,16 @@ function _load_via_host_cache(
     _timed_read!(timing, time() - t)
     bufs = _timed_transfer(cache, arrays, timing)
     lock(() -> cache.host_misses += 1, cache.lock)
-    _cache_host!(cache, entry.name, arrays)
+    _cache_host!(cache, entry, arrays)
     return bufs
+end
+
+# `entry`'s cached host copy (private store), or `nothing`. The copy kept under its name belongs to
+# another version when a reload replaced the model since it was read, and uploading it would run the
+# new program on the old weights: that one is never returned. Caller holds `cache.lock`.
+function _cached_host(cache::WeightCache, entry::ModelEntry)
+    c = get(cache.host_cached, entry.name, nothing)
+    return (c === nothing || c.entry !== entry) ? nothing : c.arrays
 end
 
 # Count one device load of `name` in its load rank (`bump_load_rank`), which orders the private
@@ -141,34 +149,40 @@ function _host_victims(cache::WeightCache, need::Int; below::Float64 = Inf)
         freed >= need && break
         get(cache.host_rank, n, 0.0) >= below && break
         push!(out, n)
-        freed += _host_bytes(cache.host_cached[n])
+        freed += _host_bytes(cache.host_cached[n].arrays)
     end
     return freed >= need ? out : nothing
 end
 
 function _evict_host!(cache::WeightCache, names)
     for n in names
-        cache.host_cached_bytes -= _host_bytes(pop!(cache.host_cached, n))
+        cache.host_cached_bytes -= _host_bytes(pop!(cache.host_cached, n).arrays)
     end
     return nothing
 end
 
-# Keep `arrays` as `name`'s cached host copy (private store) if the budget can make room for them,
+# Keep `arrays` as `entry`'s cached host copy (private store) if the budget can make room for them,
 # evicting the copies with the lowest load rank, and only copies ranked below this one: a copy loaded
-# less often never displaces one loaded more. `load` counts this as a device load of `name` (false
-# for a dropped host floor, which is not a load). Evicts nothing unless that makes them fit.
-function _cache_host!(cache::WeightCache, name::String, arrays::Vector{Any}; load::Bool = true)
+# less often never displaces one loaded more. `load` counts this as a device load of the model (false
+# for a dropped host floor, which is not a load). Evicts nothing unless that makes them fit, except a
+# copy another version of the model left under its name, which no load can use any more.
+function _cache_host!(cache::WeightCache, entry::ModelEntry, arrays::Vector{Any}; load::Bool = true)
+    name = entry.name
     budget = cache.host_budget::Int
     nb = _host_bytes(arrays)
     floors = _host_floor_bytes(cache)
     return lock(cache.lock) do
         rank = load ? _rank_load!(cache, name) : get(cache.host_rank, name, 0.0)
-        haskey(cache.host_cached, name) && return true
+        old = get(cache.host_cached, name, nothing)
+        if old !== nothing
+            old.entry === entry && return true
+            _evict_host!(cache, (name,))
+        end
         floors + nb > budget && return false          # would not fit even with every copy evicted
         victims = _host_victims(cache, floors + cache.host_cached_bytes + nb - budget; below = rank)
         victims === nothing && return false
         _evict_host!(cache, victims)
-        cache.host_cached[name] = arrays
+        cache.host_cached[name] = HostCopy(entry, arrays)
         cache.host_cached_bytes += nb
         return true
     end
@@ -177,20 +191,20 @@ end
 # Drop `name`'s cached host copy (private store), if any: the model was removed or reloaded.
 function _uncache_host!(cache::WeightCache, name::AbstractString)
     lock(cache.lock) do
-        arrays = pop!(cache.host_cached, String(name), nothing)
-        arrays === nothing && return
-        cache.host_cached_bytes -= _host_bytes(arrays)
+        c = pop!(cache.host_cached, String(name), nothing)
+        c === nothing && return
+        cache.host_cached_bytes -= _host_bytes(c.arrays)
     end
     return nothing
 end
 
-# Take `name`'s cached host copy out of the cache (private store), or `nothing`.
-function _take_cached_host!(cache::WeightCache, name::AbstractString)
+# Take `entry`'s cached host copy out of the cache (private store), or `nothing`.
+function _take_cached_host!(cache::WeightCache, entry::ModelEntry)
     cache.store isa SharedWeightStore && return nothing
     return lock(cache.lock) do
-        arrays = pop!(cache.host_cached, String(name), nothing)
+        arrays = _cached_host(cache, entry)
         arrays === nothing && return nothing
-        cache.host_cached_bytes -= _host_bytes(arrays)
+        _evict_host!(cache, (entry.name,))
         return arrays
     end
 end
@@ -345,7 +359,7 @@ function _stage_host_weights(cache::WeightCache, entry::ModelEntry, names::Vecto
         return StagedWeights(_read_checked(entry, names), false)
     end
     if host_budgeted(cache)
-        arrays = lock(() -> get(cache.host_cached, entry.name, nothing), cache.lock)
+        arrays = lock(() -> _cached_host(cache, entry), cache.lock)
         arrays === nothing || return StagedWeights(arrays, true)
         return StagedWeights(_read_checked(entry, names), false; fresh = true)
     end
@@ -388,7 +402,7 @@ function release_staged!(cache::WeightCache, entry::ModelEntry, staged::StagedWe
         arrays = nothing
         release_cached_host_weights!(cache.store, staged.cached)
     elseif uploaded && staged.fresh
-        _cache_host!(cache, entry.name, arrays)
+        _cache_host!(cache, entry, arrays)
     end
     return nothing
 end
@@ -414,5 +428,5 @@ function has_host_copy(cache::WeightCache, entry::ModelEntry)
         digest = weights_digest(entry.name, specs; content = weights_file_token(entry.weights_id))
         return cached_region_exists(store, entry.name, digest)
     end
-    return lock(() -> haskey(cache.host_cached, entry.name), cache.lock)
+    return lock(() -> _cached_host(cache, entry) !== nothing, cache.lock)
 end
