@@ -101,6 +101,7 @@ include("meta.jl")
 include("transport/metrics.jl")
 include("transport/responsiveness.jl")   # the interactive-thread lag monitor
 include("transport/grpc.jl")
+include("transport/drain.jl")   # the graceful-drain gate on the gRPC server
 include("transport/control_grpc.jl")
 include("server.jl")
 

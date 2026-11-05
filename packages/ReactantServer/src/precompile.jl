@@ -65,6 +65,7 @@ using PrecompileTools: @setup_workload, @compile_workload
     function _pc_serve(sched, reg, ctx, metrics)
         server = build_grpc_server(sched, reg, "mock", ctx.shm, "127.0.0.1", 1, ctx)
         server.port = 0                       # an OS-assigned port, read back after start!
+        gRPCServer.add_interceptor!(server, _DrainInterceptor(ReactantServerCore.DrainGate()))   # as serve does
         mserver = nothing
         client = HTTP.Client()
         gRPCServer.start!(server)

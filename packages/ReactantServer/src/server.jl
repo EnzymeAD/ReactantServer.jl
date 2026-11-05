@@ -23,6 +23,7 @@ struct RunningServer
     watcher::Union{BundleWatcher, Nothing}
     metrics_server::Any        # HTTP metrics listener, or nothing when metrics_port == 0
     monitor::InteractiveMonitor
+    drain::ReactantServerCore.DrainGate   # in-flight ModelInfer count; refuses new ones once draining
 end
 
 # ── Heartbeat registration ──────────────────────────────────────────────────────────────────────
@@ -99,20 +100,55 @@ function _beat(event::Symbol, detail)
 end
 
 """
-    stop!(s::RunningServer)
+    stop!(s::RunningServer; drain_seconds=0)
 
-Shut down a server started with `serve(...; blocking=false)`. Stops the model-directory watcher
-(if running), closes the metrics endpoint (if running) and the gRPC server, halts the scheduler's
-dispatch loop, and tears down any registered shared-memory regions. Returns `nothing`.
+Shut down a server started with `serve(...; blocking=false)`. From the start new ModelInfer calls
+are refused with UNAVAILABLE, and ServerReady, ModelReady, RepositoryIndex and `/readyz` report the
+worker not ready; with `drain_seconds > 0` the calls already admitted (queued or running) first get
+up to `drain_seconds` to finish. Then it stops the model-directory watcher (if running), closes
+the gRPC server, halts the scheduler's dispatch loop, closes the metrics endpoint (if running),
+and tears down any registered shared-memory regions. Returns `nothing`.
 """
-function stop!(s::RunningServer)
+function stop!(s::RunningServer; drain_seconds::Real = 0)
+    # Refuse new inference (UNAVAILABLE) and report not ready from here on; with a drain budget, first
+    # let the admitted calls finish.
+    ReactantServerCore.drain_inflight!(s.drain, drain_seconds; what = "worker")
     s.watcher === nothing || stop_watching!(s.watcher)
     stop_interactive_monitor!(s.monitor)
-    s.metrics_server === nothing || close(s.metrics_server)
     close(s.server)
     shutdown!(s.scheduler)
+    # Join the dispatch loop and the watcher, bounded: a loop mid-execution finishes its batch, and a
+    # watcher mid-load finishes that load, neither of which must hold up the process exiting.
+    _join_bounded(s.scheduler.task, "dispatch loop")
+    s.watcher === nothing || _join_bounded(s.watcher.task, "model directory watcher")
+    s.metrics_server === nothing || _close_http_bounded(s.metrics_server)
     shm_teardown!(s.shm)
     _beat(:down, s.config)
+    return nothing
+end
+
+# Wait at most `seconds` for a background task to finish, warning when it does not.
+function _join_bounded(t::Union{Task, Nothing}, what::AbstractString; seconds::Real = 10.0)
+    t === nothing && return nothing
+    timedwait(() -> istaskdone(t), Float64(seconds); pollint = 0.05) === :ok ||
+        @warn "stop: the $what did not finish within $(seconds)s; continuing shutdown without it"
+    return nothing
+end
+
+# `close(::HTTP.Server)` waits until every connection is idle, without bound; a scrape in progress
+# (or a stalled client) would hold shutdown. Close gracefully for a bounded time, then force it.
+function _close_http_bounded(server; seconds::Real = 5.0)
+    closing = Threads.@spawn try
+        close(server)
+    catch
+    end
+    if timedwait(() -> istaskdone(closing), Float64(seconds); pollint = 0.05) !== :ok
+        @warn "stop: the metrics listener did not close within $(seconds)s; forcing it"
+        try
+            HTTP.forceclose(server)
+        catch
+        end
+    end
     return nothing
 end
 
@@ -330,7 +366,9 @@ Run one worker from the node file at `node_path`, in this process: load the file
 worker entry, bring up the runtime and its models, and start the gRPC server (the KServe V2
 inference API and the worker control service). `worker` selects which worker entry to serve; it
 may be omitted when the node file has exactly one worker. When `blocking` is false the server runs
-in the background and a `RunningServer` is returned (stop it with `stop!`).
+in the background and a `RunningServer` is returned (stop it with `stop!`). A blocking server serves
+until a drain is requested (`request_drain!`, or under the node supervisor end of file on stdin),
+then drains, shuts everything down and returns.
 
 To run every worker in a node file, one process per device, use `ReactantServerNode.supervise`.
 """
@@ -376,14 +414,18 @@ function _meta_concurrency()
 end
 
 # /readyz for the metrics listener: ready once every loaded model is compiled, the ServerReady rule,
-# and never once the dispatch loop has died. A named callable rather than a closure so the precompile
-# workload can start the listener with this exact type; HTTP.jl specializes the listener's code on
-# the handler, and through it on this.
+# never once the dispatch loop has died, and not while the server drains. A named callable rather
+# than a closure so the precompile workload can start the listener with this exact type; HTTP.jl
+# specializes the listener's code on the handler, and through it on this.
 struct _RegistryReady
     registry::ModelRegistry
     sched::Scheduler
+    draining::Threads.Atomic{Bool}
 end
+_RegistryReady(registry::ModelRegistry, sched::Scheduler) =
+    _RegistryReady(registry, sched, Threads.Atomic{Bool}(false))
 function (r::_RegistryReady)()
+    r.draining[] && return false
     es = values(r.registry.by_name)
     return (!isempty(es) || !isempty(r.registry.meta)) && all(e -> e.executable !== nothing, es) &&
         dispatch_alive(r.sched)
@@ -415,6 +457,9 @@ function serve(
         worker_name::AbstractString = ""
     )
     _check_serve_guards(cfg)
+    # Under the node supervisor, end of file on stdin is the request to drain (see
+    # ReactantServerCore's drain.jl). Watch from the start: a request during bring-up exits at once.
+    blocking && ReactantServerCore.watch_stdin_drain()
     # Count JIT time from here on (julia_compile_seconds_total), so model loading, the startup probe
     # and each model's first requests all show up.
     enable_compile_timing!()
@@ -455,28 +500,44 @@ function serve(
     # port) and tells the client as much as `grpc.error_detail` allows.
     name = _worker_name(worker_name; fallback = "port $(cfg.endpoints.port)")
     server.context = InferContext(sched, registry, shm, pool.platform, metrics, cfg.grpc.error_detail, name)   # swap before start!
+    # Refuses new inference with UNAVAILABLE and reports not ready once the server drains.
+    drain = ReactantServerCore.DrainGate()
+    gRPCServer.add_interceptor!(server, _DrainInterceptor(drain))
     # Optional Prometheus metrics endpoint (opt-in via endpoints.metrics_port > 0). Request counting
     # is always on (the InferContext carries `metrics`); only the HTTP listener is gated.
     metrics_server = nothing
     if cfg.endpoints.metrics_port > 0
         metrics_server = start_worker_metrics(
             metrics, cfg.endpoints.host, cfg.endpoints.metrics_port;
-            ready_fn = _RegistryReady(registry, sched), live_fn = _DispatchLive(sched),
+            ready_fn = _RegistryReady(registry, sched, drain.draining), live_fn = _DispatchLive(sched),
             worker_name = worker_name, gpu = _gpu_identity(cfg)
         )
     end
     @info "Starting gRPC server" host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests models = model_names(registry)
-    if blocking
-        _beat(:up, cfg)
+    blocking || return _start_server(cfg, registry, sched, pool, shm, server, watcher, metrics_server, monitor, drain)
+    # Blocking: serve until a drain is requested (the supervisor closing stdin, or `request_drain!`),
+    # then drain and tear everything down, so the process exits 0 with nothing left running.
+    # Interrupting the wait (Ctrl-C at a REPL) stops at once, without draining.
+    ReactantServerCore.begin_serving!()
+    try
+        s = _start_server(cfg, registry, sched, pool, shm, server, watcher, metrics_server, monitor, drain)
+        secs = 0.0
         try
-            run(server)
+            secs = ReactantServerCore.wait_for_drain_request()
+        catch err
+            err isa InterruptException || rethrow()
         finally
-            stop_interactive_monitor!(monitor)
-            _beat(:down, cfg)
+            stop!(s; drain_seconds = secs)
         end
-        return nothing
+    finally
+        ReactantServerCore.end_serving!()
     end
+    return nothing
+end
+
+# Bind the gRPC port, then announce the server: `:up` means it is accepting traffic.
+function _start_server(cfg, registry, sched, pool, shm, server, watcher, metrics_server, monitor, drain)
     gRPCServer.start!(server)
     _beat(:up, cfg)
-    return RunningServer(cfg, registry, sched, pool, shm, server, cfg.endpoints.port, watcher, metrics_server, monitor)
+    return RunningServer(cfg, registry, sched, pool, shm, server, cfg.endpoints.port, watcher, metrics_server, monitor, drain)
 end
