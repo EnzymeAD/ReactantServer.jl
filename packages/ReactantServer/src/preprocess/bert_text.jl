@@ -17,6 +17,21 @@
 
 module BertText
 
+# --- client input errors ---
+
+"""
+    TextInputError(msg)
+
+Raised by the wire helpers ([`wire_text`](@ref), [`wire_texts`](@ref) and the batch encoders) when
+the client's text tensors cannot be decoded: a length tensor that does not match its batch, a row
+length out of range, or bytes that are not valid UTF-8. The worker answers it with
+`INVALID_ARGUMENT`, as a mistake in the request rather than a server failure.
+"""
+struct TextInputError <: Exception
+    msg::String
+end
+Base.showerror(io::IO, e::TextInputError) = print(io, e.msg)
+
 # --- tokenizer ---
 
 struct BertTokenizer
@@ -253,27 +268,36 @@ end
     wire_text(bytes) -> String
 
 Decode one UTF-8 client tensor (any UInt8 array shape) to a String. Use for a scalar text input
-such as a cross-encoder's shared query; batched rows go through [`wire_texts`](@ref).
+such as a cross-encoder's shared query; batched rows go through [`wire_texts`](@ref). Bytes that are
+not valid UTF-8 raise [`TextInputError`](@ref).
 """
-wire_text(bytes::AbstractArray{UInt8}) = String(collect(UInt8, vec(bytes)))
+function wire_text(bytes::AbstractArray{UInt8})
+    s = String(collect(UInt8, vec(bytes)))
+    isvalid(s) || throw(TextInputError("text input is not valid UTF-8"))
+    return s
+end
 
 """
     wire_texts(texts, lens; lens_name="lens") -> Vector{String}
 
 Decode a `(max_bytes, batch)` UInt8 matrix of zero-padded UTF-8 rows into `batch` Strings, using
 `lens[b]` as row `b`'s byte length. `lens_name` only names the offending tensor in error messages.
+A `lens` that does not match the rows, a length out of range, or a row that is not valid UTF-8
+raises [`TextInputError`](@ref).
 """
 function wire_texts(
         texts::AbstractMatrix{UInt8}, lens::AbstractVector;
         lens_name::AbstractString = "lens"
     )
     B = size(texts, 2)
-    length(lens) == B || error("$lens_name has $(length(lens)) entries for $B text rows")
+    length(lens) == B || throw(TextInputError("$lens_name has $(length(lens)) entries for $B text rows"))
     out = Vector{String}(undef, B)
     for b in 1:B
-        n = Int(lens[b])
-        0 <= n <= size(texts, 1) || error("$lens_name[$b] = $n out of range")
-        out[b] = String(@view texts[1:n, b])
+        n = lens[b]
+        (isinteger(n) && 0 <= n <= size(texts, 1)) || throw(TextInputError("$lens_name[$b] = $n out of range"))
+        s = String(@view texts[1:Int(n), b])
+        isvalid(s) || throw(TextInputError("text row $b is not valid UTF-8"))
+        out[b] = s
     end
     return out
 end

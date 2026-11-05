@@ -869,15 +869,15 @@ function shutdown!(s::Scheduler)
 end
 
 # Reject everything still pending at shutdown so no caller stays blocked on its reply channel:
-# queued requests across all models and any pending control commands. Caller holds `s.cond`.
-function _reject_pending_locked!(s::Scheduler)
+# queued requests across all models and any pending control commands, with `err` (UNAVAILABLE at
+# the transport). Caller holds `s.cond`.
+function _reject_pending_locked!(s::Scheduler, err::Exception = _unavailable(s))
     for (name, pf) in s.prefetched
         entry = get(s.registry.by_name, name, nothing)
         (pf.staged === nothing || entry === nothing || s.weight_cache === nothing) ||
             release_staged!(s.weight_cache, entry, pf.staged; uploaded = false)
     end
     empty!(s.prefetched)
-    err = ErrorException("server is shutting down")
     for entry in values(s.registry.by_name)
         entry.sched === nothing && continue
         for qr in entry.sched.queue
@@ -905,6 +905,9 @@ function _reject_pending_locked!(s::Scheduler)
     empty!(s.control)
     return nothing
 end
+
+# The rejection a request or control command meets once the dispatch loop no longer runs.
+_unavailable(::Scheduler) = WorkerUnavailableError("server is shutting down")
 
 # Build zero-filled executable inputs at batch size `sz` (0 = unbatched) and input-shape `variant`
 # for warmup. The variant supplies the variable-axis sizes in the same (input, axis) order they were
@@ -1141,7 +1144,7 @@ function stage_weights!(s::Scheduler, names::Vector{String}; hold_seconds::Real 
                 push!(out, name => ModelEntry[s.registry.by_name[c] for c in meta.calls if haskey(s.registry.by_name, c)])
             else
                 e = get(s.registry.by_name, name, nothing)
-                e === nothing && throw(ErrorException("unknown model: $name"))
+                e === nothing && throw(ModelNotFoundError(name))
                 push!(out, name => ModelEntry[e])
             end
         end
@@ -1290,25 +1293,26 @@ end
 # Submission and the dispatch loop
 # ---------------------------------------------------------------------------------------------
 
-# Enqueue a request onto its model's queue and wake the dispatch loop. Unknown models, a
-# stopped scheduler, and a full queue are reported immediately through the reply channel
-# (the caller sees an exception). `max_queue_depth` caps each model's queue independently,
-# so one backlogged model cannot starve admission for the others.
+# Enqueue a request onto its model's queue and wake the dispatch loop. Unknown models
+# (`ModelNotFoundError`), a stopped scheduler (`WorkerUnavailableError`), and a full queue
+# (`QueueFullError`) are reported immediately through the reply channel (the caller sees the
+# exception). `max_queue_depth` caps each model's queue independently, so one backlogged model
+# cannot starve admission for the others.
 function submit!(s::Scheduler, qr::QueuedRequest)
     lock(s.cond) do
         if !s.running
-            put!(qr.reply, ErrorException("server is shutting down"))
+            put!(qr.reply, _unavailable(s))
             return
         end
         # Targets are regular models only: a meta runs on the request task (see `infer`), and its
         # GPU sub-calls arrive here as committed requests for the sub-models, which live in `by_name`.
         entry = get(s.registry.by_name, qr.req.model_name, nothing)
         if entry === nothing || entry.sched === nothing
-            put!(qr.reply, ErrorException("unknown model: $(qr.req.model_name)"))
+            put!(qr.reply, ModelNotFoundError(qr.req.model_name))
             return
         end
         if length(entry.sched.queue) >= s.cfg.max_queue_depth
-            put!(qr.reply, ErrorException("queue for model '$(qr.req.model_name)' is full ($(s.cfg.max_queue_depth)); request rejected"))
+            put!(qr.reply, QueueFullError(qr.req.model_name, s.cfg.max_queue_depth))
             return
         end
         if qr.committed
@@ -1377,7 +1381,7 @@ end
 function _run_control(s::Scheduler, op::Function)
     reply = Channel{Any}(1)
     lock(s.cond) do
-        s.running || throw(ErrorException("server is shutting down"))
+        s.running || throw(_unavailable(s))
         push!(s.control, ControlCommand(op, reply))
         notify(s.cond)
     end
@@ -1468,7 +1472,7 @@ function _set_residency_op!(s::Scheduler, name::AbstractString, target::Residenc
                 return last
             end
             entry = get(sch.registry.by_name, nm, nothing)
-            entry === nothing && throw(ErrorException("unknown model: $name"))
+            entry === nothing && throw(ModelNotFoundError(name))
             return set_residency_state!(sch.weight_cache, entry, target; floor = floor_of(entry), staged = staged_of(entry))
         end
     )
@@ -1483,7 +1487,7 @@ Available in both residency modes. Raises on an unknown model.
 function set_policy!(s::Scheduler, name::AbstractString; weight::Union{Real, Nothing} = nothing)
     lock(s.cond) do
         entry = get(s.registry.by_name, String(name), nothing)
-        (entry === nothing || entry.sched === nothing) && throw(ErrorException("unknown model: $name"))
+        (entry === nothing || entry.sched === nothing) && throw(ModelNotFoundError(name))
         weight === nothing || (entry.sched.weight = Float64(weight))
     end
     return nothing
@@ -1596,7 +1600,7 @@ function _evict_entry!(sch::Scheduler, name::AbstractString)
         p = e === nothing ? nothing : pop!(sch.prefetched, e.name, nothing)
         if e !== nothing && e.sched !== nothing
             for qr in e.sched.queue
-                put!(qr.reply, ErrorException("model '$name' was unloaded"))
+                put!(qr.reply, ModelNotFoundError(name, "model '$name' was unloaded"))
             end
             empty!(e.sched.queue)
             t = e.sched.stage_task
@@ -1798,7 +1802,7 @@ function _rename_entry!(
             throw(ErrorException("cannot rename '$old' to '$new': that name is already registered"))
         e = pop!(sch.registry.meta, old, nothing)
         e === nothing && (e = pop!(sch.registry.by_name, old, nothing))
-        e === nothing && throw(ErrorException("unknown model: $old"))
+        e === nothing && throw(ModelNotFoundError(old))
         e.name = new
         e.sched === nothing || (e.sched.name = new)
         (e isa MetaEntry ? sch.registry.meta : sch.registry.by_name)[new] = e
@@ -1868,7 +1872,7 @@ function remove_meta!(s::Scheduler, name::AbstractString)
         e = pop!(s.registry.meta, String(name), nothing)
         if e !== nothing && e.sched !== nothing
             for qr in e.sched.queue       # unblock any callers waiting on an in-flight meta request
-                put!(qr.reply, ErrorException("model '$name' was unloaded"))
+                put!(qr.reply, ModelNotFoundError(name, "model '$name' was unloaded"))
             end
             empty!(e.sched.queue)
         end
@@ -1896,11 +1900,10 @@ function infer(s::Scheduler, req::InferRequest; committed::Bool = false)
         # sub-calls re-enter `infer` (committed) for the sub-models. A meta is never itself a committed
         # sub-call (metas cannot call metas), so `committed` is irrelevant on this branch.
         meta = get(s.registry.meta, req.model_name, nothing)
-        (meta === nothing || meta.sched === nothing) &&
-            throw(ErrorException("unknown model: $(req.model_name)"))
+        (meta === nothing || meta.sched === nothing) && throw(ModelNotFoundError(req.model_name))
         return _run_meta_request(s, meta, req)
     end
-    entry.sched === nothing && throw(ErrorException("unknown model: $(req.model_name)"))
+    entry.sched === nothing && throw(ModelNotFoundError(req.model_name))
     # preprocess/postprocess come from a bundle's model.jl, defined in a newer world age;
     # invokelatest crosses that boundary (harmless for identity).
     prepared = Base.invokelatest(entry.preprocess, req.inputs)
@@ -2107,7 +2110,7 @@ function describe_models(s::Scheduler, names::AbstractVector{<:AbstractString})
         reg = s.registry
         wanted = isempty(names) ? routable_model_names(reg) : sort!(unique(String.(names)))
         unknown = [n for n in wanted if get_model(reg, n) === nothing && get_meta(reg, n) === nothing]
-        isempty(unknown) || throw(ArgumentError("unknown model: $(join(unknown, ", "))"))
+        isempty(unknown) || throw(ModelNotFoundError(join(unknown, ", "), "unknown model: $(join(unknown, ", "))"))
         return map(wanted) do n
             e = get_model(reg, n)
             e === nothing && return (name = n, manifest = get_meta(reg, n).manifest, max_batch_size = 0)

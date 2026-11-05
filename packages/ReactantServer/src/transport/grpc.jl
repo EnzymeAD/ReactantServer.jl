@@ -56,8 +56,75 @@ const _GRPC_STATUS_NAME = Dict{Int, String}(
     Int(gRPCServer.StatusCode.UNIMPLEMENTED) => "UNIMPLEMENTED", Int(gRPCServer.StatusCode.INTERNAL) => "INTERNAL",
     Int(gRPCServer.StatusCode.UNAVAILABLE) => "UNAVAILABLE", Int(gRPCServer.StatusCode.DATA_LOSS) => "DATA_LOSS",
 )
-_status_label(e) = e isa gRPCServer.GRPCError ? get(_GRPC_STATUS_NAME, Int(e.code), "UNKNOWN") :
-    e isa DeadlineExceeded ? "DEADLINE_EXCEEDED" : "INTERNAL"
+_status_label(e) = get(_GRPC_STATUS_NAME, Int(_grpc_status(e)), "UNKNOWN")
+
+# The worker's status contract, the one place a failure gets its gRPC code. Clients and the gateway
+# act on the code (back off, fail over to another replica, give up, re-register shared memory), so
+# each kind of failure has exactly one, chosen by its type:
+#
+# - RESOURCE_EXHAUSTED: the model's queue is full (backpressure; retry after a backoff)
+# - UNAVAILABLE: the worker is shutting down or draining, its dispatch loop died, or the model is
+#   not resident under externally-managed residency (another replica may serve it; never
+#   FAILED_PRECONDITION, which a client reads as a stale shared-memory registration)
+# - NOT_FOUND: the model is unknown here, or was unloaded or replaced while the request waited
+# - DEADLINE_EXCEEDED: the deadline passed before dispatch (EDF laxity drops included), or the
+#   dispatch timeout did
+# - CANCELLED: the client cancelled the call
+# - INVALID_ARGUMENT: the request's own data is wrong (a hook's `InvalidInputError`, bad text)
+# - FAILED_PRECONDITION: a shared-memory region the registry does not know (re-register and retry)
+# - INTERNAL: anything else, a failure on the server's side
+#
+# Decode, input validation and encode classify the codec's client errors themselves (see
+# `_as_invalid`, `_validate_inputs`, `_as_encode_error`) and arrive here as GRPCErrors.
+function _grpc_status(e)
+    S = gRPCServer.StatusCode
+    e isa gRPCServer.GRPCError && return e.code
+    e isa QueueFullError && return S.RESOURCE_EXHAUSTED
+    (e isa WorkerUnavailableError || e isa NotResidentError) && return S.UNAVAILABLE
+    (e isa ModelNotFoundError || _replaced_during_request(e)) && return S.NOT_FOUND
+    (e isa DeadlineExceeded || e isa DispatchTimeoutError) && return S.DEADLINE_EXCEEDED
+    e isa RequestCancelledError && return S.CANCELLED
+    _client_data_error(e) && return S.INVALID_ARGUMENT
+    e isa UnregisteredRegionError && return S.FAILED_PRECONDITION
+    return S.INTERNAL
+end
+
+# Errors a bundle hook raises for client data it cannot accept.
+_client_data_error(e) = e isa InvalidInputError || e isa BertText.TextInputError
+
+# A request whose model was replaced while it was in preprocess, which the reload path rejects with
+# a plain ErrorException ("model 'X' was replaced during the request ..."). It is retryable like any
+# model unloaded under a request, so NOT_FOUND. Raised as a `ModelNotFoundError` instead, it needs
+# no match here.
+_replaced_during_request(e) = e isa ErrorException && occursin("was replaced during the request", e.msg)
+
+# gRPC carries the message in a header, so keep it to a line's worth.
+const _STATUS_MESSAGE_MAX = 1024
+function _status_message(e)
+    msg = sprint(showerror, e)
+    return ncodeunits(msg) <= _STATUS_MESSAGE_MAX ? msg :
+        msg[1:prevind(msg, _STATUS_MESSAGE_MAX + 1)] * " ..."
+end
+
+# `e` as the GRPCError the client receives, with the contract's code. A server-side failure
+# (INTERNAL) is logged here with its backtrace `bt`, since the client sees only its message.
+function _as_grpc_error(e, bt, what::AbstractString)
+    e isa gRPCServer.GRPCError && return e
+    code = _grpc_status(e)
+    code == gRPCServer.StatusCode.INTERNAL && @error "$what failed" exception = (e, bt)
+    return gRPCServer.GRPCError(code, _status_message(e))
+end
+
+# Run a handler body with every exception it throws mapped through the status contract, rather than
+# left to gRPCServer, which reads a server-side KeyError as NOT_FOUND, an ArgumentError as
+# INVALID_ARGUMENT and a BoundsError as OUT_OF_RANGE.
+function _with_status(f, what::AbstractString)
+    try
+        return f()
+    catch e
+        throw(_as_grpc_error(e, catch_backtrace(), what))
+    end
+end
 
 # A request's effective absolute deadline (local time_ns()): the TIGHTEST of the in-body KV timeout
 # (carried through the gateway's raw-byte forwarding) and the grpc-timeout (which the gateway
@@ -79,15 +146,36 @@ _invalid(msg) = throw(gRPCServer.GRPCError(gRPCServer.StatusCode.INVALID_ARGUMEN
 # shared-memory region the registry does not know (e.g. the client registered with a previous
 # incarnation of this process, before a restart wiped the in-memory registry) is mapped to
 # FAILED_PRECONDITION instead: it is recoverable by re-registering, so it is a distinct signal
-# from a genuinely malformed request. The client re-registers and retries on this status.
+# from a genuinely malformed request. The client re-registers and retries on this status. Running
+# out of memory is the server's failure, not the request's, and is rethrown (INTERNAL). For a
+# request decode and the shared-memory RPCs, whose every other failure comes from client data.
 function _as_invalid(f)
+    try
+        return f()
+    catch e
+        e isa gRPCServer.GRPCError && rethrow()
+        e isa OutOfMemoryError && rethrow()
+        e isa UnregisteredRegionError &&
+            throw(gRPCServer.GRPCError(gRPCServer.StatusCode.FAILED_PRECONDITION, sprint(showerror, e)))
+        _invalid(sprint(showerror, e))
+    end
+end
+
+# Run the response encode. The codec rejects outputs that cannot be returned as the client asked
+# (a requested output the model does not produce, an output larger than its shared-memory slot, an
+# access outside the client's region) with an ErrorException or ArgumentError: INVALID_ARGUMENT. A
+# region the registry no longer knows is a stale registration: FAILED_PRECONDITION. Anything else
+# (out of memory copying an output, a bug) is the server's own failure and is rethrown, to become
+# INTERNAL.
+function _as_encode_error(f)
     try
         return f()
     catch e
         e isa gRPCServer.GRPCError && rethrow()
         e isa UnregisteredRegionError &&
             throw(gRPCServer.GRPCError(gRPCServer.StatusCode.FAILED_PRECONDITION, sprint(showerror, e)))
-        _invalid(sprint(showerror, e))
+        (e isa ErrorException || e isa ArgumentError) && _invalid(sprint(showerror, e))
+        rethrow()
     end
 end
 
@@ -173,50 +261,36 @@ function _validate_inputs(entry, request::InferRequest)
     return nothing
 end
 
-# Map the scheduler's model-availability rejections to NOT_FOUND. The dynamic watcher can unload or
-# reload a model in the narrow window between the readiness lookup above and dispatch, in which case
-# `submit!` reports "unknown model" or a queued request is rejected with "was unloaded". Surfacing
-# those as NOT_FOUND (rather than the default INTERNAL) keeps them consistent with the pre-dispatch
-# lookup, so the gateway treats them as retryable and refreshes its routes. Other runtime errors
-# keep their default mapping. Mirrors the message match in control_grpc.jl's `_as_control`.
-function _infer_or_not_found(ctx::InferContext, request)
-    try
-        return infer(ctx.sched, request)
-    catch e
-        e isa gRPCServer.GRPCError && rethrow()
-        # A request the scheduler dropped at admission for an expired deadline -> DEADLINE_EXCEEDED.
-        e isa DeadlineExceeded && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.DEADLINE_EXCEEDED, sprint(showerror, e)))
-        msg = sprint(showerror, e)
-        (occursin("unknown model", msg) || occursin("was unloaded", msg)) && _not_found(msg)
-        rethrow()
-    end
-end
+# Run a request through the scheduler: the handlers' one way into `infer`, with its keywords passed
+# through. A failure keeps its type; `_handle_infer` maps it to the contract's code (`_grpc_status`),
+# which replaced the message matching this helper once did.
+_infer_or_not_found(ctx::InferContext, request; kw...) = infer(ctx.sched, request; kw...)
 
 # Time and count every ModelInfer for the worker's Prometheus export (worker_requests_total by
 # model+status, worker_request_latency_seconds), then delegate to the handler body. `finish` is
 # applied to the response inside the timed region (the raw path encodes there), and `t0` lets a
-# caller start the clock before its own work (the raw path starts it before decoding).
+# caller start the clock before its own work (the raw path starts it before decoding). Every
+# failure leaves as a GRPCError carrying the status contract's code (`_grpc_status`), and the
+# status label counted is that same code.
 function _handle_infer(
         ctx::InferContext, req, grpc_deadline_ns::Integer = 0;
         finish = identity, t0::Float64 = time()
     )
     name = req.model_name
-    if ctx.metrics === nothing
-        try
-            return finish(_handle_infer_impl(ctx, req, grpc_deadline_ns))
-        finally
-            _beat(:request, String(name))
-        end
-    end
     try
         resp = finish(_handle_infer_impl(ctx, req, grpc_deadline_ns))
-        observe_request!(ctx.metrics, name, time() - t0)
-        inc_request!(ctx.metrics, name, "OK")
+        if ctx.metrics !== nothing
+            observe_request!(ctx.metrics, name, time() - t0)
+            inc_request!(ctx.metrics, name, "OK")
+        end
         return resp
     catch e
-        observe_request!(ctx.metrics, name, time() - t0)
-        inc_request!(ctx.metrics, name, _status_label(e))
-        rethrow()
+        err = _as_grpc_error(e, catch_backtrace(), "ModelInfer for model '$name'")
+        if ctx.metrics !== nothing
+            observe_request!(ctx.metrics, name, time() - t0)
+            inc_request!(ctx.metrics, name, _status_label(err))
+        end
+        throw(err)
     finally
         # Fired on success and failure alike: a failing request is still a client using this server.
         _beat(:request, String(name))
@@ -232,6 +306,7 @@ function _handle_infer_raw(ctx::InferContext, body::Vector{UInt8}, grpc_deadline
     req = try
         ProtoBuf.decode(ProtoBuf.ProtoDecoder(IOBuffer(body)), inference.ModelInferRequest)
     catch err
+        err isa OutOfMemoryError && rethrow()
         _invalid("malformed ModelInferRequest: " * sprint(showerror, err))
     end
     return _handle_infer(ctx, req, grpc_deadline_ns; finish = _encode_message, t0 = t0)
@@ -254,23 +329,23 @@ function _handle_infer_impl(ctx::InferContext, req, grpc_deadline_ns::Integer = 
     deadline_ns = _effective_deadline(decoded.request.deadline_ns, grpc_deadline_ns)
     request = InferRequest(name, decoded.request.requested_outputs, decoded.request.inputs, deadline_ns)
     _validate_inputs(entry, request)
-    outputs = _infer_or_not_found(ctx, request)   # availability rejections -> NOT_FOUND; else INTERNAL
+    outputs = _infer_or_not_found(ctx, request)
     # Encoding rejects a requested output the model does not produce: a client mistake, so
     # surface it as INVALID_ARGUMENT (matching the codec's documented contract).
-    return _as_invalid(() -> encode_infer_response(inference, name, decoded, outputs, ctx.shm))
+    return _as_encode_error(() -> encode_infer_response(inference, name, decoded, outputs, ctx.shm))
 end
 
 # A meta's orchestration runs on this request task (`infer` -> `_run_meta_request`), under the worker's
 # one-meta-at-a-time gate; its in-process sub-calls dispatch on the loop. Input validation reuses the
-# regular path (it reads only `manifest`, which MetaEntry also carries). `_infer_or_not_found` maps a
-# deadline bail to DEADLINE_EXCEEDED and an unknown/unloaded sub-model to NOT_FOUND, as the regular path.
+# regular path (it reads only `manifest`, which MetaEntry also carries). A deadline bail and an
+# unknown or unloaded sub-model keep their types, and `_handle_infer` maps them as on the regular path.
 function _handle_meta_infer(ctx::InferContext, meta, req, grpc_deadline_ns::Integer = 0)
     decoded = _as_invalid(() -> decode_infer_request(inference, req, ctx.shm))
     deadline_ns = _effective_deadline(decoded.request.deadline_ns, grpc_deadline_ns)
     request = InferRequest(meta.name, decoded.request.requested_outputs, decoded.request.inputs, deadline_ns)
     _validate_inputs(meta, request)
     outputs = _infer_or_not_found(ctx, request)
-    return _as_invalid(() -> encode_infer_response(inference, meta.name, decoded, outputs, ctx.shm))
+    return _as_encode_error(() -> encode_infer_response(inference, meta.name, decoded, outputs, ctx.shm))
 end
 
 # List models with per-model readiness reflecting residency. `req.ready` filters to ready models
@@ -328,8 +403,9 @@ package's per-direction caps).
 # shared with the scheduler's dispatch loop. A handler that does real work there (decoding, a lock
 # wait, file or shared-memory I/O, or code compiling on first use) stalls every other request and the
 # dispatch loop until it finishes. `_offloaded` wraps a handler so its body runs on a default-pool task
-# while the interactive task only waits; errors, gRPC status included, propagate unchanged.
-_offloaded(handler) = (ctx, req) -> off_interactive(() -> handler(ctx, req))
+# while the interactive task only waits; a GRPCError propagates unchanged, and any other error leaves
+# with the status contract's code (`_with_status`).
+_offloaded(handler) = (ctx, req) -> off_interactive(() -> _with_status(() -> handler(ctx, req), ctx.method))
 
 function build_grpc_server(
         sched::Scheduler, registry::ModelRegistry, platform::AbstractString,

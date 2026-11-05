@@ -77,6 +77,9 @@ include("runtime/tf32.jl")
 # backend (for device_memory_stats) and weight_cache (for weight_cache_stats); before scheduler.
 include("runtime/observe.jl")
 
+# The typed request failures the scheduler raises; the transport maps each to its gRPC status.
+include("errors.jl")
+
 include("scheduler.jl")
 
 # Dynamic model-directory watching (opt-in via model_poll_seconds). Defined after the scheduler
@@ -106,5 +109,6 @@ include("precompile.jl")
 
 export serve, serve_worker, stop!, register_model, register_meta_model
 export register_heartbeat!, register_serve_guard!
+export InvalidInputError
 
 end # module ReactantServer

@@ -18,15 +18,18 @@ _from_core_residency(s::ResidencyState) =
     s == UNPINNED ? _CTRL.Residency.UNPINNED :
     s == PINNED_SYSTEM ? _CTRL.Residency.PINNED_SYSTEM : _CTRL.Residency.PINNED_DEVICE
 
-# Run a control action, mapping a thrown error to NOT_FOUND for an unknown model and to
-# FAILED_PRECONDITION otherwise (e.g. residency control on a self-managed worker).
+# Run a control action, mapping a thrown error to NOT_FOUND for an unknown model
+# (`ModelNotFoundError`), to UNAVAILABLE when the worker is shutting down or its dispatch loop died
+# (`WorkerUnavailableError`), and to FAILED_PRECONDITION otherwise (e.g. residency control on a
+# self-managed worker).
 function _as_control(f)
     try
         return f()
     catch e
         e isa gRPCServer.GRPCError && rethrow()
         msg = sprint(showerror, e)
-        occursin("unknown model", msg) && _not_found(msg)
+        e isa ModelNotFoundError && _not_found(msg)
+        e isa WorkerUnavailableError && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, msg))
         throw(gRPCServer.GRPCError(gRPCServer.StatusCode.FAILED_PRECONDITION, msg))
     end
 end

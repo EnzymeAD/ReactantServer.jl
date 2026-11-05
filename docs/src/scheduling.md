@@ -66,6 +66,25 @@ dispatch is scheduled promptly and is never starved by the hook tasks that satur
 pool. With no interactive thread the default pool is used; correctness is unaffected, only the
 overlap.
 
+### Status codes
+
+Every way a request can fail has one gRPC status, chosen by the kind of failure, so a client and
+the gateway can act on it (back off, try another replica, give up, re-register shared memory):
+
+| Status | When |
+| --- | --- |
+| `RESOURCE_EXHAUSTED` | the model's queue holds `max_queue_depth` requests, or the worker is at its `max_concurrent_requests` cap |
+| `UNAVAILABLE` | the worker is shutting down, its dispatch loop has died, or (externally managed residency) the model is not resident on this worker |
+| `NOT_FOUND` | the model is not served here: never loaded, or unloaded or replaced while the request waited |
+| `DEADLINE_EXCEEDED` | the deadline passed before dispatch (the `edf` laxity drop included), or the dispatch timeout did |
+| `CANCELLED` | the client cancelled the call |
+| `INVALID_ARGUMENT` | the request itself is wrong: malformed, an input that does not match the model, a requested output the model does not produce, an output larger than its shared-memory slot, or data a `preprocess` hook rejects with [`InvalidInputError`](@ref) |
+| `FAILED_PRECONDITION` | a shared-memory region this worker does not know (it restarted since the client registered): re-register and retry |
+| `INTERNAL` | anything else: a failure on the server's side, logged on the worker with its backtrace |
+
+The worker's `worker_requests_total{status}` counts each request under the same status the
+client receives.
+
 ## Decision order
 
 Each time the GPU frees up, the scheduler decides in this order:

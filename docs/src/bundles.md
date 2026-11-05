@@ -151,6 +151,11 @@ declare the client-facing tensors via `client_inputs` / `client_outputs` in the 
 `model.jl` those keys are not permitted and the executable specs are the client-facing specs. See
 [`register_model`](@ref) in the API reference for the exact hook signatures.
 
+A `preprocess` hook that receives data it cannot accept (text that is not valid UTF-8, a length
+tensor that does not match its batch) should throw [`InvalidInputError`](@ref): the client then
+gets `INVALID_ARGUMENT`, and the gateway does not retry the request elsewhere. Any other exception
+a hook throws is treated as a failure on the server's side and answered `INTERNAL`.
+
 For a bundle whose `model.jl` chains several models with data-dependent logic rather than wrapping
 one executable, see [Meta Models](meta_models.md). That feature is experimental and its design is
 subject to change; prefer a single program with the fixed-size result pattern below where possible.

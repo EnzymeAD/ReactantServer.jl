@@ -40,6 +40,11 @@ ReactantServer.migrate_bundle_weights!
 ReactantServer.verify_transposed
 ReactantServer.resolve_weights_path
 ReactantServer.NotResidentError
+ReactantServer.QueueFullError
+ReactantServer.WorkerUnavailableError
+ReactantServer.ModelNotFoundError
+ReactantServer.DispatchTimeoutError
+ReactantServer.RequestCancelledError
 ReactantServer.RunningServer
 ReactantServer.weight_budget
 ReactantServer.weight_cache_stats
