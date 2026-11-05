@@ -43,16 +43,21 @@ end
 
 _mig_bytes(a) = reinterpret(UInt8, vec(collect(a)))
 
-# Every tensor of the bundle's chosen weights file reads back as the expected Julia array.
-function _mig_reads(dir, expected = _MIG_WEIGHTS)
+# The name of the file a bundle loads its weights from, and whether every tensor of it reads back
+# as the expected Julia array.
+function _mig_loaded(dir, expected = _MIG_WEIGHTS)
     entry = _RSM.load_bundle_entry(dir)
     try
-        keys(entry.weights) == keys(expected) || return false
-        return all(_mig_bytes(_RSM.read_weight(entry.weights, k)) == _mig_bytes(v) for (k, v) in expected)
+        same = keys(entry.weights) == keys(expected) &&
+            all(_mig_bytes(_RSM.read_weight(entry.weights, k)) == _mig_bytes(v) for (k, v) in expected)
+        return basename(entry.weights_path), same
     finally
         _RSM.close_weights!(entry.weights)
     end
 end
+
+# Every tensor of the bundle's chosen weights file reads back as the expected Julia array.
+_mig_reads(dir, expected = _MIG_WEIGHTS) = _mig_loaded(dir, expected)[2]
 
 _xla(path) = _RSM._with_weights(w -> w.xla_order, path)
 _mfst(dir) = _RSM.YAML.load_file(joinpath(dir, "manifest.yaml"))
@@ -75,6 +80,16 @@ function _raw_safetensors(path, entries, metadata)
         end
     end
     return path
+end
+
+# `weights` in the program's axis order, as ReactantServerExport 2.0 writes them.
+function _mig_xla(path, weights = _MIG_WEIGHTS)
+    md = Dict("argument_order" => JSON3.write(sort!(collect(keys(weights)))), "axis_order" => "xla")
+    entries = [
+        k => (eltype(v) == Float16 ? "F16" : "F32", reverse(collect(size(v))), Vector{UInt8}(_mig_bytes(v)))
+            for (k, v) in weights
+    ]
+    return _raw_safetensors(path, entries, md)
 end
 
 @testset "weights in the program's axis order" begin
@@ -263,6 +278,154 @@ end
     end
 end
 
+const _MIG_NEWER = Dict{String, Array}(k => v .* 2 for (k, v) in _MIG_WEIGHTS)
+
+@testset "an export deployed over a copy-migrated bundle is loaded in every mode" begin
+    for mode in (_RSM.MIGRATE_OFF, _RSM.MIGRATE_COPY, _RSM.MIGRATE_REPLACE)
+        mktempdir() do root
+            dir = _mig_bundle(root, "xlaredeploy")
+            lpath, tpath = joinpath(dir, "weights.safetensors"), joinpath(dir, "weights.T.safetensors")
+            @test _RSM.migrate_bundle_weights!(dir, _RSM.MIGRATE_COPY) == :copied
+            # re-exported with ReactantServerExport 2.0, deployed by an atomic rename, manifest kept
+            Base.Filesystem.rename(_mig_xla(joinpath(root, "incoming.safetensors"), _MIG_NEWER), lpath)
+            if mode == _RSM.MIGRATE_OFF
+                @test _RSM.migrate_bundle_weights!(dir, mode) == :off
+                @test _mfst(dir)["weights_file"] == "weights.T.safetensors" && isfile(tpath)     # untouched
+                @test (@test_logs (:warn, r"axis order; loading it rather than") match_mode = :any _mig_loaded(dir, _MIG_NEWER)) ==
+                    ("weights.safetensors", true)
+            else
+                @test (@test_logs (:info, r"dropping weights.T.safetensors") match_mode = :any _RSM.migrate_bundle_weights!(dir, mode)) == :current
+                @test !haskey(_mfst(dir), "weights_file") && _mfst(dir)["format_version"] == "2.0"
+                @test !isfile(tpath) && _no_tmp(dir)
+                @test (@test_logs min_level = Base.CoreLogging.Warn _mig_loaded(dir, _MIG_NEWER)) == ("weights.safetensors", true)
+                @test _RSM.migrate_bundle_weights!(dir, mode) == :current
+            end
+        end
+    end
+end
+
+@testset "a crash while dropping a stale copy leaves the export loaded and resumes" begin
+    mktempdir() do root
+        dir = _mig_bundle(root, "dropcrash")
+        lpath, tpath = joinpath(dir, "weights.safetensors"), joinpath(dir, "weights.T.safetensors")
+        @test _RSM.migrate_bundle_weights!(dir, _RSM.MIGRATE_COPY) == :copied
+        Base.Filesystem.rename(_mig_xla(joinpath(root, "incoming.safetensors"), _MIG_NEWER), lpath)
+        _RSM._MIGRATION_STEP_HOOK[] = s -> s === :unlink_copy && error("simulated crash at $s")
+        try
+            @test (@test_logs (:error, r"weights migration failed") match_mode = :any _RSM.migrate_bundle_weights!(dir, _RSM.MIGRATE_COPY)) == :failed
+        finally
+            _RSM._MIGRATION_STEP_HOOK[] = nothing
+        end
+        @test !haskey(_mfst(dir), "weights_file") && isfile(tpath)
+        @test _mig_loaded(dir, _MIG_NEWER) == ("weights.safetensors", true)
+        @test _RSM.migrate_bundle_weights!(dir, _RSM.MIGRATE_COPY) == :current
+        @test !isfile(tpath)
+    end
+end
+
+@testset "a weights.T.safetensors the migration did not write is the manifest's choice" begin
+    mktempdir() do root
+        dir = _mig_bundle(root, "ownT")
+        tpath = joinpath(dir, "weights.T.safetensors")
+        _mig_xla(tpath)
+        _mig_xla(joinpath(dir, "weights.safetensors"), _MIG_NEWER)
+        open(io -> write(io, "weights_file: weights.T.safetensors\n"), joinpath(dir, "manifest.yaml"), "a")
+        for mode in (_RSM.MIGRATE_COPY, _RSM.MIGRATE_REPLACE)
+            @test _RSM.migrate_bundle_weights!(dir, mode) == :skipped
+        end
+        @test isfile(tpath) && _mfst(dir)["weights_file"] == "weights.T.safetensors"
+        @test _mig_loaded(dir) == ("weights.T.safetensors", true)
+    end
+end
+
+# Record the hash of a weights file once it is `age` seconds old (two by default; Linux file
+# timestamps move in ticks of a few milliseconds), so files a test wrote a moment ago are recorded.
+function _with_record_age(f, age)
+    saved = _RSM._SHA_RECORD_MIN_AGE[]
+    _RSM._SHA_RECORD_MIN_AGE[] = age
+    try
+        return f()
+    finally
+        _RSM._SHA_RECORD_MIN_AGE[] = saved
+    end
+end
+
+@testset "a legacy redeploy that keeps size and mtime is never ignored" begin
+    # `rsync -t` renames a new file into place; `cp -p` rewrites the old one. Either way the
+    # copy's recorded size:mtime still matches, so only the content tells the versions apart.
+    for how in (:rsync_t, :cp_p), mode in (_RSM.MIGRATE_OFF, _RSM.MIGRATE_COPY, _RSM.MIGRATE_REPLACE)
+        mktempdir() do root
+            dir = _mig_bundle(root, "sametoken")
+            lpath, tpath = joinpath(dir, "weights.safetensors"), joinpath(dir, "weights.T.safetensors")
+            sleep(0.1)
+            # the original's hash is recorded with the copy, as for a bundle migrated long ago
+            @test _with_record_age(() -> _RSM.migrate_bundle_weights!(dir, _RSM.MIGRATE_COPY), 0.05) == :copied
+            @test isfile(joinpath(dir, ".cache", "weights_sha256.json"))
+            recorded = _RSM._with_weights(t -> t.metadata["migrated_from"], tpath)
+            src = joinpath(_mig_bundle(joinpath(root, "build"), "sametoken"; weights = _MIG_NEWER), "weights.safetensors")
+            run(`touch -r $lpath $src`)
+            how === :rsync_t ? Base.Filesystem.rename(src, lpath) : run(`cp -p $src $lpath`)
+            @test _RSM._source_token(stat(lpath)) == recorded
+            if mode == _RSM.MIGRATE_OFF
+                @test _RSM.migrate_bundle_weights!(dir, mode) == :off
+                @test (@test_logs (:warn, r"predates") match_mode = :any _mig_loaded(dir, _MIG_NEWER)) == ("weights.safetensors", true)
+            elseif mode == _RSM.MIGRATE_COPY
+                @test _RSM.migrate_bundle_weights!(dir, mode) == :copied
+                @test _mig_loaded(dir, _MIG_NEWER) == ("weights.T.safetensors", true)
+            else
+                @test _RSM.migrate_bundle_weights!(dir, mode) == :replaced
+                @test _mig_loaded(dir, _MIG_NEWER) == ("weights.safetensors", true)
+            end
+        end
+    end
+end
+
+@testset "the original's hash is kept in .cache/ and recomputed only when the file changes" begin
+    mktempdir() do root
+        dir = _mig_bundle(root, "shamemo")
+        lpath, tpath = joinpath(dir, "weights.safetensors"), joinpath(dir, "weights.T.safetensors")
+        record = joinpath(dir, ".cache", "weights_sha256.json")
+        sleep(0.1)
+        _with_record_age(0.05) do
+            @test _RSM.migrate_bundle_weights!(dir, _RSM.MIGRATE_COPY) == :copied
+            rec = JSON3.read(read(record, String), Dict{String, Any})
+            @test rec["sha256"] == bytes2hex(_RSM.SHA.sha256(read(lpath))) ==
+                _RSM._with_weights(t -> t.metadata["migrated_from_sha256"], tpath)
+            @test rec["identity"] == _RSM._stat_identity(stat(lpath))
+            # A record whose key matches is used without reading the file: one naming another hash
+            # makes the copy look stale.
+            write(record, JSON3.write(Dict("identity" => rec["identity"], "sha256" => "0"^64)))
+            @test (@test_logs (:warn, r"predates") match_mode = :any _mig_loaded(dir)) == ("weights.safetensors", true)
+            # The same content under a new key (chmod moves the ctime) is hashed again; the copy is kept.
+            tino = stat(tpath).inode
+            chmod(lpath, 0o600)
+            sleep(0.1)
+            @test _RSM.migrate_bundle_weights!(dir, _RSM.MIGRATE_COPY) == :current
+            @test stat(tpath).inode == tino
+            @test JSON3.read(read(record, String), Dict{String, Any}) ==
+                Dict("identity" => _RSM._stat_identity(stat(lpath)), "sha256" => rec["sha256"])
+            rm(record)
+            @test _mig_loaded(dir) == ("weights.T.safetensors", true) && isfile(record)
+            if ccall(:geteuid, Cuint, ()) == 0
+                @test_skip "root ignores directory permissions"
+            else
+                rm(record)
+                chmod(dirname(record), 0o555)
+                try
+                    @test (@test_logs (:warn, r"could not record the SHA-256") match_mode = :any _mig_loaded(dir)) ==
+                        ("weights.T.safetensors", true)
+                finally
+                    chmod(dirname(record), 0o755)
+                end
+            end
+        end
+        # A file changed more recently than the record age is hashed but not recorded.
+        rm(record; force = true)
+        @test _with_record_age(() -> _mig_loaded(dir), 1.0e9) == ("weights.T.safetensors", true)
+        @test !isfile(record)
+    end
+end
+
 @testset "a corrupted copy is caught before anything is replaced" begin
     mktempdir() do root
         dir = _mig_bundle(root, "corrupt")
@@ -355,5 +518,42 @@ end
         @test run(dir) == y_legacy
         @test _RSM.migrate_bundle_weights!(dir, _RSM.MIGRATE_REPLACE) == :replaced
         @test run(dir) == y_legacy
+    end
+end
+
+@testset "a redeploy over a copy-migrated bundle computes with the deployed weights (CPU)" begin
+    backend = _RSM.ReactantBackend()
+    cfg = _RSM.RuntimeConfig(_RSM.CPU_BACKEND, 0, 0.9, true, true)
+    pool = _RSM.resolve_client(backend, cfg)
+    x = Float32[1, -2, 3]
+    compute(dir) = begin
+        entry = _RSM.load_bundle_entry(dir)
+        entry.executable = _RSM.build_loaded_model(backend, pool, entry)
+        _RSM.run_model(backend, pool, entry.executable, [_RSM.NamedTensor("x", x)])[1].data
+    end
+    W1 = Float32[1 2 3; 4 5 6; 7 8 10]
+    W2 = W1 .* 2
+    W3 = W1 .+ 1
+    mktempdir() do root
+        dir = _mig_bundle(root, "matvec2"; weights = Dict{String, Array}("w" => W1))
+        lpath = joinpath(dir, "weights.safetensors")
+        legacy(w, build) = joinpath(_mig_bundle(joinpath(root, build), "matvec2"; weights = Dict{String, Array}("w" => w)), "weights.safetensors")
+        @test _RSM.migrate_bundle_weights!(dir, _RSM.MIGRATE_COPY) == :copied
+        @test compute(dir) == permutedims(W1) * x
+        # an export in the program's axis order, manifest kept: loaded with migration off, then
+        # adopted by copy
+        Base.Filesystem.rename(_mig_xla(joinpath(root, "export.safetensors"), Dict{String, Array}("w" => W2)), lpath)
+        @test (@test_logs (:warn, r"loading it rather than") match_mode = :any compute(dir)) == permutedims(W2) * x
+        @test _RSM.migrate_bundle_weights!(dir, _RSM.MIGRATE_COPY) == :current
+        @test compute(dir) == permutedims(W2) * x
+        # a legacy file again, copied, then redeployed with `cp -p` keeping its size and mtime
+        Base.Filesystem.rename(legacy(W1, "v1"), lpath)
+        @test _RSM.migrate_bundle_weights!(dir, _RSM.MIGRATE_COPY) == :copied
+        src = legacy(W3, "v3")
+        run(`touch -r $lpath $src`)
+        run(`cp -p $src $lpath`)
+        @test (@test_logs (:warn, r"predates") match_mode = :any compute(dir)) == permutedims(W3) * x
+        @test _RSM.migrate_bundle_weights!(dir, _RSM.MIGRATE_COPY) == :copied
+        @test compute(dir) == permutedims(W3) * x
     end
 end

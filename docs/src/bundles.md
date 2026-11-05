@@ -18,8 +18,9 @@ A bundle is a directory containing:
   `weights_file` (a migrated copy is `weights.T.safetensors`).
 - `model.jl` - optional; registers custom pre/post-processing (see below).
 - `.cache/` - written by the worker, never by you: the serialized-executable cache (compiled
-  programs keyed by MLIR content, Reactant_jll build and device) plus `mlir_hashes.json`. Safe to
-  delete at any time; the watcher ignores it. See `runtime.executable_cache` in [Node Configuration](node_config.md).
+  programs keyed by MLIR content, Reactant_jll build and device) plus `mlir_hashes.json`, and for a
+  migrated bundle `weights_sha256.json` (see [Migrating older bundles](#Migrating-older-bundles)).
+  Safe to delete at any time; the watcher ignores it. See `runtime.executable_cache` in [Node Configuration](node_config.md).
 
 The directory name is the model name: renaming the directory renames the model, with no edits to
 the manifest or `model.jl` (a `name` declared in either is informational and ignored). Each
@@ -108,10 +109,25 @@ Workers on one node take turns on a lock in the bundle's `.cache/`, so a bundle 
 A migration that cannot run (no free space, a read-only directory, an invalid copy) is logged and
 the bundle loads as it was.
 
-If you redeploy `weights.safetensors` after a `copy` migration, the copy is stale: the server
-notices that the original changed since the copy was made, loads the original, and, with migration
-on, rebuilds the copy. Comments and formatting in `manifest.yaml` are kept; only the
+If you redeploy `weights.safetensors` after a `copy` migration, the copy is stale, and the server
+loads what you deployed whatever `runtime.weights_migration` is. A copy is loaded only while the
+SHA-256 of `weights.safetensors` equals the one the copy recorded; size and modification time are
+not trusted, since a reproducible build, normalized timestamps, `rsync -t` or `cp -p` can keep
+both. A redeployed legacy file is loaded itself and, with migration on, copied again. A file in the
+program's axis order (re-exported with ReactantServerExport 2.0, manifest kept) is loaded itself,
+and with migration on the server removes the `weights_file` line and the stale copy, leaving
+`format_version` as it was. Comments and formatting in `manifest.yaml` are kept; only the
 `weights_file` and `format_version` lines change.
+
+Hashing a large file takes a while (on the order of 150 MB/s), so the worker keeps the hash of
+`weights.safetensors` in `.cache/weights_sha256.json`, keyed by the file's inode, size,
+modification time and change time. Any rewrite or replacement of the file changes that key, so the
+file is hashed again only when it changed, or was copied, `chmod`ed or relabeled with the same
+content. Timestamps are coarse, so a file changed less than two seconds before it is hashed is not
+recorded, and its next load hashes it again. A bundle migrated offline and then copied into the
+model directory is hashed on its first load there, and on every load if the workers cannot write
+its `.cache/`; running `tools/migrate_weights.jl --copy` on it in place, as a user who can, records
+the hash for them.
 
 `tools/migrate_weights.jl` runs the same migration offline, for model directories the workers
 cannot write or to convert ahead of a deploy.

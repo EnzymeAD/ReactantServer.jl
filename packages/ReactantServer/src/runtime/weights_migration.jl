@@ -15,6 +15,12 @@
 # after each rename. Each step leaves a bundle that a 0.2.0 server loads correctly (the loader takes
 # the layout from the file, not the manifest), so a crash anywhere resumes on the next load.
 #
+# `weights.safetensors` is what the operator deploys, so a copy stands in for it only while it is
+# still the file the copy was made from, judged by content (see `_source_sha256`). A redeployed
+# legacy original is loaded itself (and, with migration on, copied again). Once
+# `weights.safetensors` is in the program's axis order (replace's swap, or an export deployed over
+# the original) it is the weights file in every mode, and copy and replace drop the stale copy.
+#
 # Workers on one node serialize on an flock in the bundle's `.cache/`, so one bundle is migrated
 # once. A migration never fails a model: errors are logged and the bundle loads as it was.
 
@@ -22,8 +28,8 @@ using SHA: SHA
 
 const LEGACY_WEIGHTS_FILE = ReactantServerCore.DEFAULT_WEIGHTS_FILE
 const XLA_COPY_FILE = "weights.T.safetensors"
-const MIGRATED_FROM_KEY = "migrated_from"                 # source "size:mtime" (cheap staleness check)
-const MIGRATED_FROM_SHA_KEY = "migrated_from_sha256"      # source content hash (checked before replace)
+const MIGRATED_FROM_KEY = "migrated_from"                 # source "size:mtime" (what 0.2.0 servers compare)
+const MIGRATED_FROM_SHA_KEY = "migrated_from_sha256"      # source content hash (decides whether the copy is current)
 const _MIGRATION_KEYS = (AXIS_ORDER_KEY, MIGRATED_FROM_KEY, MIGRATED_FROM_SHA_KEY)
 const _MIGRATION_SPACE_MARGIN = 64 << 20
 
@@ -45,6 +51,49 @@ _source_token(w::WeightsFile) = _source_token(stat(w.io))
 function _sha256_hex(w::WeightsFile)
     seekstart(w.io)
     return bytes2hex(SHA.sha256(w.io))
+end
+
+# Whether a copy is current is decided by the SHA-256 of `weights.safetensors` against the one the
+# copy records, never by size and mtime, which a redeploy can keep (reproducible builds, normalized
+# timestamps, `rsync -t`, `cp -p`). Hashing is slow (SHA.jl runs at about 150 MB/s), so the result
+# is kept in `.cache/`, keyed by the file's inode, size, mtime and ctime: a file renamed into place
+# has another inode, and a rewrite in place moves the ctime, which no user-space call can set back.
+# The device number is left out because NFS clients number one export differently, which would make
+# workers on different nodes overwrite each other's record. Timestamps are coarse (a kernel tick
+# locally, up to a second or two on some network and FAT filesystems), so a file changed less than
+# `_SHA_RECORD_MIN_AGE` seconds before it is hashed is not recorded: a second rewrite within the same
+# tick would keep its key. The record is a cache: a mismatched, missing or unwritable one costs a
+# hash, never a wrong answer.
+const _SOURCE_SHA_FILE = "weights_sha256.json"
+const _SHA_RECORD_MIN_AGE = Ref(2.0)                       # test seam
+
+_stat_identity(st) = string(st.inode, ":", st.size, ":", st.mtime, ":", st.ctime)
+
+# The SHA-256 of the open `weights.safetensors` `w` of bundle `dir`.
+function _source_sha256(dir, w::WeightsFile)
+    st = stat(w.io)
+    id = _stat_identity(st)
+    record = joinpath(dir, ".cache", _SOURCE_SHA_FILE)
+    rec = try
+        isfile(record) ? JSON3.read(read(record, String), Dict{String, Any}) : nothing
+    catch
+        nothing                                            # unreadable: hash again and rewrite it
+    end
+    rec !== nothing && get(rec, "identity", nothing) == id && get(rec, "sha256", nothing) isa String &&
+        return rec["sha256"]
+    settled = time() - st.ctime >= _SHA_RECORD_MIN_AGE[]
+    sha = _sha256_hex(w)
+    (settled && _stat_identity(stat(w.io)) == id) || return sha     # changed lately, or while hashed
+    tmp = record * ".tmp." * string(getpid()) * "." * string(rand(UInt32); base = 16)
+    try
+        mkpath(dirname(record))
+        write(tmp, JSON3.write(Dict("identity" => id, "sha256" => sha)))
+        Base.Filesystem.rename(tmp, record)
+    catch e
+        rm(tmp; force = true)
+        @warn "could not record the SHA-256 of $(LEGACY_WEIGHTS_FILE); each load hashes it again" bundle = dir exception = e
+    end
+    return sha
 end
 
 _bytes(a) = reinterpret(UInt8, vec(a))
@@ -233,12 +282,12 @@ function _with_weights(f, path)
 end
 
 # The copy at `tpath` is usable for `legacy`: in the program's axis order and made from this
-# version of it. With `prove`, every tensor is verified too.
-function _copy_matches(tpath, legacy::WeightsFile; prove::Bool)
+# version of it, whose SHA-256 is `sha`. With `prove`, every tensor is verified too.
+function _copy_matches(tpath, legacy::WeightsFile, sha; prove::Bool)
     isfile(tpath) || return false
     return _with_weights(tpath) do t
         md = something(t.metadata, Dict{String, String}())
-        (t.xla_order && get(md, MIGRATED_FROM_KEY, nothing) == _source_token(legacy)) || return false
+        (t.xla_order && get(md, MIGRATED_FROM_SHA_KEY, nothing) == sha) || return false
         prove || return true
         try
             verify_transposed(legacy, t; reference = legacy.path)
@@ -251,14 +300,14 @@ function _copy_matches(tpath, legacy::WeightsFile; prove::Bool)
     end
 end
 
-function _build_copy!(dir, legacy::WeightsFile)
+function _build_copy!(dir, legacy::WeightsFile, sha)
     need = filesize(legacy.path) + _MIGRATION_SPACE_MARGIN
     avail = _AVAILABLE_BYTES[](dir)
     avail >= need || _refuse("not enough free space in $dir: need $(Base.format_bytes(need)), have $(Base.format_bytes(avail))")
     md = Dict{String, String}(something(legacy.metadata, Dict{String, String}()))
     md[AXIS_ORDER_KEY] = AXIS_ORDER_XLA
     md[MIGRATED_FROM_KEY] = _source_token(legacy)
-    md[MIGRATED_FROM_SHA_KEY] = _sha256_hex(legacy)
+    md[MIGRATED_FROM_SHA_KEY] = sha
     _step!(:write_copy)
     _durable_write(
         io -> _write_xla_weights(io, legacy, md), dir, XLA_COPY_FILE; like = legacy.path,
@@ -273,7 +322,9 @@ end
 Migrate one bundle's weights file to the program's axis order (see [`WeightsMigration`](@ref)).
 Returns `:off`, `:skipped` (nothing to migrate: a meta bundle, or a custom `weights_file`),
 `:current` (already in the program's axis order, or already copied under `copy`), `:copied`,
-`:replaced`, or `:failed` (logged; the bundle is left loadable as it was).
+`:replaced`, or `:failed` (logged; the bundle is left loadable as it was). A `weights.safetensors`
+deployed in the program's axis order over a copy-migrated bundle is `:current` in both modes: the
+manifest is pointed back at it and the copy, made from the file it replaced, is removed.
 """
 function migrate_bundle_weights!(dir::AbstractString, mode::WeightsMigration)
     mode == MIGRATE_OFF && return :off
@@ -303,9 +354,11 @@ function _migrate!(dir::String, mode::WeightsMigration)
     wf in (LEGACY_WEIGHTS_FILE, XLA_COPY_FILE) || return :skipped
     lpath, tpath = joinpath(dir, LEGACY_WEIGHTS_FILE), joinpath(dir, XLA_COPY_FILE)
 
-    # Already in the program's axis order: finish a replace that stopped after its rename, or done.
+    # Already in the program's axis order: finish a replace that stopped after its rename, drop a
+    # copy that an export deployed over the original made stale, or done.
     if isfile(lpath) && _with_weights(w -> w.xla_order, lpath)
         wf == XLA_COPY_FILE || return _drop_copy!(dir, lpath, tpath, :current)
+        (isfile(tpath) && samefile(lpath, tpath)) || return _drop_stale_copy!(dir, lpath, tpath)
         mode == MIGRATE_REPLACE || return :current
         return _finish_replace!(dir, lpath, tpath)
     end
@@ -313,10 +366,11 @@ function _migrate!(dir::String, mode::WeightsMigration)
     isfile(lpath) || return wf == XLA_COPY_FILE ? :current : :skipped
 
     return _with_weights(lpath) do legacy
+        sha = _source_sha256(dir, legacy)
         changed = false
-        if wf == LEGACY_WEIGHTS_FILE || !_copy_matches(tpath, legacy; prove = false)
+        if wf == LEGACY_WEIGHTS_FILE || !_copy_matches(tpath, legacy, sha; prove = false)
             # No copy yet, a copy from a crash, or a stale copy (the original was redeployed).
-            _copy_matches(tpath, legacy; prove = true) || _build_copy!(dir, legacy)
+            _copy_matches(tpath, legacy, sha; prove = true) || _build_copy!(dir, legacy, sha)
             _step!(:point_manifest)
             _edit_manifest!(dir, "weights_file" => XLA_COPY_FILE)
             changed = true
@@ -358,10 +412,25 @@ function _finish_replace!(dir, lpath, tpath)
     return _drop_copy!(dir, lpath, tpath, :replaced)
 end
 
-# Remove the copy's name once weights.safetensors is the same file.
+# weights.safetensors is in the program's axis order but is not the copy the manifest points at: an
+# export was deployed over the original, so the copy, made from the file it replaced, is stale.
+# Point the manifest back at weights.safetensors, then remove the copy. `format_version` stays as
+# deployed, as for a bundle that was never migrated.
+function _drop_stale_copy!(dir, lpath, tpath)
+    isfile(tpath) && !_made_by_migration(tpath) && return :skipped      # the manifest's own file
+    _edit_manifest!(dir, "weights_file" => nothing)
+    @info "$(LEGACY_WEIGHTS_FILE) is in the program's axis order; dropping $(XLA_COPY_FILE), which was made from an earlier version of it" bundle = dir
+    return _drop_copy!(dir, lpath, tpath, :current)
+end
+
+# A copy written by `_build_copy!`, whatever weights.safetensors is now.
+_made_by_migration(path) = _with_weights(w -> haskey(something(w.metadata, Dict{String, String}()), MIGRATED_FROM_SHA_KEY), path)
+
+# Remove the copy's name once weights.safetensors is the same file, or once the copy is a stale one
+# the manifest no longer names (no server loads it then).
 function _drop_copy!(dir, lpath, tpath, result)
     if isfile(tpath)
-        if samefile(lpath, tpath)
+        if samefile(lpath, tpath) || _made_by_migration(tpath)
             _step!(:unlink_copy)
             rm(tpath)
             _fsync_dir(dir)
@@ -397,18 +466,27 @@ end
     resolve_weights_path(dir, m::Manifest) -> String
 
 The weights file to load for a bundle. Normally the manifest's `weights_file`; but a migrated copy
-whose source `weights.safetensors` has changed since (a redeploy of the original) is stale, and
-the original is loaded instead, so a deploy is never ignored.
+is loaded only while `weights.safetensors` is still the file it was made from, compared by SHA-256
+(not by size and modification time, which a redeploy can keep). A `weights.safetensors` in the
+program's axis order (an export deployed over the original) is loaded itself, and a redeployed
+legacy original is loaded instead of the stale copy, so a deploy is never ignored, whatever
+`runtime.weights_migration` is.
 """
 function resolve_weights_path(dir::AbstractString, m::Manifest)
     path = joinpath(dir, m.weights_file)
     m.weights_file == XLA_COPY_FILE || return path
     lpath = joinpath(dir, LEGACY_WEIGHTS_FILE)
     (isfile(path) && isfile(lpath)) || return path
-    recorded = _with_weights(w -> get(something(w.metadata, Dict{String, String}()), MIGRATED_FROM_KEY, nothing), path)
-    recorded === nothing && return path
-    recorded == _source_token(stat(lpath)) && return path
-    _with_weights(w -> w.xla_order, lpath) && return path   # replaced mid-way: both current
-    @warn "$(XLA_COPY_FILE) predates the current $(LEGACY_WEIGHTS_FILE); loading the original" bundle = dir
-    return lpath
+    made_from = _with_weights(w -> get(something(w.metadata, Dict{String, String}()), MIGRATED_FROM_SHA_KEY, nothing), path)
+    made_from === nothing && return path           # not a migrated copy: the manifest's own file
+    return _with_weights(lpath) do l
+        if l.xla_order                             # replaced mid-way (the same file), or redeployed
+            samefile(lpath, path) ||
+                @warn "$(LEGACY_WEIGHTS_FILE) is in the program's axis order; loading it rather than $(XLA_COPY_FILE), which was made from an earlier version of it" bundle = dir
+            return lpath
+        end
+        made_from == _source_sha256(dir, l) && return path
+        @warn "$(XLA_COPY_FILE) predates the current $(LEGACY_WEIGHTS_FILE); loading the original" bundle = dir
+        return lpath
+    end
 end

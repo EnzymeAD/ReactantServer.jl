@@ -138,7 +138,8 @@ original is untouched, and servers older than 0.2 ignore the new field and keep 
 `replace` then swaps the copy in as `weights.safetensors` and marks the manifest
 `format_version: "2.1"`, which older servers refuse; use it once every server reading the
 directory runs 0.2 or later. The bundle directory must be writable. A migration never fails a model:
-on any error it is logged and the bundle loads as it was. See
+on any error it is logged and the bundle loads as it was. In every mode, `off` included, a
+`weights.safetensors` deployed after a migration is the file that loads. See
 [Migrating older bundles](bundles.md#Migrating-older-bundles).
 
 `runtime.xla_flags` is a mapping of XLA `DebugOptions` field names (no leading `--`) to values,
