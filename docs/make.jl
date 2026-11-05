@@ -144,7 +144,16 @@ makedocs(;
         "Project" => [
             "Philosophy" => "design/philosophy.md",
         ],
-        "API Reference" => "api.md",
+        # One page per package: a single page of every docstring outgrew Documenter's HTML size limit.
+        "API Reference" => [
+            "Overview" => "api.md",
+            "Core" => "api_core.md",
+            "Worker" => "api_worker.md",
+            "Gateway" => "api_gateway.md",
+            "Node" => "api_node.md",
+            "Client" => "api_client.md",
+            "Export" => "api_export.md",
+        ],
     ],
 )
 
