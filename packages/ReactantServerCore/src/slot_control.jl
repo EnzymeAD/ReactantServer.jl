@@ -322,13 +322,22 @@ _control_word_ptr(c::SlotControl) = Ptr{UInt64}(c.mapping.ptr + _control_object_
 
 Whether the client has given up on `c`'s attempt: its word no longer reads OWNED(token). Never
 waits: when the region's lock is busy (a copy in progress) or the region is gone, it answers
-`false` and leaves the decision to the claim before the output write.
+`false` and leaves the decision to the claim before the output write. So it does when the word
+cannot be read safely (CORE-4): the object no longer covers it, or its page cannot be allocated;
+the claim then reports that.
 """
 function slot_control_cancelled(c::SlotControl)
     r = c.mapping
     trylock(r.lock) || return false
     try
         r.attached || return false
+        try
+            _ensure_backed(r, _control_object_offset(c), 8)
+        catch
+            # Whatever failed, the claim before the output write fails the same way and reports it;
+            # this runs on the dispatch loop, which must not throw for one request.
+            return false
+        end
         return GC.@preserve r unsafe_load(_control_word_ptr(c), 1, :acquire) != slot_word(SLOT_OWNED, c.token)
     finally
         unlock(r.lock)
@@ -339,8 +348,10 @@ end
     shm_write_controlled!(c::SlotControl, items, model_name; chunk_bytes, before_chunk = nothing)
 
 Write a request's shared-memory outputs under the slot control protocol. `items` are
-`(data::Array, offset, nbytes)` triples in `c`'s region (bounds are checked first). Holding the
-region's lock: take an OFD write lock on the control word, claim OWNED(t) -> WRITING(t), copy each
+`(data::Array, offset, nbytes)` triples in `c`'s region. Holding the region's lock: check every
+output's bounds, then that the object still covers every output and the control word and that their
+pages are allocated (CORE-4; [`ShmRegionShrunkError`](@ref) or [`ShmSpaceError`](@ref), with the word
+untouched), take an OFD write lock on the control word, claim OWNED(t) -> WRITING(t), copy each
 output in `chunk_bytes` pieces, checking before each piece that the word still reads WRITING(t),
 then store DONE(t) and unlock (both in `finally`). A lock or a claim that fails means the client gave
 up: nothing is written and [`RequestCancelled`](@ref) is thrown. `before_chunk` is a test hook.
@@ -354,6 +365,10 @@ function shm_write_controlled!(
         r.attached || throw(UnregisteredRegionError(r.name))
         dsts = Ptr{UInt8}[first(_region_base(r, off, nb)) for (_, off, nb) in items]
         lock_at = _control_object_offset(c)
+        _ensure_backed(r, lock_at, 8)
+        for ((_, _, nb), dst) in zip(items, dsts)
+            _ensure_backed(r, Int(dst - r.ptr), Int(nb))
+        end
         shm_try_lock(r.fd, lock_at, 8) ||
             throw(RequestCancelled(String(model_name), "its slot control word is locked by another party"))
         try
@@ -390,11 +405,11 @@ function shm_write_controlled!(
 end
 
 # Copy `nbytes` of `data` into a region at `offset`, without the protocol (a client that sends no
-# slot control).
+# slot control). The object must still cover the range, whose pages are allocated first (CORE-4).
 function _shm_copy_in!(r::ShmRegion, offset::Integer, data::Array, nbytes::Integer)
     @lock r.lock begin
         r.attached || throw(UnregisteredRegionError(r.name))
-        base, bs = _region_base(r, offset, nbytes)
+        base, bs = _backed_region_base(r, offset, nbytes)
         GC.@preserve r data unsafe_copyto!(base, convert(Ptr{UInt8}, pointer(data)), bs)
     end
     return nothing

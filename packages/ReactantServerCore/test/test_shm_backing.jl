@@ -4,7 +4,7 @@
 # SIGBUS. A scenario that did so before the fix runs in a child process, so a regression fails the
 # test instead of killing the suite. The full /dev/shm is a private tmpfs of a few MiB in a user and
 # mount namespace (`unshare`); where unprivileged namespaces are not available those tests are
-# skipped. Nothing here writes more than a few KiB to the host's own /dev/shm.
+# skipped. Nothing here allocates more than about 100 KiB of the host's own /dev/shm.
 
 const _BK = ReactantServerCore
 
@@ -69,7 +69,7 @@ end
     # A full /dev/shm, simulated: creation throws ShmSpaceError and leaves no object behind.
     old = _BK._SHM_FALLOCATE[]
     asked = Tuple{Int, Int}[]
-    key = string("/rsbk-", string(getpid(); base = 36), "-", string(rand(UInt32); base = 36))
+    key = string("/rsbk-", string(getpid(); base = 36), "-pool")
     try
         _BK._SHM_FALLOCATE[] = (fd, off, len) -> (push!(asked, (Int(off), Int(len))); Libc.ENOSPC)
         err = try
@@ -126,5 +126,187 @@ end
         @test r.ok
         @test _child_line(r, "SPACE") == "SPACE $(Libc.ENOSPC)"
         @test _child_line(r, "LEFT") == "LEFT []"         # nothing left in /dev/shm
+    end
+end
+
+# A test object's key, short enough for macOS. A counter rather than `rand`: every testset starts
+# from the same RNG state, so two testsets would draw the same key.
+const _BK_SEQ = Ref(0)
+_bk_key() = string("/rsbk-", string(getpid(); base = 36), "-", _BK_SEQ[] += 1)
+
+# The child scripts below print `TAG result` for each access: `OK`, or the name of the exception.
+const _BK_PROBE = """
+using ReactantServerCore
+const RSC = ReactantServerCore
+function probe(tag, f)
+    v = try
+        f()
+        "OK"
+    catch e
+        string(nameof(typeof(e)))
+    end
+    println(tag, " ", v)
+    flush(stdout)
+end
+const PAGE = Int(ccall(:getpagesize, Cint, ()))
+"""
+
+@testset "a region's pages are checked and allocated before every copy (CORE-4)" begin
+    page = Int(ccall(:getpagesize, Cint, ()))
+    key = _bk_key()
+    cfd, cptr, _ = _BK.shm_create_exclusive(key, 4 * page)
+    reg = _BK.SharedMemoryRegistry(; reap_interval = 0)
+    old = nothing
+    try
+        old = _BK._SHM_FALLOCATE[]
+        # A window that starts a page into the object: the checks use absolute object offsets.
+        _BK.shm_register!(reg, "w", key, page, 3 * page)
+        r = _BK.shm_regions(reg)["w"]
+        asked = Tuple{Int, Int}[]
+        _BK._SHM_FALLOCATE[] = (fd, off, len) -> (push!(asked, (Int(off), Int(len))); Cint(0))
+        _BK.shm_write!(reg, "w", 100, fill(0x07, 50))
+        @test _BK.shm_read(reg, "w", 100, 50) == fill(0x07, 50)
+        @test asked == [(page + 100, 50), (page + 100, 50)]
+        empty!(asked)
+        t = UInt64(12345)
+        unsafe_store!(Ptr{UInt64}(cptr + 3 * page), _BK.slot_word(_BK.SLOT_OWNED, t))
+        c = _BK.SlotControl(r, 2 * page, t)
+        @test !_BK.slot_control_cancelled(c)
+        @test asked == [(3 * page, 8)]
+        empty!(asked)
+        _BK.shm_write_controlled!(c, [(fill(0x09, 10), 0, 10), (fill(0x0a, 20), page, 20)], "m")
+        @test asked == [(3 * page, 8), (page, 10), (2 * page, 20)]
+        @test unsafe_load(Ptr{UInt64}(cptr + 3 * page)) == _BK.slot_word(_BK.SLOT_DONE, t)
+
+        # No room for the pages (simulated): ShmSpaceError, and nothing is touched. The controlled
+        # write fails before its claim, so the word still reads OWNED and the client can take it back.
+        _BK._SHM_FALLOCATE[] = (fd, off, len) -> Libc.ENOSPC
+        @test_throws ShmSpaceError _BK.shm_read(reg, "w", 0, 16)
+        @test_throws ShmSpaceError _BK.shm_write!(reg, "w", 0, fill(0x01, 16))
+        @test_throws ShmSpaceError _BK._shm_copy_in!(r, 0, fill(0x01, 16), 16)
+        t2 = UInt64(12346)
+        unsafe_store!(Ptr{UInt64}(cptr + 3 * page), _BK.slot_word(_BK.SLOT_OWNED, t2))
+        c2 = _BK.SlotControl(r, 2 * page, t2)
+        @test !_BK.slot_control_cancelled(c2)          # undecided: left to the claim
+        @test_throws ShmSpaceError _BK.shm_write_controlled!(c2, [(fill(0x01, 16), 0, 16)], "m")
+        @test unsafe_load(Ptr{UInt64}(cptr + 3 * page)) == _BK.slot_word(_BK.SLOT_OWNED, t2)
+        @test unsafe_load(Ptr{UInt8}(cptr + page)) == 0x09   # the earlier output is untouched
+        err = try
+            _BK.shm_read(reg, "w", 0, 16)
+        catch e
+            e
+        end
+        @test err.errno == Libc.ENOSPC && err.bytes == 16 && err.name == "w"
+    finally
+        old === nothing || (_BK._SHM_FALLOCATE[] = old)
+        _BK.shm_teardown!(reg)
+        _BK._shm_munmap(cptr, 4 * page)
+        close(cfd)
+        ccall(:shm_unlink, Cint, (Cstring,), key)
+    end
+end
+
+# A client shrinks its object after registering it. Before the fix every access below past the new
+# end killed the process with SIGBUS (the first one ended the child). Objects of a few pages, in the
+# host's /dev/shm.
+@testset "a region shrunk after registration fails cleanly, not with SIGBUS (CORE-4)" begin
+    key = _bk_key()
+    r = try
+        _run_child(
+            _BK_PROBE * """
+                key = $(repr(key))
+                cfd, cptr, _ = RSC.shm_create_exclusive(key, 4 * PAGE)
+                reg = RSC.SharedMemoryRegistry(; reap_interval = 0)
+                RSC.shm_register!(reg, "s", key, 0, 4 * PAGE)
+                region = RSC.shm_regions(reg)["s"]
+                t = UInt64(77)
+                unsafe_store!(Ptr{UInt64}(cptr + 64), RSC.slot_word(RSC.SLOT_OWNED, t))   # page 0
+                unsafe_store!(Ptr{UInt64}(cptr + 3 * PAGE), RSC.slot_word(RSC.SLOT_OWNED, t))
+                ccall(:ftruncate, Cint, (Cint, Int64), cfd.fd, PAGE)                   # the client shrinks it
+                probe("READ", () -> RSC.shm_read(reg, "s", 2 * PAGE, 16))
+                probe("WRITE", () -> RSC.shm_write!(reg, "s", 2 * PAGE, ones(UInt8, 16)))
+                probe("COPYIN", () -> RSC._shm_copy_in!(region, 2 * PAGE, ones(UInt8, 16), 16))
+                far = RSC.SlotControl(region, 3 * PAGE, t)                             # word past the end
+                println("CANCELLED ", RSC.slot_control_cancelled(far))
+                probe("CONTROL_WORD", () -> RSC.shm_write_controlled!(far, [(ones(UInt8, 16), 0, 16)], "m"))
+                near = RSC.SlotControl(region, 64, t)                                  # output past the end
+                probe("CONTROL_OUTPUT", () -> RSC.shm_write_controlled!(near, [(ones(UInt8, 16), 2 * PAGE, 16)], "m"))
+                println("WORD ", unsafe_load(Ptr{UInt64}(cptr + 64)) == RSC.slot_word(RSC.SLOT_OWNED, t))
+                probe("READ_INSIDE", () -> RSC.shm_read(reg, "s", 0, 16))              # what is left still reads
+                probe("REREGISTER", () -> RSC.shm_register!(reg, "s", key, 0, 4 * PAGE))
+                ccall(:ftruncate, Cint, (Cint, Int64), cfd.fd, 4 * PAGE)               # grown back
+                probe("READ_GROWN", () -> RSC.shm_read(reg, "s", 2 * PAGE, 16))
+                RSC.shm_teardown!(reg)
+                """
+        )
+    finally
+        ccall(:shm_unlink, Cint, (Cstring,), key)
+    end
+    _report_child(r)
+    @test r.signal != 7
+    @test r.ok
+    for tag in ("READ", "WRITE", "COPYIN", "CONTROL_WORD", "CONTROL_OUTPUT")
+        @test _child_line(r, tag) == "$tag ShmRegionShrunkError"
+    end
+    @test _child_line(r, "CANCELLED") == "CANCELLED false"   # undecided: left to the claim
+    @test _child_line(r, "WORD") == "WORD true"               # refused before the claim
+    @test _child_line(r, "READ_INSIDE") == "READ_INSIDE OK"
+    # Registering the shrunk object again is refused, so a client that re-registers on
+    # FAILED_PRECONDITION cannot loop.
+    @test _child_line(r, "REREGISTER") == "REREGISTER ArgumentError"
+    @test _child_line(r, "READ_GROWN") == "READ_GROWN OK"
+end
+
+# A client that sizes its object without allocating it (an older client, or a third-party KServe or
+# Triton client) on a 2 MiB /dev/shm. Before the fix the first output write past the space left
+# killed the process with SIGBUS, and so did reading a page the client never wrote.
+@testset "a region a full /dev/shm cannot back fails cleanly, not with SIGBUS (CORE-4)" begin
+    if !_private_shm_usable()
+        @info "skipping: no unprivileged user and mount namespaces here"
+        @test_skip false
+    else
+        r = _run_child(
+            _BK_PROBE * """
+                const MiB = 1 << 20
+                key = "/rsbk-sparse"
+                raw = ccall(:shm_open, Cint, (Cstring, Cint, UInt32), key, 0o102, 0o600)   # O_RDWR | O_CREAT
+                ccall(:ftruncate, Cint, (Cint, Int64), raw, 8MiB)                         # sized, not allocated
+                cptr = ccall(:mmap, Ptr{UInt8}, (Ptr{Cvoid}, Csize_t, Cint, Cint, Cint, Int64), C_NULL, 8MiB, 3, 1, raw, 0)
+                reg = RSC.SharedMemoryRegistry(; reap_interval = 0)
+                RSC.shm_register!(reg, "s", key, 0, 8MiB)
+                region = RSC.shm_regions(reg)["s"]
+                t = UInt64(91)
+                unsafe_store!(Ptr{UInt64}(cptr + 8MiB - PAGE), RSC.slot_word(RSC.SLOT_OWNED, t))   # one page
+                c = RSC.SlotControl(region, 8MiB - PAGE, t)
+                probe("WRITE", () -> RSC.shm_write!(reg, "s", 0, ones(UInt8, 4MiB)))
+                probe("COPYIN", () -> RSC._shm_copy_in!(region, 0, ones(UInt8, 4MiB), 4MiB))
+                probe("CONTROLLED", () -> RSC.shm_write_controlled!(c, [(ones(UInt8, 4MiB), 0, 4MiB)], "m"))
+                println("WORD ", unsafe_load(Ptr{UInt64}(cptr + 8MiB - PAGE)) == RSC.slot_word(RSC.SLOT_OWNED, t))
+                probe("READ_HOLE", () -> RSC.shm_read(reg, "s", 4MiB, 4MiB))
+                probe("WRITE_FITS", () -> RSC.shm_write!(reg, "s", 0, ones(UInt8, 64 * 1024)))
+                # Fill /dev/shm to the last page: a control word on a page nobody wrote cannot be read.
+                filler = ccall(:shm_open, Cint, (Cstring, Cint, UInt32), "/rsbk-filler", 0o102, 0o600)
+                used = 0
+                for chunk in (256 * 1024, PAGE)
+                    while ccall(:posix_fallocate, Cint, (Cint, Int64, Int64), filler, used, chunk) == 0
+                        global used += chunk
+                    end
+                end
+                hole = RSC.SlotControl(region, 6MiB, t)
+                println("CANCELLED_HOLE ", RSC.slot_control_cancelled(hole))
+                probe("CONTROLLED_HOLE", () -> RSC.shm_write_controlled!(hole, [(ones(UInt8, 16), 0, 16)], "m"))
+                RSC.shm_teardown!(reg)
+                """;
+            shm_size = "2m"
+        )
+        _report_child(r)
+        @test r.signal != 7
+        @test r.ok
+        for tag in ("WRITE", "COPYIN", "CONTROLLED", "READ_HOLE", "CONTROLLED_HOLE")
+            @test _child_line(r, tag) == "$tag ShmSpaceError"
+        end
+        @test _child_line(r, "WORD") == "WORD true"               # refused before the claim
+        @test _child_line(r, "WRITE_FITS") == "WRITE_FITS OK"
+        @test _child_line(r, "CANCELLED_HOLE") == "CANCELLED_HOLE false"
     end
 end

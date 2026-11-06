@@ -500,3 +500,250 @@ end
         @test all(k -> get(outcomes, k, 0) >= 20, kinds)
     end
 end
+
+# ---- CORE-4: no SIGBUS from a region's pages ----
+#
+# The worker checks, before every copy into or out of a registered region and before touching a
+# slot control word, that the object still covers the range and that the range's pages exist, so a
+# shrunk object or a full /dev/shm fails the request instead of killing the worker with SIGBUS. The
+# mock model is test_status_cancel.jl's `_sc_entry`: x and y are f32 (2, n), y = x .* [2, 3].
+
+# A one-item request for model "m" whose x is read from `region` at `x_at` and whose y is written
+# there at `y_at` (`nothing`: inline), with request parameters `ctl` (slot control).
+function _bk_body(region, x_at, y_at; ctl = Dict{String, _ShmInf.InferParameter}())
+    none = Dict{String, _ShmInf.InferParameter}()
+    shm(off) = Dict(
+        "shared_memory_region" => _sp(region), "shared_memory_offset" => _ip(off),
+        "shared_memory_byte_size" => _ip(8)
+    )
+    req = _ShmInf.ModelInferRequest(;
+        model_name = "m",
+        inputs = [
+            _ShmInf.var"ModelInferRequest.InferInputTensor"(;
+                name = "x", datatype = "FP32", shape = Int64[1, 2], parameters = x_at === nothing ? none : shm(x_at)
+            ),
+        ],
+        outputs = [
+            _ShmInf.var"ModelInferRequest.InferRequestedOutputTensor"(;
+                name = "y", parameters = y_at === nothing ? none : shm(y_at)
+            ),
+        ],
+        raw_input_contents = x_at === nothing ? [collect(reinterpret(UInt8, Float32[1, 2]))] : Vector{UInt8}[],
+        parameters = ctl
+    )
+    return ReactantServer._encode_message(req)
+end
+
+_bk_ctl(region, at, t) = Dict(
+    ReactantServer.SLOT_CONTROL_REGION_PARAM => _sp(region),
+    ReactantServer.SLOT_CONTROL_OFFSET_PARAM => _ip(at),
+    ReactantServer.SLOT_CONTROL_TOKEN_PARAM => _ip(t)
+)
+
+@testset "pages /dev/shm has no room for: RESOURCE_EXHAUSTED, nothing written (CORE-4)" begin
+    sched, ctx = _sc_sched(_sc_entry("m"))
+    ReactantServer.start!(sched)
+    page = Int(ccall(:getpagesize, Cint, ()))
+    key = _test_shm_key()
+    cfd, cptr, _ = _RSCore.shm_create_exclusive(key, 2 * page)
+    full = nothing
+    y() = [unsafe_load(Ptr{Float32}(cptr + page), i) for i in 1:2]
+    word() = unsafe_load(Ptr{UInt64}(cptr + page + 64))
+    try
+        full = _RSCore._SHM_FALLOCATE[]
+        ReactantServer.shm_register!(ctx.shm, "r", key, 0, 2 * page)
+        unsafe_store!(Ptr{Float32}(cptr), 1.0f0, 1)
+        unsafe_store!(Ptr{Float32}(cptr), 2.0f0, 2)
+        @test _sc_call(ctx, _bk_body("r", 0, page)) isa Vector{UInt8}
+        @test y() == Float32[2, 6]
+        unsafe_store!(Ptr{UInt64}(cptr + page), UInt64(0))
+
+        _RSCore._SHM_FALLOCATE[] = (fd, off, len) -> Libc.ENOSPC
+        @test _sc_code(_sc_call(ctx, _bk_body("r", 0, nothing))) == _SCStatus.RESOURCE_EXHAUSTED
+        err = _sc_call(ctx, _bk_body("r", nothing, page))
+        @test _sc_code(err) == _SCStatus.RESOURCE_EXHAUSTED
+        @test occursin("/dev/shm", err.message)
+        @test y() == Float32[0, 0]
+        if ReactantServer.slot_control_supported()
+            t = UInt64(99)
+            unsafe_store!(Ptr{UInt64}(cptr + page + 64), _RSCore.slot_word(_RSCore.SLOT_OWNED, t))
+            @test _sc_code(_sc_call(ctx, _bk_body("r", nothing, page; ctl = _bk_ctl("r", page + 64, t)))) ==
+                _SCStatus.RESOURCE_EXHAUSTED
+            @test word() == _RSCore.slot_word(_RSCore.SLOT_OWNED, t)   # refused before the claim
+            @test y() == Float32[0, 0]
+        end
+    finally
+        full === nothing || (_RSCore._SHM_FALLOCATE[] = full)
+        ReactantServer.shutdown!(sched)
+        ReactantServer.shm_teardown!(ctx.shm)
+        _RSCore._shm_munmap(cptr, 2 * page)
+        close(cfd)
+        ccall(:shm_unlink, Cint, (Cstring,), key)
+    end
+end
+
+# The real kernel cases, through the worker's ModelInfer and register handlers in a child process, so
+# a regression (the worker dying with SIGBUS) fails the test instead of the suite. The child shrinks
+# an object it registered, in the host's /dev/shm (a few pages); and, where unprivileged user and
+# mount namespaces exist, it runs on a private 2 MiB /dev/shm, which it fills to the last page, and
+# serves a region whose pages its client never allocated (an older or third-party client).
+const _BK_WORKER_CHILD = raw"""
+using ReactantServer
+const RS = ReactantServer
+const C = RS.ReactantServerCore
+const IN = RS.inference
+const PAGE = Int(ccall(:getpagesize, Cint, ()))
+const MiB = 1 << 20
+
+function entry()
+    spec(n) = RS.TensorSpec(n, RS.F32, RS.Dim[RS.Dim(RS.FIXED, 2), RS.Dim(RS.BATCH)], 2)
+    man = RS.Manifest(
+        "2.0", "m", "", RS.TensorSpec[spec("x")], RS.TensorSpec[spec("y")], nothing, nothing,
+        RS.BatchingSpec(Int[]), RS.Provenance(Dict{String, Any}()), 1
+    )
+    sig = RS.ModelSignature(["x"], DataType[Float32], ["w"], 1, ["y"], DataType[Float32], 1, Tuple{String, Int}[])
+    exec = RS.MockExecutable(a -> [a[1] .* a[2]], 1)
+    model = RS.LoadedModel(sig, Dict{Int, Any}(1 => exec, 4 => exec), Any[RS.MockBuffer(Float32[2, 3])])
+    return RS.ModelEntry("m", man, Dict{Int, Vector{UInt8}}(), "", nothing, model, nothing, identity, identity)
+end
+backend = RS.MockBackend()
+mpool = RS.MemoryPool(backend, RS.MockClient(), RS.MockDevice(0), "mock", nothing)
+models = RS.ModelRegistry()
+models.by_name["m"] = entry()
+sched = RS.Scheduler(models, backend, mpool, RS.SchedulerConfig(30.0, 64, 30.0; discipline = RS.FIFO))
+ctx = RS.InferContext(sched, models, RS.SharedMemoryRegistry(; reap_interval = 0), "mock", nothing)
+RS.start!(sched)
+
+par(s::String) = IN.InferParameter(; parameter_choice = RS.ProtoBuf.OneOf(:string_param, s))
+par(i::Integer) = IN.InferParameter(; parameter_choice = RS.ProtoBuf.OneOf(:int64_param, Int64(i)))
+none() = Dict{String, IN.InferParameter}()
+shm(region, at) = Dict(
+    "shared_memory_region" => par(region), "shared_memory_offset" => par(at),
+    "shared_memory_byte_size" => par(8)
+)
+function body(region, x_at, y_at; ctl = none())
+    x = IN.var"ModelInferRequest.InferInputTensor"(;
+        name = "x", datatype = "FP32", shape = Int64[1, 2], parameters = x_at === nothing ? none() : shm(region, x_at)
+    )
+    y = IN.var"ModelInferRequest.InferRequestedOutputTensor"(;
+        name = "y", parameters = y_at === nothing ? none() : shm(region, y_at)
+    )
+    raw = x_at === nothing ? [collect(reinterpret(UInt8, Float32[1, 2]))] : Vector{UInt8}[]
+    req = IN.ModelInferRequest(; model_name = "m", inputs = [x], outputs = [y], raw_input_contents = raw, parameters = ctl)
+    return RS._encode_message(req)
+end
+ctl(region, at, t) = Dict(
+    RS.SLOT_CONTROL_REGION_PARAM => par(region), RS.SLOT_CONTROL_OFFSET_PARAM => par(at),
+    RS.SLOT_CONTROL_TOKEN_PARAM => par(t)
+)
+function status(tag, f)
+    v = try
+        f()
+        "OK"
+    catch e
+        e isa RS.gRPCServer.GRPCError ? string(e.code) : "THROWN " * string(nameof(typeof(e)))
+    end
+    println(tag, " ", v)
+    flush(stdout)
+end
+infer(b) = RS._handle_infer_raw(ctx, b, 0)
+register(name, key, bytes) = RS._handle_shm_register(
+    ctx.shm, IN.SystemSharedMemoryRegisterRequest(; name = name, key = key, offset = 0, byte_size = bytes)
+)
+store_x(ptr) = (unsafe_store!(Ptr{Float32}(ptr), 1.0f0, 1); unsafe_store!(Ptr{Float32}(ptr), 2.0f0, 2))
+
+# A client (allocating its object, as ReactantServerClient does) shrinks it to one page after
+# registering four.
+key = ENV["BK_KEY"]
+cfd, cptr, _ = C.shm_create_exclusive(key, 4 * PAGE)
+store_x(cptr)
+t = 5
+unsafe_store!(Ptr{UInt64}(cptr + 3 * PAGE), C.slot_word(C.SLOT_OWNED, UInt64(t)))
+status("REGISTER", () -> register("s", key, 4 * PAGE))
+status("BEFORE", () -> infer(body("s", 0, 2 * PAGE)))
+ccall(:ftruncate, Cint, (Cint, Int64), cfd.fd, PAGE)
+status("SHRUNK_INPUT", () -> infer(body("s", 2 * PAGE, nothing)))
+status("SHRUNK_OUTPUT", () -> infer(body("s", 0, 2 * PAGE)))
+status("SHRUNK_CONTROL", () -> infer(body("s", 0, 64; ctl = ctl("s", 3 * PAGE, t))))       # word past the end
+status("SHRUNK_INSIDE", () -> infer(body("s", 0, nothing)))
+status("SHRUNK_REREGISTER", () -> register("s", key, 4 * PAGE))
+
+if get(ENV, "BK_FULL", "0") == "1"
+    # A client that sizes its object and never allocates it, on a /dev/shm then filled to the last page.
+    fkey = "/bk-sparse"
+    raw = ccall(:shm_open, Cint, (Cstring, Cint, UInt32), fkey, 0o102, 0o600)    # O_RDWR | O_CREAT
+    ccall(:ftruncate, Cint, (Cint, Int64), raw, 8MiB)
+    fptr = ccall(:mmap, Ptr{UInt8}, (Ptr{Cvoid}, Csize_t, Cint, Cint, Cint, Int64), C_NULL, 8MiB, 3, 1, raw, 0)
+    store_x(fptr)                                                                # page 0 only
+    status("FULL_REGISTER", () -> register("f", fkey, 8MiB))
+    filler = ccall(:shm_open, Cint, (Cstring, Cint, UInt32), "/bk-filler", 0o102, 0o600)
+    used = 0
+    for chunk in (256 * 1024, PAGE)
+        while ccall(:posix_fallocate, Cint, (Cint, Int64, Int64), filler, used, chunk) == 0
+            global used += chunk
+        end
+    end
+    status("FULL_OUTPUT", () -> infer(body("f", 0, 4MiB)))                     # a page nobody wrote
+    status("FULL_INPUT", () -> infer(body("f", 4MiB, nothing)))                # one nobody wrote either
+    status("FULL_ALLOCATED", () -> infer(body("f", 0, 64)))                    # page 0 has a page
+    println("FULL_Y ", [unsafe_load(Ptr{Float32}(fptr + 64), i) for i in 1:2])
+end
+RS.shutdown!(sched)
+"""
+
+@testset "a shrunk region and a full /dev/shm fail the request, not the worker (CORE-4)" begin
+    if !Sys.islinux()
+        @test_skip false
+    else
+        unshare = Sys.which("unshare")
+        full = unshare !== nothing && success(
+            pipeline(
+                `$unshare --user --map-root-user --mount sh -c 'mount -t tmpfs -o size=1m tmpfs /dev/shm'`;
+                stdout = devnull, stderr = devnull
+            )
+        )
+        full || @info "no unprivileged user and mount namespaces here: skipping the full /dev/shm part"
+        key = _test_shm_key() * "c"         # sibling testsets draw the same `rand` key
+        jl = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) -e $_BK_WORKER_CHILD`
+        cmd = if full
+            mount = "mount -t tmpfs -o size=2m tmpfs /dev/shm && exec \"\$@\""
+            `$unshare --user --map-root-user --mount sh -c $mount sh $jl`
+        else
+            jl
+        end
+        out, err = IOBuffer(), IOBuffer()
+        env = ("BK_KEY" => key, "BK_FULL" => full ? "1" : "0")
+        p = try
+            run(pipeline(ignorestatus(addenv(cmd, env...)); stdout = out, stderr = err))
+        finally
+            ccall(:shm_unlink, Cint, (Cstring,), key)
+        end
+        text = String(take!(out))
+        lines = Dict{String, String}()
+        for l in split(text, '\n')
+            parts = split(l, ' '; limit = 2)
+            length(parts) == 2 && (lines[String(parts[1])] = String(parts[2]))
+        end
+        success(p) ||
+            @error "worker child failed" signal = p.termsignal stdout = text stderr = last(String(take!(err)), 4000)
+        @test p.termsignal != 7                       # not killed by SIGBUS
+        @test success(p)
+        @test get(lines, "REGISTER", "") == "OK"
+        @test get(lines, "BEFORE", "") == "OK"
+        # A shrunk region is a stale registration, for inputs, outputs and the control word alike...
+        for tag in ("SHRUNK_INPUT", "SHRUNK_OUTPUT", "SHRUNK_CONTROL")
+            @test get(lines, tag, "") == "FAILED_PRECONDITION"
+        end
+        @test get(lines, "SHRUNK_INSIDE", "") == "OK"
+        # ...and registering it again is refused, so a client that re-registers on
+        # FAILED_PRECONDITION (ReactantServerClient does, once) stops there.
+        @test get(lines, "SHRUNK_REREGISTER", "") == "INVALID_ARGUMENT"
+        if full
+            @test get(lines, "FULL_REGISTER", "") == "OK"
+            @test get(lines, "FULL_OUTPUT", "") == "RESOURCE_EXHAUSTED"
+            @test get(lines, "FULL_INPUT", "") == "RESOURCE_EXHAUSTED"
+            @test get(lines, "FULL_ALLOCATED", "") == "OK"
+            @test get(lines, "FULL_Y", "") == "Float32[2.0, 6.0]"
+        end
+    end
+end

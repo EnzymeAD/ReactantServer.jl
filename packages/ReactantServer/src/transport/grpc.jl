@@ -98,7 +98,9 @@ _status_label(e) = get(_GRPC_STATUS_NAME, Int(_grpc_status(e)), "UNKNOWN")
 # act on the code (back off, fail over to another replica, give up, re-register shared memory), so
 # each kind of failure has exactly one, chosen by its type:
 #
-# - RESOURCE_EXHAUSTED: the model's queue is full (backpressure; retry after a backoff)
+# - RESOURCE_EXHAUSTED: the model's queue is full (backpressure; retry after a backoff), or /dev/shm
+#   has no room for the pages of a shared-memory range the request reads or writes (`ShmSpaceError`,
+#   CORE-4)
 # - UNAVAILABLE: the worker is shutting down or draining, its dispatch loop died, the model is
 #   not resident under externally-managed residency, or admission cannot place it on the device
 #   now (`AdmissionError`). Another replica may serve it; never FAILED_PRECONDITION, which a
@@ -109,7 +111,9 @@ _status_label(e) = get(_GRPC_STATUS_NAME, Int(_grpc_status(e)), "UNKNOWN")
 # - CANCELLED: the client cancelled the call, or gave up the shared-memory slot the request writes
 #   (`RequestCancelled`, CORE-3: dropped at dispatch, or its output write was refused)
 # - INVALID_ARGUMENT: the request's own data is wrong (a hook's `InvalidInputError`, bad text)
-# - FAILED_PRECONDITION: a shared-memory region the registry does not know (re-register and retry)
+# - FAILED_PRECONDITION: a shared-memory region the registry does not know (re-register and retry),
+#   or one whose object was shrunk since it was registered (`ShmRegionShrunkError`, CORE-4; the
+#   re-registration is refused while the object is too small, so a client cannot loop on it)
 # - ALREADY_EXISTS: a shared-memory region name registered for another client's live object
 # - INTERNAL: anything else, a failure on the server's side
 #
@@ -118,13 +122,13 @@ _status_label(e) = get(_GRPC_STATUS_NAME, Int(_grpc_status(e)), "UNKNOWN")
 function _grpc_status(e)
     S = gRPCServer.StatusCode
     e isa gRPCServer.GRPCError && return e.code
-    e isa QueueFullError && return S.RESOURCE_EXHAUSTED
+    (e isa QueueFullError || e isa ShmSpaceError) && return S.RESOURCE_EXHAUSTED
     (e isa WorkerUnavailableError || e isa NotResidentError || e isa AdmissionError) && return S.UNAVAILABLE
     e isa ModelNotFoundError && return S.NOT_FOUND
     (e isa DeadlineExceeded || e isa DispatchTimeoutError) && return S.DEADLINE_EXCEEDED
     (e isa RequestCancelledError || e isa RequestCancelled) && return S.CANCELLED
     _client_data_error(e) && return S.INVALID_ARGUMENT
-    e isa UnregisteredRegionError && return S.FAILED_PRECONDITION
+    (e isa UnregisteredRegionError || e isa ShmRegionShrunkError) && return S.FAILED_PRECONDITION
     e isa ShmRegionExistsError && return S.ALREADY_EXISTS
     return S.INTERNAL
 end
@@ -200,17 +204,21 @@ _invalid(msg) = throw(gRPCServer.GRPCError(gRPCServer.StatusCode.INVALID_ARGUMEN
 # shared-memory region the registry does not know (e.g. the client registered with a previous
 # incarnation of this process, before a restart wiped the in-memory registry) is mapped to
 # FAILED_PRECONDITION instead: it is recoverable by re-registering, so it is a distinct signal
-# from a genuinely malformed request. The client re-registers and retries on this status. Running
-# out of memory is the server's failure, not the request's, and is rethrown (INTERNAL). For a
-# request decode and the shared-memory RPCs, whose every other failure comes from client data.
+# from a genuinely malformed request. The client re-registers and retries on this status. So is a
+# region whose object was shrunk since it was registered (CORE-4), whose re-registration is refused.
+# A region whose pages /dev/shm has no room for is RESOURCE_EXHAUSTED. Running out of memory is the
+# server's failure, not the request's, and is rethrown (INTERNAL). For a request decode and the
+# shared-memory RPCs, whose every other failure comes from client data.
 function _as_invalid(f)
     try
         return f()
     catch e
         e isa gRPCServer.GRPCError && rethrow()
         e isa OutOfMemoryError && rethrow()
-        e isa UnregisteredRegionError &&
+        (e isa UnregisteredRegionError || e isa ShmRegionShrunkError) &&
             throw(gRPCServer.GRPCError(gRPCServer.StatusCode.FAILED_PRECONDITION, sprint(showerror, e)))
+        e isa ShmSpaceError &&
+            throw(gRPCServer.GRPCError(gRPCServer.StatusCode.RESOURCE_EXHAUSTED, sprint(showerror, e)))
         # A name registered for another client's live object (CORE-2), as Triton reports it.
         e isa ShmRegionExistsError &&
             throw(gRPCServer.GRPCError(gRPCServer.StatusCode.ALREADY_EXISTS, sprint(showerror, e)))
@@ -221,16 +229,19 @@ end
 # Run the response encode. The codec rejects outputs that cannot be returned as the client asked
 # (a requested output the model does not produce, an output larger than its shared-memory slot, an
 # access outside the client's region) with an ErrorException or ArgumentError: INVALID_ARGUMENT. A
-# region the registry no longer knows is a stale registration: FAILED_PRECONDITION. Anything else
-# (out of memory copying an output, a bug) is the server's own failure and is rethrown, to become
-# INTERNAL.
+# region the registry no longer knows, or whose object was shrunk since it was registered, is a
+# stale registration: FAILED_PRECONDITION. Output pages /dev/shm has no room for are
+# RESOURCE_EXHAUSTED (CORE-4). Anything else (out of memory copying an output, a bug) is the server's
+# own failure and is rethrown, to become INTERNAL.
 function _as_encode_error(f)
     try
         return f()
     catch e
         e isa gRPCServer.GRPCError && rethrow()
-        e isa UnregisteredRegionError &&
+        (e isa UnregisteredRegionError || e isa ShmRegionShrunkError) &&
             throw(gRPCServer.GRPCError(gRPCServer.StatusCode.FAILED_PRECONDITION, sprint(showerror, e)))
+        e isa ShmSpaceError &&
+            throw(gRPCServer.GRPCError(gRPCServer.StatusCode.RESOURCE_EXHAUSTED, sprint(showerror, e)))
         # A shared-memory output write skipped because its client is gone (CORE-3): the slot was
         # given up (CANCELLED), or, for a client without slot control, the deadline had passed.
         e isa RequestCancelled && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.CANCELLED, sprint(showerror, e)))

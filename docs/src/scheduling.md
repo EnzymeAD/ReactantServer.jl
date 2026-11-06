@@ -87,13 +87,13 @@ the gateway can act on it (back off, try another replica, give up, re-register s
 
 | Status | When |
 | --- | --- |
-| `RESOURCE_EXHAUSTED` | the model's queue holds `max_queue_depth` requests, or the worker is at its `max_concurrent_requests` cap |
+| `RESOURCE_EXHAUSTED` | the model's queue holds `max_queue_depth` requests, or the worker is at its `max_concurrent_requests` cap, or `/dev/shm` has no room for the pages of a shared-memory region the request reads or writes (see [Deployment](deployment.md)) |
 | `UNAVAILABLE` | the worker is shutting down or draining (see [Stopping](deployment.md#Stopping)), its dispatch loop has died, (externally managed residency) the model is not resident on this worker, or the model cannot be placed on this worker's device now (see [On-demand Weights](on_demand_weights.md#Memory-fragmentation-and-compaction)) |
 | `NOT_FOUND` | the model is not served here: never loaded, or unloaded or replaced while the request waited |
 | `DEADLINE_EXCEEDED` | the deadline passed before dispatch (the `edf` laxity drop included), or the dispatch timeout did |
 | `CANCELLED` | the client cancelled the call |
 | `INVALID_ARGUMENT` | the request itself is wrong: malformed, an input that does not match the model, a requested output the model does not produce, an output larger than its shared-memory slot, or data a `preprocess` hook rejects with [`InvalidInputError`](@ref) |
-| `FAILED_PRECONDITION` | a shared-memory region this worker does not know (it restarted since the client registered): re-register and retry |
+| `FAILED_PRECONDITION` | a shared-memory region this worker does not know (it restarted since the client registered): re-register and retry. Also a region whose object the client has shrunk since registering it, so that it no longer covers what the request reads or writes; registering that object again is refused (`INVALID_ARGUMENT`) while it is smaller than the window |
 | `INTERNAL` | anything else: a failure on the server's side, logged on the worker with its backtrace under a request id; the client is told that id (and the exception text only under `grpc.error_detail: full`, see [Node Configuration](node_config.md)) |
 
 The worker's `worker_requests_total{status}` counts each request under the same status the

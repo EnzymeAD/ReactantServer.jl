@@ -90,9 +90,11 @@ _shm_munmap(ptr::Ptr, len::Integer) = (ccall(:munmap, Cint, (Ptr{Cvoid}, Csize_t
 # touched, not when the object is sized. Touching a page through a mapping raises SIGBUS, which kills
 # the process, when tmpfs cannot allocate it (`/dev/shm` is full, or the memory limit refuses it) and
 # when it lies past the object's end (the object was shrunk after it was mapped). A read fault
-# allocates too, so reading a page nobody wrote is no safer than writing it. A client pool therefore
-# allocates its whole object when it is created; `posix_fallocate` reports a page it cannot allocate
-# as an error number instead of a signal.
+# allocates too, so reading a page nobody wrote is no safer than writing it. Both ends therefore make
+# sure of the pages before touching them through a mapping: a client pool allocates its whole object
+# when it is created, and a server checks a registered region's size and allocates the range before
+# every copy into or out of it (shared_memory.jl). `posix_fallocate` reports a page it cannot
+# allocate as an error number instead of a signal.
 
 """
     ShmSpaceError(name, bytes, errno)
@@ -100,7 +102,8 @@ _shm_munmap(ptr::Ptr, len::Integer) = (ccall(:munmap, Cint, (Ptr{Cvoid}, Csize_t
 The pages of `bytes` bytes of the shared-memory object or region `name` could not be allocated:
 `/dev/shm` is full (`ENOSPC`) or the memory limit refused them (`ENOMEM`). Raised where touching an
 unallocated page would otherwise kill the process with SIGBUS: when a client's `BufferPool` object is
-created (nothing is left behind).
+created (nothing is left behind), and before a server copies into or out of a registered region (the
+transport maps it to RESOURCE_EXHAUSTED).
 """
 struct ShmSpaceError <: Exception
     name::String
@@ -118,8 +121,9 @@ const _EDQUOT = Cint(122)   # Linux; tmpfs reports it when a quota refuses the p
 # that is there (a page tmpfs allocates reads as zeros, as an unallocated one did). Returns 0 or an
 # error number: posix_fallocate returns it rather than setting errno, so the call can be gc_safe and
 # a collection need not wait out a large allocation. It would also extend an object shorter than
-# the range. A signal can interrupt a large allocation (tmpfs undoes it and reports EINTR), which is
-# retried. Linux only; elsewhere it reports 0 and nothing is allocated.
+# the range; a server checks the size first (shared_memory.jl). A signal can interrupt a large
+# allocation (tmpfs undoes it and reports EINTR), which is retried. Linux only; elsewhere it reports
+# 0 and nothing is allocated.
 function _shm_fallocate(fd::Cint, offset::Integer, len::Integer)
     (Sys.islinux() && len > 0) || return Cint(0)
     while true
@@ -130,18 +134,22 @@ function _shm_fallocate(fd::Cint, offset::Integer, len::Integer)
 end
 
 # The allocation every caller goes through, `(fd, offset, len) -> errno`. A Ref so tests can simulate
-# a full /dev/shm.
+# a full /dev/shm; called with `invokelatest`, so a replacement defined after a long-running task
+# started (the worker's dispatch loop) is seen by it.
 const _SHM_FALLOCATE = Ref{Function}(_shm_fallocate)
 
 # Allocate the pages of [offset, offset + len) of `fd`'s object (named `name` in errors), or throw:
 # `ShmSpaceError` when there is no room for them, `SystemError` for any other failure.
 function _shm_back!(fd::Cint, offset::Integer, len::Integer, name::AbstractString)
-    rc = Cint(_SHM_FALLOCATE[](fd, offset, len))
+    rc = Cint(Base.invokelatest(_SHM_FALLOCATE[], fd, offset, len))
     rc == 0 && return nothing
     (rc == Libc.ENOSPC || rc == Libc.ENOMEM || rc == _EDQUOT) &&
         throw(ShmSpaceError(String(name), Int(len), rc))
     throw(SystemError("posix_fallocate of shared memory '$name'", rc))
 end
+
+# The current size of `fd`'s object.
+_fstat_size(fd::ShmFd) = Int(stat(RawFD(fd.fd)).size)
 
 """
     shm_open_existing(key) -> (fd::ShmFd, ptr::Ptr{UInt8}, len::Int, identity::ShmIdentity)

@@ -127,6 +127,7 @@ export request_drain!
 export ShmRegion, SharedMemoryRegistry, shm_register!, shm_unregister!, shm_read, shm_write!
 export shm_regions, shm_teardown!, same_ipc_namespace, UnregisteredRegionError
 export ShmRegionExistsError, shm_reap!, SHM_REAP_INTERVAL_SECONDS
+export ShmRegionShrunkError
 
 # ---- codec ----
 export OutputTarget, DecodedRequest, decode_infer_request, encode_infer_response, encode_model_metadata
