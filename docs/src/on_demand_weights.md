@@ -170,6 +170,11 @@ worker are read ahead at a time, oldest request first; a third waits for a free 
 being read on the loop that runs the GPU. The worker never reads a weights file on that loop: a
 read there would hold the GPU idle for every model for as long as the disk takes. If a background
 read fails, the requests waiting for it get the error, and the next request starts a fresh read.
+A model read ahead keeps its slot only while it has requests to transfer the weights for. When the
+model's turn ends without the transfer (its requests failed before it, were cancelled, timed out or
+passed their deadline) and nothing more is queued for it, or the model is unloaded or reloaded, the
+worker lets go of what it read and the slot passes to the next model; a model with requests still
+queued keeps it for them.
 Workers on the same node read different models at once; two workers wanting the same model share
 one read.
 
@@ -240,15 +245,19 @@ uploads because a refused device allocation is slow to discover: XLA's allocator
 10 seconds for memory to be released before it reports one.
 
 1. **Feasibility.** A model that cannot fit even with every evictable model gone (weights
-   plus the device-pinned models plus scratch exceed the device) is rejected at once,
-   without evicting anything, and the requests for it fail. That holds on a serving worker.
-   At startup the worker loads its on-demand models one at a time to measure them (except
-   under `model_control_mode: explicit`), and a model that fails this check there stops the
+   plus scratch plus the memory no eviction frees exceed the device) is rejected at once,
+   without evicting anything, and on a serving worker the requests for it fail with
+   `UNAVAILABLE`. A serving worker measures the memory no eviction frees: the allocator's
+   bytes in use less what the evictable models hold, so the device-pinned models count at
+   their allocated size, and so does any other buffer the weight cache does not own. At
+   startup the check counts the device-pinned models' weights alone. The worker loads its
+   on-demand models one at a time there to measure them (except
+   under `model_control_mode: explicit`), and a model that fails this check stops the
    worker from starting: under the node supervisor it restarts into the same failure, and
    none of its models serve until the bundle is removed. A hot load of such a model in
    `dynamic` mode fails too, and the watcher retries it every second poll, recompiling it
-   each time. Check that each model fits beside the device-pinned models before you deploy
-   it.
+   each time; in between, the model stays listed and its requests fail with `UNAVAILABLE`.
+   Check that each model fits beside the device-pinned models before you deploy it.
 2. **Room for the weights.** Free memory must hold the weights plus the largest scratch any
    resident model needs, the largest free block must hold all of the weights, and the
    on-demand byte budget must allow them. "Hold" follows the allocator's split rule: it
@@ -286,13 +295,31 @@ are evicted only when nothing else frees enough. The search is allocation-free a
 measured at 64 resident models it takes about 6 to 22 microseconds.
 
 Compaction (below) is the fallback when eviction alone cannot make room: the worker frees
-every evictable model, reloads the most valuable of them largest first together with the
-new model, and retries once; if that fails too the request fails with an admission error
-naming the reason. A former resident is reloaded only if the whole refill, replayed under
+every evictable model, checks from the statistics that the new model fits on its own,
+reloads the most valuable of them largest first together with the new model, and retries
+once. A former resident is reloaded only if the whole refill, replayed under
 the allocator's split rule, still leaves the scratch block free; one that fails to reload
 anyway stays evicted rather than failing the request. Device-pinned models never move, so a pinned model that splits the
 device can make a large model unplaceable; place pinned models with that in mind. Without
 device statistics (the CPU backend) only the byte budget applies.
+
+When the new model does not fit even after compaction, the worker does not ask the allocator
+for it, so it never pays the 10 second wait: the model is left off the device, the models
+compaction freed (and the ones its admission evicted) are reloaded as far as they fit, and the
+request fails with `UNAVAILABLE` and an admission error naming the reason, so a gateway tries
+another replica. If the upload succeeds but then leaves no room for the scratch block, the
+upload is undone the same way, rather than leaving a model resident that could not run.
+
+A model that failed admission is not tried again at once. Until something changes that could make
+it fit (device memory that no eviction frees is released, a device-pinned model is unloaded, a
+residency changes, or the model itself is reloaded), its requests fail at once with `UNAVAILABLE`:
+nothing is evicted or uploaded, and its weights are not read into host memory for them. Unloading
+or loading other on-demand models does not end the refusal, since it cannot change what fits.
+`worker_weight_admission_failures_total` counts the admissions that failed and
+`worker_weight_admission_refusals_total` the ones refused at once. When memory freed elsewhere ends
+a refusal, the request that finds out has no weights read ahead to upload, so it fails with
+`UNAVAILABLE` as well, and the model's next request has them read in the background and is
+admitted.
 
 Whatever drives compaction frees the on-demand region the same way; what differs is *when*
 it fires and *what* gets reloaded eagerly. Underneath, compaction is a worker control RPC,
@@ -374,8 +401,10 @@ front for `preload`).
 
 The default, `off`, compacts only when a worker's admission cannot otherwise place a model,
 so models that are still warm are not dropped on every placement change. Watch
-`worker_weight_fallback_compactions_total` for how often that happens and
-`worker_weight_admission_failures_total` for models that could not be placed at all.
+`worker_weight_fallback_compactions_total` for how often that happens,
+`worker_weight_admission_failures_total` for models that could not be placed at all, and
+`worker_weight_admission_refusals_total` for the requests refused because such a model still
+cannot be placed.
 `lazy` compacts every affected worker on every placement-changing repack
 (`compaction_interval: 1`), which pays a one-time reload on the first request per moved
 model; raise `compaction_interval` to fire it less often, or use `preload` to warm the new

@@ -331,8 +331,21 @@ function materialize_host_weights!(::PrivateWeightStore, key, digest, specs, fil
     return arrays
 end
 
+# Whether the region `name` has pages for at least `total` bytes (its file's allocated blocks).
+# Always true off Linux, where the store reserves nothing up front.
+function _region_allocated(name, total::Int)
+    Sys.islinux() || return true
+    st = stat("/dev/shm" * name)
+    return st.blocks * 512 >= total
+end
+
 # Attach an existing READY region with the digest, or return nothing. Caller holds some flock.
+# A region whose creator died between sizing it and reserving its pages has none, and reading its
+# header would allocate one, which on a full /dev/shm raises SIGBUS (CORE-4). A published region was
+# reserved in full before its header was written, so one with fewer allocated bytes than `total` is
+# not READY and is passed over without touching it; the creator path then removes it.
 function _attach_ready(name, digest::UInt64, total::Int)
+    _region_allocated(name, total) || return nothing
     existing = try
         SharedMemory(name)
     catch

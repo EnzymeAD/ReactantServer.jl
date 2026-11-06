@@ -56,6 +56,13 @@ that fails, the client latches that endpoint to inline transport and a backgroun
 re-probes it every `shm_reprobe_interval` seconds, restoring shared memory when the server
 recovers.
 
+The shared-memory pool is created on the first call that chooses shared memory, and every page of
+it is allocated then, so `/dev/shm` must have room for the whole pool (`pool_bytes`, plus a page of
+slot control words per 32 slots). When it has not, `:auto` latches the endpoint to inline
+transport with a warning, and the background re-probe creates the pool once there is room; `:on`
+fails with an error that says so. Allocating up front is what keeps a full `/dev/shm` from
+killing the client with SIGBUS partway through staging a request.
+
 Your IO implements `length`, `item_input_bytes`, `infer_encode_chunk!` (request the chunk's
 input buffers with `scratch`, write into them, and return them tagged with their tensor names),
 and `infer_decode_chunk!` (consume the response). The pool's fixed-slot allocator hands every

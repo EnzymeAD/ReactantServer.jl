@@ -18,6 +18,16 @@
 # that no longer resolves to the registered object (unlinked, or unlinked and created again) is
 # stale and replaced, and a different object that still exists is refused (ALREADY_EXISTS). Stale
 # registrations are also dropped at every registration and periodically (CORE-11).
+#
+# Backing (CORE-4): the size of the object is checked at registration, but the client can shrink it
+# afterwards, and its pages may not exist yet (tmpfs allocates a page on first touch, and a client
+# need not have touched every page it registered). A touch through the mapping of a page past the
+# object's end, or of a page a full /dev/shm cannot allocate, raises SIGBUS and kills the worker.
+# So before every copy into or out of a region, and before touching a slot control word, the worker
+# checks with fstat that the object still covers the range (`ShmRegionShrunkError` otherwise,
+# FAILED_PRECONDITION) and allocates the range's pages with posix_fallocate (`ShmSpaceError` when
+# there is no room, RESOURCE_EXHAUSTED). A client that shrinks the object between the check and the
+# copy can still raise SIGBUS; shared memory is a local trust boundary (docs/src/security.md).
 
 # Thrown when a tensor references a shared-memory region name the registry does not know. This is
 # a distinct type (not a bare ArgumentError) so the transport can map it to a distinct gRPC status
@@ -44,6 +54,29 @@ Base.showerror(io::IO, e::ShmRegionExistsError) =
     print(
     io, "shared memory region '", e.name, "' is already registered for a different object ",
     "that still exists (key '", e.key, "')"
+)
+
+"""
+    ShmRegionShrunkError(name, key, size, needed)
+
+Raised before a copy into or out of the registered region `name` (or a touch of a slot control word
+in it) when its shared-memory object `key` is now `size` bytes, shorter than the `needed` bytes the
+access reaches: the client shrank the object after registering it, and touching the missing pages
+would kill the worker with SIGBUS (CORE-4). The transport maps it to FAILED_PRECONDITION, the code
+of a registration that no longer holds; registering the object again is refused while it is too
+small for the window, so a client that re-registers on that code cannot loop.
+"""
+struct ShmRegionShrunkError <: Exception
+    name::String
+    key::String
+    size::Int
+    needed::Int
+end
+Base.showerror(io::IO, e::ShmRegionShrunkError) =
+    print(
+    io, "shared memory region '", e.name, "' no longer fits its object: '", e.key, "' is now ",
+    e.size, " bytes, but the access reaches byte ", e.needed,
+    " (the object was shrunk after it was registered)"
 )
 
 mutable struct ShmRegion
@@ -344,18 +377,45 @@ function _region_base(r::ShmRegion, offset::Integer, byte_size::Integer)
     return r.ptr + r.offset + off, bs
 end
 
+# Make a touch through `r`'s mapping of bytes [start, start + len) of the object (absolute offsets,
+# inside the mapping) safe from SIGBUS (CORE-4): the object must still cover the range, and the
+# range's pages must exist. Throws ShmRegionShrunkError or ShmSpaceError. Caller holds `r.lock` with
+# `r.attached`. One fstat answers both when it proves the whole object dense, which a
+# ReactantServerClient pool is from creation. Otherwise (an object sized but never fully written, or
+# with a hole anywhere, even outside the range) posix_fallocate allocates the range's pages; it walks
+# even an already allocated range, in about an eighth of the time copying it takes (17 µs against
+# 130 µs per MiB, measured on tmpfs). Neither closes the race with a client that shrinks the object
+# or frees its pages after the check (docs/src/security.md).
+function _ensure_backed(r::ShmRegion, start::Int, len::Int)
+    len > 0 || return nothing
+    size, dense = _fstat_size_dense(r.fd)
+    start + len <= size || throw(ShmRegionShrunkError(r.name, r.key, size, start + len))
+    dense || _shm_back!(r.fd.fd, start, len, r.name)
+    return nothing
+end
+
+# `_region_base`, then `_ensure_backed` for the bytes it names. Caller holds `r.lock` with
+# `r.attached`.
+function _backed_region_base(r::ShmRegion, offset::Integer, byte_size::Integer)
+    base, bs = _region_base(r, offset, byte_size)
+    _ensure_backed(r, Int(base - r.ptr), bs)
+    return base, bs
+end
+
 """
     shm_read(registry, name, offset, byte_size) -> Vector{UInt8}
 
 Copy `[offset, offset+byte_size)` of the named region into a fresh byte vector. The copy is
 done while the region's lock is held, so a concurrent `shm_unregister!` of the same region
-cannot detach the mapping underneath the read.
+cannot detach the mapping underneath the read. The object must still cover the range
+([`ShmRegionShrunkError`](@ref) otherwise), and its pages are allocated first
+([`ShmSpaceError`](@ref) when `/dev/shm` has no room), so the copy cannot raise SIGBUS.
 """
 function shm_read(reg::SharedMemoryRegistry, name::AbstractString, offset::Integer, byte_size::Integer)
     r = _lookup_region(reg, name)
     @lock r.lock begin
         r.attached || throw(UnregisteredRegionError(String(name)))
-        base, bs = _region_base(r, offset, byte_size)
+        base, bs = _backed_region_base(r, offset, byte_size)
         out = Vector{UInt8}(undef, bs)
         GC.@preserve r out unsafe_copyto!(pointer(out), base, bs)
         return out
@@ -367,7 +427,8 @@ end
 
 Copy `bytes` into `[offset, offset+length(bytes))` of the named region. The copy is done while
 the region's lock is held, so a concurrent `shm_unregister!` of the same region cannot detach
-the mapping underneath the write.
+the mapping underneath the write. As for [`shm_read`](@ref), the object must still cover the range
+and its pages are allocated first.
 """
 function shm_write!(
         reg::SharedMemoryRegistry, name::AbstractString, offset::Integer,
@@ -382,7 +443,7 @@ end
 function shm_write!(r::ShmRegion, offset::Integer, bytes::Vector{UInt8})
     @lock r.lock begin
         r.attached || throw(UnregisteredRegionError(r.name))
-        base, bs = _region_base(r, offset, length(bytes))
+        base, bs = _backed_region_base(r, offset, length(bytes))
         GC.@preserve r bytes unsafe_copyto!(base, pointer(bytes), bs)
         return nothing
     end

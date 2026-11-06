@@ -15,6 +15,7 @@ const ReactantServer = ReactantServerCore
     include("test_buffer_pool.jl")
     include("test_shm_registry.jl")
     include("test_slot_control.jl")
+    include("test_shm_backing.jl")
     include("test_weight_store.jl")
     include("test_drain.jl")
 end

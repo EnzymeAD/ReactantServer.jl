@@ -42,6 +42,7 @@ include("grpc_helpers.jl")
     include("test_weight_cache.jl")
     include("test_host_cache.jl")
     include("test_weight_staging.jl")
+    include("test_staging_release.jl")   # after test_weight_staging.jl: reuses its helpers
     include("test_admission.jl")
     include("test_weights_version.jl")
     include("test_weights_file.jl")

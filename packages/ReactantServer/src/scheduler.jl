@@ -625,9 +625,22 @@ function _record_wait!(st::ModelSchedState, now::Float64, taken::Vector{QueuedRe
     return nothing
 end
 
+# Run one selected dispatch. However it ends (run, failed before or after the upload, every request
+# dropped at its deadline, withdrawn or cancelled, or an error that escapes it), it ends here, so this
+# is where a staged model that no longer needs what it read gives back its staging slot (see
+# `_release_idle_stage!`). A dispatch that uploaded has nothing staged left, and a model with requests
+# still queued keeps its weights for the dispatch that will run them.
+function execute_and_record!(s::Scheduler, d::Dispatch)
+    try
+        return _execute_dispatch!(s, d)
+    finally
+        _release_idle_stage!(s, d.entry)
+    end
+end
+
 # Run the coalesced dispatch outside the lock, deliver per-request results, then take the lock
 # briefly to record compute time once for the whole dispatch (never once per request).
-function execute_and_record!(s::Scheduler, d::Dispatch)
+function _execute_dispatch!(s::Scheduler, d::Dispatch)
     entry, B, taken = d.entry, d.size, d.taken
     st = entry.sched
     # Deadline admission: drop any request that cannot meet its deadline before we begin GPU work.
@@ -693,7 +706,7 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
     end
     if length(live) != length(taken)
         taken = live          # the catch below and the slicing loop operate only on live requests
-        isempty(taken) && return _release_idle_stage!(s, entry)
+        isempty(taken) && return nothing    # `execute_and_record!` gives back a slot it staged
     end
     try
         # Inputs were already run through the model's preprocess hook on each caller's task before
@@ -1137,6 +1150,15 @@ end
 # is `:pending`: it waits for a slot rather than reading on the dispatch loop. Its requests wait for
 # the read either way; on the loop they would also hold up every other model's.
 #
+# A model is `:staged` only while it has requests queued or its dispatch is running, so the slot it
+# holds always comes back. A read that lands for a model with nothing queued is dropped (`_run_stage!`).
+# Every dispatch ends in `_release_idle_stage!` (see `execute_and_record!`): one that uploaded has
+# nothing staged left, and one whose requests all failed before the upload, or were dropped at their
+# deadline, withdrawn or cancelled, releases the read once nothing more is queued. Unloading the model
+# (`_evict_entry!`) or stopping the worker (`_reject_pending_locked!`) releases it as well. A slot
+# kept past that would be kept for good, and with every slot gone each cold model would wait
+# `:pending` forever.
+#
 # This runs after every pass of the dispatch loop and on every submission, so whatever left a queued
 # model off the device (an eviction, a compaction, a residency change) has marked it before the next
 # selection.
@@ -1190,7 +1212,10 @@ end
 
 # The background read for one model. On success the model waits, staged, for its dispatch; if it
 # was unloaded, loaded some other way, or the read failed, the read is dropped and the dispatch
-# loads the model itself. Either way the loop is woken to reconsider it.
+# loads the model itself. It is dropped too when nothing is queued for the model any more, as
+# happens when something else loaded the model while the read ran (a compaction told to reload it)
+# and the model then served its requests and was evicted again: held for a dispatch that never comes,
+# the read would keep its slot for good. Either way the loop is woken to reconsider it.
 function _run_stage!(s::Scheduler, entry::ModelEntry)
     wc = s.weight_cache::WeightCache
     staged = nothing
@@ -1205,7 +1230,8 @@ function _run_stage!(s::Scheduler, entry::ModelEntry)
     lock(s.cond) do
         st = entry.sched
         live = s.running && get(s.registry.by_name, entry.name, nothing) === entry
-        if staged !== nothing && live && st.host_stage === :staging && entry.executable.weights === nothing
+        if staged !== nothing && live && st.host_stage === :staging && entry.executable.weights === nothing &&
+                !isempty(st.queue)
             st.staged = staged
             st.host_stage = :staged
         else
@@ -1434,8 +1460,11 @@ function _acquire_for_dispatch!(s::Scheduler, entry::ModelEntry)
     return nothing
 end
 
-# Release a staged model's weights when it has nothing left to run (its requests were all dropped
-# at their deadline), so its region does not stay held. Caller does not hold `s.cond`.
+# Release a staged model's weights when it has nothing left to run, so its region and its staging
+# slot do not stay held: its dispatch answered every request it took without uploading (they failed
+# before the upload, or were dropped at their deadline, withdrawn or cancelled) and no other request
+# has been queued since. A model with requests still queued keeps its weights for its next dispatch.
+# Run at the end of every dispatch (`execute_and_record!`). Caller does not hold `s.cond`.
 function _release_idle_stage!(s::Scheduler, entry::ModelEntry)
     wc = s.weight_cache
     wc === nothing && return nothing

@@ -213,6 +213,69 @@ end
     end
 end
 
+# The pool's pages are allocated when it is created (CORE-4), so a full /dev/shm fails its creation
+# instead of killing the client with SIGBUS while it stages. Simulated here; the real kernel case is
+# in ReactantServerCore's test_shm_backing.jl.
+@testset "a pool /dev/shm has no room for: :auto goes inline, :on fails loudly (CORE-4)" begin
+    st = MockState()
+    port = free_port()
+    server = _mk_server(st, port); gRPCServer.start!(server)
+    full = nothing
+    try
+        full = ReactantServerCore._SHM_FALLOCATE[]
+        kserve_init(; pool_bytes = 1 << 20, n_slots = 4, shm_reprobe_interval = 0.0)
+        ReactantServerCore._SHM_FALLOCATE[] = (fd, off, len) -> Libc.ENOSPC
+        mk(mode) = KServeModel(
+            "127.0.0.1", port, "m"; shared_memory = mode, max_batch_size = 1, deadline = 60.0,
+            retry = _noretry()
+        )
+
+        # :on: an error that says what to do; nothing is cached, so the next call tries again.
+        on = mk(:on)
+        err = try
+            infer_sync(on, RecoveryIO(1))
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("shared_memory=:on", err.msg) && occursin("/dev/shm", err.msg)
+        @test occursin("No space left", err.msg)
+        @test RSC._shm_pool[] === nothing
+        @test !haskey(RSC._pool_routes, (on.host, on.port, :on))
+
+        # :auto: sent inline, and latched for the background re-probe.
+        auto = mk(:auto)
+        key = (auto.host, auto.port, :auto)
+        io = RecoveryIO(3)
+        @test_logs (:warn, r"pool of .* could not be created.*inline transport") infer_sync(auto, io)
+        @test io.decoded[] == 3
+        @test haskey(RSC._latched, key)
+        @test !RSC.is_shm_backed(RSC.get_or_create_pool!(auto))
+        @test st.register_calls[] == 0
+        # A re-probe pass while /dev/shm is still full leaves it latched.
+        RSC._reprobe_once()
+        @test haskey(RSC._latched, key)
+        @test RSC._shm_pool[] === nothing
+
+        # Once there is room, the re-probe creates the pool and restores shared memory.
+        ReactantServerCore._SHM_FALLOCATE[] = full
+        RSC._reprobe_once()
+        @test !haskey(RSC._latched, key)
+        @test RSC.is_shm_backed(RSC.get_or_create_pool!(auto))
+        io2 = RecoveryIO(2)
+        infer_sync(auto, io2)
+        @test io2.decoded[] == 2
+        io3 = RecoveryIO(1)
+        infer_sync(on, io3)
+        @test io3.decoded[] == 1
+    finally
+        full === nothing || (ReactantServerCore._SHM_FALLOCATE[] = full)
+        kserve_shutdown()
+        close(server)
+    end
+end
+
 @testset "kserve_init again gives the pool a new name (CLI-2)" begin
     st = MockState()
     port = free_port()

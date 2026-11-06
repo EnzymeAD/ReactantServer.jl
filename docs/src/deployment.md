@@ -171,12 +171,20 @@ With `shared_host_weights` on, size `/dev/shm` above the combined weights of eve
 serves, plus room for the client regions. A tmpfs is allocated lazily, so a generous limit costs
 nothing until it is used. `--shm-size` does not apply together with `--ipc=host`.
 
-Do not let `/dev/shm` fill. Because its pages are allocated lazily, a client's shared-memory pool
-is created without error on a nearly full `/dev/shm`, and whichever process later touches a page
-there is no room for is killed by SIGBUS: the client while it stages inputs, or the worker while
-it writes outputs into the client's region. A worker killed this way fails every request in flight
-on it, and the supervisor restarts it. Size `/dev/shm` (`--shm-size`) for every client pool plus
-the shared weights, and watch its use (`df /dev/shm`).
+Do not let `/dev/shm` fill. Its pages are allocated lazily, and touching through a memory mapping
+a page there is no room for kills the process with SIGBUS, so every party allocates its pages
+before it touches them. `ReactantServerClient` allocates every page of its shared-memory pool
+when it creates the pool: on a `/dev/shm` without room for it the client sends inline instead
+(`shared_memory = :auto`, the default) or fails (`:on`), and retries shared memory in the
+background (see [the client](client.md)). A worker allocates the pages of a client's region before
+it reads inputs from or writes outputs into them (other KServe and Triton clients may leave a
+region's pages unallocated), unless `fstat` shows every page of the object allocated already, as
+for a `ReactantServerClient` pool, and fails the request with `RESOURCE_EXHAUSTED` when there is no
+room. Shared weights are allocated in full when a worker creates their region, and a model whose
+copy does not fit gets a private copy instead ([On-demand Weights](on_demand_weights.md)). A full
+`/dev/shm` therefore costs the shared-memory transport, requests, or shared weights rather than a
+worker, but it still costs them: size it (`--shm-size`) for every client pool plus the shared
+weights, and watch its use (`df /dev/shm`).
 
 **Process and thread limits.** Podman limits a container to 2048 processes by default
 (`--pids-limit`), and the limit counts threads. Each worker runs a Julia compute pool, XLA's

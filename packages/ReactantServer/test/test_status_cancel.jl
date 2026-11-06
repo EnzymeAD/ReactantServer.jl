@@ -72,6 +72,8 @@ _sc_until(f; timeout = 5.0) = timedwait(f, timeout; pollint = 0.01) === :ok
     # Not resident under externally-managed residency: another replica may hold it. Never
     # FAILED_PRECONDITION, which a client reads as a stale shared-memory registration.
     @test code(_SC.NotResidentError("m")) == _SCStatus.UNAVAILABLE
+    # A model this worker cannot place on its device now (MEM-3): a replica with room may serve it.
+    @test code(_SC.AdmissionError("m", "does not fit")) == _SCStatus.UNAVAILABLE
     @test code(_SC.ModelNotFoundError("m")) == _SCStatus.NOT_FOUND
     @test code(_SC.ModelNotFoundError("m", "model 'm' was unloaded")) == _SCStatus.NOT_FOUND
     # The reload path's rejection of a request whose model was replaced in preprocess is retryable
@@ -85,6 +87,10 @@ _sc_until(f; timeout = 5.0) = timedwait(f, timeout; pollint = 0.01) === :ok
     @test code(_SC.InvalidInputError("bad")) == _SCStatus.INVALID_ARGUMENT
     @test code(_SC.BertText.TextInputError("bad")) == _SCStatus.INVALID_ARGUMENT
     @test code(_SC.UnregisteredRegionError("r")) == _SCStatus.FAILED_PRECONDITION
+    # A region shrunk since it was registered is as stale as an unknown one; pages /dev/shm has no
+    # room for are a resource the node ran out of (CORE-4).
+    @test code(_SC.ShmRegionShrunkError("r", "/k", 0, 8)) == _SCStatus.FAILED_PRECONDITION
+    @test code(_SC.ShmSpaceError("r", 8, Libc.ENOSPC)) == _SCStatus.RESOURCE_EXHAUSTED
     # Server-side exceptions stay INTERNAL. gRPCServer's own mapping would have made these
     # NOT_FOUND, INVALID_ARGUMENT and OUT_OF_RANGE, telling the client the request was at fault.
     for e in (KeyError(:k), ArgumentError("a"), BoundsError([1], 2), ErrorException("e"), OutOfMemoryError())
@@ -111,6 +117,8 @@ _sc_until(f; timeout = 5.0) = timedwait(f, timeout; pollint = 0.01) === :ok
     @test _sc_code(enc(ErrorException("requested output 'z' is not produced by the model"))) == _SCStatus.INVALID_ARGUMENT
     @test _sc_code(enc(ArgumentError("shared memory access is out of bounds"))) == _SCStatus.INVALID_ARGUMENT
     @test _sc_code(enc(_SC.UnregisteredRegionError("r"))) == _SCStatus.FAILED_PRECONDITION
+    @test _sc_code(enc(_SC.ShmRegionShrunkError("r", "/k", 0, 8))) == _SCStatus.FAILED_PRECONDITION
+    @test _sc_code(enc(_SC.ShmSpaceError("r", 8, Libc.ENOSPC))) == _SCStatus.RESOURCE_EXHAUSTED
     @test enc(OutOfMemoryError()) isa OutOfMemoryError
     @test enc(KeyError(:k)) isa KeyError
     # The decode keeps mapping client data to INVALID_ARGUMENT, except running out of memory.
@@ -120,6 +128,8 @@ _sc_until(f; timeout = 5.0) = timedwait(f, timeout; pollint = 0.01) === :ok
         x
     end
     @test _sc_code(dec(ErrorException("malformed"))) == _SCStatus.INVALID_ARGUMENT
+    @test _sc_code(dec(_SC.ShmRegionShrunkError("r", "/k", 0, 8))) == _SCStatus.FAILED_PRECONDITION
+    @test _sc_code(dec(_SC.ShmSpaceError("r", 8, Libc.ENOSPC))) == _SCStatus.RESOURCE_EXHAUSTED
     @test dec(OutOfMemoryError()) isa OutOfMemoryError
 end
 

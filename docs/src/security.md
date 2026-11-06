@@ -20,7 +20,17 @@ following before exposing any endpoint:
   mapped (device and inode), not by its name: registering a name that is held by another client's
   object that still exists fails with `ALREADY_EXISTS` instead of redirecting that client's
   traffic, and registrations whose object was unlinked or recreated are dropped. An object a
-  crashed client left behind stays registered until it is removed from `/dev/shm`.
+  crashed client left behind stays registered until it is removed from `/dev/shm`. Before every
+  copy into or out of a registered region, and before touching a slot control word, a worker checks
+  that the object still covers the range and that the range's pages exist (allocating them unless
+  `fstat` shows every page of the object allocated), so a client that shrinks its object after
+  registering it gets `FAILED_PRECONDITION`, and a range whose pages a full
+  `/dev/shm` cannot hold gets `RESOURCE_EXHAUSTED`, rather than the worker touching a page that is
+  not there, which would kill it with SIGBUS. The check and the copy are not atomic: a client that
+  shrinks its object, or frees its pages while `/dev/shm` is full, during the worker's copy can
+  still kill the worker with SIGBUS. Closing that window would take a SIGBUS handler around the
+  copy, or file seals, which `shm_open` objects do not support. A local process that can register
+  a region can therefore still crash a worker on purpose; only let trusted clients register regions.
 - **Internal errors are redacted by default.** With `grpc.error_detail: redacted` (the default,
   set node-wide under `global.grpc`), a client is told of a failure inside the server only by a
   request id and the worker's (or gateway's) name, and the gateway never names a worker by host

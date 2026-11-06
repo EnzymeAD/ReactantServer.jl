@@ -391,3 +391,128 @@ end
     @test cache.admission_failures == 0
     @test cache.loads > 10 && cache.evicts > 0
 end
+
+# ── MEM-3: a model that cannot be placed is refused, rolled back, and not retried until something
+# that could make it fit changes ──────────────────────────────────────────────────────────────────
+
+# Claim `size` bytes at offset `off` that no model owns and no eviction frees (a buffer awaiting its
+# finalizer, say), carving them out of the free block that holds them. `_frag_unhold!` frees them.
+function _frag_hold!(b::FragBackend, off::Int, size::Int)
+    k = findfirst(((o, s),) -> o <= off && off + size <= o + s, b.free)
+    o, s = b.free[k]
+    deleteat!(b.free, k)
+    off + size < o + s && insert!(b.free, k, (off + size, o + s - off - size))
+    off > o && insert!(b.free, k, (o, off - o))
+    return (off, size)
+end
+_frag_unhold!(b::FragBackend, h) = _frag_release!(b, h...)
+
+_in_lru(sched, name) = name in sched.weight_cache.lru
+
+@testset "admission: a model that cannot fit beside memory no eviction frees is refused before evicting (MEM-3)" begin
+    b = FragBackend(32 * _KiB)
+    hold = _frag_hold!(b, 0, 8 * _KiB)
+    sched = _frag_scheduler(b, _frag_entry(b, "A"; kib = [4]), _frag_entry(b, "m"; kib = [4, 4, 4, 4], scratch = 10 * _KiB))
+    cache = sched.weight_cache
+    cache.serving = true              # startup still judges feasibility by the device-pinned models alone
+    m = sched.registry.by_name["m"]
+    _frag_load!(sched, "A")
+    sched.registry.by_name["A"].executable.host_weights = Any[zeros(Float32, _KiB)]
+    # By bytes alone m fits: 16 KiB of weights and 11 KiB of scratch in 32 KiB. Beside the 8 KiB
+    # held it cannot, which the allocator's own statistics show before anything is evicted.
+    @test_throws ReactantServer.AdmissionError _frag_load!(sched, "m")
+    @test _resident(sched, "A")
+    @test cache.fallback_compactions == 0
+    @test !_resident(sched, "m") && !_in_lru(sched, "m")
+    @test b.refusals == 0
+    @test cache.admission_failures == 1
+    # Its requests fail at once: nothing is read into host memory for them, nothing is evicted.
+    @test !ReactantServer.needs_host_stage(cache, m)
+    @test _dispatch1!(sched, "m") isa ReactantServer.AdmissionError
+    @test _resident(sched, "A") && cache.fallback_compactions == 0 && cache.admission_failures == 1
+    # Freeing the held memory lifts the refusal. The request that finds that out has no weights in
+    # host memory to upload, so it fails (UNAVAILABLE) rather than read the file on the dispatch
+    # loop; the next one is read ahead and admitted.
+    _frag_unhold!(b, hold)
+    @test _dispatch1!(sched, "m") isa ReactantServer.AdmissionError
+    @test ReactantServer.needs_host_stage(cache, m)
+    @test _dispatch1!(sched, "m")[1].data == reshape(Float32[1, 1], 2, 1)
+    @test _resident(sched, "m") && _resident(sched, "A")
+    @test b.refusals == 0
+end
+
+@testset "admission: a failed admission is rolled back: not resident, not in the LRU, buffers freed (MEM-3)" begin
+    b = FragBackend(24 * _KiB)
+    _frag_hold!(b, 14 * _KiB, 4 * _KiB)                          # free blocks of 14 and 6 KiB
+    sched = _frag_scheduler(b, _frag_entry(b, "m"; kib = [4, 4], scratch = 10 * _KiB))
+    cache = sched.weight_cache
+    m = sched.registry.by_name["m"].executable
+    m.host_weights = Any[zeros(Float32, _KiB), zeros(Float32, _KiB)]
+    # The statistics say m fits: 20 KiB free holds its 8 KiB of weights and 11 KiB of scratch, and
+    # the 14 KiB block holds its weights. But best fit gives the first tensor the whole 6 KiB block
+    # and splits the second off the 14, which leaves 10 KiB: no room for the scratch.
+    @test_throws ReactantServer.AdmissionError _frag_load!(sched, "m")
+    @test m.weights === nothing && !_in_lru(sched, "m")
+    @test cache.resident_bytes == 0
+    @test isempty(b.live)
+    @test b.refusals == 0
+    # A request for it is refused, rather than run without room for its scratch.
+    @test _dispatch1!(sched, "m") isa ReactantServer.AdmissionError
+    @test b.refusals == 0
+    @test cache.fallback_compactions == 1
+end
+
+@testset "admission: an unplaceable model is not retried until memory is freed or it is reloaded (MEM-3)" begin
+    b = FragBackend(32 * _KiB)
+    hold = _frag_hold!(b, 14 * _KiB, 4 * _KiB)                   # two 14 KiB blocks
+    sched = _frag_scheduler(
+        b, _frag_entry(b, "P"; kib = [2], pinned = true), _frag_entry(b, "A"; kib = [4]),
+        _frag_entry(b, "B"; kib = [4]), _frag_entry(b, "C"; kib = [2]), _frag_entry(b, "m"; kib = [16])
+    )
+    cache = sched.weight_cache
+    m = sched.registry.by_name["m"]
+    for n in ("A", "B")
+        sched.registry.by_name[n].executable.host_weights = Any[zeros(Float32, _KiB)]
+        _frag_load!(sched, n)
+    end
+    sched.registry.by_name["m"].executable.host_weights = Any[zeros(Float32, 4 * _KiB)]
+    # 28 KiB free holds m's one 16 KiB tensor by bytes, but no block can. Eviction and compaction
+    # find that out once, from the statistics: the allocator is never asked for the 16 KiB.
+    @test_throws ReactantServer.AdmissionError _frag_load!(sched, "m")
+    @test b.refusals == 0
+    @test cache.fallback_compactions == 1
+    @test !_resident(sched, "m") && !_in_lru(sched, "m")
+    @test _resident(sched, "A") && _resident(sched, "B")         # what it evicted is back
+    # Nothing that could make it fit has changed: refused at once, with nothing evicted.
+    evicts, loads = cache.evicts, cache.loads
+    for _ in 1:3
+        @test_throws ReactantServer.AdmissionError _frag_load!(sched, "m")
+    end
+    @test cache.fallback_compactions == 1 && cache.evicts == evicts && cache.loads == loads
+    @test b.refusals == 0
+    @test _resident(sched, "A") && _resident(sched, "B")
+    # Unloading a model that held nothing eviction could not free changes nothing for m.
+    ReactantServer._evict_entry!(sched, "C")
+    @test ReactantServer.admission_refused(cache, m)
+    @test_throws ReactantServer.AdmissionError _frag_load!(sched, "m")
+    @test cache.fallback_compactions == 1
+    # Unloading a device-pinned model does: m is tried again (and still does not fit).
+    ReactantServer._evict_entry!(sched, "P")
+    @test !ReactantServer.admission_refused(cache, m)
+    @test_throws ReactantServer.AdmissionError _frag_load!(sched, "m")
+    @test cache.fallback_compactions == 2 && b.refusals == 0
+    @test_throws ReactantServer.AdmissionError _frag_load!(sched, "m")
+    @test cache.fallback_compactions == 2
+    # So is a new version of m.
+    m.executable = _frag_entry(b, "m"; kib = [16]).executable
+    m.executable.host_weights = Any[zeros(Float32, 4 * _KiB)]
+    @test_throws ReactantServer.AdmissionError _frag_load!(sched, "m")
+    @test cache.fallback_compactions == 3 && b.refusals == 0
+    # Freeing the memory that splits the device lets it in.
+    _frag_unhold!(b, hold)
+    _frag_load!(sched, "m")
+    @test _resident(sched, "m")
+    @test b.refusals == 0
+    @test cache.admission_failures == 3
+    @test cache.admission_refusals == 5
+end
