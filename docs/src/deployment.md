@@ -171,12 +171,14 @@ With `shared_host_weights` on, size `/dev/shm` above the combined weights of eve
 serves, plus room for the client regions. A tmpfs is allocated lazily, so a generous limit costs
 nothing until it is used. `--shm-size` does not apply together with `--ipc=host`.
 
-Do not let `/dev/shm` fill. Because its pages are allocated lazily, a client's shared-memory pool
-is created without error on a nearly full `/dev/shm`, and whichever process later touches a page
-there is no room for is killed by SIGBUS: the client while it stages inputs, or the worker while
-it writes outputs into the client's region. A worker killed this way fails every request in flight
-on it, and the supervisor restarts it. Size `/dev/shm` (`--shm-size`) for every client pool plus
-the shared weights, and watch its use (`df /dev/shm`).
+Do not let `/dev/shm` fill. `ReactantServerClient` allocates every page of its shared-memory pool
+when it creates the pool, so on a `/dev/shm` without room for it the client sends inline instead
+(`shared_memory = :auto`, the default) or fails (`:on`), and retries shared memory in the
+background (see [the client](client.md)). Other clients may create their regions with pages
+allocated lazily, and whichever process later touches a page there is no room for is killed by
+SIGBUS: the worker while it writes outputs into such a region. A worker killed this way fails
+every request in flight on it, and the supervisor restarts it. Size `/dev/shm` (`--shm-size`) for
+every client pool plus the shared weights, and watch its use (`df /dev/shm`).
 
 **Process and thread limits.** Podman limits a container to 2048 processes by default
 (`--pids-limit`), and the limit counts threads. Each worker runs a Julia compute pool, XLA's

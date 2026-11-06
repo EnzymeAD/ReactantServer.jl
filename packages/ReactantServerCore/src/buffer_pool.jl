@@ -128,6 +128,10 @@ token (two pools never share a name, even one after the other in one process), u
 A SHM pool's object also holds the slot control area after the data slots (page aligned, one
 128-byte word per slot), so its length, [`pool_region_bytes`](@ref), is what a client registers.
 `retire_after` is [`SLOT_RETIRE_SECONDS`](@ref) unless a test shortens it.
+
+Every page of a SHM pool's object is allocated when the pool is created, so staging into it, or a
+server writing outputs into it, can never find `/dev/shm` full (CORE-4). When `/dev/shm` cannot hold
+`pool_region_bytes` the constructor throws [`ShmSpaceError`](@ref) and leaves no object behind.
 """
 function BufferPool(
         n_bytes::Integer; n_slots::Integer = 8, use_shm::Bool = true,

@@ -241,7 +241,11 @@ end
 # latched endpoint is the background poller, which unlatches it once the server can register again.
 
 # Route `model`'s endpoint to the inline pool and record it for the re-probe poller. Idempotent.
-function latch_inline!(model::KServeModel)
+# `reason` opens the warning logged when the endpoint is first latched.
+function latch_inline!(
+        model::KServeModel;
+        reason::AbstractString = "shared memory unrecoverable for $(model.host):$(model.port)"
+    )
     key = (model.host, model.port, model.shared_memory)
     already = @lock _pools_lock begin
         was = haskey(_latched, key)
@@ -250,8 +254,8 @@ function latch_inline!(model::KServeModel)
         was
     end
     if !already
-        @warn "shared memory unrecoverable for $(model.host):$(model.port); falling back to inline " *
-            "transport (a background probe will restore SHM if the server recovers)"
+        @warn "$reason; falling back to inline transport (a background probe restores shared " *
+            "memory once it works again)"
     end
     _ensure_reprobe_running!()
     return _get_inline_pool!()
@@ -309,7 +313,14 @@ end
 function _reprobe_once()
     latched = @lock _pools_lock collect(_latched)   # snapshot of (key => model)
     isempty(latched) && return
-    shm = _get_shm_pool!()
+    shm = try
+        _get_shm_pool!()
+    catch ex
+        # /dev/shm still has no room for the pool (CORE-4): everything stays latched until a later pass.
+        ex isa ShmSpaceError || rethrow()
+        @debug "SHM re-probe: the shared-memory pool still cannot be created; staying on inline" exception = ex
+        return
+    end
     for (key, model) in latched
         try
             query_same_ipc_namespace(
@@ -360,7 +371,21 @@ function _decide_pool!(model::KServeModel)
         return _get_inline_pool!()
     end
 
-    shm_pool = _get_shm_pool!()
+    shm_pool = try
+        _get_shm_pool!()
+    catch e
+        e isa ShmSpaceError || rethrow()
+        # /dev/shm cannot hold the pool, whose pages are all allocated at creation (CORE-4).
+        msg = "the client's shared-memory pool of $(Base.format_bytes(_pool_bytes[])) could not be " *
+            "created for $(model.host):$(model.port): $(sprint(showerror, e))"
+        mode === :on && error(
+            "shared_memory=:on, but $msg. Make room in /dev/shm or enlarge it (--shm-size), lower " *
+                "`pool_bytes` in kserve_init, or use shared_memory=:auto to fall back to inline transport."
+        )
+        # :auto sends inline; the re-probe poller creates the pool and restores shared memory once
+        # /dev/shm has room for it.
+        return latch_inline!(model; reason = msg)
+    end
     verdict = query_same_ipc_namespace(model, shmid(shm_pool.pool.backing))
 
     if verdict === :yes

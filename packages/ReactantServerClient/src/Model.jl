@@ -144,10 +144,13 @@ variable when set and the kwarg is omitted.
 - `:auto` (default): probe the server with `IsSameIPCNamespace`; use shared memory only if the
   server confirms it shares this client's IPC namespace. If the server returns false, or does
   not implement the RPC, fall back to inline transport. There is no silent runtime fallback.
+  When `/dev/shm` has no room for the client's staging pool (its pages are allocated when it is
+  created), the endpoint falls back to inline transport with a warning, and the background
+  re-probe (see [`kserve_init`](@ref)) restores shared memory once the pool can be created.
 - `:on`: force shared memory. The server confirming a different namespace is a hard error (fail
-  loudly, no fallback). If the server does not implement `IsSameIPCNamespace` (e.g. stock
-  Triton), shared memory is still attempted via `SystemSharedMemoryRegister`; making that work
-  is then the caller's responsibility.
+  loudly, no fallback), and so is a staging pool `/dev/shm` has no room for. If the server does
+  not implement `IsSameIPCNamespace` (e.g. stock Triton), shared memory is still attempted via
+  `SystemSharedMemoryRegister`; making that work is then the caller's responsibility.
 - `:off`: never use shared memory; always send inline. The probe is not sent.
 
 On macOS system shared memory is not supported yet: `:auto` sends inline without probing (and

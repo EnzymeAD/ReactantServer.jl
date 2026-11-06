@@ -75,6 +75,7 @@ export BufferPool, PoolSlot, acquire_slot!, release_slot!, subslot, reset_slot!,
 export pool_view, pool_memory, pool_fsa, is_shm_backed, scratch
 export pool_base_pointer, pool_region_name, pool_slot_bytes
 export try_acquire_slot!, pool_region_bytes, SLOT_RETIRE_SECONDS
+export ShmSpaceError
 
 # ---- slot control (CORE-3) ----
 export SlotControl, SlotWriteInProgress, slot_arm!, slot_seal!, slot_control_offset, has_slot_control
