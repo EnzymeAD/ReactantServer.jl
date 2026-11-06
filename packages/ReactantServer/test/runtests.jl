@@ -52,6 +52,7 @@ include("grpc_helpers.jl")
     include("test_server_e2e.jl")
     include("test_drain.jl")
     include("test_grpc_admission.jl")   # after test_drain.jl: reuses its slow bundle
+    include("test_client_giveups.jl")   # after test_drain.jl: reuses its slow bundle
     include("test_watcher.jl")
     include("test_xla_serialization.jl")
     include("test_executable_cache.jl")

@@ -29,6 +29,28 @@ const _MAX_MESSAGE_BYTES = 512 * 1024 * 1024
 const _H2_INITIAL_WINDOW_BYTES = 32 * 1024 * 1024     # per-stream receive window
 const _H2_CONNECTION_WINDOW_BYTES = 32 * 1024 * 1024  # connection-level receive window
 
+# The streams a client connection may have open at once (SETTINGS_MAX_CONCURRENT_STREAMS) by default:
+# 2^31 - 1, more than a client can ever open on one connection (its stream ids are odd and below
+# 2^31). It is this large for the reason the gateway's listener is (GW-18): HTTP.jl derives its
+# Rapid-Reset (CVE-2023-44487) budget from it, and once the peer has reset more than
+# `max_concurrent_streams + 100` streams over the connection's whole life, the server sends
+# GOAWAY(ENHANCE_YOUR_CALM). Every call a client gives up on (its deadline passed, or it cancelled)
+# resets one stream, so at gRPCServer's default of 100 a client is cut off after its 200th give-up,
+# and a gRPCClient-based one (ReactantServerClient, or the gateway's per-worker handle) can then
+# park its later calls until their deadline (GW-19). With this limit the budget is out of reach, and
+# what bounds a client that resets streams is the inbound admission cap,
+# `endpoints.max_concurrent_requests` (unless it is 0): a reset call's handler counts against it
+# until it returns. `grpc.rapid_reset_protection` restores gRPCServer's default limit, and with it
+# the budget (see `_listener_streams`).
+const _H2_MAX_CONCURRENT_STREAMS = Int(typemax(Int32))
+
+# The listener's per-connection stream limit, as keyword arguments for gRPCServer: by default
+# `_H2_MAX_CONCURRENT_STREAMS`; with `grpc.rapid_reset_protection` none is passed, so gRPCServer's
+# default of 100 streams per connection applies, and with it HTTP.jl's budget of 200 resets per
+# connection.
+_listener_streams(rapid_reset_protection::Bool) =
+    rapid_reset_protection ? (;) : (; max_concurrent_streams = _H2_MAX_CONCURRENT_STREAMS)
+
 # Per-request state threaded through gRPCServer's context payload. `metrics` is `nothing` only for
 # control-plane-only contexts (e.g. tests that never serve inference); `serve` always supplies it.
 # `error_detail` is how much an INTERNAL error tells the client (`grpc.error_detail`), and `name` is
@@ -457,7 +479,7 @@ _handle_is_same_ipc_namespace(name) =
 """
     build_grpc_server(sched, registry, platform, shm, host, port, ctx;
                       max_recv_msg_bytes=_MAX_MESSAGE_BYTES, max_send_msg_bytes=_MAX_MESSAGE_BYTES,
-                      max_concurrent_requests=0,
+                      max_concurrent_requests=0, rapid_reset_protection=false,
                       h2_initial_window_size=_H2_INITIAL_WINDOW_BYTES,
                       h2_connection_window_size=_H2_CONNECTION_WINDOW_BYTES) -> GRPCServer
 
@@ -466,7 +488,8 @@ Register the KServe V2 GRPCInferenceService and ControlService handlers on a fre
 every request's `ServerContext.payload`; `serve` supplies the metrics-bearing context after
 constructing the server. The message-size caps default to `_MAX_MESSAGE_BYTES`; `serve` passes
 the configured `grpc.max_recv_msg_bytes` / `max_send_msg_bytes` (passed through as the merged
-package's per-direction caps).
+package's per-direction caps), `endpoints.max_concurrent_requests` and
+`grpc.rapid_reset_protection` (see `_listener_streams`).
 """
 # HTTP.jl starts every request handler on the :interactive thread pool, which has one thread here,
 # shared with the scheduler's dispatch loop. A handler that does real work there (decoding, a lock
@@ -502,6 +525,7 @@ function build_grpc_server(
         max_recv_msg_bytes::Integer = _MAX_MESSAGE_BYTES,
         max_send_msg_bytes::Integer = _MAX_MESSAGE_BYTES,
         max_concurrent_requests::Integer = 0,
+        rapid_reset_protection::Bool = false,
         h2_initial_window_size::Integer = _H2_INITIAL_WINDOW_BYTES,
         h2_connection_window_size::Integer = _H2_CONNECTION_WINDOW_BYTES
     )
@@ -511,6 +535,7 @@ function build_grpc_server(
         max_receive_message_length = max_recv_msg_bytes,
         max_send_message_length = max_send_msg_bytes,
         max_concurrent_requests = _admission_limit(max_concurrent_requests),
+        _listener_streams(rapid_reset_protection)...,
         h2_initial_window_size = h2_initial_window_size,
         h2_connection_window_size = h2_connection_window_size
     )

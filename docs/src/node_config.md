@@ -91,6 +91,7 @@ global:
     max_recv_msg_bytes: 536870912  # 512 MiB; max inbound gRPC message
     max_send_msg_bytes: 536870912  # 512 MiB; max outbound gRPC message
     error_detail: redacted     # what an INTERNAL error tells clients: redacted | full
+    rapid_reset_protection: false  # true: HTTP/2 Rapid-Reset cut-off on the listener; see below
 ```
 
 Each sub-block corresponds to a typed config struct ([`RuntimeConfig`](@ref),
@@ -215,6 +216,14 @@ keeps its explanation. In both modes every status message is sanitized: `grpc-st
 them in an error message can misread the call's status. The per-component overrides are
 `INFERENCE_SERVER_GRPC_ERROR_DETAIL` (a worker) and `REACTANT_GATEWAY_GRPC_ERROR_DETAIL` (the
 gateway).
+
+`grpc.rapid_reset_protection` (default `false`; environment
+`INFERENCE_SERVER_GRPC_RAPID_RESET_PROTECTION`) switches on the Rapid-Reset (CVE-2023-44487)
+protection of the HTTP/2 server a worker listens with, as the gateway's key of the same name does
+for the gateway; [Gateway configuration](#Gateway-configuration) describes what it does to clients
+that give up on calls. With it off, the default, no client is disconnected for giving up on calls,
+and what bounds a client that resets streams is `endpoints.max_concurrent_requests`, past which
+calls are shed with `RESOURCE_EXHAUSTED` (nothing bounds it when that is 0).
 
 `scheduler.discipline` selects the dispatch policy: `fair` (the default), `fifo`, or `edf`. Workers
 behind a gateway in `lpt_packing` mode must run `fifo` or `edf`. [Scheduling](scheduling.md)
@@ -403,3 +412,4 @@ overrides were applied, is logged at startup.
 | `INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES` | `grpc.max_recv_msg_bytes` | bytes |
 | `INFERENCE_SERVER_GRPC_MAX_SEND_MSG_BYTES` | `grpc.max_send_msg_bytes` | bytes |
 | `INFERENCE_SERVER_GRPC_ERROR_DETAIL` | `grpc.error_detail` | `redacted`, `full` |
+| `INFERENCE_SERVER_GRPC_RAPID_RESET_PROTECTION` | `grpc.rapid_reset_protection` | bool |

@@ -458,17 +458,27 @@ gRPC transport settings for a worker's server. `max_recv_msg_bytes` / `max_send_
 single gRPC message in each direction. The server allocates a received message's full declared
 length as soon as its length prefix arrives, so the receive cap also bounds that buffer per request.
 `error_detail` (an [`ErrorDetail`](@ref)) is how much an `INTERNAL` error tells the client.
+`rapid_reset_protection` (default `false`) keeps the HTTP/2 Rapid-Reset (CVE-2023-44487)
+protection of the worker's listener: a client connection may then have 100 streams open at once,
+and the worker ends it once the client has reset more than 200 streams over the connection's
+life, which a client does each time it gives up on a call. Off, a client is never disconnected for
+giving up on calls, and `endpoints.max_concurrent_requests` is what bounds one that resets streams.
 Configured under the `grpc:` block of a worker (or node `global:`) config, with
 `INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES` / `INFERENCE_SERVER_GRPC_MAX_SEND_MSG_BYTES` /
-`INFERENCE_SERVER_GRPC_ERROR_DETAIL` environment overrides. Defaults: `DEFAULT_GRPC_MSG_BYTES`
-(512 MiB) and `redacted`.
+`INFERENCE_SERVER_GRPC_ERROR_DETAIL` / `INFERENCE_SERVER_GRPC_RAPID_RESET_PROTECTION` environment
+overrides. Defaults: `DEFAULT_GRPC_MSG_BYTES` (512 MiB), `redacted` and `false`.
 """
 struct GrpcConfig
     max_recv_msg_bytes::Int
     max_send_msg_bytes::Int
     error_detail::ErrorDetail
+    rapid_reset_protection::Bool   # keep HTTP.jl's Rapid-Reset cut-off on the listener (GW-19)
 end
 
+# The forms without `rapid_reset_protection` (and without `error_detail`): the defaults, no
+# Rapid-Reset cut-off and production-safe redaction.
+GrpcConfig(max_recv_msg_bytes::Integer, max_send_msg_bytes::Integer, error_detail::ErrorDetail) =
+    GrpcConfig(max_recv_msg_bytes, max_send_msg_bytes, error_detail, false)
 GrpcConfig(max_recv_msg_bytes::Integer, max_send_msg_bytes::Integer) =
     GrpcConfig(max_recv_msg_bytes, max_send_msg_bytes, ERROR_DETAIL_REDACTED)
 GrpcConfig() = GrpcConfig(DEFAULT_GRPC_MSG_BYTES, DEFAULT_GRPC_MSG_BYTES)
@@ -565,6 +575,7 @@ const ENV_PATHS = Tuple{String, Vector{String}, DataType}[
     ("GRPC_MAX_RECV_MSG_BYTES", ["grpc", "max_recv_msg_bytes"], Int),
     ("GRPC_MAX_SEND_MSG_BYTES", ["grpc", "max_send_msg_bytes"], Int),
     ("GRPC_ERROR_DETAIL", ["grpc", "error_detail"], String),
+    ("GRPC_RAPID_RESET_PROTECTION", ["grpc", "rapid_reset_protection"], Bool),
 ]
 
 _parse_env(::Type{Int}, s) = parse(Int, s)
@@ -910,6 +921,7 @@ function build_config(raw::AbstractDict)
         _opt(gc, "max_recv_msg_bytes", Int, DEFAULT_GRPC_MSG_BYTES),
         _opt(gc, "max_send_msg_bytes", Int, DEFAULT_GRPC_MSG_BYTES),
         _parse_error_detail(_opt(gc, "error_detail", String, "redacted")),
+        _opt(gc, "rapid_reset_protection", Bool, false),
     )
 
     return ServerConfig(

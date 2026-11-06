@@ -382,6 +382,57 @@ end
     end
 end
 
+@testset "grpc.rapid_reset_protection: off by default; file, environment, per-worker override (GW-19)" begin
+    mktempdir() do dir
+        modeldir = joinpath(dir, "models"); mkpath(modeldir)
+        rrp(body) = load_single_worker(dir, body; model_repo = modeldir)[1].grpc.rapid_reset_protection
+
+        # Off unless configured, in every constructor.
+        @test !rrp("runtime:\n  backend: cpu")
+        @test !ReactantServer.GrpcConfig().rapid_reset_protection
+        @test !ReactantServer.GrpcConfig(1, 2, ReactantServer.ERROR_DETAIL_FULL).rapid_reset_protection
+        @test ReactantServer.GrpcConfig(1, 2, ReactantServer.ERROR_DETAIL_FULL, true).rapid_reset_protection
+
+        # The file, and the environment over it, either way.
+        @test rrp("grpc:\n  rapid_reset_protection: true")
+        @test !rrp("grpc:\n  rapid_reset_protection: false")
+        withenv("INFERENCE_SERVER_GRPC_RAPID_RESET_PROTECTION" => "true") do
+            cfg, applied, _ = load_single_worker(dir, "runtime:\n  backend: cpu"; model_repo = modeldir)
+            @test cfg.grpc.rapid_reset_protection
+            @test ("INFERENCE_SERVER_GRPC_RAPID_RESET_PROTECTION", "true") in applied
+        end
+        withenv("INFERENCE_SERVER_GRPC_RAPID_RESET_PROTECTION" => "0") do
+            @test !rrp("grpc:\n  rapid_reset_protection: true")
+        end
+
+        # A value that is not a boolean is refused rather than read as off.
+        @test_throws ReactantServer.ConfigError rrp("grpc:\n  rapid_reset_protection: sometimes")
+        @test_throws ReactantServer.ConfigError rrp("grpc:\n  rapid_reset_protection: 1")
+
+        # Set node-wide in global.grpc, it reaches every worker; a worker's own grpc block wins.
+        path = joinpath(dir, "node.yaml")
+        write(
+            path, """
+            model_repo: $modeldir
+            base_port: 8080
+            global:
+              grpc:
+                rapid_reset_protection: true
+                error_detail: full
+            workers:
+              - { name: worker0 }
+              - { name: worker1, grpc: { rapid_reset_protection: false } }
+            """
+        )
+        node = ReactantServer.load_node(path)
+        cfg0, _, _ = ReactantServer.node_server_config(node, "worker0")
+        cfg1, _, _ = ReactantServer.node_server_config(node, "worker1")
+        @test cfg0.grpc.rapid_reset_protection
+        @test !cfg1.grpc.rapid_reset_protection
+        @test cfg1.grpc.error_detail == ReactantServer.ERROR_DETAIL_FULL   # the rest of global.grpc still applies
+    end
+end
+
 @testset "status messages: sanitized for the grpc-message header, request ids" begin
     sanitize = ReactantServer.sanitize_status_message
     # gRPCClient reads `grpc-status: <n>` anywhere in the response headers, the message included, so

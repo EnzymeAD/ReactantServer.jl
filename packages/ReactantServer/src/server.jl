@@ -494,6 +494,7 @@ function serve(
         max_recv_msg_bytes = cfg.grpc.max_recv_msg_bytes,
         max_send_msg_bytes = cfg.grpc.max_send_msg_bytes,
         max_concurrent_requests = cfg.endpoints.max_concurrent_requests,
+        rapid_reset_protection = cfg.grpc.rapid_reset_protection,
         h2_initial_window_size = _H2_INITIAL_WINDOW_BYTES,
         h2_connection_window_size = _H2_CONNECTION_WINDOW_BYTES
     )
@@ -522,7 +523,7 @@ function serve(
             worker_name = worker_name, gpu = _gpu_identity(cfg)
         )
     end
-    @info "Starting gRPC server" host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests models = model_names(registry)
+    @info "Starting gRPC server" host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests rapid_reset_protection = cfg.grpc.rapid_reset_protection models = model_names(registry)
     blocking || return _start_server(cfg, registry, sched, pool, shm, server, watcher, metrics_server, monitor, drain)
     # Blocking: serve until a drain is requested (the supervisor closing stdin, or `request_drain!`),
     # then drain and tear everything down, so the process exits 0 with nothing left running.
