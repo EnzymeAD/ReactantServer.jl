@@ -1,6 +1,6 @@
 name = "ReactantServerClient"
 uuid = "df172679-9d9b-4a02-a92c-27cb5f9e1c5c"
-version = "1.0.3"
+version = "1.1.0"
 authors = ["Carroll Vance <cvance@medicalmetrics.com>"]
 
 [deps]
@@ -16,7 +16,7 @@ FixedSizeArrays = "0.3, 1"
 InterProcessCommunication = "0.1.6"
 PrecompileTools = "1"
 ProtoBuf = "1.3.0"
-ReactantServerCore = "1.1.0"
+ReactantServerCore = "2.0.0"
 gRPCClient = "1.2"
 gRPCServer = "0.1"
 julia = "1.12"
