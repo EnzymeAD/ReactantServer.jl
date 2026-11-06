@@ -426,6 +426,19 @@ _in_lru(sched, name) = name in sched.weight_cache.lru
     @test !_resident(sched, "m") && !_in_lru(sched, "m")
     @test b.refusals == 0
     @test cache.admission_failures == 1
+    # Its requests fail at once: nothing is read into host memory for them, nothing is evicted.
+    @test !ReactantServer.needs_host_stage(cache, m)
+    @test _dispatch1!(sched, "m") isa ReactantServer.AdmissionError
+    @test _resident(sched, "A") && cache.fallback_compactions == 0 && cache.admission_failures == 1
+    # Freeing the held memory lifts the refusal. The request that finds that out has no weights in
+    # host memory to upload, so it fails (UNAVAILABLE) rather than read the file on the dispatch
+    # loop; the next one is read ahead and admitted.
+    _frag_unhold!(b, hold)
+    @test _dispatch1!(sched, "m") isa ReactantServer.AdmissionError
+    @test ReactantServer.needs_host_stage(cache, m)
+    @test _dispatch1!(sched, "m")[1].data == reshape(Float32[1, 1], 2, 1)
+    @test _resident(sched, "m") && _resident(sched, "A")
+    @test b.refusals == 0
 end
 
 @testset "admission: a failed admission is rolled back: not resident, not in the LRU, buffers freed (MEM-3)" begin
@@ -446,6 +459,7 @@ end
     # A request for it is refused, rather than run without room for its scratch.
     @test _dispatch1!(sched, "m") isa ReactantServer.AdmissionError
     @test b.refusals == 0
+    @test cache.fallback_compactions == 1
 end
 
 @testset "admission: an unplaceable model is not retried until memory is freed or it is reloaded (MEM-3)" begin
@@ -469,4 +483,36 @@ end
     @test cache.fallback_compactions == 1
     @test !_resident(sched, "m") && !_in_lru(sched, "m")
     @test _resident(sched, "A") && _resident(sched, "B")         # what it evicted is back
+    # Nothing that could make it fit has changed: refused at once, with nothing evicted.
+    evicts, loads = cache.evicts, cache.loads
+    for _ in 1:3
+        @test_throws ReactantServer.AdmissionError _frag_load!(sched, "m")
+    end
+    @test cache.fallback_compactions == 1 && cache.evicts == evicts && cache.loads == loads
+    @test b.refusals == 0
+    @test _resident(sched, "A") && _resident(sched, "B")
+    # Unloading a model that held nothing eviction could not free changes nothing for m.
+    ReactantServer._evict_entry!(sched, "C")
+    @test ReactantServer.admission_refused(cache, m)
+    @test_throws ReactantServer.AdmissionError _frag_load!(sched, "m")
+    @test cache.fallback_compactions == 1
+    # Unloading a device-pinned model does: m is tried again (and still does not fit).
+    ReactantServer._evict_entry!(sched, "P")
+    @test !ReactantServer.admission_refused(cache, m)
+    @test_throws ReactantServer.AdmissionError _frag_load!(sched, "m")
+    @test cache.fallback_compactions == 2 && b.refusals == 0
+    @test_throws ReactantServer.AdmissionError _frag_load!(sched, "m")
+    @test cache.fallback_compactions == 2
+    # So is a new version of m.
+    m.executable = _frag_entry(b, "m"; kib = [16]).executable
+    m.executable.host_weights = Any[zeros(Float32, 4 * _KiB)]
+    @test_throws ReactantServer.AdmissionError _frag_load!(sched, "m")
+    @test cache.fallback_compactions == 3 && b.refusals == 0
+    # Freeing the memory that splits the device lets it in.
+    _frag_unhold!(b, hold)
+    _frag_load!(sched, "m")
+    @test _resident(sched, "m")
+    @test b.refusals == 0
+    @test cache.admission_failures == 3
+    @test cache.admission_refusals == 5
 end

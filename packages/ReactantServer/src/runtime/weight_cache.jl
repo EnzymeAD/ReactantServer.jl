@@ -24,6 +24,18 @@ struct HostCopy
     arrays::Vector{Any}
 end
 
+# A model admission could not place on the device, remembered so that its next requests are refused
+# at once instead of evicting and compacting again to the same end (see admission.jl). It stands
+# while what could make the model fit is unchanged: the same version of the model (`owner`; a
+# reload is a new one), no device-pinned model unloaded and no residency changed since
+# (`generation`), and no less device memory held that eviction cannot free (`unevictable`, bytes).
+struct AdmissionRefusal
+    owner::LoadedModel
+    generation::Int
+    unevictable::Int
+    reason::String
+end
+
 mutable struct WeightCache
     backend::AbstractBackend
     pool::MemoryPool
@@ -48,6 +60,9 @@ mutable struct WeightCache
     search::VictimSearch           # reusable victim-search arrays (dispatch thread only)
     fallback_compactions::Int      # observability: compactions admission ran because eviction alone could not fit
     admission_failures::Int        # observability: models admission could not fit even after compacting
+    refusals::Dict{String, AdmissionRefusal}   # models admission failed to place, by name
+    generation::Int                # bumped when a device-pinned model is unloaded or a residency changes; ends every refusal
+    admission_refusals::Int        # observability: admissions refused at once by a standing refusal
     # Host weight cache (host_cache below). With the shared store the budget and the cache live in
     # /dev/shm (`store.budget`); with the private store they are this worker's, below.
     host_budget::Union{Int, Nothing}       # this worker's share of the host budget (private store); nothing = unbudgeted
@@ -89,6 +104,7 @@ WeightCache(
     WeightCache(
     backend, pool, registry, mode, store, Int(max_bytes), 0, String[], 0, 0, 0.0, 0, 0, 0, 0, 0,
     Dict{String, ModelFootprint}(), 0.0, Float64(min_residency_seconds), VictimSearch(), 0, 0,
+    Dict{String, AdmissionRefusal}(), 0, 0,
     host_budget === nothing ? nothing : Int(host_budget), Dict{String, HostCopy}(), Dict{String, Float64}(), 0, 0, 0,
     false, Set{String}(), 0.0, 0, 0.0, 0, Dict{Symbol, Int}(r => 0 for r in EVICT_REASONS), 0.0, 0, 0, 0.0,
     ReentrantLock()
@@ -475,6 +491,7 @@ function _set_residency_state!(
     end
 
     lock(cache.lock) do
+        cache.generation += 1        # what eviction cannot free may have changed: refusals end
         # Uncount if presently counted (non-device-pinned and device-resident).
         if entry.name in cache.lru
             _remove_lru!(cache, entry.name)
@@ -534,9 +551,13 @@ function release_all!(cache::WeightCache, entry::ModelEntry)
             _remove_lru!(cache, entry.name)
             cache.resident_bytes -= model.nbytes
         end
+        # Unloading a device-pinned model frees memory no eviction could, so any refused model may
+        # fit now. Unloading another changes nothing a refusal depends on.
+        is_device_pinned(model) && model.weights !== nothing && (cache.generation += 1)
         to_free = model.weights
         model.weights = nothing
         delete!(cache.footprints, entry.name)
+        delete!(cache.refusals, entry.name)
     end
     to_free === nothing || free_weights!(cache.backend, to_free)
     if model.host_weights !== nothing
@@ -654,6 +675,7 @@ function weight_cache_stats(cache::WeightCache)
             weight_pool = cache.weight_pool, load_bytes = cache.load_bytes,
             fallback_compactions = cache.fallback_compactions,
             admission_failures = cache.admission_failures,
+            admission_refusals = cache.admission_refusals,
             evicts_by_reason = copy(cache.evicts_by_reason), compaction_seconds = cache.compaction_seconds,
             stages = cache.stages, stage_failures = cache.stage_failures, stage_seconds = cache.stage_seconds,
             host_budget = host_budget(cache), host_cached_bytes = host_cached_bytes(cache),

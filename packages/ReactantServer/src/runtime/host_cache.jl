@@ -293,13 +293,16 @@ StagedWeights(arrays, hit; cached = nothing, fresh = false) =
     needs_host_stage(cache, entry) -> Bool
 
 Whether loading `entry` has host work to do ahead of time: a self-managed, unpinned model that is
-off the device and has no host floor (`residency: system`) to upload from.
+off the device and has no host floor (`residency: system`) to upload from. A model admission has
+refused (`admission_refused`) has none: its dispatch is refused without a load, so reading its
+weights would be wasted.
 """
 function needs_host_stage(cache::WeightCache, entry::ModelEntry)
     cache.mode == SELF_MANAGED || return false
     model = entry.executable
     model === nothing && return false
-    return !is_device_pinned(model) && model.weights === nothing && model.host_weights === nothing
+    return !is_device_pinned(model) && model.weights === nothing && model.host_weights === nothing &&
+        !admission_refused(cache, entry)
 end
 
 """

@@ -30,7 +30,11 @@
 #
 # A failed admission leaves nothing behind: m is not resident and holds no device memory (an
 # upload that step C then finds without room for the scratch is undone), and what compaction
-# freed is reloaded as far as it fits.
+# freed is reloaded as far as it fits. It is also remembered (`AdmissionRefusal`): until something
+# that could make m fit changes (device memory freed that eviction cannot free, a device-pinned
+# model unloaded, a residency changed, m reloaded), m's admissions fail at once, so its requests
+# neither flush the working set nor wait on the allocator, and none of its weights are read into
+# host memory for them (`needs_host_stage`). The transport answers them UNAVAILABLE.
 #
 # The pinned set is m plus the device-pinned models. Executions are synchronous on the dispatch
 # loop, which also runs admission (on a default-pool task it waits for, see `off_interactive`), so
@@ -61,9 +65,10 @@ const FREE_WAIT_SECONDS = 0.05
     AdmissionError
 
 Raised when a model cannot be placed on the device: either it cannot fit even with every
-evictable model gone, or eviction and compaction together could not make room. Carries the
-reason and a memory report for the log. The transport answers a request that meets it with
-`UNAVAILABLE`: the model cannot be placed on this worker now, and another replica may have room.
+evictable model gone, or eviction and compaction together could not make room, or one of those
+happened before and nothing that could make it fit has changed since. Carries the reason and a
+memory report for the log. The transport answers a request that meets it with `UNAVAILABLE`: the
+model cannot be placed on this worker now, and another replica may have room.
 """
 struct AdmissionError <: Exception
     model::String
@@ -184,10 +189,62 @@ end
 
 _fmt_bytes(n) = n === nothing ? "unknown" : Base.format_bytes(n)
 
-# Fail the admission of `entry` for `reason`.
+"""
+    admission_refused(cache, entry) -> Bool
+
+Whether admission refused `entry` (see `AdmissionRefusal`) and, as far as can be told without
+the device statistics, nothing that would let it in has changed since: the model is the same
+version, no device-pinned model was unloaded and no residency changed. Its requests are then
+refused without reading its weights. Other memory freed since is noticed at its next admission
+(`admit_weights!`). Takes the cache lock, so any task can ask.
+"""
+admission_refused(cache::WeightCache, entry::ModelEntry) = _standing_refusal(cache, entry) !== nothing
+
+function _standing_refusal(cache::WeightCache, entry::ModelEntry)
+    return lock(cache.lock) do
+        r = get(cache.refusals, entry.name, nothing)
+        (r === nothing || r.owner !== entry.executable || r.generation != cache.generation) && return nothing
+        return r
+    end
+end
+
+# Fail the admission of `entry` for `reason` and remember it, with the device memory that eviction
+# cannot free right now, so its next admissions fail at once until something changes.
 function _refuse!(cache::WeightCache, entry::ModelEntry, reason::String)
-    lock(() -> cache.admission_failures += 1, cache.lock)
+    stats = device_memory_stats(cache.backend, cache.pool)
+    unevictable = stats === nothing ? 0 : _unevictable_bytes(cache, stats)
+    lock(cache.lock) do
+        cache.admission_failures += 1
+        cache.refusals[entry.name] = AdmissionRefusal(entry.executable, cache.generation, unevictable, reason)
+    end
     throw(AdmissionError(entry.name, reason))
+end
+
+# Before admitting `entry`: a refusal that stands fails the admission at once, with nothing evicted
+# or uploaded. One that less unevictable memory has ended is dropped, and the admission goes ahead,
+# unless it has no weights in host memory to upload: the dispatch loop never reads a weights file,
+# so this request fails (UNAVAILABLE, retryable) and the model's next request has them read first.
+function _check_refusal!(cache::WeightCache, entry::ModelEntry, stats, staged)
+    r = _standing_refusal(cache, entry)
+    if r !== nothing && _unevictable_bytes(cache, stats) >= r.unevictable
+        lock(() -> cache.admission_refusals += 1, cache.lock)
+        throw(
+            AdmissionError(
+                entry.name, "$(r.reason) (an earlier attempt; not retried until device memory is " *
+                    "freed, a device-pinned model is unloaded, a residency changes, or the model is reloaded)"
+            )
+        )
+    end
+    lock(() -> delete!(cache.refusals, entry.name), cache.lock)
+    if r !== nothing && staged === nothing && needs_host_stage(cache, entry)
+        throw(
+            AdmissionError(
+                entry.name, "device memory was freed since it last failed admission; its weights " *
+                    "are read into host memory for its next request, which tries again"
+            )
+        )
+    end
+    return nothing
 end
 
 # Undo the upload of `entry` an admission committed before failing: free its device buffers and
@@ -276,15 +333,16 @@ _chosen_names(s::VictimSearch) = [s.names[i] for i in 1:s.n if s.best[i]]
     admit_weights!(cache, entry; staged=nothing) -> nothing
 
 Make the evicted model `entry` resident, evicting what it must (see the file header for the
-steps). Throws [`AdmissionError`](@ref) when the model cannot be placed, leaving it off the device.
-Runs for the dispatch loop, the sole residency mutator. `staged` is the model's weights already
-read into host memory (see `stage_host_weights`), which every upload of `entry` here uses; the
-caller releases it.
+steps). Throws [`AdmissionError`](@ref) when the model cannot be placed, leaving it off the device,
+and at once, without evicting anything, while an earlier failure stands. Runs for the dispatch
+loop, the sole residency mutator. `staged` is the model's weights already read into host memory
+(see `stage_host_weights`), which every upload of `entry` here uses; the caller releases it.
 """
 function admit_weights!(cache::WeightCache, entry::ModelEntry; staged = nothing)
     model = entry.executable
     fp = model_footprint(cache, entry)
     stats = device_memory_stats(cache.backend, cache.pool)
+    stats === nothing || _check_refusal!(cache, entry, stats, staged)
 
     # 0. Feasibility: only the memory no eviction frees stays. A serving worker measures it. At
     # startup, where a failed admission stops the worker (the probe loads each model in turn), it

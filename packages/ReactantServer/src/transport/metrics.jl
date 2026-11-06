@@ -45,7 +45,7 @@ Prometheus.metric_names(::WorkerSnapshotCollector) = (
     "worker_weight_load_seconds_total", "worker_weight_load_bytes_total",
     "worker_weight_upload_seconds_total", "worker_weight_read_seconds_total", "worker_weight_read_bytes_total",
     "worker_weight_compactions_total", "worker_weight_fallback_compactions_total",
-    "worker_weight_admission_failures_total",
+    "worker_weight_admission_failures_total", "worker_weight_admission_refusals_total",
     "worker_host_weight_budget_bytes", "worker_host_weight_cached_bytes",
     "worker_host_weight_hits_total", "worker_host_weight_misses_total",
     "worker_model_scratch_bytes", "worker_model_load_seconds",
@@ -289,6 +289,11 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
             _scalar(
                 "worker_weight_admission_failures_total", "counter",
                 "Models that could not be placed on the device even after compacting.", wc.admission_failures
+            ),
+            _scalar(
+                "worker_weight_admission_refusals_total", "counter",
+                "Admissions refused at once, without evicting, because the model failed admission and " *
+                    "nothing that could make it fit has changed since.", wc.admission_refusals
             ),
         )
         # Host weight cache (only under runtime.host_weight_budget).

@@ -256,8 +256,8 @@ uploads because a refused device allocation is slow to discover: XLA's allocator
    worker from starting: under the node supervisor it restarts into the same failure, and
    none of its models serve until the bundle is removed. A hot load of such a model in
    `dynamic` mode fails too, and the watcher retries it every second poll, recompiling it
-   each time. Check that each model fits beside the device-pinned models before you deploy
-   it.
+   each time; in between, the model stays listed and its requests fail with `UNAVAILABLE`.
+   Check that each model fits beside the device-pinned models before you deploy it.
 2. **Room for the weights.** Free memory must hold the weights plus the largest scratch any
    resident model needs, the largest free block must hold all of the weights, and the
    on-demand byte budget must allow them. "Hold" follows the allocator's split rule: it
@@ -309,6 +309,17 @@ compaction freed (and the ones its admission evicted) are reloaded as far as the
 request fails with `UNAVAILABLE` and an admission error naming the reason, so a gateway tries
 another replica. If the upload succeeds but then leaves no room for the scratch block, the
 upload is undone the same way, rather than leaving a model resident that could not run.
+
+A model that failed admission is not tried again at once. Until something changes that could make
+it fit (device memory that no eviction frees is released, a device-pinned model is unloaded, a
+residency changes, or the model itself is reloaded), its requests fail at once with `UNAVAILABLE`:
+nothing is evicted or uploaded, and its weights are not read into host memory for them. Unloading
+or loading other on-demand models does not end the refusal, since it cannot change what fits.
+`worker_weight_admission_failures_total` counts the admissions that failed and
+`worker_weight_admission_refusals_total` the ones refused at once. When memory freed elsewhere ends
+a refusal, the request that finds out has no weights read ahead to upload, so it fails with
+`UNAVAILABLE` as well, and the model's next request has them read in the background and is
+admitted.
 
 Whatever drives compaction frees the on-demand region the same way; what differs is *when*
 it fires and *what* gets reloaded eagerly. Underneath, compaction is a worker control RPC,
@@ -390,8 +401,10 @@ front for `preload`).
 
 The default, `off`, compacts only when a worker's admission cannot otherwise place a model,
 so models that are still warm are not dropped on every placement change. Watch
-`worker_weight_fallback_compactions_total` for how often that happens and
-`worker_weight_admission_failures_total` for models that could not be placed at all.
+`worker_weight_fallback_compactions_total` for how often that happens,
+`worker_weight_admission_failures_total` for models that could not be placed at all, and
+`worker_weight_admission_refusals_total` for the requests refused because such a model still
+cannot be placed.
 `lazy` compacts every affected worker on every placement-changing repack
 (`compaction_interval: 1`), which pays a one-time reload on the first request per moved
 model; raise `compaction_interval` to fire it less often, or use `preload` to warm the new
