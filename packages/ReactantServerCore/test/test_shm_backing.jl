@@ -310,3 +310,42 @@ end
         @test _child_line(r, "CANCELLED_HOLE") == "CANCELLED_HOLE false"
     end
 end
+
+# The shared weight store reserves a region's pages before writing it, so a full /dev/shm fails a
+# new region with SharedStoreFull. A region whose creator died between sizing it and reserving its
+# pages has none: before the fix the next worker read its header to see whether it was READY, and on
+# a full /dev/shm that read killed the worker with SIGBUS.
+@testset "a shared weight region left without pages is skipped, not read (CORE-4)" begin
+    if !_private_shm_usable()
+        @info "skipping: no unprivileged user and mount namespaces here"
+        @test_skip false
+    else
+        r = _run_child(
+            _BK_PROBE * """
+                key = "remnant"
+                specs = [(Float32, (1 << 18,))]
+                dg = RSC.weights_digest(key, specs)
+                _, total = RSC._layout(specs)
+                name = "/rsw-" * key * "-" * string(dg; base = 16)
+                raw = ccall(:shm_open, Cint, (Cstring, Cint, UInt32), name, 0o102, 0o666)   # O_RDWR | O_CREAT
+                ccall(:ftruncate, Cint, (Cint, Int64), raw, total)                           # and then it died
+                ccall(:close, Cint, (Cint,), raw)
+                filler = ccall(:shm_open, Cint, (Cstring, Cint, UInt32), "/rsbk-filler", 0o102, 0o600)
+                used = 0
+                for chunk in (256 * 1024, PAGE)
+                    while ccall(:posix_fallocate, Cint, (Cint, Int64, Int64), filler, used, chunk) == 0
+                        global used += chunk
+                    end
+                end
+                probe("MATERIALIZE", () -> RSC.materialize_host_weights!(RSC.SharedWeightStore(), key, dg, specs, a -> fill!(a[1], 1.0f0)))
+                println("REMNANT ", isfile("/dev/shm" * name))
+                """;
+            shm_size = "2m"
+        )
+        _report_child(r)
+        @test r.signal != 7
+        @test r.ok
+        @test _child_line(r, "MATERIALIZE") == "MATERIALIZE SharedStoreFull"
+        @test _child_line(r, "REMNANT") == "REMNANT false"        # the creator path removed it
+    end
+end
