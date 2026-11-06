@@ -277,11 +277,11 @@ function Prometheus.collect!(metrics::Vector, c::AdmissionCollector)
         metrics,
         _adm_scalar(
             "gateway_inflight_requests", "gauge",
-            "RPCs currently being handled (counted only when the cap is enabled).", c.inflight[]
+            "RPCs admitted and still being handled.", c.inflight[]
         ),
         _adm_scalar(
             "gateway_requests_shed_total", "counter",
-            "RPCs rejected with RESOURCE_EXHAUSTED at the inbound concurrency cap.", c.shed[]
+            "RPCs rejected with RESOURCE_EXHAUSTED at the inbound concurrency cap, before any handler ran (so not in gateway_requests_total).", c.shed[]
         ),
         _adm_scalar(
             "gateway_max_concurrent_requests", "gauge",

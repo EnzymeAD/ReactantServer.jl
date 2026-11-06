@@ -703,6 +703,12 @@ _model_infer_rpc(ctx, body) = _gw_status(ctx.payload, "ModelInfer") do
     _gw_infer(body, ctx.payload, deadline_to_time_ns(ctx.deadline, gRPCServer.remaining_time(ctx)), _CallCancelled(ctx))
 end
 
+# What the gateway passes gRPCServer as `max_concurrent_requests` for an inbound cap of `cap`
+# (0 = uncapped). gRPCServer's own uncapped forms (`nothing`, 0) also stop it counting the calls in
+# flight, which `gateway_inflight_requests` reads, so an uncapped gateway passes a cap that cannot be
+# reached instead: no call is shed and the count stays live.
+_admission_limit(cap::Integer) = cap > 0 ? Int(cap) : typemax(Int)
+
 """
     build_gateway_server(state, cfg, host, port) -> GRPCServer
 
@@ -723,6 +729,9 @@ function build_gateway_server(
         context = state,
         max_receive_message_length = cfg.max_recv_msg_bytes,
         max_send_message_length = cfg.max_send_msg_bytes,
+        # The inbound cap: past it gRPCServer sheds a call at once with RESOURCE_EXHAUSTED, before
+        # any handler runs, and counts it in the `shed_total` that `gateway_requests_shed_total` reads.
+        max_concurrent_requests = _admission_limit(inbound_cap(cfg)),
         h2_initial_window_size = h2_initial_window_size,
         h2_connection_window_size = h2_connection_window_size
     )

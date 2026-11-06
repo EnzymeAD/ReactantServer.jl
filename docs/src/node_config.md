@@ -300,8 +300,10 @@ grpc:
   max_send_msg_bytes: 536870912
   error_detail: redacted          # what an INTERNAL error tells clients: redacted | full
   max_concurrent_requests_per_worker: 64  # inbound cap is this x worker count; 0 = uncapped.
-                                          # Sized above the outbound stream limit so a startup
-                                          # burst has headroom rather than being shed early
+                                          # A call past it is shed at once with RESOURCE_EXHAUSTED
+                                          # (gateway_requests_shed_total). Sized above the outbound
+                                          # stream limit so a startup burst has headroom rather
+                                          # than being shed early
 worker_client:
   request_timeout_seconds: 60
   max_concurrent_streams: 32      # outbound in-flight RPCs the gateway multiplexes to one worker

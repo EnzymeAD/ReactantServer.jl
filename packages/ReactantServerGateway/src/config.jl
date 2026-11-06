@@ -162,6 +162,15 @@ struct GatewayConfig
     error_detail::ErrorDetail
 end
 
+"""
+    inbound_cap(cfg) -> Int
+
+The gateway's inbound admission cap: `grpc.max_concurrent_requests_per_worker` times the number
+of worker endpoints, or 0 for uncapped. The gRPC server sheds a call past it at once with
+RESOURCE_EXHAUSTED (see `build_gateway_server`).
+"""
+inbound_cap(cfg::GatewayConfig) = cfg.max_concurrent_requests_per_worker * length(cfg.workers)
+
 # The positional form without `error_detail` (tests, older callers): production-safe redaction.
 GatewayConfig(
     listen_grpc, listen_metrics, workers, worker_metrics, worker_names,

@@ -193,9 +193,9 @@ function serve_gateway(gateway_path::Union{AbstractString, Nothing} = nothing; b
     host, port = _split_hostport(cfg.listen_grpc)
     # Inbound admission cap: a per-worker multiple of the configured budget, scaled by the fleet
     # size so the gateway sheds (RESOURCE_EXHAUSTED) only past what the workers can plausibly absorb.
-    # 0 (per-worker = 0) disables the cap. The server's own admission atomics are read live by the
-    # admission metrics.
-    max_concurrent = cfg.max_concurrent_requests_per_worker * length(cfg.workers)
+    # 0 (per-worker = 0) disables the cap. `build_gateway_server` gives it to the gRPC server, whose
+    # own admission atomics the admission metrics read live.
+    max_concurrent = inbound_cap(cfg)
     server = build_gateway_server(state, cfg, host, port)
     register_admission!(metrics, server.inflight, server.shed_total, max_concurrent)
     # Refuses new inference with UNAVAILABLE once the gateway drains.
