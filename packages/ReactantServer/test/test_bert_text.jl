@@ -100,9 +100,17 @@ end
 
             data, lens = _bt_wire(["the cat", "sat", ""])
             @test _BT.wire_texts(data, lens) == ["the cat", "sat", ""]
-            @test_throws ErrorException _BT.wire_texts(data, lens[1:2])
-            @test_throws ErrorException _BT.wire_texts(data, Int32[99, 1, 1])
-            @test_throws ErrorException _BT.wire_texts(data, Int32[-1, 1, 1])
+            # Client data errors are their own type, which the worker answers with INVALID_ARGUMENT
+            # rather than INTERNAL.
+            @test_throws _BT.TextInputError _BT.wire_texts(data, lens[1:2])
+            @test_throws _BT.TextInputError _BT.wire_texts(data, Int32[99, 1, 1])
+            @test_throws _BT.TextInputError _BT.wire_texts(data, Int32[-1, 1, 1])
+            # Bytes that are not UTF-8 are rejected at decode, before the tokenizer (where a
+            # malformed Char used to raise an InvalidCharError deep inside normalization).
+            bad = UInt8[0x61, 0xff, 0x62]
+            @test_throws _BT.TextInputError _BT.wire_text(bad)
+            @test_throws _BT.TextInputError _BT.wire_texts(reshape(bad, 3, 1), Int32[3])
+            @test _BT.wire_texts(reshape(bad, 3, 1), Int32[1]) == ["a"]     # only the row's own bytes count
         end
     end
 

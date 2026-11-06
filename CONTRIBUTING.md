@@ -37,8 +37,8 @@ The PyTorch portion skips gracefully when `torch`/`torchax` are unavailable.
 scripts that exercise the Reactant runtime and export paths in isolation.
 
 The CPU end-to-end test runs the node supervisor with two CPU workers and the embedded gateway as
-host processes (no containers, no GPU), drives a model through the gateway, and checks graceful
-shutdown:
+host processes (no containers, no GPU), drives a model through the gateway, and checks the graceful
+drain on SIGTERM (requests in flight finish, new ones get UNAVAILABLE, every process exits 0):
 
 ```
 bash packages/ReactantServer/test/e2e/run_e2e_cpu.sh

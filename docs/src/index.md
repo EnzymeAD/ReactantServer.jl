@@ -40,7 +40,7 @@ features:
     link: /on_demand_weights/
   - icon: 🔀
     title: A coalescing scheduler
-    details: A deficit-weighted, cost-aware scheduler merges same-model requests into one execution at a compiled batch size.
+    details: A weighted-fair scheduler, charging each model the GPU time it uses, merges same-model requests into one execution at a compiled batch size.
     link: /scheduling/
   - icon: 🔁
     title: Hot reload

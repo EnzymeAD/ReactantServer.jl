@@ -150,15 +150,10 @@ end
         @test arrs[1] == Float32[10, 20, 30, 40]
         @test isfile(region)
 
-        # A model rename rekeys the attachment; the region (content-addressed under the OLD name)
-        # stays mapped and a release under the NEW key detaches and unlinks it.
-        rename_host_weights!(store, key, key * "_renamed")
+        release_host_weights!(store, key * "_other")        # nothing attached under that key: no-op
         @test isfile(region)
-        release_host_weights!(store, key)                  # old key: no longer attached, no-op
-        @test isfile(region)
-        release_host_weights!(store, key * "_renamed")
+        release_host_weights!(store, key)
         @test !isfile(region)         # sole holder unlinks on release
-        rename_host_weights!(PrivateWeightStore(), "a", "b")   # no-op
     end
 end
 

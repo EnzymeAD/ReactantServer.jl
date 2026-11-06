@@ -76,8 +76,10 @@ end
 
 # Per-message wire caps. The 4 MiB gRPC default is far below what inference tensors routinely
 # need (a single 768x768x4 f32 output is ~9.4 MB), so the whole stack sizes generously: the worker
-# and gateway both default to 512 MiB and the client matches them. These are decode-time caps, not
-# allocations; raising them costs nothing until a message that large actually arrives.
+# and gateway both default to 512 MiB and the client matches them. The send cap is only a check on
+# each encoded request, but the receive cap is not free: gRPCClient allocates a buffer of a response
+# message's full declared length as soon as its 5-byte length prefix arrives, so each call being
+# received can hold up to the cap.
 const DEFAULT_MAX_MESSAGE_BYTES = 512 * 1024 * 1024
 
 # Per-direction default used when the constructor kwarg is omitted: the env var if set, else

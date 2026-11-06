@@ -5,6 +5,7 @@
 import InterProcessCommunication as IPC
 
 const _ShmInf = ReactantServer.inference
+const _RSCore = ReactantServer.ReactantServerCore
 
 _sp(s) = _ShmInf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:string_param, String(s)))
 _ip(i) = _ShmInf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:int64_param, Int64(i)))
@@ -190,10 +191,36 @@ end
                 WorkerRPC.ModelInfer, port,
                 _ShmInf.ModelInferRequest(; model_name = "scale4", inputs = [inB], outputs = [outB])
             )
-            @test isempty(mB.raw_output_contents)                 # output went to shm, not inline
+            # output went to shm, not inline: an empty placeholder keeps raw_output_contents positional
+            @test mB.raw_output_contents == [UInt8[]]
             @test mB.outputs[1].name == "y"
             # the server wrote the result into the region at offset 16
             @test reinterpret(Float32, view(vio, 17:32)) == Float32[6, 8, 10, 12]
+
+            # A shared-memory parameter of the wrong type is a client error (INVALID_ARGUMENT): an
+            # offset sent as a string must not be read as offset 0 and overwrite the input.
+            for (k, bad) in (
+                    ("shared_memory_offset", _sp("16")), ("shared_memory_byte_size", _sp("16")),
+                    ("shared_memory_region", _ip(1)),
+                )
+                outBad = _ShmInf.var"ModelInferRequest.InferRequestedOutputTensor"(;
+                    name = "y", parameters = merge(outB.parameters, Dict(k => bad))
+                )
+                fill!(view(vio, 17:32), 0x00)
+                try
+                    grpc_call(
+                        WorkerRPC.ModelInfer, port,
+                        _ShmInf.ModelInferRequest(; model_name = "scale4", inputs = [inB], outputs = [outBad])
+                    )
+                    @test false
+                catch ex
+                    @test ex isa gRPCClient.gRPCServiceCallException
+                    @test ex.grpc_status == Int(ReactantServer._G.StatusCode.INVALID_ARGUMENT)
+                    @test occursin("invalid value type", ex.message)
+                end
+                @test reinterpret(Float32, view(vio, 1:16)) == Float32[3, 4, 5, 6]   # input untouched
+                @test all(==(0x00), view(vio, 17:32))                                # nothing written
+            end
 
             # --- unregister one, then confirm it is gone ---
             ru = grpc_call(
@@ -278,5 +305,198 @@ end
     finally
         ReactantServer.shm_teardown!(reg)
         finalize(shm)
+    end
+end
+
+# The slot control protocol (CORE-3) on a real CPU worker, driven with a client-side BufferPool the
+# way ReactantServerClient stages a chunk: a claimed attempt gets its output written and its word
+# DONE; an attempt its client already gave up is dropped at dispatch (CANCELLED) and never written;
+# malformed and stale control is refused with the status the client acts on.
+@testset "slot control on a CPU worker (CORE-3)" begin
+    if !ReactantServer.slot_control_supported()
+        @test_skip false
+    else
+        mktempdir() do root
+            write_bundle(
+                root, "scale4"; manifest_yaml = """
+                format_version: "2.0"
+                name: scale4
+                executable_inputs:
+                  - {name: x, dtype: f32, shape: c, dims: {c: 4}}
+                executable_outputs:
+                  - {name: y, dtype: f32, shape: c, dims: {c: 4}}
+                batching: {compiled_batch_sizes: [1]}
+                """, mlir_text = """
+                module {
+                  func.func @main(%x: tensor<4xf32>, %w: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.multiply %x, %w : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+                """, weights = Dict("w" => Float32[2, 2, 2, 2]), argument_order = ["w"]
+            )
+            port = grpc_free_port()
+            cfg = ReactantServer.ServerConfig(
+                [root], "",
+                ReactantServer.RuntimeConfig(ReactantServer.CPU_BACKEND, 0, 0.9, true, true),
+                ReactantServer.SchedulerConfig(30.0, 64, 30.0),
+                ReactantServer.EndpointsConfig("127.0.0.1", port)
+            )
+            srv = ReactantServer.serve(cfg; backend = ReactantServer.ReactantBackend(), blocking = false)
+            sleep(0.3)
+            pool = ReactantServer.BufferPool(1 << 16; n_slots = 2)
+            name = ReactantServer.pool_region_name(pool)
+            try
+                grpc_call(
+                    WorkerRPC.SystemSharedMemoryRegister, port,
+                    _ShmInf.SystemSharedMemoryRegisterRequest(;
+                        name = name, key = "/" * name, offset = 0, byte_size = ReactantServer.pool_region_bytes(pool)
+                    )
+                )
+                s = ReactantServer.acquire_slot!(pool)
+                xin = ReactantServer.subslot(s, 16; align = 4)
+                yout = ReactantServer.subslot(s, 16; align = 4)
+                ReactantServer.pool_view(xin, Float32, 4) .= Float32[1, 2, 3, 4]
+                word() = unsafe_load(_RSCore._word_ptr(pool, s.index), 1, :acquire)
+                ctl(t) = Dict(
+                    ReactantServer.SLOT_CONTROL_REGION_PARAM => _sp(name),
+                    ReactantServer.SLOT_CONTROL_OFFSET_PARAM => _ip(ReactantServer.slot_control_offset(s)),
+                    ReactantServer.SLOT_CONTROL_TOKEN_PARAM => _ip(t)
+                )
+                shm(sub) = Dict(
+                    "shared_memory_region" => _sp(name), "shared_memory_offset" => _ip(sub.offset),
+                    "shared_memory_byte_size" => _ip(16)
+                )
+                input = _ShmInf.var"ModelInferRequest.InferInputTensor"(; name = "x", datatype = "FP32", shape = Int64[4], parameters = shm(xin))
+                out_shm = _ShmInf.var"ModelInferRequest.InferRequestedOutputTensor"(; name = "y", parameters = shm(yout))
+                out_inline = _ShmInf.var"ModelInferRequest.InferRequestedOutputTensor"(; name = "y")
+                infer(params, out) = grpc_call(
+                    WorkerRPC.ModelInfer, port,
+                    _ShmInf.ModelInferRequest(; model_name = "scale4", inputs = [input], outputs = [out], parameters = params)
+                )
+                status(f) = try
+                    f()
+                    nothing
+                catch ex
+                    ex isa gRPCClient.gRPCServiceCallException ? ex.grpc_status : rethrow()
+                end
+
+                # Claimed and written: the output lands and the word reads DONE.
+                t = ReactantServer.slot_arm!(s)
+                resp = infer(ctl(t), out_shm)
+                @test resp.raw_output_contents == [UInt8[]]
+                @test word() == _RSCore.slot_word(_RSCore.SLOT_DONE, t)
+                @test ReactantServer.slot_seal!(s)
+                @test ReactantServer.pool_view(yout, Float32, 4) == Float32[2, 4, 6, 8]
+
+                # Given up before it ran: dropped at dispatch. With an inline output only the dispatch
+                # check can answer CANCELLED, so this is the scheduler's predicate at work.
+                fill!(ReactantServer.pool_view(yout, UInt8, 16), 0x00)
+                t2 = ReactantServer.slot_arm!(s)
+                @test ReactantServer.slot_seal!(s)           # closes OWNED(t2), as giving up does
+                @test status(() -> infer(ctl(t2), out_inline)) == Int(ReactantServer._G.StatusCode.CANCELLED)
+                @test status(() -> infer(ctl(t2), out_shm)) == Int(ReactantServer._G.StatusCode.CANCELLED)
+                @test all(==(0x00), ReactantServer.pool_view(yout, UInt8, 16))
+
+                # Malformed control is a client error; a control word in an unknown region is stale.
+                t3 = ReactantServer.slot_arm!(s)
+                partial = filter(kv -> first(kv) != ReactantServer.SLOT_CONTROL_TOKEN_PARAM, ctl(t3))
+                @test status(() -> infer(partial, out_shm)) == Int(ReactantServer._G.StatusCode.INVALID_ARGUMENT)
+                typed = merge(ctl(t3), Dict(ReactantServer.SLOT_CONTROL_TOKEN_PARAM => _sp("1")))
+                @test status(() -> infer(typed, out_shm)) == Int(ReactantServer._G.StatusCode.INVALID_ARGUMENT)
+                stale = merge(ctl(t3), Dict(ReactantServer.SLOT_CONTROL_REGION_PARAM => _sp("gone")))
+                @test status(() -> infer(stale, out_inline)) == Int(ReactantServer._G.StatusCode.FAILED_PRECONDITION)
+                @test word() == _RSCore.slot_word(_RSCore.SLOT_OWNED, t3)   # untouched
+                # A request without control still works (third-party clients).
+                @test infer(Dict{String, _ShmInf.InferParameter}(), out_shm).outputs[1].name == "y"
+                @test ReactantServer.pool_view(yout, Float32, 4) == Float32[2, 4, 6, 8]
+                ReactantServer.release_slot!(s)
+            finally
+                ReactantServer.stop!(srv)
+                close(pool)
+            end
+        end
+    end
+end
+
+# The same give-up versus write race as the Core test, with the client and the writer on separate
+# threads and random spins between every step, so the interleavings are not limited to yield points.
+# Both spins start from a go signal, not from the spawn: `Threads.@spawn` returns only after waking
+# each sleeping thread in turn, which keeps the client busy for over 100 us on a 64-thread host
+# while the writer is already running, so nearly every write would finish before the client could
+# give up. The busy-waits pass a GC safepoint, so a collection requested meanwhile cannot deadlock
+# them. Iterations go on past 2000 until every outcome has been seen 20 times, up to 20000.
+@testset "slot control under thread interleavings (CORE-3)" begin
+    if !ReactantServer.slot_control_supported() || Threads.nthreads() < 2
+        @test_skip false
+    else
+        pool = ReactantServer.BufferPool(1 << 16; n_slots = 1)
+        reg = ReactantServer.SharedMemoryRegistry(; reap_interval = 0)
+        ReactantServer.shm_register!(reg, "r", "/" * ReactantServer.pool_region_name(pool), 0, ReactantServer.pool_region_bytes(pool))
+        r = ReactantServer.shm_regions(reg)["r"]
+        function spin(ns)
+            t0 = time_ns()
+            while time_ns() - t0 < ns
+            end
+            return nothing
+        end
+        n = 4096
+        outcomes = Dict{Symbol, Int}()
+        kinds = (:refused, :written, :quarantined)
+        bad = 0
+        iters = 0
+        try
+            while iters < 2000 || (iters < 20_000 && any(k -> get(outcomes, k, 0) < 20, kinds))
+                iters += 1
+                s = ReactantServer.acquire_slot!(pool)
+                out = ReactantServer.subslot(s, n)
+                view = ReactantServer.pool_view(out, UInt8, n)
+                fill!(view, 0x00)
+                ReactantServer.slot_arm!(s)
+                c = ReactantServer.SlotControl(r, ReactantServer.slot_control_offset(s), s.token)
+                pattern = fill(UInt8(1 + iters % 200), n)
+                ready = Threads.Atomic{Bool}(false)
+                go = Threads.Atomic{Bool}(false)
+                writer = Threads.@spawn begin
+                    ready[] = true
+                    while !go[]
+                        GC.safepoint()
+                    end
+                    spin(rand(0:30_000))
+                    try
+                        _RSCore.shm_write_controlled!(c, [(pattern, out.offset, n)], "m"; chunk_bytes = 256, before_chunk = () -> spin(rand(0:2_000)))
+                        :written
+                    catch e
+                        e isa ReactantServer.RequestCancelled || rethrow()
+                        :refused
+                    end
+                end
+                while !ready[]
+                    GC.safepoint()
+                end
+                go[] = true                                      # both spins start here
+                spin(rand(0:40_000))
+                ReactantServer.release_slot!(s)                  # the client gives up
+                if pool.quarantined[1]
+                    result = fetch(writer)
+                    reuse = ReactantServer.try_acquire_slot!(pool)
+                    (result === :written && reuse !== nothing && view == pattern) || (bad += 1)
+                    outcomes[:quarantined] = get(outcomes, :quarantined, 0) + 1
+                else
+                    reuse = ReactantServer.try_acquire_slot!(pool)
+                    fill!(view, 0xee)                            # the next user's data
+                    result = fetch(writer)
+                    (reuse !== nothing && all(==(0xee), view)) || (bad += 1)
+                    outcomes[result] = get(outcomes, result, 0) + 1
+                end
+                reuse === nothing || ReactantServer.release_slot!(reuse)
+            end
+        finally
+            ReactantServer.shm_teardown!(reg)
+            close(pool)
+        end
+        @info "slot control thread interleavings" iterations = iters outcomes
+        @test bad == 0
+        @test all(k -> get(outcomes, k, 0) >= 20, kinds)
     end
 end

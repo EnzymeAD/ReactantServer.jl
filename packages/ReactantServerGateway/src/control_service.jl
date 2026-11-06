@@ -20,8 +20,10 @@ const _REPACK_WAIT_MAX_SECONDS = 120.0
 
 # --- error mapping ----------------------------------------------------------------------------
 
-# Run a control action, mapping a rejected value to INVALID_ARGUMENT and anything unexpected to
-# INTERNAL. Mirrors the worker's `_as_control` (packages/ReactantServer/src/transport/control_grpc.jl).
+# Run a control action, mapping a rejected value to INVALID_ARGUMENT. Anything unexpected is rethrown
+# and reaches the client as INTERNAL through `_gw_status`, which logs it under a request id and
+# redacts it as `grpc.error_detail` says. Mirrors the worker's `_as_control`
+# (packages/ReactantServer/src/transport/control_grpc.jl).
 function _as_gateway_control(f)
     try
         return f()
@@ -29,13 +31,7 @@ function _as_gateway_control(f)
         e isa gRPCServer.GRPCError && rethrow()
         e isa ReactantServerCore.ConfigError &&
             throw(gRPCServer.GRPCError(gRPCServer.StatusCode.INVALID_ARGUMENT, e.msg))
-        @error "gateway control: handler failed" exception = (e, catch_backtrace())
-        throw(
-            gRPCServer.GRPCError(
-                gRPCServer.StatusCode.INTERNAL,
-                "gateway control call failed: $(sprint(showerror, e))"
-            )
-        )
+        rethrow()
     end
 end
 
@@ -487,8 +483,8 @@ end
 register_gateway_control_service!(server, state::GatewayState) =
     register_GatewayControlService!(
     server;
-    GetSchedulingStatus = (ctx, req) -> _gw_scheduling_status(req, ctx.payload),
-    SetSchedulingPolicy = (ctx, req) -> _gw_set_scheduling_policy(req, ctx.payload),
-    SetModelPlacement = (ctx, req) -> _gw_set_model_placement(req, ctx.payload),
-    Repack = (ctx, req) -> _gw_repack(req, ctx.payload)
+    GetSchedulingStatus = _gw_handler(_gw_scheduling_status, "GetSchedulingStatus"),
+    SetSchedulingPolicy = _gw_handler(_gw_set_scheduling_policy, "SetSchedulingPolicy"),
+    SetModelPlacement = _gw_handler(_gw_set_model_placement, "SetModelPlacement"),
+    Repack = _gw_handler(_gw_repack, "Repack")
 )

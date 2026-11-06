@@ -263,7 +263,7 @@ end
         @test sched.weight_cache.footprints[name].scratch_bytes == scratch + 8
     end
     # Pinned models are probed too under the resettable regime (their cost estimate got seeded).
-    @test haskey(sched.registry.by_name["pinned"].sched.cost_estimate, 1)
+    @test haskey(sched.registry.by_name["pinned"].sched.cost_estimate, (ReactantServer.VariantKey(), 1))
 end
 
 @testset "memory probe: the monotone-peak fallback stays ordering-based and inherits pollution" begin

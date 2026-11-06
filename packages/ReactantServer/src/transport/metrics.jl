@@ -112,7 +112,7 @@ function Prometheus.collect!(metrics::Vector, c::AdmissionCollector)
         metrics,
         _scalar(
             "worker_inflight_requests", "gauge",
-            "RPCs currently being handled (counted only when the cap is enabled).", c.inflight[]
+            "RPCs admitted and still being handled.", c.inflight[]
         ),
         _scalar(
             "worker_requests_shed_total", "counter",
@@ -559,15 +559,15 @@ function _gpu_identity(cfg::ServerConfig, env::AbstractDict = ENV)
 end
 
 """
-    start_worker_metrics(metrics, host, port; ready_fn, worker_name="", gpu="") -> HTTP server
+    start_worker_metrics(metrics, host, port; ready_fn, live_fn, worker_name="", gpu="") -> HTTP server
 
-Serve `/metrics` (Prometheus text exposition), `/healthz`, and `/readyz` (`ready_fn()`) on an
-HTTP/1.1 listener. Mirrors the gateway's admin server. Non-empty `worker_name` / `gpu` are
+Serve `/metrics` (Prometheus text exposition), `/healthz` (`live_fn()`, always live by default), and
+`/readyz` (`ready_fn()`) on an HTTP/1.1 listener. Mirrors the gateway's admin server. Non-empty `worker_name` / `gpu` are
 injected as constant `worker` / `gpu` labels on every exported series. Close the returned
 server to stop it.
 """
 function start_worker_metrics(
-        m::WorkerMetrics, host::AbstractString, port::Integer; ready_fn,
+        m::WorkerMetrics, host::AbstractString, port::Integer; ready_fn, live_fn = Returns(true),
         worker_name::AbstractString = "", gpu::AbstractString = ""
     )
     labels = Pair{String, String}[]
@@ -585,7 +585,7 @@ function start_worker_metrics(
             end
             return HTTP.Response(200, ["Content-Type" => PROMETHEUS_EXPOSITION_CONTENT_TYPE]; body = body)
         elseif target == "/healthz"
-            return HTTP.Response(200; body = "ok")
+            return live_fn() ? HTTP.Response(200; body = "ok") : HTTP.Response(503; body = "not live")
         elseif target == "/readyz"
             return ready_fn() ? HTTP.Response(200; body = "ok") : HTTP.Response(503; body = "not ready")
         else

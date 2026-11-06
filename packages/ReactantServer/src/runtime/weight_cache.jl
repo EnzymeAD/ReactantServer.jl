@@ -16,6 +16,14 @@
 # residency. The lock guards the brief bookkeeping commits against the read-only metrics snapshot;
 # the slow device transfers run outside it.
 
+# A cached host copy of a model's weights (private store) and the entry it was read for. A reload is
+# a new entry under the same name, whose program can bind different weights, so a copy serves only
+# the entry that read it (see `_cached_host`): the version that replaced it reads its own.
+struct HostCopy
+    entry::ModelEntry
+    arrays::Vector{Any}
+end
+
 mutable struct WeightCache
     backend::AbstractBackend
     pool::MemoryPool
@@ -43,7 +51,7 @@ mutable struct WeightCache
     # Host weight cache (host_cache below). With the shared store the budget and the cache live in
     # /dev/shm (`store.budget`); with the private store they are this worker's, below.
     host_budget::Union{Int, Nothing}       # this worker's share of the host budget (private store); nothing = unbudgeted
-    host_cached::Dict{String, Vector{Any}} # private store: cached host copies of unpinned models
+    host_cached::Dict{String, HostCopy}    # private store: cached host copies of unpinned models
     # private store: each model's load rank (`bump_load_rank`), its decayed count of device loads,
     # which orders eviction. Kept after a copy is evicted, so a model's standing outlives its copy.
     host_rank::Dict{String, Float64}
@@ -81,7 +89,7 @@ WeightCache(
     WeightCache(
     backend, pool, registry, mode, store, Int(max_bytes), 0, String[], 0, 0, 0.0, 0, 0, 0, 0, 0,
     Dict{String, ModelFootprint}(), 0.0, Float64(min_residency_seconds), VictimSearch(), 0, 0,
-    host_budget === nothing ? nothing : Int(host_budget), Dict{String, Vector{Any}}(), Dict{String, Float64}(), 0, 0, 0,
+    host_budget === nothing ? nothing : Int(host_budget), Dict{String, HostCopy}(), Dict{String, Float64}(), 0, 0, 0,
     false, Set{String}(), 0.0, 0, 0.0, 0, Dict{Symbol, Int}(r => 0 for r in EVICT_REASONS), 0.0, 0, 0, 0.0,
     ReentrantLock()
 )
@@ -444,7 +452,7 @@ function _set_residency_state!(
     drop_host = false
     if target == PINNED_SYSTEM && model.host_weights === nothing
         # A cached host copy (private store) becomes the floor without rereading the file.
-        new_host = _take_cached_host!(cache, entry.name)
+        new_host = _take_cached_host!(cache, entry)
         new_host === nothing && (new_host = floor)
         new_host === nothing && (new_host = host_materialize(cache.store, entry, model.sig.weight_names))
     elseif target == UNPINNED && model.host_weights !== nothing
@@ -484,7 +492,7 @@ function _set_residency_state!(
     # Under a host budget a dropped floor stays cached (the shared store keeps the region; the
     # private store keeps the arrays if they fit), so the next load does not read the file.
     if host_budgeted(cache) && !(cache.store isa SharedWeightStore)
-        drop_host && _cache_host!(cache, entry.name, old_host; load = false)
+        drop_host && _cache_host!(cache, entry, old_host; load = false)
         target == PINNED_SYSTEM && _fit_floors!(cache)
     end
     log_residency_change(
@@ -532,29 +540,6 @@ function release_all!(cache::WeightCache, entry::ModelEntry)
         host_release!(cache.store, entry.name)
     end
     _uncache_host!(cache, entry.name)
-    return nothing
-end
-
-"""
-    rename!(cache, old, new) -> nothing
-
-Rekey a model's residency bookkeeping from `old` to `new` after a model rename: the LRU entry
-(when the model is device-resident and non-pinned) and the host-weight store key. No device or
-host memory moves; the weights themselves are untouched. Runs on the dispatch thread (sole
-residency mutator), like every other cache mutation.
-"""
-function rename!(cache::WeightCache, old::AbstractString, new::AbstractString)
-    lock(cache.lock) do
-        i = findfirst(==(String(old)), cache.lru)
-        i === nothing || (cache.lru[i] = String(new))
-        fp = pop!(cache.footprints, String(old), nothing)
-        fp === nothing || (cache.footprints[String(new)] = fp)
-        arrays = pop!(cache.host_cached, String(old), nothing)
-        arrays === nothing || (cache.host_cached[String(new)] = arrays)
-        rank = pop!(cache.host_rank, String(old), nothing)
-        rank === nothing || (cache.host_rank[String(new)] = rank)
-    end
-    host_rename!(cache.store, old, new)
     return nothing
 end
 

@@ -74,7 +74,41 @@ replicated on every GPU unless the gateway's `lpt_packing` mode places it on few
 `REACTANT_NODE_FILE`. On a host without GPUs, `REACTANT_GPUS=0` with `backend: cpu` makes a CPU
 node, and `REACTANT_CPU_WORKERS` sets its worker count. `REACTANT_ROLE` selects what the
 supervisor runs: the default `all`, or only the `workers` or only the `gateway`, for splitting a
-node across machines.
+node across machines. `REACTANT_RAPID_RESET_PROTECTION=true` turns HTTP/2 Rapid-Reset protection on
+for the gateway and every worker the supervisor launches, and overrides
+`global.grpc.rapid_reset_protection` in the node file. It is off by default. When it is on, a client
+is disconnected after about 200 calls it gave up on per connection; see
+[Rapid-Reset protection](node_config.md#Rapid-Reset-protection).
+
+### Stopping
+
+On SIGTERM (or a SIGINT sent to the supervisor alone; Ctrl-C in a terminal also reaches its
+children and stops them at once) the supervisor drains the node from the outside in, so requests
+already accepted finish instead of failing:
+
+1. The gateway stops accepting requests: `/readyz` reports 503, and a new ModelInfer gets
+   UNAVAILABLE. The requests it has already forwarded finish on the workers, which are still
+   serving, for up to 60 seconds; then the gateway exits.
+2. The workers are then asked to stop, all at once. Each one refuses new inference with
+   UNAVAILABLE, reports not ready (`ServerReady`, `ModelReady`, `RepositoryIndex` and `/readyz`), so
+   a gateway elsewhere routes around it, and finishes its queued and in-flight requests for up to
+   15 seconds (60 when a sole worker serves the public ports itself, with no gateway). Then it shuts
+   down and exits with status 0.
+3. The supervisor exits with status 0 once every child has.
+
+An idle node stops in a few seconds; the budgets only matter while requests are in flight. A child
+that does not exit within its budget plus its grace window (10 seconds for the gateway, 15 for a
+worker) is sent SIGKILL, and one that does not acknowledge the request within 10 seconds, typically
+a worker still compiling its models at startup, is sent SIGTERM instead. The drain is best effort:
+if the container runtime's stop timeout runs out first, the runtime kills the node.
+
+The supervisor does not ask its children to drain with a signal. The worker and the gateway run
+more than one thread, which requires Julia's own signal handling, and under it SIGTERM ends the
+process at once. So the supervisor gives each child a pipe on stdin and asks it to drain by closing
+that pipe (`REACTANT_STDIN_DRAIN_SECONDS` in the child's environment carries the budget). A worker
+or gateway run without the supervisor still exits at once on SIGTERM; in your own process, drain
+one with `stop!(server; drain_seconds = 30)`, or call `request_drain!(30)` to make a blocking
+`serve` drain and return.
 
 ## The container image
 
@@ -102,8 +136,9 @@ Reactant, CUDA) and the driver it requires.
 Every model compiles on every worker before the gRPC port accepts traffic, so the first start
 is slow; later starts load the compiled programs from each bundle's cache
 (`runtime.executable_cache` in [Node Configuration](node_config.md)). Watch readiness with `curl -sf http://127.0.0.1:8002/readyz` or the container's health status,
-not the container state. On stop, the supervisor drains its workers on SIGTERM; give it room
-before the runtime escalates to SIGKILL (`--stop-timeout`, or `stop_grace_period` in compose).
+not the container state. On stop, the supervisor drains the gateway and then the workers on
+SIGTERM ([Stopping](#Stopping)); give it room before the runtime escalates to SIGKILL
+(`--stop-timeout`, or `stop_grace_period` in compose).
 
 ### Container settings
 
@@ -136,6 +171,13 @@ With `shared_host_weights` on, size `/dev/shm` above the combined weights of eve
 serves, plus room for the client regions. A tmpfs is allocated lazily, so a generous limit costs
 nothing until it is used. `--shm-size` does not apply together with `--ipc=host`.
 
+Do not let `/dev/shm` fill. Because its pages are allocated lazily, a client's shared-memory pool
+is created without error on a nearly full `/dev/shm`, and whichever process later touches a page
+there is no room for is killed by SIGBUS: the client while it stages inputs, or the worker while
+it writes outputs into the client's region. A worker killed this way fails every request in flight
+on it, and the supervisor restarts it. Size `/dev/shm` (`--shm-size`) for every client pool plus
+the shared weights, and watch its use (`df /dev/shm`).
+
 **Process and thread limits.** Podman limits a container to 2048 processes by default
 (`--pids-limit`), and the limit counts threads. Each worker runs a Julia compute pool, XLA's
 asynchronous runners, and the host libraries' own pools, so a multi-GPU node can cross 2048
@@ -151,7 +193,13 @@ worker should run.
 
 **Model repository.** Mount it at `/var/lib/reactantserver/models`, writable: the compiled
 executable cache lives inside each bundle, so a read-only mount recompiles every program on every
-start. In `dynamic` mode the server watches the mount and hot-loads changes.
+start. In `dynamic` mode the server watches the mount and hot-loads changes. It cannot tell a
+mount that has gone away from a repository that was emptied: if the repository is missing or lists
+no bundles at two consecutive polls (`model_poll_seconds`, 15 s by default), as can happen with
+network storage (an NFS stale handle, an autofs expiry, a remount), every worker that watches it
+unloads every model from it (their requests get `NOT_FOUND`) and loads them again one at a time
+once it is back. Keep the repository on local storage, or use `model_control_mode: static`, which
+does not watch it.
 
 **Persistent caches.** Mount a volume at `/var/cache/reactant-compile` to keep XLA's autotune
 results across container recreation; without it every start re-times every GEMM and convolution.
@@ -186,13 +234,15 @@ and healthcheck scripts.
 ## Outside the image
 
 The supervisor runs the same way from a Julia environment, as in [Run a Node](tutorials/julia/node.md).
-Start it with `julia --handle-signals=no` so its own handler runs and it shuts its workers down on
-SIGTERM. Unlike the image, such an environment resolves its dependencies itself, so it does not get
-the image's locked versions or its precompiled caches. On a GPU host, select the Reactant CUDA build
-before the environment precompiles, with `REACTANT_GPU=cuda` and `REACTANT_GPU_VERSION` (`12.9` or
-`13.1`), and make sure the host provides the CUDA libraries Reactant loads by name
-(`libnvJitLink.so.13`, `libnvrtc.so.13`, `libcupti.so`). `INFERENCE_SERVER_MODEL_DIRS` overrides the
-node file's model repository (colon-separated). Use the container for anything long-running.
+Start it with `julia --handle-signals=no --threads=1,0` so its own handler runs and it drains its
+children on SIGTERM ([Stopping](#Stopping)). Turning off Julia's signal handling is only safe on
+one thread, so the supervisor refuses to start with more. Unlike the image, such an environment
+resolves its dependencies itself, so it does not get the image's locked versions or its precompiled
+caches. On a GPU host, select the Reactant CUDA build before the environment precompiles, with
+`REACTANT_GPU=cuda` and `REACTANT_GPU_VERSION` (`12.9` or `13.1`), and make sure the host provides
+the CUDA libraries Reactant loads by name (`libnvJitLink.so.13`, `libnvrtc.so.13`, `libcupti.so`).
+`INFERENCE_SERVER_MODEL_DIRS` overrides the node file's model repository (colon-separated). Use the
+container for anything long-running.
 
 ## Where the children load from
 

@@ -94,7 +94,7 @@ end
 
 """
     load_bundle_entry(dir; validator=NullSignatureValidator(), batch_sizes=BATCH_SIZES_ALL,
-                      weights_migration=MIGRATE_OFF) -> ModelEntry
+                      weights_migration=MIGRATE_OFF, signature=nothing) -> ModelEntry
 
 Parse and validate the bundle directory `dir` into an uncompiled `ModelEntry` (its `executable`
 and `sched` slots are `nothing`). The model's name is the directory's basename: renaming the
@@ -104,14 +104,17 @@ and the metadata RPC, agrees on the served name). Used by both `load_bundles` an
 watcher (see watcher.jl) to load a single bundle. `batch_sizes` selects which compiled batch
 sizes are read (see [`BatchSizeMode`](@ref)). `weights_migration` converts a legacy-order weights
 file first (see [`migrate_bundle_weights!`](@ref)); a failed migration is logged and the bundle
-loads as it was.
+loads as it was. `signature`, when a `Ref`, receives the bundle's `bundle_signature` taken
+after the migration (which rewrites files) and before any file is read: the version of the files
+this entry is built from.
 """
 function load_bundle_entry(
         dir::AbstractString; validator::SignatureValidator = NullSignatureValidator(),
         batch_sizes::BatchSizeMode = BATCH_SIZES_ALL,
-        weights_migration::WeightsMigration = MIGRATE_OFF
+        weights_migration::WeightsMigration = MIGRATE_OFF, signature = nothing
     )
     migrate_bundle_weights!(dir, weights_migration)
+    signature === nothing || (signature[] = bundle_signature(dir))
     manifest_path = joinpath(dir, "manifest.yaml")
     raw = YAML.load_file(manifest_path; dicttype = Dict{String, Any})
     raw isa AbstractDict || throw(BundleError("manifest in $dir is not a mapping"))
@@ -154,11 +157,14 @@ end
 
 function _load_one_bundle!(
         reg::ModelRegistry, dir::AbstractString, validator::SignatureValidator,
-        batch_sizes::BatchSizeMode, weights_migration::WeightsMigration = MIGRATE_OFF
+        batch_sizes::BatchSizeMode, weights_migration::WeightsMigration = MIGRATE_OFF;
+        signatures = nothing
     )
-    entry = load_bundle_entry(dir; validator, batch_sizes, weights_migration)
+    sig = signatures === nothing ? nothing : Ref{BundleSig}()
+    entry = load_bundle_entry(dir; validator, batch_sizes, weights_migration, signature = sig)
     (haskey(reg.by_name, entry.name) || haskey(reg.meta, entry.name)) &&
         throw(BundleError("duplicate model name '$(entry.name)'"))
+    signatures === nothing || (signatures[entry.name] = sig[])
     if entry isa MetaEntry
         reg.meta[entry.name] = entry
     else
@@ -168,7 +174,8 @@ function _load_one_bundle!(
 end
 
 """
-    load_bundles(model_dirs; validator=NullSignatureValidator(), include=nothing, batch_sizes=BATCH_SIZES_ALL) -> ModelRegistry
+    load_bundles(model_dirs; validator=NullSignatureValidator(), include=nothing, batch_sizes=BATCH_SIZES_ALL,
+                 weights_migration=MIGRATE_OFF, signatures=nothing) -> ModelRegistry
 
 Discover every subdirectory containing a manifest.yaml under each model dir, load and
 validate it, and register it. The runtime fills each entry's executable slot afterwards.
@@ -177,14 +184,16 @@ When `include` is a non-empty collection of model names, only bundles whose dire
 is in the set are loaded. The directory name IS the model name (see `load_bundle_entry`), so
 filtering by directory avoids parsing skipped manifests. Names in `include` that are not found
 in any model dir produce a warning. `batch_sizes` and `weights_migration` are passed to every
-[`load_bundle_entry`](@ref).
+[`load_bundle_entry`](@ref). `signatures`, when a `Dict`, receives each loaded bundle's signature
+as it was read (see `load_bundle_entry`), which seeds the directory watcher.
 """
 function load_bundles(
         model_dirs::AbstractVector{<:AbstractString};
         validator::SignatureValidator = NullSignatureValidator(),
         include = nothing,
         batch_sizes::BatchSizeMode = BATCH_SIZES_ALL,
-        weights_migration::WeightsMigration = MIGRATE_OFF
+        weights_migration::WeightsMigration = MIGRATE_OFF,
+        signatures = nothing
     )
     want = include === nothing ? nothing : Set{String}(String(x) for x in include)
     reg = ModelRegistry()
@@ -198,7 +207,7 @@ function load_bundles(
             if want !== nothing && !(name in want)
                 continue
             end
-            _load_one_bundle!(reg, child, validator, batch_sizes, weights_migration)
+            _load_one_bundle!(reg, child, validator, batch_sizes, weights_migration; signatures)
             push!(found, name)
         end
     end

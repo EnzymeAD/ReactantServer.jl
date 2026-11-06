@@ -1,4 +1,4 @@
-# The scheduler: a deficit-weighted, cost-aware, coalescing dispatch policy.
+# The scheduler: a weighted-fair, coalescing dispatch policy.
 #
 # Requests arrive concurrently and are placed in per-model queues. Whenever the GPU is free
 # the scheduler decides which model to dispatch next, coalesces that model's queued requests
@@ -7,9 +7,9 @@
 # its own threading. Only one execution runs at a time by design.
 #
 # Decision order each time the GPU frees up:
-#   1. Score every model with a non-empty queue by a deficit-weighted, cost-aware
-#      priority and pick the highest (or, under the FIFO discipline, pick the model
-#      with the oldest queued request).
+#   1. Pick the model with a non-empty queue that has been charged the least device time
+#      for its weight (or, under the FIFO discipline, the model with the oldest queued
+#      request; under EDF, the soonest deadline).
 #   2. Coalesce the selected model's queued requests (FIFO) into one compiled-batch-size
 #      dispatch; the remainder stays queued.
 #
@@ -17,15 +17,22 @@
 # they are not implemented.
 #
 # A single Threads.Condition guards all mutable scheduler state (the per-model queues and the
-# EMA/cost fields) and signals the dispatch loop when work arrives. The loop holds the lock
-# only to select and dequeue; the actual execution runs outside the lock so producers keep
-# enqueuing during GPU work, then the lock is re-taken briefly to record the dispatch.
+# virtual-time, EMA and cost fields) and signals the dispatch loop when work arrives. The loop
+# holds the lock only to select and dequeue; the actual execution runs outside the lock so
+# producers keep enqueuing during GPU work, then the lock is re-taken briefly to record the
+# dispatch.
 
-# Effective cost used for scoring when a (model, batch size) pair has no measurement yet. The
-# absolute value does not matter: while every candidate is unseeded they share it, so the
-# deficit term decides. Warmup normally seeds real values before traffic arrives.
-const _DEFAULT_COST = 0.01            # seconds
 const _WAIT_SAMPLE_CAP = 1024         # bounded ring of recent queue-wait samples per model
+
+# How the learned cost of a compiled program moves (see `_update_cost!`). One measurement raises an
+# estimate by at most `_COST_MAX_RISE` of itself. A new measurement's weight is `cost_ema_alpha` for
+# back-to-back runs and grows toward 1 as the estimate ages, the estimate's own weight halving every
+# `_COST_HALFLIFE_SECONDS` since it was last refreshed. Under EDF, an estimate not refreshed for
+# `_COST_STALE_SECONDS` is measured again before the laxity check sheds a whole dispatch on it (see
+# `execute_and_record!`).
+const _COST_MAX_RISE = 0.25
+const _COST_HALFLIFE_SECONDS = 2.0
+const _COST_STALE_SECONDS = 10.0
 
 # `ModelSchedState` (the per-model scheduling state) is defined in `runtime/model_types.jl` so
 # that `ModelEntry` can hold it; its methods live here.
@@ -37,11 +44,14 @@ struct ControlCommand
     reply::Channel{Any}
 end
 
-# Admits at most `capacity` meta orchestrations at once on this worker (default 1). A meta holds a
-# permit across its WHOLE run, including the CPU glue between stages, so only one meta's GPU sub-calls
-# ever compete with regular work; the GPU itself is not held during glue (sub-calls dispatch on the
-# loop). `acquire_meta_gate!` is deadline-bounded: a meta that cannot get a permit before its deadline
-# is shed before doing any GPU work, so a meta backlog sheds at admission rather than piling up.
+# Admits at most `capacity` meta orchestrations at once on this worker. The constructor defaults to 1,
+# as does a bare `Scheduler`; a served worker passes REACTANT_META_CONCURRENCY (default 2, see
+# server.jl `_meta_concurrency`). A compute-only meta (no `calls`) bypasses the gate. A meta holds a
+# permit across its WHOLE run, including the CPU glue between stages, so at most `capacity` metas' GPU
+# sub-calls ever compete with regular work; the GPU itself is not held during glue (sub-calls dispatch
+# on the loop). `acquire_meta_gate!` is deadline-bounded: a meta that cannot get a permit before its
+# deadline is shed before doing any GPU work, so a meta backlog sheds at admission rather than piling
+# up.
 mutable struct MetaGate
     cond::Threads.Condition   # guards `n_held`
     capacity::Int
@@ -89,10 +99,10 @@ end
 """
     Scheduler
 
-The deficit-weighted, cost-aware, coalescing dispatch engine. Concurrent
+The weighted-fair, coalescing dispatch engine. Concurrent
 requests land on per-model queues; a single dispatch loop runs one GPU execution at a time,
 coalescing same-model requests into one batched execution at a compiled size and sharing GPU
-time by relative model weight and a learned per-batch-size cost estimate. It holds the
+time by relative model weight, charged in measured device seconds. It holds the
 model registry, the backend, the device memory pool, the [`SchedulerConfig`](@ref),
 per-model dispatch state, and an optional on-demand `WeightCache`. Submit work with
 [`infer`](@ref) and read observability counters with [`scheduler_metrics`](@ref).
@@ -108,10 +118,11 @@ mutable struct Scheduler
     weight_cache::Union{WeightCache, Nothing}   # on-demand weight residency, or nothing when disabled
     scratch_pool::Union{BufferPool, Nothing}    # local reuse pool for meta intermediates (plain Memory); nothing disables
     control::Vector{ControlCommand}            # pending control commands, drained by the dispatch loop
-    meta_gate::MetaGate                        # admits one meta orchestration at a time (capacity configurable)
+    meta_gate::MetaGate                        # admits `capacity` GPU-using metas at once: 1 as constructed,
+    # REACTANT_META_CONCURRENCY (default 2) on a served worker
     committed::Vector{QueuedRequest}           # in-flight metas' continuation sub-calls awaiting the next GPU slot, each
     # dispatched ahead of the discipline scan. One entry per in-flight meta, so
-    # it is bounded by the gate: committed count == REACTANT_META_CONCURRENCY.
+    # it is bounded by the gate: at most its capacity (REACTANT_META_CONCURRENCY on a served worker).
     compact_loads_mark::Int                    # weight-cache load count at the last automatic compaction; sole
     # writer is the dispatch thread. Drives load-driven compaction:
     # compact once `weight_cache.loads` advances by `cfg.compaction_interval`.
@@ -121,13 +132,19 @@ mutable struct Scheduler
     residency_lock::ReentrantLock              # one residency change at a time (`set_residency!`)
     prefetched::Dict{String, Any}              # weights staged ahead of a placement change, by model
     # (`stage_weights!`); guarded by `cond`
+    failure::Any                               # the exception that killed the dispatch loop, or nothing
+    # while it serves (see `_dispatch_loop_died!`); guarded by `cond`
+    on_failure::Any                            # `f(err)` run once if the dispatch loop dies, or nothing
+    vfloor::Float64                            # virtual time of the most recent fair dispatch; never
+    # decreases (see `_select_fair!`); guarded by `cond`
 end
 
 function Scheduler(registry::ModelRegistry, backend::AbstractBackend, pool::MemoryPool, cfg::SchedulerConfig)
     return Scheduler(
         registry, backend, pool, cfg,
         Threads.Condition(), false, nothing, nothing, nothing, ControlCommand[],
-        MetaGate(1), QueuedRequest[], 0, nothing, ReentrantLock(), Dict{String, Any}()
+        MetaGate(1), QueuedRequest[], 0, nothing, ReentrantLock(), Dict{String, Any}(),
+        nothing, nothing, 0.0
     )
 end
 
@@ -141,11 +158,16 @@ end
 
 
 # ---------------------------------------------------------------------------------------------
-# EMA and cost-estimate updates
+# Fair charging, EMA and cost-estimate updates
 # ---------------------------------------------------------------------------------------------
 
+# Charge `seconds` of dispatch-loop time to a model's fair-discipline virtual time, scaled by its
+# weight: a model of weight 2 is charged half as much per second, so it gets twice the share.
+_charge_fair!(st::ModelSchedState, seconds::Real) = (st.vtime += max(Float64(seconds), 0.0) / st.weight; nothing)
+
 # Decay the recent-compute EMA to `now` by the configured half-life. Applied consistently
-# before any read or write so the stored value is always current.
+# before any read or write so the stored value is always current. The EMA is reported
+# (`scheduler_metrics`); no discipline schedules by it.
 function _decay_ema!(st::ModelSchedState, halflife::Float64, now::Float64)
     dt = now - st.ema_last_update
     if dt > 0
@@ -155,22 +177,60 @@ function _decay_ema!(st::ModelSchedState, halflife::Float64, now::Float64)
     return st.recent_compute_ema
 end
 
-# Refine the per-batch-size cost estimate toward the measured time. Initializes to the first
-# measurement so the estimate converges immediately rather than drifting up from zero.
-function _update_cost!(st::ModelSchedState, B::Int, measured::Float64, alpha::Float64)
-    old = get(st.cost_estimate, B, measured)
-    st.cost_estimate[B] = alpha * measured + (1 - alpha) * old
+# Fold one measured run of a compiled program (shape variant, batch size) into its cost estimate.
+#
+# - The program's first run in this process is cold (lazy initialization, autotuning, caches) and is
+#   not used: the second run seeds the estimate, at the smaller of the two times.
+# - After that the estimate moves toward each measurement with weight
+#   `w = 1 - (1 - alpha) * 2^(-age / _COST_HALFLIFE_SECONDS)`, where `age` is the time since the
+#   estimate was last refreshed: `alpha` for back-to-back runs, approaching 1 for an estimate so old
+#   that it says little about the program now. Weighting by elapsed time rather than by count keeps a
+#   program measured once a minute from holding on to a value from many minutes ago.
+# - A rise is capped at `_COST_MAX_RISE` of the estimate per measurement, however slow the run or old
+#   the estimate, so one outlier (a GC pause, a cold cache, a co-tenant on the device) moves it by at
+#   most that much. A fall is not capped: timing noise makes runs slower, not faster, so a fast run
+#   is evidence of what the program costs, and the estimate never drops below the measurement.
+#
+# A model's estimates are written only on the dispatch thread, or at startup before it runs; a meta's
+# own record is written under `s.cond`.
+function _update_cost!(
+        st::ModelSchedState, variant::VariantKey, B::Int, measured::Float64, alpha::Float64, now::Float64
+    )
+    isfinite(measured) || return nothing
+    m = max(measured, 0.0)
+    c = get!(CostEstimate, st.cost_estimate, (variant, B))
+    c.runs += 1
+    if c.runs == 1
+        c.seconds = m                          # held, untrusted, until the second run
+        return nothing
+    elseif c.runs == 2
+        c.seconds = min(c.seconds, m)
+    else
+        w = 1 - (1 - alpha) * 2.0^(-max(now - c.refreshed, 0.0) / _COST_HALFLIFE_SECONDS)
+        c.seconds += min(w * (m - c.seconds), _COST_MAX_RISE * c.seconds)
+    end
+    c.refreshed = now
     return nothing
 end
 
-effective_cost(st::ModelSchedState, B::Int, discount::Float64) =
-    get(st.cost_estimate, B, _DEFAULT_COST) * (1 - discount)
+# The learned cost of one compiled program, or `nothing` until it has been measured warm.
+function _cost_seconds(st::ModelSchedState, variant::VariantKey, B::Integer)
+    c = get(st.cost_estimate, (variant, Int(B)), nothing)
+    return (c === nothing || c.runs < 2) ? nothing : c.seconds
+end
 
-# Deficit-weighted, cost-aware priority. A model that has consumed less than its share recently
-# scores higher; dividing by cost stops an expensive model from blocking cheaper ones on a
-# marginal fairness edge. The clamp bounds both lockout and domination.
-priority(share::Float64, normalized_ema::Float64, cap::Float64, eff_cost::Float64) =
-    clamp(share - normalized_ema, -cap, cap) / eff_cost
+# Run one compiled program to measure its cost (warmup and the startup probe): twice for a program
+# never run before, whose first run is cold and not used (see `_update_cost!`), once otherwise. A
+# failed run propagates to the caller.
+function _measure_program!(s::Scheduler, entry::ModelEntry, variant::VariantKey, sz::Int, inputs)
+    st = entry.sched
+    runs = (st !== nothing && !haskey(st.cost_estimate, (variant, sz))) ? 2 : 1
+    for _ in 1:runs
+        _, dt = _timed_run(s, entry.executable, inputs; offload = true)
+        st === nothing || _update_cost!(st, variant, sz, dt, s.cfg.cost_ema_alpha, time())
+    end
+    return nothing
+end
 
 # ---------------------------------------------------------------------------------------------
 # Batch contribution and coalescing plan
@@ -179,7 +239,9 @@ priority(share::Float64, normalized_ema::Float64, cap::Float64, eff_cost::Float6
 # Rows present along the executable batch axis after preprocessing. Used to size output slices.
 # Each executable input carries its OWN batch axis (per-input, batch-last), so read the count at
 # each matched input's own `sp.batch_axis` rather than one shared position. The batch size comes
-# from the first executable input that has a batch axis.
+# from the first executable input that has a batch axis; a request whose batched inputs disagree on
+# it is never coalesced or split (see `_batch_extents_agree`), so the count stands for every input
+# of any request that shares a dispatch.
 function _executable_rows(entry::ModelEntry, inputs::AbstractVector{NamedTensor})
     m = entry.manifest
     m.input_batch_dim === nothing && return 1
@@ -190,6 +252,29 @@ function _executable_rows(entry::ModelEntry, inputs::AbstractVector{NamedTensor}
         end
     end
     return 1
+end
+
+# Whether a request's batched executable inputs all have the same extent, each read along its own
+# batch axis. Only such a request may share a dispatch or be split. `_executable_rows` counts the
+# first batched input alone, so a request whose inputs disagree (three rows of one input, two of
+# another), merged with other requests, would pair its rows with a neighbor's while the merged
+# shapes still match: the program runs and returns mixed rows to innocent callers. It dispatches
+# alone instead and fails on its own. A missing batched input counts as a disagreement too, since
+# merging it would fail every request in the dispatch. Validation cannot catch either: it sees the
+# client's inputs, and preprocess may change an input's row count. Evaluated as the queue is
+# planned rather than cached at enqueue; it reads a few sizes per request, beside the variant and
+# row reads plan_batch already makes.
+function _batch_extents_agree(entry::ModelEntry, inputs::AbstractVector{NamedTensor})
+    rows = nothing
+    for sp in entry.manifest.executable_inputs
+        sp.batch_axis === nothing && continue
+        k = findfirst(t -> t.name == sp.name, inputs)
+        k === nothing && return false
+        r = size(inputs[k].data, sp.batch_axis)
+        rows === nothing && (rows = r)
+        r == rows || return false
+    end
+    return true
 end
 
 # A model can coalesce multiple requests only when EVERY executable input carries a batch axis and
@@ -225,7 +310,8 @@ _smallest_ge(sizes::Vector{Int}, n::Int) = (i = findfirst(>=(n), sizes); i === n
 # shape may still be larger and padded); a single request over the cap is never split, so it
 # dispatches alone. For non-coalescable models exactly one request is taken at its own size, and so
 # is it for every model when `coalesce` is false (`scheduler.coalescing`), so a request's rows always
-# occupy the same slots of the same program whatever else is queued.
+# occupy the same slots of the same program whatever else is queued. A request whose batched inputs
+# disagree on their batch extent is never coalesced either: it dispatches alone.
 function plan_batch(entry::ModelEntry, st::ModelSchedState; coalesce::Bool = true)
     isempty(st.queue) && return nothing
     front = st.queue[1]
@@ -252,11 +338,18 @@ function plan_batch(entry::ModelEntry, st::ModelSchedState; coalesce::Bool = tru
         return (key, QueuedRequest[front])
     end
 
+    # A front request whose batched inputs disagree on their batch extent never shares a dispatch
+    # (see `_batch_extents_agree`). Planned at its own row count, it runs alone with its inputs
+    # passed straight through, unpadded, so the execution fails for that caller only.
+    _batch_extents_agree(entry, front.prepared) || return (rows(front), QueuedRequest[front])
+
     # The leading run of same-variant requests is the only window we may coalesce within (keeps
     # `taken` a contiguous front prefix so _finalize can deleteat! it, and preserves FIFO order).
+    # A request whose batch extents disagree also ends it; it leads a later dispatch, alone.
     nprefix = 0
     for qr in st.queue
         _request_variant(entry, qr.prepared) == variant || break
+        _batch_extents_agree(entry, qr.prepared) || break
         nprefix += 1
     end
     prefix = view(st.queue, 1:nprefix)
@@ -349,7 +442,7 @@ function select_dispatch!(s::Scheduler, now::Float64)
     end
     s.cfg.discipline == FIFO && return _select_fifo!(s)
     s.cfg.discipline == EDF && return _select_edf!(s)
-    return _select_fair!(s, now)
+    return _select_fair!(s)
 end
 
 # FIFO: serve the model whose oldest queued request is the oldest overall, then coalesce its queue.
@@ -408,37 +501,34 @@ function _select_edf!(s::Scheduler)
     return _finalize(chosen, plan_batch(chosen, chosen.sched; coalesce = s.cfg.coalescing))
 end
 
-# Fair: deficit-weighted, cost-aware priority. Decay every EMA to now before reading, then normalize.
-# (Metas are not scheduled here; they run under the meta gate and their sub-calls compete as ordinary
-# requests for the sub-models.)
-function _select_fair!(s::Scheduler, now::Float64)
-    for entry in values(s.registry.by_name)
-        entry.sched === nothing || _decay_ema!(entry.sched, s.cfg.ema_halflife_seconds, now)
-    end
-    total_ema = sum(e.sched.recent_compute_ema for e in values(s.registry.by_name) if e.sched !== nothing; init = 0.0)
-    total_w = sum(e.sched.weight for e in values(s.registry.by_name) if e.sched !== nothing; init = 0.0)
-
+# Fair: start-time fair queueing over measured device seconds. Each dispatch charges its model the
+# loop time it took over the model's weight (`_charge_fair!`), and the schedulable model with the
+# least virtual time `vtime` goes next, so while models stay backlogged each one's device time
+# tracks its weight share, whatever the models cost per dispatch. `s.vfloor` is the virtual time of
+# the most recent fair dispatch, and a candidate below it is lifted to it before comparing: a model
+# that was idle, newly loaded, or waiting for its weights to be read rejoins level with the busy
+# ones, neither banking credit for the time it was away nor paying for capacity it used while it
+# ran alone. Candidates are exactly the schedulable models with a plan, so the selector stays
+# work-conserving: a model alone in the queue is served whatever its virtual time. Ties break by
+# the oldest front request, then by name. (Metas are not scheduled here; they run under the meta
+# gate and their sub-calls compete as ordinary requests for the sub-models.)
+function _select_fair!(s::Scheduler)
     chosen = nothing
     chosen_plan = nothing
-    best_p = -Inf
     for entry in values(s.registry.by_name)
         _schedulable(entry) || continue
         st = entry.sched
         plan = plan_batch(entry, st; coalesce = s.cfg.coalescing)
         plan === nothing && continue
-        B = plan[1]
-        share = total_w == 0 ? 0.0 : st.weight / total_w
-        # All-zero case: every model normalizes to zero, so the deficit equals the share and
-        # quiet or newly loaded models stay schedulable.
-        nema = total_ema == 0 ? 0.0 : st.recent_compute_ema / total_ema
-        p = priority(share, nema, s.cfg.recency_penalty_cap, effective_cost(st, B, s.cfg.coalescing_discount))
-        if chosen === nothing || p > best_p ||
-                (p == best_p && st.queue[1].enqueued_at < chosen.sched.queue[1].enqueued_at) ||
-                (p == best_p && st.queue[1].enqueued_at == chosen.sched.queue[1].enqueued_at && entry.name < chosen.name)
-            chosen, chosen_plan, best_p = entry, plan, p
+        st.vtime = max(st.vtime, s.vfloor)
+        if chosen === nothing || st.vtime < chosen.sched.vtime ||
+                (st.vtime == chosen.sched.vtime && st.queue[1].enqueued_at < chosen.sched.queue[1].enqueued_at) ||
+                (st.vtime == chosen.sched.vtime && st.queue[1].enqueued_at == chosen.sched.queue[1].enqueued_at && entry.name < chosen.name)
+            chosen, chosen_plan = entry, plan
         end
     end
     chosen === nothing && return nothing
+    s.vfloor = chosen.sched.vtime     # every candidate was lifted to the floor, so it never decreases
     return _finalize(chosen, chosen_plan)
 end
 
@@ -448,7 +538,10 @@ end
 
 # Concatenate the per-request executable inputs along the batch axis into one set sized to B,
 # padding with zeros when the real rows fall short of B. Inputs without a batch axis are taken
-# from the first request (they do not vary across the batch).
+# from the first request (they do not vary across the batch). Every batched input must come to
+# `total_rows`: plan_batch merges only requests whose inputs agree on their batch extent, and an
+# input that did not would be padded out of step with the others, pairing one request's rows with
+# another's, so it is refused here rather than run.
 function _coalesce_inputs(entry::ModelEntry, pres::Vector{Vector{NamedTensor}}, total_rows::Int, B::Int)
     m = entry.manifest
     merged = NamedTensor[]
@@ -460,6 +553,8 @@ function _coalesce_inputs(entry::ModelEntry, pres::Vector{Vector{NamedTensor}}, 
         end
         axis = sp.batch_axis
         data = length(arrays) == 1 ? arrays[1] : cat(arrays...; dims = axis)
+        size(data, axis) == total_rows ||
+            error("input '$(sp.name)' has $(size(data, axis)) rows along its batch axis, expected $total_rows")
         if total_rows < B
             padshape = collect(size(data))
             padshape[axis] = B - total_rows
@@ -502,12 +597,13 @@ end
 # 128-core host it measured a 264 us median (347 us p99) with the default pool idle, the time to wake
 # a sleeping thread, and with the pool saturated by request handlers a 14 us median but a 6.3 ms p99
 # and a 152 ms worst case, waiting for a free thread. That is material next to a millisecond program,
-# so only a program whose learned cost at this batch size is at least `_OFFLOAD_EXEC_SECONDS`, or that
-# has not been measured yet (it could be long), is handed off; a shorter one delays request intake by
-# no more than its own run time.
+# so only a program whose learned cost (for this shape variant and batch size) is at least
+# `_OFFLOAD_EXEC_SECONDS`, or that has not been measured yet (it could be long), is handed off; a
+# shorter one delays request intake by no more than its own run time.
 const _OFFLOAD_EXEC_SECONDS = 0.05
 
-_offload_execution(st::ModelSchedState, B::Integer) = get(st.cost_estimate, B, Inf) >= _OFFLOAD_EXEC_SECONDS
+_offload_execution(st::ModelSchedState, variant::VariantKey, B::Integer) =
+    something(_cost_seconds(st, variant, B), Inf) >= _OFFLOAD_EXEC_SECONDS
 
 # Run one execution, timed where it runs, so the measured compute excludes any task hand-off.
 function _timed_run(s::Scheduler, model::LoadedModel, inputs; offload::Bool)
@@ -542,20 +638,57 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
     # burn GPU on work that will miss anyway (the classic EDF overload failure mode). Dropped requests
     # get a DeadlineExceeded reply (mapped to gRPC DEADLINE_EXCEEDED upstream); only feasible ones run,
     # and when none are feasible we skip run_model entirely. The cost estimate is learned from prior
-    # dispatches; unseeded it defaults small, so the laxity drop is a no-op until the model has run once.
+    # dispatches of this program; until it has been measured warm the laxity drop is a no-op.
+    # A request its caller has withdrawn (`_withdraw!`) is dropped here too, without a reply: nobody
+    # waits for one.
+    #
+    # A drop leaves nothing measured, so an inflated estimate would shed every request whose budget it
+    # exceeds for good. When the laxity margin alone would drop every request of the dispatch and the
+    # estimate has not been refreshed for `_COST_STALE_SECONDS`, the oldest such request runs anyway
+    # to measure the program again, at most once per that interval. A withdrawn request is never that
+    # run.
     now_ns = Int64(time_ns())
-    laxity_ns = s.cfg.discipline == EDF ?
-        round(Int64, get(st.cost_estimate, B, _DEFAULT_COST) * 1.0e9) : Int64(0)
+    # Every taken request shares the front request's shape variant (plan_batch coalesces within one),
+    # and the cost of the program that runs is that variant's at B.
+    variant = _request_variant(entry, taken[1].prepared)
+    est = s.cfg.discipline == EDF ? _cost_seconds(st, variant, B) : nothing
+    laxity_ns = est === nothing ? Int64(0) : round(Int64, est * 1.0e9)
     live = QueuedRequest[]
+    remeasure = nothing          # the oldest request only the laxity margin drops
     for qr in taken
         # A committed request is an in-flight meta's continuation: skip the laxity drop (we already
         # spent GPU on its earlier stages, so we do not abandon it on a prediction), but still honor
         # the base deadline-passed check, so a meta that has genuinely run out of time stops here.
         margin_ns = qr.committed ? Int64(0) : laxity_ns
-        if qr.req.deadline_ns != 0 && now_ns + margin_ns >= qr.req.deadline_ns
-            put!(qr.reply, DeadlineExceeded(qr.req.model_name))
+        if _withdrawn(qr)
+            continue          # its caller stopped waiting (dispatch timeout, cancellation): never run it
+        elseif request_cancelled(qr.req)
+            # Its client gave up its shared-memory slot (CORE-3). Checked before the deadline branch so
+            # such a request is answered here, once, and is never picked as the re-measure run.
+            put!(qr.reply, RequestCancelled(qr.req.model_name, "its client gave up the shared-memory slot"))
+        elseif qr.req.deadline_ns != 0 && now_ns + margin_ns >= qr.req.deadline_ns
+            if remeasure === nothing && now_ns < qr.req.deadline_ns
+                remeasure = qr
+            else
+                put!(qr.reply, DeadlineExceeded(qr.req.model_name))
+            end
         else
             push!(live, qr)
+        end
+    end
+    # Withdrawal is set from the caller's task, so check it again before the re-measure decision: a
+    # request withdrawn since the scan is neither run to measure the program nor answered. A slot
+    # its client gave up on since the scan (CORE-3) is answered CANCELLED instead of being run.
+    if remeasure !== nothing && !_withdrawn(remeasure)
+        c = st.cost_estimate[(variant, B)]       # exists: only a measured estimate has a margin
+        if request_cancelled(remeasure.req)
+            put!(remeasure.reply, RequestCancelled(remeasure.req.model_name, "its client gave up the shared-memory slot"))
+        elseif isempty(live) && time() - max(c.refreshed, c.remeasured) >= _COST_STALE_SECONDS
+            c.remeasured = time()
+            push!(live, remeasure)
+            @debug "EDF: running a request its stale cost estimate would shed, to measure the program again" model = entry.name variant = variant size = B estimate = est
+        else
+            put!(remeasure.reply, DeadlineExceeded(remeasure.req.model_name))
         end
     end
     if length(live) != length(taken)
@@ -577,10 +710,13 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
 
         # Ensure the model's weights are resident before running (loads on demand and evicts
         # LRU under budget pressure). Load time is excluded from compute_time, which feeds the
-        # cost estimate, so the estimate reflects steady-state (resident) execution.
+        # cost estimate, so the estimate reflects steady-state (resident) execution. The load
+        # still held the dispatch loop, so the fair discipline charges it to the model.
+        t_load = time()
         _acquire_for_dispatch!(s, entry)
+        load_time = time() - t_load
         out, compute_time = _timed_run(
-            s, entry.executable, merged; offload = _offload_execution(st, B)
+            s, entry.executable, merged; offload = _offload_execution(st, variant, B)
         )
 
         # Slice every per-request result before delivering any. Slicing can throw; doing it up
@@ -599,7 +735,8 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
             now = time()
             _decay_ema!(st, s.cfg.ema_halflife_seconds, now)
             st.recent_compute_ema += compute_time
-            _update_cost!(st, B, compute_time, s.cfg.cost_ema_alpha)
+            _charge_fair!(st, max(compute_time, 0.0) + max(load_time, 0.0))
+            _update_cost!(st, variant, B, compute_time, s.cfg.cost_ema_alpha, now)
             st.dispatch_count += 1
             st.requests_served += length(taken)
             st.rows_served += total
@@ -632,7 +769,11 @@ end
 # GPU/model-call cost), NOT its wall time: the data-dependent Julia glue between stages is excluded, so
 # the control plane (lpt_packing) balances on the meta's real device work rather than its CPU glue. A
 # compute-only meta therefore reports ~0 compute, which is correct — it consumes no GPU.
-function _run_meta_request(s::Scheduler, meta::MetaEntry, req::InferRequest)
+# `scratch_out` goes to `run_meta`: when given, the meta's scratch slots outlive this call (see `infer`).
+function _run_meta_request(
+        s::Scheduler, meta::MetaEntry, req::InferRequest;
+        scratch_out::Union{Vector{PoolSlot}, Nothing} = nothing
+    )
     # Base deadline check first: no point starting already-expired work (no GPU spent yet).
     req.deadline_ns != 0 && Int64(time_ns()) >= req.deadline_ns && throw(DeadlineExceeded(meta.name))
     gated = !isempty(meta.calls)   # compute-only metas (no sub-calls) skip the gate
@@ -640,14 +781,17 @@ function _run_meta_request(s::Scheduler, meta::MetaEntry, req::InferRequest)
     caller = QueueingCaller(s, s.scratch_pool)
     call_ns = Ref(Int64(0))
     try
-        out = run_meta(meta, caller, req.inputs; deadline_ns = req.deadline_ns, call_ns_out = call_ns)
+        out = run_meta(
+            meta, caller, req.inputs;
+            deadline_ns = req.deadline_ns, call_ns_out = call_ns, scratch_out = scratch_out
+        )
         compute = call_ns[] / 1.0e9     # sub-call (model) time only; the Julia glue between stages is excluded
         st = meta.sched
         lock(s.cond) do
             now = time()
             _decay_ema!(st, s.cfg.ema_halflife_seconds, now)
             st.recent_compute_ema += compute
-            _update_cost!(st, 0, compute, s.cfg.cost_ema_alpha)
+            _update_cost!(st, VariantKey(), 0, compute, s.cfg.cost_ema_alpha, now)
             st.dispatch_count += 1
             st.requests_served += 1
             st.rows_served += 1
@@ -674,7 +818,7 @@ end
 # Measure the worst-case execution scratch (transient device memory beyond resident weights) by
 # probing each model in ISOLATION: free all non-pinned device weights so only pinned + the probed
 # model are resident, run every compiled (variant,size), and read the allocator's peak. The
-# per-model run also seeds the fair discipline's cost estimates. Returns max scratch in bytes (0 when
+# per-model run also seeds the cost estimates. Returns max scratch in bytes (0 when
 # the backend reports no device stats, e.g. CPU/mock).
 #
 # Two measurement modes, chosen by whether the backend can reset the allocator's high-water mark
@@ -724,7 +868,7 @@ function _probe_max_scratch!(s::Scheduler, pinned_bytes::Int)
     return max(0, max_scratch)
 end
 
-# Run every compiled (variant, size) of one resident model, seeding its FAIR cost estimates, and
+# Run every compiled (variant, size) of one resident model, seeding its cost estimates, and
 # return its scratch estimate in bytes. Resettable: the peak is reset first and the result is
 # `peak - in_use_before`, exact for this model. Otherwise `peak - resident_floor`, the monotone-peak
 # formula (`resident_floor` = pinned + the heaviest weight set resident so far). When the model
@@ -748,11 +892,10 @@ function _probe_entry_scratch!(s::Scheduler, entry::ModelEntry, resettable::Bool
             inputs = _zero_inputs(entry, variant, sz)
             inputs === nothing && continue
             try
-                _, dt = _timed_run(s, model, inputs; offload = true)
-                entry.sched === nothing || (entry.sched.cost_estimate[sz] = max(dt, eps()))
+                _measure_program!(s, entry, variant, sz, inputs)
                 ran = true
             catch err
-                @warn "memory probe / warmup run failed; using default cost" model = entry.name variant = variant size = sz exception = err
+                @warn "memory probe / warmup run failed; the program stays unmeasured until it dispatches" model = entry.name variant = variant size = sz exception = err
             end
         end
     end
@@ -799,7 +942,7 @@ end
 # Prepare every registered entry's scheduling state, then spawn the dispatch loop. Entries are
 # already in the registry (loaded and compiled by `serve`). When `autosize_arena > 0` (set by the
 # worker when the on-demand cache is enabled), the isolation probe runs every model regardless of
-# discipline, doubling as the FAIR cost warmup and the scratch measurement, and the cache is sized
+# discipline, doubling as the cost warmup and the scratch measurement, and the cache is sized
 # before serving begins.
 function start!(
         s::Scheduler; autosize_arena::Integer = 0, autosize_fraction::Real = 0.0,
@@ -814,11 +957,11 @@ function start!(
     end
     s.weight_cache === nothing || preload_pinned!(s.weight_cache, s.registry)
     if autosize_arena > 0 && s.weight_cache !== nothing
-        # The probe runs every model (seeding FAIR costs too) and sizes the cache.
+        # The probe runs every model (seeding the cost estimates too) and sizes the cache.
         _autosize_weight_cache!(s, Int(autosize_arena), Float64(autosize_fraction), Float64(autosize_wiggle))
         _fill_device!(s)
     elseif s.cfg.discipline == FAIR
-        # No auto-size (cache off, or no device stats): just seed FAIR costs.
+        # No auto-size (cache off, or no device stats): just seed the cost estimates.
         for entry in values(s.registry.by_name)
             _warmup_entry!(s, entry)
         end
@@ -869,27 +1012,16 @@ function shutdown!(s::Scheduler)
 end
 
 # Reject everything still pending at shutdown so no caller stays blocked on its reply channel:
-# queued requests across all models and any pending control commands. Caller holds `s.cond`.
-function _reject_pending_locked!(s::Scheduler)
-    for (name, pf) in s.prefetched
-        entry = get(s.registry.by_name, name, nothing)
-        (pf.staged === nothing || entry === nothing || s.weight_cache === nothing) ||
-            release_staged!(s.weight_cache, entry, pf.staged; uploaded = false)
-    end
-    empty!(s.prefetched)
-    err = ErrorException("server is shutting down")
+# queued requests across all models and any pending control commands, with `err` (UNAVAILABLE at
+# the transport). Every caller is answered before any held weights are released, since a release
+# does shared-store I/O that can fail. Caller holds `s.cond`.
+function _reject_pending_locked!(s::Scheduler, err::Exception = _unavailable(s))
     for entry in values(s.registry.by_name)
         entry.sched === nothing && continue
         for qr in entry.sched.queue
             put!(qr.reply, err)
         end
         empty!(entry.sched.queue)
-        st = entry.sched
-        if st.host_stage === :staged && s.weight_cache !== nothing
-            release_staged!(s.weight_cache, entry, st.staged; uploaded = false)
-            st.staged = nothing
-            st.host_stage = :none
-        end
     end
     for entry in values(s.registry.meta)
         entry.sched === nothing && continue
@@ -903,7 +1035,41 @@ function _reject_pending_locked!(s::Scheduler)
         put!(c.reply, err)
     end
     empty!(s.control)
+    for (name, pf) in s.prefetched
+        entry = get(s.registry.by_name, name, nothing)
+        (pf.staged === nothing || entry === nothing || s.weight_cache === nothing) ||
+            release_staged!(s.weight_cache, entry, pf.staged; uploaded = false)
+    end
+    empty!(s.prefetched)
+    for entry in values(s.registry.by_name)
+        st = entry.sched
+        if st !== nothing && st.host_stage === :staged && s.weight_cache !== nothing
+            release_staged!(s.weight_cache, entry, st.staged; uploaded = false)
+            st.staged = nothing
+            st.host_stage = :none
+        end
+    end
     return nothing
+end
+
+# The rejection a request or control command meets once the dispatch loop no longer runs: the
+# worker is shutting down, or the loop died.
+_unavailable(s::Scheduler) = WorkerUnavailableError(
+    s.failure === nothing ? "server is shutting down" :
+        "the worker's dispatch loop failed, so this worker serves no more requests until it restarts"
+)
+
+"""
+    dispatch_alive(scheduler) -> Bool
+
+Whether the dispatch loop can still serve: `false` once it has died with an unexpected error
+(the worker then reports not live and not ready, and rejects every request with `UNAVAILABLE`).
+"""
+function dispatch_alive(s::Scheduler)
+    s.failure === nothing || return false
+    t = s.task
+    # A loop task that ended while the scheduler still runs died some way the guard did not see.
+    return !(s.running && t !== nothing && istaskdone(t))
 end
 
 # Build zero-filled executable inputs at batch size `sz` (0 = unbatched) and input-shape `variant`
@@ -930,8 +1096,9 @@ function _zero_inputs(entry::ModelEntry, variant::VariantKey, sz::Int)
     return inputs
 end
 
-# Seed one entry's cost_estimate by running each compiled size once. Failures are non-fatal: the
-# default cost covers any unseeded pair until the first real dispatch measures it.
+# Seed one entry's cost_estimate by running each compiled (variant, size) twice, the first run being
+# cold (see `_measure_program!`). Failures are non-fatal: a program left unmeasured is measured by its
+# first real dispatches, and until then the EDF laxity check does not shed on it.
 function _warmup_entry!(s::Scheduler, entry::ModelEntry)
     (entry.executable === nothing || entry.sched === nothing) && return nothing
     isempty(entry.manifest.executable_inputs) && return nothing   # cannot synthesize inputs
@@ -941,10 +1108,9 @@ function _warmup_entry!(s::Scheduler, entry::ModelEntry)
             inputs === nothing && continue
             try
                 s.weight_cache === nothing || acquire!(s.weight_cache, entry)
-                _, dt = _timed_run(s, entry.executable, inputs; offload = true)
-                entry.sched.cost_estimate[sz] = max(dt, eps())
+                _measure_program!(s, entry, variant, sz, inputs)
             catch err
-                @warn "scheduler cost warmup failed; using default cost" model = entry.name variant = variant size = sz exception = err
+                @warn "scheduler cost warmup failed; the program stays unmeasured until it dispatches" model = entry.name variant = variant size = sz exception = err
             end
         end
     end
@@ -1141,7 +1307,7 @@ function stage_weights!(s::Scheduler, names::Vector{String}; hold_seconds::Real 
                 push!(out, name => ModelEntry[s.registry.by_name[c] for c in meta.calls if haskey(s.registry.by_name, c)])
             else
                 e = get(s.registry.by_name, name, nothing)
-                e === nothing && throw(ErrorException("unknown model: $name"))
+                e === nothing && throw(ModelNotFoundError(name))
                 push!(out, name => ModelEntry[e])
             end
         end
@@ -1290,25 +1456,41 @@ end
 # Submission and the dispatch loop
 # ---------------------------------------------------------------------------------------------
 
-# Enqueue a request onto its model's queue and wake the dispatch loop. Unknown models, a
-# stopped scheduler, and a full queue are reported immediately through the reply channel
-# (the caller sees an exception). `max_queue_depth` caps each model's queue independently,
-# so one backlogged model cannot starve admission for the others.
-function submit!(s::Scheduler, qr::QueuedRequest)
+# Enqueue a request onto its model's queue and wake the dispatch loop. Unknown models
+# (`ModelNotFoundError`), a stopped scheduler (`WorkerUnavailableError`), and a full queue
+# (`QueueFullError`) are reported immediately through the reply channel (the caller sees the
+# exception). `max_queue_depth` caps each model's queue independently, so one backlogged model
+# cannot starve admission for the others. `expected` is the entry whose preprocess made
+# `qr.prepared` (see `infer`); when another entry holds the name by now, the request is refused
+# rather than run on a version it was not prepared for.
+function submit!(s::Scheduler, qr::QueuedRequest; expected::Union{ModelEntry, Nothing} = nothing)
     lock(s.cond) do
         if !s.running
-            put!(qr.reply, ErrorException("server is shutting down"))
+            put!(qr.reply, _unavailable(s))
             return
         end
         # Targets are regular models only: a meta runs on the request task (see `infer`), and its
         # GPU sub-calls arrive here as committed requests for the sub-models, which live in `by_name`.
         entry = get(s.registry.by_name, qr.req.model_name, nothing)
         if entry === nothing || entry.sched === nothing
-            put!(qr.reply, ErrorException("unknown model: $(qr.req.model_name)"))
+            put!(qr.reply, ModelNotFoundError(qr.req.model_name))
+            return
+        end
+        # A reload replaced the model while this request was in preprocess. Run here, its inputs
+        # would meet the new program and its outputs the old postprocess, so it fails instead, as a
+        # `ModelNotFoundError`: the version it was prepared for is unloaded, which the transport
+        # maps to the retryable NOT_FOUND.
+        if expected !== nothing && entry !== expected
+            name = qr.req.model_name
+            put!(
+                qr.reply, ModelNotFoundError(
+                    name, "model '$name' was replaced during the request (the version that preprocessed it was unloaded); retry"
+                )
+            )
             return
         end
         if length(entry.sched.queue) >= s.cfg.max_queue_depth
-            put!(qr.reply, ErrorException("queue for model '$(qr.req.model_name)' is full ($(s.cfg.max_queue_depth)); request rejected"))
+            put!(qr.reply, QueueFullError(qr.req.model_name, s.cfg.max_queue_depth))
             return
         end
         if qr.committed
@@ -1327,7 +1509,21 @@ function submit!(s::Scheduler, qr::QueuedRequest)
     return nothing
 end
 
+# The dispatch loop, guarded. A failure one request or one dispatch can be held to is answered to
+# just those callers (the execution's own catch, the guard around `execute_and_record!` below, and
+# each control command's), and serving goes on. An exception that escapes anyway (one in selecting
+# the next dispatch, say) means nothing will ever be dispatched again, so it is fatal to the worker
+# rather than a silent stop: see `_dispatch_loop_died!`.
 function dispatch_loop(s::Scheduler)
+    try
+        _dispatch_loop(s)
+    catch err
+        _dispatch_loop_died!(s, err, catch_backtrace())
+    end
+    return nothing
+end
+
+function _dispatch_loop(s::Scheduler)
     while true
         cmds, chosen = lock(s.cond) do
             while s.running && isempty(s.control) && !_has_queued(s)
@@ -1357,7 +1553,14 @@ function dispatch_loop(s::Scheduler)
         end
         (isempty(cmds) && chosen === nothing) && break
         if chosen !== nothing
-            execute_and_record!(s, chosen)
+            try
+                execute_and_record!(s, chosen)
+            catch err
+                # A failure outside the execution's own catch (the deadline admission, releasing an
+                # idle staged model) belongs to this dispatch alone: fail its requests, keep serving.
+                @error "a dispatch failed outside its execution; failing its requests" model = chosen.entry.name exception = (err, catch_backtrace())
+                _fail_unanswered!(chosen.taken, err)
+            end
             _maybe_compact!(s)
         end
         # A residency change or a compaction can leave queued models off the device.
@@ -1365,6 +1568,62 @@ function dispatch_loop(s::Scheduler)
         isempty(s.prefetched) || _sweep_prefetched!(s)
     end
     return nothing
+end
+
+# Answer with `err` each request that has no reply waiting. Only the dispatch loop replies to a taken
+# request, so an empty channel means it was never answered (or its caller has already taken the
+# reply, and the extra one is never read).
+function _fail_unanswered!(qrs::Vector{QueuedRequest}, err)
+    for qr in qrs
+        isready(qr.reply) || put!(qr.reply, err)
+    end
+    return nothing
+end
+
+# The dispatch loop died with `err`, which no single request can be held to, and nothing will be
+# dispatched again. Log it with its backtrace; mark the scheduler failed, so ServerLive, ServerReady,
+# ModelReady and `/readyz` say no from now on and every later request or control command is rejected
+# with `WorkerUnavailableError` (UNAVAILABLE); answer everything already queued the same way; then run
+# the `on_failure` hook once (a worker process exits nonzero there so its supervisor restarts it, see
+# `on_dispatch_failure!`). A failure during a shutdown already under way only logs.
+function _dispatch_loop_died!(s::Scheduler, err, bt)
+    @error "the dispatch loop failed; this worker no longer serves and reports not live" exception = (err, bt)
+    stopping = false
+    hook = lock(s.cond) do
+        stopping = !s.running
+        s.failure = err
+        s.running = false
+        try
+            _reject_pending_locked!(s)
+        catch e
+            @error "releasing held weights after the dispatch loop failed" exception = (e, catch_backtrace())
+        end
+        notify(s.cond)
+        return s.on_failure
+    end
+    (hook === nothing || stopping) && return nothing
+    try
+        hook(err)
+    catch e
+        @error "the dispatch-failure hook threw" exception = (e, catch_backtrace())
+    end
+    return nothing
+end
+
+"""
+    on_dispatch_failure!(scheduler, f) -> scheduler
+
+Run `f(err)` once if the dispatch loop dies with the unexpected error `err`, or right away if it
+already has. A blocking [`serve`](@ref) (a worker process) installs a hook that exits the process
+nonzero, so the node supervisor restarts it; an embedded server keeps running and reports not live.
+"""
+function on_dispatch_failure!(s::Scheduler, f)
+    failed = lock(s.cond) do
+        s.on_failure = f
+        return s.failure
+    end
+    failed === nothing || f(failed)
+    return s
 end
 
 # ---------------------------------------------------------------------------------------------
@@ -1377,7 +1636,7 @@ end
 function _run_control(s::Scheduler, op::Function)
     reply = Channel{Any}(1)
     lock(s.cond) do
-        s.running || throw(ErrorException("server is shutting down"))
+        s.running || throw(_unavailable(s))
         push!(s.control, ControlCommand(op, reply))
         notify(s.cond)
     end
@@ -1468,7 +1727,7 @@ function _set_residency_op!(s::Scheduler, name::AbstractString, target::Residenc
                 return last
             end
             entry = get(sch.registry.by_name, nm, nothing)
-            entry === nothing && throw(ErrorException("unknown model: $name"))
+            entry === nothing && throw(ModelNotFoundError(name))
             return set_residency_state!(sch.weight_cache, entry, target; floor = floor_of(entry), staged = staged_of(entry))
         end
     )
@@ -1477,13 +1736,19 @@ end
 """
     set_policy!(scheduler, name; weight=nothing) -> nothing
 
-Update a model's live scheduler policy. `weight` is consulted only by the fair discipline.
-Available in both residency modes. Raises on an unknown model.
+Update a model's live scheduler policy. `weight` is consulted only by the fair discipline and must
+be a positive finite number. Available in both residency modes. Raises a `ModelNotFoundError` on an
+unknown model, and an [`InvalidInputError`](@ref) for a weight that is zero, negative, infinite or
+NaN (the `SetModelPolicy` RPC answers it with `INVALID_ARGUMENT`).
 """
 function set_policy!(s::Scheduler, name::AbstractString; weight::Union{Real, Nothing} = nothing)
+    # The fair discipline charges a dispatch as its seconds over the weight, so only a positive,
+    # finite weight orders models: Inf charges nothing, and NaN fails every comparison.
+    weight === nothing || (isfinite(weight) && weight > 0) ||
+        throw(InvalidInputError("weight must be a positive finite number, got $weight"))
     lock(s.cond) do
         entry = get(s.registry.by_name, String(name), nothing)
-        (entry === nothing || entry.sched === nothing) && throw(ErrorException("unknown model: $name"))
+        (entry === nothing || entry.sched === nothing) && throw(ModelNotFoundError(name))
         weight === nothing || (entry.sched.weight = Float64(weight))
     end
     return nothing
@@ -1596,7 +1861,7 @@ function _evict_entry!(sch::Scheduler, name::AbstractString)
         p = e === nothing ? nothing : pop!(sch.prefetched, e.name, nothing)
         if e !== nothing && e.sched !== nothing
             for qr in e.sched.queue
-                put!(qr.reply, ErrorException("model '$name' was unloaded"))
+                put!(qr.reply, ModelNotFoundError(name, "model '$name' was unloaded"))
             end
             empty!(e.sched.queue)
             t = e.sched.stage_task
@@ -1675,18 +1940,23 @@ function evict!(s::Scheduler, name::AbstractString)
 end
 
 """
-    load_model!(scheduler, backend, pool, entry; state, on_demand, store) -> String
+    load_model!(scheduler, backend, pool, entry; state, on_demand, store, unchanged) -> Union{String, Nothing}
 
 Compile and admit a freshly loaded (uncompiled) bundle `entry`, replacing any existing model of
 the same name. Runs entirely on the dispatch thread inside one control op (a stop-the-world swap):
 any existing model is evicted first so its device memory is freed before the new artifact is
 compiled, then the new entry is compiled (`build_loaded_model`) and admitted. This is the dynamic
 directory watcher's load/reload path. Returns the model name.
+
+`unchanged()` says whether the bundle's files are still the ones `entry` was read from. It is asked
+before the control op, where `false` leaves any existing model serving, and again once the new
+version is compiled, before it is admitted, where `false` discards it (the existing model is gone by
+then). Either way the entry is never admitted and `nothing` is returned.
 """
 function load_model!(
         s::Scheduler, backend::AbstractBackend, pool::MemoryPool, entry::ModelEntry;
         state::ResidencyState, on_demand::Bool, store::WeightStore = PrivateWeightStore(),
-        executable_cache::Bool = false
+        executable_cache::Bool = false, unchanged::Function = () -> true
     )
     # Read the weights before the control op, which runs on the dispatch loop: a device-resident
     # model's host arrays (and a CPU worker's, which keeps every model resident), or an on-demand
@@ -1704,6 +1974,8 @@ function load_model!(
     end
     defer_floor = on_demand && state == PINNED_SYSTEM
     name = try
+        # The files changed while the weights were read: keep the running version, try again later.
+        unchanged() || (close_weights!(entry.weights); return nothing)
         _run_control(
             s, function (sch)
                 _evict_entry!(sch, entry.name)          # no-op on a fresh load; frees device memory on reload
@@ -1713,6 +1985,8 @@ function load_model!(
                     executable_cache = executable_cache, host_arrays = host_arrays,
                     defer_floor = defer_floor
                 )
+                # Changed during the compile: this version may mix old and new files. Never admit it.
+                unchanged() || (_discard_unadmitted!(sch, entry); return nothing)
                 n = _admit_entry!(sch, entry; staged = staged)
                 _reprobe_after_load!(sch, entry)
                 return n
@@ -1721,8 +1995,20 @@ function load_model!(
     finally
         staged === nothing || release_staged!(s.weight_cache, entry, staged; uploaded = false)
     end
+    name === nothing && return nothing
     defer_floor && _attach_floor!(s, entry, store, names)
     return name
+end
+
+# Free what `build_loaded_model` gave an entry that is then not admitted (see `load_model!`): the
+# releases `_evict_entry!` makes, for an entry that never reached the registry. Dispatch thread.
+function _discard_unadmitted!(sch::Scheduler, entry::ModelEntry)
+    sch.weight_cache === nothing || release_all!(sch.weight_cache, entry)
+    close_weights!(entry.weights)
+    for inner in values(entry.executable.execs), exec in values(inner)
+        free_executable!(sch.backend, exec)
+    end
+    return nothing
 end
 
 # Give a hot-loaded system-pinned model its host floor: read it off the dispatch loop, then commit
@@ -1787,62 +2073,6 @@ Alias for [`evict!`](@ref): remove a model from the live system. Provided for sy
 """
 unload_model!(s::Scheduler, name::AbstractString) = evict!(s, name)
 
-# Body assuming it already runs on the dispatch thread (mirrors `_admit_entry!`/`_evict_entry!`).
-function _rename_entry!(
-        sch::Scheduler, old::String, new::String,
-        residency::Union{ResidencyState, Nothing}
-    )
-    old == new && return new
-    entry = lock(sch.cond) do
-        (haskey(sch.registry.by_name, new) || haskey(sch.registry.meta, new)) &&
-            throw(ErrorException("cannot rename '$old' to '$new': that name is already registered"))
-        e = pop!(sch.registry.meta, old, nothing)
-        e === nothing && (e = pop!(sch.registry.by_name, old, nothing))
-        e === nothing && throw(ErrorException("unknown model: $old"))
-        e.name = new
-        e.sched === nothing || (e.sched.name = new)
-        (e isa MetaEntry ? sch.registry.meta : sch.registry.by_name)[new] = e
-        return e
-    end
-    if entry isa ModelEntry
-        # Residency bookkeeping (LRU, host store) is keyed by name; rekey it. The cache has its own
-        # lock and this is the dispatch thread, the sole residency mutator, so ordering is safe.
-        sch.weight_cache === nothing || rename!(sch.weight_cache, old, new)
-        # The residency floor is operator config keyed by model name, so the new name may resolve
-        # to a different floor (e.g. `-production` is pinned where `-staging` was not). Apply it.
-        if residency !== nothing && sch.weight_cache !== nothing &&
-                entry.executable !== nothing && entry.executable.state != residency
-            set_residency_state!(sch.weight_cache, entry, residency)
-        end
-        # A meta calls its sub-models by name; a callee renamed out from under a meta will fail at
-        # call time. Surface it (the registry-driven rename flow renames whole suffix families, so
-        # this indicates a stale meta bundle).
-        refs = [m.name for m in values(sch.registry.meta) if old in m.calls]
-        isempty(refs) ||
-            @warn "renamed model is declared in meta.calls under its old name; those metas will fail to call it" old = old new = new metas = refs
-    end
-    log_model_renamed(old, new)
-    return new
-end
-
-"""
-    rename_model!(scheduler, old, new; residency=nothing) -> String
-
-Rename a live model (regular or meta) in place: rekey the registry, its scheduling state, and its
-residency bookkeeping. The compiled executables, device weights, and host floor are untouched, so
-a rename never recompiles or moves memory. This is the dynamic watcher's fast path for a renamed
-bundle directory (a model-registry promotion such as `-staging` -> `-production`). `residency`,
-when given, is the residency floor resolved for the NEW name; it is applied if it differs from
-the model's current floor. Queued requests ride along: they hold the entry itself. Raises when
-`old` is not registered or `new` already is. Returns the new name.
-"""
-function rename_model!(
-        s::Scheduler, old::AbstractString, new::AbstractString;
-        residency::Union{ResidencyState, Nothing} = nothing
-    )
-    return _run_control(s, sch -> _rename_entry!(sch, String(old), String(new), residency))
-end
-
 """
     put_meta!(scheduler, entry::MetaEntry) -> String
 
@@ -1868,7 +2098,7 @@ function remove_meta!(s::Scheduler, name::AbstractString)
         e = pop!(s.registry.meta, String(name), nothing)
         if e !== nothing && e.sched !== nothing
             for qr in e.sched.queue       # unblock any callers waiting on an in-flight meta request
-                put!(qr.reply, ErrorException("model '$name' was unloaded"))
+                put!(qr.reply, ModelNotFoundError(name, "model '$name' was unloaded"))
             end
             empty!(e.sched.queue)
         end
@@ -1876,8 +2106,99 @@ function remove_meta!(s::Scheduler, name::AbstractString)
     return nothing
 end
 
+# ---------------------------------------------------------------------------------------------
+# Waiting for a reply: the dispatch timeout and cancellation
+# ---------------------------------------------------------------------------------------------
+#
+# A caller waits on its request's reply channel, bounded by `scheduler.dispatch_timeout_seconds`
+# from submission and, for a gRPC call, by the client cancelling it. Either way out WITHDRAWS the
+# request: the dispatch loop drops a withdrawn request where it drops expired ones
+# (`execute_and_record!`), so one still queued never runs, and the result of one already executing
+# is put on a channel nobody reads. The caller's wake-up is a sentinel its own timer puts on the reply
+# channel, which has room for it beside the scheduler's one reply, so neither side ever blocks.
+
+# How often a waiting caller's timer checks its dispatch timeout and its cancellation probe.
+const _WAIT_POLL_SECONDS = 0.1
+
+# The cancellation probe of the request being served: a zero-argument function that returns true
+# once the client has cancelled the call, or nothing. `infer` sets it around a meta's orchestration,
+# so the meta's sub-calls (which re-enter `infer`, on the same task or tasks it spawns) inherit it.
+const _CANCEL_PROBE = Base.ScopedValues.ScopedValue{Any}(nothing)
+
+# Put on a request's reply channel by its own caller's timer, never by the scheduler.
+struct _StopWaiting
+    err::Exception
+end
+
+# Withdraw a request its caller no longer waits for; see `_withdrawn`.
+_withdraw!(qr::QueuedRequest) = (qr.withdrawn[] = true; nothing)
+
+# Whether the dispatch loop must drop `qr` rather than run it: its caller stopped waiting.
+_withdrawn(qr::QueuedRequest) = qr.withdrawn[]
+
+_is_cancelled(probe) = probe !== nothing && (
+    try
+        probe() === true
+    catch
+        false
+    end
+)
+
+# Wait for the reply to each of `qrs` (one request, or the pieces of a split one) and return them in
+# order. Past the dispatch timeout, or once `cancelled` reports the call cancelled, every piece is
+# withdrawn and `DispatchTimeoutError` or `RequestCancelledError` is thrown.
+function _await_replies(s::Scheduler, qrs::Vector{QueuedRequest}, cancelled)
+    timeout = s.cfg.dispatch_timeout_seconds
+    timed = timeout > 0 && isfinite(timeout)
+    (timed || cancelled !== nothing) || return Any[take!(qr.reply) for qr in qrs]
+    model = qrs[1].req.model_name
+    t0 = time()
+    poll = timed ? min(_WAIT_POLL_SECONDS, timeout) : _WAIT_POLL_SECONDS
+    # A Timer runs its callback on one task, one firing at a time, and this one closes itself when it
+    # fires, so each channel gets at most one wake-up.
+    timer = Timer(poll; interval = poll) do t
+        err = if timed && time() - t0 >= timeout
+            DispatchTimeoutError(model, timeout)
+        elseif _is_cancelled(cancelled)
+            RequestCancelledError(model)
+        else
+            nothing
+        end
+        err === nothing && return
+        close(t)
+        for qr in qrs
+            put!(qr.reply, _StopWaiting(err))
+        end
+    end
+    try
+        replies = Vector{Any}(undef, length(qrs))
+        for (i, qr) in enumerate(qrs)
+            r = take!(qr.reply)
+            if r isa _StopWaiting
+                foreach(_withdraw!, qrs)
+                throw(r.err)
+            end
+            replies[i] = r
+        end
+        return replies
+    finally
+        close(timer)
+    end
+end
+
+# A preprocess that leaves out an input the shape variant is read from would fail the variant lookup
+# on the dispatch loop, where the failure cannot be pinned on this one request; fail it here instead.
+function _check_variant_inputs(entry::ModelEntry, prepared::Vector{NamedTensor})
+    entry.executable === nothing && return nothing
+    for (nm, _) in entry.executable.sig.variant_spec
+        any(t -> t.name == nm, prepared) ||
+            throw(ErrorException("preprocess of model '$(entry.name)' did not produce executable input '$nm'"))
+    end
+    return nothing
+end
+
 """
-    infer(scheduler, request) -> Vector{NamedTensor}
+    infer(scheduler, request; cancelled=nothing) -> Vector{NamedTensor}
 
 Submit a request and block until the scheduler returns the result. Re-raises any error
 captured during dispatch.
@@ -1887,23 +2208,47 @@ dispatch loop: preprocess before the request is queued, postprocess on the raw d
 loop hands back. Because each gRPC request runs on its own task, many requests' hook work
 proceeds in parallel and overlaps the single, serialized GPU execution. The dispatch loop coalesces
 and runs `qr.prepared` and never executes a request whose preprocess has not finished, since a
-request is only enqueued (made visible to the loop) after preprocess returns.
+request is only enqueued (made visible to the loop) after preprocess returns. A request runs on
+the version of the model whose preprocess it went through: if a reload replaces the model in the
+meantime, the request fails (NOT_FOUND on the wire, which a client or gateway retries).
+
+The wait is bounded by `scheduler.dispatch_timeout_seconds` (0 waits indefinitely): past it the
+request is withdrawn (it never runs if still queued; a running one's result is discarded) and
+[`DispatchTimeoutError`](@ref) is thrown. `cancelled`, a zero-argument function that returns `true`
+once the caller's client has cancelled the call, is polled while waiting; it withdraws the request
+the same way and throws [`RequestCancelledError`](@ref). A meta's sub-calls inherit it.
+
+`scratch_out` applies to a meta only (a regular model acquires no scratch). When given, the pool slots
+the meta's `call.scratch` acquires are collected there and stay held after `infer` returns or throws,
+because the outputs may alias them; the caller releases them with `release_scratch!` once it no longer
+reads the outputs (the gRPC handler does, after encoding the response). Without it, an output that
+aliases a slot is copied before the slot is released.
 """
-function infer(s::Scheduler, req::InferRequest; committed::Bool = false)
-    entry = get(s.registry.by_name, req.model_name, nothing)
+function infer(
+        s::Scheduler, req::InferRequest; committed::Bool = false, cancelled = _CANCEL_PROBE[],
+        scratch_out::Union{Vector{PoolSlot}, Nothing} = nothing
+    )
+    # Under the lock: the dispatch loop and the watcher insert and remove entries concurrently.
+    entry, meta = lock(s.cond) do
+        e = get(s.registry.by_name, req.model_name, nothing)
+        return (e, e === nothing ? get(s.registry.meta, req.model_name, nothing) : nothing)
+    end
     if entry === nothing
         # A meta has no executable: it runs its orchestration on this task under the meta gate, and its
         # sub-calls re-enter `infer` (committed) for the sub-models. A meta is never itself a committed
         # sub-call (metas cannot call metas), so `committed` is irrelevant on this branch.
-        meta = get(s.registry.meta, req.model_name, nothing)
-        (meta === nothing || meta.sched === nothing) &&
-            throw(ErrorException("unknown model: $(req.model_name)"))
-        return _run_meta_request(s, meta, req)
+        (meta === nothing || meta.sched === nothing) && throw(ModelNotFoundError(req.model_name))
+        return Base.ScopedValues.with(
+            () -> _run_meta_request(s, meta, req; scratch_out = scratch_out), _CANCEL_PROBE => cancelled
+        )
     end
-    entry.sched === nothing && throw(ErrorException("unknown model: $(req.model_name)"))
+    entry.sched === nothing && throw(ModelNotFoundError(req.model_name))
+    # A call whose client is already gone is neither preprocessed nor queued.
+    _is_cancelled(cancelled) && throw(RequestCancelledError(req.model_name))
     # preprocess/postprocess come from a bundle's model.jl, defined in a newer world age;
     # invokelatest crosses that boundary (harmless for identity).
     prepared = Base.invokelatest(entry.preprocess, req.inputs)
+    _check_variant_inputs(entry, prepared)
     # A request larger than the largest compiled batch is split into pieces the model can run and
     # the pieces' outputs are joined back, so a client that batches 32 against a bundle compiled for
     # `[1]` gets an answer rather than an INTERNAL error. The inverse of coalescing: the same batch
@@ -1913,11 +2258,11 @@ function infer(s::Scheduler, req::InferRequest; committed::Bool = false)
     maxB = _max_compiled_rows(entry, prepared)
     rows = _executable_rows(entry, prepared)
     if maxB !== nothing && rows > maxB
-        return _infer_split(s, entry, req, prepared, rows, maxB; committed)
+        return _infer_split(s, entry, req, prepared, rows, maxB; committed, cancelled)
     end
     qr = QueuedRequest(req, prepared; committed = committed)
-    submit!(s, qr)
-    raw = take!(qr.reply)
+    submit!(s, qr; expected = entry)        # only onto the version whose preprocess ran
+    raw = only(_await_replies(s, [qr], cancelled))
     raw isa Exception && throw(raw)
     return Base.invokelatest(entry.postprocess, raw)
 end
@@ -1930,8 +2275,11 @@ end
 # uncompiled (then the ordinary path raises the precise error) or the model is unbatched (key 0).
 # Only a coalescable model splits: every executable output then carries a batch axis, so the join
 # has an axis to join along rather than silently taking an unbatched output from the first piece.
+# A request whose batched inputs disagree on their batch extent is never split either: there is no
+# one row count to cut every input by, so it runs whole and alone (see `_batch_extents_agree`).
 function _max_compiled_rows(entry::ModelEntry, prepared::Vector{NamedTensor})
     _coalescable(entry) || return nothing
+    _batch_extents_agree(entry, prepared) || return nothing
     execs = entry.executable.execs
     variant = _request_variant(entry, prepared)
     haskey(execs, variant) || return nothing
@@ -1972,7 +2320,7 @@ end
 
 function _infer_split(
         s::Scheduler, entry::ModelEntry, req::InferRequest, prepared::Vector{NamedTensor},
-        rows::Int, maxB::Int; committed::Bool
+        rows::Int, maxB::Int; committed::Bool, cancelled = nothing
     )
     in_specs = entry.manifest.executable_inputs
     ranges = _split_ranges(rows, maxB)
@@ -1983,13 +2331,13 @@ function _infer_split(
     for rng in ranges
         piece = _take_rows(prepared, in_specs, rng)
         qr = QueuedRequest(req, piece; committed = committed)
-        submit!(s, qr)
+        submit!(s, qr; expected = entry)    # every piece onto the version that preprocessed them
         push!(qrs, qr)
     end
+    replies = _await_replies(s, qrs, cancelled)
     raws = Vector{Vector{NamedTensor}}(undef, length(qrs))
     failure = nothing
-    for (i, qr) in enumerate(qrs)
-        r = take!(qr.reply)
+    for (i, r) in enumerate(replies)
         if r isa Exception
             failure === nothing && (failure = r)
         else
@@ -2107,7 +2455,7 @@ function describe_models(s::Scheduler, names::AbstractVector{<:AbstractString})
         reg = s.registry
         wanted = isempty(names) ? routable_model_names(reg) : sort!(unique(String.(names)))
         unknown = [n for n in wanted if get_model(reg, n) === nothing && get_meta(reg, n) === nothing]
-        isempty(unknown) || throw(ArgumentError("unknown model: $(join(unknown, ", "))"))
+        isempty(unknown) || throw(ModelNotFoundError(join(unknown, ", "), "unknown model: $(join(unknown, ", "))"))
         return map(wanted) do n
             e = get_model(reg, n)
             e === nothing && return (name = n, manifest = get_meta(reg, n).manifest, max_batch_size = 0)

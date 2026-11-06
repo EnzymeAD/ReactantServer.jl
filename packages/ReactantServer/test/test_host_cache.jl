@@ -131,13 +131,30 @@ end
     @test _reads(sched, "A") == n               # and serves the next load
 end
 
-@testset "host cache: removing or renaming a model updates its cached copy" begin
+@testset "host cache (private): a reloaded model never gets the previous version's copy" begin
+    sched = _hc_scheduler("A"; host_budget = 4 * sizeof(_W))
+    wc = sched.weight_cache
+    v1 = sched.registry.by_name["A"]
+    @test _served(sched, "A") && haskey(wc.host_cached, "A")   # v1's copy is cached
+    # A reload builds a new entry under the same name, with new weights of the same shape.
+    v2 = _hc_entry("A")
+    v2.weights.tensors["w"] = Float32[20, 200]
+    @test ReactantServer.has_host_copy(wc, v1) && !ReactantServer.has_host_copy(wc, v2)
+    staged = ReactantServer.stage_host_weights(wc, v2)
+    @test !staged.hit && staged.arrays[1] == Float32[20, 200] && v2.weights.reads == 1
+    # Once v2 is uploaded its copy replaces v1's, and v1's is never handed out again.
+    ReactantServer.release_staged!(wc, v2, staged; uploaded = true)
+    @test wc.host_cached["A"].entry === v2 && wc.host_cached_bytes == sizeof(_W)
+    @test !ReactantServer.has_host_copy(wc, v1)
+    @test ReactantServer._take_cached_host!(wc, v1) === nothing
+    @test ReactantServer._take_cached_host!(wc, v2) == Any[Float32[20, 200]]
+end
+
+@testset "host cache: removing a model drops its cached copy" begin
     sched = _hc_scheduler("A", "B"; device_models = 2, host_budget = 4 * sizeof(_W))
     wc = sched.weight_cache
     _served(sched, "A")
     _served(sched, "B")
-    ReactantServer.rename!(wc, "A", "A2")
-    @test haskey(wc.host_cached, "A2") && haskey(wc.host_rank, "A2") && !haskey(wc.host_rank, "A")
     ReactantServer.release_all!(wc, sched.registry.by_name["B"])
     @test !haskey(wc.host_cached, "B") && wc.host_cached_bytes == sizeof(_W)
 end

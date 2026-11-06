@@ -18,15 +18,20 @@ _from_core_residency(s::ResidencyState) =
     s == UNPINNED ? _CTRL.Residency.UNPINNED :
     s == PINNED_SYSTEM ? _CTRL.Residency.PINNED_SYSTEM : _CTRL.Residency.PINNED_DEVICE
 
-# Run a control action, mapping a thrown error to NOT_FOUND for an unknown model and to
-# FAILED_PRECONDITION otherwise (e.g. residency control on a self-managed worker).
+# Run a control action, mapping a thrown error to NOT_FOUND for an unknown model
+# (`ModelNotFoundError`), to UNAVAILABLE when the worker is shutting down or its dispatch loop died
+# (`WorkerUnavailableError`), to INVALID_ARGUMENT for a client's bad value (`InvalidInputError`,
+# such as a fair weight that is not positive and finite), and to FAILED_PRECONDITION otherwise
+# (e.g. residency control on a self-managed worker).
 function _as_control(f)
     try
         return f()
     catch e
         e isa gRPCServer.GRPCError && rethrow()
         msg = sprint(showerror, e)
-        occursin("unknown model", msg) && _not_found(msg)
+        e isa ModelNotFoundError && _not_found(msg)
+        e isa WorkerUnavailableError && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, msg))
+        _client_data_error(e) && _invalid(msg)
         throw(gRPCServer.GRPCError(gRPCServer.StatusCode.FAILED_PRECONDITION, msg))
     end
 end
@@ -91,6 +96,8 @@ function _handle_set_model_residency(ctx::InferContext, req)
 end
 
 function _handle_set_model_policy(ctx::InferContext, req)
+    # A weight that is not positive and finite raises `InvalidInputError` in `set_policy!`, a client's
+    # bad value, which `_as_control` answers with INVALID_ARGUMENT.
     return _as_control() do
         set_policy!(ctx.sched, req.name; weight = req.has_weight ? req.weight : nothing)
         _CTRL.SetModelPolicyResponse()

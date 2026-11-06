@@ -23,7 +23,9 @@ that serves the model. On a multi-worker node it also serves the node's merged m
   operator-configured number of GPUs with coalescing-aware routing (`lpt_packing`); see
   [Scheduling modes](#Scheduling-modes) below. A third mode, `least_outstanding`, spreads by
   live occupancy. Either way, a request fails over to the remaining replicas when a worker
-  returns `NotFound` or `Unavailable`.
+  returns `NotFound` or `Unavailable`, or the call to it fails in the transport; every other
+  status reaches the client as the worker sent it, and a request that uses shared memory is
+  never retried on another worker (see [Status codes and failover](#Status-codes-and-failover)).
 - **Readiness probe:** a background loop calls each worker's KServe `ServerReady` RPC; `/readyz`
   is ready when at least one worker reports ready.
 - **Raw passthrough:** the `ModelInfer` hot path never decodes or re-marshals the protobuf body.
@@ -40,8 +42,12 @@ that serves the model. On a multi-worker node it also serves the node's merged m
   that.
 - **SHM broadcast:** `SystemSharedMemoryRegister` / `Unregister` are fanned out to every worker.
   POSIX SHM regions are host-local; every worker attaches via `shm_open` independently. Register
-  succeeds only if all workers succeed (it rolls back partial success); unregister succeeds if
-  any worker does.
+  succeeds only if all workers succeed. On a partial failure it rolls back only the registrations
+  this call created: each worker is first asked (`SystemSharedMemoryStatus`) whether it already
+  holds the name, and one that did (a client re-registering after another worker restarted) keeps
+  it. A worker that holds the name for another client's live object answers `ALREADY_EXISTS`, and
+  the gateway returns `ALREADY_EXISTS`; other failures return `FAILED_PRECONDITION`. Unregister
+  succeeds if any worker does.
 - **SHM namespace probe:** `IsSameIPCNamespace` is fanned out to every worker and the gateway
   returns `true` only if all of them can see the client's region (any worker may service a later
   `ModelInfer`). A worker that errors or does not implement the RPC counts as `false`.
@@ -458,6 +464,42 @@ installed.
     [Security](security.md)), so the gateway's gRPC port must not be exposed outside the
     trusted network.
 
+## Status codes and failover
+
+The gateway forwards a worker's gRPC status to the client unchanged, and moves a request on to
+the next replica only when the worker it tried could not serve it:
+
+| The worker call ended with | The gateway |
+| --- | --- |
+| `NOT_FOUND` (the model was unloaded there since the last discovery round) | tries the next replica and refreshes its routes |
+| `UNAVAILABLE` (the worker is shutting down or draining, its dispatch loop died, or the model is not resident there) | tries the next replica |
+| a transport failure (connection refused or reset, a response that broke off, a client handle reset after a hung probe) | tries the next replica, as `UNAVAILABLE` |
+| any other status: `DEADLINE_EXCEEDED`, `INTERNAL`, `INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`, `FAILED_PRECONDITION`, `CANCELLED`, ... | returns it to the client as is |
+
+A deterministic failure (`INTERNAL`) or the request's own mistake (`INVALID_ARGUMENT`) would only
+repeat on another replica, a passed deadline cannot be met there either, and `RESOURCE_EXHAUSTED`
+and `FAILED_PRECONDITION` are signals the client acts on (back off; re-register shared memory).
+When every replica fails over, the client gets the last worker's status. Status messages follow
+`grpc.error_detail` (see [Node Configuration](node_config.md)): under `redacted`, the default, a
+worker's message passes through as the worker sent it, a failure of the call to a worker names the
+worker by its name or position and never by host and port, and the gateway's own `INTERNAL`
+failures are reported by request id and logged in full on the gateway; under `full`, messages also
+name the worker by host and port and carry the exception text.
+
+A request that reads an input from, or writes an output to, a registered shared-memory region
+(a `shared_memory_region` parameter on any input or requested output) is never retried on another
+replica: the worker that failed it may still be running it, and a second worker writing the same
+output slot, or reading an input slot the client has since reused, would corrupt the client's
+data. Whatever ends its attempt (`NOT_FOUND`, `UNAVAILABLE`, an abandoned or reset call, a
+transport failure) reaches the client as `UNAVAILABLE`, which `ReactantServerClient` retries. Its
+other statuses pass through like any request's. The gateway reads only the tensors' parameter
+keys to tell, never their payloads.
+
+When a client cancels its call, the gateway cancels its in-flight worker call (with gRPCClient's
+`grpc_cancel`) and the worker withdraws the queued request, so cancelled work is not run. Both
+hops depend on gRPCServer reporting a cancelled call (`is_cancelled`); gRPCServer 0.1.2 does not
+yet, so until a release that does, a cancelled call runs to completion as before.
+
 ## What the gateway does not do
 
 - Streaming RPCs.
@@ -511,8 +553,9 @@ returning whether it reported ready.
   directly.
 - The routing table is rebuilt every 10s from each worker's `RepositoryIndex` and swapped in
   atomically. If a worker dies, its routes persist until the next successful probe (up to ~10s);
-  in the gap, requests to its models fail over to the remaining replicas (on `NotFound` or
-  `Unavailable`), and a model with no live replica returns `NotFound`. The worker-side readiness
+  in the gap, requests to its models fail over to the remaining replicas (on `NotFound`,
+  `Unavailable`, or a transport failure; see [Status codes and failover](#Status-codes-and-failover)),
+  and a model with no live replica returns `NotFound`. The worker-side readiness
   probe (`ServerReady`, same 10s loop) drives `/readyz` and the `gateway_worker_ready` metric.
 - Under `lpt_packing`, the gateway polls the workers on every 10s probe round to refresh routing
   metadata and accumulate consumed compute, but recomputes the placement only once the fleet has

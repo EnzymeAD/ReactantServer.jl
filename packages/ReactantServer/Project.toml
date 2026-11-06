@@ -52,7 +52,7 @@ ProtoBuf = "1.3.0"
 # serialization and allocator-statistics C API (EnzymeAD/Reactant.jl#3277). The Julia side of that
 # API (#3305) is not released yet, so runtime/xla_serialization.jl carries it; see there.
 Reactant = "0.2.287"
-ReactantServerCore = "1.4.0"
+ReactantServerCore = "2.0.0"
 # A bounded range, [0.0.410, 0.1.0): for a 0.0.x version a plain "0.0.410" would admit 0.0.410
 # alone, and General requires an upper bound. The worker calls PjRtLoadedExecutableSerialize and
 # friends directly, so this row states the real requirement even though Reactant's own bound

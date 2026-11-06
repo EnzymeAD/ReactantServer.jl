@@ -8,8 +8,23 @@
 struct ChildSpec
     name::String
     cmd::Cmd
-    grace_seconds::Float64   # SIGTERM-to-SIGKILL window at shutdown
+    grace_seconds::Float64   # SIGTERM-to-SIGKILL window at shutdown (after the drain, for a draining child)
+    drain_seconds::Float64   # graceful drain budget, requested by closing the child's stdin; 0 = SIGTERM at once
+    stage::Int               # shutdown order: every child of a lower stage stops before the next stage is asked
 end
+ChildSpec(name::AbstractString, cmd::Cmd, grace_seconds::Real) =
+    ChildSpec(String(name), cmd, Float64(grace_seconds), 0.0, 1)
+
+# How long the node's public endpoint (the embedded gateway, or a sole worker bound to the public
+# ports itself) may take on shutdown to finish the requests it has already accepted.
+const PUBLIC_DRAIN_SECONDS = 60.0
+# How long a worker behind the gateway may take to finish its queued and in-flight requests. The
+# gateway has drained before the workers are asked, so this is mostly for direct clients.
+const WORKER_DRAIN_SECONDS = 15.0
+# Shutdown stages: the gateway stops (draining) while the workers still serve its in-flight requests,
+# and only then are the workers asked to drain.
+const _GATEWAY_STAGE = 1
+const _WORKER_STAGE = 2
 
 """
     ChildEnvironment(worker_project, gateway_project, load_path)
@@ -135,7 +150,8 @@ function worker_spec(
         grpc_port::Union{Integer, Nothing} = nothing,
         metrics_port::Union{Integer, Nothing} = nothing,
         node_workers::Integer = 1,
-        grace_seconds::Real = 15.0
+        grace_seconds::Real = 15.0,
+        drain_seconds::Real = WORKER_DRAIN_SECONDS
     )
     ce = children isa ChildEnvironment ? children : workspace_environment(children)
     proj = ce.worker_project
@@ -161,7 +177,16 @@ function worker_spec(
         push!(pairs, "INFERENCE_SERVER_RUNTIME_HOST_WEIGHT_BUDGET_WORKERS" => string(Int(node_workers)))
     # Meta sub-calls run in-process now, so no loopback gRPC endpoint or shared-memory fan-out mesh is
     # injected; each worker builds its own local meta-scratch pool in serve().
-    return ChildSpec(String(name), addenv(cmd, pairs...), Float64(grace_seconds))
+    _push_drain!(pairs, drain_seconds)
+    return ChildSpec(String(name), addenv(cmd, pairs...), Float64(grace_seconds), Float64(drain_seconds), _WORKER_STAGE)
+end
+
+# A child that drains on shutdown gets a pipe on stdin (see supervisor.jl), and the variable that
+# tells it end of file there is a drain request with this budget (ReactantServerCore.STDIN_DRAIN_ENV).
+function _push_drain!(pairs, drain_seconds::Real)
+    drain_seconds > 0 &&
+        push!(pairs, ReactantServerCore.STDIN_DRAIN_ENV => string(Float64(drain_seconds)))
+    return pairs
 end
 
 # The node's public gRPC and metrics ports (where clients and Prometheus connect): the gateway's
@@ -192,6 +217,9 @@ The embedded gateway child. With no `gateway_path`, the gateway runs from defaul
 synthesized into `REACTANT_GATEWAY_WORKERS`, and `metrics_endpoints` (the workers' metrics
 addresses) into `REACTANT_GATEWAY_WORKER_METRICS`, so the gateway's /metrics aggregates every
 worker's export. A mounted gateway.yml wins: it is passed through and no endpoint env is set.
+The node-wide `rapid_reset_protection` is the exception: it is synthesized into
+`REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION` with or without a mounted file, unless that variable
+is already set or the file sets `grpc.rapid_reset_protection` itself.
 """
 function gateway_spec(
         children::Union{AbstractString, ChildEnvironment};
@@ -201,7 +229,10 @@ function gateway_spec(
         worker_names::Union{Vector{String}, Nothing} = nothing,
         grpc_max_recv::Union{Integer, Nothing} = nothing,
         grpc_max_send::Union{Integer, Nothing} = nothing,
-        grace_seconds::Real = 10.0
+        grpc_error_detail::Union{AbstractString, Nothing} = nothing,
+        rapid_reset_protection::Union{Bool, Nothing} = nothing,
+        grace_seconds::Real = 10.0,
+        drain_seconds::Real = PUBLIC_DRAIN_SECONDS
     )
     ce = children isa ChildEnvironment ? children : workspace_environment(children)
     proj = ce.gateway_project
@@ -236,9 +267,23 @@ function gateway_spec(
             push!(pairs, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES" => string(grpc_max_recv))
         grpc_max_send === nothing || haskey(ENV, "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES") ||
             push!(pairs, "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES" => string(grpc_max_send))
+        # Likewise how much an INTERNAL error tells clients (global.grpc.error_detail).
+        grpc_error_detail === nothing || haskey(ENV, "REACTANT_GATEWAY_GRPC_ERROR_DETAIL") ||
+            push!(pairs, "REACTANT_GATEWAY_GRPC_ERROR_DETAIL" => String(grpc_error_detail))
     end
+    # The node-wide Rapid-Reset switch (global.grpc.rapid_reset_protection, or
+    # REACTANT_RAPID_RESET_PROTECTION on the supervisor). Unlike the settings above it also reaches a
+    # gateway run from a mounted gateway.yml, since it is meant to cover the whole node at once, but
+    # only when that file does not set grpc.rapid_reset_protection itself: the gateway's environment
+    # wins over its file, so the variable would silently override what the operator wrote there. An
+    # explicit env value wins too.
+    rapid_reset_protection === nothing ||
+        haskey(ENV, "REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION") ||
+        _gateway_file_sets(gateway_path, "grpc", "rapid_reset_protection") ||
+        push!(pairs, "REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION" => string(rapid_reset_protection))
+    _push_drain!(pairs, drain_seconds)
     isempty(pairs) || (cmd = addenv(cmd, pairs...))
-    return ChildSpec("gateway", cmd, Float64(grace_seconds))
+    return ChildSpec("gateway", cmd, Float64(grace_seconds), Float64(drain_seconds), _GATEWAY_STAGE)
 end
 
 """
@@ -262,6 +307,23 @@ function worker_metrics_endpoints(node::AbstractDict; host::AbstractString = "12
     mbp = get(node, "metrics_base_port", nothing)
     mbp isa Integer || return String[]
     return String["$host:$(Int(mbp) + i - 1)" for i in 1:length(_node_workers(node))]
+end
+
+# Whether the gateway file at `path` sets the key at the nested `keys`. A file the supervisor cannot
+# read or parse counts as setting it, so nothing is synthesized over it; the gateway reports the
+# file's problem itself.
+function _gateway_file_sets(path::Union{AbstractString, Nothing}, keys::AbstractString...)
+    path === nothing && return false
+    raw = try
+        YAML.load_file(path; dicttype = Dict{String, Any})
+    catch
+        return true
+    end
+    for k in keys
+        (raw isa AbstractDict && haskey(raw, k)) || return false
+        raw = raw[k]
+    end
+    return true
 end
 
 # The gateway's listen ports (for the worker-port collision warning): defaults 8001/8002,

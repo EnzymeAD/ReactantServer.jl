@@ -61,7 +61,7 @@ end)
 loud error. The loader also rejects a meta bundle whose `model.jl` calls `register_model` instead
 of `register_meta_model`.
 
-## Execution: local, on the request task, one meta at a time
+## Execution: local, on the request task, a bounded number of GPU metas at a time
 
 A meta's `run(inputs, call)` executes on the gRPC request task, off the GPU dispatch loop, exactly
 like a model's pre/post hooks. Each `call(name, inputs)` re-enters the local scheduler in-process:
@@ -111,10 +111,11 @@ Client --infer(two_stage)--> Gateway
 
 A meta does not hold the GPU for its whole run. Each stage is an ordinary dispatch on the loop,
 so the GPU is occupied only while a stage actually computes and is free during the meta's CPU glue,
-when the loop serves other models. The trade is the gate: while a meta holds its permit, a second
-meta on the same worker waits (its stages cannot start), though the GPU is not wasted because
-regular models run in the meantime. A stage runs at batch 1 for the meta unless other clients' calls
-to the same sub-model happen to coalesce with it on the loop.
+when the loop serves other models. The trade is the gate: once its permits are all held (by two
+metas at the default concurrency), a further GPU meta on the same worker waits (its stages cannot
+start), though the GPU is not wasted because regular models run in the meantime. A stage runs at
+batch 1 for the meta unless other clients' calls to the same sub-model happen to coalesce with it
+on the loop.
 
 A meta carries a deadline like any request. It is dropped before it starts if the deadline has
 already passed or if it cannot take a gate permit in time, so a meta backlog sheds at admission
@@ -162,10 +163,17 @@ reference; either way the `model.jl` is identical. The pool is plain memory, loc
 and never shared across processes. It exists purely to keep large intermediates off the per-request
 allocation path; because the sub-call runs in-process, the buffer is handed to the next stage by
 reference, with no copy. A meta that never calls `scratch` just allocates normally. The pool
-defaults to 1 GiB across 16 slots, configured per worker, and the acquired slots are released when
-the orchestration returns. Concurrent metas share the pool, so size it for that many in-flight
-metas; the deadline-bounded acquire degrades gracefully if it is ever starved. The client driver
-exposes the same `scratch` interface for staging inference inputs (see [Client Usage](client.md)).
+defaults to 1 GiB across 16 slots, configured per worker. Concurrent metas share the pool, so size it
+for that many in-flight metas (compute-only metas included, since they bypass the gate); the
+deadline-bounded acquire degrades gracefully if it is ever starved. The client driver exposes the
+same `scratch` interface for staging inference inputs (see [Client Usage](client.md)).
+
+Scratch buffers are request-scoped. The slots a request acquired stay held until the worker has
+encoded that request's response, and are released then, whether the request succeeded or failed. A
+meta can therefore return a scratch buffer as an output tensor: it is encoded without an extra copy,
+and no other request can write into it first. A buffer must not outlive its request, though: once
+the response is encoded its slot goes to the next meta, so do not keep a reference to it (in a
+global, a cache, or a task that outlives `run`).
 
 Request every buffer in one `call.scratch` call (pass a vector of `dims => T` pairs to get several
 at once); calling it more than once per request is rejected, and a scratch buffer must reach the

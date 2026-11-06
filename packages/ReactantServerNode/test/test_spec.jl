@@ -172,6 +172,14 @@ end
     @test RSN._worker_thread_count(100, 1) == 16   # capped
     @test RSN._worker_thread_count(1, 4) == 1      # floored
 
+    # A drain budget of 0 opts a child out of the stdin drain protocol (SIGTERM at once).
+    nodrain = RSN.worker_spec("worker1", "/run/node.yaml", "1", "/opt/rs"; drain_seconds = 0)
+    @test nodrain.drain_seconds == 0
+    @test _envval(nodrain.cmd, ReactantServerCore.STDIN_DRAIN_ENV) === nothing
+    # The three-argument form (a plain child) neither drains nor is staged after anything.
+    plain = RSN.ChildSpec("plain", `true`, 3)
+    @test (plain.grace_seconds, plain.drain_seconds, plain.stage) == (3.0, 0.0, 1)
+
     # A CPU worker gets explicit empty GPU visibility (never the container's
     # CUDA_VISIBLE_DEVICES). Bind hosts stay the node file's concern.
     spec = RSN.worker_spec("worker0", "/run/node.yaml", nothing, "/opt/rs")
@@ -260,6 +268,14 @@ end
         # Worker metrics endpoints feed the gateway's aggregated /metrics.
         @test _envval(sup.children[3].spec.cmd, "REACTANT_GATEWAY_WORKER_METRICS") ==
             "127.0.0.1:9100,127.0.0.1:9101"
+        # Shutdown: the gateway (stage 1) drains for up to a minute before the workers (stage 2)
+        # are asked; each child reads the drain budget from the variable its stdin protocol uses.
+        gw, w0 = sup.children[3].spec, sup.children[1].spec
+        @test (gw.stage, gw.drain_seconds) == (1, RSN.PUBLIC_DRAIN_SECONDS)
+        @test (w0.stage, w0.drain_seconds) == (2, RSN.WORKER_DRAIN_SECONDS)
+        @test RSN.PUBLIC_DRAIN_SECONDS == 60
+        @test _envval(gw.cmd, ReactantServerCore.STDIN_DRAIN_ENV) == "60.0"
+        @test _envval(w0.cmd, ReactantServerCore.STDIN_DRAIN_ENV) == string(RSN.WORKER_DRAIN_SECONDS)
         @test occursin("role=all", String(take!(sink)))
     end
 end
@@ -278,6 +294,9 @@ end
         @test _envval(w, "INFERENCE_SERVER_ENDPOINTS_PORT") == "8001"
         @test _envval(w, "INFERENCE_SERVER_ENDPOINTS_METRICS_PORT") == "8002"
         @test _envval(w, "CUDA_VISIBLE_DEVICES") == "0"
+        # As the public endpoint, the sole worker drains as long as a gateway would.
+        @test sup.children[1].spec.drain_seconds == RSN.PUBLIC_DRAIN_SECONDS
+        @test _envval(w, ReactantServerCore.STDIN_DRAIN_ENV) == "60.0"
         @test occursin("no gateway", String(take!(sink)))
 
         # The public ports honor the gateway listen overrides.
@@ -429,6 +448,13 @@ end
         # A mounted gateway.yml suppresses synthesis (the gateway reads its own file).
         gwf = RSN.gateway_spec("/opt/rs"; gateway_path = "/etc/x/gateway.yml", grpc_max_recv = 111)
         @test _envval(gwf.cmd, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES") === nothing
+
+        # The INTERNAL error detail is mirrored the same way.
+        withenv("REACTANT_GATEWAY_GRPC_ERROR_DETAIL" => nothing) do
+            gwd = RSN.gateway_spec("/opt/rs"; endpoints = ["127.0.0.1:8080"], grpc_error_detail = "full")
+            @test _envval(gwd.cmd, "REACTANT_GATEWAY_GRPC_ERROR_DETAIL") == "full"
+            @test _envval(gw0.cmd, "REACTANT_GATEWAY_GRPC_ERROR_DETAIL") === nothing
+        end
     end
 
     # An explicit process env wins over the synthesized value.
@@ -452,11 +478,13 @@ end
               grpc:
                 max_recv_msg_bytes: 111
                 max_send_msg_bytes: 222
+                error_detail: full
             """
         )
         withenv(
             "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES" => nothing,
-            "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES" => nothing
+            "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES" => nothing,
+            "REACTANT_GATEWAY_GRPC_ERROR_DETAIL" => nothing
         ) do
             sup = RSN.build_supervisor(
                 path; env = Dict("REACTANT_GPUS" => "2"),
@@ -465,6 +493,130 @@ end
             gw = sup.children[end].spec.cmd   # the gateway is the last child
             @test _envval(gw, "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES") == "111"
             @test _envval(gw, "REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES") == "222"
+            # One node-level error_detail reaches the gateway (the workers read global.grpc directly).
+            @test _envval(gw, "REACTANT_GATEWAY_GRPC_ERROR_DETAIL") == "full"
+        end
+        # A value that is neither mode is refused at startup rather than silently ignored.
+        write(path, replace(read(path, String), "error_detail: full" => "error_detail: verbose"))
+        @test_throws ArgumentError RSN.build_supervisor(
+            path; env = Dict("REACTANT_GPUS" => "2"),
+            sink = IOBuffer(), workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "run")
+        )
+    end
+end
+
+const _RRP_GW = "REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION"
+
+@testset "gateway_spec: the node-wide Rapid-Reset setting" begin
+    mktempdir() do dir
+        silent = joinpath(dir, "silent.yml")      # a mounted gateway.yml that does not set the key
+        write(silent, "grpc:\n  error_detail: full\nendpoints:\n  - \"127.0.0.1:8080\"\n")
+        own = joinpath(dir, "own.yml")            # one that does
+        write(own, "grpc:\n  rapid_reset_protection: false\nendpoints:\n  - \"127.0.0.1:8080\"\n")
+        withenv(_RRP_GW => nothing) do
+            ep = ["127.0.0.1:8080"]
+            @test _envval(RSN.gateway_spec("/opt/rs"; endpoints = ep, rapid_reset_protection = true).cmd, _RRP_GW) == "true"
+            @test _envval(RSN.gateway_spec("/opt/rs"; endpoints = ep, rapid_reset_protection = false).cmd, _RRP_GW) == "false"
+            # Unset at node level: nothing synthesized, so the gateway keeps its own default (off).
+            @test _envval(RSN.gateway_spec("/opt/rs"; endpoints = ep).cmd, _RRP_GW) === nothing
+            # Unlike the message sizes, it reaches a gateway run from a mounted file that is silent on
+            # it, but a value written in the file wins (the variable would override it).
+            @test _envval(RSN.gateway_spec("/opt/rs"; gateway_path = silent, rapid_reset_protection = true).cmd, _RRP_GW) == "true"
+            @test _envval(RSN.gateway_spec("/opt/rs"; gateway_path = own, rapid_reset_protection = true).cmd, _RRP_GW) === nothing
+            @test RSN._gateway_file_sets(own, "grpc", "rapid_reset_protection")
+            @test !RSN._gateway_file_sets(silent, "grpc", "rapid_reset_protection")
+            @test !RSN._gateway_file_sets(nothing, "grpc", "rapid_reset_protection")
+        end
+        # The gateway's own variable wins: it is never overwritten.
+        withenv(_RRP_GW => "false") do
+            @test _envval(RSN.gateway_spec("/opt/rs"; endpoints = ["127.0.0.1:8080"], rapid_reset_protection = true).cmd, _RRP_GW) == "false"
+        end
+    end
+end
+
+@testset "build_supervisor: one Rapid-Reset setting reaches the gateway and every worker" begin
+    mktempdir() do dir
+        # Each worker's resolved setting, from the node file the supervisor materialized for them
+        # (what each worker child reads), and the gateway child's synthesized variable.
+        function launched(node_body; env = Dict{String, String}(), gateway_path = nothing, role = nothing, tag = "run")
+            path = joinpath(dir, "node_$tag.yaml")
+            write(path, "model_repo: /repo\nbase_port: 8080\n" * node_body)
+            run_dir = joinpath(dir, tag)
+            sup = RSN.build_supervisor(
+                path; env = merge(Dict("REACTANT_GPUS" => "0", "REACTANT_CPU_WORKERS" => "2"), env),
+                role = role, gateway_path = gateway_path, sink = IOBuffer(), workspace_root = STUB_ROOT,
+                runtime_dir = run_dir
+            )
+            gw = [c.spec for c in sup.children if c.spec.name == "gateway"]
+            gwval = isempty(gw) ? :none : _envval(only(gw).cmd, _RRP_GW)
+            mat = joinpath(run_dir, "node.yaml")
+            isfile(mat) || return Dict{String, Bool}(), gwval
+            node = ReactantServerCore.load_node(mat)
+            workers = Dict(
+                n => ReactantServerCore.node_server_config(node, n)[1].grpc.rapid_reset_protection
+                    for n in ReactantServerCore.worker_names(node)
+            )
+            # Every worker child runs from that file.
+            @test all(c -> c.spec.name == "gateway" || any(==(mat), c.spec.cmd.exec), sup.children)
+            return workers, gwval
+        end
+        cpu = "global:\n  runtime:\n    backend: cpu\n"
+        on = "global:\n  runtime:\n    backend: cpu\n  grpc:\n    rapid_reset_protection: true\n"
+        two = "workers:\n  - { name: worker0 }\n  - { name: worker1, grpc: { rapid_reset_protection: false } }\n"
+        withenv(_RRP_GW => nothing, "INFERENCE_SERVER_GRPC_RAPID_RESET_PROTECTION" => nothing) do
+            # Default: off everywhere, and nothing is written or synthesized.
+            @test launched(cpu; tag = "default") == (Dict("worker0" => false, "worker1" => false), nothing)
+            # The node file's one key turns it on for the gateway and every worker.
+            @test launched(on; tag = "file") == (Dict("worker0" => true, "worker1" => true), "true")
+            # So does one variable on the node container, without the key; and it wins over the key.
+            @test launched(cpu; env = Dict(RSN.NODE_RAPID_RESET_ENV => "true"), tag = "env") ==
+                (Dict("worker0" => true, "worker1" => true), "true")
+            @test launched(on; env = Dict(RSN.NODE_RAPID_RESET_ENV => "off"), tag = "envoff") ==
+                (Dict("worker0" => false, "worker1" => false), "false")
+            @test launched(on; env = Dict(RSN.NODE_RAPID_RESET_ENV => ""), tag = "envempty") ==
+                (Dict("worker0" => true, "worker1" => true), "true")
+            # A worker's own value wins over the node-wide one, from the file or the environment.
+            @test launched(on * two; tag = "perworker") == (Dict("worker0" => true, "worker1" => false), "true")
+            @test launched(cpu * two; env = Dict(RSN.NODE_RAPID_RESET_ENV => "true"), tag = "perworker_env") ==
+                (Dict("worker0" => true, "worker1" => false), "true")
+            # A mounted gateway.yml that sets the key keeps its value; one that is silent gets the node's.
+            own = joinpath(dir, "own.yml")
+            write(own, "grpc:\n  rapid_reset_protection: false\nendpoints:\n  - \"127.0.0.1:8080\"\n")
+            silent = joinpath(dir, "silent.yml")
+            write(silent, "endpoints:\n  - \"127.0.0.1:8080\"\n")
+            @test launched(on; gateway_path = own, tag = "gwown") == (Dict("worker0" => true, "worker1" => true), nothing)
+            @test launched(on; gateway_path = silent, tag = "gwsilent") == (Dict("worker0" => true, "worker1" => true), "true")
+            # The gateway role (a node split across machines) takes it too.
+            @test launched(cpu; env = Dict(RSN.NODE_RAPID_RESET_ENV => "1"), role = :gateway, tag = "gwrole") ==
+                (Dict{String, Bool}(), "true")
+            # A value that is not a boolean is refused at startup, from either source.
+            @test_throws ReactantServerCore.ConfigError launched(cpu; env = Dict(RSN.NODE_RAPID_RESET_ENV => "ture"), tag = "bad1")
+            @test_throws ReactantServerCore.ConfigError launched(
+                "global:\n  runtime:\n    backend: cpu\n  grpc:\n    rapid_reset_protection: yes please\n"; tag = "bad2"
+            )
+        end
+    end
+end
+
+@testset "gateway file: explicit, REACTANT_GATEWAY_FILE, then the mount point" begin
+    mktempdir() do dir
+        mounted = joinpath(dir, "mounted.yml")
+        envfile = joinpath(dir, "env.yml")
+        explicit = joinpath(dir, "explicit.yml")
+        foreach(f -> write(f, "endpoints: []\n"), (mounted, envfile))
+        saved = RSN._DEFAULT_GATEWAY_FILE[]
+        RSN._DEFAULT_GATEWAY_FILE[] = mounted
+        try
+            @test RSN._resolve_gateway_path(nothing, Dict{String, String}()) == mounted
+            @test RSN._resolve_gateway_path(nothing, Dict("REACTANT_GATEWAY_FILE" => envfile)) == envfile
+            @test RSN._resolve_gateway_path(explicit, Dict("REACTANT_GATEWAY_FILE" => envfile)) == explicit
+            @test_throws ReactantServerCore.ConfigError RSN._resolve_gateway_path(
+                nothing, Dict("REACTANT_GATEWAY_FILE" => joinpath(dir, "missing.yml"))
+            )
+            rm(mounted)
+            @test RSN._resolve_gateway_path(nothing, Dict{String, String}()) === nothing
+        finally
+            RSN._DEFAULT_GATEWAY_FILE[] = saved
         end
     end
 end

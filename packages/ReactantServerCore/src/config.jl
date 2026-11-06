@@ -49,10 +49,10 @@ control plane pins them.
 """
     SchedulingDiscipline
 
-The inter-model dispatch ordering. `FAIR` is the deficit-weighted, cost-aware policy with
-per-model weights and the coalescing discount; `FIFO` serves in global arrival order; `EDF`
-(earliest-deadline-first) serves the model whose most-urgent queued request has the soonest
-deadline. Coalescing runs underneath all three.
+The inter-model dispatch ordering. `FAIR` shares the device by per-model weight, charging each
+dispatch the device time it measured (start-time fair queueing); `FIFO` serves in global arrival
+order; `EDF` (earliest-deadline-first) serves the model whose most-urgent queued request has the
+soonest deadline. Coalescing runs underneath all three.
 
 Guidance: `FAIR` is for deployments where models share this worker with no upstream placement
 authority, a single-GPU worker or a multi-GPU fleet behind the round-robin gateway, where the
@@ -305,10 +305,10 @@ RuntimeConfig(
     ModelSchedConfig
 
 Per-model scheduler overrides (an entry under `scheduler.models`). `weight` is the model's
-relative compute share (default `1.0`, so all-default weights yield uniform shares; consulted
-only by the fair discipline). `residency` is the model's initial residency floor (see
-[`ResidencyState`](@ref)); `nothing` means unspecified, which the server resolves at startup
-to `UNPINNED` (swapped on demand, with host RAM copies within `runtime.host_weight_budget`), or to
+relative compute share, a positive finite number (default `1.0`, so all-default weights yield
+uniform shares; consulted only by the fair discipline). `residency` is the model's initial
+residency floor (see [`ResidencyState`](@ref)); `nothing` means unspecified, which the server
+resolves at startup to `UNPINNED` (swapped on demand, with host RAM copies within `runtime.host_weight_budget`), or to
 `PINNED_SYSTEM` when the on-demand weight cache is enabled and the budget is unlimited. `max_batch_size` caps how many rows the scheduler coalesces into one
 dispatch of this model; `nothing` means uncapped. The cap does not change compiled shapes:
 a partial fill still pads up to the smallest compiled batch size, and a single request larger
@@ -334,12 +334,17 @@ ModelSchedConfig(
     SchedulerConfig
 
 Global scheduler settings (the `scheduler:` config block). `ema_halflife_seconds` is the
-half-life of the recent-compute moving average that drives fairness; `recency_penalty_cap`
-bounds the recency adjustment; `coalescing_discount` is the cost discount applied to coalesced
-batches; `cost_ema_alpha` is the smoothing factor for the learned per-batch-size cost;
+half-life of the per-model recent-compute moving average the worker reports, which no discipline
+schedules by; `recency_penalty_cap` and `coalescing_discount` are accepted and validated for
+compatibility but have no effect, since the fair discipline charges measured device time rather
+than ranking by a clamped recency deficit over a discounted cost; `cost_ema_alpha` is the
+weight a new measurement gets in the learned cost of each compiled program (shape variant and
+batch size) when it follows the previous one closely (an older estimate gives way faster);
 `max_queue_depth` caps each model's queue independently (a full model rejects new requests
 without affecting admission for the others); `dispatch_timeout_seconds` is the per-request
-execution timeout; `discipline` selects the inter-model ordering (see
+execution timeout, how long a request may wait for its result from submission (queueing and
+execution together) before it is withdrawn and fails with `DEADLINE_EXCEEDED` (0 disables it);
+`discipline` selects the inter-model ordering (see
 [`SchedulingDiscipline`](@ref)); `compaction_interval` runs worker-local memory compaction every N
 on-demand weight-cache loads (0 disables), the standalone (no-gateway) trigger, off by default so a
 gateway-fronted worker never self-compacts; and `models` holds the per-model
@@ -421,24 +426,61 @@ EndpointsConfig(host, port, metrics_port) = EndpointsConfig(host, port, metrics_
 
 # Default gRPC message-size cap, shared by the worker, gateway, and client. The 4 MiB gRPC default
 # is far below what inference tensors routinely need, so the whole stack sizes generously; 512 MiB
-# is the common default. These are decode/encode caps, not allocations: raising them costs nothing
-# until a message that large actually arrives.
+# is the common default. The send cap is only a check, but the receive cap is not free: the gRPC
+# server allocates a buffer of a request message's full declared length as soon as its 5-byte
+# length prefix arrives, so each request being received can hold up to the cap (see
+# docs/src/security.md).
 const DEFAULT_GRPC_MSG_BYTES = 512 * 1024 * 1024
+
+"""
+    ErrorDetail
+
+How much an `INTERNAL` error tells the client: the `grpc.error_detail` key of the worker and the
+gateway. `ERROR_DETAIL_REDACTED` (`redacted`, the default) sends only a generic message naming a
+request id and the server, and logs the full exception and backtrace under that same id, so a
+production client learns nothing about the server's internals but an operator can still find the
+failure. `ERROR_DETAIL_FULL` (`full`) also sends the exception text (capped at 1 KiB), for
+development and testing. Every other status code always carries its explanation.
+"""
+@enum ErrorDetail ERROR_DETAIL_REDACTED ERROR_DETAIL_FULL
+
+function _parse_error_detail(s)
+    ls = lowercase(strip(s))
+    ls == "redacted" && return ERROR_DETAIL_REDACTED
+    ls == "full" && return ERROR_DETAIL_FULL
+    throw(ConfigError("grpc.error_detail must be 'redacted' or 'full', got '$s'"))
+end
 
 """
     GrpcConfig
 
-gRPC transport limits for a worker's server. `max_recv_msg_bytes` / `max_send_msg_bytes` bound a
-single gRPC message in each direction (decode/encode caps, not allocations). Configured under the
-`grpc:` block of a worker (or node `global:`) config, with `INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES`
-/ `INFERENCE_SERVER_GRPC_MAX_SEND_MSG_BYTES` environment overrides. Default `DEFAULT_GRPC_MSG_BYTES`
-(512 MiB).
+gRPC transport settings for a worker's server. `max_recv_msg_bytes` / `max_send_msg_bytes` bound a
+single gRPC message in each direction. The server allocates a received message's full declared
+length as soon as its length prefix arrives, so the receive cap also bounds that buffer per request.
+`error_detail` (an [`ErrorDetail`](@ref)) is how much an `INTERNAL` error tells the client.
+`rapid_reset_protection` (default `false`) keeps the HTTP/2 Rapid-Reset (CVE-2023-44487)
+protection of the worker's listener: a client connection may then have 100 streams open at once,
+and the worker ends it once the client has reset more than 200 streams over the connection's
+life, which a client does each time it gives up on a call. Off, a client is never disconnected for
+giving up on calls, and `endpoints.max_concurrent_requests` is what bounds one that resets streams.
+Configured under the `grpc:` block of a worker (or node `global:`) config, with
+`INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES` / `INFERENCE_SERVER_GRPC_MAX_SEND_MSG_BYTES` /
+`INFERENCE_SERVER_GRPC_ERROR_DETAIL` / `INFERENCE_SERVER_GRPC_RAPID_RESET_PROTECTION` environment
+overrides. Defaults: `DEFAULT_GRPC_MSG_BYTES` (512 MiB), `redacted` and `false`.
 """
 struct GrpcConfig
     max_recv_msg_bytes::Int
     max_send_msg_bytes::Int
+    error_detail::ErrorDetail
+    rapid_reset_protection::Bool   # keep HTTP.jl's Rapid-Reset cut-off on the listener (GW-19)
 end
 
+# The forms without `rapid_reset_protection` (and without `error_detail`): the defaults, no
+# Rapid-Reset cut-off and production-safe redaction.
+GrpcConfig(max_recv_msg_bytes::Integer, max_send_msg_bytes::Integer, error_detail::ErrorDetail) =
+    GrpcConfig(max_recv_msg_bytes, max_send_msg_bytes, error_detail, false)
+GrpcConfig(max_recv_msg_bytes::Integer, max_send_msg_bytes::Integer) =
+    GrpcConfig(max_recv_msg_bytes, max_send_msg_bytes, ERROR_DETAIL_REDACTED)
 GrpcConfig() = GrpcConfig(DEFAULT_GRPC_MSG_BYTES, DEFAULT_GRPC_MSG_BYTES)
 
 """
@@ -532,6 +574,8 @@ const ENV_PATHS = Tuple{String, Vector{String}, DataType}[
     ("ENDPOINTS_MAX_CONCURRENT_REQUESTS", ["endpoints", "max_concurrent_requests"], Int),
     ("GRPC_MAX_RECV_MSG_BYTES", ["grpc", "max_recv_msg_bytes"], Int),
     ("GRPC_MAX_SEND_MSG_BYTES", ["grpc", "max_send_msg_bytes"], Int),
+    ("GRPC_ERROR_DETAIL", ["grpc", "error_detail"], String),
+    ("GRPC_RAPID_RESET_PROTECTION", ["grpc", "rapid_reset_protection"], Bool),
 ]
 
 _parse_env(::Type{Int}, s) = parse(Int, s)
@@ -876,6 +920,8 @@ function build_config(raw::AbstractDict)
     grpc = GrpcConfig(
         _opt(gc, "max_recv_msg_bytes", Int, DEFAULT_GRPC_MSG_BYTES),
         _opt(gc, "max_send_msg_bytes", Int, DEFAULT_GRPC_MSG_BYTES),
+        _parse_error_detail(_opt(gc, "error_detail", String, "redacted")),
+        _opt(gc, "rapid_reset_protection", Bool, false),
     )
 
     return ServerConfig(
@@ -903,10 +949,15 @@ function validate_config(cfg::ServerConfig)
     0 <= cfg.scheduler.coalescing_discount < 1 || throw(ConfigError("scheduler.coalescing_discount must be in [0, 1)"))
     0 < cfg.scheduler.cost_ema_alpha <= 1 || throw(ConfigError("scheduler.cost_ema_alpha must be in (0, 1]"))
     cfg.scheduler.max_queue_depth > 0 || throw(ConfigError("scheduler.max_queue_depth must be positive"))
+    cfg.scheduler.dispatch_timeout_seconds >= 0 ||
+        throw(ConfigError("scheduler.dispatch_timeout_seconds must be non-negative (0 = no timeout)"))
     cfg.scheduler.compaction_interval >= 0 ||
         throw(ConfigError("scheduler.compaction_interval must be non-negative (0 = disabled)"))
     for (name, mc) in cfg.scheduler.models
-        mc.weight > 0 || throw(ConfigError("scheduler.models.$name.weight must be positive"))
+        # The fair discipline charges a dispatch as its seconds over the weight, so only a positive,
+        # finite weight orders models: Inf charges nothing, and NaN fails every comparison.
+        isfinite(mc.weight) && mc.weight > 0 ||
+            throw(ConfigError("scheduler.models.$name.weight must be a positive finite number, got $(mc.weight)"))
         mc.max_batch_size === nothing || mc.max_batch_size >= 1 ||
             throw(ConfigError("scheduler.models.$name.max_batch_size must be >= 1"))
     end

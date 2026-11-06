@@ -37,10 +37,10 @@ gRPCClient = "1.1.0"
 gRPCServer = "0.1"
 ReactantServer = "0.1, 0.2"
 ReactantServerClient = "1"
-ReactantServerCore = "1.2"
+ReactantServerCore = "2"
 ReactantServerExport = "1, 2"
-ReactantServerGateway = "0.1"
-ReactantServerNode = "0.1"
+ReactantServerGateway = "0.2"
+ReactantServerNode = "0.2"
 
 [sources]
 ReactantServer = {path = "../packages/ReactantServer"}

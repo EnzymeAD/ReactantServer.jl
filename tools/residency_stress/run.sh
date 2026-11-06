@@ -123,14 +123,30 @@ else
     METRICS="http://127.0.0.1:$GW_METRICS_PORT/metrics"
     READY="http://127.0.0.1:$GW_METRICS_PORT/readyz"
     export REACTANT_WORKSPACE_ROOT="$REPO_ROOT"
+    # Pin the embedded gateway's config to this run's workers (worker i on BASE_PORT + i): without
+    # REACTANT_GATEWAY_FILE the supervisor reads /etc/reactantserver/gateway.yml whenever it exists,
+    # and on a host with a deployment's file there the gateway would route to that deployment.
+    NWORKERS="${RS_GPUS:-2}"
+    {
+        echo "listen:"
+        echo "  grpc: \"127.0.0.1:$GW_PORT\""
+        echo "  metrics: \"127.0.0.1:$GW_METRICS_PORT\""
+        echo "endpoints:"
+        for ((i = 0; i < NWORKERS; i++)); do echo "  - \"127.0.0.1:$((BASE_PORT + i))\""; done
+        echo "metrics_endpoints:"
+        for ((i = 0; i < NWORKERS; i++)); do echo "  - \"127.0.0.1:$((METRICS_BASE_PORT + i))\""; done
+        echo "worker_names:"
+        for ((i = 0; i < NWORKERS; i++)); do echo "  - worker$i"; done
+    } > "$RUN/gateway.yml"
+    export REACTANT_GATEWAY_FILE="$RUN/gateway.yml"
     export REACTANT_GATEWAY_LISTEN_GRPC="127.0.0.1:$GW_PORT"
     export REACTANT_GATEWAY_LISTEN_METRICS="127.0.0.1:$GW_METRICS_PORT"
     export REACTANT_GATEWAY_SCHEDULING_COMPACTION_MODE="${RS_GW_COMPACTION:-off}"
     if [[ "$BACKEND" == "cpu" ]]; then
         export REACTANT_GPUS=0
-        export REACTANT_CPU_WORKERS="${RS_GPUS:-2}"
+        export REACTANT_CPU_WORKERS="$NWORKERS"
     fi
-    "${LEASE[@]}" julia --handle-signals=no --project="$REPO_ROOT/packages/ReactantServerNode" -e '
+    "${LEASE[@]}" julia --handle-signals=no --threads=1,0 --project="$REPO_ROOT/packages/ReactantServerNode" -e '
         using ReactantServerNode
         exit(ReactantServerNode.supervise(ARGS[1]; runtime_dir = ARGS[2]))
     ' "$RUN/node.yaml" "$RUN/supervisor" > >(stamp > "$RUN/worker.log") 2>&1 &

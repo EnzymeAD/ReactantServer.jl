@@ -63,11 +63,21 @@ n_slots(p::InferenceBufferPool) = p.pool.n_slots
 # allocator. `span` requests that many physically contiguous slots as one range.
 acquire_slot!(p::InferenceBufferPool, span::Integer = 1) = acquire_slot!(p.pool, span)
 
+# Whether chunks staged in this pool run the slot control protocol (CORE-3): a SHM pool on Linux.
+_slot_controlled(p::InferenceBufferPool) = has_slot_control(p.pool)
+
 # ---- Triton/KServe SHM registration ----
 
 # Register the pool's SHM region with the model's server. No-op for inline pools and for models
 # whose (host, port) is already registered. Register failures propagate so the lazy-creation
-# path can fall back to an inline pool. The pre-emptive unregister is best-effort and quiet.
+# path can fall back to an inline pool.
+#
+# There is no unregister first. A worker treats registering the same name for the same object as an
+# idempotent success, replaces a registration whose object is gone, and refuses (ALREADY_EXISTS) a
+# name held by another live object (CORE-2). So a re-registration after one worker behind a gateway
+# restarted re-creates it there and leaves the healthy workers' registration, and the requests in
+# flight against it, untouched; the unregister used to fail those requests at encode (CLI-8), and
+# against a name held by another client it would have removed that client's registration.
 function register_pool_with_model!(p::InferenceBufferPool, model::KServeModel)
     is_shm_backed(p) || return
 
@@ -75,23 +85,14 @@ function register_pool_with_model!(p::InferenceBufferPool, model::KServeModel)
     lock(p.register_lock) do
         key in p.registered_keys && return
 
-        try
-            GRPCInferenceService.SystemSharedMemoryUnregister(
-                model.chan,
-                SystemSharedMemoryUnregisterRequest(name = pool_name(p));
-                deadline = SHM_CONTROL_DEADLINE,
-            )
-        catch ex
-            @info ex
-        end
-
         GRPCInferenceService.SystemSharedMemoryRegister(
             model.chan,
             SystemSharedMemoryRegisterRequest(
                 name = pool_name(p),
                 key = shmid(p.pool.backing),
                 offset = 0,
-                byte_size = sizeof(p),
+                # The whole object: the data slots and the slot control area after them.
+                byte_size = pool_region_bytes(p.pool),
             );
             deadline = SHM_CONTROL_DEADLINE,
         )

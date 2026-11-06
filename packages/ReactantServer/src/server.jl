@@ -23,6 +23,7 @@ struct RunningServer
     watcher::Union{BundleWatcher, Nothing}
     metrics_server::Any        # HTTP metrics listener, or nothing when metrics_port == 0
     monitor::InteractiveMonitor
+    drain::ReactantServerCore.DrainGate   # in-flight ModelInfer count; refuses new ones once draining
 end
 
 # ── Heartbeat registration ──────────────────────────────────────────────────────────────────────
@@ -99,20 +100,55 @@ function _beat(event::Symbol, detail)
 end
 
 """
-    stop!(s::RunningServer)
+    stop!(s::RunningServer; drain_seconds=0)
 
-Shut down a server started with `serve(...; blocking=false)`. Stops the model-directory watcher
-(if running), closes the metrics endpoint (if running) and the gRPC server, halts the scheduler's
-dispatch loop, and tears down any registered shared-memory regions. Returns `nothing`.
+Shut down a server started with `serve(...; blocking=false)`. From the start new ModelInfer calls
+are refused with UNAVAILABLE, and ServerReady, ModelReady, RepositoryIndex and `/readyz` report the
+worker not ready; with `drain_seconds > 0` the calls already admitted (queued or running) first get
+up to `drain_seconds` to finish. Then it stops the model-directory watcher (if running), closes
+the gRPC server, halts the scheduler's dispatch loop, closes the metrics endpoint (if running),
+and tears down any registered shared-memory regions. Returns `nothing`.
 """
-function stop!(s::RunningServer)
+function stop!(s::RunningServer; drain_seconds::Real = 0)
+    # Refuse new inference (UNAVAILABLE) and report not ready from here on; with a drain budget, first
+    # let the admitted calls finish.
+    ReactantServerCore.drain_inflight!(s.drain, drain_seconds; what = "worker")
     s.watcher === nothing || stop_watching!(s.watcher)
     stop_interactive_monitor!(s.monitor)
-    s.metrics_server === nothing || close(s.metrics_server)
     close(s.server)
     shutdown!(s.scheduler)
+    # Join the dispatch loop and the watcher, bounded: a loop mid-execution finishes its batch, and a
+    # watcher mid-load finishes that load, neither of which must hold up the process exiting.
+    _join_bounded(s.scheduler.task, "dispatch loop")
+    s.watcher === nothing || _join_bounded(s.watcher.task, "model directory watcher")
+    s.metrics_server === nothing || _close_http_bounded(s.metrics_server)
     shm_teardown!(s.shm)
     _beat(:down, s.config)
+    return nothing
+end
+
+# Wait at most `seconds` for a background task to finish, warning when it does not.
+function _join_bounded(t::Union{Task, Nothing}, what::AbstractString; seconds::Real = 10.0)
+    t === nothing && return nothing
+    timedwait(() -> istaskdone(t), Float64(seconds); pollint = 0.05) === :ok ||
+        @warn "stop: the $what did not finish within $(seconds)s; continuing shutdown without it"
+    return nothing
+end
+
+# `close(::HTTP.Server)` waits until every connection is idle, without bound; a scrape in progress
+# (or a stalled client) would hold shutdown. Close gracefully for a bounded time, then force it.
+function _close_http_bounded(server; seconds::Real = 5.0)
+    closing = Threads.@spawn try
+        close(server)
+    catch
+    end
+    if timedwait(() -> istaskdone(closing), Float64(seconds); pollint = 0.05) !== :ok
+        @warn "stop: the metrics listener did not close within $(seconds)s; forcing it"
+        try
+            HTTP.forceclose(server)
+        catch
+        end
+    end
     return nothing
 end
 
@@ -137,15 +173,6 @@ function _resolve_residency(cfg::ServerConfig, name::AbstractString, on_demand::
     # Under a host weight budget (the default is 0) an unspecified model is cached, evictably, rather
     # than pinned in RAM, so the budget governs it; only `unlimited` pins every model in RAM.
     return on_demand && cfg.runtime.host_weight_budget === nothing ? PINNED_SYSTEM : UNPINNED
-end
-
-# The per-request execution timeout is parsed and validated but not enforced by the dispatch
-# loop (a mid-execution watchdog is out of scope). Warn operators who tuned it so the silence
-# is not mistaken for an effect.
-function _warn_unenforced_config(cfg::ServerConfig)
-    cfg.scheduler.dispatch_timeout_seconds != 30.0 &&
-        @warn "scheduler.dispatch_timeout_seconds is set but not enforced (no mid-execution watchdog)" value = cfg.scheduler.dispatch_timeout_seconds
-    return nothing
 end
 
 # The regulated profile deliberately leaves `numerics` alone, so it states the precision actually in
@@ -203,7 +230,6 @@ function _assert_tf32_not_overridden(env = ENV)
 end
 
 function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
-    _warn_unenforced_config(cfg)
     # numerics=f32 defense in depth: NVIDIA_TF32_OVERRIDE must be in the environment before the
     # CUDA client (and its cuBLAS/cuDNN handles) exists. It covers library-internal matmul paths
     # the op-level precision pin cannot see; it does NOT govern XLA's Triton GEMMs, which the pin
@@ -234,9 +260,12 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     probe = pool.platform == "cuda" ? tf32_probe(backend, pool) : nothing
     cfg.runtime.profile == PROFILE_REGULATED && _report_regulated_precision(cfg.runtime, backend, pool, probe; coalescing = cfg.scheduler.coalescing)
     include = isempty(cfg.models_include) ? nothing : cfg.models_include
+    # Each bundle's signature as it was read: the directory watcher starts from these, so a bundle
+    # added, changed or removed while the models below compile is a change to its first polls.
+    signatures = Dict{String, BundleSig}()
     registry = load_bundles(
         cfg.model_dirs; include = include, batch_sizes = cfg.runtime.batch_sizes,
-        weights_migration = cfg.runtime.weights_migration
+        weights_migration = cfg.runtime.weights_migration, signatures = signatures
     )
     isempty(registry.by_name) && @warn "no model bundles found" model_dirs = cfg.model_dirs models_include = cfg.models_include
     # Resident weights are sized as a share of the BFC arena (`device_memory_fraction * device`), resolved now
@@ -322,7 +351,7 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
         watcher = BundleWatcher(
             sched, backend, pool, cfg;
             interval = cfg.model_poll_seconds, on_demand = on_demand,
-            store = store, include = include_names
+            store = store, include = include_names, seen = signatures
         )
         start_watching!(watcher)
     end
@@ -337,7 +366,11 @@ Run one worker from the node file at `node_path`, in this process: load the file
 worker entry, bring up the runtime and its models, and start the gRPC server (the KServe V2
 inference API and the worker control service). `worker` selects which worker entry to serve; it
 may be omitted when the node file has exactly one worker. When `blocking` is false the server runs
-in the background and a `RunningServer` is returned (stop it with `stop!`).
+in the background and a `RunningServer` is returned (stop it with `stop!`). A blocking server serves
+until a drain is requested (`request_drain!`, or under the node supervisor end of file on stdin),
+then drains, shuts everything down and returns. Should its dispatch loop die, a blocking server
+instead exits the process with status 70, whether it is serving or draining, so the node supervisor
+sees the failure (and restarts the worker unless it is shutting down).
 
 To run every worker in a node file, one process per device, use `ReactantServerNode.supervise`.
 """
@@ -382,15 +415,43 @@ function _meta_concurrency()
     return max(1, n)
 end
 
-# /readyz for the metrics listener: ready once every loaded model is compiled, the ServerReady rule.
-# A named callable rather than a closure so the precompile workload can start the listener with this
-# exact type; HTTP.jl specializes the listener's code on the handler, and through it on this.
+# /readyz for the metrics listener: ready once every loaded model is compiled, the ServerReady rule,
+# never once the dispatch loop has died, and not while the server drains. A named callable rather
+# than a closure so the precompile workload can start the listener with this exact type; HTTP.jl
+# specializes the listener's code on the handler, and through it on this.
 struct _RegistryReady
     registry::ModelRegistry
+    sched::Scheduler
+    draining::Threads.Atomic{Bool}
 end
+_RegistryReady(registry::ModelRegistry, sched::Scheduler) =
+    _RegistryReady(registry, sched, Threads.Atomic{Bool}(false))
 function (r::_RegistryReady)()
+    r.draining[] && return false
     es = values(r.registry.by_name)
-    return (!isempty(es) || !isempty(r.registry.meta)) && all(e -> e.executable !== nothing, es)
+    return (!isempty(es) || !isempty(r.registry.meta)) && all(e -> e.executable !== nothing, es) &&
+        dispatch_alive(r.sched)
+end
+
+# /healthz for the metrics listener: live while the dispatch loop serves, as ServerLive.
+struct _DispatchLive
+    sched::Scheduler
+end
+(l::_DispatchLive)() = dispatch_alive(l.sched)
+
+# A worker process whose dispatch loop has died serves nothing more, so it exits nonzero and its
+# node supervisor restarts it. The pause first lets the handlers just answered UNAVAILABLE send
+# their replies.
+const _DISPATCH_FAILURE_EXIT_CODE = 70      # EX_SOFTWARE
+const _DISPATCH_FAILURE_EXIT_GRACE_SECONDS = 2.0
+
+function _exit_on_dispatch_failure(_)
+    @error "exiting so the supervisor restarts this worker" exit_code = _DISPATCH_FAILURE_EXIT_CODE
+    Threads.@spawn :default begin
+        sleep(_DISPATCH_FAILURE_EXIT_GRACE_SECONDS)
+        exit(_DISPATCH_FAILURE_EXIT_CODE)
+    end
+    return nothing
 end
 
 function serve(
@@ -398,18 +459,30 @@ function serve(
         worker_name::AbstractString = ""
     )
     _check_serve_guards(cfg)
+    # Under the node supervisor, end of file on stdin is the request to drain (see
+    # ReactantServerCore's drain.jl). Watch from the start: a request during bring-up exits at once.
+    blocking && ReactantServerCore.watch_stdin_drain()
     # Count JIT time from here on (julia_compile_seconds_total), so model loading, the startup probe
     # and each model's first requests all show up.
     enable_compile_timing!()
     shm = SharedMemoryRegistry()   # client-facing SystemSharedMemory feature (decode/encode shm path)
     pool, registry, sched, watcher = _bring_up(cfg, backend)
-    # Local reuse pool for meta-model intermediates: plain Memory, never shared. With one meta at a time
-    # (the gate below) the pool sees no cross-meta contention; it keeps large per-request intermediates
-    # (e.g. an ROI feature tensor) off the allocation path and holds down GC pressure. Sized by env.
+    # A blocking serve is a worker process: should its dispatch loop die, exit nonzero for a restart.
+    # `exiting` records that the hook fired, for the end of a blocking serve (see there).
+    exiting = Threads.Atomic{Bool}(false)
+    blocking && on_dispatch_failure!(sched, err -> (exiting[] = true; _exit_on_dispatch_failure(err)))
+    # Local reuse pool for meta-model intermediates: plain Memory, never shared across processes. It
+    # keeps large per-request intermediates (e.g. an ROI feature tensor) off the allocation path and
+    # holds down GC pressure. Several metas use it at once (the gate below admits two by default, and
+    # compute-only metas bypass it), so they compete for its slots: a request holds the slots its
+    # `call.scratch` took until it no longer reads its outputs, which for a gRPC request is after
+    # its response is encoded (see `run_meta`), and a meta that finds no free slot waits for one,
+    # until its deadline if it has one. Sized by env (`_meta_scratch_pool`).
     sched.scratch_pool = _meta_scratch_pool()
-    # Admit one meta orchestration at a time (configurable). A meta holds a permit across its whole run,
-    # including the CPU glue between stages, but not the GPU itself: its sub-calls dispatch on the loop,
-    # so other models run while the meta computes between stages.
+    # Admit a bounded number of GPU-using meta orchestrations at once (`_meta_concurrency`, default
+    # 2). A meta holds a permit across its whole run, including the CPU glue between stages, but not
+    # the GPU itself: its sub-calls dispatch on the loop, so other models run while the meta
+    # computes between stages.
     sched.meta_gate = MetaGate(_meta_concurrency())
     # Build the gRPC server first (registered, with a metrics-less payload), then adopt the
     # server's own admission atomics into the metrics collector, then swap in the real payload
@@ -421,6 +494,7 @@ function serve(
         max_recv_msg_bytes = cfg.grpc.max_recv_msg_bytes,
         max_send_msg_bytes = cfg.grpc.max_send_msg_bytes,
         max_concurrent_requests = cfg.endpoints.max_concurrent_requests,
+        rapid_reset_protection = cfg.grpc.rapid_reset_protection,
         h2_initial_window_size = _H2_INITIAL_WINDOW_BYTES,
         h2_connection_window_size = _H2_CONNECTION_WINDOW_BYTES
     )
@@ -432,28 +506,54 @@ function serve(
     )
     # Measure the interactive thread from here on: it is the one request handling shares with dispatch.
     monitor = start_interactive_monitor!(InteractiveMonitor(metrics.registry))
-    server.context = InferContext(sched, registry, shm, pool.platform, metrics)   # swap before start!
+    # An INTERNAL error names this worker (the node's worker name, else REACTANT_WORKER_NAME, else its
+    # port) and tells the client as much as `grpc.error_detail` allows.
+    name = _worker_name(worker_name; fallback = "port $(cfg.endpoints.port)")
+    server.context = InferContext(sched, registry, shm, pool.platform, metrics, cfg.grpc.error_detail, name)   # swap before start!
+    # Refuses new inference with UNAVAILABLE and reports not ready once the server drains.
+    drain = ReactantServerCore.DrainGate()
+    gRPCServer.add_interceptor!(server, _DrainInterceptor(drain))
     # Optional Prometheus metrics endpoint (opt-in via endpoints.metrics_port > 0). Request counting
     # is always on (the InferContext carries `metrics`); only the HTTP listener is gated.
     metrics_server = nothing
     if cfg.endpoints.metrics_port > 0
         metrics_server = start_worker_metrics(
             metrics, cfg.endpoints.host, cfg.endpoints.metrics_port;
-            ready_fn = _RegistryReady(registry), worker_name = worker_name, gpu = _gpu_identity(cfg)
+            ready_fn = _RegistryReady(registry, sched, drain.draining), live_fn = _DispatchLive(sched),
+            worker_name = worker_name, gpu = _gpu_identity(cfg)
         )
     end
-    @info "Starting gRPC server" host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests models = model_names(registry)
-    if blocking
-        _beat(:up, cfg)
+    @info "Starting gRPC server" host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests rapid_reset_protection = cfg.grpc.rapid_reset_protection models = model_names(registry)
+    blocking || return _start_server(cfg, registry, sched, pool, shm, server, watcher, metrics_server, monitor, drain)
+    # Blocking: serve until a drain is requested (the supervisor closing stdin, or `request_drain!`),
+    # then drain and tear everything down, so the process exits 0 with nothing left running.
+    # Interrupting the wait (Ctrl-C at a REPL) stops at once, without draining.
+    ReactantServerCore.begin_serving!()
+    try
+        s = _start_server(cfg, registry, sched, pool, shm, server, watcher, metrics_server, monitor, drain)
+        secs = 0.0
         try
-            run(server)
+            secs = ReactantServerCore.wait_for_drain_request()
+        catch err
+            err isa InterruptException || rethrow()
         finally
-            stop_interactive_monitor!(monitor)
-            _beat(:down, cfg)
+            stop!(s; drain_seconds = secs)
         end
-        return nothing
+    finally
+        ReactantServerCore.end_serving!()
     end
+    # A dispatch loop that died while the worker served or drained has scheduled the exit with
+    # `_DISPATCH_FAILURE_EXIT_CODE` (`_exit_on_dispatch_failure`) after a grace for the replies just
+    # sent. A drain that ends inside that grace returns here first, and returning would let the
+    # process exit 0 in its place; exit with the failure's code now instead. (A loop that fails only
+    # once the shutdown has begun fires no hook, as the scheduler decides, and the exit stays 0.)
+    exiting[] && exit(_DISPATCH_FAILURE_EXIT_CODE)
+    return nothing
+end
+
+# Bind the gRPC port, then announce the server: `:up` means it is accepting traffic.
+function _start_server(cfg, registry, sched, pool, shm, server, watcher, metrics_server, monitor, drain)
     gRPCServer.start!(server)
     _beat(:up, cfg)
-    return RunningServer(cfg, registry, sched, pool, shm, server, cfg.endpoints.port, watcher, metrics_server, monitor)
+    return RunningServer(cfg, registry, sched, pool, shm, server, cfg.endpoints.port, watcher, metrics_server, monitor, drain)
 end

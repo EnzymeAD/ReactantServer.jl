@@ -40,7 +40,8 @@ import ReactantServerCore:
     _opt,
     _set_nested!,
     _parse_env,
-    _parse_env_var
+    _parse_env_var,
+    _parse_error_detail
 
 # gRPC codegen: the generated modules carry client constructors and the per-service
 # registration functions, but `using` does not re-export them, so re-export the three
@@ -63,6 +64,7 @@ include("server.jl")
 include("control_service.jl")   # the gateway's own GatewayControlService handlers
 include("health.jl")
 include("responsiveness.jl")   # the event-loop lag monitor
+include("drain.jl")   # the graceful-drain gate on the gRPC server
 
 """
     RunningGateway
@@ -81,6 +83,7 @@ struct RunningGateway{S}
     prober::HealthProber
     monitor::LoopMonitor
     server::S          # the gRPC server handle (GRPCServer)
+    drain::ReactantServerCore.DrainGate   # in-flight ModelInfer count; refuses new ones once draining
 end
 
 """
@@ -100,6 +103,24 @@ bound_ports(g::RunningGateway) =
 # to become config/env-tunable later.
 const _H2_INITIAL_WINDOW_BYTES = 32 * 1024 * 1024     # per-stream receive window
 const _H2_CONNECTION_WINDOW_BYTES = 32 * 1024 * 1024  # connection-level receive window
+
+# The streams a client connection may have open at once (SETTINGS_MAX_CONCURRENT_STREAMS) by default:
+# 2^31 - 1, more than a client can ever open on one connection (its stream ids are odd and below
+# 2^31). It is this large because HTTP.jl derives its Rapid-Reset (CVE-2023-44487) budget from it:
+# once the peer has reset more than `max_concurrent_streams + 100` streams over the connection's whole
+# life, the server sends GOAWAY(ENHANCE_YOUR_CALM). Every call a client gives up on (its deadline
+# passed, or it cancelled) resets one stream, so at gRPCServer's default of 100 an ordinary client is
+# cut off after its 200th give-up. libcurl, which gRPCClient and so ReactantServerClient drive with
+# CURLOPT_PIPEWAIT, then parks every later call behind the replacement connection until the call's
+# deadline when that connection's first calls were give-ups too: it waits for a connection to show it
+# multiplexes before reusing it, and one that never answered a call never does, until it has been
+# idle for 118 s and libcurl drops it (GW-18). With this limit the budget is out of reach. What bounds
+# a client that resets streams is the gateway's inbound admission cap (`inbound_cap`, unless it is
+# configured to 0): a reset call's handler counts against it until it returns, and a call past it is
+# shed at once with RESOURCE_EXHAUSTED. `grpc.rapid_reset_protection` restores gRPCServer's default
+# limit, and with it the budget, for an operator who prefers HTTP.jl's protection to clients that
+# keep their connection (see `_listener_streams`).
+const _H2_MAX_CONCURRENT_STREAMS = Int(typemax(Int32))
 
 # How long lpt_packing startup waits for all workers to come up over the control plane before
 # serving (REACTANT_GATEWAY_STARTUP_WAIT_SECONDS). "inf"/"forever"/"-1" waits indefinitely and 0
@@ -124,7 +145,9 @@ Load `gateway.yml` (listen addresses and the worker endpoint list), build the wo
 start the admin HTTP server and the readiness/discovery prober (which probes each endpoint's
 ServerReady and RepositoryIndex and swaps in the discovered routing table), and serve the KServe
 gRPC proxy. When `blocking` is false the server runs in the background and a
-[`RunningGateway`](@ref) is returned (stop it with [`stop!`](@ref ReactantServer.stop!)).
+[`RunningGateway`](@ref) is returned (stop it with [`stop!`](@ref ReactantServer.stop!)). A
+blocking gateway serves until a drain is requested (`request_drain!`, or under the node supervisor
+end of file on stdin), then drains, shuts down and returns.
 
 `gateway_path` may be omitted (or `nothing`) to configure the gateway from defaults and
 `REACTANT_GATEWAY_*` environment variables alone; the endpoint list then comes from
@@ -132,6 +155,9 @@ gRPC proxy. When `blocking` is false the server runs in the background and a
 gateway.yml.
 """
 function serve_gateway(gateway_path::Union{AbstractString, Nothing} = nothing; blocking::Bool = true)
+    # Under the node supervisor, end of file on stdin is the request to drain (see
+    # ReactantServerCore's drain.jl). Watch from the start: a request during startup exits at once.
+    blocking && ReactantServerCore.watch_stdin_drain()
     cfg = load_gateway(gateway_path)
     pool = ClientPool(cfg)
     routes = DiscoveredRoutes()
@@ -167,7 +193,9 @@ function serve_gateway(gateway_path::Union{AbstractString, Nothing} = nothing; b
     cfg.scheduling_mode == "round_robin" ?
         (@info "gateway scheduling" mode = cfg.scheduling_mode) :
         (@info "gateway scheduling" mode = cfg.scheduling_mode work_basis = cfg.work_basis)
-    state = GatewayState(pool, routes, gate, metrics, refresher, scheduler)
+    state = GatewayState(
+        pool, routes, gate, metrics, refresher, scheduler, cfg.error_detail, worker_labels(cfg)
+    )
 
     admin = start_admin(metrics, cfg.listen_metrics; worker_metrics = cfg.worker_metrics)
     # Discover routes once synchronously so the table is populated before we accept traffic;
@@ -183,33 +211,81 @@ function serve_gateway(gateway_path::Union{AbstractString, Nothing} = nothing; b
     host, port = _split_hostport(cfg.listen_grpc)
     # Inbound admission cap: a per-worker multiple of the configured budget, scaled by the fleet
     # size so the gateway sheds (RESOURCE_EXHAUSTED) only past what the workers can plausibly absorb.
-    # 0 (per-worker = 0) disables the cap. The server's own admission atomics are read live by the
-    # admission metrics.
-    max_concurrent = cfg.max_concurrent_requests_per_worker * length(cfg.workers)
+    # 0 (per-worker = 0) disables the cap. `build_gateway_server` gives it to the gRPC server, whose
+    # own admission atomics the admission metrics read live.
+    max_concurrent = inbound_cap(cfg)
     server = build_gateway_server(state, cfg, host, port)
     register_admission!(metrics, server.inflight, server.shed_total, max_concurrent)
-    @info "Starting reactant-gateway" grpc = cfg.listen_grpc metrics = cfg.listen_metrics endpoints = cfg.workers max_concurrent_requests = max_concurrent outbound_streams_per_worker = cfg.max_concurrent_streams_per_worker
+    # Refuses new inference with UNAVAILABLE once the gateway drains.
+    drain = ReactantServerCore.DrainGate()
+    gRPCServer.add_interceptor!(server, _DrainInterceptor(drain))
+    @info "Starting reactant-gateway" grpc = cfg.listen_grpc metrics = cfg.listen_metrics endpoints = cfg.workers max_concurrent_requests = max_concurrent outbound_streams_per_worker = cfg.max_concurrent_streams_per_worker rapid_reset_protection = cfg.rapid_reset_protection
 
-    if blocking
-        run(server)
-        return nothing
+    blocking || return _start_gateway(cfg, pool, routes, gate, metrics, admin, prober, monitor, server, drain)
+    # Blocking: serve until a drain is requested (the supervisor closing stdin, or `request_drain!`),
+    # then drain and tear everything down, so the process exits 0. Interrupting the wait (Ctrl-C at a
+    # REPL) stops at once, without draining.
+    ReactantServerCore.begin_serving!()
+    try
+        g = _start_gateway(cfg, pool, routes, gate, metrics, admin, prober, monitor, server, drain)
+        secs = 0.0
+        try
+            secs = ReactantServerCore.wait_for_drain_request()
+        catch err
+            err isa InterruptException || rethrow()
+        finally
+            stop!(g; drain_seconds = secs)
+        end
+    finally
+        ReactantServerCore.end_serving!()
     end
+    return nothing
+end
+
+function _start_gateway(cfg, pool, routes, gate, metrics, admin, prober, monitor, server, drain)
     gRPCServer.start!(server)
-    return RunningGateway(cfg, pool, routes, gate, metrics, admin, prober, monitor, server)
+    return RunningGateway(cfg, pool, routes, gate, metrics, admin, prober, monitor, server, drain)
 end
 
 """
-    stop!(g::RunningGateway)
+    stop!(g::RunningGateway; drain_seconds=0)
 
-Shut down a gateway started with `serve_gateway(...; blocking=false)`: close the gRPC server,
-halt the readiness prober, and close the admin HTTP server.
+Shut down a gateway started with `serve_gateway(...; blocking=false)`: halt the readiness prober,
+report not ready on `/readyz`, refuse new ModelInfer calls with UNAVAILABLE, close the gRPC
+server, and close the admin HTTP server. With `drain_seconds > 0` the calls already forwarded get
+up to `drain_seconds` to finish before the gRPC server closes.
 """
-function stop!(g::RunningGateway)
-    close(g.server)
+function stop!(g::RunningGateway; drain_seconds::Real = 0)
+    # Refuse new inference (UNAVAILABLE) and report not ready from here on; with a drain budget, first
+    # let the forwarded calls finish. The prober stops first so it cannot report the gateway ready
+    # again, and /readyz is turned down on every check while the drain waits (a probe round already
+    # under way may still set it).
     stop_prober!(g.prober)
+    set_ready!(g.admin, false)
+    ReactantServerCore.drain_inflight!(
+        g.drain, drain_seconds; what = "gateway", poll = () -> set_ready!(g.admin, false)
+    )
+    close(g.server)
     stop_loop_monitor!(g.monitor)
-    close(g.admin.server)
+    _close_http_bounded(g.admin.server)
     close_pool!(g.pool)
+    return nothing
+end
+
+# `close(::HTTP.Server)` waits until every connection is idle, without bound; a scrape in progress
+# (or a stalled client) would hold shutdown. Close gracefully for a bounded time, then force it.
+function _close_http_bounded(server; seconds::Real = 5.0)
+    closing = Threads.@spawn try
+        close(server)
+    catch
+    end
+    if timedwait(() -> istaskdone(closing), Float64(seconds); pollint = 0.05) !== :ok
+        @warn "stop: the admin listener did not close within $(seconds)s; forcing it"
+        try
+            HTTP.forceclose(server)
+        catch
+        end
+    end
     return nothing
 end
 

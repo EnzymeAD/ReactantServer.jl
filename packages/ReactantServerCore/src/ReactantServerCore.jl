@@ -23,9 +23,16 @@ include("proto/inference/inference.jl")
 # ReactantServer ControlService protobuf messages (ProtoBuf only; worker control plane).
 include("proto/control/control.jl")
 
-# Shared-memory primitives: aliasing helpers (vendored MMISHM) and the slot-allocated pool.
+# Shared-memory primitives: aliasing helpers (vendored MMISHM), objects mapped through a retained
+# descriptor, and the slot-allocated pool.
 include("shm_helpers.jl")
+include("shm_object.jl")
 include("buffer_pool.jl")
+
+# Server-side shared-memory registry, and the per-slot control words both sides use (CORE-3).
+# Before the boundary types, which carry a request's slot control.
+include("shared_memory.jl")
+include("slot_control.jl")
 
 # Host-weight residency store (private, or node-shared via POSIX SHM + flock).
 include("weight_store.jl")
@@ -36,9 +43,13 @@ include("manifest.jl")
 include("signature.jl")
 include("config.jl")
 include("node.jl")
+# The text of an error status, as the worker and the gateway send it.
+include("status_message.jl")
 
-# Server-side shared-memory registry and the wire <-> boundary codec.
-include("shared_memory.jl")
+# Cooperative drain requests for a blocking worker or gateway (the supervisor's stop protocol).
+include("drain.jl")
+
+# The wire <-> boundary codec.
 include("codec.jl")
 
 function __init__()
@@ -63,10 +74,16 @@ export memory_from_shm, memory_from_bytes, fsa_from_memory
 export BufferPool, PoolSlot, acquire_slot!, release_slot!, subslot, reset_slot!, PoolAcquireTimeout, PoolClosedError
 export pool_view, pool_memory, pool_fsa, is_shm_backed, scratch
 export pool_base_pointer, pool_region_name, pool_slot_bytes
+export try_acquire_slot!, pool_region_bytes, SLOT_RETIRE_SECONDS
+
+# ---- slot control (CORE-3) ----
+export SlotControl, SlotWriteInProgress, slot_arm!, slot_seal!, slot_control_offset, has_slot_control
+export slot_control_supported, request_cancelled, RequestCancelled
+export SLOT_CONTROL_REGION_PARAM, SLOT_CONTROL_OFFSET_PARAM, SLOT_CONTROL_TOKEN_PARAM
 
 # ---- weight store ----
 export WeightStore, PrivateWeightStore, SharedWeightStore
-export materialize_host_weights!, release_host_weights!, rename_host_weights!, weights_digest,
+export materialize_host_weights!, release_host_weights!, weights_digest,
     weights_file_token, WeightsFileId, NO_WEIGHTS_FILE, weights_file_id, SharedStoreFull,
     with_cached_host_weights, trim_host_cache!, host_cache_bytes, bump_load_rank,
     HOST_CACHE_HALFLIFE_SECONDS,
@@ -95,15 +112,20 @@ export BatchSizeMode, BATCH_SIZES_ALL, BATCH_SIZES_LARGEST
 export WeightsMigration, MIGRATE_OFF, MIGRATE_COPY, MIGRATE_REPLACE
 export RuntimeProfile, PROFILE_DEFAULT, PROFILE_REGULATED
 export RuntimeConfig, ModelSchedConfig, SchedulerConfig, EndpointsConfig, GrpcConfig, ServerConfig
+export ErrorDetail, ERROR_DETAIL_REDACTED, ERROR_DETAIL_FULL, sanitize_status_message, error_request_id
 export build_config, validate_config, apply_env_overrides!, log_effective_config, parse_byte_size
 
 # ---- node ----
 export load_node, load_node_raw, validate_node, worker_names, worker_raw_config, node_server_config
 export node_gpus, materialize_node!
 
+# ---- drain ----
+export request_drain!
+
 # ---- shared-memory registry ----
 export ShmRegion, SharedMemoryRegistry, shm_register!, shm_unregister!, shm_read, shm_write!
 export shm_regions, shm_teardown!, same_ipc_namespace, UnregisteredRegionError
+export ShmRegionExistsError, shm_reap!, SHM_REAP_INTERVAL_SECONDS
 
 # ---- codec ----
 export OutputTarget, DecodedRequest, decode_infer_request, encode_infer_response, encode_model_metadata

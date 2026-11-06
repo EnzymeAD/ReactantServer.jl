@@ -90,6 +90,8 @@ global:
   grpc:                        # -> GrpcConfig
     max_recv_msg_bytes: 536870912  # 512 MiB; max inbound gRPC message
     max_send_msg_bytes: 536870912  # 512 MiB; max outbound gRPC message
+    error_detail: redacted     # what an INTERNAL error tells clients: redacted | full
+    rapid_reset_protection: false  # true: HTTP/2 Rapid-Reset cut-off, gateway too; see below
 ```
 
 Each sub-block corresponds to a typed config struct ([`RuntimeConfig`](@ref),
@@ -137,7 +139,8 @@ original is untouched, and servers older than 0.2 ignore the new field and keep 
 `replace` then swaps the copy in as `weights.safetensors` and marks the manifest
 `format_version: "2.1"`, which older servers refuse; use it once every server reading the
 directory runs 0.2 or later. The bundle directory must be writable. A migration never fails a model:
-on any error it is logged and the bundle loads as it was. See
+on any error it is logged and the bundle loads as it was. In every mode, `off` included, a
+`weights.safetensors` deployed after a migration is the file that loads. See
 [Migrating older bundles](bundles.md#Migrating-older-bundles).
 
 `runtime.xla_flags` is a mapping of XLA `DebugOptions` field names (no leading `--`) to values,
@@ -162,9 +165,14 @@ validated deployment should use.
 
 - `dynamic` (the default) watches the repository and loads, unloads, and reloads bundles online as
   their files change, including the weights, the MLIR, the manifest, and `model.jl`. A bundle must
-  look the same on two consecutive polls before it loads, so a half-written bundle never does, and
-  a reload swaps one model while every other model keeps serving. A renamed directory with
-  unchanged contents renames the live model in place, without recompiling.
+  look the same on two consecutive polls before it loads, so a half-written bundle never does. A
+  load or reload compiles the bundle on the worker's dispatch loop, so every other model on that
+  worker pauses until the compile ends, and a reloaded model answers `NOT_FOUND` until its new
+  version is in. The loop shares a thread with request handling, so the worker's health probes
+  stall for that time as well. An executable-cache hit (`runtime.executable_cache`) keeps the pause
+  short; an uncached compile takes 5 to 30 seconds per compiled program. A renamed directory is an
+  unload of the old name and a load of the new one. A bundle whose files change while it loads is
+  not admitted: the next poll loads it again from the files as they are then.
 - `static` loads the startup set once and never changes it.
 - `explicit` cedes the lifecycle to an external control plane: the worker takes no action of its
   own, and a model serves only while the control plane holds it resident through the worker
@@ -179,12 +187,40 @@ single device through its own `CUDA_VISIBLE_DEVICES`.
 The `global.grpc` block is the single node-level place for gRPC message-size limits: every
 worker reads it directly, and the supervisor also mirrors it into the embedded gateway (as
 `REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES` / `REACTANT_GATEWAY_GRPC_MAX_SEND_MSG_BYTES`), so one
-block sizes the whole node. The defaults are 512 MiB each, and these are decode/encode caps, not
-allocations: raising them costs nothing until a message that large actually arrives.
+block sizes the whole node. The defaults are 512 MiB each. `max_send_msg_bytes` is only a check
+on each outgoing message, but `max_recv_msg_bytes` also sizes memory: the gRPC server allocates a
+buffer of a request message's full declared length as soon as the message's 5-byte length prefix
+arrives, before any of the payload, so every request being received can hold up to
+`max_recv_msg_bytes` however few bytes its client has sent. Size it to the largest inline message
+the deployment needs (tensors passed through shared memory do not count): the largest request for
+a worker, and for the gateway, which applies the same limit to the responses it receives from
+workers, the larger of the largest request and the largest response. Lower it wherever untrusted
+clients can connect; see [Security](security.md).
 Per-component environment overrides still apply, with the gateway's own
 `REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES` winning over the mirrored value:
 `INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES` for a worker, `REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES`
 for the gateway.
+
+`global.grpc.error_detail` decides what a client is told when a request fails inside the server
+(`INTERNAL`), and like the message sizes it reaches every worker directly and the embedded gateway
+through the supervisor's mirror (`REACTANT_GATEWAY_GRPC_ERROR_DETAIL`). Under `redacted`, the
+default and the production setting, the client gets only `internal error (request id <id>, worker
+<name>); see the worker log` (from the gateway's own failures, `gateway` and the gateway log). The
+id is the KServe request `id` when the client sent one, otherwise one the server generates, and
+the server logs the full exception and backtrace under that same id and name, so a client report
+can be traced to its log line. Under `full`, for development and testing, the message also carries
+the exception text (at most 1 KiB). In `redacted` mode the gateway also names workers by their
+worker name (or position), never by host and port. Only `INTERNAL` is redacted: every other status
+keeps its explanation. In both modes every status message is sanitized: `grpc-status:` and
+`grpc-message:` in it become `grpc-status=` and `grpc-message=`, since a client library that finds
+them in an error message can misread the call's status. The per-component overrides are
+`INFERENCE_SERVER_GRPC_ERROR_DETAIL` (a worker) and `REACTANT_GATEWAY_GRPC_ERROR_DETAIL` (the
+gateway).
+
+`global.grpc.rapid_reset_protection` (default `false`) switches on HTTP/2 Rapid-Reset protection
+for every worker and the embedded gateway at once; see
+[Rapid-Reset protection](#Rapid-Reset-protection) for what that does to clients, the matching
+environment variable, and which setting wins.
 
 `scheduler.discipline` selects the dispatch policy: `fair` (the default), `fifo`, or `edf`. Workers
 behind a gateway in `lpt_packing` mode must run `fifo` or `edf`. [Scheduling](scheduling.md)
@@ -268,9 +304,13 @@ listen:
 grpc:
   max_recv_msg_bytes: 536870912   # 512 MiB
   max_send_msg_bytes: 536870912
+  error_detail: redacted          # what an INTERNAL error tells clients: redacted | full
   max_concurrent_requests_per_worker: 64  # inbound cap is this x worker count; 0 = uncapped.
-                                          # Sized above the outbound stream limit so a startup
-                                          # burst has headroom rather than being shed early
+                                          # A call past it is shed at once with RESOURCE_EXHAUSTED
+                                          # (gateway_requests_shed_total). Sized above the outbound
+                                          # stream limit so a startup burst has headroom rather
+                                          # than being shed early
+  rapid_reset_protection: false   # true: HTTP.jl's Rapid-Reset cut-off (see below)
 worker_client:
   request_timeout_seconds: 60
   max_concurrent_streams: 32      # outbound in-flight RPCs the gateway multiplexes to one worker
@@ -288,11 +328,65 @@ endpoints:                        # worker host:port addresses, across any numbe
   - "10.0.0.2:8080"
 ```
 
+`grpc.rapid_reset_protection` (default `false`; environment
+`REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION`) switches on the gateway's HTTP/2 Rapid-Reset
+protection. Under the supervisor the node-wide setting also reaches a gateway run from a mounted
+`gateway.yml` that does not set this key; see [Rapid-Reset protection](#Rapid-Reset-protection).
+
 The gateway is also configured by `REACTANT_GATEWAY_*` environment overrides
 (`REACTANT_GATEWAY_WORKERS` replaces the endpoint list, comma separated). The embedded gateway
 under the supervisor is launched from defaults plus those synthesized environment variables, so
 a single node needs no `gateway.yml` at all. See [Multi-GPU Gateway](gateway.md) for the
 scheduling modes, the runtime control plane, and the lpt_packing-specific knobs.
+
+## Rapid-Reset protection
+
+HTTP/2 Rapid-Reset (CVE-2023-44487) protection is off by default on every worker and on the
+gateway. With it on, a client connection may have 100 streams open at once, and the server ends
+the connection (`GOAWAY(ENHANCE_YOUR_CALM)`) once the client has reset more than 200 streams over
+the connection's life. A client resets a stream every time it gives up on a call (its deadline
+passes, or it cancels), so **a client that gives up on calls is disconnected after about 200
+give-ups per connection**, however long the connection has been up. gRPCClient-based clients,
+`ReactantServerClient` among them, can then hang on every call to that server until the call's
+deadline, for up to about two minutes, if their first calls on the new connection are give-ups
+as well (libcurl waits for that connection to answer before using it, and it never does). The
+gateway is such a client of each worker: every call it forwards that reaches its deadline resets a
+stream on its connection to that worker, so protection on the workers can cut the gateway off the
+same way. With it off, no client is disconnected for giving up on calls, and what bounds a client
+that resets streams is the server's inbound cap, past which calls are shed with
+`RESOURCE_EXHAUSTED`: `endpoints.max_concurrent_requests` on a worker, and
+`grpc.max_concurrent_requests_per_worker` times the worker count on the gateway. Nothing bounds it
+where that cap is 0. Turn the protection on only where untrusted clients can connect, and only if
+the clients that depend on the node can tolerate being cut off as described.
+
+On a node, one setting turns it on or off for the gateway and every worker:
+
+```yaml
+global:
+  grpc:
+    rapid_reset_protection: true
+```
+
+or, without editing the node file, `REACTANT_RAPID_RESET_PROTECTION=true` on the node container.
+The supervisor reads that variable; it accepts `true`, `false`, `1`, `0`, `yes`, `no`, `on` and
+`off`, refuses anything else at startup, and wins over the node file. The supervisor hands the
+value to every worker it launches through the node file they read, and to the embedded gateway as
+`REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION`, in the `all`, `workers` and `gateway` roles alike. A
+value set for one component still wins over it. For each component, the first of these that is
+set decides:
+
+- **A worker:** `INFERENCE_SERVER_GRPC_RAPID_RESET_PROTECTION`, then `grpc.rapid_reset_protection`
+  in that worker's own `workers:` entry, then `REACTANT_RAPID_RESET_PROTECTION`, then
+  `global.grpc.rapid_reset_protection`; otherwise off.
+- **The embedded gateway:** `REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION`, then
+  `grpc.rapid_reset_protection` in a mounted `gateway.yml`, then `REACTANT_RAPID_RESET_PROTECTION`,
+  then `global.grpc.rapid_reset_protection`; otherwise off. Unlike the message sizes and
+  `error_detail`, which a mounted `gateway.yml` owns whether or not it sets them, the node-wide
+  value reaches a gateway run from a mounted file that does not set this key.
+
+A worker or gateway run without the supervisor has only its own settings: a worker reads its node
+file's `global.grpc` and its own entry, with `INFERENCE_SERVER_GRPC_RAPID_RESET_PROTECTION` over
+both, and a gateway its `gateway.yml`, with `REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION` over it.
 
 ## Environment overrides
 
@@ -351,3 +445,5 @@ overrides were applied, is logged at startup.
 | `INFERENCE_SERVER_ENDPOINTS_MAX_CONCURRENT_REQUESTS` | `endpoints.max_concurrent_requests` | integer |
 | `INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES` | `grpc.max_recv_msg_bytes` | bytes |
 | `INFERENCE_SERVER_GRPC_MAX_SEND_MSG_BYTES` | `grpc.max_send_msg_bytes` | bytes |
+| `INFERENCE_SERVER_GRPC_ERROR_DETAIL` | `grpc.error_detail` | `redacted`, `full` |
+| `INFERENCE_SERVER_GRPC_RAPID_RESET_PROTECTION` | `grpc.rapid_reset_protection` | bool |

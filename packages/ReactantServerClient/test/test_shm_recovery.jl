@@ -31,10 +31,12 @@ mutable struct MockState
     register_calls::Threads.Atomic{Int}  # total SystemSharedMemoryRegister invocations
     infer_calls::Threads.Atomic{Int}
     lock::ReentrantLock
+    unregister_calls::Threads.Atomic{Int}
+    registered_names::Vector{String}     # every name a register call carried, in order
 end
 MockState() = MockState(
     Set{String}(), true, false, 0.0, Threads.Atomic{Int}(0),
-    Threads.Atomic{Int}(0), ReentrantLock()
+    Threads.Atomic{Int}(0), ReentrantLock(), Threads.Atomic{Int}(0), String[]
 )
 
 # Extract a tensor's shared_memory_region string parameter, or nothing when the tensor is inline.
@@ -65,6 +67,7 @@ function _mk_server(st::MockState, port::Integer)
     _reg(
         "SystemSharedMemoryRegister", inf.SystemSharedMemoryRegisterRequest, inf.SystemSharedMemoryRegisterResponse, (ctx, req) -> begin
             Threads.atomic_add!(st.register_calls, 1)
+            @lock st.lock push!(st.registered_names, req.name)
             st.reject_register &&
                 throw(gRPCServer.GRPCError(gRPCServer.StatusCode.INTERNAL, "register rejected"))
             @lock st.lock push!(st.regions, req.name)
@@ -73,6 +76,7 @@ function _mk_server(st::MockState, port::Integer)
     )
     _reg(
         "SystemSharedMemoryUnregister", inf.SystemSharedMemoryUnregisterRequest, inf.SystemSharedMemoryUnregisterResponse, (ctx, req) -> begin
+            Threads.atomic_add!(st.unregister_calls, 1)
             @lock st.lock (isempty(req.name) ? empty!(st.regions) : delete!(st.regions, req.name))
             inf.SystemSharedMemoryUnregisterResponse()
         end
@@ -198,6 +202,86 @@ end
         io6 = RecoveryIO(1)
         infer_sync(m, io6)
         @test io6.decoded[] == 1
+        # No (re)registration above sent an Unregister first: re-registering the same object is
+        # idempotent on the worker, and a pre-emptive unregister failed requests in flight (CLI-8).
+        @test st.unregister_calls[] == 0
+        # Every registration carried the one pool's name.
+        @test length(unique(st.registered_names)) == 1
+    finally
+        kserve_shutdown()
+        close(server)
+    end
+end
+
+@testset "kserve_init again gives the pool a new name (CLI-2)" begin
+    st = MockState()
+    port = free_port()
+    server = _mk_server(st, port); gRPCServer.start!(server)
+    try
+        names = String[]
+        keys = String[]
+        for _ in 1:3
+            kserve_init(; pool_bytes = 1 << 20, n_slots = 4, shm_reprobe_interval = 0.0)
+            m = KServeModel("127.0.0.1", port, "m"; shared_memory = :on, max_batch_size = 1, deadline = 60.0, retry = _noretry())
+            io = RecoveryIO(2)
+            infer_sync(m, io)
+            @test io.decoded[] == 2
+            pool = RSC._shm_pool[]
+            push!(names, RSC.pool_name(pool))
+            push!(keys, RSC.shmid(pool.pool.backing))
+        end
+        # Each generation has its own name and key, so a chunk still in flight from an earlier
+        # generation can never re-register its name onto a later generation's memory, and an older
+        # pool's unlink can never remove a newer pool's name.
+        @test allunique(names) && allunique(keys)
+        @test names == [k[2:end] for k in keys]
+        # The earlier generations' objects are gone; only the current one exists.
+        @test all(k -> ReactantServerCore.shm_key_identity(k) === :gone, keys[1:(end - 1)])
+        @test ReactantServerCore.shm_key_identity(keys[end]) isa ReactantServerCore.ShmIdentity
+    finally
+        kserve_shutdown()
+        close(server)
+    end
+end
+
+# Mixed dtypes with an odd per-item size (37 bytes), staged through typed views: before CORE-15 a
+# Float32 buffer after the UInt8 one was misaligned for odd chunk sizes, and every slot but the
+# first of a 10^6-byte, 3-slot pool started at an odd offset.
+mutable struct MixedIO <: AbstractInferenceIO
+    n::Int
+    decoded::Threads.Atomic{Int}
+end
+Base.length(io::MixedIO) = io.n
+ReactantServerClient.item_input_bytes(::MixedIO) = 3 + 4 * 4 + 8 + 5 * 2
+function ReactantServerClient.infer_encode_chunk!(io::MixedIO, r, slot)
+    k = length(r)
+    ins = scratch(slot, ["m" => ((3, k), UInt8), "x" => ((4, k), Float32), "d" => ((k,), Float64), "h" => ((5, k), Float16)])
+    m, x, d, h = pool_view(ins...)
+    m .= 0x01
+    x .= 2.0f0
+    d .= 3.0
+    h .= Float16(4)
+    return ins
+end
+ReactantServerClient.infer_decode_chunk!(io::MixedIO, r, response) = (Threads.atomic_add!(io.decoded, length(r)); nothing)
+
+@testset "mixed-dtype IO on an odd pool geometry (CORE-15)" begin
+    st = MockState()
+    port = free_port()
+    server = _mk_server(st, port); gRPCServer.start!(server)
+    try
+        for mode in (:on, :off), mbs in (1, 3, 1000)
+            kserve_init(; pool_bytes = 10^6, n_slots = 3, shm_reprobe_interval = 0.0)
+            m = KServeModel("127.0.0.1", port, "m"; shared_memory = mode, max_batch_size = mbs, deadline = 60.0, retry = _noretry())
+            n = mbs == 1000 ? 20_000 : 10                # 1000: chunks of slot_bytes ÷ 37, then a remainder
+            io = MixedIO(n, Threads.Atomic{Int}(0))
+            infer_sync(m, io)
+            @test io.decoded[] == n
+            io2 = MixedIO(n, Threads.Atomic{Int}(0))
+            infer_async(m, io2)
+            @test io2.decoded[] == n
+            @test RSC.is_shm_backed(RSC.get_or_create_pool!(m)) == (mode === :on)
+        end
     finally
         kserve_shutdown()
         close(server)

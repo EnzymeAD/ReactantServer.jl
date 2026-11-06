@@ -54,7 +54,10 @@ wait_for_gpu_reclaim
 
 # --handle-signals=no lets the supervisor's own SIGTERM/SIGINT handler run (Julia's default
 # runtime handling would otherwise consume SIGTERM and die without shutting children down).
-exec julia --handle-signals=no --project=/opt/reactantserver/packages/ReactantServerNode -e '
+# --threads=1,0 keeps it on one thread, which that requires: without the runtime's signal handlers
+# a garbage collection with a second thread running segfaults (Julia 1.12 adds an interactive
+# thread by default), and the supervisor refuses to start that way.
+exec julia --handle-signals=no --threads=1,0 --project=/opt/reactantserver/packages/ReactantServerNode -e '
     using ReactantServerNode
     ReactantServerNode.main()
 '

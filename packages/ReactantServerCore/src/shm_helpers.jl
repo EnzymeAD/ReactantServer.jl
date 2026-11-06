@@ -12,7 +12,14 @@
 # process during ops triage. Set by `_init_shm_naming!` from the module `__init__`.
 const _naming_token = Ref{String}("")
 
-_init_shm_naming!() = (_naming_token[] = string(getpid(), "-", bytes2hex(rand(UInt8, 4))); nothing)
+# 32 bits from the operating system's entropy source, as hex. `Libc.getrandom!` is what Random's
+# `RandomDevice` reads; unlike the default RNG it cannot be made deterministic by seeding the global
+# RNG before this package loads, which used to give two processes with the same pid (in two pid
+# namespaces sharing /dev/shm) the same keys (CORE-21). Core does not depend on Random, hence the
+# direct call.
+_entropy_hex32() = bytes2hex(Libc.getrandom!(Vector{UInt8}(undef, 4)))
+
+_init_shm_naming!() = (_naming_token[] = string(getpid(), "-", _entropy_hex32()); nothing)
 
 # macOS (XNU) rejects POSIX shared-memory names longer than PSHMNAMLEN (31) bytes after the
 # leading slash, far below Linux's 255, so keys are minted against that budget on every platform
@@ -25,13 +32,23 @@ function _shm_name_fragment(name::String)
     return string(name[1:5], string(hash(name) & 0xffff; base = 16, pad = 4))
 end
 
-function shm_key(name::AbstractString)
+function _shm_key_with(token::AbstractString, name::AbstractString)
     s = replace(String(name), r"[^A-Za-z0-9_.-]" => '_')
-    key = string("/shm-", _naming_token[], "-", _shm_name_fragment(s))
+    key = string("/shm-", token, "-", _shm_name_fragment(s))
     length(key) <= 31 ||
         error("shm_key: 31-byte name budget exceeded (PID longer than 7 digits?)")
     return key
 end
+
+shm_key(name::AbstractString) = _shm_key_with(_naming_token[], name)
+
+# A key of the same layout under a freshly drawn token, for one pool generation. A BufferPool
+# mints one of these instead of reusing `shm_key(name)`, so a pool created after another with the
+# same name was closed (kserve_init again, CLI-2) gets a different name: a chunk still in flight from
+# the old pool can then never re-register its name onto the new pool's memory, and the old pool's
+# deferred unlink can never remove the new pool's name. It is also what a creation retries with when
+# the name is taken (EEXIST, e.g. an object a crashed process with the same pid left behind).
+_fresh_shm_key(name::AbstractString) = _shm_key_with(string(getpid(), "-", _entropy_hex32()), name)
 
 WrappedFArray(shm::SharedMemory, ::Type{T}, shape) where {T} = WrappedArray(shm, T, shape...)
 

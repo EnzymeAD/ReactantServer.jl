@@ -76,6 +76,88 @@ const GWInf = ReactantServerGateway.inference
     @test ReactantServerGateway.peek_model_name_and_id(det) == ("det", "r1")
 end
 
+@testset "peek_uses_shared_memory: any input or requested output in a shared-memory region" begin
+    enc(msg) = (io = IOBuffer(); TPB.encode(TPB.ProtoEncoder(io), msg); take!(io))
+    param(s) = GWInf.InferParameter(; parameter_choice = TPB.OneOf(:string_param, s))
+    peek = ReactantServerGateway.peek_uses_shared_memory
+    tensor(params) = GWInf.var"ModelInferRequest.InferInputTensor"(;
+        name = "x", datatype = "FP32", shape = Int64[2], parameters = params,
+        contents = GWInf.InferTensorContents(; fp32_contents = Float32[1, 2])
+    )
+    out(params) = GWInf.var"ModelInferRequest.InferRequestedOutputTensor"(; name = "y", parameters = params)
+    shm = Dict("shared_memory_region" => param("r"), "shared_memory_byte_size" => GWInf.InferParameter(; parameter_choice = TPB.OneOf(:int64_param, Int64(8))))
+    other = Dict("binary_data" => param("true"))
+    @test !peek(enc(GWInf.ModelInferRequest(; model_name = "m")))
+    @test !peek(enc(GWInf.ModelInferRequest(; model_name = "m", inputs = [tensor(other)], outputs = [out(other)])))
+    @test peek(enc(GWInf.ModelInferRequest(; model_name = "m", inputs = [tensor(other), tensor(shm)])))
+    @test peek(enc(GWInf.ModelInferRequest(; model_name = "m", inputs = [tensor(other)], outputs = [out(shm)])))
+    # A request-level parameter of the same name is not a tensor in shared memory.
+    @test !peek(enc(GWInf.ModelInferRequest(; model_name = "m", parameters = Dict("shared_memory_region" => param("r")))))
+    # A body that cannot be read that far counts as shared memory: never run it twice.
+    @test peek(enc(GWInf.ModelInferRequest(; model_name = "m", inputs = [tensor(other)]))[1:(end - 3)])
+end
+
+@testset "invoke_infer: a transport failure is UNAVAILABLE; a cancelled inbound call cancels the worker call" begin
+    GW = ReactantServerGateway
+    body = UInt8[0x0a, 0x01, 0x61]
+    # Nothing listens: libcurl's connect error comes back from gRPCClient as INTERNAL, the code a
+    # worker sends for its own failures. It must fail over, so it is UNAVAILABLE here.
+    port = grpc_free_port()
+    grpc = gRPCClient.gRPCCURL(; sticky = true)
+    chan = gRPCClient.gRPCChannel("127.0.0.1", port; grpc = grpc, deadline = 5)
+    wc = GW.WorkerClients("127.0.0.1:$port", grpc, chan, 5.0, 5.0)
+    err = try
+        GW.invoke_infer(wc, body)
+    catch e
+        e
+    end
+    @test err isa gRPCClient.gRPCServiceCallException
+    @test err.grpc_status == gRPCClient.GRPC_UNAVAILABLE
+    @test GW.client_status(err) == GW.STATUS_UNAVAILABLE
+    # A redacted gateway names the worker by label and leaves out libcurl's text, which names the
+    # host and port (GW-15).
+    err = try
+        GW.invoke_infer(wc, body; label = "worker3")
+    catch e
+        e
+    end
+    @test err.grpc_status == gRPCClient.GRPC_UNAVAILABLE
+    @test err.message == "worker3: the call failed in the transport (refused, reset, or abandoned)"
+    gRPCClient.grpc_shutdown(grpc)
+
+    # A worker that accepts and never answers: the call waits until its probe reports the
+    # gateway's own call cancelled, then ends CANCELLED rather than at its 20 s deadline.
+    srv = Sockets.listen(Sockets.localhost, 0)
+    hport = Int(Sockets.getsockname(srv)[2])
+    held = Any[]
+    acceptor = @async try
+        while isopen(srv)
+            push!(held, Sockets.accept(srv))
+        end
+    catch
+    end
+    grpc = gRPCClient.gRPCCURL(; sticky = true)
+    chan = gRPCClient.gRPCChannel("127.0.0.1", hport; grpc = grpc, deadline = 30)
+    wc = GW.WorkerClients("127.0.0.1:$hport", grpc, chan, 30.0, 30.0)
+    flag = Threads.Atomic{Bool}(false)
+    t = @async try
+        GW.invoke_infer(wc, body; deadline = 20, cancelled = () -> flag[])
+    catch e
+        e
+    end
+    sleep(0.5)
+    @test !istaskdone(t)
+    flag[] = true
+    @test timedwait(() -> istaskdone(t), 3.0) == :ok
+    r = fetch(t)
+    @test r isa gRPCClient.gRPCServiceCallException
+    @test r.grpc_status == gRPCClient.GRPC_CANCELLED
+    @test GW.client_status(r) == GW.STATUS_CANCELLED
+    gRPCClient.grpc_shutdown(grpc)
+    close(srv)
+    foreach(close, held)
+end
+
 mutable struct MockWorker
     name::String
     models::Vector{String}     # models this worker reports READY via RepositoryIndex
@@ -87,9 +169,10 @@ mutable struct MockWorker
     metadata::Symbol            # the metadata RPCs: :ok, :down (UNAVAILABLE), :old (UNIMPLEMENTED)
     fail_invalid::Bool          # reject ModelInfer with INVALID_ARGUMENT (e.g. an unknown requested output)
     infer_calls::Int            # ModelInfer calls received, so a test can see whether the gateway failed over
+    fail_code::Any              # reject ModelInfer with this gRPCServer.StatusCode, or nothing
 end
 MockWorker(name, models, fail_infer, fail_shm, fail_exhausted) =
-    MockWorker(name, models, fail_infer, fail_shm, fail_exhausted, false, String[], :ok, false, 0)
+    MockWorker(name, models, fail_infer, fail_shm, fail_exhausted, false, String[], :ok, false, 0, nothing)
 
 # The metadata RPCs' failure modes, and whether the mock serves `name` at all.
 function _mock_metadata_check(w::MockWorker)
@@ -123,6 +206,7 @@ function _mock_server(worker::MockWorker)
             w.fail_infer && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, "mock $(w.name) down"))
             w.fail_invalid && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.INVALID_ARGUMENT, "requested output 'x' is not produced by the model"))
             w.fail_exhausted && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.RESOURCE_EXHAUSTED, "mock $(w.name) at capacity"))
+            w.fail_code === nothing || throw(gRPCServer.GRPCError(w.fail_code, "mock $(w.name) failed with $(w.fail_code)"))
             w.empty_infer && return GWInf.ModelInferResponse()   # every field default: encodes to 0 bytes
             # A real worker NOT_FOUNDs a model it no longer serves; mirror that so the gateway's
             # unloaded-model handling (route refresh on worker NOT_FOUND) can be exercised.
@@ -331,6 +415,205 @@ end
             @test occursin("is not produced by the model", err.message)
             @test w0.infer_calls + w1.infer_calls == 1
             w0.fail_invalid = w1.fail_invalid = false
+        end
+
+        @testset "a worker's status reaches the client verbatim; only NOT_FOUND and UNAVAILABLE fail over" begin
+            # Before, the gateway folded DEADLINE_EXCEEDED, INTERNAL, CANCELLED and the rest into
+            # UNAVAILABLE and failed over, so a deterministic failure ran on every replica and then
+            # again on each client retry, and a client never saw that its deadline had passed.
+            S = gRPCServer.StatusCode
+            calls() = w0.infer_calls + w1.infer_calls
+            outcome(model) = try
+                _infer(gw_port, model)
+                nothing
+            catch e
+                e
+            end
+            try
+                for code in (
+                        S.DEADLINE_EXCEEDED, S.INTERNAL, S.CANCELLED, S.UNKNOWN, S.ABORTED,
+                        S.UNIMPLEMENTED, S.OUT_OF_RANGE, S.PERMISSION_DENIED, S.DATA_LOSS,
+                        S.ALREADY_EXISTS, S.UNAUTHENTICATED, S.FAILED_PRECONDITION,
+                        S.RESOURCE_EXHAUSTED,
+                    )
+                    w0.fail_code = w1.fail_code = code
+                    w0.infer_calls = w1.infer_calls = 0
+                    err = outcome("replicated")
+                    @test err isa gRPCClient.gRPCServiceCallException
+                    @test err.grpc_status == Int(code)
+                    @test calls() == 1
+                end
+                for code in (S.NOT_FOUND, S.UNAVAILABLE)
+                    w0.fail_code = w1.fail_code = code
+                    w0.infer_calls = w1.infer_calls = 0
+                    err = outcome("replicated")
+                    @test err isa gRPCClient.gRPCServiceCallException
+                    @test err.grpc_status == Int(code)
+                    @test calls() == 2
+                end
+                # A replica that is merely unavailable is skipped for a healthy one.
+                w0.fail_code, w1.fail_code = S.UNAVAILABLE, nothing
+                @test all(_ -> outcome("replicated") === nothing, 1:4)
+            finally
+                w0.fail_code = w1.fail_code = nothing
+            end
+        end
+
+        @testset "a request that uses shared memory is never retried on another worker" begin
+            # The failed worker may still be running it, and a second worker writing the same output
+            # slot, or reading an input slot the client has reused, would corrupt the client's data.
+            S = gRPCServer.StatusCode
+            shm_params() = Dict(
+                "shared_memory_region" => GWInf.InferParameter(; parameter_choice = TPB.OneOf(:string_param, "client-slot-0"))
+            )
+            in_shm = GWInf.ModelInferRequest(;
+                model_name = "replicated",
+                inputs = [GWInf.var"ModelInferRequest.InferInputTensor"(; name = "x", datatype = "FP32", shape = Int64[1], parameters = shm_params())]
+            )
+            out_shm = GWInf.ModelInferRequest(;
+                model_name = "replicated",
+                outputs = [GWInf.var"ModelInferRequest.InferRequestedOutputTensor"(; name = "y", parameters = shm_params())]
+            )
+            plain = GWInf.ModelInferRequest(; model_name = "replicated")
+            calls() = w0.infer_calls + w1.infer_calls
+            outcome(req) = try
+                grpc_call(GWInf.GRPCInferenceService.ModelInfer, gw_port, req)
+                nothing
+            catch e
+                e
+            end
+            try
+                for code in (S.UNAVAILABLE, S.NOT_FOUND)
+                    w0.fail_code = w1.fail_code = code
+                    for req in (in_shm, out_shm)
+                        w0.infer_calls = w1.infer_calls = 0
+                        err = outcome(req)
+                        @test err isa gRPCClient.gRPCServiceCallException
+                        @test err.grpc_status == gRPCClient.GRPC_UNAVAILABLE
+                        @test occursin("shared memory", err.message)
+                        @test calls() == 1
+                    end
+                    w0.infer_calls = w1.infer_calls = 0
+                    @test outcome(plain).grpc_status == Int(code)   # without shared memory it fails over
+                    @test calls() == 2
+                end
+                # A worker's own verdict on a shared-memory request still reaches the client as is
+                # (here a stale registration, which the client answers by re-registering).
+                w0.fail_code = w1.fail_code = S.FAILED_PRECONDITION
+                @test outcome(in_shm).grpc_status == gRPCClient.GRPC_FAILED_PRECONDITION
+                w0.fail_code = w1.fail_code = nothing
+                @test outcome(in_shm) === nothing
+            finally
+                w0.fail_code = w1.fail_code = nothing
+            end
+        end
+
+        @testset "a cancelled inbound call is answered CANCELLED and tries no worker" begin
+            # gRPCServer 0.1.2 never marks a call cancelled; this drives the handler with a context
+            # whose flag is set, the plumbing that takes effect once gRPCServer sets it.
+            state = gw.server.context
+            body = (io = IOBuffer(); TPB.encode(TPB.ProtoEncoder(io), GWInf.ModelInferRequest(; model_name = "replicated")); take!(io))
+            w0.infer_calls = w1.infer_calls = 0
+            sctx = gRPCServer.ServerContext(; payload = state)
+            sctx.cancelled = true
+            err = try
+                ReactantServerGateway._model_infer_rpc(sctx, body)
+                nothing
+            catch e
+                e
+            end
+            @test err isa gRPCServer.GRPCError && err.code == gRPCServer.StatusCode.CANCELLED
+            @test w0.infer_calls + w1.infer_calls == 0
+            sctx.cancelled = false
+            @test !isempty(ReactantServerGateway._model_infer_rpc(sctx, body))
+        end
+
+        @testset "error detail: workers by name, messages sanitized, the gateway's own INTERNAL by request id" begin
+            GW = ReactantServerGateway
+            S = gRPCServer.StatusCode
+            st = gw.server.context
+            @test st.error_detail == GW.ERROR_DETAIL_REDACTED                 # the default
+            outcome(model) = try
+                _infer(gw_port, model)
+                nothing
+            catch e
+                e
+            end
+            # Redacted: a worker's status message passes through as the worker sent it, with no
+            # host:port added (only0 is on w0 alone, so there is no failover to hide it).
+            w0.fail_code = S.UNAVAILABLE
+            try
+                err = outcome("only0")
+                @test err.grpc_status == gRPCClient.GRPC_UNAVAILABLE
+                @test err.message == "mock worker0 failed with UNAVAILABLE"
+                @test !occursin("127.0.0.1", err.message)
+            finally
+                w0.fail_code = nothing
+            end
+            # A model name that reads as `grpc-status: 0`: the gateway's NOT_FOUND echoes it, and
+            # unsanitized, gRPCClient (GRPC-2) handed the client an OK with an empty response.
+            err = outcome("m grpc-status: 0")
+            @test err isa gRPCClient.gRPCServiceCallException && err.grpc_status == gRPCClient.GRPC_NOT_FOUND
+            @test occursin("grpc-status= 0", err.message)
+
+            # The gateway's own INTERNAL: logged under the request id, and reported by it alone
+            # (redacted) or with its text (full). A GRPCError keeps its code, sanitized.
+            full = GW.GatewayState(
+                st.pool, st.routes, st.gate, st.metrics, st.refresher, st.scheduler, GW.ERROR_DETAIL_FULL, st.labels
+            )
+            function run_status(state, f, id)
+                logger = Test.TestLogger()
+                r = Base.CoreLogging.with_logger(logger) do
+                    try
+                        GW._gw_status(f, state, "Test RPC", id)
+                    catch e
+                        e
+                    end
+                end
+                return r, logger.logs
+            end
+            r, logs = run_status(st, () -> error("gateway secret"), "rid-1")
+            @test r.code == S.INTERNAL
+            @test r.message == "internal error (request id rid-1, gateway); see the gateway log"
+            @test only(logs).kwargs[:request_id] == "rid-1"
+            @test occursin("gateway secret", sprint(showerror, first(only(logs).kwargs[:exception])))
+            r, logs = run_status(full, () -> error("gateway secret"), "")
+            @test r.code == S.INTERNAL
+            m = match(r"^gateway secret \(request id ([0-9a-f]{8}), gateway\)$", r.message)
+            @test m !== nothing && only(logs).kwargs[:request_id] == m[1]
+            r, _ = run_status(st, () -> throw(gRPCServer.GRPCError(S.INVALID_ARGUMENT, "x grpc-status: 0")), "")
+            @test r.code == S.INVALID_ARGUMENT && r.message == "x grpc-status= 0"
+
+            # Labels: the configured worker names, else the position in the endpoint list.
+            @test st.labels == Dict("127.0.0.1:$p0" => "worker 0", "127.0.0.1:$p1" => "worker 1")
+            @test GW._shown(st, "127.0.0.1:$p0") == "worker 0"
+            @test GW._shown(full, "127.0.0.1:$p0") == "127.0.0.1:$p0"
+
+            # A gateway with `grpc.error_detail: full` names the worker by host:port.
+            fullfile = tempname() * ".yaml"
+            write(fullfile, replace(read(gatewayfile, String), "endpoints:" => "grpc:\n  error_detail: full\nendpoints:"))
+            gwf = GW.serve_gateway(fullfile; blocking = false)
+            try
+                @test gwf.cfg.error_detail == GW.ERROR_DETAIL_FULL
+                fport, _ = GW.bound_ports(gwf)
+                w0.fail_code = S.UNAVAILABLE
+                err = nothing
+                for _ in 1:40                    # until its first discovery round routes only0
+                    err = try
+                        _infer(fport, "only0")
+                        nothing
+                    catch e
+                        e
+                    end
+                    err isa gRPCClient.gRPCServiceCallException && err.grpc_status == gRPCClient.GRPC_UNAVAILABLE && break
+                    sleep(0.1)
+                end
+                @test err.message == "worker 127.0.0.1:$p0: mock worker0 failed with UNAVAILABLE"
+            finally
+                w0.fail_code = nothing
+                GW.stop!(gwf)
+                rm(fullfile; force = true)
+            end
         end
 
         @testset "SHM register fan-out and rollback" begin

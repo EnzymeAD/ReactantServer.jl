@@ -177,7 +177,7 @@ end
         @test !istaskdone(tE)                           # the unload waits on the read in progress
         notify(gw.gate)
         @test fetch(tE) === B
-        @test fetch(tB) isa ErrorException              # the queued request was rejected as unloaded
+        @test fetch(tB) isa ReactantServer.ModelNotFoundError   # the queued request was rejected as unloaded
         @test B.sched.host_stage === :none && B.sched.staged === nothing
         @test _st_infer(sched, "A") == _ST_OUT          # the worker carries on
     finally
@@ -304,7 +304,7 @@ end
             wait(hb)
             @test worst[] < 0.5                         # timers kept firing through the 1.5 s run
             # The cost is measured where the program ran, so it reflects the run, not the hand-off.
-            @test 1.4 < S.sched.cost_estimate[1] < 3.0
+            @test 1.4 < ReactantServer._cost_seconds(S.sched, ReactantServer.VariantKey(), 1) < 3.0
         finally
             ReactantServer.shutdown!(sched)
         end
@@ -330,7 +330,7 @@ end
         @test _st_infer(sched, "B") == _ST_OUT
         @test gw.reads[] == 1                            # the dispatch uploaded what was staged
         @test isempty(sched.prefetched)
-        @test_throws ErrorException ReactantServer.stage_weights!(sched, ["nope"])
+        @test_throws ReactantServer.ModelNotFoundError ReactantServer.stage_weights!(sched, ["nope"])
     finally
         ReactantServer.shutdown!(sched)
     end

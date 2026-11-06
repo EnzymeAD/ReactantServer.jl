@@ -61,8 +61,8 @@ services:
     ports:
       - "8001:8001"   # KServe V2 gRPC endpoint for clients (Triton-compatible)
       - "8002:8002"   # Prometheus metrics / health / admin HTTP (Triton-compatible)
-    # The supervisor forwards SIGTERM to its workers and waits for them; give it room before
-    # Docker escalates to SIGKILL.
+    # On SIGTERM the supervisor drains the gateway, then the workers, and waits for them; give it
+    # room before Docker escalates to SIGKILL.
     stop_grace_period: 30s
     # The OCI image carries no HEALTHCHECK (that field exists only in Docker's image format), so it
     # is set here: the gateway's /readyz, ready once at least one worker serves. start_period is

@@ -104,3 +104,108 @@ end
     @test any(l -> occursin("sending SIGKILL", l), _sink_lines(sink))
     @test !process_running(sup.children[1].proc)
 end
+
+@testset "supervisor: refuses --handle-signals=no with more than one thread" begin
+    @test RSN.check_signal_threads(1, 8) === nothing     # Julia's own signal handling: any threads
+    @test RSN.check_signal_threads(0, 1) === nothing     # handling off, one thread: the entrypoint
+    @test_throws ReactantServerCore.ConfigError RSN.check_signal_threads(0, 2)
+    err = try
+        RSN.check_signal_threads(0, 2)
+    catch e
+        e
+    end
+    @test occursin("--threads=1,0", sprint(showerror, err))
+    @test RSN.check_signal_threads() === nothing         # this test process keeps its handlers
+end
+
+# A child that speaks the drain protocol as the worker and the gateway do (ReactantServerCore's
+# stdin watcher): it serves until the supervisor closes its stdin, acknowledges, spends `work`
+# seconds "draining", and exits 0. It prints when its drain began and ended, so the test can order
+# the children's drains on the host clock.
+function _drain_spec(name, stage; drain = 10.0, grace = 5.0, work = 1.0)
+    script = """
+    using ReactantServerCore
+    ReactantServerCore.watch_stdin_drain()
+    ReactantServerCore.begin_serving!()
+    println("up"); flush(stdout)
+    ReactantServerCore.wait_for_drain_request()
+    println("drain begins ", time()); flush(stdout)
+    sleep($work)
+    println("drain ends ", time()); flush(stdout)
+    """
+    cmd = addenv(
+        `$(Base.julia_cmd()) --project=$(Base.active_project()) --startup-file=no -e $script`,
+        ReactantServerCore.STDIN_DRAIN_ENV => string(drain)
+    )
+    return RSN.ChildSpec(name, cmd, grace, drain, stage)
+end
+
+function _stamp(lines, name, what)
+    l = only(filter(l -> startswith(l, "[$name] drain $what "), lines))
+    return parse(Float64, last(split(l)))
+end
+
+@testset "supervisor: drains the gateway first, then the workers in parallel" begin
+    sink = IOBuffer()
+    specs = [
+        _drain_spec("w0", 2; work = 2.0),
+        _drain_spec("gw", 1; work = 1.0),
+        _drain_spec("w1", 2; work = 2.0),
+    ]
+    sup = RSN.Supervisor(specs; sink = sink)
+    t = @async RSN.run_supervisor!(sup; install_signal_handlers = false)
+    @test wait_for(() -> count(l -> endswith(l, "] up"), _sink_lines(sink)) == 3; timeout = 300)
+    RSN.request_shutdown!(sup)
+    @test fetch(t) == 0
+    lines = _sink_lines(sink)
+    # The gateway finished its drain and exited before either worker was asked.
+    gw_stopped = findfirst(l -> startswith(l, "[supervisor] gw stopped"), lines)
+    @test gw_stopped !== nothing
+    @test gw_stopped < findfirst(l -> startswith(l, "[supervisor] asking w0 to drain"), lines)
+    @test gw_stopped < findfirst(l -> startswith(l, "[supervisor] asking w1 to drain"), lines)
+    @test _stamp(lines, "gw", "ends") < min(_stamp(lines, "w0", "begins"), _stamp(lines, "w1", "begins"))
+    # The workers drained at the same time, not one after the other.
+    @test abs(_stamp(lines, "w0", "begins") - _stamp(lines, "w1", "begins")) < 1.5
+    for name in ("gw", "w0", "w1")
+        @test any(l -> startswith(l, "[supervisor] asking $name to drain (up to 10s)"), lines)
+        @test any(l -> startswith(l, "[$name] ") && occursin(ReactantServerCore.DRAIN_ACK_LINE, l), lines)
+        @test any(l -> startswith(l, "[supervisor] $name stopped (code=0, signal=0)"), lines)
+    end
+    @test !any(l -> occursin("SIGTERM", l) || occursin("SIGKILL", l), lines)
+end
+
+@testset "supervisor: a child that never acknowledges the drain gets SIGTERM" begin
+    sink = IOBuffer()
+    # Asked to drain (stdin closed), but it never reads stdin, as a worker still compiling does.
+    deaf = RSN.ChildSpec(
+        "deaf", `$(Base.julia_cmd()) --startup-file=no -e 'println("up"); flush(stdout); sleep(120)'`,
+        5.0, 60.0, 1
+    )
+    sup = RSN.Supervisor([deaf]; sink = sink)
+    t = @async RSN.run_supervisor!(sup; install_signal_handlers = false)
+    @test wait_for(() -> any(==("[deaf] up"), _sink_lines(sink)))
+    t0 = time()
+    RSN.request_shutdown!(sup)
+    @test fetch(t) == 0
+    @test time() - t0 < 40                               # the ack window, not the 60 s drain
+    lines = _sink_lines(sink)
+    @test any(l -> occursin("deaf did not acknowledge the drain request within 10s; sending SIGTERM", l), lines)
+    @test any(l -> startswith(l, "[supervisor] deaf stopped") && occursin("signal=15", l), lines)
+    @test !any(l -> occursin("SIGKILL", l), lines)
+end
+
+@testset "supervisor: grace windows run in parallel" begin
+    sink = IOBuffer()
+    # TERM-ignoring children (exec keeps the ignored disposition, so SIGKILL leaves no orphan).
+    stubborn(name) = RSN.ChildSpec(name, `sh -c 'trap "" TERM; echo "ignoring TERM"; exec sleep 120'`, 2.0)
+    sup = RSN.Supervisor([stubborn("s1"), stubborn("s2"), stubborn("s3")]; sink = sink)
+    t = @async RSN.run_supervisor!(sup; install_signal_handlers = false)
+    @test wait_for(() -> count(l -> endswith(l, "] ignoring TERM"), _sink_lines(sink)) == 3)
+    t0 = time()
+    RSN.request_shutdown!(sup)
+    @test fetch(t) == 0
+    @test time() - t0 < 5                                # one 2 s window, not three in a row
+    lines = _sink_lines(sink)
+    @test count(l -> occursin("did not exit within 2s; sending SIGKILL", l), lines) == 3
+    @test all(c -> !process_running(c.proc), sup.children)
+end

@@ -223,13 +223,19 @@ scratch(slot::PoolSlot, name::AbstractString, dims, ::Type{T}) where {T} =
     first(scratch(slot, [String(name) => (dims, T)]))
 
 function scratch(slot::PoolSlot, specs::AbstractVector{<:Pair{<:AbstractString}})
-    return PoolInferInput[_scratch_input(slot, first(s), last(s)) for s in specs]
+    # Laid out by element alignment, largest first, so every buffer is aligned for its type with no
+    # padding between them; the descriptors come back in the requested order (CORE-15).
+    out = Vector{PoolInferInput}(undef, length(specs))
+    for i in ReactantServerCore._scratch_order([last(last(s)) for s in specs])
+        out[i] = _scratch_input(slot, first(specs[i]), last(specs[i]))
+    end
+    return out
 end
 
 function _scratch_input(slot::PoolSlot, name::AbstractString, spec)
     dims, T = first(spec), last(spec)
     d = dims isa Tuple ? dims : (dims,)
-    sub = subslot(slot, sizeof(T) * prod(d))
+    sub = subslot(slot, sizeof(T) * prod(d); align = Base.datatype_alignment(T))
     return PoolInferInput(String(name), sub, Int[d...], T)
 end
 
@@ -480,16 +486,31 @@ end
 # Normalize a response so its `raw_output_contents` is full-length and aligned to `outputs`,
 # making the SHM transport invisible to `InferOutput` / `infer_decode_chunk!`. For each output
 # the server wrote to shared memory (carries a region parameter), copy the bytes it actually
-# wrote out of our pool slot (before the slot is released) and strip the SHM parameters; inline
-# outputs are taken from the original `raw_output_contents` in order, because the server's encoder
-# only appends a raw entry per inline output (codec.jl), so positions are compressed there.
+# wrote out of our pool slot (before the slot is released) and strip the SHM parameters.
+#
+# Inline outputs come from the response's `raw_output_contents`, which arrives in one of two forms.
+# The KServe proto requires one entry per output in `outputs` order, with an empty placeholder for
+# each shared-memory output (positional; what Triton sends and what Triton clients index). Older
+# ReactantServer workers appended an entry for inline outputs only (compressed). The two are told
+# apart by length: positional has exactly one entry per output, compressed one per inline output,
+# and the lengths coincide only when no output went to shared memory, where the forms are the same.
 function _rehydrate_response(response, subslots)
     isempty(subslots) && return response
 
+    outputs = response.outputs
+    raw_in = response.raw_output_contents
+    positional = length(raw_in) == length(outputs)
+    if !positional
+        n_inline = count(o -> !_is_shm_output(o.parameters), outputs)
+        length(raw_in) == n_inline || error(
+            "response has $(length(raw_in)) raw_output_contents entries for $(length(outputs)) " *
+                "outputs ($n_inline inline); expected one per output or one per inline output",
+        )
+    end
     new_outputs = var"ModelInferResponse.InferOutputTensor"[]
     raw = Vector{UInt8}[]
     inline_idx = 1
-    for o in response.outputs
+    for (i, o) in enumerate(outputs)
         if _is_shm_output(o.parameters)
             sub = subslots[o.name]
             nbytes = something(_shm_byte_size(o.parameters), _output_bytes_from_shape(o))
@@ -503,7 +524,7 @@ function _rehydrate_response(response, subslots)
                 ),
             )
         else
-            push!(raw, response.raw_output_contents[inline_idx])
+            push!(raw, raw_in[positional ? i : inline_idx])
             inline_idx += 1
             push!(new_outputs, o)
         end
@@ -519,9 +540,26 @@ function _rehydrate_response(response, subslots)
     )
 end
 
+# Add the slot control parameters for one attempt to `params`, arming `slot` with a fresh token
+# (CORE-3). A retry re-arms, which closes the previous attempt so its server can no longer write.
+function _add_slot_control!(params, pool::InferenceBufferPool, slot::PoolSlot)
+    token = slot_arm!(slot)
+    params[SLOT_CONTROL_REGION_PARAM] = InferParameter(parameter_choice = OneOf(:string_param, pool_name(pool)))
+    params[SLOT_CONTROL_OFFSET_PARAM] =
+        InferParameter(parameter_choice = OneOf(:int64_param, Int64(slot_control_offset(slot))))
+    params[SLOT_CONTROL_TOKEN_PARAM] = InferParameter(parameter_choice = OneOf(:int64_param, Int64(token)))
+    return params
+end
+
 # Run one chunk end-to-end on a freshly acquired slot: fill the staging buffer, send the
 # request, handle the response, and always return the slot to the pool. `infer_encode_chunk!` is
 # serialized by `fill_lock` because concrete IOs commonly read from shared source state.
+#
+# On a SHM pool every attempt carries the slot control parameters under a fresh token. Shared-memory
+# outputs are read only once `slot_seal!` confirms no server can still be writing them, and the
+# `finally` releases the slot whatever happened: release closes the attempt, so a server that has
+# not begun writing never will, and a slot a server is writing at that moment is quarantined rather
+# than reused (see `release_slot!`). Nothing here waits on a server.
 function _run_chunk(m, io, pool, fill_lock, r, slot)
     return try
         reset_slot!(slot)
@@ -539,16 +577,19 @@ function _run_chunk(m, io, pool, fill_lock, r, slot)
         # GC.@preserve keeps the backing alive from encoding through response decode; the slot is
         # released only in the `finally` after this send returns.
         materialized, raws = _materialize_inputs(inputs, m, pool)
+        controlled = _slot_controlled(pool)
         response = GC.@preserve pool begin
             _send_with_shm_recovery(m, pool) do
                 _infer_with_retry(m) do budget_s
+                    params = _request_deadline_params(budget_s)
+                    controlled && _add_slot_control!(params, pool, slot)
                     GRPCInferenceService.ModelInfer(
                         m.chan,
                         ModelInferRequest(
                             model_name = model_name(m),
                             inputs = materialized,
                             outputs = requested,
-                            parameters = _request_deadline_params(budget_s),
+                            parameters = params,
                             raw_input_contents = raws,
                         );
                         deadline = budget_s,
@@ -556,10 +597,74 @@ function _run_chunk(m, io, pool, fill_lock, r, slot)
                 end
             end
         end
+        if controlled && !isempty(out_subslots)
+            slot_seal!(slot) || error(
+                "the shared-memory outputs of this chunk were claimed by another writer after the " *
+                    "response; they cannot be trusted",
+            )
+        end
         infer_decode_chunk!(io, r, _rehydrate_response(response, out_subslots))
     finally
         release_slot!(slot)
     end
+end
+
+# How many chunks bound for a shared-memory pool were sent inline because no slot was free at once.
+const _INLINE_FALLBACKS = Threads.Atomic{Int}(0)
+
+"""
+    inline_fallback_count() -> Int
+
+How many chunks this process sent inline instead of through its shared-memory pool because no pool
+slot was free when the chunk was staged (all in flight, or quarantined or retired behind a server
+still writing them). A steadily growing count means the pool has too few slots for the concurrency.
+"""
+inline_fallback_count() = _INLINE_FALLBACKS[]
+
+# A private one-slot inline pool large enough for a chunk sized for `pool`'s `span` slots.
+_ephemeral_inline_pool(pool::InferenceBufferPool, span::Integer) = InferenceBufferPool(
+    cld(span * slot_bytes(pool), ReactantServerCore._page_size()) * ReactantServerCore._page_size();
+    n_slots = 1, use_shm = false,
+)
+
+# Whether chunk `r` fits one gRPC message each way when sent inline: its inputs in the request and
+# its declared outputs in the response, with room for the protobuf framing.
+function _fits_inline(m::AbstractInferenceModel, io::AbstractInferenceIO, r)
+    m isa KServeModel || return true
+    margin = 1 << 20
+    return length(r) * item_input_bytes(io) + margin <= m.max_send_message_length &&
+        length(r) * item_output_bytes(io) + margin <= m.max_receive_message_length
+end
+
+# The pool and slot a chunk is staged in. A slot of `pool` when one is free right now; otherwise the
+# chunk goes inline at once through a private buffer, so no chunk ever waits on a slot another
+# chunk (or an enclosing inference, CLI-10) holds. Only a chunk too large for one gRPC message waits
+# for a slot of a SHM pool, and then no longer than the model's deadline.
+function _chunk_slot(m::AbstractInferenceModel, io::AbstractInferenceIO, pool::InferenceBufferPool, r, span::Integer)
+    slot = try_acquire_slot!(pool.pool, span)
+    slot === nothing || return pool, slot
+    if !is_shm_backed(pool) || _fits_inline(m, io, r)
+        if is_shm_backed(pool)
+            n = Threads.atomic_add!(_INLINE_FALLBACKS, 1) + 1
+            @debug "no shared-memory slot free; sending this chunk inline" fallbacks = n
+            @info "no shared-memory slot was free for a chunk, so it was sent inline; " *
+                "`ReactantServerClient.inline_fallback_count()` counts these" maxlog = 1
+        end
+        eph = _ephemeral_inline_pool(pool, span)
+        return eph, acquire_slot!(eph.pool, 1)
+    end
+    budget = overall_deadline(m)
+    deadline_ns = budget > 0 ? Int64(time_ns()) + round(Int64, budget * 1.0e9) : Int64(0)
+    slot = try
+        acquire_slot!(pool.pool, span; deadline_ns = deadline_ns)
+    catch e
+        e isa PoolAcquireTimeout || rethrow()
+        error(
+            "no shared-memory slot became free within the model's deadline for a chunk of " *
+                "$(length(r)) items, which is too large to send inline in one gRPC message",
+        )
+    end
+    return pool, slot
 end
 
 function _drive_pool_inference(
@@ -573,16 +678,16 @@ function _drive_pool_inference(
 
     if force_serial
         for r in BatchIterator(length(io), chunk)
-            slot = acquire_slot!(pool, span)
-            _run_chunk(m, io, pool, fill_lock, r, slot)
+            chunk_pool, slot = _chunk_slot(m, io, pool, r, span)
+            _run_chunk(m, io, chunk_pool, fill_lock, r, slot)
         end
         return nothing
     end
 
-    # Each chunk acquires a disjoint slot run from the pool's shared allocator, so concurrency
-    # is bounded by the slot count and ranges never overlap across tasks or across concurrent
-    # top-level inference calls. The in-flight window mirrors how many spans the pool can serve
-    # at once so we do not spawn an unbounded number of tasks blocked on acquisition.
+    # Each chunk acquires a disjoint slot run from the pool's shared allocator, so ranges never
+    # overlap across tasks or across concurrent top-level inference calls. The in-flight window is
+    # how many spans the pool holds, so one call alone never runs out of slots; a chunk that still
+    # finds none free (concurrent calls, a quarantined slot) goes inline rather than waiting.
     window = max(1, n_slots(pool) ÷ span)
     tasks = Task[]
     err = Ref{Any}(nothing)
@@ -596,9 +701,9 @@ function _drive_pool_inference(
         err[] === nothing || break
         local_r = r
         t = Threads.@spawn begin
-            slot = acquire_slot!(pool, span)
             try
-                _run_chunk(m, io, pool, fill_lock, local_r, slot)
+                chunk_pool, slot = _chunk_slot(m, io, pool, local_r, span)
+                _run_chunk(m, io, chunk_pool, fill_lock, local_r, slot)
             catch ex
                 err[] = ex
                 rethrow()

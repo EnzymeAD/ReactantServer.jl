@@ -196,7 +196,9 @@ How the budget is shared depends on `shared_host_weights`:
   restarts, so the cache is warm after a restart, and each worker trims the node to the budget at
   startup.
 - **Private** (`false`): each worker keeps its own copies and gets an even share,
-  `host_weight_budget ÷ host_weight_budget_workers`, with no coordination.
+  `host_weight_budget ÷ host_weight_budget_workers`, with no coordination. A copy belongs to the
+  loaded version of its model: a hot reload reads the new version's weights file and never uploads
+  the copy the previous version left.
   `host_weight_budget_workers` defaults to 1; the node supervisor sets it to the node's worker
   count, so set it yourself only when running several workers without the supervisor.
 
@@ -239,7 +241,14 @@ uploads because a refused device allocation is slow to discover: XLA's allocator
 
 1. **Feasibility.** A model that cannot fit even with every evictable model gone (weights
    plus the device-pinned models plus scratch exceed the device) is rejected at once,
-   without evicting anything.
+   without evicting anything, and the requests for it fail. That holds on a serving worker.
+   At startup the worker loads its on-demand models one at a time to measure them (except
+   under `model_control_mode: explicit`), and a model that fails this check there stops the
+   worker from starting: under the node supervisor it restarts into the same failure, and
+   none of its models serve until the bundle is removed. A hot load of such a model in
+   `dynamic` mode fails too, and the watcher retries it every second poll, recompiling it
+   each time. Check that each model fits beside the device-pinned models before you deploy
+   it.
 2. **Room for the weights.** Free memory must hold the weights plus the largest scratch any
    resident model needs, the largest free block must hold all of the weights, and the
    on-demand byte budget must allow them. "Hold" follows the allocator's split rule: it

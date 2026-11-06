@@ -145,24 +145,61 @@ function _array_from_contents(dt::DType, wire_shape::Vector{Int}, c)
     return arr
 end
 
-# Read a typed parameter out of a tensor's parameters map, or nothing if absent/mismatched.
-function _param_string(params, key)
-    haskey(params, key) || return nothing
-    p = params[key].parameter_choice
-    return (p !== nothing && p.name === :string_param) ? p[]::String : nothing
-end
+# Read a typed parameter out of a parameters map, or nothing if absent/mismatched.
 function _param_int(params, key)
     haskey(params, key) || return nothing
     p = params[key].parameter_choice
     return (p !== nothing && p.name === :int64_param) ? Int(p[]) : nothing
 end
 
-# Where a requested output's data should be written.
+# Read `key` from a parameters map, insisting on the parameter type `kind` (:string_param or
+# :int64_param). Absent is `nothing`; present with any other type (or no value) is an error, never
+# silently "absent". `what` names the tensor for the message.
+function _strict_param(params, key::AbstractString, kind::Symbol, what::AbstractString)
+    haskey(params, key) || return nothing
+    p = params[key].parameter_choice
+    (p !== nothing && p.name === kind) ||
+        error("invalid value type for '$key' parameter for $what, expected $kind")
+    return p[]
+end
+
+# A tensor's shared-memory reference `(region, offset, byte_size)`, or `nothing` when it does not
+# reference shared memory. Read strictly, as Triton and the KServe system shared-memory extension
+# define it: `shared_memory_region` is a string_param, `shared_memory_offset` and
+# `shared_memory_byte_size` are int64_params; the offset defaults to 0, the byte size is required,
+# and neither may appear without a region. A parameter of any other type used to read as absent, so
+# an offset sent as a string read from (or wrote to) offset 0; every such case is now a client error
+# (INVALID_ARGUMENT at the transport).
+function _shm_reference(params, what::AbstractString)
+    region = _strict_param(params, _SHM_REGION, :string_param, what)
+    offset = _strict_param(params, _SHM_OFFSET, :int64_param, what)
+    bsize = _strict_param(params, _SHM_BYTE_SIZE, :int64_param, what)
+    if region === nothing
+        offset === nothing ||
+            error("'$_SHM_OFFSET' can not be specified without '$_SHM_REGION' for $what")
+        bsize === nothing ||
+            error("'$_SHM_BYTE_SIZE' can not be specified without '$_SHM_REGION' for $what")
+        return nothing
+    end
+    isempty(region) && error("'$_SHM_REGION' for $what is empty")
+    bsize === nothing &&
+        error("'$_SHM_BYTE_SIZE' must be specified along with '$_SHM_REGION' for $what")
+    off = something(offset, Int64(0))
+    off >= 0 || error("'$_SHM_OFFSET' for $what must be non-negative, got $off")
+    bsize >= 0 || error("'$_SHM_BYTE_SIZE' for $what must be non-negative, got $bsize")
+    return String(region), Int(off), Int(bsize)
+end
+
+# Where a requested output's data should be written. `mapping` is the registration `region` resolved
+# to when the request was decoded (nothing when decoded without a registry): the output goes to
+# that object or nowhere, even if the name is registered again, for another object, meanwhile.
 struct OutputTarget
     region::String
     offset::Int
     byte_size::Int
+    mapping::Union{ShmRegion, Nothing}
 end
+OutputTarget(region, offset, byte_size) = OutputTarget(region, offset, byte_size, nothing)
 
 struct DecodedRequest
     request::InferRequest
@@ -203,12 +240,10 @@ function decode_infer_request(
         t = msg.inputs[i]
         dt = dtype_from_kserve(t.datatype)
         shape = Int[Int(s) for s in t.shape]
-        region = _param_string(t.parameters, _SHM_REGION)
-        data = if region !== nothing
+        ref = _shm_reference(t.parameters, "input '$(t.name)'")
+        data = if ref !== nothing
             registry === nothing && error("input '$(t.name)' references shared memory but the server has no registry")
-            offset = something(_param_int(t.parameters, _SHM_OFFSET), 0)
-            bsize = _param_int(t.parameters, _SHM_BYTE_SIZE)
-            bsize === nothing && error("input '$(t.name)' is missing $_SHM_BYTE_SIZE")
+            region, offset, bsize = ref
             _array_from_raw(dt, shape, shm_read(registry, region, offset, bsize))
         elseif use_raw
             _array_from_raw(dt, shape, msg.raw_input_contents[i])
@@ -223,16 +258,49 @@ function decode_infer_request(
     requested = String[o.name for o in msg.outputs]
     targets = Dict{String, OutputTarget}()
     for o in msg.outputs
-        region = _param_string(o.parameters, _SHM_REGION)
-        region === nothing && continue
-        offset = something(_param_int(o.parameters, _SHM_OFFSET), 0)
-        bsize = _param_int(o.parameters, _SHM_BYTE_SIZE)
-        bsize === nothing && error("output '$(o.name)' references shared memory but is missing $_SHM_BYTE_SIZE")
-        targets[o.name] = OutputTarget(region, offset, bsize)
+        ref = _shm_reference(o.parameters, "output '$(o.name)'")
+        ref === nothing && continue
+        # Resolve the region now: an unknown one fails before any compute (FAILED_PRECONDITION), and
+        # the write later goes to exactly this registration.
+        mapping = registry === nothing ? nothing : _lookup_region(registry, first(ref))
+        targets[o.name] = OutputTarget(ref..., mapping)
     end
 
+    control = _decode_slot_control(msg.parameters, registry)
+    if control !== nothing
+        # One region, one lock: the claim on the control word covers the output writes only when
+        # they land in the word's own registration.
+        all(t -> t.mapping === control.mapping, values(targets)) || error(
+            "shared-memory outputs must be in the slot control region '$(control.mapping.name)'"
+        )
+    end
     deadline_ns = _decode_deadline_ns(msg.parameters)
-    return DecodedRequest(InferRequest(msg.model_name, requested, tensors, deadline_ns), msg.id, targets)
+    return DecodedRequest(InferRequest(msg.model_name, requested, tensors, deadline_ns, control), msg.id, targets)
+end
+
+# A request's slot control (CORE-3) from its request-level parameters, or `nothing` when it sends
+# none. Read as strictly as the tensor parameters: all three or none, each of its declared type. The
+# region resolves like an output's (FAILED_PRECONDITION when unknown) and the word must lie, 8-byte
+# aligned, inside the registered window.
+function _decode_slot_control(params, registry)
+    what = "the request"
+    region = _strict_param(params, SLOT_CONTROL_REGION_PARAM, :string_param, what)
+    offset = _strict_param(params, SLOT_CONTROL_OFFSET_PARAM, :int64_param, what)
+    token = _strict_param(params, SLOT_CONTROL_TOKEN_PARAM, :int64_param, what)
+    region === offset === token === nothing && return nothing
+    (region === nothing || offset === nothing || token === nothing) && error(
+        "slot control needs all of '$SLOT_CONTROL_REGION_PARAM', '$SLOT_CONTROL_OFFSET_PARAM' and " *
+            "'$SLOT_CONTROL_TOKEN_PARAM'"
+    )
+    slot_control_supported() ||
+        error("shared-memory slot control is not supported on this server's platform (it needs Linux)")
+    registry === nothing && error("the request carries slot control but the server has no registry")
+    (1 <= token <= _SLOT_TOKEN_MAX) || error("'$SLOT_CONTROL_TOKEN_PARAM' is out of range: $token")
+    r = _lookup_region(registry, String(region))
+    (0 <= offset && offset <= r.byte_size - 8 && (r.offset + offset) % 8 == 0) || error(
+        "'$SLOT_CONTROL_OFFSET_PARAM' $offset is not an aligned 8-byte word inside region '$(r.name)'"
+    )
+    return SlotControl(r, Int(offset), UInt64(token))
 end
 
 # Copy a Julia col-major array's bytes into a fresh Vector{UInt8}. The bytes are already
@@ -304,24 +372,33 @@ end
 
 Build the response message, writing any output whose requested entry named a shared-memory
 region into that region (and referencing it in the response) instead of inline.
-raw_output_contents holds the inline outputs in order. The PB-first form builds the message
-from pb module `PB` (consumer packages pass their own generated module).
+raw_output_contents holds one entry per output in `outputs` order, as the KServe proto requires:
+the bytes of an inline output, or an empty placeholder for a shared-memory output, so a client
+that indexes it by output position (as Triton clients do) reads the right tensor. The PB-first
+form builds the message from pb module `PB` (consumer packages pass their own generated module).
 """
 function encode_infer_response(
         model_name::AbstractString, decoded::DecodedRequest,
         outputs::Vector{NamedTensor},
-        registry::Union{SharedMemoryRegistry, Nothing}
+        registry::Union{SharedMemoryRegistry, Nothing}; kwargs...
     )
-    return encode_infer_response(inference, model_name, decoded, outputs, registry)
+    return encode_infer_response(inference, model_name, decoded, outputs, registry; kwargs...)
 end
 
+# Every shared-memory output is checked before any is written, and they are written together: under
+# the slot control protocol when the request carries it (CORE-3), so nothing is written into a slot
+# its client gave up on; otherwise as before, except that nothing is written once `deadline_ns` (the
+# request's effective deadline, local time_ns(), 0 = none) has passed, since the client has given up
+# by then and may already be reusing the memory.
 function encode_infer_response(
         PB::Module, model_name::AbstractString, decoded::DecodedRequest,
         outputs::Vector{NamedTensor},
-        registry::Union{SharedMemoryRegistry, Nothing}
+        registry::Union{SharedMemoryRegistry, Nothing};
+        deadline_ns::Integer = decoded.request.deadline_ns
     )
     out_tensors = PB.var"ModelInferResponse.InferOutputTensor"[]
     raw = Vector{UInt8}[]
+    pending = Tuple{ShmRegion, Array, Int, Int}[]   # (region, data, offset, nbytes) per shm output
     selected = _select_outputs(outputs, decoded.request.requested_outputs)
     for t in selected
         tgt = get(decoded.output_targets, t.name, nothing)
@@ -329,20 +406,36 @@ function encode_infer_response(
             push!(out_tensors, _output_tensor(PB, t))
             push!(raw, _raw_from_array(t.data))
         else
-            registry === nothing && error("output '$(t.name)' targets shared memory but the server has no registry")
-            bytes = _raw_from_array(t.data)
-            length(bytes) <= tgt.byte_size ||
-                error("output '$(t.name)' produced $(length(bytes)) bytes but region slot is $(tgt.byte_size)")
-            shm_write!(registry, tgt.region, tgt.offset, bytes)
+            (registry === nothing || tgt.mapping === nothing) &&
+                error("output '$(t.name)' targets shared memory but the server has no registry")
+            nbytes = sizeof(eltype(t.data)) * length(t.data)
+            nbytes <= tgt.byte_size ||
+                error("output '$(t.name)' produced $nbytes bytes but region slot is $(tgt.byte_size)")
+            push!(pending, (tgt.mapping, t.data, tgt.offset, nbytes))
             params = Dict(
                 _SHM_REGION => _string_param(PB, tgt.region),
                 _SHM_OFFSET => _int_param(PB, tgt.offset),
-                _SHM_BYTE_SIZE => _int_param(PB, length(bytes)),
+                _SHM_BYTE_SIZE => _int_param(PB, nbytes),
             )
             push!(out_tensors, _output_tensor(PB, t; parameters = params))
+            push!(raw, UInt8[])   # placeholder keeps raw_output_contents aligned with outputs
         end
     end
+    isempty(pending) || _write_shm_outputs!(decoded, pending, model_name, Int64(deadline_ns))
     return _build_response(PB, model_name, id_of(decoded), out_tensors, raw)
+end
+
+function _write_shm_outputs!(decoded::DecodedRequest, pending, model_name, deadline_ns::Int64)
+    control = decoded.request.slot_control
+    if control === nothing
+        (deadline_ns != 0 && Int64(time_ns()) >= deadline_ns) && throw(DeadlineExceeded(String(model_name)))
+        for (r, data, offset, nbytes) in pending
+            _shm_copy_in!(r, offset, data, nbytes)
+        end
+    else
+        shm_write_controlled!(control, [(data, offset, nbytes) for (_, data, offset, nbytes) in pending], model_name)
+    end
+    return nothing
 end
 
 id_of(d::DecodedRequest) = d.id

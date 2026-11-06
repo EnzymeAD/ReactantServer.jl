@@ -72,7 +72,7 @@ The `BertText` surface is a small set of composable helpers:
 | Helper | What it does |
 | --- | --- |
 | `load_tokenizer(vocab_path)` | Load a HuggingFace `vocab.txt` (one token per line, line number minus 1 is the id); returns the `BertTokenizer` the other helpers take. |
-| `wire_text(bytes)` / `wire_texts(texts, lens)` | Decode one UTF-8 tensor (the cross encoder's shared query) or a `(max_bytes, batch)` matrix of zero-padded rows using the per-row byte lengths. |
+| `wire_text(bytes)` / `wire_texts(texts, lens)` | Decode one UTF-8 tensor (the cross encoder's shared query) or a `(max_bytes, batch)` matrix of zero-padded rows using the per-row byte lengths. Bytes that are not valid UTF-8, a `lens` that does not match the rows, or a length out of range raise `BertText.TextInputError`, which the client receives as `INVALID_ARGUMENT`. |
 | `encode_single(t, text)` / `encode_pair(t, a, b)` | Encode one text as `[CLS] text [SEP]`, or a pair as `[CLS] a [SEP] b [SEP]` with HF `LongestFirst` truncation; the pair form also returns `token_type_ids`. |
 | `encode_text_batch` / `encode_pair_batch` | The preprocess entry points: decode the wire rows, encode each, and pad to the smallest bucket that fits. |
 | `pad_batch(encoded, buckets)` / `seq_bucket(n, buckets)` | Pack per-row token ids into `(seq, batch)` matrices at the smallest compiled sequence length that holds them; `pad_batch` errors clearly if an input exceeds the largest bucket. |
