@@ -167,6 +167,13 @@ With `shared_host_weights` on, size `/dev/shm` above the combined weights of eve
 serves, plus room for the client regions. A tmpfs is allocated lazily, so a generous limit costs
 nothing until it is used. `--shm-size` does not apply together with `--ipc=host`.
 
+Do not let `/dev/shm` fill. Because its pages are allocated lazily, a client's shared-memory pool
+is created without error on a nearly full `/dev/shm`, and whichever process later touches a page
+there is no room for is killed by SIGBUS: the client while it stages inputs, or the worker while
+it writes outputs into the client's region. A worker killed this way fails every request in flight
+on it, and the supervisor restarts it. Size `/dev/shm` (`--shm-size`) for every client pool plus
+the shared weights, and watch its use (`df /dev/shm`).
+
 **Process and thread limits.** Podman limits a container to 2048 processes by default
 (`--pids-limit`), and the limit counts threads. Each worker runs a Julia compute pool, XLA's
 asynchronous runners, and the host libraries' own pools, so a multi-GPU node can cross 2048
@@ -182,7 +189,13 @@ worker should run.
 
 **Model repository.** Mount it at `/var/lib/reactantserver/models`, writable: the compiled
 executable cache lives inside each bundle, so a read-only mount recompiles every program on every
-start. In `dynamic` mode the server watches the mount and hot-loads changes.
+start. In `dynamic` mode the server watches the mount and hot-loads changes. It cannot tell a
+mount that has gone away from a repository that was emptied: if the repository is missing or lists
+no bundles at two consecutive polls (`model_poll_seconds`, 15 s by default), as can happen with
+network storage (an NFS stale handle, an autofs expiry, a remount), every worker that watches it
+unloads every model from it (their requests get `NOT_FOUND`) and loads them again one at a time
+once it is back. Keep the repository on local storage, or use `model_control_mode: static`, which
+does not watch it.
 
 **Persistent caches.** Mount a volume at `/var/cache/reactant-compile` to keep XLA's autotune
 results across container recreation; without it every start re-times every GEMM and convolution.

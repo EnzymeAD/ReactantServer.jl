@@ -1,9 +1,11 @@
 # Meta models: a Julia orchestration (a bundle's model.jl that calls register_meta_model) chains
 # other models with data-dependent logic. A meta runs its orchestration on the request task under a
-# one-meta-at-a-time gate, and each sub-call re-enters the local scheduler in-process via a
-# QueueingCaller (no gateway, no shared-memory transport): the sub-model dispatches on the loop as a
-# committed request. These tests exercise that path: manifest/bundle loading, the injected caller, the
-# declared-call guard, the deadline bail, and the cross-bundle recursion check.
+# per-worker meta gate (one permit in a `Scheduler` as these tests build it, unless a test sets more;
+# REACTANT_META_CONCURRENCY, default 2, on a served worker; a compute-only meta bypasses it), and each
+# sub-call re-enters the local scheduler in-process via a QueueingCaller (no gateway, no
+# shared-memory transport): the sub-model dispatches on the loop as a committed request. These tests
+# exercise that path: manifest/bundle loading, the injected caller, the declared-call guard, the
+# deadline bail, and the cross-bundle recursion check.
 
 const _RS = ReactantServer
 

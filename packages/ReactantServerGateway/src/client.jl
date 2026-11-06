@@ -100,12 +100,16 @@ all_clients(p::ClientPool) = [p.clients[u] for u in p.order]
 
 # Reset a worker's multi handle in place: close it (dropping every pooled connection and aborting
 # any in-flight request on it) and re-open it. The worker's channel holds this handle by
-# identity, so it transparently uses the fresh handle afterward. This recovers from a poisoned
-# connection: when a worker is caught mid-stall (TCP accepted but HTTP/2 not yet negotiated),
-# libcurl keeps the half-open connection pooled and every later request reuses (PIPEWAITs on) it
-# and hangs forever; only dropping the connection recovers it (the per-worker equivalent of a
-# process restart). Call this when a probe to the worker *hangs* (times out or hits its deadline),
-# not on a fast refuse.
+# identity, so it transparently uses the fresh handle afterward. This recovers from a stuck
+# connection. gRPCClient sets CURLOPT_PIPEWAIT on every call, and with it libcurl does not use a
+# pooled HTTP/2 connection until a call on it has had a response: a new call waits for that
+# connection instead of opening another, even when no call is using it. When every call on a
+# connection is given up before the worker answers any (a worker caught mid-stall: TCP accepted,
+# nothing answered yet), the connection stays pooled unanswered, and every later call to the worker
+# waits behind it and fails just after its own deadline (gRPCClient's watchdog cancels it). That
+# lasts until libcurl drops the connection after 118 s idle (CURLOPT_MAXAGE_CONN); closing the
+# handle drops it at once (the per-worker equivalent of a process restart). Call this when a probe
+# to the worker *hangs* (times out or hits its deadline), not on a fast refuse.
 function reset_clients!(wc::WorkerClients)
     try
         gRPCClient.grpc_shutdown(wc.grpc)

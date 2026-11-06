@@ -15,7 +15,9 @@
 #
 # A change is acted on only once its signature is observed identical across two consecutive polls
 # (debounce), so a bundle still being copied in is not loaded half-written; `load_bundle_entry`'s
-# validation is the backstop. A failed load/reload is logged and retried on the next poll.
+# validation is the backstop. A failed load/reload is logged and retried every second poll: the
+# change is not recorded as applied, so the next poll sees it again as a new change and the one
+# after confirms and retries it.
 #
 # A load records the signature the files had when they were read, not when the load ended, and a
 # new version is admitted only if the files still have that signature once it is built. A bundle
@@ -132,9 +134,10 @@ end
 
 # Apply a single confirmed change. `desired === nothing` means the bundle is gone (unload); a
 # BundleSig means load or reload from `dir`. Failures are logged and not propagated: `seen` is left
-# untouched on a load failure so the next poll retries. A load whose files changed before the new
-# version was admitted is not admitted; it is left pending at what is on disk then, so the next poll
-# loads it again once that has held still.
+# untouched on a load failure, so the change is detected again on the next poll and retried on the
+# one after (the two-poll debounce). A load whose files changed before the new version was admitted
+# is not admitted; it is left pending at what is on disk then, so the next poll loads it again once
+# that has held still.
 function _apply_change!(
         w::BundleWatcher, name::AbstractString,
         desired::Union{BundleSig, Nothing}, dir::Union{String, Nothing}

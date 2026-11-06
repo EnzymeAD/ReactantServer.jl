@@ -471,13 +471,18 @@ function serve(
     # `exiting` records that the hook fired, for the end of a blocking serve (see there).
     exiting = Threads.Atomic{Bool}(false)
     blocking && on_dispatch_failure!(sched, err -> (exiting[] = true; _exit_on_dispatch_failure(err)))
-    # Local reuse pool for meta-model intermediates: plain Memory, never shared. With one meta at a time
-    # (the gate below) the pool sees no cross-meta contention; it keeps large per-request intermediates
-    # (e.g. an ROI feature tensor) off the allocation path and holds down GC pressure. Sized by env.
+    # Local reuse pool for meta-model intermediates: plain Memory, never shared across processes. It
+    # keeps large per-request intermediates (e.g. an ROI feature tensor) off the allocation path and
+    # holds down GC pressure. Several metas use it at once (the gate below admits two by default, and
+    # compute-only metas bypass it), so they compete for its slots: a request holds the slots its
+    # `call.scratch` took until it no longer reads its outputs, which for a gRPC request is after
+    # its response is encoded (see `run_meta`), and a meta that finds no free slot waits for one,
+    # until its deadline if it has one. Sized by env (`_meta_scratch_pool`).
     sched.scratch_pool = _meta_scratch_pool()
-    # Admit one meta orchestration at a time (configurable). A meta holds a permit across its whole run,
-    # including the CPU glue between stages, but not the GPU itself: its sub-calls dispatch on the loop,
-    # so other models run while the meta computes between stages.
+    # Admit a bounded number of GPU-using meta orchestrations at once (`_meta_concurrency`, default
+    # 2). A meta holds a permit across its whole run, including the CPU glue between stages, but not
+    # the GPU itself: its sub-calls dispatch on the loop, so other models run while the meta
+    # computes between stages.
     sched.meta_gate = MetaGate(_meta_concurrency())
     # Build the gRPC server first (registered, with a metrics-less payload), then adopt the
     # server's own admission atomics into the metrics collector, then swap in the real payload

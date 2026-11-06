@@ -133,9 +133,10 @@ const _EInf = ReactantServer.inference
 end
 
 # A meta model served alongside its backbone, driven over the real gRPC path. The meta's orchestration
-# runs on the request task under the worker's one-meta-at-a-time gate, and its call to "scale4" re-enters
-# the scheduler in-process (the sub-model dispatches on the loop). This exercises the full wire path the
-# unit tests skip: decode -> run orchestration -> in-process committed sub-call -> encode.
+# runs on the request task under the worker's meta gate (REACTANT_META_CONCURRENCY permits, default 2,
+# since `serve` builds it), and its call to "scale4" re-enters the scheduler in-process (the sub-model
+# dispatches on the loop). This exercises the full wire path the unit tests skip: decode -> run
+# orchestration -> in-process committed sub-call -> encode.
 @testset "meta model end-to-end (CPU, in-process)" begin
     mktempdir() do root
         # Backbone: y = x .* 2.

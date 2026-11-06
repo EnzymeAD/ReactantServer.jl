@@ -61,7 +61,7 @@ end)
 loud error. The loader also rejects a meta bundle whose `model.jl` calls `register_model` instead
 of `register_meta_model`.
 
-## Execution: local, on the request task, one meta at a time
+## Execution: local, on the request task, a bounded number of GPU metas at a time
 
 A meta's `run(inputs, call)` executes on the gRPC request task, off the GPU dispatch loop, exactly
 like a model's pre/post hooks. Each `call(name, inputs)` re-enters the local scheduler in-process:
@@ -111,10 +111,11 @@ Client --infer(two_stage)--> Gateway
 
 A meta does not hold the GPU for its whole run. Each stage is an ordinary dispatch on the loop,
 so the GPU is occupied only while a stage actually computes and is free during the meta's CPU glue,
-when the loop serves other models. The trade is the gate: while a meta holds its permit, a second
-meta on the same worker waits (its stages cannot start), though the GPU is not wasted because
-regular models run in the meantime. A stage runs at batch 1 for the meta unless other clients' calls
-to the same sub-model happen to coalesce with it on the loop.
+when the loop serves other models. The trade is the gate: once its permits are all held (by two
+metas at the default concurrency), a further GPU meta on the same worker waits (its stages cannot
+start), though the GPU is not wasted because regular models run in the meantime. A stage runs at
+batch 1 for the meta unless other clients' calls to the same sub-model happen to coalesce with it
+on the loop.
 
 A meta carries a deadline like any request. It is dropped before it starts if the deadline has
 already passed or if it cannot take a gate permit in time, so a meta backlog sheds at admission

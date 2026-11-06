@@ -44,11 +44,14 @@ struct ControlCommand
     reply::Channel{Any}
 end
 
-# Admits at most `capacity` meta orchestrations at once on this worker (default 1). A meta holds a
-# permit across its WHOLE run, including the CPU glue between stages, so only one meta's GPU sub-calls
-# ever compete with regular work; the GPU itself is not held during glue (sub-calls dispatch on the
-# loop). `acquire_meta_gate!` is deadline-bounded: a meta that cannot get a permit before its deadline
-# is shed before doing any GPU work, so a meta backlog sheds at admission rather than piling up.
+# Admits at most `capacity` meta orchestrations at once on this worker. The constructor defaults to 1,
+# as does a bare `Scheduler`; a served worker passes REACTANT_META_CONCURRENCY (default 2, see
+# server.jl `_meta_concurrency`). A compute-only meta (no `calls`) bypasses the gate. A meta holds a
+# permit across its WHOLE run, including the CPU glue between stages, so at most `capacity` metas' GPU
+# sub-calls ever compete with regular work; the GPU itself is not held during glue (sub-calls dispatch
+# on the loop). `acquire_meta_gate!` is deadline-bounded: a meta that cannot get a permit before its
+# deadline is shed before doing any GPU work, so a meta backlog sheds at admission rather than piling
+# up.
 mutable struct MetaGate
     cond::Threads.Condition   # guards `n_held`
     capacity::Int
@@ -115,10 +118,11 @@ mutable struct Scheduler
     weight_cache::Union{WeightCache, Nothing}   # on-demand weight residency, or nothing when disabled
     scratch_pool::Union{BufferPool, Nothing}    # local reuse pool for meta intermediates (plain Memory); nothing disables
     control::Vector{ControlCommand}            # pending control commands, drained by the dispatch loop
-    meta_gate::MetaGate                        # admits one meta orchestration at a time (capacity configurable)
+    meta_gate::MetaGate                        # admits `capacity` GPU-using metas at once: 1 as constructed,
+    # REACTANT_META_CONCURRENCY (default 2) on a served worker
     committed::Vector{QueuedRequest}           # in-flight metas' continuation sub-calls awaiting the next GPU slot, each
     # dispatched ahead of the discipline scan. One entry per in-flight meta, so
-    # it is bounded by the gate: committed count == REACTANT_META_CONCURRENCY.
+    # it is bounded by the gate: at most its capacity (REACTANT_META_CONCURRENCY on a served worker).
     compact_loads_mark::Int                    # weight-cache load count at the last automatic compaction; sole
     # writer is the dispatch thread. Drives load-driven compaction:
     # compact once `weight_cache.loads` advances by `cfg.compaction_interval`.

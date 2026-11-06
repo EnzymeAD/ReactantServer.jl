@@ -1,13 +1,17 @@
 # Meta-model execution: a meta model is a user-authored Julia workflow (a bundle's model.jl that
 # calls register_meta_model) that chains several models with data-dependent logic in between. Its
 # orchestration runs on the gRPC request task (off the GPU dispatch loop, like the pre/post hooks),
-# under a per-worker gate that admits only one meta at a time (see scheduler.jl `infer`). Each sub-call
-# goes through an injected `QueueingCaller` that re-enters the local scheduler in-process: the sub-model
-# dispatches on the loop (so the GPU is free for other models during the meta's CPU glue), but a meta's
-# in-flight sub-call is COMMITTED, so it jumps the queue for the next GPU slot and is never shed on the
-# EDF laxity prediction (only on the base deadline-passed check). There is no loopback gRPC and no
-# shared-memory transport. The sub-models are internal to the meta (the gateway never routes to them);
-# placement keeps them resident with their meta.
+# under a per-worker gate that admits a bounded number of metas at once (REACTANT_META_CONCURRENCY,
+# default 2); a compute-only meta (no declared calls) bypasses it (see scheduler.jl
+# `_run_meta_request`). Concurrent metas share the worker's scratch pool, and the slots a meta takes
+# through `call.scratch` stay held until its outputs are no longer read, which for a gRPC request is
+# after its response is encoded (see `run_meta`). Each sub-call goes through an injected
+# `QueueingCaller` that re-enters the local scheduler in-process: the sub-model dispatches on the loop
+# (so the GPU is free for other models during the meta's CPU glue), but a meta's in-flight sub-call is
+# COMMITTED, so it jumps the queue for the next GPU slot and is never shed on the EDF laxity
+# prediction (only on the base deadline-passed check). There is no loopback gRPC and no shared-memory
+# transport. The sub-models are internal to the meta (the gateway never routes to them); placement
+# keeps them resident with their meta.
 
 abstract type ModelCaller end
 

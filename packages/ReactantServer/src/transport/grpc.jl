@@ -390,9 +390,10 @@ function _handle_infer_impl(ctx::InferContext, req, grpc_deadline_ns::Integer = 
 end
 
 # A meta's orchestration runs on this request task (`infer` -> `_run_meta_request`), under the worker's
-# one-meta-at-a-time gate; its in-process sub-calls dispatch on the loop. Input validation reuses the
-# regular path (it reads only `manifest`, which MetaEntry also carries). A deadline bail and an
-# unknown or unloaded sub-model keep their types, and `_handle_infer` maps them as on the regular path.
+# meta gate (two metas at once by default; a compute-only meta bypasses it); its in-process sub-calls
+# dispatch on the loop. Input validation reuses the regular path (it reads only `manifest`, which
+# MetaEntry also carries). A deadline bail and an unknown or unloaded sub-model keep their types, and
+# `_handle_infer` maps them as on the regular path.
 # The outputs may alias the pool slots the meta's `call.scratch` acquired, so `infer` hands those slots
 # here (`scratch_out`) rather than releasing them when the orchestration returns, and they go back to
 # the pool only after the response is encoded, on every path. `encode_infer_response` copies each

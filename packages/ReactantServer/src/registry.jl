@@ -100,9 +100,10 @@ ModelEntry(
 
 # A meta model: a Julia orchestration over other models. It owns no compiled executable or weights and
 # is not scheduled on the dispatch loop. Its `run` executes on the gRPC request task under a per-worker
-# gate (one meta at a time), and each sub-call re-enters the scheduler in-process for the sub-model (see
-# meta.jl `QueueingCaller`, scheduler.jl `_run_meta_request`). `sched` is filled when the scheduler
-# prepares the entry and holds only its serving counters for the control plane (it has no dispatch queue).
+# gate (two metas at once by default; a compute-only meta, with no `calls`, bypasses it), and each
+# sub-call re-enters the scheduler in-process for the sub-model (see meta.jl `QueueingCaller`,
+# scheduler.jl `_run_meta_request`). `sched` is filled when the scheduler prepares the entry and holds
+# only its serving counters for the control plane (it has no dispatch queue).
 mutable struct MetaEntry <: AbstractDispatchEntry
     name::String
     manifest::Manifest
