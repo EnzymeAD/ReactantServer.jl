@@ -160,6 +160,13 @@ struct GatewayConfig
     stage_timeout_seconds::Float64
     # How much an INTERNAL error tells the client (`grpc.error_detail`): `redacted` (default) or `full`.
     error_detail::ErrorDetail
+    # Whether the listener keeps HTTP.jl's Rapid-Reset protection (`grpc.rapid_reset_protection`,
+    # default false). When true, a client connection may have gRPCServer's default of 100 streams open
+    # at once, and HTTP.jl ends it with GOAWAY(ENHANCE_YOUR_CALM) once the client has reset more than
+    # 200 streams over its life: every call it gives up on resets one, and gRPCClient-based clients
+    # can then hang until their deadline (GW-18). When false the stream limit is out of any client's
+    # reach and the inbound admission cap is what bounds a resetting client.
+    rapid_reset_protection::Bool
 end
 
 """
@@ -171,7 +178,8 @@ RESOURCE_EXHAUSTED (see `build_gateway_server`).
 """
 inbound_cap(cfg::GatewayConfig) = cfg.max_concurrent_requests_per_worker * length(cfg.workers)
 
-# The positional form without `error_detail` (tests, older callers): production-safe redaction.
+# The positional form without `error_detail` and `rapid_reset_protection` (tests, older callers): the
+# defaults, production-safe redaction and no Rapid-Reset cut-off.
 GatewayConfig(
     listen_grpc, listen_metrics, workers, worker_metrics, worker_names,
     request_timeout_seconds, max_recv_msg_bytes, max_send_msg_bytes, log_level, log_format,
@@ -189,7 +197,7 @@ GatewayConfig(
     routing_fill_factor, routing_policy, routing_fill_mode, models,
     max_concurrent_streams_per_worker, max_concurrent_requests_per_worker, compaction_mode,
     compaction_interval, forbid_memory_oversubscription, payback_seconds, prime_moves,
-    stage_timeout_seconds, ERROR_DETAIL_REDACTED
+    stage_timeout_seconds, ERROR_DETAIL_REDACTED, false
 )
 
 const GW_ENV_PREFIX = "REACTANT_GATEWAY_"
@@ -219,6 +227,7 @@ const GW_ENV_PATHS = Tuple{String, Vector{String}, DataType}[
     ("GRPC_MAX_SEND_MSG_BYTES", ["grpc", "max_send_msg_bytes"], Int),
     ("GRPC_MAX_CONCURRENT_REQUESTS_PER_WORKER", ["grpc", "max_concurrent_requests_per_worker"], Int),
     ("GRPC_ERROR_DETAIL", ["grpc", "error_detail"], String),
+    ("GRPC_RAPID_RESET_PROTECTION", ["grpc", "rapid_reset_protection"], Bool),
     ("LOGGING_LEVEL", ["logging", "level"], String),
     ("LOGGING_FORMAT", ["logging", "format"], String),
     ("TLS_CERT_FILE", ["tls", "cert_file"], String),
@@ -365,6 +374,7 @@ function _build_gateway_config(raw::Dict{String, Any})
         _opt(sched, "prime_moves", Bool, true),
         _opt(sched, "stage_timeout_seconds", Float64, 120.0),
         _parse_error_detail(_opt(grpc, "error_detail", String, "redacted")),
+        _opt(grpc, "rapid_reset_protection", Bool, false),
     )
     cfg.max_concurrent_streams_per_worker > 0 ||
         throw(ConfigError("worker_client.max_concurrent_streams must be positive"))

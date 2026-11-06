@@ -104,6 +104,24 @@ bound_ports(g::RunningGateway) =
 const _H2_INITIAL_WINDOW_BYTES = 32 * 1024 * 1024     # per-stream receive window
 const _H2_CONNECTION_WINDOW_BYTES = 32 * 1024 * 1024  # connection-level receive window
 
+# The streams a client connection may have open at once (SETTINGS_MAX_CONCURRENT_STREAMS) by default:
+# 2^31 - 1, more than a client can ever open on one connection (its stream ids are odd and below
+# 2^31). It is this large because HTTP.jl derives its Rapid-Reset (CVE-2023-44487) budget from it:
+# once the peer has reset more than `max_concurrent_streams + 100` streams over the connection's whole
+# life, the server sends GOAWAY(ENHANCE_YOUR_CALM). Every call a client gives up on (its deadline
+# passed, or it cancelled) resets one stream, so at gRPCServer's default of 100 an ordinary client is
+# cut off after its 200th give-up. libcurl, which gRPCClient and so ReactantServerClient drive with
+# CURLOPT_PIPEWAIT, then parks every later call behind the replacement connection until the call's
+# deadline when that connection's first calls were give-ups too: it waits for a connection to show it
+# multiplexes before reusing it, and one that never answered a call never does, until it has been
+# idle for 118 s and libcurl drops it (GW-18). With this limit the budget is out of reach. What bounds
+# a client that resets streams is the gateway's inbound admission cap (`inbound_cap`, unless it is
+# configured to 0): a reset call's handler counts against it until it returns, and a call past it is
+# shed at once with RESOURCE_EXHAUSTED. `grpc.rapid_reset_protection` restores gRPCServer's default
+# limit, and with it the budget, for an operator who prefers HTTP.jl's protection to clients that
+# keep their connection (see `_listener_streams`).
+const _H2_MAX_CONCURRENT_STREAMS = Int(typemax(Int32))
+
 # How long lpt_packing startup waits for all workers to come up over the control plane before
 # serving (REACTANT_GATEWAY_STARTUP_WAIT_SECONDS). "inf"/"forever"/"-1" waits indefinitely and 0
 # checks once. The default is a short grace rather than a single check: a worker that already
@@ -201,7 +219,7 @@ function serve_gateway(gateway_path::Union{AbstractString, Nothing} = nothing; b
     # Refuses new inference with UNAVAILABLE once the gateway drains.
     drain = ReactantServerCore.DrainGate()
     gRPCServer.add_interceptor!(server, _DrainInterceptor(drain))
-    @info "Starting reactant-gateway" grpc = cfg.listen_grpc metrics = cfg.listen_metrics endpoints = cfg.workers max_concurrent_requests = max_concurrent outbound_streams_per_worker = cfg.max_concurrent_streams_per_worker
+    @info "Starting reactant-gateway" grpc = cfg.listen_grpc metrics = cfg.listen_metrics endpoints = cfg.workers max_concurrent_requests = max_concurrent outbound_streams_per_worker = cfg.max_concurrent_streams_per_worker rapid_reset_protection = cfg.rapid_reset_protection
 
     blocking || return _start_gateway(cfg, pool, routes, gate, metrics, admin, prober, monitor, server, drain)
     # Blocking: serve until a drain is requested (the supervisor closing stdin, or `request_drain!`),

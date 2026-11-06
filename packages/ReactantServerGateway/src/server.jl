@@ -709,6 +709,13 @@ end
 # reached instead: no call is shed and the count stays live.
 _admission_limit(cap::Integer) = cap > 0 ? Int(cap) : typemax(Int)
 
+# The listener's per-connection stream limit, as keyword arguments for gRPCServer. By default it is
+# `_H2_MAX_CONCURRENT_STREAMS`, so a client is never cut off for giving up on calls (GW-18). With
+# `grpc.rapid_reset_protection` none is passed: gRPCServer's default of 100 streams per connection
+# applies, and with it HTTP.jl's Rapid-Reset budget of 200 resets per connection.
+_listener_streams(cfg::GatewayConfig) =
+    cfg.rapid_reset_protection ? (;) : (; max_concurrent_streams = _H2_MAX_CONCURRENT_STREAMS)
+
 """
     build_gateway_server(state, cfg, host, port) -> GRPCServer
 
@@ -732,6 +739,7 @@ function build_gateway_server(
         # The inbound cap: past it gRPCServer sheds a call at once with RESOURCE_EXHAUSTED, before
         # any handler runs, and counts it in the `shed_total` that `gateway_requests_shed_total` reads.
         max_concurrent_requests = _admission_limit(inbound_cap(cfg)),
+        _listener_streams(cfg)...,
         h2_initial_window_size = h2_initial_window_size,
         h2_connection_window_size = h2_connection_window_size
     )

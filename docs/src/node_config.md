@@ -304,6 +304,7 @@ grpc:
                                           # (gateway_requests_shed_total). Sized above the outbound
                                           # stream limit so a startup burst has headroom rather
                                           # than being shed early
+  rapid_reset_protection: false   # true: HTTP.jl's Rapid-Reset cut-off (see below)
 worker_client:
   request_timeout_seconds: 60
   max_concurrent_streams: 32      # outbound in-flight RPCs the gateway multiplexes to one worker
@@ -320,6 +321,23 @@ endpoints:                        # worker host:port addresses, across any numbe
   - "10.0.0.1:8080"
   - "10.0.0.2:8080"
 ```
+
+`grpc.rapid_reset_protection` (default `false`; environment
+`REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION`) switches on the Rapid-Reset (CVE-2023-44487)
+protection of the HTTP/2 server the gateway listens with. With it on, a client connection may
+have 100 streams open at once, and the gateway ends the connection
+(`GOAWAY(ENHANCE_YOUR_CALM)`) once the client has reset more than 200 streams over the
+connection's life. A client resets a stream every time it gives up on a call (its deadline
+passes, or it cancels), so **a client that gives up on calls is disconnected after about 200
+give-ups per connection**, however long the connection has been up. gRPCClient-based clients,
+`ReactantServerClient` among them, can then hang on every call to the gateway until the call's
+deadline, for up to about two minutes, if their first calls on the new connection are give-ups
+as well (libcurl waits for that connection to answer before using it, and it never does). With
+it off, the default, no client is disconnected for giving up on calls, and what bounds a client
+that resets streams is the inbound cap, `max_concurrent_requests_per_worker` times the worker
+count, past which calls are shed with `RESOURCE_EXHAUSTED` (nothing bounds it when that is 0).
+Turn it on only for a gateway that untrusted clients can reach, and only if the clients that
+depend on it can tolerate being cut off as described.
 
 The gateway is also configured by `REACTANT_GATEWAY_*` environment overrides
 (`REACTANT_GATEWAY_WORKERS` replaces the endpoint list, comma separated). The embedded gateway
