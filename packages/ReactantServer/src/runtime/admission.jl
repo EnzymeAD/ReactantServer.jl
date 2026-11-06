@@ -25,8 +25,12 @@
 #      model, m included, so every resident model can still run. Evict until it does.
 #
 # When eviction runs out of candidates, compaction is the fallback (`_compact_and_retry!`):
-# free every evictable model, reload the ones worth keeping largest first with m (as many as the
-# split rule says fit), retry once.
+# free every evictable model, check from the statistics that m fits alone, reload the ones worth
+# keeping largest first with m (as many as the split rule says fit), retry once.
+#
+# A failed admission leaves nothing behind: m is not resident and holds no device memory (an
+# upload that step C then finds without room for the scratch is undone), and what compaction
+# freed is reloaded as far as it fits.
 #
 # The pinned set is m plus the device-pinned models. Executions are synchronous on the dispatch
 # loop, which also runs admission (on a default-pool task it waits for, see `off_interactive`), so
@@ -137,9 +141,9 @@ end
 _scratch_of(cache::WeightCache, fp::ModelFootprint) = fp.scratch_bytes > 0 ? fp.scratch_bytes : cache.max_scratch
 
 # The contiguous block that must stay available for executions: the largest scratch among the
-# device-pinned models, the resident on-demand models, and `fp` (the model being admitted).
-function _scratch_need(cache::WeightCache, fp::ModelFootprint)
-    need = _scratch_of(cache, fp)
+# device-pinned models, the resident on-demand models, and `fp` (the model being admitted), if any.
+function _scratch_need(cache::WeightCache, fp::Union{ModelFootprint, Nothing} = nothing)
+    need = fp === nothing ? 0 : _scratch_of(cache, fp)
     for entry in values(cache.registry.by_name)
         model = entry.executable
         (model === nothing || model.weights === nothing) && continue
@@ -179,6 +183,38 @@ function _unevictable_bytes(cache::WeightCache, stats)
 end
 
 _fmt_bytes(n) = n === nothing ? "unknown" : Base.format_bytes(n)
+
+# Fail the admission of `entry` for `reason`.
+function _refuse!(cache::WeightCache, entry::ModelEntry, reason::String)
+    lock(() -> cache.admission_failures += 1, cache.lock)
+    throw(AdmissionError(entry.name, reason))
+end
+
+# Undo the upload of `entry` an admission committed before failing: free its device buffers and
+# drop it from the LRU and the budget (not counted as an eviction), then wait for the free to show.
+function _unadmit!(cache::WeightCache, entry::ModelEntry)
+    model = entry.executable
+    fp = model_footprint(cache, entry)
+    before = _memory_point(cache)
+    bufs = lock(cache.lock) do
+        b = model.weights
+        model.weights = nothing
+        if entry.name in cache.lru
+            _remove_lru!(cache, entry.name)
+            cache.resident_bytes -= model.nbytes
+        end
+        return b
+    end
+    bufs === nothing && return nothing
+    free_weights!(cache.backend, bufs)
+    before === nothing || _await_frees!(cache, before.in_use, evictable_bytes(fp))
+    log_memory_event(:evict, entry.name, fp, before, _memory_point(cache))
+    log_residency_change(
+        entry.name, :device, :system, model.nbytes;
+        memory = memory_report(cache.backend, cache.pool; registry = cache.registry, weight_cache = cache)
+    )
+    return nothing
+end
 
 # Fill the cache's victim search with every resident on-demand model except `exclude`, in LRU order
 # (front first, so cost ties evict the least recently used).
@@ -240,9 +276,10 @@ _chosen_names(s::VictimSearch) = [s.names[i] for i in 1:s.n if s.best[i]]
     admit_weights!(cache, entry; staged=nothing) -> nothing
 
 Make the evicted model `entry` resident, evicting what it must (see the file header for the
-steps). Throws [`AdmissionError`](@ref) when the model cannot be placed. Runs for the dispatch
-loop, the sole residency mutator. `staged` is the model's weights already read into host memory
-(see `stage_host_weights`), which every upload of `entry` here uses; the caller releases it.
+steps). Throws [`AdmissionError`](@ref) when the model cannot be placed, leaving it off the device.
+Runs for the dispatch loop, the sole residency mutator. `staged` is the model's weights already
+read into host memory (see `stage_host_weights`), which every upload of `entry` here uses; the
+caller releases it.
 """
 function admit_weights!(cache::WeightCache, entry::ModelEntry; staged = nothing)
     model = entry.executable
@@ -256,18 +293,15 @@ function admit_weights!(cache::WeightCache, entry::ModelEntry; staged = nothing)
         pinned_bytes, pinned_scratch = _pinned_floor(cache)
         held = cache.serving ? max(_unevictable_bytes(cache, stats), pinned_bytes) : pinned_bytes
         need = fp.weight_bytes + held + max(_scratch_of(cache, fp), pinned_scratch)
-        if need > stats.limit
-            cache.admission_failures += 1
-            throw(
-                AdmissionError(
-                    entry.name, "needs $(_fmt_bytes(need)) with the device-pinned models and other memory no " *
-                        "eviction frees ($(_fmt_bytes(held))), the device allows $(_fmt_bytes(stats.limit))"
-                )
-            )
-        end
+        need > stats.limit && _refuse!(
+            cache, entry, "needs $(_fmt_bytes(need)) with the device-pinned models and other memory no " *
+                "eviction frees ($(_fmt_bytes(held))), the device allows $(_fmt_bytes(stats.limit))"
+        )
     end
 
-    # A. Make room for the weights.
+    # A. Make room for the weights. `victims` collects what this admission evicts, which a failure
+    # puts back as far as it fits (`_compact_and_retry!`).
+    victims = String[]
     while true
         deficit, contiguous_short = _weights_shortfall(cache, model, fp, stats)
         (deficit <= 0 && !contiguous_short) && break
@@ -287,8 +321,9 @@ function admit_weights!(cache::WeightCache, entry::ModelEntry; staged = nothing)
                 @warn "weight cache: model exceeds budget even after evicting all unpinned models; loading anyway" model = entry.name nbytes = model.nbytes budget = cache.max_bytes
                 break
             end
-            return _compact_and_retry!(cache, entry; staged = staged)
+            return _compact_and_retry!(cache, entry; staged = staged, victims = victims)
         end
+        append!(victims, chosen)
         stats = _evict_chosen!(cache, stats, chosen; reason = deficit > 0 ? :bytes : :contiguity)
     end
 
@@ -298,7 +333,7 @@ function admit_weights!(cache::WeightCache, entry::ModelEntry; staged = nothing)
     catch err
         stats === nothing && rethrow()
         @warn "weight upload failed despite admission; compacting and retrying" model = entry.name exception = err
-        return _compact_and_retry!(cache, entry; staged = staged)
+        return _compact_and_retry!(cache, entry; staged = staged, victims = victims)
     end
 
     # C. Guarantee the scratch block for every resident model, this one included.
@@ -310,7 +345,8 @@ function admit_weights!(cache::WeightCache, entry::ModelEntry; staged = nothing)
         s = _fill_candidates!(cache, entry.name, time())
         i = select_cheapest!(s)
         i == 0 && (i = select_cheapest!(s; allow_protected = true))
-        i == 0 && return _compact_and_retry!(cache, entry; staged = staged)
+        i == 0 && return _compact_and_retry!(cache, entry; staged = staged, victims = victims)
+        push!(victims, s.names[i])
         _evict_chosen!(cache, stats, [s.names[i]]; reason = :scratch)
     end
     return
@@ -327,21 +363,20 @@ function _reload_left(cache::WeightCache, block::Integer, entries)
     return left
 end
 
-# The fallback: free every evictable model (and `entry` if it got uploaded), then reload the most
-# valuable of the previously resident models that fit alongside `entry` and have a host copy to
-# upload from, largest first so the refill packs tightly, and check that the weights and the scratch
-# block both fit. Runs at most
-# once per admission; a second failure is an AdmissionError.
-function _compact_and_retry!(cache::WeightCache, entry::ModelEntry; staged = nothing)
+# The fallback: free every evictable model (and `entry` if it got uploaded), then decide from the
+# statistics whether `entry` fits on its own: all its weights in the largest free block under the
+# split rule, which guarantees the upload (`bfc_block_fits`), and the scratch block in the bytes
+# left. If it does, reload the most valuable former residents that fit alongside it, upload them
+# and it largest first (`_refill!`), and check that the scratch block fits; if it does not after
+# all, the upload is undone. If `entry` does not fit, nothing is uploaded for it: the former
+# residents, and the models this admission evicted (`victims`), are reloaded as far as they fit.
+# Either failure is refused (`_refuse!`). Runs at most once per admission.
+function _compact_and_retry!(cache::WeightCache, entry::ModelEntry; staged = nothing, victims = String[])
     fp = model_footprint(cache, entry)
-    keep = [name for name in cache.lru if name != entry.name]
-    for name in keep
-        _refresh_priority!(cache, cache.registry.by_name[name], cache.footprints[name])
-    end
-    sort!(keep; by = name -> cache.footprints[name].priority, rev = true)
+    former = String[name for name in cache.lru if name != entry.name]
     cache.fallback_compactions += 1
     before = device_memory_stats(cache.backend, cache.pool)
-    freed = sum((cache.footprints[name].weight_bytes for name in cache.lru); init = 0)
+    freed = sum((evictable_bytes(model_footprint(cache, cache.registry.by_name[name])) for name in cache.lru); init = 0)
     compact!(cache, cache.registry)
     # A model uploaded moments ago (step C's fallback) may free late; wait so the room is real.
     stats = before === nothing ? nothing : _await_frees!(cache, before.in_use, freed)
@@ -349,24 +384,55 @@ function _compact_and_retry!(cache::WeightCache, entry::ModelEntry; staged = not
         _upload_commit!(cache, entry; staged = staged)
         return nothing
     end
-    # Room left once the pinned floor, `entry` and the scratch block are accounted for: fill it
-    # with the most valuable former residents, within the operator's byte budget too.
     scratch = _scratch_need(cache, fp)
-    room = stats.free - fp.weight_bytes - scratch
-    budget = cache.max_bytes - entry.executable.nbytes
+    lf = largest_free_bytes(stats)
+    if fp.weight_bytes + scratch > stats.free || (lf !== nothing && !bfc_block_fits(lf, fp.tensor_bytes))
+        _refill!(cache, stats, unique!(vcat(former, victims)), entry, _scratch_need(cache); with_entry = false)
+        _refuse!(
+            cache, entry, "its weights ($(_fmt_bytes(fp.weight_bytes))) and scratch " *
+                "($(_fmt_bytes(scratch))) do not fit even with every evictable model gone: " *
+                "$(_fmt_bytes(stats.free)) free, the largest free block $(_fmt_bytes(lf))"
+        )
+    end
+    _refill!(cache, stats, former, entry, scratch; staged = staged)
+    stats = device_memory_stats(cache.backend, cache.pool)
+    lf = largest_free_bytes(stats)
+    if lf !== nothing && lf < _scratch_need(cache, fp)
+        report = memory_report(cache.backend, cache.pool; registry = cache.registry, weight_cache = cache)
+        @error "admission: scratch block does not fit after compaction; the upload is undone" model = entry.name memory = report
+        _unadmit!(cache, entry)
+        _refuse!(cache, entry, "the scratch block does not fit after compaction ($(report))")
+    end
+    return nothing
+end
+
+# Reload, largest first so the refill packs tightly, the most valuable of the evicted models `names`
+# that fit in the free memory `stats` describes, together with the admitted model `entry` (uploaded
+# with them, unless `with_entry` is false), the scratch block `scratch`, and the operator's byte
+# budget. Only a model with a host copy is reloaded: this runs on the dispatch loop, which never
+# reads a weights file. One without stays evicted and is read in the background before its next
+# dispatch. A failed reload of one of them leaves it evicted; a failed upload of `entry` is refused.
+function _refill!(
+        cache::WeightCache, stats, names::Vector{String}, entry::ModelEntry, scratch::Int;
+        staged = nothing, with_entry::Bool = true
+    )
+    fps = Dict(name => model_footprint(cache, cache.registry.by_name[name]) for name in names)
+    for name in names
+        _refresh_priority!(cache, cache.registry.by_name[name], fps[name])
+    end
+    sort!(names; by = name -> fps[name].priority, rev = true)
+    room = stats.free - scratch - (with_entry ? model_footprint(cache, entry).weight_bytes : 0)
+    budget = cache.max_bytes - (with_entry ? entry.executable.nbytes : 0)
     # Bytes alone over-commit: BFC can hand a tensor a whole chunk (`bfc_block_fits`), and an upload
-    # it refuses costs a 10 s allocator retry. So a former resident is kept only if the whole reload,
+    # it refuses costs a 10 s allocator retry. So a model is reloaded only if the whole reload,
     # simulated into the largest free block in upload order (largest first), still leaves the scratch
-    # block. Other free chunks can only add room, so `entry` fits whenever the simulation does.
+    # block. Other free chunks can only add room, so the upload succeeds whenever the simulation does.
     lf = largest_free_bytes(stats)
     by_size = e -> cache.footprints[e.name].weight_bytes
-    reload = ModelEntry[entry]
-    for name in keep
+    reload = with_entry ? ModelEntry[entry] : ModelEntry[]
+    for name in names
         e = cache.registry.by_name[name]
-        f = cache.footprints[name]
-        # Only a former resident with a host copy is reloaded here: this runs on the dispatch loop,
-        # which never reads a weights file. One without stays evicted and is read in the background
-        # before its next dispatch.
+        f = fps[name]
         has_host_copy(cache, e) || continue
         extra = max(0, _scratch_of(cache, f) - scratch)    # a larger scratch block it would need
         (f.weight_bytes + extra <= room && e.executable.nbytes <= budget) || continue
@@ -386,22 +452,14 @@ function _compact_and_retry!(cache::WeightCache, entry::ModelEntry; staged = not
         catch err
             report = memory_report(cache.backend, cache.pool; registry = cache.registry, weight_cache = cache)
             if e !== entry
-                # `entry` is resident; a former resident that does not fit just stays evicted.
+                # A former resident that does not fit just stays evicted.
                 @warn "admission: reload of a former resident after compaction failed" model = entry.name reloading = e.name memory = report exception = err
                 continue
             end
-            cache.admission_failures += 1
+            # Its partial upload is freed already (`transfer_to_device`).
             @error "admission: reload after compaction failed" model = entry.name memory = report exception = err
-            throw(AdmissionError(entry.name, "upload failed after compaction ($(report))"))
+            _refuse!(cache, entry, "upload failed after compaction ($(report))")
         end
-    end
-    stats = device_memory_stats(cache.backend, cache.pool)
-    lf = largest_free_bytes(stats)
-    if lf !== nothing && lf < _scratch_need(cache, fp)
-        cache.admission_failures += 1
-        report = memory_report(cache.backend, cache.pool; registry = cache.registry, weight_cache = cache)
-        @error "admission: scratch block does not fit after compaction" model = entry.name memory = report
-        throw(AdmissionError(entry.name, "the scratch block does not fit after compaction ($(report))"))
     end
     return nothing
 end

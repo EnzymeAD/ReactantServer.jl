@@ -427,3 +427,46 @@ _in_lru(sched, name) = name in sched.weight_cache.lru
     @test b.refusals == 0
     @test cache.admission_failures == 1
 end
+
+@testset "admission: a failed admission is rolled back: not resident, not in the LRU, buffers freed (MEM-3)" begin
+    b = FragBackend(24 * _KiB)
+    _frag_hold!(b, 14 * _KiB, 4 * _KiB)                          # free blocks of 14 and 6 KiB
+    sched = _frag_scheduler(b, _frag_entry(b, "m"; kib = [4, 4], scratch = 10 * _KiB))
+    cache = sched.weight_cache
+    m = sched.registry.by_name["m"].executable
+    m.host_weights = Any[zeros(Float32, _KiB), zeros(Float32, _KiB)]
+    # The statistics say m fits: 20 KiB free holds its 8 KiB of weights and 11 KiB of scratch, and
+    # the 14 KiB block holds its weights. But best fit gives the first tensor the whole 6 KiB block
+    # and splits the second off the 14, which leaves 10 KiB: no room for the scratch.
+    @test_throws ReactantServer.AdmissionError _frag_load!(sched, "m")
+    @test m.weights === nothing && !_in_lru(sched, "m")
+    @test cache.resident_bytes == 0
+    @test isempty(b.live)
+    @test b.refusals == 0
+    # A request for it is refused, rather than run without room for its scratch.
+    @test _dispatch1!(sched, "m") isa ReactantServer.AdmissionError
+    @test b.refusals == 0
+end
+
+@testset "admission: an unplaceable model is not retried until memory is freed or it is reloaded (MEM-3)" begin
+    b = FragBackend(32 * _KiB)
+    hold = _frag_hold!(b, 14 * _KiB, 4 * _KiB)                   # two 14 KiB blocks
+    sched = _frag_scheduler(
+        b, _frag_entry(b, "P"; kib = [2], pinned = true), _frag_entry(b, "A"; kib = [4]),
+        _frag_entry(b, "B"; kib = [4]), _frag_entry(b, "C"; kib = [2]), _frag_entry(b, "m"; kib = [16])
+    )
+    cache = sched.weight_cache
+    m = sched.registry.by_name["m"]
+    for n in ("A", "B")
+        sched.registry.by_name[n].executable.host_weights = Any[zeros(Float32, _KiB)]
+        _frag_load!(sched, n)
+    end
+    sched.registry.by_name["m"].executable.host_weights = Any[zeros(Float32, 4 * _KiB)]
+    # 28 KiB free holds m's one 16 KiB tensor by bytes, but no block can. Eviction and compaction
+    # find that out once, from the statistics: the allocator is never asked for the 16 KiB.
+    @test_throws ReactantServer.AdmissionError _frag_load!(sched, "m")
+    @test b.refusals == 0
+    @test cache.fallback_compactions == 1
+    @test !_resident(sched, "m") && !_in_lru(sched, "m")
+    @test _resident(sched, "A") && _resident(sched, "B")         # what it evicted is back
+end

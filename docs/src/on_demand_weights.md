@@ -295,13 +295,20 @@ are evicted only when nothing else frees enough. The search is allocation-free a
 measured at 64 resident models it takes about 6 to 22 microseconds.
 
 Compaction (below) is the fallback when eviction alone cannot make room: the worker frees
-every evictable model, reloads the most valuable of them largest first together with the
-new model, and retries once; if that fails too the request fails with an admission error
-naming the reason. A former resident is reloaded only if the whole refill, replayed under
+every evictable model, checks from the statistics that the new model fits on its own,
+reloads the most valuable of them largest first together with the new model, and retries
+once. A former resident is reloaded only if the whole refill, replayed under
 the allocator's split rule, still leaves the scratch block free; one that fails to reload
 anyway stays evicted rather than failing the request. Device-pinned models never move, so a pinned model that splits the
 device can make a large model unplaceable; place pinned models with that in mind. Without
 device statistics (the CPU backend) only the byte budget applies.
+
+When the new model does not fit even after compaction, the worker does not ask the allocator
+for it, so it never pays the 10 second wait: the model is left off the device, the models
+compaction freed (and the ones its admission evicted) are reloaded as far as they fit, and the
+request fails with `UNAVAILABLE` and an admission error naming the reason, so a gateway tries
+another replica. If the upload succeeds but then leaves no room for the scratch block, the
+upload is undone the same way, rather than leaving a model resident that could not run.
 
 Whatever drives compaction frees the on-demand region the same way; what differs is *when*
 it fires and *what* gets reloaded eagerly. Underneath, compaction is a worker control RPC,
