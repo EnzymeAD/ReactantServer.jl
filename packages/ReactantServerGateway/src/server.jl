@@ -103,8 +103,9 @@ _server_exc(status::AbstractString, msg::AbstractString) =
 
 # The worker failures a request moves on to the next replica for: the model is not there (NOT_FOUND:
 # unloaded since discovery) or the worker cannot serve right now (UNAVAILABLE: shutting down, its
-# dispatch loop died, the model not resident there, or the call failed in the transport). Every other
-# status is the request's own outcome and would only repeat on another replica.
+# dispatch loop died, the model not resident there or not placeable on its device now, or the call
+# failed in the transport). Every other status is the request's own outcome and would only repeat on
+# another replica.
 _fails_over(status::AbstractString) = status == STATUS_NOT_FOUND || status == STATUS_UNAVAILABLE
 
 _is_cancelled(cancelled) = cancelled !== nothing && (

@@ -55,7 +55,8 @@ const FREE_WAIT_SECONDS = 0.05
 
 Raised when a model cannot be placed on the device: either it cannot fit even with every
 evictable model gone, or eviction and compaction together could not make room. Carries the
-reason and a memory report for the log.
+reason and a memory report for the log. The transport answers a request that meets it with
+`UNAVAILABLE`: the model cannot be placed on this worker now, and another replica may have room.
 """
 struct AdmissionError <: Exception
     model::String

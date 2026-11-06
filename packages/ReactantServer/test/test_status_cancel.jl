@@ -72,6 +72,8 @@ _sc_until(f; timeout = 5.0) = timedwait(f, timeout; pollint = 0.01) === :ok
     # Not resident under externally-managed residency: another replica may hold it. Never
     # FAILED_PRECONDITION, which a client reads as a stale shared-memory registration.
     @test code(_SC.NotResidentError("m")) == _SCStatus.UNAVAILABLE
+    # A model this worker cannot place on its device now (MEM-3): a replica with room may serve it.
+    @test code(_SC.AdmissionError("m", "does not fit")) == _SCStatus.UNAVAILABLE
     @test code(_SC.ModelNotFoundError("m")) == _SCStatus.NOT_FOUND
     @test code(_SC.ModelNotFoundError("m", "model 'm' was unloaded")) == _SCStatus.NOT_FOUND
     # The reload path's rejection of a request whose model was replaced in preprocess is retryable
