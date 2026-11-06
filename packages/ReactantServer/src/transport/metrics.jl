@@ -112,7 +112,7 @@ function Prometheus.collect!(metrics::Vector, c::AdmissionCollector)
         metrics,
         _scalar(
             "worker_inflight_requests", "gauge",
-            "RPCs currently being handled (counted only when the cap is enabled).", c.inflight[]
+            "RPCs admitted and still being handled.", c.inflight[]
         ),
         _scalar(
             "worker_requests_shed_total", "counter",

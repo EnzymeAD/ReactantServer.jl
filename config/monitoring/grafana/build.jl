@@ -592,7 +592,7 @@ function models()
             q(top("sum by (model) (rate(worker_compute_seconds_total{%W,%M}%ri)) / (sum by (model) (rate(worker_dispatch_total{%W,%M}%ri)) > 0)", "worker_compute_seconds_total"); legend = "{{model}}");
             unit = "s", links = model_links()
         ),
-        ts("Requests in flight by worker", q("sum by (worker) (worker_inflight_requests{%W})"; legend = "{{worker}}"); desc = "Counted only when the worker's concurrency cap is on."),
+        ts("Requests in flight by worker", q("sum by (worker) (worker_inflight_requests{%W})"; legend = "{{worker}}"); desc = "RPCs of any method that each worker has admitted and is still handling."),
     )
 
     row!(b, "Batching")

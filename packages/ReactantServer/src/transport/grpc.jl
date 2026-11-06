@@ -490,6 +490,12 @@ function _model_infer_rpc(ctx, body)
     end
 end
 
+# What the worker passes gRPCServer as `max_concurrent_requests` for `endpoints.max_concurrent_requests`
+# = `cap` (0 = uncapped). gRPCServer's own uncapped forms (`nothing`, 0) also stop it counting the
+# calls in flight, which `worker_inflight_requests` reads, so an uncapped worker passes a cap that
+# cannot be reached instead: no call is shed and the count stays live (WRK-16).
+_admission_limit(cap::Integer) = cap > 0 ? Int(cap) : typemax(Int)
+
 function build_grpc_server(
         sched::Scheduler, registry::ModelRegistry, platform::AbstractString,
         shm::SharedMemoryRegistry, host::AbstractString, port::Integer, ctx::InferContext;
@@ -504,7 +510,7 @@ function build_grpc_server(
         context = ctx,
         max_receive_message_length = max_recv_msg_bytes,
         max_send_message_length = max_send_msg_bytes,
-        max_concurrent_requests = (max_concurrent_requests > 0 ? max_concurrent_requests : nothing),
+        max_concurrent_requests = _admission_limit(max_concurrent_requests),
         h2_initial_window_size = h2_initial_window_size,
         h2_connection_window_size = h2_connection_window_size
     )

@@ -1858,7 +1858,7 @@
         "type": "prometheus",
         "uid": "${ds}"
       },
-      "description": "Counted only when the worker's concurrency cap is on.",
+      "description": "RPCs of any method that each worker has admitted and is still handling.",
       "fieldConfig": {
         "defaults": {
           "color": {
