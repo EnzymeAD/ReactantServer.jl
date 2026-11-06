@@ -30,8 +30,9 @@ end
 
 # The node's global.grpc dict, or an empty dict when absent/malformed. Workers pick this block up
 # directly through their own config (it deep-merges via `global:`); the supervisor reads it here only
-# to mirror the message-size limits into the embedded gateway's REACTANT_GATEWAY_GRPC_* env, so one
-# node-level `global.grpc` block configures the workers and the gateway alike.
+# to mirror its settings (message-size limits, error detail, Rapid-Reset protection) into the
+# embedded gateway's REACTANT_GATEWAY_GRPC_* env, so one node-level `global.grpc` block configures
+# the workers and the gateway alike.
 function _node_grpc(node::AbstractDict)
     g = get(node, "global", nothing)
     g isa AbstractDict || return Dict{String, Any}()
@@ -59,6 +60,45 @@ function _node_grpc_error_detail(node::AbstractDict)
     (v isa AbstractString && lowercase(strip(v)) in ("redacted", "full")) ||
         throw(ArgumentError("node config 'global.grpc.error_detail' must be \"redacted\" or \"full\", got $(repr(v))"))
     return lowercase(strip(String(v)))
+end
+
+# The node-wide HTTP/2 Rapid-Reset switch (GW-18, GW-19): `REACTANT_RAPID_RESET_PROTECTION` from the
+# supervisor's environment, else `global.grpc.rapid_reset_protection` from the node file, else
+# nothing (unset, so every child keeps its own default, off). The environment wins over the file, as
+# `REACTANT_GPUS` and `REACTANT_ROLE` do over their keys, and an empty value counts as unset. Unlike
+# the children's own boolean overrides, which read any unrecognized value as false, a value that is
+# not a boolean is refused: a typo must not silently leave a security setting off.
+const NODE_RAPID_RESET_ENV = "REACTANT_RAPID_RESET_PROTECTION"
+
+function _node_rapid_reset_protection(node::Union{AbstractDict, Nothing}, env::AbstractDict)
+    v = lowercase(strip(get(env, NODE_RAPID_RESET_ENV, "")))
+    if !isempty(v)
+        v in ("1", "true", "yes", "on") && return true
+        v in ("0", "false", "no", "off") && return false
+        throw(ConfigError("$NODE_RAPID_RESET_ENV must be true or false, got $(repr(env[NODE_RAPID_RESET_ENV]))"))
+    end
+    node === nothing && return nothing
+    gc = _node_grpc(node)
+    haskey(gc, "rapid_reset_protection") || return nothing
+    b = gc["rapid_reset_protection"]
+    b isa Bool ||
+        throw(ConfigError("node config 'global.grpc.rapid_reset_protection' must be true or false, got $(repr(b))"))
+    return b
+end
+
+# Record the node-wide value as `global.grpc.rapid_reset_protection` in the node file the workers
+# read. Each worker merges its own entry over `global:`, so the value reaches every worker the
+# supervisor launches while a worker's own `grpc.rapid_reset_protection` still wins. (Passing it as
+# INFERENCE_SERVER_GRPC_RAPID_RESET_PROTECTION instead would override that per-worker value.)
+function _set_node_rapid_reset!(node::AbstractDict, value::Bool)
+    g = get(node, "global", nothing)
+    g === nothing && (g = node["global"] = Dict{String, Any}())
+    g isa AbstractDict || throw(ConfigError("node config 'global' must be a mapping"))
+    gc = get(g, "grpc", nothing)
+    gc === nothing && (gc = g["grpc"] = Dict{String, Any}())
+    gc isa AbstractDict || throw(ConfigError("node config 'global.grpc' must be a mapping"))
+    gc["rapid_reset_protection"] = value
+    return node
 end
 
 # Write the materialized (workers synthesized, devices assigned) node file where children and
@@ -153,8 +193,12 @@ function build_supervisor(
     notes = String[]
     gw_path = _resolve_gateway_path(gateway_path, env)
 
+    # One node-level setting turns HTTP/2 Rapid-Reset protection on or off for every child launched
+    # here: the workers through the node file they read, the gateway through its environment.
+    rapid_reset = _node_rapid_reset_protection(node, env)
+
     if r === :gateway
-        push!(specs, gateway_spec(children; gateway_path = gw_path))
+        push!(specs, gateway_spec(children; gateway_path = gw_path, rapid_reset_protection = rapid_reset))
     else
         devices = detect_gpus(env; node = node)
         if isempty(devices) && _node_backend(node) != "cpu"
@@ -163,6 +207,7 @@ function build_supervisor(
         cpu_workers = parse(Int, get(env, "REACTANT_CPU_WORKERS", "1"))
         selectors = materialize_node!(node, devices; cpu_workers = cpu_workers)
         validate_node(node)
+        rapid_reset === nothing || _set_node_rapid_reset!(node, rapid_reset)
         length(devices) > length(selectors) &&
             push!(notes, "node file defines $(length(selectors)) worker(s); $(length(devices) - length(selectors)) visible device(s) left unused")
         node_file = _write_materialized(node, runtime_dir)
@@ -215,7 +260,8 @@ function build_supervisor(
                     worker_names = gw_path === nothing ? String[_worker_name(w) for w in ws] : nothing,
                     grpc_max_recv = gw_path === nothing ? _node_grpc_bytes(node, "max_recv_msg_bytes") : nothing,
                     grpc_max_send = gw_path === nothing ? _node_grpc_bytes(node, "max_send_msg_bytes") : nothing,
-                    grpc_error_detail = gw_path === nothing ? _node_grpc_error_detail(node) : nothing
+                    grpc_error_detail = gw_path === nothing ? _node_grpc_error_detail(node) : nothing,
+                    rapid_reset_protection = rapid_reset
                 )
             )
         end

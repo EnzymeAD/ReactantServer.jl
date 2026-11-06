@@ -104,7 +104,8 @@ export JULIA_LOAD_PATH="$WORK/prefs:@:@v#.#:@stdlib"
 # deployment's workers. This lists what the supervisor would otherwise synthesize: worker i on
 # BASE_PORT + i, with metrics on METRICS_BASE_PORT + i. Every node this script starts gets one.
 # A gateway file owns its gRPC settings (the supervisor mirrors the node's global.grpc only into an
-# env-configured gateway), so it also states the node's `grpc.error_detail` (argument 2).
+# env-configured gateway, except rapid_reset_protection, which also reaches a file that does not set
+# it), so it also states the node's `grpc.error_detail` (argument 2).
 write_gateway_config() {
     cat > "$1" << EOF
 listen:

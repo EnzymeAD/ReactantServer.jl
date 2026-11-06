@@ -66,3 +66,7 @@ global:
   # grpc:
   #   max_recv_msg_bytes: 536870912   # 512 MiB
   #   max_send_msg_bytes: 536870912
+  #   # HTTP/2 Rapid-Reset protection for the gateway and every worker at once (default false, or
+  #   # REACTANT_RAPID_RESET_PROTECTION on the container). On, a client is disconnected after about
+  #   # 200 calls it gave up on per connection; see the Node Configuration page of the docs.
+  #   rapid_reset_protection: false

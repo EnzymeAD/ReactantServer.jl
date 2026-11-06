@@ -217,6 +217,9 @@ The embedded gateway child. With no `gateway_path`, the gateway runs from defaul
 synthesized into `REACTANT_GATEWAY_WORKERS`, and `metrics_endpoints` (the workers' metrics
 addresses) into `REACTANT_GATEWAY_WORKER_METRICS`, so the gateway's /metrics aggregates every
 worker's export. A mounted gateway.yml wins: it is passed through and no endpoint env is set.
+The node-wide `rapid_reset_protection` is the exception: it is synthesized into
+`REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION` with or without a mounted file, unless that variable
+is already set or the file sets `grpc.rapid_reset_protection` itself.
 """
 function gateway_spec(
         children::Union{AbstractString, ChildEnvironment};
@@ -227,6 +230,7 @@ function gateway_spec(
         grpc_max_recv::Union{Integer, Nothing} = nothing,
         grpc_max_send::Union{Integer, Nothing} = nothing,
         grpc_error_detail::Union{AbstractString, Nothing} = nothing,
+        rapid_reset_protection::Union{Bool, Nothing} = nothing,
         grace_seconds::Real = 10.0,
         drain_seconds::Real = PUBLIC_DRAIN_SECONDS
     )
@@ -267,6 +271,16 @@ function gateway_spec(
         grpc_error_detail === nothing || haskey(ENV, "REACTANT_GATEWAY_GRPC_ERROR_DETAIL") ||
             push!(pairs, "REACTANT_GATEWAY_GRPC_ERROR_DETAIL" => String(grpc_error_detail))
     end
+    # The node-wide Rapid-Reset switch (global.grpc.rapid_reset_protection, or
+    # REACTANT_RAPID_RESET_PROTECTION on the supervisor). Unlike the settings above it also reaches a
+    # gateway run from a mounted gateway.yml, since it is meant to cover the whole node at once, but
+    # only when that file does not set grpc.rapid_reset_protection itself: the gateway's environment
+    # wins over its file, so the variable would silently override what the operator wrote there. An
+    # explicit env value wins too.
+    rapid_reset_protection === nothing ||
+        haskey(ENV, "REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION") ||
+        _gateway_file_sets(gateway_path, "grpc", "rapid_reset_protection") ||
+        push!(pairs, "REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION" => string(rapid_reset_protection))
     _push_drain!(pairs, drain_seconds)
     isempty(pairs) || (cmd = addenv(cmd, pairs...))
     return ChildSpec("gateway", cmd, Float64(grace_seconds), Float64(drain_seconds), _GATEWAY_STAGE)
@@ -293,6 +307,23 @@ function worker_metrics_endpoints(node::AbstractDict; host::AbstractString = "12
     mbp = get(node, "metrics_base_port", nothing)
     mbp isa Integer || return String[]
     return String["$host:$(Int(mbp) + i - 1)" for i in 1:length(_node_workers(node))]
+end
+
+# Whether the gateway file at `path` sets the key at the nested `keys`. A file the supervisor cannot
+# read or parse counts as setting it, so nothing is synthesized over it; the gateway reports the
+# file's problem itself.
+function _gateway_file_sets(path::Union{AbstractString, Nothing}, keys::AbstractString...)
+    path === nothing && return false
+    raw = try
+        YAML.load_file(path; dicttype = Dict{String, Any})
+    catch
+        return true
+    end
+    for k in keys
+        (raw isa AbstractDict && haskey(raw, k)) || return false
+        raw = raw[k]
+    end
+    return true
 end
 
 # The gateway's listen ports (for the worker-port collision warning): defaults 8001/8002,

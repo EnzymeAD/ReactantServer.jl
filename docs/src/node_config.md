@@ -91,7 +91,7 @@ global:
     max_recv_msg_bytes: 536870912  # 512 MiB; max inbound gRPC message
     max_send_msg_bytes: 536870912  # 512 MiB; max outbound gRPC message
     error_detail: redacted     # what an INTERNAL error tells clients: redacted | full
-    rapid_reset_protection: false  # true: HTTP/2 Rapid-Reset cut-off on the listener; see below
+    rapid_reset_protection: false  # true: HTTP/2 Rapid-Reset cut-off, gateway too; see below
 ```
 
 Each sub-block corresponds to a typed config struct ([`RuntimeConfig`](@ref),
@@ -217,13 +217,10 @@ them in an error message can misread the call's status. The per-component overri
 `INFERENCE_SERVER_GRPC_ERROR_DETAIL` (a worker) and `REACTANT_GATEWAY_GRPC_ERROR_DETAIL` (the
 gateway).
 
-`grpc.rapid_reset_protection` (default `false`; environment
-`INFERENCE_SERVER_GRPC_RAPID_RESET_PROTECTION`) switches on the Rapid-Reset (CVE-2023-44487)
-protection of the HTTP/2 server a worker listens with, as the gateway's key of the same name does
-for the gateway; [Gateway configuration](#Gateway-configuration) describes what it does to clients
-that give up on calls. With it off, the default, no client is disconnected for giving up on calls,
-and what bounds a client that resets streams is `endpoints.max_concurrent_requests`, past which
-calls are shed with `RESOURCE_EXHAUSTED` (nothing bounds it when that is 0).
+`global.grpc.rapid_reset_protection` (default `false`) switches on HTTP/2 Rapid-Reset protection
+for every worker and the embedded gateway at once; see
+[Rapid-Reset protection](#Rapid-Reset-protection) for what that does to clients, the matching
+environment variable, and which setting wins.
 
 `scheduler.discipline` selects the dispatch policy: `fair` (the default), `fifo`, or `edf`. Workers
 behind a gateway in `lpt_packing` mode must run `fifo` or `edf`. [Scheduling](scheduling.md)
@@ -332,27 +329,64 @@ endpoints:                        # worker host:port addresses, across any numbe
 ```
 
 `grpc.rapid_reset_protection` (default `false`; environment
-`REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION`) switches on the Rapid-Reset (CVE-2023-44487)
-protection of the HTTP/2 server the gateway listens with. With it on, a client connection may
-have 100 streams open at once, and the gateway ends the connection
-(`GOAWAY(ENHANCE_YOUR_CALM)`) once the client has reset more than 200 streams over the
-connection's life. A client resets a stream every time it gives up on a call (its deadline
-passes, or it cancels), so **a client that gives up on calls is disconnected after about 200
-give-ups per connection**, however long the connection has been up. gRPCClient-based clients,
-`ReactantServerClient` among them, can then hang on every call to the gateway until the call's
-deadline, for up to about two minutes, if their first calls on the new connection are give-ups
-as well (libcurl waits for that connection to answer before using it, and it never does). With
-it off, the default, no client is disconnected for giving up on calls, and what bounds a client
-that resets streams is the inbound cap, `max_concurrent_requests_per_worker` times the worker
-count, past which calls are shed with `RESOURCE_EXHAUSTED` (nothing bounds it when that is 0).
-Turn it on only for a gateway that untrusted clients can reach, and only if the clients that
-depend on it can tolerate being cut off as described.
+`REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION`) switches on the gateway's HTTP/2 Rapid-Reset
+protection. Under the supervisor the node-wide setting also reaches a gateway run from a mounted
+`gateway.yml` that does not set this key; see [Rapid-Reset protection](#Rapid-Reset-protection).
 
 The gateway is also configured by `REACTANT_GATEWAY_*` environment overrides
 (`REACTANT_GATEWAY_WORKERS` replaces the endpoint list, comma separated). The embedded gateway
 under the supervisor is launched from defaults plus those synthesized environment variables, so
 a single node needs no `gateway.yml` at all. See [Multi-GPU Gateway](gateway.md) for the
 scheduling modes, the runtime control plane, and the lpt_packing-specific knobs.
+
+## Rapid-Reset protection
+
+HTTP/2 Rapid-Reset (CVE-2023-44487) protection is off by default on every worker and on the
+gateway. With it on, a client connection may have 100 streams open at once, and the server ends
+the connection (`GOAWAY(ENHANCE_YOUR_CALM)`) once the client has reset more than 200 streams over
+the connection's life. A client resets a stream every time it gives up on a call (its deadline
+passes, or it cancels), so **a client that gives up on calls is disconnected after about 200
+give-ups per connection**, however long the connection has been up. gRPCClient-based clients,
+`ReactantServerClient` among them, can then hang on every call to that server until the call's
+deadline, for up to about two minutes, if their first calls on the new connection are give-ups
+as well (libcurl waits for that connection to answer before using it, and it never does). The
+gateway is such a client of each worker: every call it forwards that reaches its deadline resets a
+stream on its connection to that worker, so protection on the workers can cut the gateway off the
+same way. With it off, no client is disconnected for giving up on calls, and what bounds a client
+that resets streams is the server's inbound cap, past which calls are shed with
+`RESOURCE_EXHAUSTED`: `endpoints.max_concurrent_requests` on a worker, and
+`grpc.max_concurrent_requests_per_worker` times the worker count on the gateway. Nothing bounds it
+where that cap is 0. Turn the protection on only where untrusted clients can connect, and only if
+the clients that depend on the node can tolerate being cut off as described.
+
+On a node, one setting turns it on or off for the gateway and every worker:
+
+```yaml
+global:
+  grpc:
+    rapid_reset_protection: true
+```
+
+or, without editing the node file, `REACTANT_RAPID_RESET_PROTECTION=true` on the node container.
+The supervisor reads that variable; it accepts `true`, `false`, `1`, `0`, `yes`, `no`, `on` and
+`off`, refuses anything else at startup, and wins over the node file. The supervisor hands the
+value to every worker it launches through the node file they read, and to the embedded gateway as
+`REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION`, in the `all`, `workers` and `gateway` roles alike. A
+value set for one component still wins over it. For each component, the first of these that is
+set decides:
+
+- **A worker:** `INFERENCE_SERVER_GRPC_RAPID_RESET_PROTECTION`, then `grpc.rapid_reset_protection`
+  in that worker's own `workers:` entry, then `REACTANT_RAPID_RESET_PROTECTION`, then
+  `global.grpc.rapid_reset_protection`; otherwise off.
+- **The embedded gateway:** `REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION`, then
+  `grpc.rapid_reset_protection` in a mounted `gateway.yml`, then `REACTANT_RAPID_RESET_PROTECTION`,
+  then `global.grpc.rapid_reset_protection`; otherwise off. Unlike the message sizes and
+  `error_detail`, which a mounted `gateway.yml` owns whether or not it sets them, the node-wide
+  value reaches a gateway run from a mounted file that does not set this key.
+
+A worker or gateway run without the supervisor has only its own settings: a worker reads its node
+file's `global.grpc` and its own entry, with `INFERENCE_SERVER_GRPC_RAPID_RESET_PROTECTION` over
+both, and a gateway its `gateway.yml`, with `REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION` over it.
 
 ## Environment overrides
 

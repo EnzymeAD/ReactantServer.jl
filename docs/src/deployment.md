@@ -74,7 +74,11 @@ replicated on every GPU unless the gateway's `lpt_packing` mode places it on few
 `REACTANT_NODE_FILE`. On a host without GPUs, `REACTANT_GPUS=0` with `backend: cpu` makes a CPU
 node, and `REACTANT_CPU_WORKERS` sets its worker count. `REACTANT_ROLE` selects what the
 supervisor runs: the default `all`, or only the `workers` or only the `gateway`, for splitting a
-node across machines.
+node across machines. `REACTANT_RAPID_RESET_PROTECTION=true` turns HTTP/2 Rapid-Reset protection on
+for the gateway and every worker the supervisor launches, and overrides
+`global.grpc.rapid_reset_protection` in the node file. It is off by default. When it is on, a client
+is disconnected after about 200 calls it gave up on per connection; see
+[Rapid-Reset protection](node_config.md#Rapid-Reset-protection).
 
 ### Stopping
 

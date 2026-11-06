@@ -38,11 +38,14 @@ following before exposing any endpoint:
   set it in `global.grpc`, which the supervisor mirrors into the embedded gateway. An environment
   override wins over the YAML value, so also set or clear `INFERENCE_SERVER_GRPC_MAX_RECV_MSG_BYTES`
   (workers) and `REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES` (gateway).
-- **The gateway's HTTP/2 Rapid-Reset protection is off by default.** That protection disconnects a
-  client once it has reset more than 200 streams on a connection, which every client that gives up
-  on calls eventually does, and gRPCClient-based clients can then hang until their deadline. The
-  gateway therefore lets a connection reset any number of streams, and bounds a client that resets
-  them with its inbound cap (`grpc.max_concurrent_requests_per_worker`, past which calls are shed
-  with `RESOURCE_EXHAUSTED`). Where untrusted clients can reach the gateway, keep that cap above 0,
-  or set `grpc.rapid_reset_protection: true` and accept the cut-off. See
-  [Node Configuration](node_config.md).
+- **HTTP/2 Rapid-Reset protection is off by default, on the workers and the gateway.** That
+  protection disconnects a client once it has reset more than 200 streams on a connection, which
+  every client that gives up on calls eventually does, and gRPCClient-based clients can then hang
+  until their deadline. A connection may therefore reset any number of streams, and what bounds a
+  client that resets them is the inbound cap, past which calls are shed with `RESOURCE_EXHAUSTED`
+  (`endpoints.max_concurrent_requests` on a worker, `grpc.max_concurrent_requests_per_worker` on
+  the gateway). Where untrusted clients can connect, keep those caps above 0, or turn the
+  protection on and accept the cut-off: on a node, `global.grpc.rapid_reset_protection: true` (or
+  `REACTANT_RAPID_RESET_PROTECTION=true` on the node container) turns it on for every worker and
+  the embedded gateway at once. See [Rapid-Reset protection](node_config.md#Rapid-Reset-protection)
+  for which setting wins.
