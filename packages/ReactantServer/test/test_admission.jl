@@ -391,3 +391,39 @@ end
     @test cache.admission_failures == 0
     @test cache.loads > 10 && cache.evicts > 0
 end
+
+# ── MEM-3: a model that cannot be placed is refused, rolled back, and not retried until something
+# that could make it fit changes ──────────────────────────────────────────────────────────────────
+
+# Claim `size` bytes at offset `off` that no model owns and no eviction frees (a buffer awaiting its
+# finalizer, say), carving them out of the free block that holds them. `_frag_unhold!` frees them.
+function _frag_hold!(b::FragBackend, off::Int, size::Int)
+    k = findfirst(((o, s),) -> o <= off && off + size <= o + s, b.free)
+    o, s = b.free[k]
+    deleteat!(b.free, k)
+    off + size < o + s && insert!(b.free, k, (off + size, o + s - off - size))
+    off > o && insert!(b.free, k, (o, off - o))
+    return (off, size)
+end
+_frag_unhold!(b::FragBackend, h) = _frag_release!(b, h...)
+
+_in_lru(sched, name) = name in sched.weight_cache.lru
+
+@testset "admission: a model that cannot fit beside memory no eviction frees is refused before evicting (MEM-3)" begin
+    b = FragBackend(32 * _KiB)
+    hold = _frag_hold!(b, 0, 8 * _KiB)
+    sched = _frag_scheduler(b, _frag_entry(b, "A"; kib = [4]), _frag_entry(b, "m"; kib = [4, 4, 4, 4], scratch = 10 * _KiB))
+    cache = sched.weight_cache
+    cache.serving = true              # startup still judges feasibility by the device-pinned models alone
+    m = sched.registry.by_name["m"]
+    _frag_load!(sched, "A")
+    sched.registry.by_name["A"].executable.host_weights = Any[zeros(Float32, _KiB)]
+    # By bytes alone m fits: 16 KiB of weights and 11 KiB of scratch in 32 KiB. Beside the 8 KiB
+    # held it cannot, which the allocator's own statistics show before anything is evicted.
+    @test_throws ReactantServer.AdmissionError _frag_load!(sched, "m")
+    @test _resident(sched, "A")
+    @test cache.fallback_compactions == 0
+    @test !_resident(sched, "m") && !_in_lru(sched, "m")
+    @test b.refusals == 0
+    @test cache.admission_failures == 1
+end

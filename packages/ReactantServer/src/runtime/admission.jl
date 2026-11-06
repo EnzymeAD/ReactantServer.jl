@@ -7,7 +7,10 @@
 # The steps, for model m with weight bytes W, largest weight tensor wmax and scratch S:
 #
 #   0. Feasibility: m cannot fit even with every evictable model gone. Reject at once rather
-#      than evicting everything first.
+#      than evicting everything first. What stays is measured, not assumed: the allocator's bytes
+#      in use less what the evictable models hold (each one's in-use growth at its upload), so the
+#      device-pinned weights at their allocated size count, and so does any other buffer no
+#      eviction frees.
 #   A. Make room for the weights: free bytes >= W + the scratch the resident set needs, the
 #      largest free block >= W, and the operator's byte budget. Evict the cheapest covering set
 #      for a byte deficit; evict the cheapest single model when only contiguity is short.
@@ -161,6 +164,22 @@ function _pinned_floor(cache::WeightCache)
     return bytes, scratch
 end
 
+# Device bytes no eviction can free, measured: what the allocator holds less what the evictable
+# (resident on-demand) models hold. The device-pinned weights at their allocated size count, and so
+# does any buffer the weight cache does not own, such as one awaiting its finalizer. Read on the
+# dispatch loop, where no program runs meanwhile, so no execution's scratch is counted.
+function _unevictable_bytes(cache::WeightCache, stats)
+    held = 0
+    for name in cache.lru
+        fp = get(cache.footprints, name, nothing)
+        fp === nothing && (fp = model_footprint(cache, cache.registry.by_name[name]))
+        held += evictable_bytes(fp)
+    end
+    return max(stats.in_use - held, 0)
+end
+
+_fmt_bytes(n) = n === nothing ? "unknown" : Base.format_bytes(n)
+
 # Fill the cache's victim search with every resident on-demand model except `exclude`, in LRU order
 # (front first, so cost ties evict the least recently used).
 function _fill_candidates!(cache::WeightCache, exclude::String, now::Float64)
@@ -230,13 +249,21 @@ function admit_weights!(cache::WeightCache, entry::ModelEntry; staged = nothing)
     fp = model_footprint(cache, entry)
     stats = device_memory_stats(cache.backend, cache.pool)
 
-    # 0. Feasibility: the device-pinned floor is all that can never be evicted.
+    # 0. Feasibility: only the memory no eviction frees stays. A serving worker measures it. At
+    # startup, where a failed admission stops the worker (the probe loads each model in turn), it
+    # stays judged by the device-pinned models alone, as before measuring.
     if stats !== nothing
         pinned_bytes, pinned_scratch = _pinned_floor(cache)
-        need = fp.weight_bytes + pinned_bytes + max(_scratch_of(cache, fp), pinned_scratch)
+        held = cache.serving ? max(_unevictable_bytes(cache, stats), pinned_bytes) : pinned_bytes
+        need = fp.weight_bytes + held + max(_scratch_of(cache, fp), pinned_scratch)
         if need > stats.limit
             cache.admission_failures += 1
-            throw(AdmissionError(entry.name, "needs $(Base.format_bytes(need)) with the device-pinned models, the device allows $(Base.format_bytes(stats.limit))"))
+            throw(
+                AdmissionError(
+                    entry.name, "needs $(_fmt_bytes(need)) with the device-pinned models and other memory no " *
+                        "eviction frees ($(_fmt_bytes(held))), the device allows $(_fmt_bytes(stats.limit))"
+                )
+            )
         end
     end
 

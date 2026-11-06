@@ -356,10 +356,14 @@ function _upload_commit!(cache::WeightCache, entry::ModelEntry; fresh::Bool = tr
     timing = LoadTiming()
     t0 = time()
     bufs = _device_buffers(cache, entry, model; staged = staged, timing = timing)
+    after = _memory_point(cache)
     # End to end: a staged load read its weights earlier, off the dispatch loop.
     dt = time() - t0 + (staged === nothing ? 0.0 : staged.host_seconds)
     upload = timing.upload > 0 ? timing.upload : dt - something(timing.read, 0.0)
     lock(cache.lock) do
+        # Only this loop allocates on the device, so the growth in use is this upload's.
+        (before === nothing || after === nothing) ||
+            (fp.device_bytes = max(after.in_use - before.in_use, fp.weight_bytes))
         model.weights = bufs
         push!(cache.lru, entry.name)
         cache.resident_bytes += model.nbytes
@@ -381,7 +385,7 @@ function _upload_commit!(cache::WeightCache, entry::ModelEntry; fresh::Bool = tr
             fp.priority = fp.prio_base + _priority_gain(cache, fp)
         end
     end
-    log_memory_event(:load, entry.name, fp, before, _memory_point(cache))
+    log_memory_event(:load, entry.name, fp, before, after)
     log_residency_change(
         entry.name, :system, :device, model.nbytes;
         memory = memory_report(cache.backend, cache.pool; registry = cache.registry, weight_cache = cache)

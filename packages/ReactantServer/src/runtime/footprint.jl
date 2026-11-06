@@ -37,6 +37,10 @@ mutable struct ModelFootprint
     reads::Int                  # of `loads`, those that read the weights file
     prio_base::Float64          # the inflation L at the model's last use; its priority is L + its gain
     evicts::Int                 # observability: times admission evicted the model from the device
+    # What the allocator held for the weights at the last upload: its in-use growth, never taken as
+    # less than `weight_bytes` (0 = never measured). It exceeds `weight_bytes` when the split rule
+    # gave a tensor a whole chunk, and it is what evicting the model gives back.
+    device_bytes::Int
 end
 
 """
@@ -75,8 +79,12 @@ function _new_footprint(entry::ModelEntry, model::LoadedModel)
     w = sizes === nothing ? (weight_bytes = model.nbytes, max_weight_bytes = model.nbytes) :
         weight_footprint(sizes)
     tensors = sizes === nothing ? Int[model.nbytes] : Int[_alloc_rounded(n) for n in sizes]
-    return ModelFootprint(model, w.weight_bytes, w.max_weight_bytes, 0, 0.0, 0, 0, 0, 0.0, 0.0, tensors, 0.0, 0.0, 0, 0.0, 0)
+    return ModelFootprint(model, w.weight_bytes, w.max_weight_bytes, 0, 0.0, 0, 0, 0, 0.0, 0.0, tensors, 0.0, 0.0, 0, 0.0, 0, 0)
 end
+
+# The bytes evicting the model gives back to the allocator: measured at its last upload, else its
+# rounded weight bytes.
+evictable_bytes(fp::ModelFootprint) = max(fp.device_bytes, fp.weight_bytes)
 
 # XLA's BFC allocator splits a free chunk for a request only when the chunk is at least twice the
 # request or the remainder would be at least 128 MiB (its default max_internal_fragmentation_bytes);

@@ -245,10 +245,14 @@ uploads because a refused device allocation is slow to discover: XLA's allocator
 10 seconds for memory to be released before it reports one.
 
 1. **Feasibility.** A model that cannot fit even with every evictable model gone (weights
-   plus the device-pinned models plus scratch exceed the device) is rejected at once,
-   without evicting anything, and the requests for it fail. That holds on a serving worker.
-   At startup the worker loads its on-demand models one at a time to measure them (except
-   under `model_control_mode: explicit`), and a model that fails this check there stops the
+   plus scratch plus the memory no eviction frees exceed the device) is rejected at once,
+   without evicting anything, and on a serving worker the requests for it fail with
+   `UNAVAILABLE`. A serving worker measures the memory no eviction frees: the allocator's
+   bytes in use less what the evictable models hold, so the device-pinned models count at
+   their allocated size, and so does any other buffer the weight cache does not own. At
+   startup the check counts the device-pinned models' weights alone. The worker loads its
+   on-demand models one at a time there to measure them (except
+   under `model_control_mode: explicit`), and a model that fails this check stops the
    worker from starting: under the node supervisor it restarts into the same failure, and
    none of its models serve until the bundle is removed. A hot load of such a model in
    `dynamic` mode fails too, and the watcher retries it every second poll, recompiling it
