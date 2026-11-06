@@ -148,8 +148,21 @@ function _shm_back!(fd::Cint, offset::Integer, len::Integer, name::AbstractStrin
     throw(SystemError("posix_fallocate of shared memory '$name'", rc))
 end
 
-# The current size of `fd`'s object.
-_fstat_size(fd::ShmFd) = Int(stat(RawFD(fd.fd)).size)
+# The current size of `fd`'s object, and whether one fstat proves every page of it allocated, so that
+# a touch anywhere inside it needs no new page. tmpfs counts an object's allocated pages, swapped ones
+# included, in st_blocks (512-byte units); blocks equal to the size rounded up to whole pages leave
+# no room for a hole. Only pages past the end can hide one, and tmpfs keeps those only when a client
+# allocates there on purpose (fallocate with FALLOC_FL_KEEP_SIZE) or in a huge page straddling the
+# end; even then they must match the holes exactly. A dense object in huge pages has more blocks
+# than that and is not proven dense, which costs the caller speed, not safety. Linux only; elsewhere
+# it never proves density.
+function _fstat_size_dense(fd::ShmFd)
+    st = stat(RawFD(fd.fd))
+    size = Int(st.size)
+    Sys.islinux() || return size, false
+    page = _page_size()
+    return size, Int(st.blocks) * 512 == cld(size, page) * page
+end
 
 """
     shm_open_existing(key) -> (fd::ShmFd, ptr::Ptr{UInt8}, len::Int, identity::ShmIdentity)

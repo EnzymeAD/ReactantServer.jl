@@ -545,7 +545,9 @@ _bk_ctl(region, at, t) = Dict(
     ReactantServer.start!(sched)
     page = Int(ccall(:getpagesize, Cint, ()))
     key = _test_shm_key()
-    cfd, cptr, _ = _RSCore.shm_create_exclusive(key, 2 * page)
+    # A third page past the registered window: the object's pages all exist, as a
+    # ReactantServerClient pool's do, until the test frees this one.
+    cfd, cptr, _ = _RSCore.shm_create_exclusive(key, 3 * page)
     full = nothing
     y() = [unsafe_load(Ptr{Float32}(cptr + page), i) for i in 1:2]
     word() = unsafe_load(Ptr{UInt64}(cptr + page + 64))
@@ -559,6 +561,16 @@ _bk_ctl(region, at, t) = Dict(
         unsafe_store!(Ptr{UInt64}(cptr + page), UInt64(0))
 
         _RSCore._SHM_FALLOCATE[] = (fd, off, len) -> Libc.ENOSPC
+        if Sys.islinux()
+            # fstat proves every page there, so the worker allocates none and a full /dev/shm
+            # (simulated) does not matter.
+            @test _sc_call(ctx, _bk_body("r", 0, page)) isa Vector{UInt8}
+            @test y() == Float32[2, 6]
+            unsafe_store!(Ptr{UInt64}(cptr + page), UInt64(0))
+            # A page freed anywhere in the object, even outside the window, and every copy allocates
+            # again. Nothing below touches page 2.
+            @test ccall(:fallocate, Cint, (Cint, Cint, Int64, Int64), cfd.fd, 0x03, 2 * page, page) == 0
+        end
         @test _sc_code(_sc_call(ctx, _bk_body("r", 0, nothing))) == _SCStatus.RESOURCE_EXHAUSTED
         err = _sc_call(ctx, _bk_body("r", nothing, page))
         @test _sc_code(err) == _SCStatus.RESOURCE_EXHAUSTED
@@ -576,7 +588,7 @@ _bk_ctl(region, at, t) = Dict(
         full === nothing || (_RSCore._SHM_FALLOCATE[] = full)
         ReactantServer.shutdown!(sched)
         ReactantServer.shm_teardown!(ctx.shm)
-        _RSCore._shm_munmap(cptr, 2 * page)
+        _RSCore._shm_munmap(cptr, 3 * page)
         close(cfd)
         ccall(:shm_unlink, Cint, (Cstring,), key)
     end

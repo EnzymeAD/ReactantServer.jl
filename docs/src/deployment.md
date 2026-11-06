@@ -178,7 +178,8 @@ when it creates the pool: on a `/dev/shm` without room for it the client sends i
 (`shared_memory = :auto`, the default) or fails (`:on`), and retries shared memory in the
 background (see [the client](client.md)). A worker allocates the pages of a client's region before
 it reads inputs from or writes outputs into them (other KServe and Triton clients may leave a
-region's pages unallocated), and fails the request with `RESOURCE_EXHAUSTED` when there is no
+region's pages unallocated), unless `fstat` shows every page of the object allocated already, as
+for a `ReactantServerClient` pool, and fails the request with `RESOURCE_EXHAUSTED` when there is no
 room. Shared weights are allocated in full when a worker creates their region, and a model whose
 copy does not fit gets a private copy instead ([On-demand Weights](on_demand_weights.md)). A full
 `/dev/shm` therefore costs the shared-memory transport, requests, or shared weights rather than a

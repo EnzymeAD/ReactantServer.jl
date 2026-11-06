@@ -380,13 +380,17 @@ end
 # Make a touch through `r`'s mapping of bytes [start, start + len) of the object (absolute offsets,
 # inside the mapping) safe from SIGBUS (CORE-4): the object must still cover the range, and the
 # range's pages must exist. Throws ShmRegionShrunkError or ShmSpaceError. Caller holds `r.lock` with
-# `r.attached`. Costs an fstat and a posix_fallocate, which walks an already allocated range in
-# about an eighth of the time copying it takes (17 µs against 130 µs per MiB, measured on tmpfs).
+# `r.attached`. One fstat answers both when it proves the whole object dense, which a
+# ReactantServerClient pool is from creation. Otherwise (an object sized but never fully written, or
+# with a hole anywhere, even outside the range) posix_fallocate allocates the range's pages; it walks
+# even an already allocated range, in about an eighth of the time copying it takes (17 µs against
+# 130 µs per MiB, measured on tmpfs). Neither closes the race with a client that shrinks the object
+# or frees its pages after the check (docs/src/security.md).
 function _ensure_backed(r::ShmRegion, start::Int, len::Int)
     len > 0 || return nothing
-    size = _fstat_size(r.fd)
+    size, dense = _fstat_size_dense(r.fd)
     start + len <= size || throw(ShmRegionShrunkError(r.name, r.key, size, start + len))
-    _shm_back!(r.fd.fd, start, len, r.name)
+    dense || _shm_back!(r.fd.fd, start, len, r.name)
     return nothing
 end
 

@@ -134,6 +134,10 @@ end
 const _BK_SEQ = Ref(0)
 _bk_key() = string("/rsbk-", string(getpid(); base = 36), "-", _BK_SEQ[] += 1)
 
+# Free the pages of [off, off + len) of an object, as a client can after registering it
+# (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE). Linux only.
+_bk_punch(fd, off, len) = ccall(:fallocate, Cint, (Cint, Cint, Int64, Int64), fd, 0x03, off, len)
+
 # The child scripts below print `TAG result` for each access: `OK`, or the name of the exception.
 const _BK_PROBE = """
 using ReactantServerCore
@@ -151,7 +155,7 @@ end
 const PAGE = Int(ccall(:getpagesize, Cint, ()))
 """
 
-@testset "a region's pages are checked and allocated before every copy (CORE-4)" begin
+@testset "a region's pages are checked before every copy, and allocated unless fstat proves them (CORE-4)" begin
     page = Int(ccall(:getpagesize, Cint, ()))
     key = _bk_key()
     cfd, cptr, _ = _BK.shm_create_exclusive(key, 4 * page)
@@ -163,6 +167,26 @@ const PAGE = Int(ccall(:getpagesize, Cint, ()))
         _BK.shm_register!(reg, "w", key, page, 3 * page)
         r = _BK.shm_regions(reg)["w"]
         asked = Tuple{Int, Int}[]
+        if Sys.islinux()
+            # Every page of the object exists (shm_create_exclusive allocates them, as a
+            # ReactantServerClient pool does), which one fstat proves, so no copy or control word
+            # asks for pages; not even a full /dev/shm (simulated) is consulted.
+            @test _BK._fstat_size_dense(r.fd) == (4 * page, true)
+            _BK._SHM_FALLOCATE[] = (fd, off, len) -> (push!(asked, (Int(off), Int(len))); Libc.ENOSPC)
+            _BK.shm_write!(reg, "w", 100, fill(0x05, 50))
+            @test _BK.shm_read(reg, "w", 100, 50) == fill(0x05, 50)
+            t0 = UInt64(12344)
+            unsafe_store!(Ptr{UInt64}(cptr + 3 * page), _BK.slot_word(_BK.SLOT_OWNED, t0))
+            c0 = _BK.SlotControl(r, 2 * page, t0)
+            @test !_BK.slot_control_cancelled(c0)
+            _BK.shm_write_controlled!(c0, [(fill(0x06, 10), 0, 10)], "m")
+            @test unsafe_load(Ptr{UInt64}(cptr + 3 * page)) == _BK.slot_word(_BK.SLOT_DONE, t0)
+            @test isempty(asked)
+            # A hole anywhere in the object, here outside the window, and every copy allocates again.
+            # Nothing below touches page 0, so it stays a hole.
+            @test _bk_punch(cfd.fd, 0, page) == 0
+            @test _BK._fstat_size_dense(r.fd) == (4 * page, false)
+        end
         _BK._SHM_FALLOCATE[] = (fd, off, len) -> (push!(asked, (Int(off), Int(len))); Cint(0))
         _BK.shm_write!(reg, "w", 100, fill(0x07, 50))
         @test _BK.shm_read(reg, "w", 100, 50) == fill(0x07, 50)
