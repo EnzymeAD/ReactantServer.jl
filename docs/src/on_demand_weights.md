@@ -170,6 +170,11 @@ worker are read ahead at a time, oldest request first; a third waits for a free 
 being read on the loop that runs the GPU. The worker never reads a weights file on that loop: a
 read there would hold the GPU idle for every model for as long as the disk takes. If a background
 read fails, the requests waiting for it get the error, and the next request starts a fresh read.
+A model read ahead keeps its slot only while it has requests to transfer the weights for. When the
+model's turn ends without the transfer (its requests failed before it, were cancelled, timed out or
+passed their deadline) and nothing more is queued for it, or the model is unloaded or reloaded, the
+worker lets go of what it read and the slot passes to the next model; a model with requests still
+queued keeps it for them.
 Workers on the same node read different models at once; two workers wanting the same model share
 one read.
 
