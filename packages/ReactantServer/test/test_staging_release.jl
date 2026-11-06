@@ -72,6 +72,7 @@ end
 
 # Control ops for `_run_control`. Defined here, before any test starts a dispatch loop: the loop runs
 # an op in the world it was started in, which a closure written inside a testset is newer than.
+_sr_load_op(e) = sch -> ReactantServer.acquire!(sch.weight_cache, e)
 _sr_unload_op(name) = sch -> ReactantServer._evict_entry!(sch, name)
 _sr_reload_op(e) = sch -> (ReactantServer._evict_entry!(sch, e.name); ReactantServer._admit_entry!(sch, e))
 
@@ -156,6 +157,33 @@ end
             foreach(g -> notify(g.gate), gws)
             ReactantServer.shutdown!(sched)
         end
+    end
+end
+
+@testset "staging slots: a read that lands after its model's requests were served is dropped" begin
+    # Something other than the model's own dispatch loaded it while its read ran (a compaction told
+    # to reload it, say), its request was served, and it was evicted again before the read landed.
+    # What the read holds then has no request to upload it for.
+    gw = GatedWeights()
+    A = _st_entry("A", CountingWeights())
+    B = _st_entry("B", gw)
+    sched = _sr_scheduler(A, B)
+    try
+        @test _st_infer(sched, "A") == _ST_OUT
+        gw.armed = true
+        tB = Threads.@spawn _sr_infer(sched, "B", 1.0f0)
+        wait(gw.started)                                        # B's read is held
+        gw.armed = false
+        ReactantServer._run_control(sched, _sr_load_op(B))
+        @test fetch(tB) == _ST_OUT
+        @test _st_infer(sched, "A") == _ST_OUT                  # evicts B again
+        @test B.executable.weights === nothing
+        notify(gw.gate)
+        @test _sr_until(() -> lock(() -> B.sched.stage_task === nothing, sched.cond))
+        @test B.sched.host_stage === :none && B.sched.staged === nothing
+    finally
+        notify(gw.gate)
+        ReactantServer.shutdown!(sched)
     end
 end
 

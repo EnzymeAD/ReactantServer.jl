@@ -1150,6 +1150,15 @@ end
 # is `:pending`: it waits for a slot rather than reading on the dispatch loop. Its requests wait for
 # the read either way; on the loop they would also hold up every other model's.
 #
+# A model is `:staged` only while it has requests queued or its dispatch is running, so the slot it
+# holds always comes back. A read that lands for a model with nothing queued is dropped (`_run_stage!`).
+# Every dispatch ends in `_release_idle_stage!` (see `execute_and_record!`): one that uploaded has
+# nothing staged left, and one whose requests all failed before the upload, or were dropped at their
+# deadline, withdrawn or cancelled, releases the read once nothing more is queued. Unloading the model
+# (`_evict_entry!`) or stopping the worker (`_reject_pending_locked!`) releases it as well. A slot
+# kept past that would be kept for good, and with every slot gone each cold model would wait
+# `:pending` forever.
+#
 # This runs after every pass of the dispatch loop and on every submission, so whatever left a queued
 # model off the device (an eviction, a compaction, a residency change) has marked it before the next
 # selection.
@@ -1203,7 +1212,10 @@ end
 
 # The background read for one model. On success the model waits, staged, for its dispatch; if it
 # was unloaded, loaded some other way, or the read failed, the read is dropped and the dispatch
-# loads the model itself. Either way the loop is woken to reconsider it.
+# loads the model itself. It is dropped too when nothing is queued for the model any more, as
+# happens when something else loaded the model while the read ran (a compaction told to reload it)
+# and the model then served its requests and was evicted again: held for a dispatch that never comes,
+# the read would keep its slot for good. Either way the loop is woken to reconsider it.
 function _run_stage!(s::Scheduler, entry::ModelEntry)
     wc = s.weight_cache::WeightCache
     staged = nothing
@@ -1218,7 +1230,8 @@ function _run_stage!(s::Scheduler, entry::ModelEntry)
     lock(s.cond) do
         st = entry.sched
         live = s.running && get(s.registry.by_name, entry.name, nothing) === entry
-        if staged !== nothing && live && st.host_stage === :staging && entry.executable.weights === nothing
+        if staged !== nothing && live && st.host_stage === :staging && entry.executable.weights === nothing &&
+                !isempty(st.queue)
             st.staged = staged
             st.host_stage = :staged
         else
