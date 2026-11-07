@@ -15,6 +15,10 @@ Base.length(io::_TestIO) = io.n
 ReactantServerClient.item_input_bytes(io::_TestIO) = io.ipb
 ReactantServerClient.output_specs(io::_TestIO) = io.specs
 
+# A model type of the caller's own that reports a max batch size below 1 (CLI-4).
+struct _ZeroBatchModel <: AbstractInferenceModel end
+ReactantServerClient.max_batch_size(::_ZeroBatchModel) = 0
+
 # Build an InferParameter the way the wire carries shared-memory pointers.
 _strp(s) = inference.InferParameter(parameter_choice = OneOf(:string_param, String(s)))
 _intp(i) = inference.InferParameter(parameter_choice = OneOf(:int64_param, Int64(i)))
@@ -565,6 +569,44 @@ end
         io = _TestIO(10, 5000, OutputSpec[])                           # input alone exceeds pool
         @test_throws ErrorException ReactantServerClient._chunk_geometry(io, m, p)
         @test_throws ErrorException ReactantServerClient._chunk_size(io, m, p)
+    end
+
+    @testset "max_batch_size must be at least 1 (CLI-4)" begin
+        # describe_model reports 0 for a meta model and when the limit is unknown. Passed through,
+        # it used to build a model whose drivers never finished: a chunk size below 1 never
+        # advances, and every step sent another empty request.
+        for bad in (0, -1)
+            err = try
+                KServeModel("grpc://h:1", "x"; max_batch_size = bad)
+                nothing
+            catch e
+                e
+            end
+            @test err isa ArgumentError
+            @test err isa ArgumentError && occursin("max_batch_size", err.msg) &&
+                occursin("describe_model", err.msg) && occursin("meta model", err.msg)
+            @test_throws ArgumentError KServeModel("h", 1, "x"; max_batch_size = bad)
+            @test_throws ArgumentError ReactantServerClient.BatchIterator(10, bad)
+        end
+        @test KServeModel("grpc://h:1", "x"; max_batch_size = 1).max_batch_size == 1
+        @test collect(ReactantServerClient.BatchIterator(5, 2)) == [1:2, 3:4, 5:5]
+        @test isempty(collect(ReactantServerClient.BatchIterator(0, 2)))
+
+        # A model type of the caller's own that reports a size below 1 is refused before any chunk
+        # is sized.
+        p = InferenceBufferPool(4096; n_slots = 4, use_shm = false)
+        @test_throws ArgumentError ReactantServerClient._chunk_geometry(_TestIO(10, 16, OutputSpec[]), _ZeroBatchModel(), p)
+
+        # Nor can a negative per-item output size (an OutputSpec with a negative dimension) make the
+        # chunk size 0 on a shared-memory pool, where outputs share the slot with the inputs.
+        shm = InferenceBufferPool(4096; n_slots = 4, use_shm = true, name = "rsc_cli4_pool")
+        try
+            m = KServeModel("grpc://h:1", "x"; max_batch_size = 8)
+            io = _TestIO(10, 16, [OutputSpec("y", Float32, [-8])])    # -32 output bytes per item
+            @test_throws ErrorException ReactantServerClient._chunk_geometry(io, m, shm)
+        finally
+            rm(shm.pool.backing)
+        end
     end
 
     @testset "acquire_slot! forwards span through InferenceBufferPool" begin

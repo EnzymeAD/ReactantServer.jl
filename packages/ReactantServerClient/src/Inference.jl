@@ -259,6 +259,12 @@ function _chunk_geometry(io::AbstractInferenceIO, m::AbstractInferenceModel, poo
     # Shared-memory outputs are staged in the same slot as inputs, so they consume slot space.
     # Inline outputs travel in the gRPC response, not the slot, so they cost nothing here.
     opb = is_shm_backed(pool) ? item_output_bytes(io) : 0
+    # A negative output size could make the chunk size 0, which never advances (CLI-4).
+    opb >= 0 || error(
+        "item_output_bytes($(typeof(io))) returned $opb: an OutputSpec in output_specs has a " *
+            "negative per-item dimension. An output with a variable axis cannot be sized ahead of " *
+            "time; leave it out of output_specs and it comes back inline",
+    )
     per_item = ipb + opb
     span = cld(per_item, slot_bytes(pool))
     span <= n_slots(pool) || error(
@@ -266,7 +272,11 @@ function _chunk_geometry(io::AbstractInferenceIO, m::AbstractInferenceModel, poo
             "$(slot_bytes(pool)) bytes, but the pool has only $(n_slots(pool)) slots " *
             "($(sizeof(pool)) bytes total); increase pool_bytes on kserve_init",
     )
-    chunk = min(max_batch_size(m), (span * slot_bytes(pool)) ÷ per_item)
+    # KServeModel refuses a size below 1 when it is built; this covers other model types. With it,
+    # the chunk is at least 1: span * slot_bytes >= per_item > 0.
+    mbs = max_batch_size(m)
+    mbs >= 1 || throw(ArgumentError("max_batch_size($(typeof(m))) returned $mbs; it must be at least 1"))
+    chunk = min(mbs, (span * slot_bytes(pool)) ÷ per_item)
     return chunk, span
 end
 

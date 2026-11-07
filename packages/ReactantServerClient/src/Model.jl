@@ -127,6 +127,22 @@ RetryPolicy(;
     Float64(min_budget), jitter, retry_unavailable
 )
 
+# `max_batch_size` is the most items one request carries, so it must be at least 1: the drivers cut
+# a dataset into chunks of that size, and a size below 1 never advances (CLI-4). `describe_model`
+# reports 0 for a meta model and when the limit is unknown, so its value cannot be passed through
+# unchecked.
+function _check_max_batch_size(n)
+    n >= 1 && return nothing
+    throw(
+        ArgumentError(
+            "max_batch_size must be at least 1 (the most items one request carries), got $n. " *
+                "describe_model reports a max_batch_size of 0 for a meta model and when the server " *
+                "does not know the limit, so do not pass that value through: pass the largest of the " *
+                "description's batch_sizes, or 1 when it lists none."
+        )
+    )
+end
+
 """
     KServeModel(host, port, model_name; secure=false, max_batch_size=1, deadline=10.0, ...)
     KServeModel(url, model_name; max_batch_size=1, deadline=10.0, ...)
@@ -134,7 +150,9 @@ RetryPolicy(;
 A handle to one model served by a KServe V2 gRPC endpoint (a `ReactantServer` worker or the
 gateway). The second form parses a `url` of the form `grpc://host:port` (or `host:port`);
 `grpcs`/`https` selects a secure channel. `max_batch_size` caps how many items the batched
-[`infer_async`](@ref) / [`infer_sync`](@ref) drivers coalesce per request; `deadline` is the
+[`infer_async`](@ref) / [`infer_sync`](@ref) drivers coalesce per request, and must be at least 1
+(an `ArgumentError` otherwise; [`describe_model`](@ref) reports 0 for a meta model and when the
+limit is unknown, so do not pass its value through unchanged); `deadline` is the
 per-request timeout in seconds. `max_send_message_length` / `max_receive_message_length`
 bound a single gRPC message; each defaults to 512 MiB (matching the worker and gateway), or the
 `REACTANT_CLIENT_GRPC_MAX_SEND_MSG_BYTES` / `REACTANT_CLIENT_GRPC_MAX_RECV_MSG_BYTES` environment
@@ -191,6 +209,7 @@ struct KServeModel <: AbstractInferenceModel
             retry = RetryPolicy(),
             grpc = gRPCClient.grpc_global_handle(),
         )
+        _check_max_batch_size(max_batch_size)
         shared_memory in (:auto, :on, :off) ||
             throw(ArgumentError("shared_memory must be :auto, :on, or :off, got $(repr(shared_memory))"))
         reason = _shm_unsupported[]

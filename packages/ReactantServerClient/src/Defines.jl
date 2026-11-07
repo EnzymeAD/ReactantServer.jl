@@ -2,11 +2,17 @@
 # its reverse) is shared from ReactantServerCore; only the batch iterator lives here.
 
 # For batched inference: yield successive UnitRanges of at most `max_batch_size` items covering
-# 1:n. Allocation-free.
+# 1:n. Allocation-free. A size below 1 would never advance, yielding empty ranges forever, so it is
+# refused (CLI-4).
 struct BatchIterator
     n::Int
     max_batch_size::Int
-    BatchIterator(n, max_batch_size) = new(Int(n), Int(max_batch_size))
+    function BatchIterator(n, max_batch_size)
+        max_batch_size >= 1 || throw(
+            ArgumentError("BatchIterator: max_batch_size must be at least 1, got $max_batch_size")
+        )
+        return new(Int(n), Int(max_batch_size))
+    end
 end
 
 function Base.iterate(it::BatchIterator, a::Int = 1)
