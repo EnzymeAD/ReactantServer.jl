@@ -315,6 +315,8 @@ worker_client:
   request_timeout_seconds: 60
   max_concurrent_streams: 32      # outbound in-flight RPCs the gateway multiplexes to one worker
                                   # (inference and the rest; the health probes have their own)
+  route_retention_seconds: 600    # how long a worker that is unreachable or not ready keeps its
+                                  # routes, so its models are UNAVAILABLE rather than NOT_FOUND
 logging:
   level: "info"
   format: "json"

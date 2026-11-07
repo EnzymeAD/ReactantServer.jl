@@ -17,7 +17,9 @@ that serves the model. On a multi-worker node it also serves the node's merged m
   `endpoints:` in its own `gateway.yml` and queries each worker's `RepositoryIndex` RPC (every
   10s) to learn which models it currently serves. The discovered model-to-workers routing table
   is rebuilt and swapped in atomically on each probe, so a control-plane pin/unpin or a worker
-  restart flips routing on the next probe.
+  restart flips routing on the next probe. A worker that does not answer keeps the routes it last
+  reported for a while (see [Operational notes](#Operational-notes)), so a slow answer or a
+  restart does not turn its models into `NotFound`.
 - **Replica scheduling:** a model served by more than one worker is load-balanced across those
   workers, either uniformly (`round_robin`, the default) or by packing each model onto a fixed,
   operator-configured number of GPUs with coalescing-aware routing (`lpt_packing`); see
@@ -563,11 +565,18 @@ returning whether it reported ready.
   V2 gRPC endpoint during a gateway outage, so a client can fall back to addressing a worker
   directly.
 - The routing table is rebuilt every 10s from each worker's `RepositoryIndex` and swapped in
-  atomically. If a worker dies, its routes persist until the next successful probe (up to ~10s);
-  in the gap, requests to its models fail over to the remaining replicas (on `NotFound`,
-  `Unavailable`, or a transport failure; see [Status codes and failover](#Status-codes-and-failover)),
-  and a model with no live replica returns `NotFound`. The worker-side readiness
-  probe (`ServerReady`, same 10s loop) drives `/readyz` and the `gateway_worker_ready` metric.
+  atomically. A worker's answer replaces its routes, so a model it no longer lists is dropped at
+  once; a call that does not answer (it times out, is refused, or fails) changes nothing, and the
+  worker keeps the routes it last reported. While the readiness probe (`ServerReady`, same 10s
+  loop, which also drives `/readyz` and the `gateway_worker_ready` metric) finds a worker
+  unreachable or not ready, its own answers are not taken, and its models are routed to the ready
+  workers that serve them; a model that only workers in that state serve is still routed to them,
+  so its requests fail over or come back `Unavailable`, which clients retry, rather than
+  `NotFound`. A worker that stays out for `worker_client.route_retention_seconds` (default 600, the
+  time a restart takes to load and compile its models with room to spare; 0 drops its routes at its
+  first missed round) loses its routes, and a model nobody else serves becomes `NotFound`. A model
+  no worker has ever reported is `NotFound` at once. Rebuilding the table keeps each model's
+  round-robin position.
 - Under `lpt_packing`, the gateway polls the workers on every 10s probe round to refresh routing
   metadata and accumulate consumed compute, but recomputes the placement only once the fleet has
   consumed `scheduling.rebalance_compute_seconds` GPU-seconds (the first repack uses

@@ -8,11 +8,11 @@
 #   * a worker reports a routed model is gone (NOT_FOUND)             -> request_refresh! (async,
 #     fire-and-forget; we are already failing over / returning the error).
 #
-# Both reuse the prober's `discover_routes` + atomic `swap_table!`. Refreshes are single-flight
-# (concurrent callers coalesce onto one in-flight scan) and rate-limited by `min_interval`, so a
-# flood of requests for a genuinely-absent model cannot storm the workers. Full-table swaps are
-# atomic, so a refresher scan racing the prober's scan is safe (last writer wins, both reflect
-# near-current ground truth).
+# Both reuse the prober's `discover_routes!`, which records the answers and swaps the table in
+# atomically. Refreshes are single-flight (concurrent callers coalesce onto one in-flight scan) and
+# rate-limited by `min_interval`, so a flood of requests for a genuinely-absent model cannot storm the
+# workers. A refresher scan racing the prober's scan is safe: both record their answers and build the
+# table under the routes' lock, so the table always reflects the answers recorded so far.
 
 const REFRESH_MIN_INTERVAL_SECONDS = 1.0
 
@@ -33,14 +33,13 @@ RouteRefresher(
 ) =
     RouteRefresher(pool, routes, metrics, ReentrantLock(), nothing, 0.0, Float64(min_interval), 0)
 
-# Spawn a discovery scan. The caller must hold `r.lock`. The scan runs `discover_routes`, swaps the
-# fresh table in, and (always, even on failure) stamps `last_refresh`, bumps the counter, and clears
-# `inflight` so a failed scan never wedges the refresher.
+# Spawn a discovery scan. The caller must hold `r.lock`. The scan runs `discover_routes!`, which
+# swaps the fresh table in, and (always, even on failure) stamps `last_refresh`, bumps the counter,
+# and clears `inflight` so a failed scan never wedges the refresher.
 function _spawn_scan!(r::RouteRefresher)
     t = @async begin
         try
-            table = discover_routes(r.pool)
-            swap_table!(r.routes, table)
+            table = discover_routes!(r.routes, r.pool)
             set_routing_size!(r.metrics, nmodels(table))
         catch e
             @warn "refresh: route discovery failed" exception = e
