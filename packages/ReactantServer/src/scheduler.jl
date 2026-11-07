@@ -97,6 +97,35 @@ function release_meta_gate!(g::MetaGate)
 end
 
 """
+    DISPATCH_STALL_SECONDS
+
+The default of how long the dispatch loop may go without progress, with work in hand, before the
+worker reports itself not live (and not ready): 600 s. A dispatch, a weight upload, a compaction
+or a control command is one unit of work, and a legitimate one can take seconds to minutes (a large
+model read from slow storage, a dynamic-mode compile), so the default is well beyond that and twenty
+times the default request timeout (`scheduler.dispatch_timeout_seconds`, 30 s): a loop that has
+finished nothing for that long while requests wait serves nobody.
+`REACTANT_LIVENESS_DISPATCH_STALL_SECONDS` sets it (`0` turns the check off); the node supervisor
+passes its `liveness.dispatch_stall_seconds`.
+"""
+const DISPATCH_STALL_SECONDS = 600.0
+
+# Whether the dispatch loop is making progress. The loop stamps `since` when it takes up work and
+# again after each unit of work it finishes, and clears it (0) while it waits with nothing to do, so
+# `since` is the last sign of progress while it holds work. Read without the scheduler lock (which a
+# stuck loop may hold) by the liveness and readiness checks, through `dispatch_stalled`.
+mutable struct DispatchProgress
+    const since::Threads.Atomic{Float64}
+    const reported::Threads.Atomic{Bool}   # the current stall has been logged
+    stall_seconds::Float64                 # no progress this long with work in hand is a stall; 0 = never
+end
+DispatchProgress(stall_seconds::Real = DISPATCH_STALL_SECONDS) =
+    DispatchProgress(Threads.Atomic{Float64}(0.0), Threads.Atomic{Bool}(false), Float64(stall_seconds))
+
+_mark_progress!(p::DispatchProgress) = (p.since[] = time(); p.reported[] = false; nothing)
+_mark_idle!(p::DispatchProgress) = (p.since[] = 0.0; p.reported[] = false; nothing)
+
+"""
     Scheduler
 
 The weighted-fair, coalescing dispatch engine. Concurrent
@@ -137,6 +166,7 @@ mutable struct Scheduler
     on_failure::Any                            # `f(err)` run once if the dispatch loop dies, or nothing
     vfloor::Float64                            # virtual time of the most recent fair dispatch; never
     # decreases (see `_select_fair!`); guarded by `cond`
+    progress::DispatchProgress                 # the dispatch loop's last progress (see `dispatch_stalled`)
 end
 
 function Scheduler(registry::ModelRegistry, backend::AbstractBackend, pool::MemoryPool, cfg::SchedulerConfig)
@@ -144,7 +174,7 @@ function Scheduler(registry::ModelRegistry, backend::AbstractBackend, pool::Memo
         registry, backend, pool, cfg,
         Threads.Condition(), false, nothing, nothing, nothing, ControlCommand[],
         MetaGate(1), QueuedRequest[], 0, nothing, ReentrantLock(), Dict{String, Any}(),
-        nothing, nothing, 0.0
+        nothing, nothing, 0.0, DispatchProgress()
     )
 end
 
@@ -1076,13 +1106,35 @@ _unavailable(s::Scheduler) = WorkerUnavailableError(
     dispatch_alive(scheduler) -> Bool
 
 Whether the dispatch loop can still serve: `false` once it has died with an unexpected error
-(the worker then reports not live and not ready, and rejects every request with `UNAVAILABLE`).
+(the worker then reports not live and not ready, and rejects every request with `UNAVAILABLE`),
+and `false` while it is stalled (`dispatch_stalled`), which ServerLive, ServerReady,
+ModelReady, `/healthz` and `/readyz` all report until it makes progress again.
 """
 function dispatch_alive(s::Scheduler)
     s.failure === nothing || return false
     t = s.task
     # A loop task that ended while the scheduler still runs died some way the guard did not see.
-    return !(s.running && t !== nothing && istaskdone(t))
+    s.running && t !== nothing && istaskdone(t) && return false
+    return !dispatch_stalled(s)
+end
+
+"""
+    dispatch_stalled(scheduler; now=time()) -> Bool
+
+Whether the dispatch loop holds work (a dispatch, a control command, or more requests queued
+behind the one it finished) and has made no progress for longer than its stall limit
+(`DISPATCH_STALL_SECONDS` by default): stuck in a GPU call that never returns, say, while
+the threads that answer health checks are still free. An idle loop is never stalled, however long
+it waits. Lock-free, so a loop stuck while holding the scheduler lock cannot block it.
+"""
+function dispatch_stalled(s::Scheduler; now::Real = time())
+    p = s.progress
+    p.stall_seconds > 0 || return false
+    t = p.since[]
+    (t > 0 && now - t > p.stall_seconds) || return false
+    Threads.atomic_cas!(p.reported, false, true) ||
+        @error "the dispatch loop has made no progress for $(round(now - t; digits = 1))s with work in hand; reporting this worker not live and not ready until it does" stall_seconds = p.stall_seconds
+    return true
 end
 
 # Build zero-filled executable inputs at batch size `sz` (0 = unbatched) and input-shape `variant`
@@ -1556,12 +1608,15 @@ function _dispatch_loop(s::Scheduler)
     while true
         cmds, chosen = lock(s.cond) do
             while s.running && isempty(s.control) && !_has_queued(s)
+                _mark_idle!(s.progress)   # nothing to do: waiting is not a stall
                 wait(s.cond)
             end
             if !s.running
+                _mark_idle!(s.progress)
                 _reject_pending_locked!(s)
                 return (ControlCommand[], nothing)
             end
+            _mark_progress!(s.progress)   # work in hand: progress is measured from here
             # Drain control commands first; defer selecting a dispatch to the next iteration so
             # residency transitions take effect before the dispatch that may depend on them.
             if !isempty(s.control)
@@ -1579,6 +1634,7 @@ function _dispatch_loop(s::Scheduler)
             catch e
                 put!(c.reply, e)
             end
+            _mark_progress!(s.progress)
         end
         (isempty(cmds) && chosen === nothing) && break
         if chosen !== nothing
@@ -1590,7 +1646,9 @@ function _dispatch_loop(s::Scheduler)
                 @error "a dispatch failed outside its execution; failing its requests" model = chosen.entry.name exception = (err, catch_backtrace())
                 _fail_unanswered!(chosen.taken, err)
             end
+            _mark_progress!(s.progress)
             _maybe_compact!(s)
+            _mark_progress!(s.progress)
         end
         # A residency change or a compaction can leave queued models off the device.
         lock(() -> _kick_staging!(s), s.cond)
