@@ -115,24 +115,45 @@ or recreated (CORE-11). Low frequency on purpose: a check is one `shm_open` and 
 const SHM_REAP_INTERVAL_SECONDS = 60.0
 
 """
-    SharedMemoryRegistry(; reap_interval = SHM_REAP_INTERVAL_SECONDS)
+    SharedMemoryRegistry(; reap_interval = SHM_REAP_INTERVAL_SECONDS,
+                           reserved_prefixes = [SHARED_WEIGHT_PREFIX])
 
 The registry of client shared-memory regions. Once something is registered, a timer re-checks
 every `reap_interval` seconds that each registration's object still exists under its key and drops
 those that do not (see [`shm_reap!`](@ref)); `shm_teardown!` stops it. A non-positive
 interval disables the timer (registrations still sweep).
+
+A key named `<prefix>-...` for any of `reserved_prefixes` is never registered (WRK-9): by default
+that covers the regions and lock files of the node's shared host-weight store
+([`SharedWeightStore`](@ref), `/dev/shm/rsw-...`), which a client could otherwise register and
+point an output at, writing into the weights every worker on the node serves.
 """
 struct SharedMemoryRegistry
     regions::Dict{String, ShmRegion}
     lock::ReentrantLock
     reap_interval::Float64
     reaper::Base.RefValue{Union{Nothing, Timer}}
+    reserved_prefixes::Vector{String}
 end
-SharedMemoryRegistry(; reap_interval::Real = SHM_REAP_INTERVAL_SECONDS) =
-    SharedMemoryRegistry(
-    Dict{String, ShmRegion}(), ReentrantLock(), Float64(reap_interval),
-    Ref{Union{Nothing, Timer}}(nothing)
-)
+function SharedMemoryRegistry(;
+        reap_interval::Real = SHM_REAP_INTERVAL_SECONDS,
+        reserved_prefixes = [SHARED_WEIGHT_PREFIX]
+    )
+    return SharedMemoryRegistry(
+        Dict{String, ShmRegion}(), ReentrantLock(), Float64(reap_interval),
+        Ref{Union{Nothing, Timer}}(nothing), String[String(p) for p in reserved_prefixes]
+    )
+end
+
+# The reserved prefix `key` falls under, or nothing. shm_open ignores leading slashes, so
+# "rsw-x", "/rsw-x" and "//rsw-x" all name /dev/shm/rsw-x.
+function _reserved_prefix(reg::SharedMemoryRegistry, key::AbstractString)
+    name = lstrip(key, '/')
+    for p in reg.reserved_prefixes
+        startswith(name, p * "-") && return p
+    end
+    return nothing
+end
 
 # Detach our mapping of a region. Takes `r.lock`, so it waits for a copy in progress, and flips
 # `attached` so any reader blocked on the same lock bails instead of touching the munmap'd page.
@@ -168,7 +189,9 @@ and keeps that descriptor. When `name` is already registered:
 - a different object that still exists: [`ShmRegionExistsError`](@ref) (ALREADY_EXISTS), and the
   existing registration is untouched.
 
-Every registration also sweeps the registry for stale entries ([`shm_reap!`](@ref)).
+A key under one of the registry's reserved prefixes (by default the shared host-weight store's) is
+refused with an `ArgumentError` (INVALID_ARGUMENT) before it is opened. Every registration also
+sweeps the registry for stale entries ([`shm_reap!`](@ref)).
 """
 function shm_register!(
         reg::SharedMemoryRegistry, name::AbstractString, key::AbstractString,
@@ -176,6 +199,13 @@ function shm_register!(
     )
     isempty(name) && throw(ArgumentError("shared memory region name must not be empty"))
     isempty(key) && throw(ArgumentError("shared memory key must not be empty"))
+    reserved = _reserved_prefix(reg, key)
+    reserved === nothing || throw(
+        ArgumentError(
+            "shared memory key '$key' names a region of the node's shared host-weight store " *
+                "('$reserved-...'), which clients may not register"
+        )
+    )
     # Validate and narrow the untrusted sizes before any mapping exists, so an out-of-range
     # value is a clean ArgumentError rather than an InexactError after the mmap was created.
     (0 <= offset <= typemax(Int)) ||

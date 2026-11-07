@@ -1,6 +1,8 @@
 # Request intake: one client's mistake is refused, or fails, for that client alone, and never costs
-# the worker or the other clients. Through the ModelInfer handler, against the mock runtime; uses the
-# helpers of test_status_cancel.jl (_SC, _sc_entry, _sc_sched, _sc_body, _sc_call, _sc_code).
+# the worker or the other clients. Through the worker's gRPC handlers, against the mock runtime; uses
+# the helpers of test_status_cancel.jl (_SC, _sc_entry, _sc_sched, _sc_body, _sc_call, _sc_code).
+
+import InterProcessCommunication as _IK_IPC
 
 # How many times the mock program has run. Counted at file scope: the dispatch loop calls the program
 # in the world it was started in, so the function must exist before any loop starts.
@@ -124,4 +126,26 @@ end
     @test _sc_code(replies[4]) == _SCStatus.INTERNAL            # and Float64 data
     @test _IK_SHAPES == [(2, 4), (3, 4), (2, 4), (2, 4)]        # the Float64 run stopped before it
     @test entry.sched.requests_served == 4
+end
+
+@testset "registering a region of the shared host-weight store is INVALID_ARGUMENT (WRK-9)" begin
+    # A stand-in for a weight region, `/rsw-<model>-<digest>`, against the registry a worker serves
+    # with (`serve` builds it with the defaults).
+    key = "/rsw-wrk9_" * string(getpid(); base = 36) * "_" * string(rand(UInt32); base = 36) * "-0123abcd"
+    w = _IK_IPC.SharedMemory(key, 64)
+    shm = _SC.SharedMemoryRegistry(; reap_interval = 0)
+    try
+        req = _SC.inference.SystemSharedMemoryRegisterRequest(; name = "w", key = key, offset = 0, byte_size = 64)
+        err = try
+            _SC._handle_shm_register(shm, req)
+        catch e
+            e
+        end
+        @test _sc_code(err) == _SCStatus.INVALID_ARGUMENT
+        @test err isa _SC.gRPCServer.GRPCError && occursin("shared host-weight store", err.message)
+        @test isempty(_SC.shm_regions(shm))
+    finally
+        _SC.shm_teardown!(shm)
+        finalize(w)
+    end
 end

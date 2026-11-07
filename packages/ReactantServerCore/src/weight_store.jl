@@ -119,7 +119,16 @@ The default store: each worker materializes its own host copy of a model's weigh
 struct PrivateWeightStore <: WeightStore end
 
 """
-    SharedWeightStore(; mode=0o666, budget=nothing)
+    SHARED_WEIGHT_PREFIX
+
+The default name prefix of a [`SharedWeightStore`](@ref)'s regions and lock files
+(`/dev/shm/rsw-...`), the one the server uses. A [`SharedMemoryRegistry`](@ref) refuses client
+registrations of names under it by default.
+"""
+const SHARED_WEIGHT_PREFIX = "rsw"
+
+"""
+    SharedWeightStore(; mode=0o666, budget=nothing, prefix=SHARED_WEIGHT_PREFIX)
 
 Opt-in store backing each model's host weights with a node-level POSIX shared-memory region so
 same-node workers share one copy. See the file header for the flock-coordinated protocol.
@@ -130,7 +139,9 @@ but is world-writable; `0o660` is recommended for production and multi-user syst
 `budget` (bytes) caps the regions in `/dev/shm` across every worker on the node; see "Node
 budget" in the file header. `nothing` (the default) leaves them unbudgeted. `prefix` names the
 regions and lock files (`/dev/shm/<prefix>-...`); stores with different prefixes share neither
-regions nor a budget. Every worker on a node must use the same one, which the server does.
+regions nor a budget. Every worker on a node must use the same one, which the server does. A
+[`SharedMemoryRegistry`](@ref) serving clients on the same node should refuse registrations under it
+(its `reserved_prefixes`), which it does by default for `SHARED_WEIGHT_PREFIX`.
 """
 mutable struct SharedWeightStore <: WeightStore
     attached::Dict{String, NamedTuple{(:shm, :fd, :name, :lockpath), Tuple{SharedMemory, Cint, String, String}}}
@@ -140,7 +151,8 @@ mutable struct SharedWeightStore <: WeightStore
     prefix::String                # region and lock file name prefix in /dev/shm
 end
 function SharedWeightStore(;
-        mode::Integer = 0o666, budget::Union{Integer, Nothing} = nothing, prefix::AbstractString = "rsw"
+        mode::Integer = 0o666, budget::Union{Integer, Nothing} = nothing,
+        prefix::AbstractString = SHARED_WEIGHT_PREFIX
     )
     occursin(r"^[A-Za-z0-9]+$", prefix) || throw(ArgumentError("SharedWeightStore prefix must be alphanumeric, got $(repr(prefix))"))
     budget === nothing || budget >= 0 || throw(ArgumentError("SharedWeightStore budget must be non-negative, got $budget"))
