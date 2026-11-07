@@ -25,6 +25,10 @@
 #            If absent/partial, drop to a non-blocking LOCK_EX to become the creator: re-check,
 #            then (re)create, populate, msync, set READY, and downgrade to LOCK_SH. If another
 #            worker is mid-create (holds EX), spin on the fast path until it publishes READY.
+#            While it populates, the creator keeps a count of the bytes filled in the header
+#            (`_RSW_FILLED_OFFSET`), and a worker waiting for the shared lock counts each advance
+#            as progress of its own read (`note_read_progress!`), so a watcher that abandons reads
+#            with no progress tells a peer's slow fill from a stuck one.
 #   release: try to upgrade to LOCK_EX non-blocking; success means last holder, so shm_unlink the
 #            region. The lock file itself is left in place (tiny, reused). A crash auto-releases.
 #
@@ -148,6 +152,13 @@ end
 
 const _RSW_MAGIC = 0x52535701      # 'RSW' + format version 1
 const _RSW_DATA_OFFSET = 64        # header occupies the first bytes; tensor data starts here
+# Header: magic (UInt32 at 0), ready flag (UInt32 at 4), digest (UInt64 at 8), and the bytes the
+# creator has filled so far (UInt64 at 16), a progress count for waiters that no reader of a READY
+# region looks at. The rest of the header is zero. A region written before the count existed reads
+# 0 there, so its waiters see no progress, as before.
+const _RSW_FILLED_OFFSET = 16
+# How often a worker waiting for a region's shared lock checks the lock and the creator's count.
+const _FILL_POLL_SECONDS = 0.05
 const _RSW_ALIGN = 64
 
 # Linux flock / open / msync constants.
@@ -316,6 +327,63 @@ _hdr_write!(p::Ptr{UInt8}, v::T, off::Int) where {T} = unsafe_store!(convert(Ptr
 _is_ready(p::Ptr{UInt8}, digest::UInt64) =
     _hdr_read(p, UInt32, 0) == _RSW_MAGIC && _hdr_read(p, UInt32, 4) == UInt32(1) &&
     _hdr_read(p, UInt64, 8) == digest
+
+# Run the creator's `fill!(arrays)`, keeping the bytes it reads (`note_read_progress!`) counted in
+# the header at `p`, where waiting workers see them, and still counted for the read this task runs
+# under `with_read_progress`.
+function _fill_publishing!(fill!, arrays, p::Ptr{UInt8})
+    outer = _READ_PROGRESS[]
+    filled = 0
+    counter = convert(Ptr{UInt64}, p + _RSW_FILLED_OFFSET)
+    publish = function (n::Int)
+        filled += n
+        unsafe_store!(counter, UInt64(filled), :release)
+        _note_progress!(outer, n)
+        return nothing
+    end
+    with_read_progress(() -> fill!(arrays), publish)
+    return nothing
+end
+
+# The creator's count of bytes filled in region `name`, read with pread (which, unlike a touch of a
+# mapping, cannot raise SIGBUS on a region whose pages were never reserved), or nothing when the
+# region does not exist.
+function _fill_count(name::AbstractString)
+    fd = ccall(:open, Cint, (Cstring, Cint), "/dev/shm" * name, Cint(0))     # O_RDONLY
+    fd < 0 && return nothing
+    buf = Ref{UInt64}(0)
+    n = ccall(:pread, Cssize_t, (Cint, Ptr{UInt64}, Csize_t, Int64), fd, buf, Csize_t(8), Int64(_RSW_FILLED_OFFSET))
+    _close_fd(fd)
+    return n == 8 ? buf[] : nothing
+end
+
+# Take the shared lock on a region's lock file, however long it takes. A peer creating the region
+# holds the exclusive lock for its whole fill, which can take minutes for a large model on slow
+# storage; while waiting, each advance of the peer's count of bytes filled counts as progress of the
+# read this task runs (`note_read_progress!`), so the wait is not taken for a stalled read while the
+# peer's read is moving, and is when it is not (a peer stuck on storage that stopped answering, or a
+# region recreated from scratch). Polls the lock without blocking, so a waiter never pins a thread.
+function _lock_shared_following_fill(fd::Cint, name::AbstractString)
+    _try_lock_shared(fd, name) && return nothing
+    seen = something(_fill_count(name), UInt64(0))
+    while true
+        sleep(_FILL_POLL_SECONDS)
+        _try_lock_shared(fd, name) && return nothing
+        now = something(_fill_count(name), UInt64(0))
+        now > seen && note_read_progress!(Int(now - seen))
+        seen = now
+    end
+    return
+end
+
+# Take the shared lock without blocking: true when taken, false while another holds it exclusively.
+# The errno is read in the same function as the call, before anything can overwrite it.
+function _try_lock_shared(fd::Cint, name::AbstractString)
+    @ccall(flock(fd::Cint, (_LOCK_SH | _LOCK_NB)::Cint)::Cint) == 0 && return true
+    err = Libc.errno()
+    (err == Libc.EAGAIN || err == Libc.EINTR) && return false
+    throw(SystemError("locking the weight-store region $name", err))
+end
 
 """
     materialize_host_weights!(store, key, digest, specs, fill!) -> Vector{Any}
@@ -515,7 +583,7 @@ function _acquire_region(store::SharedWeightStore, key, digest::UInt64, specs, f
     try
         while true
             # Fast path: shared lock, reuse a published region (readers run concurrently).
-            _flock(fd, _LOCK_SH)
+            _lock_shared_following_fill(fd, name)
             ready = _attach_ready(name, digest, total)
             if ready !== nothing
                 shm = ready
@@ -585,8 +653,9 @@ function _acquire_region(store::SharedWeightStore, key, digest::UInt64, specs, f
                 _hdr_write!(p, _RSW_MAGIC, 0)
                 _hdr_write!(p, UInt32(0), 4)        # ready = 0 until the data is durable
                 _hdr_write!(p, digest, 8)
+                _hdr_write!(p, UInt64(0), _RSW_FILLED_OFFSET)
                 arrays = _build_arrays(shm, specs, offs)
-                fill!(arrays)
+                _fill_publishing!(fill!, arrays, p)
                 _msync(shm)
                 _hdr_write!(p, UInt32(1), 4)        # READY written last
                 _msync(shm)

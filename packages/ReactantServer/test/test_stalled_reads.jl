@@ -10,15 +10,19 @@
 const _SL_DIR = mktempdir()
 
 # Reads of the files whose descriptors are registered here wait at the file's gate, as on storage
-# that stopped answering; `_SL_SLOW` files return two bytes per read after a pause, as on storage
-# that is slow but moving.
+# that stopped answering; `_SL_SLOW` files return `bytes` per read after `pause` seconds, as on
+# storage that is slow but moving. `_SL_READS` counts the reads of each file.
 const _SL_HELD = Dict{Cint, Base.Event}()
-const _SL_SLOW = Dict{Cint, Float64}()
+const _SL_SLOW = Dict{Cint, Tuple{Float64, Int}}()
+const _SL_READS = Dict{Cint, Int}()
 const _SL_LOCK = ReentrantLock()
 const _SL_WAITING = Threads.Atomic{Int}(0)          # reads waiting at a gate now
 
 function _sl_pread(fd, ptr, n, off)
-    gate, pause = lock(() -> (get(_SL_HELD, fd, nothing), get(_SL_SLOW, fd, nothing)), _SL_LOCK)
+    gate, slow = lock(_SL_LOCK) do
+        _SL_READS[fd] = get(_SL_READS, fd, 0) + 1
+        return (get(_SL_HELD, fd, nothing), get(_SL_SLOW, fd, nothing))
+    end
     if gate !== nothing
         Threads.atomic_add!(_SL_WAITING, 1)
         try
@@ -27,14 +31,15 @@ function _sl_pread(fd, ptr, n, off)
             Threads.atomic_sub!(_SL_WAITING, 1)
         end
     end
-    if pause !== nothing
-        sleep(pause)
-        n = min(n, 2)
+    if slow !== nothing
+        sleep(slow[1])
+        n = min(n, slow[2])
     end
     return ReactantServer._pread(fd, ptr, n, off)
 end
 
 _sl_fd(e) = ReactantServer._fd(e.weights)
+_sl_reads(e) = lock(() -> get(_SL_READS, _sl_fd(e), 0), _SL_LOCK)
 
 function _sl_hold!(e)
     g = Base.Event()
@@ -59,10 +64,13 @@ function _sl_release_all!()
     return nothing
 end
 
-# A model whose single weight `_W` is in a weights file of its own, read with pread.
-function _sl_entry(name)
-    path = joinpath(_SL_DIR, "$name-$(time_ns()).safetensors")
-    SafeTensors.serialize(path, Dict("w" => copy(_W)), Dict("argument_order" => JSON3.write(["w"])))
+# A model whose single weight `_W` is in a weights file of its own, read with pread. With `path`,
+# the model opens that file again instead, as a second worker loading the same bundle does.
+function _sl_entry(name; path = nothing)
+    if path === nothing
+        path = joinpath(_SL_DIR, "$name-$(time_ns()).safetensors")
+        SafeTensors.serialize(path, Dict("w" => copy(_W)), Dict("argument_order" => JSON3.write(["w"])))
+    end
     w, id = ReactantServer.open_weights_file(path)
     sig = ReactantServer.ModelSignature(["x"], DataType[Float32], ["w"], 1, ["y"], DataType[Float32], 1)
     exec = ReactantServer.MockExecutable(args -> [args[1] .* args[2]], 1)
@@ -336,7 +344,7 @@ end
     sched = _sl_scheduler(A, B; stall = 1.0, timeout = 10.0)
     try
         @test _sl_infer(sched, "A") == _ST_OUT
-        lock(() -> (_SL_SLOW[_sl_fd(B)] = 0.3), _SL_LOCK)
+        lock(() -> (_SL_SLOW[_sl_fd(B)] = (0.3, 2)), _SL_LOCK)
         t0 = time()
         @test _sl_infer(sched, "B") == _ST_OUT
         @test time() - t0 > 1.1
@@ -388,5 +396,64 @@ end
         _sl_release_all!()
         ReactantServer._PREAD[] = old
         ReactantServer.shutdown!(sched)
+    end
+end
+
+@testset "stalled reads: waiting for a peer's fill of a shared region counts its progress; a stuck fill still stalls" begin
+    # Two workers on a node share the region of a model both want: the first fills it while holding
+    # its lock, and the second waits for the lock. A slow fill that keeps moving must not get the
+    # waiter abandoned (a large model on slow storage takes far longer than the stall limit to
+    # fill), and a fill stuck on storage that stopped answering must.
+    if !(Sys.islinux() && isdir("/dev/shm"))
+        @test_skip "shared weight store requires Linux /dev/shm"
+    else
+        Core_ = ReactantServer.ReactantServerCore
+        old = ReactantServer._PREAD[]
+        ReactantServer._PREAD[] = _sl_pread
+        prefix = "tsp" * string(getpid())
+        R = Core_._layout([(Float32, (2,))])[2]
+        A1, B1, C1 = (_sl_entry(n) for n in ("A", "B", "C"))
+        A2, B2, C2 = (_sl_entry(e.name; path = e.weights_path) for e in (A1, B1, C1))
+        store() = ReactantServer.SharedWeightStore(; budget = 8R, prefix = prefix)
+        # A 2 s limit, so that compiling the waiting path on its first use here does not count
+        # against it.
+        w1 = _sl_scheduler(A1, B1, C1; stall = 2.0, timeout = 10.0, store = store())
+        w2 = _sl_scheduler(A2, B2, C2; stall = 2.0, timeout = 10.0, store = store())
+        try
+            # Slow but moving: worker 1 reads B a byte every 0.4 s, 3.2 s in all, past the limit.
+            lock(() -> (_SL_SLOW[_sl_fd(B1)] = (0.4, 1)), _SL_LOCK)
+            t1 = Threads.@spawn _sl_infer(w1, "B")
+            # Worker 1 has read a byte of B into its region, so it is the one filling it.
+            filling() = any(r -> (@atomic r.progress.bytes) > 0, lock(() -> copy(w1.reads), w1.cond))
+            @test _sl_until(filling)
+            n2 = _sl_reads(B2)
+            t0 = time()
+            @test _sl_infer(w2, "B") == _ST_OUT             # worker 2 waited for it, and was served
+            @test time() - t0 > 2.0                         # for longer than the stall limit
+            @test fetch(t1) == _ST_OUT
+            @test _sl_reads(B2) == n2                       # from the region worker 1 filled
+            @test ReactantServer.weight_cache_metrics(w2).stalled_reads == 0
+            @test ReactantServer.weight_cache_metrics(w1).stalled_reads == 0
+            # Stuck: worker 1's read of C hangs in the middle of its fill, so worker 2, waiting for
+            # C's region, sees no progress and is abandoned like worker 1.
+            _sl_hold!(C1)
+            t1 = Threads.@spawn _sl_infer(w1, "C")
+            @test _sl_until(() -> _SL_WAITING[] == 1)
+            t0 = time()
+            @test _sl_unavailable(_sl_infer(w2, "C")) && time() - t0 < 5.0
+            @test _sl_unavailable(fetch(t1))
+            # The fill goes on: worker 1 finishes it, and both reads return and let go of the region.
+            _sl_release!(C1)
+            @test _sl_until(() -> _sl_outstanding(w1) == 0 && _sl_outstanding(w2) == 0)
+            @test _sl_infer(w2, "C") == _ST_OUT && _sl_infer(w1, "C") == _ST_OUT
+        finally
+            _sl_release_all!()
+            ReactantServer._PREAD[] = old
+            ReactantServer.shutdown!(w1)
+            ReactantServer.shutdown!(w2)
+            for f in readdir("/dev/shm"; join = true)
+                startswith(basename(f), prefix * "-") && rm(f; force = true)
+            end
+        end
     end
 end

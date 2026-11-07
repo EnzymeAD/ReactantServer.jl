@@ -356,7 +356,8 @@ request's rows always occupy the same batch slots whatever else is queued.
 model's weights into host memory may go without progress before the worker abandons it: the
 model's queued requests fail with `UNAVAILABLE`, and its read slot passes to the next model.
 Progress is bytes arriving from the weights file, so storage that is slow but moving is never cut
-off; a wait for a lock on the shared host-weight store counts as no progress.
+off; a wait for another worker filling the same shared host-weight copy counts that worker's
+progress, and any other wait on a lock counts as none.
 """
 struct SchedulerConfig
     ema_halflife_seconds::Float64

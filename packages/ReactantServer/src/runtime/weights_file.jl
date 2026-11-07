@@ -48,10 +48,10 @@ Base.getindex(w::WeightsFile, name) = read_weight(w, name)
 _fd(w::WeightsFile) = reinterpret(Cint, fd(w.io))
 
 const _ST_MAX_HEADER = 100_000_000          # the bound SafeTensors.jl enforces
-# 8 MiB per pread call. Each call is one step of a read's progress (`ReadProgress`), so the chunk
-# bounds the slowest storage a stall limit still counts as moving: 8 MiB per limit, 140 KiB/s at the
-# default 60 s. Throughput does not depend on it: a 1 GiB file in the page cache read at the same
-# 4.5 GiB/s in 64, 16 and 8 MiB calls.
+# 8 MiB per pread call. Each call is one step of a read's progress (`ReadProgress`, from
+# ReactantServerCore), so the chunk bounds the slowest storage a stall limit still counts as moving:
+# 8 MiB per limit, 140 KiB/s at the default 60 s. Throughput does not depend on it: a 1 GiB file in
+# the page cache read at the same 4.5 GiB/s in 64, 16 and 8 MiB calls.
 const _PREAD_CHUNK = 1 << 23
 
 const AXIS_ORDER_KEY = "axis_order"
@@ -64,43 +64,6 @@ function _xla_axis_order(metadata, path)
     v = metadata[AXIS_ORDER_KEY]
     v == AXIS_ORDER_XLA && return true
     throw(BundleError("$(path): unsupported weights axis_order $(repr(v)) (supported: \"$(AXIS_ORDER_XLA)\")"))
-end
-
-"""
-    ReadProgress()
-
-How far a read of weights files has got: the bytes read so far and when the last of them arrived
-(`time_ns()`). The scheduler watches the background reads it starts with one each and abandons a
-read that stops making progress (see `_check_stall!` in scheduler.jl). Every chunk a weights file
-read returns counts, through `note_read_progress!`, for the read running on that task under
-`with_read_progress`; a wait on a lock counts as none.
-"""
-mutable struct ReadProgress
-    @atomic bytes::Int
-    @atomic last_ns::Int64
-end
-ReadProgress() = ReadProgress(0, Int64(time_ns()))
-
-const _READ_PROGRESS = Base.ScopedValues.ScopedValue{Union{ReadProgress, Nothing}}(nothing)
-
-"""
-    with_read_progress(f, progress::ReadProgress)
-
-Run `f()`, counting every weights file read it makes on this task in `progress`.
-"""
-with_read_progress(f, progress::ReadProgress) = Base.ScopedValues.with(f, _READ_PROGRESS => progress)
-
-"""
-    note_read_progress!(nbytes)
-
-Count `nbytes` read for the read this task runs under `with_read_progress`, if any.
-"""
-function note_read_progress!(nbytes::Integer)
-    p = _READ_PROGRESS[]
-    p === nothing && return nothing
-    @atomic p.bytes += Int(nbytes)
-    @atomic p.last_ns = Int64(time_ns())
-    return nothing
 end
 
 # One read from a weights file: `(fd, ptr, nbytes, offset) -> (bytes read, errno)`, as pread(2) gives

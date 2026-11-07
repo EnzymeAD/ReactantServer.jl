@@ -492,3 +492,68 @@ end
         end
     end
 end
+
+@testset "SharedWeightStore: a worker waiting for a peer's fill counts the peer's progress as its own" begin
+    # A worker that wants a region a peer is creating waits for the peer's exclusive lock for the
+    # whole fill. The bytes the peer fills are counted in the region's header, and the waiter counts
+    # each advance as progress of its own read, so a watcher can tell a slow fill from a stuck one.
+    if !(Sys.islinux() && isdir("/dev/shm")) || Threads.nthreads() < 2
+        @test_skip "needs Linux /dev/shm and at least two threads"
+    else
+        prefix = "tf" * string(getpid())
+        specs = [(Float32, (1024,))]
+        R = ReactantServerCore._layout(specs)[2]
+        filler = SharedWeightStore(; budget = 4R, prefix = prefix)     # one worker...
+        waiter = SharedWeightStore(; budget = 4R, prefix = prefix)     # ...and another on the node
+        try
+            for stuck in (false, true)
+                key = stuck ? "mstuck" : "mslow"
+                dg = weights_digest(key, specs)
+                started = Base.Event()
+                go = Base.Event()
+                fill! = function (a)
+                    notify(started)
+                    if stuck
+                        wait(go)                            # storage that stopped answering
+                    else
+                        for _ in 1:12
+                            sleep(0.15)
+                            note_read_progress!(512)        # a chunk read from the weights file
+                        end
+                    end
+                    a[1] .= 7
+                    return
+                end
+                tF = Threads.@spawn acquire_cached_host_weights(filler, key, dg, specs, fill!)
+                wait(started)
+                p = ReadProgress()
+                tW = Threads.@spawn with_read_progress(p) do
+                    acquire_cached_host_weights(waiter, key, dg, specs, a -> error("the waiter must not fill"))
+                end
+                # The longest the waiter goes without progress while the peer fills, from its first
+                # (before which it may still be compiling the wait).
+                idle() = (Int64(time_ns()) - (@atomic p.last_ns)) / 1.0e9
+                worst = 0.0
+                t_end = time() + (stuck ? 1.0 : 6.0)
+                while !istaskdone(tW) && time() < t_end
+                    (@atomic p.bytes) > 0 && (worst = max(worst, idle()))
+                    sleep(0.02)
+                end
+                if stuck
+                    @test !istaskdone(tW) && (@atomic p.bytes) == 0 && idle() >= 0.9
+                    notify(go)
+                else
+                    @test (@atomic p.bytes) > 0 && worst < 0.6
+                end
+                hF = fetch(tF)
+                hW = fetch(tW)
+                @test hF isa CachedHostWeights && !hF.hit
+                @test hW isa CachedHostWeights && hW.hit && hW.arrays[1][1] == 7
+                release_cached_host_weights!(waiter, hW)
+                release_cached_host_weights!(filler, hF)
+            end
+        finally
+            _budget_cleanup(prefix)
+        end
+    end
+end

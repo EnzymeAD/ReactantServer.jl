@@ -185,12 +185,12 @@ counts the bytes it reads as they arrive, 8 MiB at a time, and one that reads no
 `scheduler.weight_read_stall_seconds` (60 s by default; 0 turns this off) is abandoned: the requests
 waiting for the model fail with `UNAVAILABLE`, which the gateway retries on another replica, and the
 read slot passes to the next model. Storage that is slow but still moving is never cut off (8 MiB per
-limit, 140 KiB/s at the default, is enough). Waiting for a lock on the shared host-weight store
-counts as no progress, including a wait for another worker that is reading the same model into the
-node's copy, so keep the limit above the time one worker takes to read your largest model. The
-abandoned read still holds a thread and the memory it was reading into. Until it returns, its model
-is not read again, and requests for it fail with `UNAVAILABLE` at once; if it returns, what it read
-is released. With four abandoned reads outstanding (a quarter of the worker's default threads when
+limit, 140 KiB/s at the default, is enough). A worker waiting for another worker that is reading the
+same model into the node's shared copy counts that worker's progress as its own, so the wait is cut
+off only when that read stalls too; any other wait on a shared host-weight lock counts as no
+progress. The abandoned read still holds a thread and the memory it was reading into. Until it
+returns, its model is not read again, and requests for it fail with `UNAVAILABLE` at once; if it
+returns, what it read is released. With four abandoned reads outstanding (a quarter of the worker's default threads when
 that is fewer, at least one), the worker starts no read at all, and every request for a model that is
 not on its GPU fails with `UNAVAILABLE` at once. Models on the GPU keep serving throughout, and the
 worker keeps reporting ready. A request still waits no longer than its dispatch timeout

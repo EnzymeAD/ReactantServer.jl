@@ -34,6 +34,9 @@ include("buffer_pool.jl")
 include("shared_memory.jl")
 include("slot_control.jl")
 
+# Progress of a read of model weights, which the weight store also reports (a peer's fill).
+include("read_progress.jl")
+
 # Host-weight residency store (private, or node-shared via POSIX SHM + flock).
 include("weight_store.jl")
 
@@ -89,6 +92,7 @@ export materialize_host_weights!, release_host_weights!, weights_digest,
     with_cached_host_weights, trim_host_cache!, host_cache_bytes, bump_load_rank,
     HOST_CACHE_HALFLIFE_SECONDS,
     CachedHostWeights, acquire_cached_host_weights, release_cached_host_weights!, cached_region_exists
+export ReadProgress, with_read_progress, note_read_progress!
 
 # ---- boundary ----
 export NamedTensor, InferRequest, QueuedRequest, DeadlineExceeded
