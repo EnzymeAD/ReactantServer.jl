@@ -159,11 +159,14 @@ function _check_once(p::HealthProber)
         observe_probe!(p.metrics, wc.url, elapsed[i])
         any_ready |= results[i]
         any_responsive |= !timeouts[i]   # answered within the watchdog (ready or not)
-        # A hung probe (timed out, not a fast refuse) means the worker was caught mid-stall, and its
-        # connection may be one that never answered, which every later call would wait behind until
-        # its deadline (see `reset_clients!`); drop it so this round's discovery and the next probe
-        # reconnect fresh.
-        timeouts[i] && reset_clients!(wc)
+        # A hung probe (timed out, not a fast refuse) means the worker was caught mid-stall, and the
+        # probe connection may be one that never answered, which every later probe would wait behind
+        # until its deadline (see `reset_if_parked!`); drop it so this round's discovery and the next
+        # probe reconnect fresh. The probes have a handle of their own, so this touches no inference.
+        timeouts[i] && reset_probe_connection!(wc)
+        # A worker that answered ready on the probe handle while its inference calls keep reaching
+        # their deadline unanswered has a parked inference connection; reset that one.
+        results[i] && reset_if_parked!(wc)
         _track_outage!(p, wc.url, results[i])
     end
     set_ready!(p.admin, any_ready)
@@ -223,7 +226,9 @@ end
 # wedged client stack (and the gateway exits for a fresh restart) ONLY after a worker has
 # answered at least once (`ever_responsive`) — i.e. a genuine regression from working to wedged.
 # Before that, an all-timeout round is just warmup (workers slow/busy/compiling) or a loaded
-# host starving the prober; restarting then is useless churn, so it is ignored.
+# host starving the prober; restarting then is useless churn, so it is ignored. Only the probes
+# count, and they run on handles of their own (see `WorkerClients`), so inference queued at busy
+# workers, however much, cannot make a round look wedged.
 function _track_wedge!(p::HealthProber, all_timed_out::Bool)
     p.wedged_rounds = all_timed_out ? p.wedged_rounds + 1 : 0
     p.ever_responsive || return nothing

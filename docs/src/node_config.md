@@ -314,6 +314,7 @@ grpc:
 worker_client:
   request_timeout_seconds: 60
   max_concurrent_streams: 32      # outbound in-flight RPCs the gateway multiplexes to one worker
+                                  # (inference and the rest; the health probes have their own)
 logging:
   level: "info"
   format: "json"

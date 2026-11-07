@@ -1,9 +1,9 @@
 # Per-worker gRPC connections used to forward requests to the Julia inference workers. ModelInfer
 # and the SHM RPCs send and receive raw Vector{UInt8} so request and response bytes pass through
-# without re-marshaling; the probes are typed (the messages are tiny). Each worker has one
-# gRPCChannel over its own libcurl multi handle, built up front and reused. The RegisterGate
-# serializes ModelInfer against a worker while a SHM register/unregister to that worker is in flight
-# (POSIX shm registration is host-global).
+# without re-marshaling; the probes are typed (the messages are tiny). Each worker has two
+# gRPCChannels, each over its own libcurl multi handle, built up front and reused (see
+# `WorkerClients`). The RegisterGate serializes ModelInfer against a worker while a SHM
+# register/unregister to that worker is in flight (POSIX shm registration is host-global).
 
 # Status strings surfaced to clients and recorded in metrics, mirroring the Go gateway. There is
 # one for every gRPC code, so a worker's code reaches the client verbatim (see `client_status`).
@@ -46,19 +46,45 @@ const _STATUS_BY_CODE = Dict{Int, String}(
     gRPCClient.GRPC_UNAUTHENTICATED => STATUS_UNAUTHENTICATED,
 )
 
-# A worker's gRPC connection: one per-worker libcurl multi handle (`grpc`) and the channel over it
-# that every RPC to the worker uses. Each worker gets its own gRPCCURL: HTTP/2 multiplexing only
-# reuses connections within one host:port, so workers share nothing, and a separate handle gives
-# each its own GRPC_MAX_STREAMS (16) in-flight budget and request semaphore, isolating a slow or
-# wedged worker to its own slots. The channel carries the data-plane defaults (request timeout,
-# message-size limits); the probes and compaction override the deadline per call.
+# A worker's gRPC connections: two libcurl multi handles of its own, each with the channel over it.
+# A handle is a connection pool and a stream budget (`max_streams` slots, past which calls wait), and
+# HTTP/2 multiplexing reuses connections only within one handle and one host:port, so workers share
+# nothing and a slow or wedged worker is isolated to its own slots.
+#
+#   - `grpc`/`chan`, `max_concurrent_streams_per_worker` slots: ModelInfer, and every other call the
+#     gateway makes for a client or for placement (shared memory, the metadata RPCs,
+#     IsSameIPCNamespace, CompactMemory, StageWeights). Its channel carries the data-plane defaults
+#     (request timeout, message-size limits); the others override the deadline per call.
+#   - `probe_grpc`/`probe_chan`: the prober's own polling (ServerReady, RepositoryIndex discovery and
+#     ModelControlStatus) and nothing else. A call's gRPCClient deadline counts the time it waits for
+#     a slot, so on a shared handle a probe waited behind every inference call queued at a busy
+#     worker, timed out although the worker was healthy, and the reset that followed aborted all of
+#     them; three such rounds made the gateway exit (GW-1). On its own handle a probe waits for no
+#     inference, so a probe that times out means the worker (or the gateway's client stack) stopped
+#     answering.
+#
+# CompactMemory and StageWeights stay on the first handle. They run for minutes, and the probe handle
+# is reset whenever a probe hangs, which is when a worker is busy with long work like theirs: on the
+# probe handle they would be aborted. Each holds one of the first handle's slots while it runs, one per
+# worker per repack.
 struct WorkerClients
     url::String
     grpc::gRPCClient.gRPCCURL
     chan::gRPCClient.gRPCChannel
+    probe_grpc::gRPCClient.gRPCCURL
+    probe_chan::gRPCClient.gRPCChannel
     probe_deadline::Float64      # ServerReady, RepositoryIndex, ModelControlStatus, IsSameIPCNamespace
     compact_deadline::Float64    # ControlService/CompactMemory (memory-compaction fan-out)
+    # ModelInfer calls in a row that ended at their deadline without an answer, and the resets of
+    # `grpc` they caused; see `reset_if_parked!`.
+    unanswered::Threads.Atomic{Int}
+    resets::Threads.Atomic{Int}
 end
+
+# One handle for every call, for a test that drives `invoke_infer` over a handle of its own.
+WorkerClients(url, grpc, chan, probe_deadline, compact_deadline) = WorkerClients(
+    url, grpc, chan, grpc, chan, probe_deadline, compact_deadline, Threads.Atomic{Int}(0), Threads.Atomic{Int}(0)
+)
 
 struct ClientPool
     order::Vector{String}
@@ -75,15 +101,22 @@ function _worker_clients(cfg::GatewayConfig, url::AbstractString)
     # one running multi handle per worker; its stream semaphore caps outbound in-flight requests to
     # this worker (the rest block until a slot frees).
     grpc = gRPCClient.gRPCCURL(; sticky = true, max_streams = cfg.max_concurrent_streams_per_worker)
-    chan = gRPCClient.gRPCChannel(
-        host, port; grpc = grpc,
+    options = (;
         deadline = cfg.request_timeout_seconds,
         max_send_message_length = cfg.max_send_msg_bytes,
-        max_recieve_message_length = cfg.max_recv_msg_bytes
+        max_recieve_message_length = cfg.max_recv_msg_bytes,
     )
+    chan = gRPCClient.gRPCChannel(host, port; grpc = grpc, options...)
+    # The prober has a few calls at most in flight to one worker (a probe, a discovery, a poll, and an
+    # on-demand discovery), so gRPCClient's default stream budget is ample.
+    probe_grpc = gRPCClient.gRPCCURL(; sticky = true)
+    probe_chan = gRPCClient.gRPCChannel(host, port; grpc = probe_grpc, options...)
     # Compaction frees and reloads weights (device-pinned models re-read from the mmap), so it can
     # run far longer than a status probe; give it a generous deadline rather than the 5s probe one.
-    return WorkerClients(url, grpc, chan, 5.0, max(cfg.request_timeout_seconds, 300.0))
+    return WorkerClients(
+        url, grpc, chan, probe_grpc, probe_chan, 5.0, max(cfg.request_timeout_seconds, 300.0),
+        Threads.Atomic{Int}(0), Threads.Atomic{Int}(0)
+    )
 end
 
 function ClientPool(cfg::GatewayConfig)
@@ -98,34 +131,85 @@ end
 get_clients(p::ClientPool, url::AbstractString) = get(p.clients, url, nothing)
 all_clients(p::ClientPool) = [p.clients[u] for u in p.order]
 
-# Reset a worker's multi handle in place: close it (dropping every pooled connection and aborting
-# any in-flight request on it) and re-open it. The worker's channel holds this handle by
-# identity, so it transparently uses the fresh handle afterward. This recovers from a stuck
-# connection. gRPCClient sets CURLOPT_PIPEWAIT on every call, and with it libcurl does not use a
-# pooled HTTP/2 connection until a call on it has had a response: a new call waits for that
-# connection instead of opening another, even when no call is using it. When every call on a
-# connection is given up before the worker answers any (a worker caught mid-stall: TCP accepted,
-# nothing answered yet), the connection stays pooled unanswered, and every later call to the worker
-# waits behind it and fails just after its own deadline (gRPCClient's watchdog cancels it). That
-# lasts until libcurl drops the connection after 118 s idle (CURLOPT_MAXAGE_CONN); closing the
-# handle drops it at once (the per-worker equivalent of a process restart). Call this when a probe
-# to the worker *hangs* (times out or hits its deadline), not on a fast refuse.
-function reset_clients!(wc::WorkerClients)
+# Reset a multi handle in place: close it (dropping every pooled connection and aborting any
+# in-flight request on it) and re-open it. A channel holds its handle by identity, so it
+# transparently uses the fresh handle afterward: the per-worker equivalent of a process restart.
+function _reset_handle!(grpc::gRPCClient.gRPCCURL, url::AbstractString)
     try
-        gRPCClient.grpc_shutdown(wc.grpc)
-        gRPCClient.grpc_init(wc.grpc)
+        gRPCClient.grpc_shutdown(grpc)
+        gRPCClient.grpc_init(grpc)
     catch e
-        @warn "gateway: error resetting worker client handle" worker = wc.url exception = e
+        @warn "gateway: error resetting worker client handle" worker = url exception = e
     end
     return nothing
 end
 
-# Shut down every worker's multi handle (closes connections, in-flight requests, the event-loop
+# Reset a worker's probe handle. Called when a probe or control-status poll to the worker *hangs*
+# (times out or hits its deadline), not on a fast refuse: the probe connection may be one that never
+# answered, which every later probe would wait behind (see `reset_if_parked!`). Only the prober's own
+# calls use this handle, so no inference is touched.
+reset_probe_connection!(wc::WorkerClients) = _reset_handle!(wc.probe_grpc, wc.url)
+
+# ModelInfer calls in a row to one worker that must end at their deadline with no answer from it
+# before `reset_if_parked!` resets the worker's inference connection.
+const PARKED_AFTER_UNANSWERED = 5
+
+"""
+    reset_if_parked!(wc) -> Bool
+
+Reset the worker's inference handle (`wc.grpc`) when its connection is parked: the last
+`PARKED_AFTER_UNANSWERED` ModelInfer calls to the worker all ended at their deadline with no answer
+from it. The prober calls this only for a worker that has just answered its ServerReady probe, ready,
+on its own handle, so the worker is up and the fault is in the inference connection.
+
+It exists for one gRPCClient 1.2.1 behavior (GW-18): gRPCClient sets CURLOPT_PIPEWAIT on every call,
+and with it libcurl does not use a pooled HTTP/2 connection until a call on it has had a response,
+and makes a new call wait for that connection instead of opening another, even when no call is
+using it. When every call on a new connection is given up before the worker answers (a restarted
+worker whose first answers are slow, or a worker frozen while the connection opened), the connection
+stays pooled unanswered, and every later call to the worker waits behind it and fails at its own
+deadline, without reaching the worker, until libcurl drops the connection after 118 s idle
+(CURLOPT_MAXAGE_CONN). Closing the handle drops it at once, and the calls parked on it fail over
+(they were never sent). Delete this, and the counting in `invoke_infer`, once gRPCClient no longer
+parks calls behind a connection that never answered.
+
+Healthy traffic never resets the handle: any answer from the worker, a success or a status it sent,
+clears the count, and a call that expired waiting for one of the handle's slots (the worker busy with
+the calls ahead of it) does not count. A worker that is slow but answering keeps its calls in flight.
+What can still look parked is a worker that answers its probes but none of the calls it receives
+before their deadlines; resetting then fails over the calls in flight to it, which a worker in that
+state would not have answered in time either.
+"""
+function reset_if_parked!(wc::WorkerClients)
+    n = wc.unanswered[]
+    n >= PARKED_AFTER_UNANSWERED || return false
+    @warn "gateway: the last $n inference calls to a worker that answers its health probes all reached their deadline unanswered; resetting its inference connection (gRPCClient parks calls behind a connection that never answered)" worker = wc.url
+    _reset_handle!(wc.grpc, wc.url)
+    wc.unanswered[] = 0
+    Threads.atomic_add!(wc.resets, 1)
+    return true
+end
+
+# Record how a ModelInfer call ended, for `reset_if_parked!`: any answer from the worker clears the
+# count of calls in a row that ended at their deadline unanswered, and such a call adds one. A call
+# that expired waiting for a slot on the handle (gRPCClient's "Deadline exceeded while queued ...")
+# never left the gateway, so it says nothing about the connection.
+function _note_infer_outcome!(wc::WorkerClients, req::gRPCClient.gRPCRequest, e)
+    if e === nothing || _worker_sent(req)
+        wc.unanswered[] = 0
+    elseif e.grpc_status == gRPCClient.GRPC_DEADLINE_EXCEEDED &&
+            !startswith(e.message, "Deadline exceeded while queued")
+        Threads.atomic_add!(wc.unanswered, 1)
+    end
+    return nothing
+end
+
+# Shut down every worker's multi handles (closes connections, in-flight requests, the event-loop
 # timer and socket watchers). Called on gateway shutdown; finalizers would otherwise reclaim them.
 function close_pool!(p::ClientPool)
-    for wc in all_clients(p)
+    for wc in all_clients(p), grpc in unique((wc.grpc, wc.probe_grpc))
         try
-            gRPCClient.grpc_shutdown(wc.grpc)
+            gRPCClient.grpc_shutdown(grpc)
         catch e
             @warn "gateway: error shutting down worker client handle" worker = wc.url exception = e
         end
@@ -137,9 +221,9 @@ end
 # gateway can forward the request's REMAINING budget as grpc-timeout, decrementing it for the time
 # already spent reaching the gateway rather than granting the worker a fresh full budget.
 #
-# A call on a handle that `reset_clients!` has shut down (a worker probe hit its deadline) fails
-# with UNAVAILABLE, so it fails over like any other unavailable worker rather than reaching the
-# client as the worker's stale shared-memory signal (FAILED_PRECONDITION). So does a call the
+# A call on a handle that `reset_if_parked!` has shut down fails with UNAVAILABLE, so it fails over
+# like any other unavailable worker rather than reaching the client as the worker's stale
+# shared-memory signal (FAILED_PRECONDITION). So does a call the
 # transport failed (a refused or reset connection, a response that broke off): gRPCClient reports
 # those as INTERNAL, the same code a worker sends for its own failures, so they are told apart
 # here, where the call itself is at hand, and only the worker's INTERNAL reaches the client as such.
@@ -166,9 +250,12 @@ function invoke_infer(
     req = rpc.req
     watch = cancelled === nothing ? nothing : _cancel_when(req, cancelled)
     try
-        return gRPCClient.grpc_async_await(req, Vector{UInt8})
+        resp = gRPCClient.grpc_async_await(req, Vector{UInt8})
+        _note_infer_outcome!(wc, req, nothing)
+        return resp
     catch e
         e isa gRPCClient.gRPCServiceCallException || rethrow()
+        _note_infer_outcome!(wc, req, e)
         if _transport_failure(req, e)
             e = gRPCClient.gRPCServiceCallException(gRPCClient.GRPC_UNAVAILABLE, "transport error: $(e.message)")
         end
@@ -261,7 +348,7 @@ _deadline_exceeded(e) =
 # Returns the worker's ServerReadyResponse.ready, or false on any other transport error.
 function probe_ready(wc::WorkerClients)
     try
-        resp = GRPCInferenceService.ServerReady(wc.chan, ServerReadyRequest(); deadline = wc.probe_deadline)
+        resp = GRPCInferenceService.ServerReady(wc.probe_chan, ServerReadyRequest(); deadline = wc.probe_deadline)
         return resp.ready
     catch e
         _deadline_exceeded(e) && rethrow()
@@ -273,7 +360,7 @@ end
 # Returns the response, or `nothing` on any other transport error.
 function fetch_control_status(wc::WorkerClients)
     try
-        return ControlService.ModelControlStatus(wc.chan, ModelControlStatusRequest(); deadline = wc.probe_deadline)
+        return ControlService.ModelControlStatus(wc.probe_chan, ModelControlStatusRequest(); deadline = wc.probe_deadline)
     catch e
         _deadline_exceeded(e) && rethrow()
         return nothing
@@ -285,7 +372,7 @@ end
 function discover_models(wc::WorkerClients)
     try
         resp = GRPCInferenceService.RepositoryIndex(
-            wc.chan, RepositoryIndexRequest(; ready = true); deadline = wc.probe_deadline
+            wc.probe_chan, RepositoryIndexRequest(; ready = true); deadline = wc.probe_deadline
         )
         return String[m.name for m in resp.models if m.state == "READY"]
     catch e

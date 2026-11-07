@@ -1591,8 +1591,8 @@ fails fast. The supervisor sets this to wait for the workers it co-launches (see
 Once all workers are reachable, FIFO discipline and identical model sets are hard requirements and
 a violation raises with the offending worker named.
 
-Every poll is watchdog-bounded (`call_timeout`): the gateway's clients share one libcurl multi
-handle whose request semaphore caps in-flight requests at GRPC_MAX_STREAMS (16). After the burst of
+Every poll is watchdog-bounded (`call_timeout`): each worker's polls run on its probe handle, a
+libcurl multi handle whose request semaphore caps in-flight requests at GRPC_MAX_STREAMS (16). After the burst of
 failed connects during warmup the handle's socket/timer driving can stall, so in-flight requests
 never complete, never return their semaphore slot, and every new call blocks at acquire forever (the
 "wedge"). A worker that is merely down refuses fast and releases its slot; but if every worker's
@@ -1626,7 +1626,7 @@ function verify_lpt_packing_preconditions!(
                 push!(pending, wc.url)
                 # A hung call (not a fast refuse) means the worker was caught mid-stall and its
                 # connection is poisoned; drop it so the next poll reconnects fresh.
-                to && (timed_out += 1; reset_clients!(wc))
+                to && (timed_out += 1; reset_probe_connection!(wc))
             else
                 statuses[wc.url] = resp
             end

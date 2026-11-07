@@ -159,7 +159,7 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64,
         resp = invoke_infer(wc, body; deadline = deadline_s, cancelled = cancelled, label = full ? nothing : _shown(st, url))
         observe_worker!(st.metrics, "ModelInfer", url, time() - t0)
         # A worker's reply always carries model_name, so an empty body is a call that ended without
-        # a response: gRPCClient before 1.1.2 returned one when `reset_clients!` aborted the call.
+        # a response: gRPCClient before 1.1.2 returned one when a handle reset aborted the call.
         # Fail over rather than hand the client an empty response as a success.
         if isempty(resp)
             @warn "infer: worker returned an empty response" model worker = url request_id = id

@@ -1053,7 +1053,7 @@ end
     )
 end
 
-@testset "reset_clients! recovers a poisoned (stalled) worker connection" begin
+@testset "reset_probe_connection! recovers a poisoned (stalled) worker connection" begin
     # A server that accepts TCP but never speaks gRPC/HTTP-2: the connection establishes then stalls
     # on the HTTP/2 handshake, exactly like a worker caught in its brief silent-accept window at
     # startup. With PIPEWAIT (which the client keeps for multiplexing), libcurl pools the half-open
@@ -1061,7 +1061,7 @@ end
     # multiplexable never re-enters libcurl's state machine, so its own CURLOPT_TIMEOUT_MS never
     # fires. gRPCClient 1.1 backstops that with a client-side deadline watchdog, so every call on a
     # poisoned connection now fails at its deadline instead of wedging forever. The gateway still
-    # calls reset_clients! when a probe to a worker hangs (the per-worker equivalent of a process
+    # resets the probe handle when a probe to a worker hangs (the per-worker equivalent of a process
     # restart); this checks the handle is usable again afterwards.
     srv = Sockets.listen(Sockets.localhost, 0)
     port = Int(Sockets.getsockname(srv)[2])
@@ -1097,7 +1097,7 @@ end
     end
 
     wc = GW.WorkerClients("127.0.0.1:$port", grpc, chan, 0.5, 0.5)
-    GW.reset_clients!(wc)                    # close + reopen the handle: drops the poisoned connection
+    GW.reset_probe_connection!(wc)           # close + reopen the handle: drops the poisoned connection
 
     status, err = bounded_call(3.0)          # fresh connection: still bounded by the deadline
     @test status == :ok
@@ -1107,8 +1107,8 @@ end
     close(srv)
 end
 
-@testset "invoke_infer: a call caught by reset_clients! fails over as UNAVAILABLE" begin
-    # reset_clients! shuts the worker's handle down and re-opens it. A ModelInfer in flight at that
+@testset "invoke_infer: a call caught by a handle reset fails over as UNAVAILABLE" begin
+    # reset_if_parked! shuts the worker's handle down and re-opens it. A ModelInfer in flight at that
     # moment, or submitted while the handle is down, must come back retryable (UNAVAILABLE), never
     # as an empty success or as the worker's FAILED_PRECONDITION shared-memory signal.
     srv = Sockets.listen(Sockets.localhost, 0)
@@ -1132,7 +1132,8 @@ end
 
     inflight = [@async(call()) for _ in 1:4]
     sleep(0.5)
-    GW.reset_clients!(wc)
+    wc.unanswered[] = GW.PARKED_AFTER_UNANSWERED
+    @test GW.reset_if_parked!(wc)
     @test timedwait(() -> all(istaskdone, inflight), 5.0) == :ok
     @test all(unavailable, fetch.(inflight))
 

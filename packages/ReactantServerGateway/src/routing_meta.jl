@@ -20,8 +20,8 @@
 # (Δcompute / Δrequests) already embeds whatever batch sizes the clients happened to send, so it
 # cannot be scaled by an item count without double-counting. Cost per item (Δcompute / Δrows) can.
 
-# Watchdog ceiling for one control-status poll. The gateway's clients share one libcurl multi
-# handle with a 16-slot request semaphore (GRPC_MAX_STREAMS); if its driving stalls, in-flight
+# Watchdog ceiling for one control-status poll. The poll runs on the worker's probe handle, a libcurl
+# multi handle with a 16-slot request semaphore (GRPC_MAX_STREAMS); if its driving stalls, in-flight
 # calls never release their slot and new calls block forever, so every poll is bounded and a worker
 # that exceeds this is treated as not-polled.
 const POLL_TIMEOUT_SECONDS = 8.0
@@ -171,7 +171,7 @@ function poll_workers(pool::ClientPool, ready_urls::Vector{String})
                 "ModelControlStatus poll", url
             )
             if resp === nothing
-                to && reset_clients!(wc)
+                to && reset_probe_connection!(wc)
                 return
             end
             lock(lk) do

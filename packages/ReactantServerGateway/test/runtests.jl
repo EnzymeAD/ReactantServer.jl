@@ -15,4 +15,5 @@ include("grpc_helpers.jl")
     include("test_drain.jl")
     include("test_admission.jl")        # after test_drain.jl: reuses its slow worker
     include("test_client_giveups.jl")   # after test_drain.jl: reuses its slow worker
+    include("test_worker_connections.jl")   # after test_drain.jl and test_gateway.jl: reuses their workers
 end

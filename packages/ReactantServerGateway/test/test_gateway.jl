@@ -365,7 +365,7 @@ end
         end
 
         @testset "an empty worker response fails over instead of passing as a success" begin
-            # gRPCClient before 1.1.2 completed a call aborted by reset_clients! with an empty body.
+            # gRPCClient before 1.1.2 completed a call aborted by a handle reset with an empty body.
             # A real worker always sets model_name, so the gateway treats empty as unavailable.
             w0.empty_infer = true
             for _ in 1:4

@@ -27,7 +27,8 @@ that serves the model. On a multi-worker node it also serves the node's merged m
   status reaches the client as the worker sent it, and a request that uses shared memory is
   never retried on another worker (see [Status codes and failover](#Status-codes-and-failover)).
 - **Readiness probe:** a background loop calls each worker's KServe `ServerReady` RPC; `/readyz`
-  is ready when at least one worker reports ready.
+  is ready when at least one worker reports ready. The probes have a connection to each worker of
+  their own, so they never wait behind the inference queued at a busy worker.
 - **Raw passthrough:** the `ModelInfer` hot path never decodes or re-marshals the protobuf body.
   The request and response types are `Vector{UInt8}` end to end (gRPCServer.jl and gRPCClient.jl
   support raw byte messages natively). To route, the gateway decodes a partial schema declaring
@@ -483,7 +484,7 @@ the next replica only when the worker it tried could not serve it:
 | --- | --- |
 | `NOT_FOUND` (the model was unloaded there since the last discovery round) | tries the next replica and refreshes its routes |
 | `UNAVAILABLE` (the worker is shutting down or draining, its dispatch loop died, or the model is not resident there or cannot be placed on its device now) | tries the next replica |
-| a transport failure (connection refused or reset, a response that broke off, a client handle reset after a hung probe) | tries the next replica, as `UNAVAILABLE` |
+| a transport failure (connection refused or reset, a response that broke off, a call aborted when its parked connection was reset) | tries the next replica, as `UNAVAILABLE` |
 | any other status: `DEADLINE_EXCEEDED`, `INTERNAL`, `INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`, `FAILED_PRECONDITION`, `CANCELLED`, ... | returns it to the client as is |
 
 A deterministic failure (`INTERNAL`) or the request's own mistake (`INVALID_ARGUMENT`) would only
@@ -582,11 +583,26 @@ returning whether it reported ready.
   `gateway_repack_staged_changes_total{outcome}`). A repack that comes due while a placed worker is
   missing from the poll logs `repack deferred` instead and runs once the worker answers or 30 s have
   passed.
-- If a probe to a worker hangs (times out, rather than failing fast), the gateway drops and
-  recreates that worker's gRPC connection before the next attempt. This recovers from a
-  half-open connection (for example one caught during a worker's brief silent-accept window at
-  startup) that would otherwise be reused and stall every later request to that worker, the
-  per-worker equivalent of a restart, without dropping HTTP/2 multiplexing for healthy workers.
+- The gateway holds two connections to each worker: one for the health probes, discovery and the
+  control-status poll, and one for everything else, inference, shared memory, the metadata RPCs,
+  `CompactMemory` and `StageWeights` (`worker_client.max_concurrent_streams` calls at once on it).
+  A probe therefore never waits for an inference slot, however busy the worker is: a probe that
+  hangs means the worker, or the gateway's own client stack, stopped answering. If a probe or a
+  control-status poll to a worker hangs (times out, rather than failing fast), the gateway drops
+  and recreates that worker's probe connection, which touches no inference. The gateway exits to be
+  restarted only when every probe has hung for three rounds in a row after it had reached a worker
+  (`REACTANT_GATEWAY_WEDGE_EXIT_ROUNDS`, 0 to disable), so a fleet saturated with inference cannot
+  trigger it.
+- The inference connection is dropped and recreated only when it is parked: the last 5 inference
+  calls to a worker all reached their deadline without any answer from it, and the worker answers
+  its health probe, ready, on the other connection. This covers a connection whose first calls were
+  all given up before the worker answered (a restarted worker whose first answers are slow, or a
+  frozen one): gRPCClient waits for a connection to answer before it uses it again, so without the
+  reset every later call to that worker waits behind it and fails at its deadline for up to two
+  minutes. Any answer from the worker, a success or a status it sent, clears the count, and a call
+  that expired waiting for a free slot does not count, so a busy worker that answers keeps its
+  calls; the reset fails over the calls in flight on the parked connection, which never reached
+  the worker. The gateway logs a warning each time.
 - Successful `ModelInfer` requests are not logged (to keep the hot path quiet); worker errors and
   a model with no live replica are logged, and per-request latency and gRPC status are exported
   as Prometheus metrics. Logs contain no tensor data.
