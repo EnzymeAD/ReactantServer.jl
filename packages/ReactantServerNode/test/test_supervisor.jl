@@ -409,7 +409,7 @@ function _fake_worker(name, mode, dir; interval = 0.5, timeout = 1.0, failures =
     port = _free_port()
     cmd = `$(Base.julia_cmd()) --startup-file=no -e $_FAKE_WORKER $port $mode $(joinpath(dir, "marker"))`
     chk = RSN.LivenessCheck("127.0.0.1", port; interval_seconds = interval, timeout_seconds = timeout, failures = failures)
-    return RSN.ChildSpec(name, addenv(cmd, "JULIA_LOAD_PATH" => "@stdlib"), 5.0, 0.0, 1, chk)
+    return RSN.ChildSpec(name, addenv(cmd, "JULIA_LOAD_PATH" => "@stdlib"), 5.0; liveness = chk)
 end
 
 @testset "supervisor: a worker that stops answering once ready is killed and restarted ($mode)" for (mode, why) in (
@@ -452,6 +452,101 @@ end
         RSN.request_shutdown!(sup)
         @test fetch(t) == 0
     end
+end
+
+# A fake nvidia-smi for one GPU (index 0, UUID GPU-fake) that reads its answers from files in `dir`:
+# `gpu` holds "used, total" in MiB, `apps` the pids holding memory on it, and while `hang` exists it
+# hangs, as nvidia-smi does on a wedged driver.
+function _fake_gpu(dir; used = 14000, total = 15360)
+    write(joinpath(dir, "gpu"), "$used, $total")
+    write(joinpath(dir, "apps"), "")
+    smi = joinpath(dir, "nvidia-smi")
+    write(
+        smi, """
+        #!/bin/sh
+        [ -f $dir/hang ] && exec sleep 60
+        case "\$*" in
+          *query-gpu*) echo "0, GPU-fake, \$(cat $dir/gpu)" ;;
+          *query-compute-apps*) for p in \$(cat $dir/apps); do echo "\$p, GPU-fake"; done ;;
+        esac
+        """
+    )
+    chmod(smi, 0o755)
+    return smi
+end
+
+_gpu_child(name, reclaim) = RSN.ChildSpec(name, `sh -c 'echo up; sleep 1; exit 3'`, 2.0; reclaim = reclaim)
+
+@testset "supervisor: a restart waits for the GPU to release the last run's memory" begin
+    # The run exits while the (fake) GPU still shows its memory in use, as it does for a moment
+    # after a worker dies or is killed. Before, the restart came right after the 1 s backoff, and the
+    # new worker could run out of memory preallocating its arena.
+    dir = mktempdir()
+    reclaim = RSN.GpuReclaim("0", _fake_gpu(dir); timeout_seconds = 60, smi_timeout_seconds = 10)
+    sink = IOBuffer()
+    sup = RSN.Supervisor([_gpu_child("g", reclaim)]; sink = sink, max_restarts = 1)
+    t = @async RSN.run_supervisor!(sup; install_signal_handlers = false)
+    waiting = "[supervisor] waiting up to 60s for GPU 0 to release g's memory before restarting it: 14000/15360 MiB used (91%)"
+    @test wait_for(() -> any(==(waiting), _sink_lines(sink)))
+    sleep(2.0)
+    @test count(l -> startswith(l, "[supervisor] started g "), _sink_lines(sink)) == 1   # still waiting
+    write(joinpath(dir, "gpu"), "300, 15360")
+    @test fetch(t) == 1                                  # the second run used up the restart budget
+    lines = _sink_lines(sink)
+    released = findfirst(l -> startswith(l, "[supervisor] GPU 0 released g's memory after "), lines)
+    @test released !== nothing && endswith(lines[released], ": 300/15360 MiB used (2%)")
+    @test released < findlast(l -> startswith(l, "[supervisor] started g "), lines)
+    @test count(l -> startswith(l, "[supervisor] started g "), lines) == 2
+
+    # The memory is low, but the dead run's pid still holds some of it: that is waited for too.
+    dir = mktempdir()
+    reclaim = RSN.GpuReclaim("0", _fake_gpu(dir; used = 300); timeout_seconds = 60, smi_timeout_seconds = 10)
+    sink = IOBuffer()
+    sup = RSN.Supervisor([_gpu_child("p", reclaim)]; sink = sink, max_restarts = 1)
+    t = @async RSN.run_supervisor!(sup; install_signal_handlers = false)
+    @test wait_for(() -> any(==("[p] up"), _sink_lines(sink)))
+    pid = sup.children[1].pid
+    write(joinpath(dir, "apps"), string(pid))
+    @test wait_for(() -> any(l -> occursin("to release p's memory before restarting it: 300/15360 MiB used (2%), pid $pid still holds memory on it", l), _sink_lines(sink)))
+    sleep(1.5)
+    write(joinpath(dir, "apps"), "")
+    @test fetch(t) == 1
+    lines = _sink_lines(sink)
+    @test findfirst(l -> startswith(l, "[supervisor] GPU 0 released p's memory"), lines) <
+        findlast(l -> startswith(l, "[supervisor] started p "), lines)
+end
+
+@testset "supervisor: the GPU wait before a restart is bounded" begin
+    # The memory is never released: after the timeout the worker is restarted anyway.
+    dir = mktempdir()
+    reclaim = RSN.GpuReclaim("0", _fake_gpu(dir); timeout_seconds = 2, smi_timeout_seconds = 10)
+    sink = IOBuffer()
+    sup = RSN.Supervisor([_gpu_child("t", reclaim)]; sink = sink, max_restarts = 1)
+    @test RSN.run_supervisor!(sup; install_signal_handlers = false) == 1
+    lines = _sink_lines(sink)
+    @test any(==("[supervisor] GPU 0 still has 14000/15360 MiB used (91%) after 2s; restarting t anyway"), lines)
+    @test count(l -> startswith(l, "[supervisor] started t "), lines) == 2
+
+    # nvidia-smi hangs: it is given up on and the worker restarted without waiting.
+    dir = mktempdir()
+    reclaim = RSN.GpuReclaim("0", _fake_gpu(dir); timeout_seconds = 60, smi_timeout_seconds = 1)
+    touch(joinpath(dir, "hang"))
+    sink = IOBuffer()
+    sup = RSN.Supervisor([_gpu_child("h", reclaim)]; sink = sink, max_restarts = 1)
+    t0 = time()
+    @test RSN.run_supervisor!(sup; install_signal_handlers = false) == 1
+    @test time() - t0 < 20
+    lines = _sink_lines(sink)
+    @test any(==("[supervisor] nvidia-smi did not answer within 1s; restarting h without waiting for its GPU memory"), lines)
+    @test count(l -> startswith(l, "[supervisor] started h "), lines) == 2
+
+    # A GPU nvidia-smi does not list is not waited for.
+    dir = mktempdir()
+    reclaim = RSN.GpuReclaim("GPU-other", _fake_gpu(dir); timeout_seconds = 60, smi_timeout_seconds = 10)
+    sink = IOBuffer()
+    sup = RSN.Supervisor([_gpu_child("a", reclaim)]; sink = sink, max_restarts = 1)
+    @test RSN.run_supervisor!(sup; install_signal_handlers = false) == 1
+    @test any(==("[supervisor] nvidia-smi does not list GPU GPU-other; restarting a without waiting for its GPU memory"), _sink_lines(sink))
 end
 
 @testset "supervisor: grace windows run in parallel" begin

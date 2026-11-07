@@ -24,8 +24,9 @@ mutable struct Child
     stdin::Union{Pipe, Nothing}   # our end of a draining child's stdin; closing it requests the drain
     drain_acked::Bool             # the child printed DRAIN_ACK_LINE since it last started
     run::Union{_Run, Nothing}     # the current (or last) run
+    pid::Union{Int, Nothing}      # the current (or last) run's pid, when it could be read
 end
-Child(spec::ChildSpec) = Child(spec, nothing, 0, 0.0, nothing, false, nothing)
+Child(spec::ChildSpec) = Child(spec, nothing, 0, 0.0, nothing, false, nothing, nothing)
 
 # Lines the log queue gave up on while it was full, at the place in the stream where they were lost.
 mutable struct _Dropped
@@ -277,6 +278,7 @@ function _run_once!(sup::Supervisor, c::Child)
         return nothing
     end
     pid = _child_pid(r.proc)
+    c.pid = pid === nothing ? nothing : Int(pid)
     _slog(sup, "started $(c.spec.name) (pid $(pid === nothing ? "unknown: it has already exited" : pid))")
     chk = c.spec.liveness
     chk === nothing || errormonitor(@async _watch_liveness(sup, c, r.proc, chk))
@@ -364,6 +366,76 @@ function _probe(chk::LivenessCheck, path::AbstractString)
     return code == 200 ? nothing : "$path answered HTTP $code"
 end
 
+# One look at a worker's GPU through nvidia-smi: its used and total memory (MiB) and whether `pid`
+# (the worker's previous run, if known) still holds memory on it. Returns a NamedTuple, or a Symbol
+# when it cannot tell: `:timeout` (nvidia-smi did not answer in time), `:failed`, or `:absent` (no
+# GPU with that index or UUID).
+function _gpu_memory(r::GpuReclaim, pid)
+    out, status = _read_bounded(
+        `$(r.smi) --query-gpu=index,uuid,memory.used,memory.total --format=csv,noheader,nounits`, r.smi_timeout
+    )
+    status === :ok || return status
+    row = nothing
+    for line in eachsplit(out, '\n')
+        f = strip.(split(line, ','))
+        length(f) >= 4 && (f[1] == r.device || f[2] == r.device) && (row = f; break)
+    end
+    row === nothing && return :absent
+    used, total = tryparse(Int, row[3]), tryparse(Int, row[4])
+    (used === nothing || total === nothing || total <= 0) && return :failed
+    held = false
+    if pid !== nothing
+        apps, status = _read_bounded(`$(r.smi) --query-compute-apps=pid,gpu_uuid --format=csv,noheader`, r.smi_timeout)
+        status === :timeout && return :timeout
+        status === :ok && (
+            held = any(eachsplit(apps, '\n')) do line
+                f = strip.(split(line, ','))
+                length(f) >= 2 && f[1] == string(pid) && f[2] == row[2]
+            end
+        )
+    end
+    return (used = used, total = total, held = held)
+end
+
+# Before a worker is restarted: wait, for up to `r.timeout` seconds, until its GPU has released the
+# memory its previous run held (see `GpuReclaim`), polling once a second, and log what happened. A
+# GPU that cannot be observed (nvidia-smi does not answer or fails, or does not list it) is not
+# waited for. Returns early once the node shuts down.
+function _await_gpu_reclaim(sup::Supervisor, c::Child, r::GpuReclaim)
+    r.timeout > 0 || return nothing
+    name, gpu = c.spec.name, r.device
+    t0 = time()
+    waiting = false
+    while !sup.shutting_down[]
+        st = _gpu_memory(r, c.pid)
+        if st isa Symbol
+            why = st === :timeout ? "nvidia-smi did not answer within $(_secs(r.smi_timeout))s" :
+                st === :absent ? "nvidia-smi does not list GPU $gpu" : "nvidia-smi failed"
+            _slog(sup, "$why; restarting $name without waiting for its GPU memory")
+            return nothing
+        end
+        pct = 100 * st.used / st.total
+        busy = pct > r.max_used_percent || st.held
+        usage = "$(st.used)/$(st.total) MiB used ($(round(Int, pct))%)" *
+            (st.held ? ", pid $(c.pid) still holds memory on it" : "")
+        elapsed = time() - t0
+        if !busy
+            waiting && _slog(sup, "GPU $gpu released $name's memory after $(round(elapsed; digits = 1))s: $usage")
+            return nothing
+        end
+        if !waiting
+            _slog(sup, "waiting up to $(_secs(r.timeout))s for GPU $gpu to release $name's memory before restarting it: $usage")
+            waiting = true
+        end
+        if elapsed >= r.timeout
+            _slog(sup, "GPU $gpu still has $usage after $(_secs(r.timeout))s; restarting $name anyway")
+            return nothing
+        end
+        _sleep_interruptible(sup, min(1.0, r.timeout - elapsed))
+    end
+    return nothing
+end
+
 # Bring a child whose supervision hit an unexpected error back to a known state before it is
 # restarted: kill it if it is still running (a second copy would fight it for its ports and its
 # GPU), then stop reading its pipes.
@@ -440,6 +512,13 @@ function _supervise!(sup::Supervisor, c::Child)
         delay = min(2.0^(c.restarts - 1), sup.backoff_cap)
         _slog(sup, "restarting $(c.spec.name) in $(round(delay; digits = 1))s")
         _sleep_interruptible(sup, delay)
+        if c.spec.reclaim !== nothing
+            try
+                _await_gpu_reclaim(sup, c, c.spec.reclaim)
+            catch err
+                _slog(sup, "waiting for $(c.spec.name)'s GPU memory failed; restarting it now:\n$(_describe(err, catch_backtrace()))")
+            end
+        end
     end
     return nothing
 end

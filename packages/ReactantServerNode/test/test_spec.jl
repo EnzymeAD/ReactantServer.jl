@@ -698,3 +698,38 @@ end
         )
     end
 end
+
+@testset "build_supervisor: GPU-reclaim wait before worker restarts" begin
+    mktempdir() do dir
+        bin = mkpath(joinpath(dir, "bin"))
+        smi = joinpath(bin, "nvidia-smi")
+        write(smi, "#!/bin/sh\n")
+        chmod(smi, 0o755)
+        built(env; yaml = _node_yaml(dir)) = RSN.build_supervisor(
+            yaml; env = env, sink = IOBuffer(), workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "run")
+        )
+        # Each GPU worker waits on its own GPU, with the image's startup-gate variables and defaults;
+        # nvidia-smi is looked up on the PATH the supervisor was given. The gateway has no GPU.
+        sup = built(Dict("REACTANT_GPUS" => "2", "PATH" => bin))
+        w0, w1, gw = (c.spec for c in sup.children)
+        @test (w0.reclaim.device, w1.reclaim.device) == ("0", "1")
+        @test (w0.reclaim.smi, w0.reclaim.timeout, w0.reclaim.max_used_percent, w0.reclaim.smi_timeout) == (smi, 30.0, 15.0, 30.0)
+        @test gw.reclaim === nothing
+        env = Dict(
+            "REACTANT_GPUS" => "GPU-aaaa", "PATH" => bin, RSN.GPU_RECLAIM_TIMEOUT_ENV => "45",
+            RSN.GPU_RECLAIM_MAX_USED_ENV => "20", RSN.NVIDIA_SMI_TIMEOUT_ENV => "5"
+        )
+        r = only(built(env).children).spec.reclaim
+        @test (r.device, r.timeout, r.max_used_percent, r.smi_timeout) == ("GPU-aaaa", 45.0, 20.0, 5.0)
+        # No wait: the timeout set to 0, no nvidia-smi on the PATH, or a CPU node.
+        @test only(built(Dict("REACTANT_GPUS" => "1", "PATH" => bin, RSN.GPU_RECLAIM_TIMEOUT_ENV => "0")).children).spec.reclaim === nothing
+        @test only(built(Dict("REACTANT_GPUS" => "1")).children).spec.reclaim === nothing
+        cpu = joinpath(dir, "cpu.yaml")
+        write(cpu, "model_repo: /repo\nbase_port: 8080\nglobal:\n  runtime:\n    backend: cpu\n")
+        @test all(c -> c.spec.reclaim === nothing, built(Dict("REACTANT_GPUS" => "0", "PATH" => bin); yaml = cpu).children)
+        # Values that make no sense fail at startup.
+        for (var, v) in ((RSN.GPU_RECLAIM_TIMEOUT_ENV, "-1"), (RSN.GPU_RECLAIM_TIMEOUT_ENV, "soon"), (RSN.GPU_RECLAIM_MAX_USED_ENV, "150"))
+            @test_throws ReactantServerCore.ConfigError built(Dict("REACTANT_GPUS" => "1", "PATH" => bin, var => v))
+        end
+    end
+end

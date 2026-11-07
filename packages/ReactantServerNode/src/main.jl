@@ -186,6 +186,38 @@ function _liveness_target(
     return ip === nothing ? nothing : (ip, port)
 end
 
+# The GPU-reclaim wait for each worker's restarts (see `GpuReclaim`), from the same variables as the
+# image's startup wait, and the startup line describing it (`nothing` on a CPU node). No wait for a
+# worker without a GPU, on a CPU node, without nvidia-smi, or with the timeout set to 0.
+function _gpu_reclaims(node::AbstractDict, selectors, env::AbstractDict)
+    none = Union{GpuReclaim, Nothing}[nothing for _ in selectors]
+    (_node_backend(node) == "cpu" || all(isnothing, selectors)) && return none, nothing
+    timeout = _env_seconds(env, GPU_RECLAIM_TIMEOUT_ENV, GPU_RECLAIM_TIMEOUT_SECONDS)
+    max_used = _env_seconds(env, GPU_RECLAIM_MAX_USED_ENV, GPU_RECLAIM_MAX_USED_PERCENT)
+    max_used <= 100 || throw(ConfigError("$GPU_RECLAIM_MAX_USED_ENV must be a percentage (0 to 100), got $max_used"))
+    timeout == 0 && return none, "worker restarts do not wait for GPU memory ($GPU_RECLAIM_TIMEOUT_ENV is 0)"
+    smi = _which("nvidia-smi", env)
+    smi === nothing && return none, "worker restarts do not wait for GPU memory: nvidia-smi not found"
+    smi_timeout = nvidia_smi_timeout(env)
+    reclaims = Union{GpuReclaim, Nothing}[
+        sel === nothing ? nothing :
+            GpuReclaim(sel, smi; timeout_seconds = timeout, max_used_percent = max_used, smi_timeout_seconds = smi_timeout)
+            for sel in selectors
+    ]
+    return reclaims, "worker restarts wait up to $(_secs(timeout))s for their GPU's used memory to drop to $(_secs(max_used))% ($GPU_RECLAIM_TIMEOUT_ENV, $GPU_RECLAIM_MAX_USED_ENV)"
+end
+
+# A non-negative number of seconds (or percent) from `env[var]`, else `default`; anything else is a
+# ConfigError naming the variable.
+function _env_seconds(env::AbstractDict, var::AbstractString, default::Real)
+    v = strip(get(env, var, ""))
+    isempty(v) && return Float64(default)
+    x = tryparse(Float64, v)
+    (x !== nothing && x >= 0 && isfinite(x)) ||
+        throw(ConfigError("$var must be a non-negative number, got $(repr(env[var]))"))
+    return x
+end
+
 # The startup line saying how the workers' liveness is checked; `unchecked` names the workers with
 # no HTTP listener to check.
 function _liveness_note(s, unchecked::Vector{String}, nworkers::Integer)
@@ -340,6 +372,9 @@ function build_supervisor(
                 for w in ws
         ]
         push!(notes, _liveness_note(liveness, String[_worker_name(w) for (w, c) in zip(ws, checks) if c === nothing], length(ws)))
+        # A restarted GPU worker first waits for its GPU to release the memory its last run held.
+        reclaims, note = _gpu_reclaims(node, selectors, env)
+        note === nothing || push!(notes, note)
         # Meta sub-calls run in-process on each worker now (no loopback, no shared-memory mesh), so a
         # worker needs neither a gateway endpoint nor a fan-out region injected. Each worker keeps its
         # own local meta-scratch pool (sized by REACTANT_FANOUT_BYTES/_SLOTS, read in serve()).
@@ -350,12 +385,14 @@ function build_supervisor(
                         _worker_name(w), node_file, selectors[i], children;
                         compute_threads = worker_threads, grpc_port = gpub, metrics_port = mpub,
                         node_workers = length(ws), drain_seconds = PUBLIC_DRAIN_SECONDS,
-                        liveness = checks[i], dispatch_stall_seconds = liveness.dispatch_stall_seconds
+                        liveness = checks[i], dispatch_stall_seconds = liveness.dispatch_stall_seconds,
+                        reclaim = reclaims[i]
                     ) :
                     worker_spec(
                         _worker_name(w), node_file, selectors[i], children;
                         compute_threads = worker_threads, node_workers = length(ws),
-                        liveness = checks[i], dispatch_stall_seconds = liveness.dispatch_stall_seconds
+                        liveness = checks[i], dispatch_stall_seconds = liveness.dispatch_stall_seconds,
+                        reclaim = reclaims[i]
                     )
             )
         end

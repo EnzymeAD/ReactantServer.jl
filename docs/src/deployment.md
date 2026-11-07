@@ -92,7 +92,16 @@ reported ready, the supervisor checks its `/healthz` every 10 seconds and sends 
 failures in a row, and the worker reports itself not live once its dispatch loop has had work and
 finished none of it for 10 minutes. [Worker liveness](node_config.md#Worker-liveness) has the
 settings (the node file's `liveness:` block, or `REACTANT_LIVENESS_*` on the container) and their
-limits. With `REACTANT_SUPERVISOR_MAX_RESTARTS` set, a child that fails that many times in a row
+limits. Before a GPU worker is restarted, the supervisor waits until the driver has released the
+memory its last run held on its GPU, as the image's entrypoint does once at container start: up to
+`REACTANT_GPU_RECLAIM_TIMEOUT_SECONDS` (default 30; 0 turns the wait off), until the GPU's used
+memory is at most `REACTANT_GPU_RECLAIM_MAX_USED_PERCENT` of it (default 15) and the dead process no
+longer holds any. Otherwise a restart a second after a crash or a liveness kill can find the memory
+still held and run out of it while it preallocates. After the timeout the worker is restarted
+anyway, and every step is logged; a CPU node, or a node without `nvidia-smi`, does not wait, and
+neither does a restart when `nvidia-smi` does not answer.
+
+With `REACTANT_SUPERVISOR_MAX_RESTARTS` set, a child that fails that many times in a row
 without a stable minute of uptime takes the node down with status 1, so the container restart
 policy acts. The supervisor never stops supervising a child silently: if it cannot go on (an
 internal error it cannot recover from), it says why and exits with status 1.

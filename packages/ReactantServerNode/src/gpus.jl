@@ -112,3 +112,13 @@ function detect_gpus(
     dev === nothing || return dev
     return String[]
 end
+
+# `name` on the PATH of `env` (the environment the supervisor was given, which may not be ENV), or
+# `nothing`.
+function _which(name::AbstractString, env::AbstractDict = ENV)
+    for dir in split(get(env, "PATH", ""), ':'; keepempty = false)
+        p = joinpath(dir, name)
+        isfile(p) && Sys.isexecutable(p) && return p
+    end
+    return nothing
+end

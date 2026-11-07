@@ -54,6 +54,40 @@ function LivenessCheck(
     return LivenessCheck(ip, Int(port), Float64(interval_seconds), Float64(timeout_seconds), Int(failures))
 end
 
+# Defaults of the GPU-reclaim wait before a worker restart, the same variables (and defaults) as the
+# image's startup wait in deploy/runtime/entrypoint.node.sh: wait up to 30 s, until the GPU's used
+# memory is at most 15% of it.
+const GPU_RECLAIM_TIMEOUT_ENV = "REACTANT_GPU_RECLAIM_TIMEOUT_SECONDS"
+const GPU_RECLAIM_MAX_USED_ENV = "REACTANT_GPU_RECLAIM_MAX_USED_PERCENT"
+const GPU_RECLAIM_TIMEOUT_SECONDS = 30.0
+const GPU_RECLAIM_MAX_USED_PERCENT = 15.0
+
+"""
+    GpuReclaim(device, smi; timeout_seconds=30, max_used_percent=15, smi_timeout_seconds=30)
+
+How the supervisor waits, before it restarts a worker, for the driver to release the GPU memory
+the worker's previous run held, so the new run does not run out of memory while it preallocates.
+`device` is the worker's GPU as the supervisor assigned it (an `nvidia-smi` index or a GPU UUID) and
+`smi` the `nvidia-smi` to ask. The GPU counts as released once its used memory is at most
+`max_used_percent` of its total and the previous run's pid no longer holds memory on it (a pid
+`nvidia-smi` lists from another PID namespace never matches, so there the memory alone decides).
+The wait gives up after `timeout_seconds` and restarts the worker anyway; each `nvidia-smi` call is
+given up on after `smi_timeout_seconds`, and then the worker is restarted without waiting.
+"""
+struct GpuReclaim
+    device::String
+    smi::String
+    timeout::Float64
+    max_used_percent::Float64
+    smi_timeout::Float64
+end
+GpuReclaim(
+    device::AbstractString, smi::AbstractString; timeout_seconds::Real = GPU_RECLAIM_TIMEOUT_SECONDS,
+    max_used_percent::Real = GPU_RECLAIM_MAX_USED_PERCENT, smi_timeout_seconds::Real = NVIDIA_SMI_TIMEOUT_SECONDS
+) = GpuReclaim(
+    String(device), String(smi), Float64(timeout_seconds), Float64(max_used_percent), Float64(smi_timeout_seconds)
+)
+
 struct ChildSpec
     name::String
     cmd::Cmd
@@ -61,11 +95,12 @@ struct ChildSpec
     drain_seconds::Float64   # graceful drain budget, requested by closing the child's stdin; 0 = SIGTERM at once
     stage::Int               # shutdown order: every child of a lower stage stops before the next stage is asked
     liveness::Union{LivenessCheck, Nothing}   # how a running child is checked; nothing = only its exit is watched
+    reclaim::Union{GpuReclaim, Nothing}       # what a restart waits for on the child's GPU; nothing = no wait
 end
-ChildSpec(name::AbstractString, cmd::Cmd, grace_seconds::Real) =
-    ChildSpec(String(name), cmd, Float64(grace_seconds), 0.0, 1, nothing)
-ChildSpec(name::AbstractString, cmd::Cmd, grace_seconds::Real, drain_seconds::Real, stage::Integer) =
-    ChildSpec(String(name), cmd, Float64(grace_seconds), Float64(drain_seconds), Int(stage), nothing)
+ChildSpec(
+    name::AbstractString, cmd::Cmd, grace_seconds::Real, drain_seconds::Real = 0.0, stage::Integer = 1;
+    liveness::Union{LivenessCheck, Nothing} = nothing, reclaim::Union{GpuReclaim, Nothing} = nothing
+) = ChildSpec(String(name), cmd, Float64(grace_seconds), Float64(drain_seconds), Int(stage), liveness, reclaim)
 
 # How long the node's public endpoint (the embedded gateway, or a sole worker bound to the public
 # ports itself) may take on shutdown to finish the requests it has already accepted.
@@ -205,7 +240,8 @@ function worker_spec(
         grace_seconds::Real = 15.0,
         drain_seconds::Real = WORKER_DRAIN_SECONDS,
         liveness::Union{LivenessCheck, Nothing} = nothing,
-        dispatch_stall_seconds::Union{Real, Nothing} = nothing
+        dispatch_stall_seconds::Union{Real, Nothing} = nothing,
+        reclaim::Union{GpuReclaim, Nothing} = nothing
     )
     ce = children isa ChildEnvironment ? children : workspace_environment(children)
     proj = ce.worker_project
@@ -235,8 +271,8 @@ function worker_spec(
     # The worker's dispatch-stall limit, which decides when its /healthz says not live.
     dispatch_stall_seconds === nothing || push!(pairs, DISPATCH_STALL_ENV => string(Float64(dispatch_stall_seconds)))
     return ChildSpec(
-        String(name), addenv(cmd, pairs...), Float64(grace_seconds), Float64(drain_seconds),
-        _WORKER_STAGE, liveness
+        String(name), addenv(cmd, pairs...), grace_seconds, drain_seconds, _WORKER_STAGE;
+        liveness = liveness, reclaim = reclaim
     )
 end
 
@@ -342,7 +378,7 @@ function gateway_spec(
         push!(pairs, "REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION" => string(rapid_reset_protection))
     _push_drain!(pairs, drain_seconds)
     isempty(pairs) || (cmd = addenv(cmd, pairs...))
-    return ChildSpec("gateway", cmd, Float64(grace_seconds), Float64(drain_seconds), _GATEWAY_STAGE, nothing)
+    return ChildSpec("gateway", cmd, grace_seconds, drain_seconds, _GATEWAY_STAGE)
 end
 
 """
