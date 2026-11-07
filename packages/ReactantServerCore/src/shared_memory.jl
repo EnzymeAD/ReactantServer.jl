@@ -353,9 +353,10 @@ function _lookup_region(reg::SharedMemoryRegistry, name::AbstractString)
     return r
 end
 
-# Bounds-checked raw byte base within a region. Caller MUST hold `r.lock` and have verified
-# `r.attached`.
-function _region_base(r::ShmRegion, offset::Integer, byte_size::Integer)
+# The access `[offset, offset + byte_size)` of region `r`, checked against its registered window
+# and narrowed to Int. Reads only the registration's constant fields, so it needs no lock: the
+# decoder checks a shared-memory output's window with it before any compute.
+function _check_window(r::ShmRegion, offset::Integer, byte_size::Integer)
     # Range-check the untrusted values before narrowing, and use the subtraction form for the
     # bounds check: `off + bs` could wrap for hostile int64 parameters.
     (0 <= offset <= typemax(Int) && 0 <= byte_size <= typemax(Int)) ||
@@ -374,6 +375,13 @@ function _region_base(r::ShmRegion, offset::Integer, byte_size::Integer)
                 "'$(r.name)' of $(r.byte_size) bytes"
         )
     )
+    return off, bs
+end
+
+# Bounds-checked raw byte base within a region. Caller MUST hold `r.lock` and have verified
+# `r.attached`.
+function _region_base(r::ShmRegion, offset::Integer, byte_size::Integer)
+    off, bs = _check_window(r, offset, byte_size)
     return r.ptr + r.offset + off, bs
 end
 
@@ -404,20 +412,30 @@ end
 
 """
     shm_read(registry, name, offset, byte_size) -> Vector{UInt8}
+    shm_read(alloc, registry, name, offset, byte_size) -> Array
 
-Copy `[offset, offset+byte_size)` of the named region into a fresh byte vector. The copy is
+Copy `[offset, offset+byte_size)` of the named region into a fresh byte vector, or into the array
+`alloc(byte_size)` returns, which must hold exactly `byte_size` bytes of a bits type (a decoded
+tensor is read straight into its final array this way, with no intermediate copy). The copy is
 done while the region's lock is held, so a concurrent `shm_unregister!` of the same region
 cannot detach the mapping underneath the read. The object must still cover the range
 ([`ShmRegionShrunkError`](@ref) otherwise), and its pages are allocated first
-([`ShmSpaceError`](@ref) when `/dev/shm` has no room), so the copy cannot raise SIGBUS.
+([`ShmSpaceError`](@ref) when `/dev/shm` has no room), so the copy cannot raise SIGBUS. The
+destination is allocated only after the range has passed both checks.
 """
 function shm_read(reg::SharedMemoryRegistry, name::AbstractString, offset::Integer, byte_size::Integer)
+    return shm_read(bs -> Vector{UInt8}(undef, bs), reg, name, offset, byte_size)
+end
+
+function shm_read(alloc, reg::SharedMemoryRegistry, name::AbstractString, offset::Integer, byte_size::Integer)
     r = _lookup_region(reg, name)
     @lock r.lock begin
         r.attached || throw(UnregisteredRegionError(String(name)))
         base, bs = _backed_region_base(r, offset, byte_size)
-        out = Vector{UInt8}(undef, bs)
-        GC.@preserve r out unsafe_copyto!(pointer(out), base, bs)
+        out = alloc(bs)
+        (out isa Array && isbitstype(eltype(out)) && sizeof(out) == bs) ||
+            throw(ArgumentError("shm_read: the destination for $bs bytes of region '$(r.name)' does not hold exactly $bs bytes of a bits type"))
+        GC.@preserve r out unsafe_copyto!(convert(Ptr{UInt8}, pointer(out)), base, bs)
         return out
     end
 end

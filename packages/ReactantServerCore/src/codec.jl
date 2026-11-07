@@ -117,6 +117,24 @@ function _array_from_raw(dt::DType, wire_shape::Vector{Int}, raw::AbstractVector
     return arr
 end
 
+# A tensor held in a registered shared-memory region, read straight into its final array (one copy,
+# out of the mapping). The client's byte size must equal what the shape and dtype need, and is
+# checked before the region is touched (CORE-7): reading it first made a wrong byte size cost a
+# buffer of that size, and, since the reads allocate missing /dev/shm pages, that many pages of the
+# region, up to the whole registered window, before the request was refused.
+function _array_from_shm(
+        registry::SharedMemoryRegistry, dt::DType, wire_shape::Vector{Int}, region::AbstractString,
+        offset::Int, bsize::Int, what::AbstractString
+    )
+    T = julia_type(dt)
+    n, nbytes = _checked_elems(T, wire_shape)
+    nbytes == bsize || error(
+        "'$_SHM_BYTE_SIZE' for $what is $bsize bytes, but shape $wire_shape of " *
+            "$(kserve_string(dt)) needs $nbytes"
+    )
+    return shm_read(_ -> _alloc_julia(T, wire_shape, n), registry, region, offset, nbytes)
+end
+
 function _array_from_contents(dt::DType, wire_shape::Vector{Int}, c)
     T = julia_type(dt)
     vals = if dt == BOOL
@@ -240,11 +258,12 @@ function decode_infer_request(
         t = msg.inputs[i]
         dt = dtype_from_kserve(t.datatype)
         shape = Int[Int(s) for s in t.shape]
-        ref = _shm_reference(t.parameters, "input '$(t.name)'")
+        what = "input '$(t.name)'"
+        ref = _shm_reference(t.parameters, what)
         data = if ref !== nothing
-            registry === nothing && error("input '$(t.name)' references shared memory but the server has no registry")
+            registry === nothing && error("$what references shared memory but the server has no registry")
             region, offset, bsize = ref
-            _array_from_raw(dt, shape, shm_read(registry, region, offset, bsize))
+            _array_from_shm(registry, dt, shape, region, offset, bsize, what)
         elseif use_raw
             _array_from_raw(dt, shape, msg.raw_input_contents[i])
         elseif t.contents !== nothing
@@ -261,8 +280,11 @@ function decode_infer_request(
         ref = _shm_reference(o.parameters, "output '$(o.name)'")
         ref === nothing && continue
         # Resolve the region now: an unknown one fails before any compute (FAILED_PRECONDITION), and
-        # the write later goes to exactly this registration.
+        # the write later goes to exactly this registration. A window outside the registered one is
+        # refused now too (INVALID_ARGUMENT), not after the model has run. The produced bytes are
+        # checked against the window before anything is written, and only their pages are touched.
         mapping = registry === nothing ? nothing : _lookup_region(registry, first(ref))
+        mapping === nothing || _check_window(mapping, ref[2], ref[3])
         targets[o.name] = OutputTarget(ref..., mapping)
     end
 
