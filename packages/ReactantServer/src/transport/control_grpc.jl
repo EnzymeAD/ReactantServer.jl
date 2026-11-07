@@ -30,7 +30,8 @@ function _as_control(f)
         e isa gRPCServer.GRPCError && rethrow()
         msg = sprint(showerror, e)
         e isa ModelNotFoundError && _not_found(msg)
-        e isa WorkerUnavailableError && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, msg))
+        (e isa WorkerUnavailableError || e isa WeightsReadStalledError) &&
+            throw(gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, msg))
         _client_data_error(e) && _invalid(msg)
         throw(gRPCServer.GRPCError(gRPCServer.StatusCode.FAILED_PRECONDITION, msg))
     end

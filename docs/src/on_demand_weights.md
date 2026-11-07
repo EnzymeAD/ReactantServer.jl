@@ -204,7 +204,9 @@ The same holds for every other load. Compaction, and the fallback compaction adm
 only models with a host copy to upload from; a model without one stays evicted until its next request
 reads it in the background. A hot reload from the directory watcher reads the new version's weights
 before it takes the GPU loop (and attaches a `residency: system` floor after), and a residency change
-on an externally managed worker reads before its control step.
+on an externally managed worker reads before its control step. That read is watched for progress like
+the reads above: one that stalls fails the `SetModelResidency` call with `UNAVAILABLE`, and the next
+residency change, for any other model, does not wait for it.
 
 A gateway moving a model onto a worker can read it there ahead of time: the worker's
 `StageWeights` RPC reads the named models into host memory on background tasks, holds what it read

@@ -77,7 +77,7 @@ end
 # once first, unwatched, so that compiling it never counts against a watched read's stall limit.
 function _sl_scheduler(
         entries...; stall = 1.0, timeout = 10.0, device_models = 1, bound = 4,
-        store = ReactantServer.PrivateWeightStore()
+        store = ReactantServer.PrivateWeightStore(), mode = ReactantServer.SELF_MANAGED
     )
     backend = ReactantServer.MockBackend()
     pool = ReactantServer.MemoryPool(backend, ReactantServer.MockClient(), ReactantServer.MockDevice(0), "mock", nothing)
@@ -92,7 +92,7 @@ function _sl_scheduler(
     for e in entries
         e.sched = ReactantServer.ModelSchedState(e.name, ReactantServer.ModelSchedConfig(1.0), 0.0)
     end
-    wc = ReactantServer.WeightCache(backend, pool, reg, device_models * _WBYTES; store = store)
+    wc = ReactantServer.WeightCache(backend, pool, reg, device_models * _WBYTES; store = store, mode = mode)
     ReactantServer.release_staged!(wc, entries[1], ReactantServer.stage_host_weights(wc, entries[1]); uploaded = false)
     sched.weight_cache = wc
     sched.stalled_read_bound = bound
@@ -341,6 +341,49 @@ end
         @test _sl_infer(sched, "B") == _ST_OUT
         @test time() - t0 > 1.1
         @test ReactantServer.weight_cache_metrics(sched).stalled_reads == 0
+    finally
+        _sl_release_all!()
+        ReactantServer._PREAD[] = old
+        ReactantServer.shutdown!(sched)
+    end
+end
+
+@testset "stalled reads: a residency change whose read stalls fails UNAVAILABLE and holds up no other ($target)" for target in (:device, :system)
+    # Under externally managed residency the SetModelResidency RPC reads the weights before its
+    # control step, holding the lock that orders residency changes. A read that never returns used to
+    # hang that call and every residency change after it.
+    old = ReactantServer._PREAD[]
+    ReactantServer._PREAD[] = _sl_pread
+    A = _sl_entry("A")
+    B = _sl_entry("B")
+    sched = _sl_scheduler(A, B; stall = 1.0, mode = ReactantServer.EXTERNALLY_MANAGED)
+    ctx = ReactantServer.InferContext(sched, sched.registry, ReactantServer.SharedMemoryRegistry(), "mock")
+    Ctl = ReactantServer.control
+    wire = target === :device ? Ctl.Residency.PINNED_DEVICE : Ctl.Residency.PINNED_SYSTEM
+    rpc(name) = try
+        ReactantServer._handle_set_model_residency(ctx, Ctl.SetModelResidencyRequest(; name = name, target = wire)).residency
+    catch err
+        err
+    end
+    unavailable(err) = err isa ReactantServer.gRPCServer.GRPCError &&
+        err.code == ReactantServer.gRPCServer.StatusCode.UNAVAILABLE
+    try
+        _sl_hold!(B)
+        tB = Threads.@spawn rpc("B")
+        ok = timedwait(() -> istaskdone(tB), 6.0) === :ok
+        @test ok                                            # within the stall limit, not when the read returns
+        ok || _sl_release!(B)
+        err = fetch(tB)
+        @test unavailable(err) && occursin("stalled", err.message)
+        @test !islocked(sched.residency_lock)
+        # Another model's change goes through; the stalled model's fails at once while its read is out.
+        @test rpc("A") == wire
+        t0 = time()
+        @test unavailable(rpc("B")) && time() - t0 < 1.0
+        # Once the read returns, what it read is let go, and the change for B goes through.
+        _sl_release!(B)
+        @test _sl_until(() -> _sl_outstanding(sched) == 0)
+        @test rpc("B") == wire
     finally
         _sl_release_all!()
         ReactantServer._PREAD[] = old
