@@ -7,7 +7,8 @@
 # workers refuse new requests with UNAVAILABLE, finish the admitted ones, and every process exits
 # 0), and what a client is told of an INTERNAL error in each `grpc.error_detail` mode (a second
 # node runs with `full`), and, on that node, shared-memory outputs under client give-ups and a
-# worker restart under one client. Needs no GPU.
+# worker restart under one client: the worker is stopped (SIGSTOP), so the supervisor's liveness
+# check has to find it and kill it. Needs no GPU.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
@@ -176,6 +177,25 @@ for tag in 'worker="worker0"' 'worker="worker1"' 'gateway_worker_metrics_up'; do
 done
 echo "   aggregated /metrics carries per-worker series."
 
+# Once ready, each worker's liveness is checked on its own /healthz (the default 10 s interval).
+for w in worker0 worker1; do
+    deadline=$((SECONDS + 60))
+    until grep -q "^\[supervisor\] $w is ready; checking its liveness" "$WORK/supervisor.log"; do
+        if ((SECONDS >= deadline)); then
+            echo "ERROR: the supervisor never started checking $w's liveness; supervisor lines:"
+            grep "^\[supervisor\]" "$WORK/supervisor.log" | tail -40
+            exit 1
+        fi
+        sleep 1
+    done
+done
+if grep -q "^\[supervisor\] .*failed a liveness check" "$WORK/supervisor.log"; then
+    echo "ERROR: a healthy worker failed a liveness check:"
+    grep "^\[supervisor\] .*liveness" "$WORK/supervisor.log"
+    exit 1
+fi
+echo "   the supervisor checks both workers' liveness, and both answer."
+
 # The forced INTERNAL error is in the log of the worker the client was told about, under the same
 # request id, with the exception text the client did not see.
 check_forced_log() {
@@ -227,7 +247,8 @@ check_clean_exit() {
             exit 1
         fi
     done
-    if grep -q "^\[supervisor\] .*sending SIG" "$log"; then
+    # (Step 8's liveness kill of a stopped worker is deliberate, not part of the shutdown.)
+    if [[ -n "$(grep "^\[supervisor\] .*sending SIG" "$log" | grep -v "liveness checks in a row" || true)" ]]; then
         echo "ERROR: the supervisor had to signal a child:"
         grep "^\[supervisor\] .*sending SIG" "$log"
         exit 1
@@ -257,6 +278,10 @@ sed -e "s/^base_port: .*/base_port: $BASE_PORT/" -e "s/^metrics_base_port: .*/me
     "$WORK/node.yaml" > "$WORK/node_full.yaml"
 printf '  grpc:\n    error_detail: full\n' >> "$WORK/node_full.yaml"
 write_gateway_config "$WORK/gateway_full.yml" full
+# Liveness thresholds short enough for step 8 to see a stopped worker killed within about 20 s.
+REACTANT_LIVENESS_INTERVAL_SECONDS=2 \
+REACTANT_LIVENESS_TIMEOUT_SECONDS=5 \
+REACTANT_LIVENESS_FAILURES=3 \
 REACTANT_GPUS=0 \
 REACTANT_CPU_WORKERS=2 \
 REACTANT_WORKSPACE_ROOT="$REPO_ROOT" \
@@ -291,7 +316,8 @@ check_forced_log full "$WORK/supervisor_full.log"
 
 echo "== [8/8] shared memory: short deadlines, then a worker restart under the same client =="
 # Phase A drives shared-memory outputs with deadlines short enough that clients give up while
-# requests run (CORE-3). Then worker1 is killed; once the supervisor has restarted it and the
+# requests run (CORE-3). Then worker1 is stopped (SIGSTOP: alive, but answering nothing, as a hung
+# worker); the supervisor's liveness check kills it and the supervisor restarts it. Once the
 # gateway reports it ready again, phase B checks that the same client process re-registers the
 # same region and keeps getting correct answers (CORE-2), each within a few seconds although phase
 # A gave up on about a thousand requests over its connection to the gateway (GW-18). It runs on
@@ -311,8 +337,8 @@ done
 log="$WORK/supervisor_full.log"
 old_pid="$(grep -oE 'started worker1 \(pid [0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$')"
 seen_ready="$(grep -c "health: worker ready again" "$log" || true)"
-echo "   killing worker1 (pid $old_pid) with SIGKILL"
-kill -KILL "$old_pid"
+echo "   stopping worker1 (pid $old_pid) with SIGSTOP; the supervisor's liveness check should kill it"
+kill -STOP "$old_pid"
 deadline=$((SECONDS + READY_TIMEOUT))
 until new_pid="$(grep -oE 'started worker1 \(pid [0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$')" &&
     [[ -n "$new_pid" && "$new_pid" != "$old_pid" ]] &&
@@ -323,7 +349,12 @@ until new_pid="$(grep -oE 'started worker1 \(pid [0-9]+' "$log" | tail -1 | grep
     fi
     sleep 2
 done
-echo "   worker1 restarted (pid $new_pid) and the gateway reports it ready"
+if ! grep -q "^\[supervisor\] worker1 failed 3 liveness checks in a row; sending SIGKILL" "$log"; then
+    echo "ERROR: worker1 came back, but not through its liveness check; supervisor lines:"
+    grep "^\[supervisor\]" "$log" | tail -40
+    exit 1
+fi
+echo "   worker1 was killed by its liveness check, restarted (pid $new_pid), and the gateway reports it ready"
 touch "$WORK/markers/restarted"
 set +e
 wait "$SHM_CLIENT_PID"

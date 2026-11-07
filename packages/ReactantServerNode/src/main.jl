@@ -101,6 +101,103 @@ function _set_node_rapid_reset!(node::AbstractDict, value::Bool)
     return node
 end
 
+# The node's worker liveness settings: for each one its `REACTANT_LIVENESS_*` variable, else the
+# node file's top-level `liveness:` block, else the default (spec.jl). `failures: 0` turns the
+# supervisor's check off; `dispatch_stall_seconds: 0` turns off the worker's own stall report.
+const _LIVENESS_KEYS = (
+    (:interval_seconds, "interval_seconds", "REACTANT_LIVENESS_INTERVAL_SECONDS", LIVENESS_INTERVAL_SECONDS),
+    (:timeout_seconds, "timeout_seconds", "REACTANT_LIVENESS_TIMEOUT_SECONDS", LIVENESS_TIMEOUT_SECONDS),
+    (:failures, "failures", "REACTANT_LIVENESS_FAILURES", LIVENESS_FAILURES),
+    (:dispatch_stall_seconds, "dispatch_stall_seconds", DISPATCH_STALL_ENV, DISPATCH_STALL_SECONDS),
+)
+
+function _liveness_settings(node::Union{AbstractDict, Nothing}, env::AbstractDict)
+    block = node === nothing ? nothing : get(node, "liveness", nothing)
+    block === nothing && (block = Dict{String, Any}())
+    block isa AbstractDict || throw(ConfigError("node config 'liveness' must be a mapping"))
+    known = [k[2] for k in _LIVENESS_KEYS]
+    for k in keys(block)
+        String(k) in known ||
+            throw(ConfigError("node config 'liveness' has no setting '$k' (it takes $(join(known, ", ")))"))
+    end
+    values = map(_LIVENESS_KEYS) do (_, key, var, default)
+        raw = strip(get(env, var, ""))
+        if !isempty(raw)
+            x = tryparse(Float64, raw)
+            x === nothing && throw(ConfigError("$var must be a number, got $(repr(env[var]))"))
+            return x
+        end
+        haskey(block, key) || return Float64(default)
+        x = block[key]
+        (x isa Real && !(x isa Bool)) ||
+            throw(ConfigError("node config 'liveness.$key' must be a number, got $(repr(x))"))
+        return Float64(x)
+    end
+    s = NamedTuple{first.(_LIVENESS_KEYS)}(values)
+    for key in (:interval_seconds, :timeout_seconds)
+        (s[key] > 0 && isfinite(s[key])) ||
+            throw(ConfigError("liveness.$key must be a positive number of seconds, got $(s[key])"))
+    end
+    (s.failures >= 0 && isinteger(s.failures)) ||
+        throw(ConfigError("liveness.failures must be a whole number, 0 to turn the check off, got $(s.failures)"))
+    s.dispatch_stall_seconds >= 0 ||
+        throw(ConfigError("liveness.dispatch_stall_seconds must be 0 (off) or more, got $(s.dispatch_stall_seconds)"))
+    return merge(s, (; failures = Int(s.failures)))
+end
+
+# The address the supervisor reaches a listener bound to `host` on: loopback for a wildcard bind,
+# the address itself otherwise, or `nothing` for a name that does not resolve.
+function _probe_ip(host::AbstractString)
+    h = strip(host)
+    h in ("", "0.0.0.0", "*", "localhost") && return Sockets.IPv4("127.0.0.1")
+    h == "::" && return Sockets.IPv6("::1")
+    try
+        return parse(Sockets.IPAddr, h)
+    catch
+    end
+    try
+        return Sockets.getaddrinfo(h)
+    catch
+        return nothing
+    end
+end
+
+# Where a worker's liveness is checked: its HTTP listener (`endpoints.metrics_port`) as the worker
+# itself resolves it, from its node entry, then the inherited `INFERENCE_SERVER_ENDPOINTS_*`
+# variables, then `metrics_port` (a sole worker's public port, which the supervisor sets). Returns
+# `(ip, port)`, or `nothing` when the worker has no such listener.
+function _liveness_target(
+        node::AbstractDict, name::AbstractString, env::AbstractDict;
+        metrics_port::Union{Integer, Nothing} = nothing
+    )
+    ep = get(worker_raw_config(node, name), "endpoints", Dict{String, Any}())
+    ep isa AbstractDict || return nothing
+    port = if metrics_port !== nothing
+        Int(metrics_port)
+    elseif haskey(env, "INFERENCE_SERVER_ENDPOINTS_METRICS_PORT")
+        something(tryparse(Int, strip(env["INFERENCE_SERVER_ENDPOINTS_METRICS_PORT"])), 0)
+    else
+        p = get(ep, "metrics_port", 0)
+        p isa Integer ? Int(p) : 0
+    end
+    0 < port <= 65535 || return nothing
+    host = get(env, "INFERENCE_SERVER_ENDPOINTS_HOST", get(ep, "host", "127.0.0.1"))
+    ip = host isa AbstractString ? _probe_ip(host) : nothing
+    return ip === nothing ? nothing : (ip, port)
+end
+
+# The startup line saying how the workers' liveness is checked; `unchecked` names the workers with
+# no HTTP listener to check.
+function _liveness_note(s, unchecked::Vector{String}, nworkers::Integer)
+    stall = s.dispatch_stall_seconds == 0 ? "off" : "$(_secs(s.dispatch_stall_seconds))s"
+    s.failures == 0 && return "worker liveness checks: off (liveness.failures is 0); worker dispatch stall limit: $stall"
+    length(unchecked) == nworkers &&
+        return "worker liveness checks: off, no worker has an HTTP listener to check (set metrics_base_port); worker dispatch stall limit: $stall"
+    note = "worker liveness checks: /healthz every $(_secs(s.interval_seconds))s once ready, $(_secs(s.timeout_seconds))s to answer, SIGKILL after $(s.failures) failures in a row; worker dispatch stall limit: $stall"
+    isempty(unchecked) || (note *= "; not checked (no HTTP listener): $(join(unchecked, ", "))")
+    return note
+end
+
 # Write the materialized (workers synthesized, devices assigned) node file where children and
 # the healthcheck can read it. /run/reactantserver in the container; a temp dir elsewhere.
 function _write_materialized(node::AbstractDict, runtime_dir::Union{AbstractString, Nothing})
@@ -196,6 +293,7 @@ function build_supervisor(
     # One node-level setting turns HTTP/2 Rapid-Reset protection on or off for every child launched
     # here: the workers through the node file they read, the gateway through its environment.
     rapid_reset = _node_rapid_reset_protection(node, env)
+    liveness = _liveness_settings(node, env)
 
     if r === :gateway
         push!(specs, gateway_spec(children; gateway_path = gw_path, rapid_reset_protection = rapid_reset))
@@ -229,6 +327,19 @@ function build_supervisor(
                 max(1, parse(Int, v))
         end
         push!(notes, "worker compute threads: $worker_threads (host $(Sys.CPU_THREADS) / $(length(ws)) worker(s))")
+        # Each worker's liveness is checked on its HTTP listener once it has been ready (see
+        # `LivenessCheck`); a worker without one is only restarted when it exits.
+        checks = Union{LivenessCheck, Nothing}[
+            liveness.failures == 0 ? nothing :
+                let t = _liveness_target(node, _worker_name(w), env; metrics_port = sole_public ? mpub : nothing)
+                    t === nothing ? nothing : LivenessCheck(
+                        t...; interval_seconds = liveness.interval_seconds,
+                        timeout_seconds = liveness.timeout_seconds, failures = liveness.failures
+                    )
+            end
+                for w in ws
+        ]
+        push!(notes, _liveness_note(liveness, String[_worker_name(w) for (w, c) in zip(ws, checks) if c === nothing], length(ws)))
         # Meta sub-calls run in-process on each worker now (no loopback, no shared-memory mesh), so a
         # worker needs neither a gateway endpoint nor a fan-out region injected. Each worker keeps its
         # own local meta-scratch pool (sized by REACTANT_FANOUT_BYTES/_SLOTS, read in serve()).
@@ -238,11 +349,13 @@ function build_supervisor(
                     worker_spec(
                         _worker_name(w), node_file, selectors[i], children;
                         compute_threads = worker_threads, grpc_port = gpub, metrics_port = mpub,
-                        node_workers = length(ws), drain_seconds = PUBLIC_DRAIN_SECONDS
+                        node_workers = length(ws), drain_seconds = PUBLIC_DRAIN_SECONDS,
+                        liveness = checks[i], dispatch_stall_seconds = liveness.dispatch_stall_seconds
                     ) :
                     worker_spec(
                         _worker_name(w), node_file, selectors[i], children;
-                        compute_threads = worker_threads, node_workers = length(ws)
+                        compute_threads = worker_threads, node_workers = length(ws),
+                        liveness = checks[i], dispatch_stall_seconds = liveness.dispatch_stall_seconds
                     )
             )
         end
@@ -279,8 +392,10 @@ end
 
 Run the node: spawn one worker subprocess per visible GPU (and the embedded gateway in the
 default all-in-one role), multiplex their output onto `sink` with `[name]` line prefixes,
-restart children that die, and block until SIGTERM/SIGINT (or a crash-loop budget breach).
-Returns the process exit code.
+restart children that die, kill and restart a worker that stops answering its liveness check
+once it has been ready (the node file's `liveness:` block; see Worker liveness under Node
+Configuration), and block until SIGTERM/SIGINT (or a crash-loop budget breach). Returns the
+process exit code.
 """
 function supervise(
         node_path::AbstractString; sink::IO = stdout, env::AbstractDict = ENV,

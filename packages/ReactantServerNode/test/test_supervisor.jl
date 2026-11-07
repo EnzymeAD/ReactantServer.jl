@@ -357,6 +357,98 @@ end
     end
 end
 
+# A stand-in worker with an HTTP listener on `port` answering /readyz and /healthz with 200. Its
+# first run (no `marker` file yet) misbehaves 3 s after it starts, by `mode`: "stop" stops the whole
+# process (SIGSTOP, as a deadlock or a wedged runtime would: nothing answers); "unlive" answers
+# /healthz with 503, as a worker whose dispatch loop is stalled does. "never_ready" answers /readyz
+# with 503 and never answers /healthz, as a worker still compiling its models does.
+const _FAKE_WORKER = raw"""
+using Sockets
+port, mode, marker = parse(Int, ARGS[1]), ARGS[2], ARGS[3]
+first_run = !isfile(marker)
+touch(marker)
+srv = listen(ip"127.0.0.1", port)
+t0 = time()
+println("up"); flush(stdout)
+misbehaving() = first_run && time() - t0 > 3.0
+while true
+    s = accept(srv)
+    @async try
+        path = split(readline(s))[2]
+        while !isempty(readline(s))
+        end
+        code = 200
+        if mode == "never_ready"
+            path == "/readyz" ? (code = 503) : sleep(3600)
+        elseif mode == "unlive" && misbehaving() && path == "/healthz"
+            code = 503
+        elseif mode == "stop" && misbehaving()
+            ccall(:kill, Cint, (Cint, Cint), getpid(), 19)
+        end
+        write(s, "HTTP/1.1 $code X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    catch
+    finally
+        close(s)
+    end
+end
+"""
+
+function _free_port()
+    s = RSN.Sockets.listen(RSN.Sockets.IPv4("127.0.0.1"), 0)
+    port = Int(RSN.Sockets.getsockname(s)[2])
+    close(s)
+    return port
+end
+
+function _fake_worker(name, mode, dir; interval = 0.5, timeout = 1.0, failures = 3)
+    port = _free_port()
+    cmd = `$(Base.julia_cmd()) --startup-file=no -e $_FAKE_WORKER $port $mode $(joinpath(dir, "marker"))`
+    chk = RSN.LivenessCheck("127.0.0.1", port; interval_seconds = interval, timeout_seconds = timeout, failures = failures)
+    return RSN.ChildSpec(name, addenv(cmd, "JULIA_LOAD_PATH" => "@stdlib"), 5.0, 0.0, 1, chk)
+end
+
+@testset "supervisor: a worker that stops answering once ready is killed and restarted ($mode)" for (mode, why) in (
+        ("stop", "no answer to /healthz within 1s"), ("unlive", "/healthz answered HTTP 503"),
+    )
+    # Before, the supervisor reacted only to an exit, so a worker that hung (or whose dispatch loop
+    # stalled) after it had become ready was never restarted.
+    sink = IOBuffer()
+    sup = RSN.Supervisor([_fake_worker("w", mode, mktempdir())]; sink = sink)
+    t = @async RSN.run_supervisor!(sup; install_signal_handlers = false)
+    try
+        @test wait_for(() -> count(==("[supervisor] w is ready; checking its liveness every 0.5s (SIGKILL after 3 failures in a row, 1s to answer each)"), _sink_lines(sink)) == 2; timeout = 90)
+        lines = _sink_lines(sink)
+        for k in 1:3
+            @test any(==("[supervisor] w failed a liveness check ($k of 3): $why"), lines)
+        end
+        @test any(==("[supervisor] w failed 3 liveness checks in a row; sending SIGKILL so it is restarted"), lines)
+        @test any(l -> startswith(l, "[supervisor] w exited (") && occursin("signal=9,", l), lines)
+        @test count(l -> startswith(l, "[supervisor] started w (pid "), lines) == 2
+        @test process_running(sup.children[1].proc)          # the restarted copy, checked again
+    finally
+        RSN.request_shutdown!(sup)
+        @test fetch(t) == 0
+    end
+end
+
+@testset "supervisor: a worker that has not been ready is never killed by its liveness check" begin
+    # Startup can compile for hours. Until /readyz first answers 200, /healthz is not even asked.
+    sink = IOBuffer()
+    sup = RSN.Supervisor([_fake_worker("slow", "never_ready", mktempdir())]; sink = sink)
+    t = @async RSN.run_supervisor!(sup; install_signal_handlers = false)
+    try
+        @test wait_for(() -> any(==("[slow] up"), _sink_lines(sink)))
+        sleep(6.0)                                           # a dozen check intervals
+        lines = _sink_lines(sink)
+        @test !any(l -> occursin("liveness", l) || occursin("SIGKILL", l), lines)
+        @test count(l -> startswith(l, "[supervisor] started slow"), lines) == 1
+        @test process_running(sup.children[1].proc)
+    finally
+        RSN.request_shutdown!(sup)
+        @test fetch(t) == 0
+    end
+end
+
 @testset "supervisor: grace windows run in parallel" begin
     sink = IOBuffer()
     # TERM-ignoring children (exec keeps the ignored disposition, so SIGKILL leaves no orphan).

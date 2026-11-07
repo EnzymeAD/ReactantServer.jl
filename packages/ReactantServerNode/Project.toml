@@ -5,6 +5,7 @@ authors = ["Carroll Vance <cvance@medicalmetrics.com>"]
 
 [deps]
 ReactantServerCore = "387a5f05-f7b4-4d57-bca9-cd3358e52bdc"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 YAML = "ddb6d928-2868-570f-bddf-ab3f9cf99eb6"
 
@@ -19,6 +20,7 @@ ReactantServerGateway = "b92f1031-7cb7-4fde-89de-b6dd50303018"
 ReactantServer = "0.2"
 ReactantServerCore = "2.0.0"
 ReactantServerGateway = "0.2"
+Sockets = "1"
 TOML = "1"
 YAML = "0.4.16"
 julia = "1.12"

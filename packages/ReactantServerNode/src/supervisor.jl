@@ -1,7 +1,8 @@
 # The supervision core: spawn each child with piped stdout/stderr, pump both streams line by
 # line into a bounded log queue that one writer task drains onto the shared sink (so lines never
 # interleave mid-line, the docker-compose look, and a sink that stops taking lines never stops a
-# child), restart children that die with capped exponential backoff, and on shutdown stop the
+# child), restart children that die with capped exponential backoff, kill (and so restart) a worker
+# that has been ready but stops answering its liveness check, and on shutdown stop the
 # children stage by stage: the gateway first, then the workers. A child with a drain budget is asked
 # to drain by closing its stdin (see ReactantServerCore's drain.jl) and given that long to finish
 # its requests; anything else is sent SIGTERM. Each stage's children are waited for in parallel, and
@@ -277,12 +278,90 @@ function _run_once!(sup::Supervisor, c::Child)
     end
     pid = _child_pid(r.proc)
     _slog(sup, "started $(c.spec.name) (pid $(pid === nothing ? "unknown: it has already exited" : pid))")
+    chk = c.spec.liveness
+    chk === nothing || errormonitor(@async _watch_liveness(sup, c, r.proc, chk))
     wait(r.proc)
-    _finish_run!(c, r)
+    _finish_run!(sup, c, r)
     uptime = time() - c.started_at
     sup.shutting_down[] ||
         _slog(sup, "$(c.spec.name) exited (code=$(r.proc.exitcode), signal=$(r.proc.termsignal), uptime=$(round(uptime; digits = 1))s)")
     return uptime
+end
+
+# Sleep up to `secs` while `going()` holds. Returns whether it still holds.
+function _pause(going, secs::Real)
+    deadline = time() + secs
+    while going()
+        now = time()
+        now >= deadline && return true
+        sleep(min(0.2, deadline - now))
+    end
+    return false
+end
+
+# Check one run of a worker with `chk` (see `LivenessCheck`) until it exits or the node stops:
+# wait for its first ready answer, then ask `/healthz` every interval, and send SIGKILL after
+# `chk.failures` failures in a row. The exit then takes the ordinary restart path.
+function _watch_liveness(sup::Supervisor, c::Child, proc::Base.Process, chk::LivenessCheck)
+    name = c.spec.name
+    going() = process_running(proc) && !sup.shutting_down[]
+    try
+        armed = false
+        failed = 0
+        while _pause(going, chk.interval)
+            if !armed
+                armed = _probe(chk, "/readyz") === nothing
+                (armed && going()) &&
+                    _slog(sup, "$name is ready; checking its liveness every $(_secs(chk.interval))s (SIGKILL after $(chk.failures) failures in a row, $(_secs(chk.timeout))s to answer each)")
+                continue
+            end
+            why = _probe(chk, "/healthz")
+            going() || break
+            if why === nothing
+                failed > 0 && _slog(sup, "$name answered its liveness check again after $failed failure(s)")
+                failed = 0
+                continue
+            end
+            failed += 1
+            _slog(sup, "$name failed a liveness check ($failed of $(chk.failures)): $why")
+            failed < chk.failures && continue
+            _slog(sup, "$name failed $(chk.failures) liveness checks in a row; sending SIGKILL so it is restarted")
+            kill(proc, Base.SIGKILL)
+            _pause(() -> process_running(proc), 30.0) &&
+                _slog(sup, "$name is still running 30s after SIGKILL (blocked in the kernel?); it is restarted once it exits")
+            break
+        end
+    catch err
+        _slog(sup, "liveness checks of $name stopped after an unexpected error; it is still restarted when it exits:\n$(_describe(err, catch_backtrace()))")
+    end
+    return nothing
+end
+
+_hostport(chk::LivenessCheck) = chk.ip isa Sockets.IPv6 ? "[$(chk.ip)]:$(chk.port)" : "$(chk.ip):$(chk.port)"
+
+# One HTTP/1.1 GET of `path` on the child's listener: `nothing` when it answers 200 within the
+# timeout, otherwise a short reason. Only the status line is read. Closing the socket on a timeout
+# also cancels a connect still in progress, so nothing is left waiting behind a hung child.
+function _probe(chk::LivenessCheck, path::AbstractString)
+    sock = Sockets.TCPSocket()
+    t = @async begin
+        Sockets.connect(sock, chk.ip, chk.port)
+        write(sock, "GET $path HTTP/1.1\r\nHost: $(_hostport(chk))\r\nConnection: close\r\n\r\n")
+        readline(sock)
+    end
+    done = timedwait(() -> istaskdone(t), chk.timeout; pollint = 0.05) === :ok
+    _close_quietly(sock)
+    done || return "no answer to $path within $(_secs(chk.timeout))s"
+    if istaskfailed(t)
+        err = t.result
+        return "$path: $(err isa Exception ? sprint(showerror, err) : string(err))"
+    end
+    status = fetch(t)
+    m = match(r"^HTTP/\d(?:\.\d)? (\d{3})", status)
+    m === nothing && return isempty(status) ? "$path: the connection closed without an answer" :
+        "$path: unexpected answer $(repr(first(status, 80)))"
+    code = parse(Int, m[1])
+    return code == 200 ? nothing : "$path answered HTTP $code"
 end
 
 # Bring a child whose supervision hit an unexpected error back to a known state before it is

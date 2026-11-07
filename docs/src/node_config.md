@@ -26,6 +26,9 @@ metrics_base_port: 9100
 # (ordinals or GPU UUIDs). The supervisor synthesizes one worker per selected device.
 # gpus: auto
 
+# Supervisor-only: how a worker that stops working while it still runs is found and restarted.
+# liveness: { interval_seconds: 10, timeout_seconds: 10, failures: 6, dispatch_stall_seconds: 600 }
+
 global:    # defaults merged into every worker (any block may be overridden per worker)
 workers:   # optional under the supervisor; one entry per GPU
 models:    # optional; pins the named models to device memory on the listed workers
@@ -42,6 +45,9 @@ models:    # optional; pins the named models to device memory on the listed work
   no `workers:` list is present: `auto` (the default) enumerates the visible devices, an
   integer is a device count, and a list gives explicit device selectors (ordinals or GPU
   UUIDs). The `REACTANT_GPUS` environment variable overrides this key.
+- `liveness` (optional, supervisor-only) sets how the supervisor checks that each worker still
+  works once it has been ready, and kills and restarts one that does not
+  ([Worker liveness](#Worker-liveness)).
 - `global` holds the defaults merged into every worker; any block may be overridden per worker.
 - `workers` lists the worker entries (optional under the supervisor).
 - `models` optionally pins the named models to device memory on the listed workers.
@@ -390,6 +396,58 @@ set decides:
 A worker or gateway run without the supervisor has only its own settings: a worker reads its node
 file's `global.grpc` and its own entry, with `INFERENCE_SERVER_GRPC_RAPID_RESET_PROTECTION` over
 both, and a gateway its `gateway.yml`, with `REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION` over it.
+
+## Worker liveness
+
+The supervisor restarts a worker that exits, and also one that is still running but no longer
+works: deadlocked, stopped, stuck in the kernel, or with its dispatch loop stuck in a GPU call that
+never returns. It checks each worker over the worker's HTTP listener (`metrics_base_port + i`, or
+the public `8002` for a sole worker):
+
+1. Until the worker's `/readyz` first answers 200, nothing is checked, so a startup that compiles
+   models for hours is never interrupted.
+2. From then on the supervisor asks `/healthz` every `interval_seconds`. An answer other than 200,
+   a refused connection, or no answer within `timeout_seconds` is a failure, and is logged.
+3. After `failures` failures in a row the supervisor logs that it is killing the worker, sends it
+   SIGKILL, and the usual restart takes over, with its backoff and its restart budget
+   (`REACTANT_SUPERVISOR_MAX_RESTARTS`). The restarted worker is checked again once it is ready.
+
+Nothing is checked while the node shuts down. A worker answers `/healthz` (and `ServerLive`) with
+"not live", and `/readyz` (and `ServerReady`, `ModelReady`) with "not ready", while its dispatch
+loop has had work in hand and finished none of it for `dispatch_stall_seconds`: a dispatch, a
+weight upload, a compaction and a control command each count as one piece of work. An idle worker
+is never stalled, and the worker says so in its log once per stall. That is how a GPU call that
+never returns is caught: the worker's other threads keep answering, but no longer "live".
+
+```yaml
+liveness:                       # supervisor-only; every key is optional
+  interval_seconds: 10          # REACTANT_LIVENESS_INTERVAL_SECONDS
+  timeout_seconds: 10           # REACTANT_LIVENESS_TIMEOUT_SECONDS
+  failures: 6                   # REACTANT_LIVENESS_FAILURES; 0 turns the check off
+  dispatch_stall_seconds: 600   # REACTANT_LIVENESS_DISPATCH_STALL_SECONDS; 0 turns it off
+```
+
+Each environment variable, set on the node container, wins over its key. With the defaults a
+worker that stops answering is killed after about two minutes, and one that answers "not live"
+after about one; a stalled dispatch loop is reported after ten minutes. These are far longer than
+anything a healthy worker does on the thread that answers (a garbage collection or a first-use
+compile takes seconds), and the stall limit is far longer than the slowest legitimate piece of work
+(minutes for a large model read from slow storage, or a compile in `dynamic` mode). The startup line
+`worker liveness checks: ...` shows what is in effect. The supervisor passes
+`dispatch_stall_seconds` to each worker in `REACTANT_LIVENESS_DISPATCH_STALL_SECONDS`; a worker run
+without the supervisor reads that variable itself, so an orchestrator's own liveness probe on
+`/healthz` gets the same answer.
+
+Some limits to know:
+
+- A worker with no HTTP listener (no `metrics_base_port` on a multi-worker node) is not checked; it
+  is restarted only when it exits, and the startup line names it.
+- In `dynamic` mode a hot load or reload compiles the new bundle on the thread that answers
+  `/healthz`, so a reload whose uncached compile stops that thread for longer than about two minutes
+  gets the worker killed and restarted, and it then loads the new version at startup. Raise
+  `timeout_seconds` or `failures` (or set `failures: 0`) if reloads of large uncached bundles must
+  not restart the worker.
+- The embedded gateway is restarted when it exits; it is not checked this way.
 
 ## Environment overrides
 

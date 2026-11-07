@@ -80,6 +80,27 @@ for the gateway and every worker the supervisor launches, and overrides
 is disconnected after about 200 calls it gave up on per connection; see
 [Rapid-Reset protection](node_config.md#Rapid-Reset-protection).
 
+### Restarts and logs
+
+A child that exits is restarted after a backoff that starts at 1 second and doubles up to 30. A
+worker that is still running but no longer works (deadlocked, stopped, stuck in the kernel, or with
+its dispatch loop stuck in a GPU call) is killed and restarted the same way: once it has first
+reported ready, the supervisor checks its `/healthz` every 10 seconds and sends it SIGKILL after 6
+failures in a row, and the worker reports itself not live once its dispatch loop has had work and
+finished none of it for 10 minutes. [Worker liveness](node_config.md#Worker-liveness) has the
+settings (the node file's `liveness:` block, or `REACTANT_LIVENESS_*` on the container) and their
+limits. With `REACTANT_SUPERVISOR_MAX_RESTARTS` set, a child that fails that many times in a row
+without a stable minute of uptime takes the node down with status 1, so the container restart
+policy acts. The supervisor never stops supervising a child silently: if it cannot go on (an
+internal error it cannot recover from), it says why and exits with status 1.
+
+The supervisor reads its children's output continuously and writes it to its own stdout from a
+bounded buffer (10,000 lines or 8 MiB). If whatever reads the container's log falls behind or stops,
+the children are unaffected: lines past the buffer are dropped, and once the log moves again one
+line says how many were dropped there and from which child. Once a child has exited, the
+supervisor reads what is left of its output for at most 5 seconds, so a process the child started
+that still holds its output open cannot delay the restart or the node's shutdown.
+
 ### Stopping
 
 On SIGTERM (or a SIGINT sent to the supervisor alone; Ctrl-C in a terminal also reaches its
@@ -222,7 +243,9 @@ override, which can be passed with `-e`.
 
 **Health.** An OCI image cannot carry a healthcheck, so pass one at run time:
 `/usr/local/bin/healthcheck.node.sh` reports healthy once the node's `/readyz` answers. Set the
-start period longer than a cold start, which compiles every model before `/readyz` succeeds.
+start period longer than a cold start, which compiles every model before `/readyz` succeeds. On a
+multi-worker node `/readyz` stays healthy while any worker is ready; a worker that stops working is
+restarted by the supervisor itself ([Restarts and logs](#Restarts-and-logs)).
 
 ### Building the image
 

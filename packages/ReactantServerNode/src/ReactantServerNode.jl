@@ -7,11 +7,13 @@
 # setups via the `workers` and `gateway` roles.
 #
 # This package never imports Reactant (or gRPC/HTTP): it only orchestrates subprocesses, so it
-# starts in about a second and stays out of the data path.
+# starts in about a second and stays out of the data path. Its one network use is the worker
+# liveness check, a plain HTTP/1.1 GET written over a `Sockets` connection.
 module ReactantServerNode
 
 using ReactantServerCore
 import ReactantServerCore: ConfigError, _node_workers, _worker_name, _worker_port
+import Sockets
 import TOML
 import YAML
 

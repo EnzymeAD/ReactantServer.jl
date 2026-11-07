@@ -620,3 +620,81 @@ end
         end
     end
 end
+
+@testset "build_supervisor: worker liveness settings" begin
+    mktempdir() do dir
+        build(path, env; tag = "run") = RSN.build_supervisor(
+            path; env = env, sink = IOBuffer(), workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, tag)
+        )
+        IPv4, IPv6 = RSN.Sockets.IPv4, RSN.Sockets.IPv6
+        stall(c) = _envval(c.spec.cmd, RSN.DISPATCH_STALL_ENV)
+
+        # The defaults: each worker is checked on its own metrics port, on loopback for its wildcard
+        # or loopback bind; the gateway is not checked; every worker gets the stall limit.
+        sink = IOBuffer()
+        sup = RSN.build_supervisor(
+            _node_yaml(dir); env = Dict("REACTANT_GPUS" => "2"), sink = sink,
+            workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "run")
+        )
+        w0, w1, gw = (c.spec for c in sup.children)
+        @test (w0.liveness.ip, w0.liveness.port, w1.liveness.port) == (IPv4("127.0.0.1"), 9100, 9101)
+        @test (w0.liveness.interval, w0.liveness.timeout, w0.liveness.failures) == (10.0, 10.0, 6)
+        @test gw.liveness === nothing
+        @test stall(sup.children[1]) == stall(sup.children[2]) == "600.0"
+        @test occursin(
+            "worker liveness checks: /healthz every 10s once ready, 10s to answer, SIGKILL after 6 failures in a row; worker dispatch stall limit: 600s",
+            String(take!(sink))
+        )
+
+        # The node file's `liveness:` block, with each REACTANT_LIVENESS_* variable over it. A sole
+        # worker is checked on the public metrics port it is moved to.
+        path = _node_yaml(dir; extra = "liveness: {interval_seconds: 5, timeout_seconds: 2.5, failures: 3, dispatch_stall_seconds: 120}")
+        sup = build(path, Dict("REACTANT_GPUS" => "1", "REACTANT_LIVENESS_FAILURES" => "4"))
+        chk = only(sup.children).spec.liveness
+        @test (chk.interval, chk.timeout, chk.failures, chk.port) == (5.0, 2.5, 4, 8002)
+        @test stall(only(sup.children)) == "120.0"
+        sup = build(path, Dict("REACTANT_GPUS" => "1", RSN.DISPATCH_STALL_ENV => "0"))
+        @test stall(only(sup.children)) == "0.0"
+
+        # `failures: 0` turns the supervisor's check off; the workers still get their stall limit.
+        sink = IOBuffer()
+        sup = RSN.build_supervisor(
+            _node_yaml(dir; extra = "liveness: {failures: 0}"); env = Dict("REACTANT_GPUS" => "2"), sink = sink,
+            workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "off")
+        )
+        @test all(c -> c.spec.liveness === nothing, sup.children)
+        @test stall(sup.children[1]) == "600.0"
+        @test occursin("worker liveness checks: off (liveness.failures is 0)", String(take!(sink)))
+
+        # A worker with no HTTP listener has nothing to check.
+        bare = joinpath(dir, "bare.yaml")
+        write(bare, "model_repo: /repo\nbase_port: 8080\nglobal:\n  runtime:\n    backend: cuda\n")
+        sink = IOBuffer()
+        sup = RSN.build_supervisor(
+            bare; env = Dict("REACTANT_GPUS" => "2"), sink = sink, workspace_root = STUB_ROOT,
+            runtime_dir = joinpath(dir, "bare")
+        )
+        @test all(c -> c.spec.liveness === nothing, sup.children)
+        @test occursin("worker liveness checks: off, no worker has an HTTP listener to check (set metrics_base_port)", String(take!(sink)))
+
+        # The address follows the worker's bind: a specific address is checked there, `::` on ::1, and
+        # the inherited INFERENCE_SERVER_ENDPOINTS_* variables win, as they do in the worker.
+        host(h; env = Dict{String, String}()) =
+            build(_node_yaml(dir; extra = "liveness: {}"), merge(Dict("REACTANT_GPUS" => "2", "INFERENCE_SERVER_ENDPOINTS_HOST" => h), env); tag = "h").children[1].spec.liveness
+        @test host("10.1.2.3").ip == IPv4("10.1.2.3")
+        @test host("::").ip == IPv6("::1")
+        @test host("0.0.0.0"; env = Dict("INFERENCE_SERVER_ENDPOINTS_METRICS_PORT" => "9500")).port == 9500
+
+        # Settings that make no sense fail at startup rather than at the first check.
+        for bad in (
+                "liveness: {interval_seconds: 0}", "liveness: {timeout_seconds: -1}", "liveness: {failures: 1.5}",
+                "liveness: {failures: -1}", "liveness: {dispatch_stall_seconds: -5}", "liveness: {interval: 5}",
+                "liveness: {failures: true}", "liveness: often",
+            )
+            @test_throws ReactantServerCore.ConfigError build(_node_yaml(dir; extra = bad), Dict("REACTANT_GPUS" => "1"); tag = "bad")
+        end
+        @test_throws ReactantServerCore.ConfigError build(
+            _node_yaml(dir), Dict("REACTANT_GPUS" => "1", "REACTANT_LIVENESS_TIMEOUT_SECONDS" => "soon"); tag = "bad"
+        )
+    end
+end

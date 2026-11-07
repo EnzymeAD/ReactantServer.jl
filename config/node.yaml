@@ -20,6 +20,18 @@ base_port: 8080
 # Prometheus targets, one per GPU (see the Deployment docs).
 metrics_base_port: 9100
 
+# Supervisor-only: how a worker that stops working while it still runs is found and restarted. Once
+# a worker's /readyz has answered (startup compiles are never interrupted), the supervisor asks its
+# /healthz every interval_seconds and sends it SIGKILL after `failures` failures in a row (0 turns
+# this off); the worker answers not live once its dispatch loop has had work and finished none of
+# it for dispatch_stall_seconds (0 turns that off). REACTANT_LIVENESS_<KEY> on the container wins.
+# Needs metrics_base_port above. These are the defaults:
+# liveness:
+#   interval_seconds: 10
+#   timeout_seconds: 10
+#   failures: 6
+#   dispatch_stall_seconds: 600
+
 global:
   cache_dir: /var/cache/reactantserver
   # Model lifecycle control mode: dynamic (default) watches the repo and hot-swaps bundles as they
