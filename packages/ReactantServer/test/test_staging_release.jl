@@ -262,3 +262,30 @@ end
         ReactantServer.shutdown!(sched)
     end
 end
+
+@testset "stage_weights: a reload between taking a model and starting its read leaves no hold (MEM-6)" begin
+    # `stage_weights!` takes the entries under the lock and starts each read under it again later, so
+    # a reload in between leaves it holding the version just unloaded. That version is not read (its
+    # weights file is closed), and no hold is made for it: one would never be claimed, and the new
+    # version would wait behind it, `:pending`, until its requests time out. Calling
+    # `_stage_entries!` with the captured entry after the reload is that interleaving.
+    A = _st_entry("A", CountingWeights())
+    B1 = _st_entry("B", CountingWeights())
+    sched = _sr_scheduler(A, B1; timeout = 5.0)
+    try
+        @test _st_infer(sched, "A") == _ST_OUT
+        B2 = _st_entry("B", CountingWeights())
+        ReactantServer._run_control(sched, _sr_reload_op(B2))
+        @test _st_infer(sched, "A") == _ST_OUT              # evicts B2, so its next request needs a read
+        @test B2.executable.weights === nothing
+        n = B1.weights.reads
+        row = only(ReactantServer._stage_entries!(sched, sched.weight_cache, [B1], 30.0))
+        @test row.state == "failed" && occursin("unloaded or replaced", row.error)
+        @test B1.weights.reads == n                         # the unloaded version was not read
+        @test !haskey(sched.prefetched, "B")
+        @test _sr_infer(sched, "B", 1.0f0) == _ST_OUT      # the new version is read and dispatched
+        @test B2.executable.weights !== nothing
+    finally
+        ReactantServer.shutdown!(sched)
+    end
+end

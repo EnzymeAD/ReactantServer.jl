@@ -188,7 +188,9 @@ A gateway moving a model onto a worker can read it there ahead of time: the work
 `StageWeights` RPC reads the named models into host memory on background tasks, holds what it read
 until each model's first dispatch uploads it (or the hold expires, at most 10 minutes), and returns
 once the reads end. Held bytes are capped at half the host weight budget (4 GiB without one); past
-the cap a model is reported `deferred`. See [primed moves](gateway.md#Primed-moves).
+the cap a model is reported `deferred`. A model the directory watcher unloads or reloads while the
+call runs is reported `failed` and nothing is held for it, so a new version is read for its own
+requests as usual. See [primed moves](gateway.md#Primed-moves).
 
 How the budget is shared depends on `shared_host_weights`:
 

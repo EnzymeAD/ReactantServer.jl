@@ -1368,7 +1368,8 @@ sub-models', taking the worst state):
 - `state`: `"resident"` (on the device, or with a host floor: nothing to read), `"staged"` (held
   in host memory now), `"deferred"` (the held bytes would pass the cap; ask again later),
   `"skipped"` (a CPU or externally-managed worker, where the gateway does not place weights), or
-  `"failed"` (the read failed, `error` says why)
+  `"failed"` (the read failed, or the model was unloaded or replaced before its weights could be
+  held; `error` says why)
 - `read`: whether the weights came from the weights file rather than a host copy
 - `nbytes`, `seconds`: the model's weight bytes, and how long the read took
 """
@@ -1415,6 +1416,7 @@ function _stage_entries!(s::Scheduler, wc, entries::Vector{ModelEntry}, hold::Fl
     )
     rows = NamedTuple[]
     pending = Tuple{ModelEntry, Prefetched}[]
+    gone(e, when) = "model '$(e.name)' was unloaded or replaced $when its weights were read; ask again"
     for e in entries
         if wc === nothing || wc.mode != SELF_MANAGED
             push!(rows, row(e, "skipped"))
@@ -1426,6 +1428,12 @@ function _stage_entries!(s::Scheduler, wc, entries::Vector{ModelEntry}, hold::Fl
             continue
         end
         state = lock(s.cond) do
+            # `stage_weights!` took the entries under an earlier hold of the lock, and a reload or
+            # unload may have run since. Such an entry's weights file is closed (a read could get
+            # another file's bytes through a reused descriptor, or fill a shared region under the old
+            # version's digest), and a hold made for it would never be claimed: the version now
+            # registered would wait behind it, `:pending`, for good (`_kick_staging!`).
+            get(s.registry.by_name, e.name, nothing) === e || return "gone"
             pf = get(s.prefetched, e.name, nothing)
             if pf !== nothing
                 pf.expires = max(pf.expires, time() + hold)      # an earlier request's read covers it
@@ -1440,7 +1448,11 @@ function _stage_entries!(s::Scheduler, wc, entries::Vector{ModelEntry}, hold::Fl
             push!(pending, (e, pf))
             return ""
         end
-        isempty(state) || push!(rows, row(e, state))
+        if state == "gone"
+            push!(rows, row(e, "failed"; error = gone(e, "before")))
+        elseif !isempty(state)
+            push!(rows, row(e, state))
+        end
     end
     for (e, pf) in pending
         t0 = time()
@@ -1454,21 +1466,25 @@ function _stage_entries!(s::Scheduler, wc, entries::Vector{ModelEntry}, hold::Fl
         dt = time() - t0
         keep = lock(s.cond) do
             pf.task = nothing
-            live = get(s.prefetched, e.name, nothing) === pf && get(s.registry.by_name, e.name, nothing) === e
-            if staged !== nothing && live
+            mine = get(s.prefetched, e.name, nothing) === pf
+            if staged !== nothing && mine && get(s.registry.by_name, e.name, nothing) === e
                 pf.staged = staged
                 pf.expires = time() + hold
                 return true
             end
-            live && delete!(s.prefetched, e.name)
+            # Not kept, so the hold goes too, whatever became of the model: left behind with nothing
+            # in it, it would keep a version registered since `:pending` for good.
+            mine && delete!(s.prefetched, e.name)
             return false
         end
         keep || staged === nothing || release_staged!(wc, e, staged; uploaded = false)
         if staged === nothing
             @warn "reading weights ahead of a placement change failed" model = e.name exception = err
             push!(rows, row(e, "failed"; seconds = dt, error = err))
+        elseif keep
+            push!(rows, row(e, "staged"; read = !staged.hit, seconds = staged.host_seconds))
         else
-            push!(rows, row(e, keep ? "staged" : "resident"; read = !staged.hit, seconds = staged.host_seconds))
+            push!(rows, row(e, "failed"; read = !staged.hit, seconds = staged.host_seconds, error = gone(e, "while")))
         end
     end
     # The dispatch loop may already have requests waiting for one of these models.
