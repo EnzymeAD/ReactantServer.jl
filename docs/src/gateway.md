@@ -590,3 +590,12 @@ returning whether it reported ready.
 - Successful `ModelInfer` requests are not logged (to keep the hot path quiet); worker errors and
   a model with no live replica are logged, and per-request latency and gRPC status are exported
   as Prometheus metrics. Logs contain no tensor data.
+- Clients choose the names they send, so they never become metric labels as sent. The `model`
+  label of `gateway_requests_total` and `gateway_request_latency_seconds` for `ModelInfer` is the
+  model's name only while the routing table holds it; every other name (one no worker serves, an
+  empty or unreadable one) is counted under the reserved label `_unknown`, the same label the
+  workers use. A model that leaves the routing table keeps its series, so the series stay bounded
+  by the models the gateway has served. Do not name a model `_unknown`: it would share that series.
+  The shared-memory register and unregister RPCs name a region, chosen by each client process, so
+  they carry an empty `model` label, as the metadata RPCs do. Under `lpt_packing`, arrivals are
+  counted only for routed models.

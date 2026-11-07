@@ -61,6 +61,8 @@ scheduler_tick!(::GatewayScheduler, ::ClientPool, ready_urls, metrics, poll) = n
 needs_routing_meta(::GatewayScheduler) = false
 
 # Record a request arrival, for schedulers that estimate arrival rate. lpt_packing overrides this.
+# The gateway calls it only for a model the routing table holds (see `_gw_infer`), so a scheduler
+# that keeps state per name keeps it for models actually served, never for names clients make up.
 record_arrival!(::GatewayScheduler, model::AbstractString) = nothing
 
 # How many items a request carries, for a scheduler that routes by work rather than by request

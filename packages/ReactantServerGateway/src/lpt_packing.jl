@@ -654,7 +654,8 @@ function set_knobs!(s::LptPackingState; kwargs...)
 end
 
 # Hot path: one dict lookup on an immutable snapshot plus an atomic increment. Insertion of a
-# never-seen model takes the lock once to swap in an extended copy.
+# never-seen model takes the lock once to swap in an extended copy, so the gateway passes only routed
+# models (see the generic in scheduler.jl): a name a client made up would cost a copy and stay forever.
 function record_arrival!(s::LptPackingState, model::AbstractString)
     counters = @atomic s.arrivals
     c = get(counters, model, nothing)
