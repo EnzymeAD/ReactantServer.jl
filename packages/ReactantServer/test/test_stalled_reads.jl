@@ -457,3 +457,28 @@ end
         end
     end
 end
+
+@testset "stalled reads: a read is counted in worker_weight_stages_total when it starts" begin
+    # Counted when it ended, a read that never returns was never counted, though the metric is the
+    # reads started.
+    old = ReactantServer._PREAD[]
+    ReactantServer._PREAD[] = _sl_pread
+    A = _sl_entry("A")
+    B = _sl_entry("B")
+    sched = _sl_scheduler(A, B; stall = 60.0)
+    stages() = ReactantServer.weight_cache_metrics(sched).stages
+    try
+        n = stages()
+        _sl_hold!(B)
+        tB = Threads.@spawn _sl_infer(sched, "B")
+        @test _sl_until(() -> _SL_WAITING[] == 1)
+        @test stages() == n + 1                             # counted while it hangs
+        _sl_release!(B)
+        @test fetch(tB) == _ST_OUT
+        @test stages() == n + 1                             # and not again when it ends
+    finally
+        _sl_release_all!()
+        ReactantServer._PREAD[] = old
+        ReactantServer.shutdown!(sched)
+    end
+end
