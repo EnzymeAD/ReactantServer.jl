@@ -352,7 +352,7 @@ gateway-fronted worker never self-compacts; and `models` holds the per-model
 profile) lets the scheduler merge several queued requests to one model into a single dispatch; when
 it is `false` every dispatch serves exactly one request, padded to its compiled batch size, so a
 request's rows always occupy the same batch slots whatever else is queued.
-`weight_read_stall_seconds` (default `60`, `0` disables it) is how long a background read of a
+`weight_read_stall_seconds` (default `20`, `0` disables it) is how long a background read of a
 model's weights into host memory may go without progress before the worker abandons it: the
 model's queued requests fail with `UNAVAILABLE`, and its read slot passes to the next model.
 Progress is bytes arriving from the weights file, so storage that is slow but moving is never cut
@@ -374,7 +374,9 @@ struct SchedulerConfig
 end
 
 # The default `weight_read_stall_seconds`.
-const DEFAULT_WEIGHT_READ_STALL_SECONDS = 60.0
+# Below the default `dispatch_timeout_seconds` (30), so a request waiting for a read that stalls fails
+# with the retryable UNAVAILABLE rather than at its dispatch timeout.
+const DEFAULT_WEIGHT_READ_STALL_SECONDS = 20.0
 
 # Ten-argument form: the previous full positional layout (through `coalescing`), with the default
 # stall limit for weight reads.

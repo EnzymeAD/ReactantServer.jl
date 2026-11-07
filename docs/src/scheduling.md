@@ -73,9 +73,10 @@ by default; 0 disables it), counted from submission, so queueing and execution t
 the request is withdrawn and the call fails with `DEADLINE_EXCEEDED`: a request still queued is
 dropped when the dispatch loop reaches it, without running, and one already executing finishes
 but its result is discarded. This is the bound that holds when nothing else does. A request whose
-model's weights read stops making progress fails with `UNAVAILABLE` once the read is abandoned, after
-`scheduler.weight_read_stall_seconds` (see [On-demand Weights](on_demand_weights.md)), when that comes
-first. A client deadline is enforced separately, before dispatch (see [edf](#edf)).
+model's weights read stops making progress fails sooner, with `UNAVAILABLE`, once the read is
+abandoned after `scheduler.weight_read_stall_seconds` (20 s by default, below the dispatch timeout so
+that such a request can fail over; see [On-demand Weights](on_demand_weights.md)). A client deadline
+is enforced separately, before dispatch (see [edf](#edf)).
 
 A gRPC call whose client cancels it withdraws its request the same way and is answered
 `CANCELLED`, so cancelled work is not run. That depends on gRPCServer reporting the cancellation;
@@ -445,7 +446,7 @@ global:
     dispatch_timeout_seconds: 30.0 # longest a caller waits for its result; 0 = no limit
     compaction_interval: 0         # worker-local memory compaction every N on-demand loads
     coalescing: true               # merge queued requests per dispatch (false under regulated)
-    weight_read_stall_seconds: 60.0  # abandon a weights read with no progress this long; 0 = never
+    weight_read_stall_seconds: 20.0  # abandon a weights read with no progress this long; 0 = never
     models: {}                     # per-model overrides (weight, residency, max_batch_size)
 ```
 

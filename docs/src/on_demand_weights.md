@@ -182,10 +182,10 @@ A read that stops making progress is abandoned. Weights on network storage can s
 hard NFS mount whose server went away, or a shared host-weight lock held by a worker that is stuck),
 and a read waiting on them sits in the kernel for good, where nothing can interrupt it. Each read
 counts the bytes it reads as they arrive, 8 MiB at a time, and one that reads nothing for
-`scheduler.weight_read_stall_seconds` (60 s by default; 0 turns this off) is abandoned: the requests
+`scheduler.weight_read_stall_seconds` (20 s by default; 0 turns this off) is abandoned: the requests
 waiting for the model fail with `UNAVAILABLE`, which the gateway retries on another replica, and the
 read slot passes to the next model. Storage that is slow but still moving is never cut off (8 MiB per
-limit, 140 KiB/s at the default, is enough). A worker waiting for another worker that is reading the
+limit, 410 KiB/s at the default, is enough). A worker waiting for another worker that is reading the
 same model into the node's shared copy counts that worker's progress as its own, so the wait is cut
 off only when that read stalls too; any other wait on a shared host-weight lock counts as no
 progress. The abandoned read still holds a thread and the memory it was reading into. Until it
@@ -195,12 +195,18 @@ default threads when that is fewer, at least one), the worker starts no read of 
 every request for a model that is not on its GPU fails with `UNAVAILABLE` at once, unless the
 model's weights are in the worker's own host cache (private host copies under
 `runtime.host_weight_budget`), which needs no read of storage. Models on the GPU keep serving
-throughout, and the worker keeps reporting ready. A request still waits no longer than its dispatch timeout
-(`scheduler.dispatch_timeout_seconds`), so with the defaults a request that has waited 30 s for a
-stalled read fails with `DEADLINE_EXCEEDED` before the read is abandoned at 60 s; set the stall limit
-below the dispatch timeout for such requests to fail over instead. Each abandoned read is logged, and
-so is its return; `worker_weight_stalled_reads_total` counts them, and `worker_weight_stalled_reads`
-shows the ones that have not returned.
+throughout, and the worker keeps reporting ready. Each abandoned read is logged, and so is its
+return; `worker_weight_stalled_reads_total` counts them, and `worker_weight_stalled_reads` shows the
+ones that have not returned.
+
+The default limit is below the default dispatch timeout (`scheduler.dispatch_timeout_seconds`,
+30 s), so every request waiting for a read that stalls fails with the retryable `UNAVAILABLE`, which
+a gateway can move to another replica, rather than with `DEADLINE_EXCEEDED` at its dispatch timeout.
+A reason to raise it is NFS: a hard mount resends a request its server did not answer only after the
+mount's `timeo` (60 s by default over TCP), so a single lost request can hold up a healthy read for a
+minute. If the log shows reads abandoned that then return on their own, raise the limit above
+`timeo`. A limit above the dispatch timeout makes the requests waiting for a stalled read fail with
+`DEADLINE_EXCEEDED` instead, which a gateway does not retry elsewhere.
 
 The same holds for every other load. Compaction, and the fallback compaction admission runs, reload
 only models with a host copy to upload from; a model without one stays evicted until its next request

@@ -89,7 +89,7 @@ global:
     dispatch_timeout_seconds: 30.0
     compaction_interval: 0     # defragment device memory every N on-demand weight loads; 0 disables
     coalescing: true           # merge queued requests into one dispatch (profile default)
-    weight_read_stall_seconds: 60.0  # abandon a weights read with no progress this long; 0 disables
+    weight_read_stall_seconds: 20.0  # abandon a weights read with no progress this long; 0 disables
     models: {}                 # per-model overrides -> ModelSchedConfig (see below)
   endpoints:                   # -> EndpointsConfig
     host: 0.0.0.0              # bind all interfaces so the gateway and clients can reach the worker

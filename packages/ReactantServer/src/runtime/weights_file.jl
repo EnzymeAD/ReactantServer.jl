@@ -50,7 +50,7 @@ _fd(w::WeightsFile) = reinterpret(Cint, fd(w.io))
 const _ST_MAX_HEADER = 100_000_000          # the bound SafeTensors.jl enforces
 # 8 MiB per pread call. Each call is one step of a read's progress (`ReadProgress`, from
 # ReactantServerCore), so the chunk bounds the slowest storage a stall limit still counts as moving:
-# 8 MiB per limit, 140 KiB/s at the default 60 s. Throughput does not depend on it: a 1 GiB file in
+# 8 MiB per limit, 410 KiB/s at the default 20 s. Throughput does not depend on it: a 1 GiB file in
 # the page cache read at the same 4.5 GiB/s in 64, 16 and 8 MiB calls.
 const _PREAD_CHUNK = 1 << 23
 

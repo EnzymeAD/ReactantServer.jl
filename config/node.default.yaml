@@ -60,8 +60,11 @@ global:
     # progress for this long is abandoned: the requests waiting for the model fail with UNAVAILABLE,
     # which the gateway retries on another replica, and the read slot passes to the next model, so
     # storage that stops answering (a hard NFS mount) cannot hold the worker's reads for good. Slow
-    # storage that is still moving is never cut off. 0 disables.
-    weight_read_stall_seconds: 60
+    # storage that is still moving is never cut off. Kept below dispatch_timeout_seconds (30) so the
+    # requests waiting for a stalled read fail over instead of timing out. On NFS a lost request is
+    # resent only after the mount's timeo (60 s over TCP by default); raise this above it if the log
+    # shows abandoned reads that then return on their own. 0 disables.
+    weight_read_stall_seconds: 20
   endpoints:
     host: 0.0.0.0
   # gRPC message-size limits, shared by every worker and mirrored into the embedded gateway by the
