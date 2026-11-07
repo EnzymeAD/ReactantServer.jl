@@ -405,6 +405,40 @@ _c7_alloc(msg, reg) = (_c7_decode(msg, reg); @allocated _c7_decode(msg, reg))
     end
 end
 
+@testset "a request naming an input or a requested output twice is refused (WRK-11)" begin
+    t(name; params = Dict{String, _Inf.InferParameter}()) =
+        _Inf.var"ModelInferRequest.InferInputTensor"(; name, datatype = "FP32", shape = Int64[1], parameters = params)
+    o(name) = _Inf.var"ModelInferRequest.InferRequestedOutputTensor"(; name)
+    raw(v) = collect(reinterpret(UInt8, Float32[v]))
+    msg(inputs, outputs = _Inf.var"ModelInferRequest.InferRequestedOutputTensor"[]; raws = [raw(i) for i in eachindex(inputs)]) =
+        _Inf.ModelInferRequest(; model_name = "m", inputs, outputs, raw_input_contents = raws)
+    refused(m, needle) = try
+        ReactantServer.decode_infer_request(m)
+        false
+    catch e
+        e isa ErrorException && occursin(needle, e.msg)
+    end
+
+    @test refused(msg([t("x"), t("x")]), "input 'x' appears more than once")
+    @test refused(msg([t("a"), t("x"), t("a")]), "input 'a' appears more than once")
+    @test refused(msg([t("x")], [o("y"), o("y")]), "requested output 'y' appears more than once")
+    ok = ReactantServer.decode_infer_request(msg([t("a"), t("b")], [o("y"), o("z")])).request
+    @test [i.name for i in ok.inputs] == ["a", "b"] && ok.requested_outputs == ["y", "z"]
+
+    # Refused before any tensor is read: two shared-memory inputs naming a region nobody registered
+    # fail as duplicates, not as an unregistered region.
+    sp(s) = _Inf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:string_param, String(s)))
+    ip(i) = _Inf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:int64_param, Int64(i)))
+    shmp = Dict("shared_memory_region" => sp("nope"), "shared_memory_byte_size" => ip(4))
+    reg = ReactantServer.SharedMemoryRegistry(; reap_interval = 0)
+    err = try
+        ReactantServer.decode_infer_request(msg([t("x"; params = shmp), t("x"; params = shmp)]; raws = Vector{UInt8}[]), reg)
+    catch e
+        e
+    end
+    @test err isa ErrorException && occursin("input 'x' appears more than once", err.msg)
+end
+
 @testset "raw_output_contents is positional with shared-memory outputs (CORE-1)" begin
     sp(s) = _Inf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:string_param, String(s)))
     ip(i) = _Inf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:int64_param, Int64(i)))

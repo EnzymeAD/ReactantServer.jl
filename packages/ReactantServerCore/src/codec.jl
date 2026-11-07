@@ -225,6 +225,18 @@ struct DecodedRequest
     output_targets::Dict{String, OutputTarget}   # by output name; only shm-backed outputs
 end
 
+# Refuse a request that names the same input, or the same requested output, more than once (WRK-11),
+# as Triton does, before any tensor data is read. Which copy of a duplicated input a request ran with
+# depended on load: a coalesced dispatch took the first, a request dispatched alone the last.
+function _refuse_duplicate_names(tensors, what::AbstractString)
+    seen = Set{String}()
+    for t in tensors
+        t.name in seen && error("$what '$(t.name)' appears more than once in the request")
+        push!(seen, t.name)
+    end
+    return nothing
+end
+
 """
     decode_infer_request(msg, registry=nothing) -> DecodedRequest
     decode_infer_request(PB::Module, msg, registry=nothing) -> DecodedRequest
@@ -252,6 +264,8 @@ function decode_infer_request(
     if use_raw && length(msg.raw_input_contents) != n
         error("raw_input_contents has $(length(msg.raw_input_contents)) entries but request has $n inputs")
     end
+    _refuse_duplicate_names(msg.inputs, "input")
+    _refuse_duplicate_names(msg.outputs, "requested output")
 
     tensors = Vector{NamedTensor}(undef, n)
     for i in 1:n

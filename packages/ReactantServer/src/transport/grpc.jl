@@ -318,6 +318,7 @@ end
 # (column-major) order on both sides. Inputs whose batch extents disagree are accepted too, since
 # preprocess may change an input's row count; the scheduler checks the preprocessed inputs and
 # dispatches such a request alone (`_batch_extents_agree`), so it fails without touching others.
+# An input given twice is refused (WRK-11; the codec refuses it first, before reading any data).
 function _validate_inputs(entry, request::InferRequest)
     specs = client_input_spec(entry.manifest)
     byname = Dict(sp.name => sp for sp in specs)
@@ -325,6 +326,7 @@ function _validate_inputs(entry, request::InferRequest)
     for t in request.inputs
         sp = get(byname, t.name, nothing)
         sp === nothing && _invalid("input '$(t.name)' is not declared by model '$(request.model_name)'")
+        t.name in seen && _invalid("input '$(t.name)' appears more than once in the request")
         push!(seen, t.name)
         t.dtype == sp.dtype ||
             _invalid("input '$(t.name)' has dtype $(dtype_token(t.dtype)), expected $(dtype_token(sp.dtype))")
