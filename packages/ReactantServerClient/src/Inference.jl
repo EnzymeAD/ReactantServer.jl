@@ -298,8 +298,10 @@ has sent but makes no further retry (a result that still arrives is delivered). 
 those chunks to finish, so once it returns or throws, nothing writes into `io` or holds a pool slot
 for it. The error is the first failing chunk's exception as the chunk raised it, not wrapped in a
 `TaskFailedException`, so it is caught by type just as from `infer_sync`, and an unrecoverable
-shared-memory failure falls back to inline transport the same way. The chunk's backtrace stays on
-the exception stack (`current_exceptions()`).
+shared-memory failure falls back to inline transport the same way. When several chunks fail, an
+unrecoverable shared-memory failure takes precedence over the others, so that fallback happens even
+if another chunk failed first. The chunk's backtrace stays on the exception stack
+(`current_exceptions()`).
 """
 function infer_async(m::AbstractInferenceModel, io::AbstractInferenceIO)
     return _infer_pool_driven(m, io; force_serial = false)
@@ -759,13 +761,24 @@ function _drive_pool_inference(
     return nothing
 end
 
-# The first failure among one `infer_async` call's chunks, as (exception, backtrace). Set once; a
-# later failure is dropped.
+# The failure one `infer_async` call throws, as (exception, backtrace): see `_record_failure!`.
 mutable struct _FirstChunkFailure
     @atomic first::Union{Nothing, Tuple{Any, Any}}
 end
 _FirstChunkFailure() = _FirstChunkFailure(nothing)
 _failed(f::_FirstChunkFailure) = (@atomic f.first) !== nothing
+
+# Record a chunk's failure. The first one is kept, except that the first ShmUnrecoverableError
+# displaces any other failure: it is what makes `_infer_pool_driven` latch the endpoint to inline,
+# and a failure that merely came earlier must not hide it.
+function _record_failure!(f::_FirstChunkFailure, ex, bt)
+    seen = @atomic f.first
+    while seen === nothing || (ex isa ShmUnrecoverableError && !(first(seen) isa ShmUnrecoverableError))
+        seen, done = @atomicreplace f.first seen => (ex, bt)
+        done && break
+    end
+    return nothing
+end
 
 # One chunk of an `infer_async` call, run on its own task. A failure is recorded in `failure`
 # rather than thrown, so the driver can wait on every chunk without the first failed wait cutting
@@ -777,7 +790,7 @@ function _run_async_chunk(failure::_FirstChunkFailure, m, io, pool, fill_lock, r
         chunk_pool, slot = _chunk_slot(m, io, pool, r, span)
         _run_chunk(m, io, chunk_pool, fill_lock, r, slot; cancelled = () -> _failed(failure))
     catch ex
-        @atomicreplace failure.first nothing => (ex, catch_backtrace())
+        _record_failure!(failure, ex, catch_backtrace())
     end
     return nothing
 end

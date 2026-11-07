@@ -35,10 +35,13 @@ mutable struct MockState
     registered_names::Vector{String}     # every name a register call carried, in order
     fail_infer::Bool                     # when true, ModelInfer fails with INVALID_ARGUMENT
     shed::Function                       # req -> true sheds that ModelInfer with RESOURCE_EXHAUSTED
+    stale::Function                      # req -> true answers that ModelInfer as a stale registration
+    register_sleep::Float64              # seconds the register handler stalls before answering
 end
 MockState() = MockState(
     Set{String}(), true, false, 0.0, Threads.Atomic{Int}(0),
-    Threads.Atomic{Int}(0), ReentrantLock(), Threads.Atomic{Int}(0), String[], false, req -> false
+    Threads.Atomic{Int}(0), ReentrantLock(), Threads.Atomic{Int}(0), String[], false, req -> false,
+    req -> false, 0.0
 )
 
 # Extract a tensor's shared_memory_region string parameter, or nothing when the tensor is inline.
@@ -70,6 +73,7 @@ function _mk_server(st::MockState, port::Integer)
         "SystemSharedMemoryRegister", inf.SystemSharedMemoryRegisterRequest, inf.SystemSharedMemoryRegisterResponse, (ctx, req) -> begin
             Threads.atomic_add!(st.register_calls, 1)
             @lock st.lock push!(st.registered_names, req.name)
+            st.register_sleep > 0 && sleep(st.register_sleep)
             st.reject_register &&
                 throw(gRPCServer.GRPCError(gRPCServer.StatusCode.INTERNAL, "register rejected"))
             @lock st.lock push!(st.regions, req.name)
@@ -91,6 +95,11 @@ function _mk_server(st::MockState, port::Integer)
             # invokelatest: a test sets `shed` after the server's tasks started, in a newer world.
             Base.invokelatest(st.shed, req) &&
                 throw(gRPCServer.GRPCError(gRPCServer.StatusCode.RESOURCE_EXHAUSTED, "shed by the mock"))
+            Base.invokelatest(st.stale, req) && throw(
+                gRPCServer.GRPCError(
+                    gRPCServer.StatusCode.FAILED_PRECONDITION, "unregistered shared memory region (mock)"
+                )
+            )
             for t in req.inputs
                 name = _region_of(t)
                 name === nothing && continue           # inline input: nothing to check
@@ -413,6 +422,63 @@ end
         @test io2.decoded[] == 8
         @test haskey(RSC._latched, key)
         @test !RSC.is_shm_backed(RSC.get_or_create_pool!(m))
+    finally
+        kserve_shutdown()
+        close(server)
+    end
+end
+
+# Counts the items decoded. The first decode fails instead, once `ready()` holds.
+struct FailOnceIO <: AbstractInferenceIO
+    n::Int
+    ready::Function
+    armed::Threads.Atomic{Bool}
+    decoded::Threads.Atomic{Int}
+end
+FailOnceIO(n, ready) = FailOnceIO(n, ready, Threads.Atomic{Bool}(true), Threads.Atomic{Int}(0))
+Base.length(io::FailOnceIO) = io.n
+ReactantServerClient.item_input_bytes(::FailOnceIO) = 4 * sizeof(Float32)
+ReactantServerClient.infer_encode_chunk!(io::FailOnceIO, r, slot) = scratch(slot, "x", (4, length(r)), Float32)
+function ReactantServerClient.infer_decode_chunk!(io::FailOnceIO, r, response)
+    if Threads.atomic_xchg!(io.armed, false)
+        timedwait(io.ready, 30.0)
+        throw(ChunkFailure(first(r)))
+    end
+    Threads.atomic_add!(io.decoded, length(r))
+    return nothing
+end
+
+@testset "an unrecoverable shared-memory failure in infer_async wins over an earlier failure" begin
+    st = MockState()
+    port = free_port()
+    server = _mk_server(st, port); gRPCServer.start!(server)
+    try
+        kserve_init(; pool_bytes = 1 << 20, n_slots = 4, shm_reprobe_interval = 0.0)
+        m = KServeModel("127.0.0.1", port, "m"; shared_memory = :on, max_batch_size = 1, deadline = 60.0, retry = _noretry())
+        key = (m.host, m.port, m.shared_memory)
+        infer_async(m, RecoveryIO(2))                       # warm up, and register the pool
+        @test RSC.is_shm_backed(RSC.get_or_create_pool!(m))
+
+        # The first request of the next call is told its registration is stale, and the server
+        # refuses the re-registration its chunk then makes, after 1 s. Meanwhile the other chunk's
+        # response arrives and its decode fails, so the shared-memory failure comes second in time.
+        regs = st.register_calls[]
+        first_request = Threads.Atomic{Bool}(true)
+        st.stale = req -> Threads.atomic_xchg!(first_request, false)
+        st.reject_register = true
+        st.register_sleep = 1.0
+        io = FailOnceIO(2, () -> st.register_calls[] > regs)
+        err = try
+            infer_async(m, io)
+            nothing
+        catch e
+            e
+        end
+        # It still decides the outcome: the endpoint latches to inline, and the batch completes there.
+        @test err === nothing
+        @test haskey(RSC._latched, key)
+        @test !RSC.is_shm_backed(RSC.get_or_create_pool!(m))
+        @test io.decoded[] == 2
     finally
         kserve_shutdown()
         close(server)
