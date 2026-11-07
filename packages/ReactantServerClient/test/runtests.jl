@@ -873,6 +873,23 @@ end
     end
     @test d_attempts[] == 1
     @test d_budget[] == 5.0
+
+    # Once the call has failed elsewhere (another chunk of an infer_async call), no further attempt
+    # goes out: not after a shed, and not after a backoff that was already being slept.
+    slow = RSC.RetryPolicy(; initial_backoff = 5.0, jitter = false, min_budget = 0.01)
+    ms = KServeModel("grpc://h:1", "x"; deadline = 60.0, retry = slow)
+    for already in (true, false)
+        stop = Threads.Atomic{Bool}(already)
+        c_attempts = Ref(0)
+        t0 = time()
+        @test_throws RSC.gRPCClient.gRPCServiceCallException RSC._infer_with_retry(ms; cancelled = () -> stop[]) do _
+            c_attempts[] += 1
+            already || Threads.@spawn (sleep(0.2); stop[] = true)   # fails during the 5 s backoff
+            throw(shed())
+        end
+        @test c_attempts[] == 1
+        @test time() - t0 < 2.0
+    end
 end
 
 @testset "parse_grpc_url rejects malformed URLs with a clear error" begin

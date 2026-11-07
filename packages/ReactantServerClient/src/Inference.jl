@@ -293,12 +293,13 @@ and dispatching chunks concurrently (bounded by the pool's slot count). Each chu
 disjoint slot, so this is safe to call from multiple threads against one model. Results are
 delivered through `io`'s `infer_decode_chunk!`. Use [`infer_sync`](@ref) for serial dispatch.
 
-When a chunk fails, no further chunk starts, and the call waits for the chunks already in flight
-to finish (they still deliver their results), so once it returns or throws, nothing writes into
-`io` or holds a pool slot for it. The error is the first failing chunk's exception as the chunk
-raised it, not wrapped in a `TaskFailedException`, so it is caught by type just as from
-`infer_sync`, and an unrecoverable shared-memory failure falls back to inline transport the same
-way. The chunk's backtrace stays on the exception stack (`current_exceptions()`).
+When a chunk fails, no further chunk starts, and a chunk already in flight finishes the attempt it
+has sent but makes no further retry (a result that still arrives is delivered). The call waits for
+those chunks to finish, so once it returns or throws, nothing writes into `io` or holds a pool slot
+for it. The error is the first failing chunk's exception as the chunk raised it, not wrapped in a
+`TaskFailedException`, so it is caught by type just as from `infer_sync`, and an unrecoverable
+shared-memory failure falls back to inline transport the same way. The chunk's backtrace stays on
+the exception stack (`current_exceptions()`).
 """
 function infer_async(m::AbstractInferenceModel, io::AbstractInferenceIO)
     return _infer_pool_driven(m, io; force_serial = false)
@@ -348,18 +349,23 @@ function _retryable_shed(e, p::RetryPolicy)
     return p.retry_unavailable && e.grpc_status == gRPCClient.GRPC_UNAVAILABLE
 end
 
+# For a request that belongs to no larger call: it is never cancelled.
+_never() = false
+
 # Wrap a chunk send with one-shot, coalesced shared-memory recovery. On the SHM path, snapshot the
 # endpoint's registration generation, send, and on a stale-registration error re-register once (only
 # the first concurrent failer actually re-registers; see recover_registration!) and retry the send.
 # If re-registration throws, or the retry is still stale, raise ShmUnrecoverableError so the drive
 # loop latches this endpoint to inline. Inline pools (and non-KServe models) send with no recovery.
-function _send_with_shm_recovery(send, m, pool::InferenceBufferPool)
+# `cancelled()` reports that the call the chunk belongs to has already failed elsewhere; then the
+# stale error is surfaced as is, with no re-registration and no second send.
+function _send_with_shm_recovery(send, m, pool::InferenceBufferPool; cancelled = _never)
     (is_shm_backed(pool) && m isa KServeModel) || return send()
     observed = registration_gen(pool, (m.host, m.port))
     try
         return send()
     catch e
-        _is_stale_registration(e) || rethrow()
+        (_is_stale_registration(e) && !cancelled()) || rethrow()
         try
             recover_registration!(pool, m, observed)
         catch reg_err
@@ -380,7 +386,12 @@ end
 # the gRPC call timeout and as the in-body admission budget, so the retries never push total wall
 # time past that deadline. A shed with no budget left to sleep-and-retry surfaces the last error.
 # Full jitter (wait uniform in [0, backoff]) keeps concurrent chunk retries from synchronizing.
-function _infer_with_retry(attempt, m::AbstractInferenceModel)
+#
+# `cancelled()` reports that the call the request belongs to has already failed elsewhere (another
+# chunk of the same `infer_async` call). From then on no further attempt goes out: the attempt on
+# the wire finishes (a shared-memory attempt cannot be abandoned safely), and its shed, or a backoff
+# being slept when the call fails, surfaces the last error at once.
+function _infer_with_retry(attempt, m::AbstractInferenceModel; cancelled = _never)
     p = retry_policy(m)
     overall = overall_deadline(m)
     (!p.enabled || overall <= 0) && return attempt(overall)
@@ -390,15 +401,31 @@ function _infer_with_retry(attempt, m::AbstractInferenceModel)
         try
             return attempt(overall - (time() - start))
         catch e
-            _retryable_shed(e, p) || rethrow()
+            (_retryable_shed(e, p) && !cancelled()) || rethrow()
             wait_s = min(backoff, p.max_backoff)
             p.jitter && (wait_s *= rand())
             # Give up if a retry could not run after the sleep, so we never sleep away the budget
             # only to send a request the server would immediately deadline-shed.
             (time() - start) + wait_s >= overall - p.min_budget && rethrow()
-            sleep(wait_s)
+            _backoff_sleep(wait_s, cancelled) && rethrow()
             backoff *= p.factor
         end
+    end
+    return
+end
+
+# How often a retry backoff checks whether its call has failed elsewhere, in seconds.
+const _CANCEL_POLL_SECONDS = 0.05
+
+# Sleep `s` seconds of retry backoff in slices of at most _CANCEL_POLL_SECONDS. Returns true, early,
+# once `cancelled()` holds, and false after the full `s`.
+function _backoff_sleep(s, cancelled)
+    until = time() + s
+    while true
+        cancelled() && return true
+        left = until - time()
+        left <= 0 && return false
+        sleep(min(left, _CANCEL_POLL_SECONDS))
     end
     return
 end
@@ -578,7 +605,11 @@ end
 # `finally` releases the slot whatever happened: release closes the attempt, so a server that has
 # not begun writing never will, and a slot a server is writing at that moment is quarantined rather
 # than reused (see `release_slot!`). Nothing here waits on a server.
-function _run_chunk(m, io, pool, fill_lock, r, slot)
+#
+# `cancelled()` reports that the call the chunk belongs to has already failed elsewhere; from then
+# on the chunk sends no retry (see `_infer_with_retry` and `_send_with_shm_recovery`). A response
+# that still arrives is decoded as usual.
+function _run_chunk(m, io, pool, fill_lock, r, slot; cancelled = _never)
     return try
         reset_slot!(slot)
         inputs = _encoded_inputs(
@@ -597,8 +628,8 @@ function _run_chunk(m, io, pool, fill_lock, r, slot)
         materialized, raws = _materialize_inputs(inputs, m, pool)
         controlled = _slot_controlled(pool)
         response = GC.@preserve pool begin
-            _send_with_shm_recovery(m, pool) do
-                _infer_with_retry(m) do budget_s
+            _send_with_shm_recovery(m, pool; cancelled = cancelled) do
+                _infer_with_retry(m; cancelled = cancelled) do budget_s
                     params = _request_deadline_params(budget_s)
                     controlled && _add_slot_control!(params, pool, slot)
                     GRPCInferenceService.ModelInfer(
@@ -738,12 +769,13 @@ _failed(f::_FirstChunkFailure) = (@atomic f.first) !== nothing
 
 # One chunk of an `infer_async` call, run on its own task. A failure is recorded in `failure`
 # rather than thrown, so the driver can wait on every chunk without the first failed wait cutting
-# the others short. A chunk that had not started when another failed does not start.
+# the others short. A chunk that had not started when another failed does not start, and one in
+# flight finishes the attempt it has sent but makes no further retry.
 function _run_async_chunk(failure::_FirstChunkFailure, m, io, pool, fill_lock, r, span)
     _failed(failure) && return nothing
     try
         chunk_pool, slot = _chunk_slot(m, io, pool, r, span)
-        _run_chunk(m, io, chunk_pool, fill_lock, r, slot)
+        _run_chunk(m, io, chunk_pool, fill_lock, r, slot; cancelled = () -> _failed(failure))
     catch ex
         @atomicreplace failure.first nothing => (ex, catch_backtrace())
     end

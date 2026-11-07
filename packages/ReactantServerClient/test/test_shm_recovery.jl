@@ -34,10 +34,11 @@ mutable struct MockState
     unregister_calls::Threads.Atomic{Int}
     registered_names::Vector{String}     # every name a register call carried, in order
     fail_infer::Bool                     # when true, ModelInfer fails with INVALID_ARGUMENT
+    shed::Function                       # req -> true sheds that ModelInfer with RESOURCE_EXHAUSTED
 end
 MockState() = MockState(
     Set{String}(), true, false, 0.0, Threads.Atomic{Int}(0),
-    Threads.Atomic{Int}(0), ReentrantLock(), Threads.Atomic{Int}(0), String[], false
+    Threads.Atomic{Int}(0), ReentrantLock(), Threads.Atomic{Int}(0), String[], false, req -> false
 )
 
 # Extract a tensor's shared_memory_region string parameter, or nothing when the tensor is inline.
@@ -87,6 +88,9 @@ function _mk_server(st::MockState, port::Integer)
             Threads.atomic_add!(st.infer_calls, 1)
             st.fail_infer &&
                 throw(gRPCServer.GRPCError(gRPCServer.StatusCode.INVALID_ARGUMENT, "rejected by the mock"))
+            # invokelatest: a test sets `shed` after the server's tasks started, in a newer world.
+            Base.invokelatest(st.shed, req) &&
+                throw(gRPCServer.GRPCError(gRPCServer.StatusCode.RESOURCE_EXHAUSTED, "shed by the mock"))
             for t in req.inputs
                 name = _region_of(t)
                 name === nothing && continue           # inline input: nothing to check
@@ -323,6 +327,64 @@ end
             @test err isa RSC.gRPCClient.gRPCServiceCallException &&
                 err.grpc_status == RSC.gRPCClient.GRPC_INVALID_ARGUMENT
         end
+    finally
+        kserve_shutdown()
+        close(server)
+    end
+end
+
+# Item i stages its own index, so the mock can tell the chunks apart. The chunk holding item
+# `fail_at` fails in its decode once `ready()` holds.
+struct ShedFailIO <: AbstractInferenceIO
+    n::Int
+    fail_at::Int
+    ready::Function
+end
+Base.length(io::ShedFailIO) = io.n
+ReactantServerClient.item_input_bytes(::ShedFailIO) = 4 * sizeof(Float32)
+function ReactantServerClient.infer_encode_chunk!(io::ShedFailIO, r, slot)
+    x = scratch(slot, "x", (4, length(r)), Float32)
+    v = pool_view(x)
+    for (j, i) in enumerate(r)
+        v[:, j] .= i
+    end
+    return x
+end
+function ReactantServerClient.infer_decode_chunk!(io::ShedFailIO, r, response)
+    io.fail_at in r || return nothing
+    timedwait(io.ready, 30.0)
+    throw(ChunkFailure(io.fail_at))
+end
+
+@testset "once a chunk of infer_async has failed, the others stop retrying (CLI-3)" begin
+    st = MockState()
+    port = free_port()
+    server = _mk_server(st, port); gRPCServer.start!(server)
+    try
+        kserve_init(; pool_bytes = 1 << 20, n_slots = 4, shm_reprobe_interval = 0.0)
+        warm = KServeModel("127.0.0.1", port, "m"; shared_memory = :off, max_batch_size = 1, deadline = 60.0, retry = _noretry())
+        infer_sync(warm, RecoveryIO(1))                     # warm up
+        # The server sheds every request for item 2, so its chunk would retry every 0.2 s for the
+        # model's whole 20 s budget. Item 1's chunk fails once item 2's has been shed twice.
+        sheds = Threads.Atomic{Int}(0)
+        st.shed = req -> begin
+            reinterpret(Float32, req.raw_input_contents[1])[1] == 2.0f0 || return false
+            Threads.atomic_add!(sheds, 1)
+            return true
+        end
+        policy = RSC.RetryPolicy(; initial_backoff = 0.2, factor = 1.0, jitter = false, min_budget = 0.01)
+        m = KServeModel("127.0.0.1", port, "m"; shared_memory = :off, max_batch_size = 1, deadline = 20.0, retry = policy)
+        t0 = time()
+        err = try
+            infer_async(m, ShedFailIO(2, 1, () -> sheds[] >= 2))
+            nothing
+        catch e
+            e
+        end
+        elapsed = time() - t0
+        @test err isa ChunkFailure && err.item == 1         # still the first failure
+        @test elapsed < 5.0                                  # without waiting out the 20 s retry budget
+        @test sheds[] < 10                                   # item 2's chunk stopped retrying
     finally
         kserve_shutdown()
         close(server)
