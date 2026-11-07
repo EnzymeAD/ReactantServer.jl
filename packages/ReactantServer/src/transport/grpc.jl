@@ -355,7 +355,8 @@ _infer_or_not_found(ctx::InferContext, request; kw...) = infer(ctx.sched, reques
 # applied to the response inside the timed region (the raw path encodes there), and `t0` lets a
 # caller start the clock before its own work (the raw path starts it before decoding). Every
 # failure leaves as a GRPCError carrying the status contract's code (`_grpc_status`), and the
-# status label counted is that same code. `cancelled` is the call's cancellation probe (see `infer`).
+# status label counted is that same code. The model label is the name only for a model the worker
+# serves (`request_model_label`). `cancelled` is the call's cancellation probe (see `infer`).
 function _handle_infer(
         ctx::InferContext, req, grpc_deadline_ns::Integer = 0;
         finish = identity, t0::Float64 = time(), cancelled = nothing
@@ -364,8 +365,9 @@ function _handle_infer(
     try
         resp = finish(_handle_infer_impl(ctx, req, grpc_deadline_ns; cancelled = cancelled))
         if ctx.metrics !== nothing
-            observe_request!(ctx.metrics, name, time() - t0)
-            inc_request!(ctx.metrics, name, "OK")
+            label = request_model_label(ctx.registry, name)
+            observe_request!(ctx.metrics, label, time() - t0)
+            inc_request!(ctx.metrics, label, "OK")
         end
         return resp
     catch e
@@ -374,8 +376,9 @@ function _handle_infer(
             detail = ctx.error_detail, worker = ctx.name, id = req.id
         )
         if ctx.metrics !== nothing
-            observe_request!(ctx.metrics, name, time() - t0)
-            inc_request!(ctx.metrics, name, _status_label(err))
+            label = request_model_label(ctx.registry, name)
+            observe_request!(ctx.metrics, label, time() - t0)
+            inc_request!(ctx.metrics, label, _status_label(err))
         end
         throw(err)
     finally

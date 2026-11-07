@@ -3,6 +3,7 @@
 # the helpers of test_status_cancel.jl (_SC, _sc_entry, _sc_sched, _sc_body, _sc_call, _sc_code).
 
 import InterProcessCommunication as _IK_IPC
+using Random: randstring
 
 # How many times the mock program has run. Counted at file scope: the dispatch loop calls the program
 # in the world it was started in, so the function must exist before any loop starts.
@@ -147,5 +148,48 @@ end
     finally
         _SC.shm_teardown!(shm)
         finalize(w)
+    end
+end
+
+# The `model` label value of every request-metric sample in a worker's exposition.
+_ik_request_labels(text) =
+    Set(m.captures[1] for m in eachmatch(r"^worker_request\w*\{[^}]*model=\"([^\"]*)\""m, text))
+
+@testset "request metrics label only the models the worker serves (WRK-7)" begin
+    sched, ctx = _sc_sched(_sc_entry("m"); metrics = true)
+    _SC.start!(sched)
+    try
+        @test _sc_call(ctx, _sc_body("m")) isa Vector{UInt8}
+        # Ten thousand names nobody serves, and an empty one. Each used to add a counter and an
+        # 18-bucket histogram that lived as long as the worker.
+        codes = [_sc_code(_sc_call(ctx, _sc_body(randstring(16)))) for _ in 1:10_000]
+        @test all(==(_SCStatus.NOT_FOUND), codes)
+        @test _sc_code(_sc_call(ctx, _sc_body(""))) == _SCStatus.INVALID_ARGUMENT
+
+        io = IOBuffer()
+        _SC.Prometheus.expose(io, ctx.metrics.registry)
+        text = String(take!(io))
+        @test _ik_request_labels(text) == Set(["m", _SC.UNKNOWN_MODEL_LABEL])
+        @test _SC.UNKNOWN_MODEL_LABEL == "_unknown"
+        @test count(l -> startswith(l, "worker_requests_total{"), split(text, '\n')) == 3
+        counted(model, status) = (
+            m = match(Regex("^worker_requests_total\\{model=\"$model\",status=\"$status\"\\} (\\S+)", "m"), text);
+            m === nothing ? nothing : parse(Float64, m.captures[1])
+        )
+        @test counted("_unknown", "NOT_FOUND") == 10_000
+        @test counted("_unknown", "INVALID_ARGUMENT") == 1
+        @test counted("m", "OK") == 1
+
+        # The label follows what the worker serves now: a meta model counts under its own name, and
+        # a model no longer registered under the fixed label.
+        reg = sched.registry
+        @test _SC.request_model_label(reg, "m") == "m"
+        reg.meta["pipe"] = _SC.MetaEntry("pipe", reg.by_name["m"].manifest, ["m"], identity)
+        @test _SC.request_model_label(reg, "pipe") == "pipe"
+        delete!(reg.meta, "pipe")
+        @test _SC.request_model_label(reg, "pipe") == "_unknown"
+        @test _SC.request_model_label(reg, "") == "_unknown"
+    finally
+        _SC.shutdown!(sched)
     end
 end

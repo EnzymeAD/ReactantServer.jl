@@ -99,7 +99,9 @@ the gateway can act on it (back off, try another replica, give up, re-register s
 | `INTERNAL` | anything else: a failure on the server's side, logged on the worker with its backtrace under a request id; the client is told that id (and the exception text only under `grpc.error_detail: full`, see [Node Configuration](node_config.md)) |
 
 The worker's `worker_requests_total{status}` counts each request under the same status the
-client receives.
+client receives. Its `model` label (and that of `worker_request_latency_seconds`) is the model's
+name only when the worker serves a model of that name; a request for any other name, unknown or
+empty, counts under `model="_unknown"`, so names a client makes up add no series.
 
 If the dispatch loop itself fails with an error no single request can be held to, the worker
 logs it with its backtrace, reports itself not live and not ready (`ServerLive`, `ServerReady`,
