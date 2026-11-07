@@ -19,6 +19,12 @@ ReactantServerClient.output_specs(io::_TestIO) = io.specs
 struct _ZeroBatchModel <: AbstractInferenceModel end
 ReactantServerClient.max_batch_size(::_ZeroBatchModel) = 0
 
+# An IO that reports a negative output size per item (CLI-4).
+struct _NegOutputIO <: AbstractInferenceIO end
+Base.length(::_NegOutputIO) = 10
+ReactantServerClient.item_input_bytes(::_NegOutputIO) = 16
+ReactantServerClient.item_output_bytes(::_NegOutputIO) = -32
+
 # Build an InferParameter the way the wire carries shared-memory pointers.
 _strp(s) = inference.InferParameter(parameter_choice = OneOf(:string_param, String(s)))
 _intp(i) = inference.InferParameter(parameter_choice = OneOf(:int64_param, Int64(i)))
@@ -373,6 +379,23 @@ end
         @test item_output_bytes(_TestIO(1, 1, [OutputSpec("S", Float64, Int[])])) == 8
     end
 
+    @testset "OutputSpec refuses a negative dimension" begin
+        # -1 is how describe_model marks a variable axis. An even count of them used to multiply
+        # out to a positive size and pass, declaring an output the server cannot match.
+        for dims in ([-1], [-8], [-1, -4], [4, -1])
+            err = try
+                OutputSpec("y", Float32, dims)
+                nothing
+            catch e
+                e
+            end
+            @test err isa ArgumentError
+            @test err isa ArgumentError && occursin("\"y\"", err.msg) && occursin("inline", err.msg)
+        end
+        @test_throws ArgumentError OutputSpec("y", Float32, -1, -4)      # the varargs form too
+        @test OutputSpec("y", Float32, [0, 4]).per_item_dims == [0, 4]
+    end
+
     @testset "inline pool: name-only outputs, output bytes not charged to slot" begin
         p = InferenceBufferPool(4096; n_slots = 4, use_shm = false)     # 1024-byte slots
         io = _TestIO(10, 16, [OutputSpec("OUTPUT__0", Float32, [4])])
@@ -626,13 +649,13 @@ end
         p = InferenceBufferPool(4096; n_slots = 4, use_shm = false)
         @test_throws ArgumentError ReactantServerClient._chunk_geometry(_TestIO(10, 16, OutputSpec[]), _ZeroBatchModel(), p)
 
-        # Nor can a negative per-item output size (an OutputSpec with a negative dimension) make the
-        # chunk size 0 on a shared-memory pool, where outputs share the slot with the inputs.
+        # Nor can a negative per-item output size make the chunk size 0 on a shared-memory pool, where
+        # outputs share the slot with the inputs. OutputSpec refuses a negative dimension, so this
+        # takes an IO that reports a negative item_output_bytes itself.
         shm = InferenceBufferPool(4096; n_slots = 4, use_shm = true, name = "rsc_cli4_pool")
         try
             m = KServeModel("grpc://h:1", "x"; max_batch_size = 8)
-            io = _TestIO(10, 16, [OutputSpec("y", Float32, [-8])])    # -32 output bytes per item
-            @test_throws ErrorException ReactantServerClient._chunk_geometry(io, m, shm)
+            @test_throws ErrorException ReactantServerClient._chunk_geometry(_NegOutputIO(), m, shm)
         finally
             rm(shm.pool.backing)
         end

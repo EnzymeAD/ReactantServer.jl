@@ -76,6 +76,10 @@ Declares an expected network output so the driver can read it back through share
 column-major shape for a single item, excluding the leading batch dimension. For each chunk the
 driver reserves `sizeof(dtype) * prod(per_item_dims) * items_in_chunk` bytes in the staging slot
 and asks the server to write that output there. See [`output_specs`](@ref).
+
+A negative dimension is refused with an `ArgumentError`: an output with a variable axis (which
+[`describe_model`](@ref) reports as `-1`) cannot be sized ahead of time, so leave it out of
+`output_specs` and it comes back inline.
 """
 struct OutputSpec
     name::String
@@ -83,8 +87,18 @@ struct OutputSpec
     per_item_dims::Vector{Int}
 
     # Inner constructor (suppresses the default) to avoid ambiguity with the varargs form below.
-    OutputSpec(name::AbstractString, dtype::Type{<:TritonType}, dims::AbstractVector{<:Integer}) =
-        new(String(name), dtype, Int[d for d in dims])
+    function OutputSpec(name::AbstractString, dtype::Type{<:TritonType}, dims::AbstractVector{<:Integer})
+        # A negative size could not be reserved, and an even count of negative dimensions would
+        # multiply out to a positive size that matches nothing the server writes.
+        all(>=(0), dims) || throw(
+            ArgumentError(
+                "OutputSpec \"$name\": per_item_dims $(collect(dims)) has a negative dimension. An " *
+                    "output with a variable axis cannot be sized ahead of time; leave it out of " *
+                    "output_specs and it comes back inline."
+            )
+        )
+        return new(String(name), dtype, Int[d for d in dims])
+    end
 end
 
 OutputSpec(name::AbstractString, dtype::Type{<:TritonType}, dims::Integer...) =
@@ -275,12 +289,9 @@ function _chunk_geometry(io::AbstractInferenceIO, m::AbstractInferenceModel, poo
     # Shared-memory outputs are staged in the same slot as inputs, so they consume slot space.
     # Inline outputs travel in the gRPC response, not the slot, so they cost nothing here.
     opb = is_shm_backed(pool) ? item_output_bytes(io) : 0
-    # A negative output size could make the chunk size 0, which never advances (CLI-4).
-    opb >= 0 || error(
-        "item_output_bytes($(typeof(io))) returned $opb: an OutputSpec in output_specs has a " *
-            "negative per-item dimension. An output with a variable axis cannot be sized ahead of " *
-            "time; leave it out of output_specs and it comes back inline",
-    )
+    # A negative output size could make the chunk size 0, which never advances (CLI-4). OutputSpec
+    # refuses a negative dimension, so only an IO's own item_output_bytes method can report one.
+    opb >= 0 || error("item_output_bytes($(typeof(io))) returned $opb; it must not be negative")
     per_item = ipb + opb
     span = cld(per_item, slot_bytes(pool))
     span <= n_slots(pool) || error(
