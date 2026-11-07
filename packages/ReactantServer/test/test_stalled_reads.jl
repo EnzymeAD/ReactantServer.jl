@@ -85,7 +85,7 @@ end
 # once first, unwatched, so that compiling it never counts against a watched read's stall limit.
 function _sl_scheduler(
         entries...; stall = 1.0, timeout = 10.0, device_models = 1, bound = 4,
-        store = ReactantServer.PrivateWeightStore(), mode = ReactantServer.SELF_MANAGED
+        store = ReactantServer.PrivateWeightStore(), mode = ReactantServer.SELF_MANAGED, host_budget = nothing
     )
     backend = ReactantServer.MockBackend()
     pool = ReactantServer.MemoryPool(backend, ReactantServer.MockClient(), ReactantServer.MockDevice(0), "mock", nothing)
@@ -100,7 +100,9 @@ function _sl_scheduler(
     for e in entries
         e.sched = ReactantServer.ModelSchedState(e.name, ReactantServer.ModelSchedConfig(1.0), 0.0)
     end
-    wc = ReactantServer.WeightCache(backend, pool, reg, device_models * _WBYTES; store = store, mode = mode)
+    wc = ReactantServer.WeightCache(
+        backend, pool, reg, device_models * _WBYTES; store = store, mode = mode, host_budget = host_budget
+    )
     ReactantServer.release_staged!(wc, entries[1], ReactantServer.stage_host_weights(wc, entries[1]); uploaded = false)
     sched.weight_cache = wc
     sched.stalled_read_bound = bound
@@ -200,7 +202,7 @@ end
         t3 = time()
         errE = _sl_infer(sched, "E")
         @test _sl_unavailable(errE) && time() - t3 < 1.0
-        @test occursin("no new read starts", sprint(showerror, errE))
+        @test occursin("no new read of storage starts", sprint(showerror, errE))
         @test E.executable.weights === nothing
         @test _sl_infer(sched, "A") == _ST_OUT && _sl_infer(sched, "C") == _ST_OUT
         @test ReactantServer.dispatch_alive(sched)
@@ -476,6 +478,31 @@ end
         _sl_release!(B)
         @test fetch(tB) == _ST_OUT
         @test stages() == n + 1                             # and not again when it ends
+    finally
+        _sl_release_all!()
+        ReactantServer._PREAD[] = old
+        ReactantServer.shutdown!(sched)
+    end
+end
+
+@testset "stalled reads: at the bound, a model with a copy in the host cache is still loaded" begin
+    # At the bound no read of storage starts, but a model whose weights are in this worker's host
+    # cache is read from RAM, so it is loaded as usual while the others are refused.
+    old = ReactantServer._PREAD[]
+    ReactantServer._PREAD[] = _sl_pread
+    A, B, C, D = (_sl_entry(n) for n in ("A", "B", "C", "D"))
+    sched = _sl_scheduler(A, B, C, D; stall = 1.0, bound = 1, host_budget = 4 * sizeof(_W))
+    try
+        @test _sl_infer(sched, "C") == _ST_OUT              # read, and kept in the host cache
+        @test _sl_infer(sched, "A") == _ST_OUT              # evicts C from the device
+        @test C.executable.weights === nothing && haskey(sched.weight_cache.host_cached, "C")
+        _sl_hold!(B)
+        @test _sl_unavailable(_sl_infer(sched, "B"))       # stalls: the bound of 1 is reached
+        @test _sl_outstanding(sched) == 1
+        @test _sl_unavailable(_sl_infer(sched, "D"))       # no copy: refused at once
+        n = _sl_reads(C)
+        @test _sl_infer(sched, "C") == _ST_OUT              # from its host copy
+        @test _sl_reads(C) == n                             # without reading its file
     finally
         _sl_release_all!()
         ReactantServer._PREAD[] = old

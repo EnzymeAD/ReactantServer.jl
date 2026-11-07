@@ -190,10 +190,12 @@ same model into the node's shared copy counts that worker's progress as its own,
 off only when that read stalls too; any other wait on a shared host-weight lock counts as no
 progress. The abandoned read still holds a thread and the memory it was reading into. Until it
 returns, its model is not read again, and requests for it fail with `UNAVAILABLE` at once; if it
-returns, what it read is released. With four abandoned reads outstanding (a quarter of the worker's default threads when
-that is fewer, at least one), the worker starts no read at all, and every request for a model that is
-not on its GPU fails with `UNAVAILABLE` at once. Models on the GPU keep serving throughout, and the
-worker keeps reporting ready. A request still waits no longer than its dispatch timeout
+returns, what it read is released. With four abandoned reads outstanding (a quarter of the worker's
+default threads when that is fewer, at least one), the worker starts no read of storage at all, and
+every request for a model that is not on its GPU fails with `UNAVAILABLE` at once, unless the
+model's weights are in the worker's own host cache (private host copies under
+`runtime.host_weight_budget`), which needs no read of storage. Models on the GPU keep serving
+throughout, and the worker keeps reporting ready. A request still waits no longer than its dispatch timeout
 (`scheduler.dispatch_timeout_seconds`), so with the defaults a request that has waited 30 s for a
 stalled read fails with `DEADLINE_EXCEEDED` before the read is abandoned at 60 s; set the stall limit
 below the dispatch timeout for such requests to fail over instead. Each abandoned read is logged, and

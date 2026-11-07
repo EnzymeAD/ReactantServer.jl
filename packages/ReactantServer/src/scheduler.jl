@@ -1257,14 +1257,17 @@ end
 # and then what it read is released and used by nothing. Until then its model is not read again (a
 # second read would hang the same way and hold another thread), so requests for it fail at once. Each
 # stalled read holds a thread, so with `stalled_read_bound` of them outstanding the worker starts no
-# read at all and every request for a model off the device fails at once. Models on the device serve
-# throughout.
+# read of storage at all and every request for a model off the device fails at once, except for a
+# model with a copy in this worker's host cache, whose read takes it from RAM. Models on the device
+# serve throughout.
 
 const _MAX_HOST_STAGES = 2
 
-# Why no read of model `name` may start now, or nothing: an earlier read of it stalled and has not
-# returned, or so many reads have that none starts. Caller holds `s.cond`.
-function _stall_refusal(s::Scheduler, name::AbstractString)
+# Why no read of `e`'s weights may start now, or nothing: an earlier read of it stalled and has not
+# returned, or so many reads have that none starts. At that bound a model whose weights are in a
+# private host copy is still read, since its read touches no storage. Caller holds `s.cond`.
+function _stall_refusal(s::Scheduler, e::ModelEntry)
+    name = e.name
     n = 0
     own = false
     for r in s.reads
@@ -1275,10 +1278,17 @@ function _stall_refusal(s::Scheduler, name::AbstractString)
     own && return "model '$name' is not loaded on this worker now: an earlier read of its weights " *
         "stalled and has not returned, and it is not read again until it does (the weights storage " *
         "may not be answering)"
-    n >= s.stalled_read_bound && return "model '$name' is not loaded on this worker now: $n reads of " *
-        "model weights stalled and have not returned, so no new read starts until one does (the " *
-        "weights storage may not be answering)"
-    return nothing
+    (n < s.stalled_read_bound || _private_host_copy(s, e)) && return nothing
+    stalled = n == 1 ? "a read of model weights stalled and has" : "$n reads of model weights stalled and have"
+    return "model '$name' is not loaded on this worker now: $stalled not returned, so no new read of " *
+        "storage starts until one does (the weights storage may not be answering)"
+end
+
+# Whether `e`'s weights are in this worker's private host cache, so reading them takes them from
+# RAM. A region in the shared store does not count: taking it waits on a lock another worker may hold.
+function _private_host_copy(s::Scheduler, e::ModelEntry)
+    wc = s.weight_cache
+    return wc !== nothing && !(wc.store isa SharedWeightStore) && has_host_copy(wc, e)
 end
 
 # Answer every request queued for `e` with `err`. Caller holds `s.cond`.
@@ -1325,7 +1335,7 @@ function _kick_staging!(s::Scheduler)
             e.sched.host_stage = :pending         # its read is under way and kicks again when it lands
             continue
         end
-        why = _stall_refusal(s, e.name)
+        why = _stall_refusal(s, e)
         if why !== nothing
             _fail_queued!(e, WeightsReadStalledError(e.name, why))
             e.sched.host_stage = :none
@@ -1625,7 +1635,7 @@ function _stage_entries!(s::Scheduler, wc, entries::Vector{ModelEntry}, hold::Fl
                 return ("staged", "")
             end
             e.sched !== nothing && e.sched.host_stage in (:staging, :staged) && return ("staged", "")
-            why = _stall_refusal(s, e.name)
+            why = _stall_refusal(s, e)
             why === nothing || return ("failed", why)
             held = sum((p.nbytes for p in values(s.prefetched)); init = 0)
             held + m.nbytes > _prefetch_cap(wc) && return ("deferred", "")
@@ -2032,7 +2042,7 @@ end
 # (`_stall_refusal`).
 function _watched_preread(s::Scheduler, e::ModelEntry, read::Function, release::Function)
     r = lock(s.cond) do
-        why = _stall_refusal(s, e.name)
+        why = _stall_refusal(s, e)
         why === nothing || throw(WeightsReadStalledError(e.name, why))
         return _start_read!(r -> _run_preread!(s, r, read, release), s, e; kind = :residency)
     end
