@@ -11,12 +11,17 @@ set -euo pipefail
 # still held by the dying process. That squeezes the out-of-arena headroom CUDA command buffers need
 # and surfaces as an intermittent startup OOM. Poll until every visible GPU has drained below a
 # used-memory threshold before launching the workers. A clean boot passes immediately; a timeout
-# proceeds anyway (with a warning) so a genuine co-tenant never deadlocks startup. Tunables:
+# proceeds anyway (with a warning) so a genuine co-tenant never deadlocks startup. The supervisor
+# applies the same gate, per GPU, before it restarts a worker. Tunables:
 #   REACTANT_GPU_RECLAIM_TIMEOUT_SECONDS  (default 30; 0 disables the wait)
 #   REACTANT_GPU_RECLAIM_MAX_USED_PERCENT (default 15; per-GPU used-memory ceiling treated as clear)
+#   REACTANT_NVIDIA_SMI_TIMEOUT_SECONDS   (default 30; how long one nvidia-smi call may take. A wedged
+#                                          driver can hang it; the wait is then skipped with a warning)
 wait_for_gpu_reclaim() {
     local timeout="${REACTANT_GPU_RECLAIM_TIMEOUT_SECONDS:-30}"
     local max_used_pct="${REACTANT_GPU_RECLAIM_MAX_USED_PERCENT:-15}"
+    local smi_timeout="${REACTANT_NVIDIA_SMI_TIMEOUT_SECONDS:-30}"
+    [[ "$smi_timeout" =~ ^[0-9]+$ ]] && [ "$smi_timeout" -gt 0 ] || smi_timeout=30
     [[ "$timeout" =~ ^[0-9]+$ ]] && [ "$timeout" -gt 0 ] || return 0
     # Without nvidia-smi the gate cannot observe memory. Warn only when GPUs are actually present
     # (device nodes exist) but the tool is missing , the real misconfig, usually a missing "utility"
@@ -30,7 +35,13 @@ wait_for_gpu_reclaim() {
 
     local deadline=$(( $(date +%s) + timeout ))
     while :; do
-        local busy=0 idx used total pct
+        local busy=0 idx used total pct out rc=0
+        out="$(timeout --kill-after=5 "$smi_timeout" nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null </dev/null)" || rc=$?
+        # 124: timed out; 137: killed after the grace (KILL). Either way the driver is not answering.
+        if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            echo "[entrypoint] WARNING: nvidia-smi did not answer within ${smi_timeout}s; skipping the GPU-reclaim wait"
+            return 0
+        fi
         while IFS=',' read -r idx used total; do
             idx="${idx// /}"; used="${used// /}"; total="${total// /}"
             [[ "$total" =~ ^[0-9]+$ ]] && [ "$total" -gt 0 ] || continue
@@ -39,7 +50,7 @@ wait_for_gpu_reclaim() {
                 busy=1
                 echo "[entrypoint] GPU ${idx}: ${used}/${total} MiB used (${pct}%); waiting for prior-process reclamation"
             fi
-        done < <(nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || true)
+        done <<< "$out"
 
         [ "$busy" -eq 0 ] && return 0
         if [ "$(date +%s)" -ge "$deadline" ]; then

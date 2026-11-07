@@ -32,7 +32,10 @@ child processes. It does so in three steps.
    `0` means a CPU node.
 2. the node file's `gpus:` key (`auto`, a count, or a list).
 3. a `CUDA_VISIBLE_DEVICES` already set on the host.
-4. `nvidia-smi` enumeration.
+4. `nvidia-smi` enumeration. Every `nvidia-smi` call the node makes, here, in the image's
+   startup GPU-reclaim wait, and before a worker restart, is given up on after
+   `REACTANT_NVIDIA_SMI_TIMEOUT_SECONDS` (default 30), so a wedged driver cannot hang the node; here
+   detection then falls through to the device nodes.
 5. `/dev/nvidiaN` device nodes.
 
 For a CUDA node that finds no devices, startup fails with guidance (run with `--gpus all`, set
