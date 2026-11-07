@@ -88,12 +88,14 @@ end
     sink = IOBuffer()
     # A child that traps and ignores SIGTERM (a Julia child cannot: its runtime handles SIGTERM
     # on a dedicated signal thread); the supervisor must escalate to SIGKILL after the grace
-    # window.
+    # window. `exec` makes the sleep the child itself (it keeps the ignored disposition), so the
+    # SIGKILL ends it; a plain `sleep` would be a grandchild left running for two minutes, holding
+    # the child's output pipes.
     sup = RSN.Supervisor(
         [
             RSN.ChildSpec(
                 "stubborn",
-                `sh -c 'trap "" TERM; echo "ignoring TERM"; sleep 120'`, 1.0
+                `sh -c 'trap "" TERM; echo "ignoring TERM"; exec sleep 120'`, 1.0
             ),
         ]; sink = sink
     )
@@ -101,8 +103,11 @@ end
     @test wait_for(() -> any(l -> l == "[stubborn] ignoring TERM", _sink_lines(sink)))
     RSN.request_shutdown!(sup)
     @test fetch(t) == 0
-    @test any(l -> occursin("sending SIGKILL", l), _sink_lines(sink))
+    lines = _sink_lines(sink)
+    @test any(l -> occursin("sending SIGKILL", l), lines)
     @test !process_running(sup.children[1].proc)
+    # Nothing the child started outlives it: its pipes closed with it.
+    @test !any(l -> occursin("still holds its output open", l), lines)
 end
 
 @testset "supervisor: refuses --handle-signals=no with more than one thread" begin
