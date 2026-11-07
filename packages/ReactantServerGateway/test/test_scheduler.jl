@@ -74,8 +74,10 @@ function _poll(cum::Dict; batch_at::Dict = Dict(), max_batch::Dict = Dict(), wor
     )
 end
 
-# A ModelInferRequest body carrying one named input with the given shape, encoded as the wire sees it.
-function _body(model, name, shape)
+# A ModelInferRequest body carrying one named UINT8 input with the given shape and, inline in
+# `raw_input_contents`, `bytes` bytes of data for it (by default exactly what the shape needs), encoded
+# as the wire sees it. The gateway counts no more items than a request carries bytes of data.
+function _body(model, name, shape; bytes = prod(shape))
     QPB = ReactantServerGateway.PB
     QInf = ReactantServerGateway.inference
     msg = QInf.ModelInferRequest(;
@@ -84,7 +86,8 @@ function _body(model, name, shape)
             QInf.var"ModelInferRequest.InferInputTensor"(;
                 name = name, datatype = "UINT8", shape = Int64[shape...]
             ),
-        ]
+        ],
+        raw_input_contents = [zeros(UInt8, bytes)]
     )
     io = IOBuffer()
     QPB.encode(QPB.ProtoEncoder(io), msg)
@@ -167,7 +170,7 @@ end
         u3, r3 = GW.select_replicas(si, ctx_small)
         @test u3[1] == usmall[1]                               # 2 items still lighter than 32
         foreach(r -> GW.release!(si, r), (rbig, rsmall, r3))
-        @test all(c -> c[] == 0.0, values(@atomic si.inflight))
+        @test all(c -> c[] == 0, values(@atomic si.inflight))
     finally
         GW.close_pool!(pool)
     end
@@ -202,9 +205,9 @@ end
         @test all(h -> h[1][1] == ucheap[1], held)
         foreach(h -> GW.release!(sc, h[2]), held)
         foreach(r -> GW.release!(sc, r), (rdear, rcheap))
-        # The captured charge is what is released, so the counters return to baseline (to within the
-        # float rounding of summing and unsumming fractional GPU-seconds).
-        @test all(c -> isapprox(c[], 0.0; atol = 1.0e-9), values(@atomic sc.inflight))
+        # The captured charge is what is released, in whole nanoseconds, so the counters return to
+        # exactly zero.
+        @test all(c -> c[] == 0, values(@atomic sc.inflight))
     finally
         GW.close_pool!(pool2)
     end

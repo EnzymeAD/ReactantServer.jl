@@ -238,6 +238,7 @@ end
 function _worker_rows(s::LptPackingState, rep::RepackReport, tick::TickReport)
     assignment = @atomic s.assignment
     wload = @atomic s.worker_load
+    unit = work_unit(knobs(s).work_basis)
     # Readiness comes from the most recent evidence: the last prober tick, or, in the window between
     # the startup placement and the first tick, the workers that answered the startup poll. Otherwise
     # a status call right after startup would report an entire healthy fleet as not ready.
@@ -256,7 +257,7 @@ function _worker_rows(s::LptPackingState, rep::RepackReport, tick::TickReport)
         push!(
             rows, _CTRL_GW.WorkerSchedulingStatus(;
                 worker = w, ready = w in ready, models_placed = Int64(get(placed, w, 0)),
-                inflight_compute = a === nothing ? 0.0 : a[],
+                inflight_compute = a === nothing ? 0.0 : a[] * unit,
                 assigned_weight_bytes = Int64(round(bytes)),
                 weight_budget_bytes = Int64(round(cap)),
                 oversubscribed = cap > 0 && bytes > cap

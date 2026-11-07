@@ -112,15 +112,14 @@ model_meta(snap::RoutingMetaSnapshot, model::AbstractString) =
     request_items(snap::RoutingMetaSnapshot, model, body) -> Int
 
 How many items the request in `body` carries: the extent of `model`'s batch axis, read out of the
-request without decoding its payload. Falls back to 1 for a model that declares no batch axis, one
-the gateway has not polled yet, or a request missing that input, so the count degrades to a request
-count rather than to zero.
+request without decoding its payload and capped at the bytes of data the request carries for that
+input (see [`request_item_count`](@ref)). Falls back to 1 for a model that declares no batch axis,
+one the gateway has not polled yet, or a request missing that input, so the count degrades to a
+request count rather than to zero.
 """
 function request_items(snap::RoutingMetaSnapshot, model::AbstractString, body::AbstractVector{UInt8})
     m = model_meta(snap, model)
-    m.batch_axis < 1 && return 1
-    n = peek_batch_size(body, m.batch_input, m.batch_axis)
-    return n > 0 ? n : 1
+    return request_item_count(body, m.batch_input, m.batch_axis)
 end
 
 """

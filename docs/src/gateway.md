@@ -156,6 +156,16 @@ on zeros:
   the gateway, so it is counted once. Under `items` a meta charges one unit however expensive it
   is, so fleets that serve metas should use `compute`.
 
+The batch extent is the client's claim, and the gateway never rejects a request over it: the worker
+is the authority on what is valid. It believes the claim only as far as the request's own data
+goes, since every row takes at least one byte: a request counts as at most as many items as it
+carries bytes for the batch input, inline (its `raw_input_contents` entry, or the encoded length of
+its typed `contents`) or as the `shared_memory_byte_size` it declares, and as at least one item.
+A request that claims 2^62 rows in a few bytes of data therefore counts as a few items, and none
+counts as more than 2^40. The in-flight counters are integers (nanoseconds of GPU time, or items or
+requests), each request releases exactly what it was charged, and a charge is capped at about 78
+hours of GPU time, so no claim can make the arithmetic fail or leave a counter off after release.
+
 ### lpt_packing
 
 `lpt_packing` places each model on a fixed number of distinct GPUs and routes its requests to

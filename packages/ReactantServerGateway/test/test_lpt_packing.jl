@@ -639,12 +639,12 @@ end
         costs = Dict("hot" => 10.0, "m" => 1.0)
     )
     _, hc = GW.route_replica(s, "hot")
-    @test (@atomic s.worker_load)["w0"][] == 10.0             # hot's measured cost weights the load
+    @test (@atomic s.worker_load)["w0"][] == 10 * 10^9         # hot's measured cost (ns) weights the load
     @test GW.route_replica(s, "m")[1][1] == "w1"             # m avoids the busy w0
     # Blind to batch size, which is the whole reason the other bases exist: a 32-item request of m
     # charges exactly what a 1-item request charges.
     _, big = GW.route_replica(s, "m", 32)
-    @test (@atomic s.worker_load)["w1"][] == 2.0             # 1.0 + 1.0, not 1.0 + 32.0
+    @test (@atomic s.worker_load)["w1"][] == 2 * 10^9         # 1.0 + 1.0 s, not 1.0 + 32.0
 
     # With both GPUs equally loaded the choice falls back to the deterministic URL tiebreak.
     s2 = _pk_state(; routing_policy = "fill_least", work_basis = "requests")
@@ -672,9 +672,9 @@ end
     GW.route_replica(s, "dear", 8)
     m1 = GW.route_replica(s, "m", 32)
     @test m1[1][1] == "w1"
-    load = @atomic s.worker_load
-    @test load["w0"][] ≈ 8.0                                 # items x cost per item, not one request
-    @test load["w1"][] ≈ 0.32
+    load = @atomic s.worker_load                             # nanoseconds of GPU time
+    @test load["w0"][] == 8 * 10^9                           # items x cost per item, not one request
+    @test load["w1"][] == 320_000_000
 
     # items: the same traffic says the opposite, because 32 cheap items outweigh 8 expensive ones.
     # This is the wart of the items basis for `fill_least`, which compares across models.
@@ -682,21 +682,21 @@ end
     GW.route_replica(si, "dear", 8)
     GW.route_replica(si, "m", 32)
     iload = @atomic si.worker_load
-    @test iload["w0"][] == 8.0
-    @test iload["w1"][] == 32.0
+    @test iload["w0"][] == 8
+    @test iload["w1"][] == 32
 
     # requests: both charge one measured per-request cost, blind to the sizes actually sent.
     sr = _fleet("requests")
     GW.route_replica(sr, "dear", 8)
     GW.route_replica(sr, "m", 32)
     rload = @atomic sr.worker_load
-    @test rload["w0"][] ≈ 8.0
-    @test rload["w1"][] ≈ 0.32
+    @test rload["w0"][] == 8 * 10^9
+    @test rload["w1"][] == 320_000_000
 
     # Releasing subtracts the captured charge exactly, so a cost the prober refolds mid-flight cannot
     # leave the load drifting.
     GW._release_route!(m1[2])
-    @test (@atomic s.worker_load)["w1"][] == 0.0
+    @test (@atomic s.worker_load)["w1"][] == 0
 
     # A model with no measured cost of its own borrows the fleet mean rather than looking free.
     s2 = _pk_state(;
@@ -708,7 +708,7 @@ end
         item_costs = Dict("m" => 2.0)
     )
     GW.route_replica(s2, "cold", 3)
-    @test (@atomic s2.worker_load)["w0"][] ≈ 6.0             # 3 items x the 2.0 fleet mean
+    @test (@atomic s2.worker_load)["w0"][] == 6 * 10^9         # 3 items x the 2.0 s fleet mean
 end
 
 @testset "fill_least: a drained fleet compares equal, despite float residue" begin
@@ -738,18 +738,20 @@ end
         end
         foreach(h -> GW._release_route!(h[2]), held)
         # Drained means drained: every counter back to EXACTLY zero, so the next burst opens on a
-        # genuine tie. Without the settle-to-zero this reads a few e-16 on some subset of the workers.
-        @test all(a -> a[] == 0.0, values(@atomic s.worker_load))
+        # genuine tie. In Float64 GPU-seconds this read a few e-16 on some subset of the workers.
+        @test all(a -> a[] == 0, values(@atomic s.worker_load))
     end
     # Equal replicas serving equal requests get equal shares.
     counts = [get(routed, "w$i", 0) for i in 0:3]
     @test sum(counts) == 16 * 8
     @test maximum(counts) == minimum(counts)
 
-    # And the comparison itself: loads differing by less than a nanosecond of GPU time are a tie, so
-    # the rotation cursor decides rather than the crumb, while a real difference still orders.
-    @test GW._load_key(0.0) == GW._load_key(4.440892098500626e-16)
-    @test GW._load_key(0.5) < GW._load_key(0.5 + 1.0e-6)
+    # And the charge itself: whole nanoseconds of GPU time, so equal work charges equal quanta and a
+    # real difference still orders. Never 0, never past the ceiling, and never a throw.
+    @test GW._quanta(0.00326 * 31 * 1.0e9) == GW._quanta(0.00326 * 31 * 1.0e9 + 4.0e-7)
+    @test GW._quanta(0.5e9) < GW._quanta(0.5e9 + 1.0e3)
+    @test GW._quanta(0.0) == GW._quanta(NaN) == GW._quanta(-3.0) == 1
+    @test GW._quanta(Inf) == GW._quanta(2.0^62 * 1.0e9) == GW.MAX_CHARGE
 end
 
 @testset "work_basis is runtime-mutable, so a fleet can be switched without a restart" begin
@@ -760,14 +762,14 @@ end
     @test GW.knobs(s).work_basis === :compute
     GW.route_replica(s, "m", 6)
     w0 = (@atomic s.worker_load)["w0"]
-    @test w0[] ≈ 3.0                                         # 6 items x 0.5 GPU-seconds
+    @test w0[] == 3 * 10^9                                   # 6 items x 0.5 GPU-seconds, in ns
 
     # Flip the live fleet. The run already open on w0 keeps receiving m (fill_least chooses only at a
     # run boundary), so the change is visible in what the next request CHARGES.
     GW.set_knobs!(s; work_basis = :requests)
     @test GW.knobs(s).work_basis === :requests
     GW.route_replica(s, "m", 6)
-    @test w0[] ≈ 7.0                                         # +4.0, the per-request cost, size-blind
+    @test w0[] == 7 * 10^9                                   # +4.0 s, the per-request cost, size-blind
 
     # Validated exactly as gateway.yml validates it, and rejected without disturbing the live knobs.
     @test_throws ReactantServerCore.ConfigError GW.set_knobs!(s; work_basis = :gpu_seconds)
@@ -880,6 +882,8 @@ end
     import ProtoBuf as QPB
     QInf = ReactantServerGateway.inference
     enc(msg) = (io = IOBuffer(); QPB.encode(QPB.ProtoEncoder(io), msg); take!(io))
+    # The data the shape calls for travels inline: the gateway counts no more items than a request
+    # carries bytes of data for the batch input.
     body(name, shape) = enc(
         QInf.ModelInferRequest(;
             model_name = "m",
@@ -887,7 +891,8 @@ end
                 QInf.var"ModelInferRequest.InferInputTensor"(;
                     name = name, datatype = "UINT8", shape = Int64[shape...]
                 ),
-            ]
+            ],
+            raw_input_contents = [zeros(UInt8, prod(shape))]
         )
     )
 
@@ -1579,7 +1584,8 @@ end
                 AInf.var"ModelInferRequest.InferInputTensor"(;
                     name = "IN", datatype = "UINT8", shape = Int64[512, 6]
                 ),
-            ]
+            ],
+            raw_input_contents = [zeros(UInt8, 512 * 6)]
         )
         io = IOBuffer()
         ReactantServerGateway.PB.encode(ReactantServerGateway.PB.ProtoEncoder(io), req)
