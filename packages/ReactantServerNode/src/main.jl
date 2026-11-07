@@ -186,6 +186,46 @@ function _liveness_target(
     return ip === nothing ? nothing : (ip, port)
 end
 
+# Where the embedded gateway's liveness is checked: its admin listener (`/readyz` and `/healthz`)
+# as the gateway resolves it: REACTANT_GATEWAY_LISTEN_METRICS, else `listen.metrics` in a mounted
+# gateway.yml, else 0.0.0.0:8002. Returns `(ip, port)`, or `nothing` when that is not an address.
+function _gateway_liveness_target(gateway_path::Union{AbstractString, Nothing}, env::AbstractDict)
+    addr = get(env, "REACTANT_GATEWAY_LISTEN_METRICS", nothing)
+    if addr === nothing && gateway_path !== nothing && isfile(gateway_path)
+        raw = try
+            YAML.load_file(gateway_path; dicttype = Dict{String, Any})
+        catch
+            nothing
+        end
+        listen = raw isa AbstractDict ? get(raw, "listen", nothing) : nothing
+        listen isa AbstractDict && (addr = get(listen, "metrics", nothing))
+    end
+    addr === nothing && (addr = "0.0.0.0:8002")
+    addr isa AbstractString || return nothing
+    i = findlast(==(':'), addr)
+    i === nothing && return nothing
+    port = tryparse(Int, addr[(i + 1):end])
+    (port !== nothing && 0 < port <= 65535) || return nothing
+    ip = _probe_ip(strip(addr[1:(i - 1)], ['[', ']']))
+    return ip === nothing ? nothing : (ip, port)
+end
+
+# The embedded gateway's check: the workers' `liveness:` settings, on its admin listener.
+function _gateway_check(s, gateway_path::Union{AbstractString, Nothing}, env::AbstractDict)
+    s.failures == 0 && return nothing
+    t = _gateway_liveness_target(gateway_path, env)
+    t === nothing && return nothing
+    return LivenessCheck(
+        t...; interval_seconds = s.interval_seconds, timeout_seconds = s.timeout_seconds, failures = s.failures
+    )
+end
+
+function _gateway_liveness_note(chk::Union{LivenessCheck, Nothing}, s)
+    chk === nothing || return "gateway liveness check: /healthz on $(_hostport(chk)) once its /readyz has answered, same settings as the workers"
+    s.failures == 0 && return "gateway liveness check: off (liveness.failures is 0)"
+    return "gateway liveness check: off, its admin listen address is not one the supervisor can reach"
+end
+
 # The GPU-reclaim wait for each worker's restarts (see `GpuReclaim`), from the same variables as the
 # image's startup wait, and the startup line describing it (`nothing` on a CPU node). No wait for a
 # worker without a GPU, on a CPU node, without nvidia-smi, or with the timeout set to 0.
@@ -328,7 +368,13 @@ function build_supervisor(
     liveness = _liveness_settings(node, env)
 
     if r === :gateway
-        push!(specs, gateway_spec(children; gateway_path = gw_path, rapid_reset_protection = rapid_reset))
+        push!(
+            specs, gateway_spec(
+                children; gateway_path = gw_path, rapid_reset_protection = rapid_reset,
+                liveness = _gateway_check(liveness, gw_path, env)
+            )
+        )
+        push!(notes, _gateway_liveness_note(specs[end].liveness, liveness))
     else
         devices = detect_gpus(env; node = node)
         if isempty(devices) && _node_backend(node) != "cpu"
@@ -411,9 +457,11 @@ function build_supervisor(
                     grpc_max_recv = gw_path === nothing ? _node_grpc_bytes(node, "max_recv_msg_bytes") : nothing,
                     grpc_max_send = gw_path === nothing ? _node_grpc_bytes(node, "max_send_msg_bytes") : nothing,
                     grpc_error_detail = gw_path === nothing ? _node_grpc_error_detail(node) : nothing,
-                    rapid_reset_protection = rapid_reset
+                    rapid_reset_protection = rapid_reset,
+                    liveness = _gateway_check(liveness, gw_path, env)
                 )
             )
+            push!(notes, _gateway_liveness_note(specs[end].liveness, liveness))
         end
     end
 
@@ -429,10 +477,10 @@ end
 
 Run the node: spawn one worker subprocess per visible GPU (and the embedded gateway in the
 default all-in-one role), multiplex their output onto `sink` with `[name]` line prefixes,
-restart children that die, kill and restart a worker that stops answering its liveness check
-once it has been ready (the node file's `liveness:` block; see Worker liveness under Node
-Configuration), and block until SIGTERM/SIGINT (or a crash-loop budget breach). Returns the
-process exit code.
+restart children that die, kill and restart a worker or the embedded gateway that stops
+answering its liveness check once it has been ready (the node file's `liveness:` block; see
+Liveness under Node Configuration), and block until SIGTERM/SIGINT (or a crash-loop budget
+breach). Returns the process exit code.
 """
 function supervise(
         node_path::AbstractString; sink::IO = stdout, env::AbstractDict = ENV,

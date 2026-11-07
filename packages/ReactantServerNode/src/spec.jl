@@ -5,7 +5,8 @@
 # file's concern (`endpoints.host`); in a container, which ports are reachable is decided by
 # what the operator publishes, and worker metrics ports must remain scrapable.
 
-# Worker liveness defaults (the node file's `liveness:` block, see `_liveness_settings` in main.jl).
+# Liveness defaults for the workers and the embedded gateway (the node file's `liveness:` block, see
+# `_liveness_settings` in main.jl).
 # A worker that has been ready is asked `/healthz` every 10 s and given 10 s to answer, and is killed
 # after 6 failures in a row: about two minutes without an answer, or one minute of "not live"
 # answers. That is far beyond a garbage collection or a first-use compile on the thread that
@@ -327,7 +328,8 @@ function gateway_spec(
         grpc_error_detail::Union{AbstractString, Nothing} = nothing,
         rapid_reset_protection::Union{Bool, Nothing} = nothing,
         grace_seconds::Real = 10.0,
-        drain_seconds::Real = PUBLIC_DRAIN_SECONDS
+        drain_seconds::Real = PUBLIC_DRAIN_SECONDS,
+        liveness::Union{LivenessCheck, Nothing} = nothing
     )
     ce = children isa ChildEnvironment ? children : workspace_environment(children)
     proj = ce.gateway_project
@@ -378,7 +380,7 @@ function gateway_spec(
         push!(pairs, "REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION" => string(rapid_reset_protection))
     _push_drain!(pairs, drain_seconds)
     isempty(pairs) || (cmd = addenv(cmd, pairs...))
-    return ChildSpec("gateway", cmd, grace_seconds, drain_seconds, _GATEWAY_STAGE)
+    return ChildSpec("gateway", cmd, grace_seconds, drain_seconds, _GATEWAY_STAGE; liveness = liveness)
 end
 
 """

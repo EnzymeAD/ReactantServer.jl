@@ -26,7 +26,7 @@ metrics_base_port: 9100
 # (ordinals or GPU UUIDs). The supervisor synthesizes one worker per selected device.
 # gpus: auto
 
-# Supervisor-only: how a worker that stops working while it still runs is found and restarted.
+# Supervisor-only: how a worker or the gateway that stops working is found and restarted.
 # liveness: { interval_seconds: 10, timeout_seconds: 10, failures: 6, dispatch_stall_seconds: 600 }
 
 global:    # defaults merged into every worker (any block may be overridden per worker)
@@ -45,9 +45,9 @@ models:    # optional; pins the named models to device memory on the listed work
   no `workers:` list is present: `auto` (the default) enumerates the visible devices, an
   integer is a device count, and a list gives explicit device selectors (ordinals or GPU
   UUIDs). The `REACTANT_GPUS` environment variable overrides this key.
-- `liveness` (optional, supervisor-only) sets how the supervisor checks that each worker still
-  works once it has been ready, and kills and restarts one that does not
-  ([Worker liveness](#Worker-liveness)).
+- `liveness` (optional, supervisor-only) sets how the supervisor checks that each worker, and the
+  embedded gateway, still works once it has been ready, and kills and restarts one that does not
+  ([Liveness](#Liveness)).
 - `global` holds the defaults merged into every worker; any block may be overridden per worker.
 - `workers` lists the worker entries (optional under the supervisor).
 - `models` optionally pins the named models to device memory on the listed workers.
@@ -397,12 +397,14 @@ A worker or gateway run without the supervisor has only its own settings: a work
 file's `global.grpc` and its own entry, with `INFERENCE_SERVER_GRPC_RAPID_RESET_PROTECTION` over
 both, and a gateway its `gateway.yml`, with `REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION` over it.
 
-## Worker liveness
+## Liveness
 
-The supervisor restarts a worker that exits, and also one that is still running but no longer
-works: deadlocked, stopped, stuck in the kernel, or with its dispatch loop stuck in a GPU call that
-never returns. It checks each worker over the worker's HTTP listener (`metrics_base_port + i`, or
-the public `8002` for a sole worker):
+The supervisor restarts a worker or the embedded gateway that exits, and also one that is still
+running but no longer works: deadlocked, stopped, stuck in the kernel, or, for a worker, with its
+dispatch loop stuck in a GPU call that never returns. It checks each worker over the worker's HTTP
+listener (`metrics_base_port + i`, or the public `8002` for a sole worker), and the gateway over its
+admin listener (`listen.metrics`, default `8002`, whose `/readyz` answers 200 once at least one
+worker is ready). The same steps and settings apply to both:
 
 1. Until the worker's `/readyz` first answers 200, nothing is checked, so a startup that compiles
    models for hours is never interrupted.
@@ -447,7 +449,10 @@ Some limits to know:
   gets the worker killed and restarted, and it then loads the new version at startup. Raise
   `timeout_seconds` or `failures` (or set `failures: 0`) if reloads of large uncached bundles must
   not restart the worker.
-- The embedded gateway is restarted when it exits; it is not checked this way.
+- A hung gateway takes the node's public endpoint down with it, so it is killed and restarted the
+  same way; its startup line is `gateway liveness check: ...`. Its `/healthz` answers whenever the
+  process can answer at all, so the check catches a gateway that is stopped or deadlocked, not one
+  that answers while routing badly.
 
 ## Environment overrides
 

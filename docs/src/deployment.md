@@ -90,9 +90,9 @@ worker that is still running but no longer works (deadlocked, stopped, stuck in 
 its dispatch loop stuck in a GPU call) is killed and restarted the same way: once it has first
 reported ready, the supervisor checks its `/healthz` every 10 seconds and sends it SIGKILL after 6
 failures in a row, and the worker reports itself not live once its dispatch loop has had work and
-finished none of it for 10 minutes. [Worker liveness](node_config.md#Worker-liveness) has the
-settings (the node file's `liveness:` block, or `REACTANT_LIVENESS_*` on the container) and their
-limits. Before a GPU worker is restarted, the supervisor waits until the driver has released the
+finished none of it for 10 minutes. The embedded gateway is checked the same way on its admin
+listener. [Liveness](node_config.md#Liveness) has the settings (the node file's `liveness:` block, or
+`REACTANT_LIVENESS_*` on the container) and their limits. Before a GPU worker is restarted, the supervisor waits until the driver has released the
 memory its last run held on its GPU, as the image's entrypoint does once at container start: up to
 `REACTANT_GPU_RECLAIM_TIMEOUT_SECONDS` (default 30; 0 turns the wait off), until the GPU's used
 memory is at most `REACTANT_GPU_RECLAIM_MAX_USED_PERCENT` of it (default 15) and the dead process no
@@ -256,8 +256,8 @@ override, which can be passed with `-e`.
 **Health.** An OCI image cannot carry a healthcheck, so pass one at run time:
 `/usr/local/bin/healthcheck.node.sh` reports healthy once the node's `/readyz` answers. Set the
 start period longer than a cold start, which compiles every model before `/readyz` succeeds. On a
-multi-worker node `/readyz` stays healthy while any worker is ready; a worker that stops working is
-restarted by the supervisor itself ([Restarts and logs](#Restarts-and-logs)).
+multi-worker node `/readyz` stays healthy while any worker is ready; a worker or gateway that stops
+working is restarted by the supervisor itself ([Restarts and logs](#Restarts-and-logs)).
 
 ### Building the image
 

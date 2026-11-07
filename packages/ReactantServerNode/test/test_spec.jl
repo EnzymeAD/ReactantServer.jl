@@ -639,7 +639,7 @@ end
         w0, w1, gw = (c.spec for c in sup.children)
         @test (w0.liveness.ip, w0.liveness.port, w1.liveness.port) == (IPv4("127.0.0.1"), 9100, 9101)
         @test (w0.liveness.interval, w0.liveness.timeout, w0.liveness.failures) == (10.0, 10.0, 6)
-        @test gw.liveness === nothing
+        @test gw.liveness.port == 8002                   # the gateway's admin listener (its own testset)
         @test stall(sup.children[1]) == stall(sup.children[2]) == "600.0"
         @test occursin(
             "worker liveness checks: /healthz every 10s once ready, 10s to answer, SIGKILL after 6 failures in a row; worker dispatch stall limit: 600s",
@@ -674,7 +674,7 @@ end
             bare; env = Dict("REACTANT_GPUS" => "2"), sink = sink, workspace_root = STUB_ROOT,
             runtime_dir = joinpath(dir, "bare")
         )
-        @test all(c -> c.spec.liveness === nothing, sup.children)
+        @test all(c -> c.spec.liveness === nothing, filter(c -> c.spec.name != "gateway", sup.children))
         @test occursin("worker liveness checks: off, no worker has an HTTP listener to check (set metrics_base_port)", String(take!(sink)))
 
         # The address follows the worker's bind: a specific address is checked there, `::` on ::1, and
@@ -731,5 +731,40 @@ end
         for (var, v) in ((RSN.GPU_RECLAIM_TIMEOUT_ENV, "-1"), (RSN.GPU_RECLAIM_TIMEOUT_ENV, "soon"), (RSN.GPU_RECLAIM_MAX_USED_ENV, "150"))
             @test_throws ReactantServerCore.ConfigError built(Dict("REACTANT_GPUS" => "1", "PATH" => bin, var => v))
         end
+    end
+end
+
+@testset "build_supervisor: the embedded gateway's liveness check" begin
+    mktempdir() do dir
+        IPv4 = RSN.Sockets.IPv4
+        gw(sup) = only(c for c in sup.children if c.spec.name == "gateway").spec
+        built(env; kw...) = RSN.build_supervisor(
+            _node_yaml(dir; extra = "liveness: {interval_seconds: 4, failures: 2}"); env = env, sink = IOBuffer(),
+            workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "run"), kw...
+        )
+        # Before, the gateway had no check at all, so a hung gateway was never restarted. It is
+        # checked on its admin listener (default 0.0.0.0:8002, so loopback), with the workers' settings.
+        sink = IOBuffer()
+        sup = RSN.build_supervisor(
+            _node_yaml(dir; extra = "liveness: {interval_seconds: 4, failures: 2}");
+            env = Dict("REACTANT_GPUS" => "2"), sink = sink, workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "run")
+        )
+        chk = gw(sup).liveness
+        @test (chk.ip, chk.port, chk.interval, chk.timeout, chk.failures) == (IPv4("127.0.0.1"), 8002, 4.0, 10.0, 2)
+        @test occursin("gateway liveness check: /healthz on 127.0.0.1:8002 once its /readyz has answered", String(take!(sink)))
+        # Its listen address as the gateway resolves it: the environment over a mounted gateway.yml.
+        @test gw(built(Dict("REACTANT_GPUS" => "2", "REACTANT_GATEWAY_LISTEN_METRICS" => "10.0.0.5:9002"))).liveness.ip == IPv4("10.0.0.5")
+        mounted = joinpath(dir, "gateway.yml")
+        write(mounted, "listen:\n  metrics: \"127.0.0.1:7002\"\nendpoints: []\n")
+        @test gw(built(Dict("REACTANT_GPUS" => "2"); gateway_path = mounted)).liveness.port == 7002
+        @test gw(built(Dict("REACTANT_GPUS" => "2", "REACTANT_GATEWAY_LISTEN_METRICS" => "[::]:9003"))).liveness.port == 9003
+        # The gateway role checks it too; `failures: 0` turns it off with the workers' checks.
+        sup = RSN.build_supervisor(
+            _node_yaml(dir); role = :gateway, env = Dict{String, String}(), sink = IOBuffer(),
+            workspace_root = STUB_ROOT, runtime_dir = joinpath(dir, "gwrole")
+        )
+        @test only(sup.children).spec.liveness.port == 8002
+        @test gw(built(Dict("REACTANT_GPUS" => "2", "REACTANT_LIVENESS_FAILURES" => "0"))).liveness === nothing
+        @test gw(built(Dict("REACTANT_GPUS" => "2", "REACTANT_GATEWAY_LISTEN_METRICS" => "nonsense"))).liveness === nothing
     end
 end

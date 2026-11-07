@@ -47,7 +47,7 @@ GW_METRICS_PORT="$(free_port)"
 # below (a different preferences hash forces a full Reactant recompile, CPU-only and slow).
 READY_TIMEOUT="${E2E_CPU_READY_TIMEOUT:-1800}"
 
-echo "== [1/8] generating scale4 bundle =="
+echo "== [1/9] generating scale4 bundle =="
 julia --project=packages/ReactantServer "$E2E_DIR/gen_scale4.jl"
 
 mkdir -p "$WORK/models"
@@ -71,7 +71,7 @@ register_model("slow4"; preprocess = function (inputs)
 end)
 EOF
 
-echo "== [2/8] writing node file, gateway config and Reactant preference override =="
+echo "== [2/9] writing node file, gateway config and Reactant preference override =="
 # No workers list: the supervisor synthesizes them (REACTANT_CPU_WORKERS below).
 cat > "$WORK/node.yaml" << EOF
 model_repo: $WORK/models
@@ -125,7 +125,7 @@ EOF
 }
 write_gateway_config "$WORK/gateway.yml" redacted
 
-echo "== [3/8] starting supervisor (2 CPU workers + embedded gateway) =="
+echo "== [3/9] starting supervisor (2 CPU workers + embedded gateway) =="
 REACTANT_GPUS=0 \
 REACTANT_CPU_WORKERS=2 \
 REACTANT_WORKSPACE_ROOT="$REPO_ROOT" \
@@ -155,7 +155,7 @@ until curl -fsS "http://127.0.0.1:${GW_METRICS_PORT}/readyz" >/dev/null 2>&1; do
 done
 echo "   gateway ready."
 
-echo "== [4/8] running CPU e2e client =="
+echo "== [4/9] running CPU e2e client =="
 set +e
 julia --project=packages/ReactantServerGateway "$E2E_DIR/client_cpu.jl" "$GW_PORT" "$BASE_PORT" redacted |
     tee "$WORK/client_redacted.out"
@@ -177,8 +177,9 @@ for tag in 'worker="worker0"' 'worker="worker1"' 'gateway_worker_metrics_up'; do
 done
 echo "   aggregated /metrics carries per-worker series."
 
-# Once ready, each worker's liveness is checked on its own /healthz (the default 10 s interval).
-for w in worker0 worker1; do
+# Once ready, each worker's liveness is checked on its own /healthz, and the gateway's on its admin
+# listener (the default 10 s interval).
+for w in worker0 worker1 gateway; do
     deadline=$((SECONDS + 60))
     until grep -q "^\[supervisor\] $w is ready; checking its liveness" "$WORK/supervisor.log"; do
         if ((SECONDS >= deadline)); then
@@ -190,11 +191,11 @@ for w in worker0 worker1; do
     done
 done
 if grep -q "^\[supervisor\] .*failed a liveness check" "$WORK/supervisor.log"; then
-    echo "ERROR: a healthy worker failed a liveness check:"
+    echo "ERROR: a healthy child failed a liveness check:"
     grep "^\[supervisor\] .*liveness" "$WORK/supervisor.log"
     exit 1
 fi
-echo "   the supervisor checks both workers' liveness, and both answer."
+echo "   the supervisor checks both workers' and the gateway's liveness, and all answer."
 
 # The forced INTERNAL error is in the log of the worker the client was told about, under the same
 # request id, with the exception text the client did not see.
@@ -214,7 +215,7 @@ check_forced_log() {
 }
 check_forced_log redacted "$WORK/supervisor.log"
 
-echo "== [5/8] SIGTERM under load: the node drains =="
+echo "== [5/9] SIGTERM under load: the node drains =="
 # The drain client holds requests in flight, sends the supervisor SIGTERM itself, and checks both
 # drain stages (gateway, then workers) from the outside.
 set +e
@@ -230,7 +231,7 @@ fi
 sup_rc=0
 wait "$SUP_PID" || sup_rc=$?
 
-echo "== [6/8] exit codes =="
+echo "== [6/9] exit codes =="
 # The supervisor exited 0 (argument 1) and every child drained and exited 0 on its own: no SIGTERM
 # or SIGKILL fallback was needed. Argument 2 is the node's log.
 check_clean_exit() {
@@ -266,7 +267,7 @@ for tag in worker0 worker1 gateway supervisor; do
     fi
 done
 
-echo "== [7/8] full INTERNAL error detail (node global.grpc.error_detail: full) =="
+echo "== [7/9] full INTERNAL error detail (node global.grpc.error_detail: full) =="
 # A second node, identical but for `global.grpc.error_detail: full`, which reaches the workers through
 # their config and the embedded gateway through its pinned gateway config (the Node unit tests cover
 # the supervisor's mirror of global.grpc into an env-configured gateway).
@@ -314,7 +315,7 @@ if ((client_rc != 0)); then
 fi
 check_forced_log full "$WORK/supervisor_full.log"
 
-echo "== [8/8] shared memory: short deadlines, then a worker restart under the same client =="
+echo "== [8/9] shared memory: short deadlines, then a worker restart under the same client =="
 # Phase A drives shared-memory outputs with deadlines short enough that clients give up while
 # requests run (CORE-3). Then worker1 is stopped (SIGSTOP: alive, but answering nothing, as a hung
 # worker); the supervisor's liveness check kills it and the supervisor restarts it. Once the
@@ -367,9 +368,35 @@ if ((shm_rc != 0)); then
     tail -120 "$log"
     exit "$shm_rc"
 fi
+
+echo "== [9/9] a stopped gateway is killed by its liveness check and restarted =="
+# A hung gateway takes the node's public endpoint down with it. Stopped (SIGSTOP), it answers
+# nothing; the supervisor's check (2 s interval, 5 s timeout, 3 failures on this node) must kill it,
+# and the restarted gateway must serve the node again.
+old_gw="$(grep -oE 'started gateway \(pid [0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$')"
+echo "   stopping the gateway (pid $old_gw) with SIGSTOP"
+kill -STOP "$old_gw"
+deadline=$((SECONDS + READY_TIMEOUT))
+until new_gw="$(grep -oE 'started gateway \(pid [0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$')" &&
+    [[ -n "$new_gw" && "$new_gw" != "$old_gw" ]] &&
+    curl -fsS "http://127.0.0.1:${GW_METRICS_PORT}/readyz" >/dev/null 2>&1; do
+    if ((SECONDS >= deadline)); then
+        echo "ERROR: the gateway did not come back within ${READY_TIMEOUT}s; supervisor lines:"
+        grep "^\[supervisor\]" "$log" | tail -40
+        exit 1
+    fi
+    sleep 2
+done
+if ! grep -q "^\[supervisor\] gateway failed 3 liveness checks in a row; sending SIGKILL" "$log"; then
+    echo "ERROR: the gateway came back, but not through its liveness check; supervisor lines:"
+    grep "^\[supervisor\]" "$log" | tail -40
+    exit 1
+fi
+echo "   the gateway was killed by its liveness check, restarted (pid $new_gw), and is ready again"
+
 kill -TERM "$SUP_PID"
 sup_rc=0
 wait "$SUP_PID" || sup_rc=$?
 check_clean_exit "$sup_rc" "$WORK/supervisor_full.log"
 
-echo "CPU e2e: PASS (workers synthesized, gateway routed, graceful drain, clean exit, INTERNAL error detail, shared memory)"
+echo "CPU e2e: PASS (workers synthesized, gateway routed, graceful drain, clean exit, INTERNAL error detail, shared memory, liveness restarts)"
