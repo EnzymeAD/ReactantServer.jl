@@ -255,6 +255,35 @@ end
         end
     end
 
+    @testset "an input larger than its subslot is refused on either transport (CLI-12)" begin
+        # The shared-memory branch sends only an offset and a byte size, so a shape larger than the
+        # subslot used to make the server read past it, into whatever followed, without an error.
+        m = KServeModel("grpc://h:1", "x"; max_batch_size = 8)
+        shm = InferenceBufferPool(4096; n_slots = 4, use_shm = true, name = "rsc_cli12_pool")
+        inl = InferenceBufferPool(4096; n_slots = 4, use_shm = false)
+        try
+            for p in (shm, inl)
+                s = acquire_slot!(p)
+                sub = subslot(s, 4 * sizeof(Float32))                  # room for 4 Float32
+                err = try
+                    ReactantServerClient.materialize_input(InferInput("A", sub, [8], Float32), m, p)
+                    nothing
+                catch e
+                    e
+                end
+                @test err isa ArgumentError
+                @test err isa ArgumentError && occursin("\"A\"", err.msg) && occursin("16 bytes", err.msg)
+                @test_throws ArgumentError ReactantServerClient.materialize_input(InferInput("N", sub, [-4], Float32), m, p)
+                # A shape that fits is sent as before.
+                tensor, _ = ReactantServerClient.materialize_input(InferInput("A", sub, [4], Float32), m, p)
+                @test tensor.shape == [4]
+                release_slot!(s)
+            end
+        finally
+            rm(shm.pool.backing)
+        end
+    end
+
     @testset "scratch returns a homogeneous descriptor vector (no element promotion)" begin
         p = InferenceBufferPool(4096; n_slots = 4, use_shm = false)
         s = acquire_slot!(p, 2)

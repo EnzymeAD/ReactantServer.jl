@@ -127,13 +127,29 @@ on every supported (little-endian) target. The driven path covers numeric `Trito
 only, so no `BYTES` dtype needs per-element length prefixes. Callers must keep the pool rooted
 while the blob is alive (see `_run_chunk`'s `GC.@preserve`): the alias does not root the
 pool's backing on its own, and it must not outlive the slot it points into.
+
+On either transport, a descriptor whose shape needs more bytes than its subslot holds, or that has
+a negative dimension, is refused with an `ArgumentError`.
 """
 function materialize_input(
         d::PoolInferInput,
         model::AbstractInferenceModel,
         pool::InferenceBufferPool,
     )
-    n_bytes = sizeof(d.dtype) * prod(d.shape)
+    # Both transports hand the server exactly n_bytes starting at the subslot, so the subslot must
+    # hold them (CLI-12). The inline branch's pool_view would catch an overrun, but the shared-memory
+    # branch sends only an offset and a size, and the server would read past the subslot into the
+    # next input, or into another chunk's data, without an error.
+    all(>=(0), d.shape) ||
+        throw(ArgumentError("input \"$(d.name)\": shape $(d.shape) has a negative dimension"))
+    n_bytes = Base.checked_mul(Int(sizeof(d.dtype)), reduce(Base.checked_mul, d.shape; init = 1))
+    n_bytes <= d.subslot.capacity || throw(
+        ArgumentError(
+            "input \"$(d.name)\": a $(d.dtype) tensor of shape $(d.shape) is $n_bytes bytes, more " *
+                "than the $(d.subslot.capacity) bytes of the subslot it was staged in; carve the " *
+                "subslot for this shape (scratch does)"
+        )
+    )
     return if is_shm_backed(pool)
         var"ModelInferRequest.InferInputTensor"(
                 name = d.name,
