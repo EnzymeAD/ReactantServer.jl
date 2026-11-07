@@ -315,6 +315,48 @@ Base.flush(::_BrokenSink) = nothing
     @test count(l -> occursin("crashy exited (code=3", l), lines) == 3
 end
 
+# Kill the `sleep` grandchildren a test's children reported (`grandchild <pid>` lines).
+function _kill_grandchildren(lines)
+    for l in lines
+        m = match(r"\] grandchild (\d+)$", l)
+        m === nothing || run(ignorestatus(`kill $(m[1])`))
+    end
+    return nothing
+end
+
+@testset "supervisor: a grandchild holding a child's stderr delays neither restart nor shutdown" begin
+    # The child exits, but a process it started inherited its stderr and keeps it open, as an
+    # `nvidia-smi` a worker ran for a metrics scrape can. Before, the loop waited for end of file on
+    # that pipe, so the restart (and the node's shutdown) waited for the grandchild.
+    holder(name, rest) = RSN.ChildSpec(name, `sh -c "sleep 120 >/dev/null & echo \"grandchild \$!\"; $rest"`, 2.0)
+    sink = IOBuffer()
+    sup = RSN.Supervisor([holder("holder", "exit 3")]; sink = sink, max_restarts = 1)
+    t0 = time()
+    try
+        @test RSN.run_supervisor!(sup; install_signal_handlers = false) == 1
+        @test time() - t0 < 30                           # two runs and one restart, not 120 s
+        lines = _sink_lines(sink)
+        @test count(l -> startswith(l, "[supervisor] started holder"), lines) == 2
+        @test count(l -> occursin("holder has exited, but a process it started still holds its output open", l), lines) == 2
+    finally
+        _kill_grandchildren(_sink_lines(sink))
+    end
+
+    sink = IOBuffer()
+    sup = RSN.Supervisor([holder("runner", "echo up; exec sleep 120")]; sink = sink)
+    t = @async RSN.run_supervisor!(sup; install_signal_handlers = false)
+    try
+        @test wait_for(() -> any(==("[runner] up"), _sink_lines(sink)))
+        t0 = time()
+        RSN.request_shutdown!(sup)
+        @test fetch(t) == 0
+        @test time() - t0 < 15                           # the pipe's bound, not the grandchild's 120 s
+        @test any(l -> startswith(l, "[supervisor] runner stopped"), _sink_lines(sink))
+    finally
+        _kill_grandchildren(_sink_lines(sink))
+    end
+end
+
 @testset "supervisor: grace windows run in parallel" begin
     sink = IOBuffer()
     # TERM-ignoring children (exec keeps the ignored disposition, so SIGKILL leaves no orphan).

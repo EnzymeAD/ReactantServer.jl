@@ -74,8 +74,12 @@ end
 # quantity behind intermittent startup OOMs. We match our own PID (rather than a GPU index) because
 # `nvidia-smi` ignores `CUDA_VISIBLE_DEVICES` and lists every device the container can see. Reactant-
 # free, like the rest of this file; shelling out keeps it independent of any CUDA/NVML Julia binding.
-function process_device_used_bytes()
-    smi = Sys.which("nvidia-smi")
+# It runs on every metrics scrape, so it is bounded (`_read_bounded`): a wedged driver makes the
+# scrape miss this metric instead of hanging it.
+function process_device_used_bytes(;
+        smi::Union{AbstractString, Nothing} = Sys.which("nvidia-smi"),
+        timeout::Real = NVIDIA_SMI_TIMEOUT_SECONDS
+    )
     if smi === nothing
         # Reached only on a GPU worker (the caller gates on device_memory_stats != nothing). Warn
         # ONCE (maxlog=1, despite per-scrape calls): out-of-pool / command-buffer device memory is
@@ -86,7 +90,8 @@ function process_device_used_bytes()
     end
     pid = string(getpid())
     try
-        out = readchomp(`$smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits`)
+        out = _read_bounded(`$smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits`, timeout)
+        out === nothing && return nothing
         for line in eachline(IOBuffer(out))
             parts = split(line, ',')
             length(parts) >= 2 && strip(parts[1]) == pid || continue
@@ -98,6 +103,32 @@ function process_device_used_bytes()
         return nothing                                     # nvidia-smi missing/failed/unparseable
     end
     return nothing                                         # our PID holds no device memory yet
+end
+
+# How long a metrics scrape waits for `nvidia-smi`, which answers in well under a second normally.
+const NVIDIA_SMI_TIMEOUT_SECONDS = 10.0
+
+# Run `cmd` and return its standard output, or `nothing` if it fails or has not finished within
+# `timeout` seconds (it is then sent SIGKILL and left behind). It gets its own stdin and stderr
+# (/dev/null) rather than the worker's: under the node supervisor the worker's stderr is the
+# supervisor's pipe, and a copy left open in a wedged `nvidia-smi` would outlive the worker.
+function _read_bounded(cmd::Cmd, timeout::Real)
+    out = Pipe()
+    p = run(pipeline(cmd; stdin = devnull, stdout = out, stderr = devnull); wait = false)
+    close(out.in)
+    reader = @async read(out, String)
+    finished = timedwait(() -> istaskdone(reader) && !process_running(p), Float64(timeout); pollint = 0.02) === :ok
+    if !finished
+        try
+            kill(p, Base.SIGKILL)
+        catch
+        end
+        close(out)
+        @warn "nvidia-smi did not answer within $(timeout)s; the out-of-pool device-memory metrics are skipped for this scrape" maxlog = 10
+        return nothing
+    end
+    (istaskfailed(reader) || !success(p)) && return nothing
+    return fetch(reader)
 end
 
 _pct(part::Integer, whole::Integer) = whole > 0 ? round(Int, 100 * part / whole) : 0

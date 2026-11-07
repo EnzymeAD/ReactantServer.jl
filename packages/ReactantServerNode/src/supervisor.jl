@@ -248,15 +248,20 @@ _close_quietly(io) = try
 catch
 end
 
-# Wait for a task whose failure, if any, was already reported (errormonitor).
-_wait_quietly(t::Task) = try
-    wait(t)
-catch
-end
+# How long, once a child has exited, its output pipes may stay open. They normally reach end of file
+# at once; one held open longer belongs to a process the child started that inherited it (an
+# `nvidia-smi` the worker ran, say), and must not hold up the restart or the node's shutdown.
+const _PIPE_EOF_SECONDS = 5.0
 
-# After the run has ended: stop reading its pipes and release our end of its stdin.
-function _finish_run!(c::Child, r::_Run)
-    foreach(wait, r.pumps)
+# After the run has ended: read what is left in its pipes, for up to `_PIPE_EOF_SECONDS`, then stop
+# reading them, and release our end of its stdin.
+function _finish_run!(sup::Supervisor, c::Child, r::_Run)
+    if timedwait(() -> all(istaskdone, r.pumps), _PIPE_EOF_SECONDS; pollint = 0.05) !== :ok
+        _slog(sup, "$(c.spec.name) has exited, but a process it started still holds its output open; no longer reading it")
+        _close_quietly(r.out)
+        _close_quietly(r.err)
+        timedwait(() -> all(istaskdone, r.pumps), 1.0; pollint = 0.05)
+    end
     c.stdin === nothing || _close_quietly(c.stdin)
     return nothing
 end
@@ -494,7 +499,12 @@ function run_supervisor!(sup::Supervisor; install_signal_handlers::Bool = true)
     tasks = [errormonitor(@async _supervise_task(sup, c)) for c in sup.children]
     code = take!(sup.exit_signal)
     _shutdown_children!(sup)
-    foreach(_wait_quietly, tasks)
+    # Every child has now exited or been given up on after SIGKILL; each loop ends once its child's
+    # pipes are done (`_finish_run!`). A child that did not die keeps its loop waiting, so bound this.
+    if timedwait(() -> all(istaskdone, tasks), _PIPE_EOF_SECONDS + 5.0; pollint = 0.05) !== :ok
+        stuck = [c.spec.name for (c, t) in zip(sup.children, tasks) if !istaskdone(t)]
+        _slog(sup, "stopping without waiting further for $(join(stuck, ", "))")
+    end
     close(cond)
     _slog(sup, "node stopped (exit $code)")
     _close_log!(sup)
