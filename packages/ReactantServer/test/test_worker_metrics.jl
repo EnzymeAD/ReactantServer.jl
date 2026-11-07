@@ -68,6 +68,7 @@ end
     for name in (
             "worker_weight_compaction_seconds_total", "worker_weight_stages_total",
             "worker_weight_stage_failures_total", "worker_weight_stage_seconds_total",
+            "worker_weight_stalled_reads_total", "worker_weight_stalled_reads",
         )
         @test occursin("$name 0", s)
     end

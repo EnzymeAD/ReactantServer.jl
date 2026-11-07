@@ -48,7 +48,11 @@ Base.getindex(w::WeightsFile, name) = read_weight(w, name)
 _fd(w::WeightsFile) = reinterpret(Cint, fd(w.io))
 
 const _ST_MAX_HEADER = 100_000_000          # the bound SafeTensors.jl enforces
-const _PREAD_CHUNK = 1 << 26                # 64 MiB per pread call
+# 8 MiB per pread call. Each call is one step of a read's progress (`ReadProgress`), so the chunk
+# bounds the slowest storage a stall limit still counts as moving: 8 MiB per limit, 140 KiB/s at the
+# default 60 s. Throughput does not depend on it: a 1 GiB file in the page cache read at the same
+# 4.5 GiB/s in 64, 16 and 8 MiB calls.
+const _PREAD_CHUNK = 1 << 23
 
 const AXIS_ORDER_KEY = "axis_order"
 const AXIS_ORDER_XLA = "xla"
@@ -62,22 +66,72 @@ function _xla_axis_order(metadata, path)
     throw(BundleError("$(path): unsupported weights axis_order $(repr(v)) (supported: \"$(AXIS_ORDER_XLA)\")"))
 end
 
-# Read exactly `nbytes` at `offset` into `ptr`, in chunks. gc_safe: a disk read can take a while, and
-# no Julia object crosses the call (the caller roots the destination).
+"""
+    ReadProgress()
+
+How far a read of weights files has got: the bytes read so far and when the last of them arrived
+(`time_ns()`). The scheduler watches the background reads it starts with one each and abandons a
+read that stops making progress (see `_check_stall!` in scheduler.jl). Every chunk a weights file
+read returns counts, through `note_read_progress!`, for the read running on that task under
+`with_read_progress`; a wait on a lock counts as none.
+"""
+mutable struct ReadProgress
+    @atomic bytes::Int
+    @atomic last_ns::Int64
+end
+ReadProgress() = ReadProgress(0, Int64(time_ns()))
+
+const _READ_PROGRESS = Base.ScopedValues.ScopedValue{Union{ReadProgress, Nothing}}(nothing)
+
+"""
+    with_read_progress(f, progress::ReadProgress)
+
+Run `f()`, counting every weights file read it makes on this task in `progress`.
+"""
+with_read_progress(f, progress::ReadProgress) = Base.ScopedValues.with(f, _READ_PROGRESS => progress)
+
+"""
+    note_read_progress!(nbytes)
+
+Count `nbytes` read for the read this task runs under `with_read_progress`, if any.
+"""
+function note_read_progress!(nbytes::Integer)
+    p = _READ_PROGRESS[]
+    p === nothing && return nothing
+    @atomic p.bytes += Int(nbytes)
+    @atomic p.last_ns = Int64(time_ns())
+    return nothing
+end
+
+# One read from a weights file: `(fd, ptr, nbytes, offset) -> (bytes read, errno)`, as pread(2) gives
+# them (bytes read is negative on an error, which errno names). gc_safe: a disk read can take a while,
+# and no Julia object crosses the call (the caller roots the destination).
+function _pread(fd::Cint, ptr::Ptr{UInt8}, nbytes::Integer, offset::Integer)
+    r = @ccall gc_safe = true pread(fd::Cint, ptr::Ptr{Cvoid}, Csize_t(nbytes)::Csize_t, Int64(offset)::Int64)::Cssize_t
+    return (Int(r), r < 0 ? Libc.errno() : Cint(0))
+end
+
+# The read every weights file read goes through. A Ref so tests can hold a read in progress, as
+# storage that stopped answering does; called with `invokelatest`, so a replacement made after a
+# long-running task started (a background read, the dispatch loop) is seen by it.
+const _PREAD = Ref{Function}(_pread)
+
+# Read exactly `nbytes` at `offset` into `ptr`, in chunks, counting each as progress of the read
+# being watched on this task (`note_read_progress!`).
 function _pread_full!(w::WeightsFile, ptr::Ptr{UInt8}, nbytes::Int, offset::Int)
     fdc = _fd(w)
     done = 0
     while done < nbytes
         n = min(nbytes - done, _PREAD_CHUNK)
-        r = @ccall gc_safe = true pread(fdc::Cint, (ptr + done)::Ptr{Cvoid}, n::Csize_t, Int64(offset + done)::Int64)::Cssize_t
+        r, err = Base.invokelatest(_PREAD[], fdc, ptr + done, n, offset + done)::Tuple{Int, Cint}
         if r < 0
-            err = Libc.errno()
             err == Libc.EINTR && continue
             throw(SystemError("reading weights from $(w.path)", err))
         elseif r == 0
             throw(ErrorException("weights file $(w.path) ended early: it was truncated or replaced in place while loading"))
         end
         done += r
+        note_read_progress!(r)
     end
     return nothing
 end

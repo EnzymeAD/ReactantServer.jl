@@ -41,7 +41,8 @@ Prometheus.metric_names(::WorkerSnapshotCollector) = (
     "worker_weight_cache_max_scratch_bytes", "worker_weight_pool_bytes",
     "worker_weight_loads_total", "worker_weight_evicts_total", "worker_weight_compaction_seconds_total",
     "worker_weight_stages_total", "worker_weight_stage_failures_total", "worker_weight_stage_seconds_total",
-    "worker_weight_staging_models", "worker_model_loads_total", "worker_model_reads_total", "worker_model_evicts_total",
+    "worker_weight_staging_models", "worker_weight_stalled_reads_total", "worker_weight_stalled_reads",
+    "worker_model_loads_total", "worker_model_reads_total", "worker_model_evicts_total",
     "worker_weight_load_seconds_total", "worker_weight_load_bytes_total",
     "worker_weight_upload_seconds_total", "worker_weight_read_seconds_total", "worker_weight_read_bytes_total",
     "worker_weight_compactions_total", "worker_weight_fallback_compactions_total",
@@ -280,6 +281,17 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
                 "worker_weight_stage_seconds_total", "counter",
                 "Cumulative seconds of background weight reads, shared-store lock waits included (the file " *
                     "reads among them also count in worker_weight_read_seconds_total).", wc.stage_seconds
+            ),
+            _scalar(
+                "worker_weight_stalled_reads_total", "counter",
+                "Background weight reads abandoned after scheduler.weight_read_stall_seconds without progress " *
+                    "(the requests waiting for them failed with UNAVAILABLE).", wc.stalled_reads
+            ),
+            _scalar(
+                "worker_weight_stalled_reads", "gauge",
+                "Abandoned weight reads that have not returned. Each holds a thread; at a bound of a few, the " *
+                    "worker starts no read and requests for models off the device fail with UNAVAILABLE.",
+                wc.stalled_reads_outstanding
             ),
             _scalar(
                 "worker_weight_fallback_compactions_total", "counter",

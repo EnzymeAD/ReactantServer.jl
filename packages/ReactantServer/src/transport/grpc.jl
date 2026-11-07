@@ -102,8 +102,9 @@ _status_label(e) = get(_GRPC_STATUS_NAME, Int(_grpc_status(e)), "UNKNOWN")
 #   has no room for the pages of a shared-memory range the request reads or writes (`ShmSpaceError`,
 #   CORE-4)
 # - UNAVAILABLE: the worker is shutting down or draining, its dispatch loop died, the model is
-#   not resident under externally-managed residency, or admission cannot place it on the device
-#   now (`AdmissionError`). Another replica may serve it; never FAILED_PRECONDITION, which a
+#   not resident under externally-managed residency, admission cannot place it on the device
+#   now (`AdmissionError`), or its weights cannot be read now because reads stalled
+#   (`WeightsReadStalledError`). Another replica may serve it; never FAILED_PRECONDITION, which a
 #   client reads as a stale shared-memory registration
 # - NOT_FOUND: the model is unknown here, or was unloaded or replaced while the request waited
 # - DEADLINE_EXCEEDED: the deadline passed before dispatch (EDF laxity drops included), or the
@@ -123,7 +124,8 @@ function _grpc_status(e)
     S = gRPCServer.StatusCode
     e isa gRPCServer.GRPCError && return e.code
     (e isa QueueFullError || e isa ShmSpaceError) && return S.RESOURCE_EXHAUSTED
-    (e isa WorkerUnavailableError || e isa NotResidentError || e isa AdmissionError) && return S.UNAVAILABLE
+    (e isa WorkerUnavailableError || e isa NotResidentError || e isa AdmissionError || e isa WeightsReadStalledError) &&
+        return S.UNAVAILABLE
     e isa ModelNotFoundError && return S.NOT_FOUND
     (e isa DeadlineExceeded || e isa DispatchTimeoutError) && return S.DEADLINE_EXCEEDED
     (e isa RequestCancelledError || e isa RequestCancelled) && return S.CANCELLED

@@ -42,6 +42,7 @@ ReactantServer.resolve_weights_path
 ReactantServer.NotResidentError
 ReactantServer.QueueFullError
 ReactantServer.WorkerUnavailableError
+ReactantServer.WeightsReadStalledError
 ReactantServer.ModelNotFoundError
 ReactantServer.DispatchTimeoutError
 ReactantServer.RequestCancelledError

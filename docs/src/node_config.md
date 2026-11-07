@@ -89,6 +89,7 @@ global:
     dispatch_timeout_seconds: 30.0
     compaction_interval: 0     # defragment device memory every N on-demand weight loads; 0 disables
     coalescing: true           # merge queued requests into one dispatch (profile default)
+    weight_read_stall_seconds: 60.0  # abandon a weights read with no progress this long; 0 disables
     models: {}                 # per-model overrides -> ModelSchedConfig (see below)
   endpoints:                   # -> EndpointsConfig
     host: 0.0.0.0              # bind all interfaces so the gateway and clients can reach the worker
@@ -505,6 +506,7 @@ overrides were applied, is logged at startup.
 | `INFERENCE_SERVER_SCHEDULER_DISPATCH_TIMEOUT_SECONDS` | `scheduler.dispatch_timeout_seconds` | seconds |
 | `INFERENCE_SERVER_SCHEDULER_COMPACTION_INTERVAL` | `scheduler.compaction_interval` | integer |
 | `INFERENCE_SERVER_SCHEDULER_COALESCING` | `scheduler.coalescing` | bool |
+| `INFERENCE_SERVER_SCHEDULER_WEIGHT_READ_STALL_SECONDS` | `scheduler.weight_read_stall_seconds` | seconds |
 | `INFERENCE_SERVER_ENDPOINTS_HOST` | `endpoints.host` | address |
 | `INFERENCE_SERVER_ENDPOINTS_PORT` | `endpoints.port` | port |
 | `INFERENCE_SERVER_ENDPOINTS_METRICS_PORT` | `endpoints.metrics_port` | port |

@@ -56,6 +56,12 @@ global:
     # self-compacts: behind a gateway, compaction is driven by the gateway instead. Prefer larger
     # intervals.
     compaction_interval: 0
+    # A background read of a model's weights into host RAM (ahead of its upload) that makes no
+    # progress for this long is abandoned: the requests waiting for the model fail with UNAVAILABLE,
+    # which the gateway retries on another replica, and the read slot passes to the next model, so
+    # storage that stops answering (a hard NFS mount) cannot hold the worker's reads for good. Slow
+    # storage that is still moving is never cut off. 0 disables.
+    weight_read_stall_seconds: 60
   endpoints:
     host: 0.0.0.0
   # gRPC message-size limits, shared by every worker and mirrored into the embedded gateway by the

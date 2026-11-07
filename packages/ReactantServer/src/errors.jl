@@ -32,6 +32,22 @@ end
 Base.showerror(io::IO, e::WorkerUnavailableError) = print(io, e.msg)
 
 """
+    WeightsReadStalledError(model, msg)
+
+Raised to a request for a model this worker cannot load now because reading weights stalled: the
+background read of the model's weights made no progress for `scheduler.weight_read_stall_seconds`
+and was abandoned, an earlier read of them stalled and has not returned, or so many reads have
+stalled that the worker starts no new ones. Models already on the device keep serving. The gRPC
+layer maps it to `UNAVAILABLE`, so a gateway fails the request over to another replica and a
+client may retry.
+"""
+struct WeightsReadStalledError <: Exception
+    model::String
+    msg::String
+end
+Base.showerror(io::IO, e::WeightsReadStalledError) = print(io, e.msg)
+
+"""
     ModelNotFoundError(model[, msg])
 
 Raised when a request names a model this worker does not serve: it was never loaded, or it was
