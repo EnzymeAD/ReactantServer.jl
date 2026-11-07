@@ -7,18 +7,19 @@
 # test_weight_staging.jl (GatedWeights, _st_entry, _st_infer, _ST_OUT), test_weight_cache.jl (_W,
 # _WBYTES) and test_host_cache.jl (CountingWeights).
 
-# Like `_st_entry`, compiled for batches of 1 and 2, so two queued requests share a dispatch. Its
-# preprocess stands in for a model.jl with a bug: for a negative input it emits three features where
-# the program takes two. Such a request is queued (its batch extents agree and the model reads no
-# shape variant), and coalesced with another it fails the concatenation, which runs before the
-# dispatch uploads the model's weights.
+# Like `_st_entry`, compiled for a batch of 2 only, so a request of one row is padded to 2. Its
+# preprocess stands in for a model.jl with a bug: for a negative input it drops the batch axis. Such a
+# request is queued (its batch extents agree and the model reads no shape variant), and its dispatch
+# fails padding it, which runs before the dispatch uploads the model's weights. (A bad request no
+# longer fails a dispatch it shares: one whose input differs from the others' off the batch axis is
+# not merged with them (STG-1), and one missing its batch axis concatenates like any other.)
 function _sr_entry(name, weights)
     sig = ReactantServer.ModelSignature(["x"], DataType[Float32], ["w"], 1, ["y"], DataType[Float32], 1)
     exec = ReactantServer.MockExecutable(args -> [args[1] .* args[2]], 1)
-    lm = ReactantServer.LoadedModel(sig, Dict{Int, Any}(1 => exec, 2 => exec), nothing, false, _WBYTES, nothing)
+    lm = ReactantServer.LoadedModel(sig, Dict{Int, Any}(2 => exec), nothing, false, _WBYTES, nothing)
     pre = function (ins)
         x = ins[1].data
-        return [ReactantServer.NamedTensor("x", x[1] < 0 ? zeros(Float32, 3, size(x, 2)) : x)]
+        return [ReactantServer.NamedTensor("x", x[1] < 0 ? vec(x) : x)]
     end
     return ReactantServer.ModelEntry(
         name, _batched_manifest(name), Dict{Int, Vector{UInt8}}(), "", weights, lm, nothing, pre, identity
@@ -101,17 +102,16 @@ function _sr_infer(sched, name, v; deadline_ns::Integer = 0, cancelled = nothing
     end
 end
 
-# Queue a good and a bad request for the cold model `e` while its read is held, then let the read
-# land: its dispatch coalesces the two and fails before the upload. Returns both replies.
+# Queue a bad request for the cold model `e`, whose read it starts and which is held, then let the
+# read land: its dispatch fails before the upload. Returns the reply.
 function _sr_fail_before_upload!(sched, e, gw::GatedWeights)
     gw.armed = true
-    good = Threads.@spawn _sr_infer(sched, e.name, 1.0f0)
-    wait(gw.started)
     bad = Threads.@spawn _sr_infer(sched, e.name, -1.0f0)
-    @test _sr_until(() -> _sr_queued(sched, e) == 2)
+    wait(gw.started)
+    @test _sr_until(() -> _sr_queued(sched, e) == 1)
     gw.armed = false
     notify(gw.gate)
-    return fetch(good), fetch(bad)
+    return fetch(bad)
 end
 
 # Both staging slots are free: two cold models are read at once, neither waits for a slot.
@@ -143,8 +143,7 @@ end
             @test _st_infer(sched, "A") == _ST_OUT              # A on the device, every B off it
             @test all(e -> e.executable.weights === nothing, Bs)
             for i in 1:2
-                good, bad = _sr_fail_before_upload!(sched, Bs[i], gws[i])
-                @test good isa DimensionMismatch && bad isa DimensionMismatch
+                @test _sr_fail_before_upload!(sched, Bs[i], gws[i]) isa BoundsError
                 @test Bs[i].executable.weights === nothing      # nothing was uploaded
                 @test _sr_until(() -> _sr_stage(sched, Bs[i]) === :none)
                 @test Bs[i].sched.staged === nothing

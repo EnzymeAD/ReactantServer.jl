@@ -338,6 +338,30 @@ function _batch_extents_agree(entry::ModelEntry, inputs::AbstractVector{NamedTen
     return true
 end
 
+# Whether request `b`'s batched executable inputs can be concatenated with request `a`'s row for row:
+# each has the same element type and the same extent on every axis but its batch axis (STG-1), which
+# is what `cat` along the batch axis requires (a missing trailing axis counting as 1). Validation
+# checks the client's inputs, but a model's preprocess can emit a tensor whose other axes, or element
+# type, differ for some inputs. Merged with others, such a tensor failed the concatenation, or the
+# program, for every request in the dispatch; it ends the coalescing prefix instead, so it runs apart
+# from the well-formed requests and fails without them. Like `_batch_extents_agree`, this reads a few
+# sizes per request as the queue is planned.
+function _rows_alike(entry::ModelEntry, a::AbstractVector{NamedTensor}, b::AbstractVector{NamedTensor})
+    for sp in entry.manifest.executable_inputs
+        ax = sp.batch_axis
+        ax === nothing && continue
+        i = findfirst(t -> t.name == sp.name, a)
+        j = findfirst(t -> t.name == sp.name, b)
+        (i === nothing || j === nothing) && return false
+        x, y = a[i].data, b[j].data
+        eltype(x) == eltype(y) || return false
+        for d in 1:max(ndims(x), ndims(y))
+            d == ax || size(x, d) == size(y, d) || return false
+        end
+    end
+    return true
+end
+
 # A model can coalesce multiple requests only when EVERY executable input carries a batch axis and
 # every output does too (so inputs concatenate and outputs split per request). Otherwise it serves
 # one request per dispatch. Single unbatched modules (batch key 0) are never coalesced. The strict
@@ -372,7 +396,8 @@ _smallest_ge(sizes::Vector{Int}, n::Int) = (i = findfirst(>=(n), sizes); i === n
 # dispatches alone. For non-coalescable models exactly one request is taken at its own size, and so
 # is it for every model when `coalesce` is false (`scheduler.coalescing`), so a request's rows always
 # occupy the same slots of the same program whatever else is queued. A request whose batched inputs
-# disagree on their batch extent is never coalesced either: it dispatches alone.
+# disagree on their batch extent is never coalesced either: it dispatches alone. Nor are requests
+# whose inputs differ from each other off the batch axis or in element type (`_rows_alike`).
 function plan_batch(entry::ModelEntry, st::ModelSchedState; coalesce::Bool = true)
     isempty(st.queue) && return nothing
     front = st.queue[1]
@@ -406,11 +431,15 @@ function plan_batch(entry::ModelEntry, st::ModelSchedState; coalesce::Bool = tru
 
     # The leading run of same-variant requests is the only window we may coalesce within (keeps
     # `taken` a contiguous front prefix so _finalize can deleteat! it, and preserves FIFO order).
-    # A request whose batch extents disagree also ends it; it leads a later dispatch, alone.
+    # A request whose batch extents disagree also ends it; it leads a later dispatch, alone. So does
+    # one whose inputs differ from the front request's on any other axis or in element type
+    # (`_rows_alike`); it leads a later dispatch, shared only with requests whose inputs match its
+    # own. When the front request is the odd one, it dispatches without the others.
     nprefix = 0
     for qr in st.queue
         _request_variant(entry, qr.prepared) == variant || break
         _batch_extents_agree(entry, qr.prepared) || break
+        qr === front || _rows_alike(entry, front.prepared, qr.prepared) || break
         nprefix += 1
     end
     prefix = view(st.queue, 1:nprefix)
