@@ -980,6 +980,16 @@ end
     end
 end
 
+@testset "ShmUnrecoverableError shows the endpoint and the cause, not the model's internals" begin
+    RSC = ReactantServerClient
+    m = KServeModel("grpc://host.example:8001", "mymodel")
+    cause = RSC.gRPCClient.gRPCServiceCallException(RSC.gRPCClient.GRPC_INTERNAL, "register rejected")
+    msg = sprint(showerror, RSC.ShmUnrecoverableError(m, cause))
+    @test occursin("host.example:8001", msg) && occursin("mymodel", msg)
+    @test occursin("register rejected", msg)
+    @test !occursin("gRPCCURL", msg) && length(msg) < 400
+end
+
 # Shared-memory recovery against a mock KServe gRPC server (restart, coalescing, latch, unlatch).
 include("test_shm_recovery.jl")
 include("test_shm_protocol.jl")

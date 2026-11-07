@@ -354,6 +354,15 @@ struct ShmUnrecoverableError <: Exception
     cause::Any
 end
 
+# Name the endpoint and the cause. The default display printed the whole model, gRPC handle and
+# connection pool included.
+function Base.showerror(io::IO, e::ShmUnrecoverableError)
+    m = e.model
+    target = m isa KServeModel ? "model \"$(model_name(m))\" at $(m.host):$(m.port)" : string(typeof(m))
+    print(io, "ShmUnrecoverableError: shared memory could not be recovered for ", target, ": ")
+    return showerror(io, e.cause)
+end
+
 # A shed the client should back off and retry: RESOURCE_EXHAUSTED (a worker or the gateway at its
 # concurrency cap) always, and UNAVAILABLE (no replica reachable) when the policy allows. Deadline,
 # NOT_FOUND, INVALID_ARGUMENT, and INTERNAL are not retried, so a doomed request fails fast. A stale
