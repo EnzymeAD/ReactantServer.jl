@@ -282,6 +282,13 @@ Run inference over every item in `io`, staging inputs through the shared-memory 
 and dispatching chunks concurrently (bounded by the pool's slot count). Each chunk acquires a
 disjoint slot, so this is safe to call from multiple threads against one model. Results are
 delivered through `io`'s `infer_decode_chunk!`. Use [`infer_sync`](@ref) for serial dispatch.
+
+When a chunk fails, no further chunk starts, and the call waits for the chunks already in flight
+to finish (they still deliver their results), so once it returns or throws, nothing writes into
+`io` or holds a pool slot for it. The error is the first failing chunk's exception as the chunk
+raised it, not wrapped in a `TaskFailedException`, so it is caught by type just as from
+`infer_sync`, and an unrecoverable shared-memory failure falls back to inline transport the same
+way. The chunk's backtrace stays on the exception stack (`current_exceptions()`).
 """
 function infer_async(m::AbstractInferenceModel, io::AbstractInferenceIO)
     return _infer_pool_driven(m, io; force_serial = false)
@@ -391,7 +398,8 @@ end
     infer_sync(model, network_inputs) -> ModelInferResponse
 
 Synchronous inference. The [`AbstractInferenceIO`](@ref) form drives `io` one chunk at a time
-(no concurrency). The second form is a one-shot call: `network_inputs` is a vector of wire
+(no concurrency) and stops at the first chunk that fails, throwing its exception. The second
+form is a one-shot call: `network_inputs` is a vector of wire
 tensors built with [`InferInput`](@ref), sent inline in a single `ModelInferRequest`, and the
 decoded `ModelInferResponse` is returned for reading with [`InferOutput`](@ref). The one-shot
 form encodes tensor data element by element as typed contents, so it emits a one-time
@@ -690,31 +698,62 @@ function _drive_pool_inference(
     # finds none free (concurrent calls, a quarantined slot) goes inline rather than waiting.
     window = max(1, n_slots(pool) ÷ span)
     tasks = Task[]
-    err = Ref{Any}(nothing)
+    failure = _FirstChunkFailure()
 
-    i = 0
-    for r in BatchIterator(length(io), chunk)
-        i += 1
-        if length(tasks) >= window
-            wait(tasks[i - window])
+    try
+        i = 0
+        for r in BatchIterator(length(io), chunk)
+            i += 1
+            length(tasks) >= window && wait(tasks[i - window])
+            _failed(failure) && break   # after the first failure, no further chunk starts
+            push!(tasks, Threads.@spawn _run_async_chunk(failure, m, io, pool, fill_lock, r, span))
         end
-        err[] === nothing || break
-        local_r = r
-        t = Threads.@spawn begin
-            try
-                chunk_pool, slot = _chunk_slot(m, io, pool, local_r, span)
-                _run_chunk(m, io, chunk_pool, fill_lock, local_r, slot)
-            catch ex
-                err[] = ex
-                rethrow()
-            end
-        end
-        push!(tasks, t)
+    finally
+        # Whatever ends the loop, every chunk it started finishes before the call returns: one still
+        # running would go on writing into the caller's io and holding a pool slot (CLI-3). Chunk
+        # tasks record their failure instead of throwing, so these waits do not throw.
+        foreach(wait, tasks)
     end
-
-    foreach(wait, tasks)
-    err[] === nothing || throw(err[])
+    _throw_first_failure(failure)
     return nothing
+end
+
+# The first failure among one `infer_async` call's chunks, as (exception, backtrace). Set once; a
+# later failure is dropped.
+mutable struct _FirstChunkFailure
+    @atomic first::Union{Nothing, Tuple{Any, Any}}
+end
+_FirstChunkFailure() = _FirstChunkFailure(nothing)
+_failed(f::_FirstChunkFailure) = (@atomic f.first) !== nothing
+
+# One chunk of an `infer_async` call, run on its own task. A failure is recorded in `failure`
+# rather than thrown, so the driver can wait on every chunk without the first failed wait cutting
+# the others short. A chunk that had not started when another failed does not start.
+function _run_async_chunk(failure::_FirstChunkFailure, m, io, pool, fill_lock, r, span)
+    _failed(failure) && return nothing
+    try
+        chunk_pool, slot = _chunk_slot(m, io, pool, r, span)
+        _run_chunk(m, io, chunk_pool, fill_lock, r, slot)
+    catch ex
+        @atomicreplace failure.first nothing => (ex, catch_backtrace())
+    end
+    return nothing
+end
+
+# Throw the recorded chunk failure, if any, as the exception the chunk raised, not wrapped in a
+# TaskFailedException: callers that catch by type, and the inline-fallback latch in
+# `_infer_pool_driven` (which looks for `ShmUnrecoverableError`), see what `infer_sync` would have
+# thrown. Raising it inside a `catch` keeps the chunk's own backtrace on the exception stack below it
+# (`current_exceptions()`), which is where Julia prints it, as "caused by".
+function _throw_first_failure(failure::_FirstChunkFailure)
+    recorded = @atomic failure.first
+    recorded === nothing && return nothing
+    ex, bt = recorded
+    return try
+        throw(CapturedException(ex, bt))
+    catch
+        throw(ex)
+    end
 end
 
 function infer_sync(m::AbstractInferenceModel, network_inputs)
