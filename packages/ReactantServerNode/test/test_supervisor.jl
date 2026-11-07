@@ -194,6 +194,48 @@ end
     @test !any(l -> occursin("SIGKILL", l), lines)
 end
 
+# A sink whose writes wait until its gate opens, as a stdout whose reader has stopped reading does.
+struct _GatedSink <: IO
+    buf::IOBuffer
+    gate::Base.Event
+end
+_GatedSink() = _GatedSink(IOBuffer(), Base.Event())
+Base.unsafe_write(s::_GatedSink, p::Ptr{UInt8}, n::UInt) = (wait(s.gate); unsafe_write(s.buf, p, n))
+Base.write(s::_GatedSink, b::UInt8) = (wait(s.gate); write(s.buf, b))
+Base.flush(::_GatedSink) = nothing
+
+_counted(lines, re) = [parse(Int, m[1]) for m in (match(re, l) for l in lines) if m !== nothing]
+
+@testset "supervisor: a blocked log sink never blocks a child" begin
+    sink = _GatedSink()
+    done = joinpath(mktempdir(), "done")
+    # Far more output than a pipe holds (64 KiB) or the log queue keeps (50 lines), then a marker
+    # file. While the sink takes nothing, the child gets to the marker only if the supervisor keeps
+    # reading its pipe. Before, the pump waited on the sink, the pipe filled, and the child blocked.
+    script = """
+    for i in 1:20000
+        println("line \$i")
+    end
+    flush(stdout)
+    touch($(repr(done)))
+    sleep(120)
+    """
+    sup = RSN.Supervisor([_script_spec("chatty", script)]; sink = sink, log_lines = 50)
+    t = @async RSN.run_supervisor!(sup; install_signal_handlers = false)
+    @test wait_for(() -> isfile(done); timeout = 60)
+    @test position(sink.buf) == 0                        # the sink has still taken nothing
+    notify(sink.gate)
+    @test wait_for(() -> any(l -> occursin("were dropped here", l), _sink_lines(sink.buf)))
+    RSN.request_shutdown!(sup)
+    @test fetch(t) == 0
+    lines = _sink_lines(sink.buf)
+    got = _counted(lines, r"^\[chatty\] line (\d+)$")
+    dropped = _counted(lines, r"^\[supervisor\] the log sink fell behind and \d+ line\(s\) were dropped here \(.*chatty: (\d+)")
+    @test issorted(got) && allunique(got)                # one child's lines keep their order
+    @test !isempty(dropped) && length(got) + sum(dropped) == 20000   # every line written or counted
+    @test any(l -> startswith(l, "[supervisor] node stopped (exit 0)"), lines)
+end
+
 @testset "supervisor: grace windows run in parallel" begin
     sink = IOBuffer()
     # TERM-ignoring children (exec keeps the ignored disposition, so SIGKILL leaves no orphan).

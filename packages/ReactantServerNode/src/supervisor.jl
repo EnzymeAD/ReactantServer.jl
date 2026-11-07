@@ -1,6 +1,7 @@
 # The supervision core: spawn each child with piped stdout/stderr, pump both streams line by
-# line onto the shared sink under a lock (so lines never interleave mid-line, the docker-compose
-# look), restart children that die with capped exponential backoff, and on shutdown stop the
+# line into a bounded log queue that one writer task drains onto the shared sink (so lines never
+# interleave mid-line, the docker-compose look, and a sink that stops taking lines never stops a
+# child), restart children that die with capped exponential backoff, and on shutdown stop the
 # children stage by stage: the gateway first, then the workers. A child with a drain budget is asked
 # to drain by closing its stdin (see ReactantServerCore's drain.jl) and given that long to finish
 # its requests; anything else is sent SIGTERM. Each stage's children are waited for in parallel, and
@@ -16,10 +17,45 @@ mutable struct Child
 end
 Child(spec::ChildSpec) = Child(spec, nothing, 0, 0.0, nothing, false)
 
+# Lines the log queue gave up on while it was full, at the place in the stream where they were lost.
+mutable struct _Dropped
+    n::Int
+    by::Dict{String, Int}   # per stream name ("worker0", "supervisor", ...)
+end
+
+# Every line bound for the sink, children's and the supervisor's own, in the order they arrived.
+# Pumps and the supervision loops only ever add to it, which never blocks; one writer task takes
+# from it and does the (possibly blocking) writes. When the queue holds `max_lines` lines or
+# `max_bytes` bytes, a new line is dropped and counted in a `_Dropped` entry at the tail, which the
+# writer turns into one line saying how many were lost there once the sink takes lines again.
+mutable struct _LogQueue
+    const cond::Threads.Condition
+    const items::Vector{Union{String, _Dropped}}
+    bytes::Int
+    const max_lines::Int
+    const max_bytes::Int
+    writer::Union{Task, Nothing}   # nothing until `run_supervisor!`: lines are written directly before
+    closed::Bool                   # set once the node has stopped; later lines are dropped
+    failed::Int                    # lines the sink refused (a write error) since it last took one
+    failure::String                # the first of those errors
+end
+_LogQueue(max_lines::Integer, max_bytes::Integer) = _LogQueue(
+    Threads.Condition(), Union{String, _Dropped}[], 0, Int(max_lines), Int(max_bytes), nothing,
+    false, 0, ""
+)
+
+# How many lines, and bytes, the log queue holds before it drops new ones: enough for a burst (a
+# worker's startup output, a crash backtrace) while the sink is briefly slow, and a bound on what a
+# stuck sink can cost in memory.
+const _LOG_QUEUE_LINES = 10_000
+const _LOG_QUEUE_BYTES = 8 << 20
+# How long the node, once stopped, gives the writer to put the last queued lines on the sink.
+const _LOG_FLUSH_SECONDS = 10.0
+
 struct Supervisor
     children::Vector{Child}
     sink::IO
-    lk::ReentrantLock                  # serializes whole lines onto the sink
+    log::_LogQueue                     # see `_LogQueue`; the only path onto `sink`
     shutting_down::Threads.Atomic{Bool}
     exit_signal::Channel{Int}          # first value wins: the supervisor's exit code
     max_restarts::Int                  # consecutive failed restarts before giving up; 0 = never
@@ -29,29 +65,132 @@ end
 
 function Supervisor(
         specs::Vector{ChildSpec}; sink::IO = stdout, max_restarts::Int = 0,
-        backoff_cap::Real = 30.0, stable_seconds::Real = 60.0
+        backoff_cap::Real = 30.0, stable_seconds::Real = 60.0,
+        log_lines::Integer = _LOG_QUEUE_LINES, log_bytes::Integer = _LOG_QUEUE_BYTES
     )
     return Supervisor(
-        Child[Child(s) for s in specs], sink, ReentrantLock(),
+        Child[Child(s) for s in specs], sink, _LogQueue(log_lines, log_bytes),
         Threads.Atomic{Bool}(false), Channel{Int}(8), max_restarts,
         Float64(backoff_cap), Float64(stable_seconds)
     )
 end
 
+# Queue one line from the stream `name`; never blocks. Before the supervisor runs (the notes
+# `build_supervisor` logs) nothing else writes, so the line goes straight to the sink.
 function _emit(sup::Supervisor, name::AbstractString, line::AbstractString)
-    lock(sup.lk) do
-        println(sup.sink, "[", name, "] ", line)
-        flush(sup.sink)
+    q = sup.log
+    text = string("[", name, "] ", line)
+    @lock q.cond begin
+        q.closed && return nothing
+        if q.writer === nothing
+            println(sup.sink, text)
+            flush(sup.sink)
+        elseif length(q.items) >= q.max_lines || q.bytes + sizeof(text) > q.max_bytes
+            gap = isempty(q.items) ? nothing : q.items[end]
+            if !(gap isa _Dropped)
+                gap = _Dropped(0, Dict{String, Int}())
+                push!(q.items, gap)
+            end
+            gap.n += 1
+            gap.by[name] = get(gap.by, name, 0) + 1
+        else
+            push!(q.items, text)
+            q.bytes += sizeof(text)
+            notify(q.cond)
+        end
     end
     return nothing
 end
 
-_slog(sup::Supervisor, msg::AbstractString) = _emit(sup, "supervisor", msg)
+# The supervisor's own messages, one prefixed line per line of `msg`.
+function _slog(sup::Supervisor, msg::AbstractString)
+    for line in eachsplit(msg, '\n')
+        _emit(sup, "supervisor", line)
+    end
+    return nothing
+end
 
-# Drain a child stream onto the sink. eachline also yields a trailing partial line at EOF, so
-# the last words of a crashing child are never lost; pumping unconditionally means a chatty
-# child can never block on a full pipe. The drain acknowledgement is recorded as it passes; the
-# child writes it in one piece, but other output can still precede it on the same line.
+_dropped_text(d::_Dropped) = string(
+    "[supervisor] the log sink fell behind and ", d.n, " line(s) were dropped here (",
+    join(("$k: $v" for (k, v) in sort!(collect(d.by))), ", "), ")"
+)
+
+# The writer task: take queued lines in order and write each to the sink, which may block for as
+# long as the sink's reader stalls; only this task waits for it.
+function _write_log(sup::Supervisor)
+    q = sup.log
+    while true
+        item = @lock q.cond begin
+            while isempty(q.items) && !q.closed
+                wait(q.cond)
+            end
+            isempty(q.items) && return nothing   # closed, and everything queued is written
+            it = popfirst!(q.items)
+            it isa String && (q.bytes -= sizeof(it))
+            it
+        end
+        _write_line(sup, item isa String ? item : _dropped_text(item))
+    end
+    return
+end
+
+# Write one line to the sink. A write that fails (a closed stdout, say) loses that line: the first
+# failure is reported on stderr, and the next line the sink does take is followed by a count.
+function _write_line(sup::Supervisor, text::AbstractString)
+    q = sup.log
+    try
+        println(sup.sink, text)
+        flush(sup.sink)
+    catch err
+        q.failed += 1
+        if q.failed == 1
+            q.failure = sprint(showerror, err)
+            try
+                println(stderr, "[supervisor] writing to the log failed ($(q.failure)); lines are lost until it works again")
+            catch
+            end
+        end
+        return nothing
+    end
+    if q.failed > 0
+        n, why = q.failed, q.failure
+        q.failed = 0
+        _write_line(sup, "[supervisor] $n log line(s) were lost: writing them failed ($why)")
+    end
+    return nothing
+end
+
+function _start_log_writer!(sup::Supervisor)
+    q = sup.log
+    @lock q.cond begin
+        q.writer === nothing && (q.writer = errormonitor(@async _write_log(sup)))
+    end
+    return nothing
+end
+
+# Stop taking lines and give the writer up to `seconds` to put the queued ones on the sink. A sink
+# that is still stuck then keeps them: the node exits without waiting on its log reader.
+function _close_log!(sup::Supervisor; seconds::Real = _LOG_FLUSH_SECONDS)
+    q = sup.log
+    w = @lock q.cond begin
+        q.closed = true
+        notify(q.cond)
+        q.writer
+    end
+    w === nothing && return nothing
+    if timedwait(() -> istaskdone(w), Float64(seconds); pollint = 0.02) !== :ok
+        try
+            println(stderr, "[supervisor] the log sink did not take the last lines within $(_secs(seconds))s; stopping without them")
+        catch
+        end
+    end
+    return nothing
+end
+
+# Drain a child stream into the log queue. eachline also yields a trailing partial line at EOF, so
+# the last words of a crashing child are never lost; the queue never blocks, so the child can never
+# block on a full pipe, whatever the sink does. The drain acknowledgement is recorded as it passes;
+# the child writes it in one piece, but other output can still precede it on the same line.
 function _pump(sup::Supervisor, c::Child, io::IO)
     for line in eachline(io)
         occursin(ReactantServerCore.DRAIN_ACK_LINE, line) && (c.drain_acked = true)
@@ -238,6 +377,7 @@ parallel; a child that does not finish within its windows is sent SIGKILL. Refus
 """
 function run_supervisor!(sup::Supervisor; install_signal_handlers::Bool = true)
     check_signal_threads()
+    _start_log_writer!(sup)
     cond = Base.AsyncCondition()
     if install_signal_handlers
         install_term_handlers!(cond)
@@ -257,5 +397,6 @@ function run_supervisor!(sup::Supervisor; install_signal_handlers::Bool = true)
     foreach(wait, tasks)
     close(cond)
     _slog(sup, "node stopped (exit $code)")
+    _close_log!(sup)
     return code
 end
