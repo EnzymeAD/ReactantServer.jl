@@ -7,6 +7,14 @@
 # its requests; anything else is sent SIGTERM. Each stage's children are waited for in parallel, and
 # stragglers are sent SIGKILL.
 
+# One run of a child: its process and our ends of the pipes we gave it, with the tasks pumping them.
+struct _Run
+    proc::Base.Process
+    out::Pipe
+    err::Pipe
+    pumps::Vector{Task}
+end
+
 mutable struct Child
     spec::ChildSpec
     proc::Union{Base.Process, Nothing}
@@ -14,8 +22,9 @@ mutable struct Child
     started_at::Float64
     stdin::Union{Pipe, Nothing}   # our end of a draining child's stdin; closing it requests the drain
     drain_acked::Bool             # the child printed DRAIN_ACK_LINE since it last started
+    run::Union{_Run, Nothing}     # the current (or last) run
 end
-Child(spec::ChildSpec) = Child(spec, nothing, 0, 0.0, nothing, false)
+Child(spec::ChildSpec) = Child(spec, nothing, 0, 0.0, nothing, false, nothing)
 
 # Lines the log queue gave up on while it was full, at the place in the stream where they were lost.
 mutable struct _Dropped
@@ -215,9 +224,90 @@ function _start!(sup::Supervisor, c::Child)
     c.stdin = inp
     c.drain_acked = false
     c.started_at = time()
-    t1 = @async _pump(sup, c, out)
-    t2 = @async _pump(sup, c, err)
-    return proc, t1, t2
+    r = _Run(proc, out, err, Task[@async(_pump(sup, c, out)), @async(_pump(sup, c, err))])
+    c.run = r
+    return r
+end
+
+# How the supervisor reads a child's pid: `getpid`, behind a Ref only so the tests can make it fail.
+const _GETPID = Ref{Any}(getpid)
+
+# The child's pid, or `nothing` when it has none to report: a child that exited at once is already
+# reaped, and `getpid` fails with ESRCH. Any other failure is unexpected and propagates.
+function _child_pid(p::Base.Process)
+    return try
+        _GETPID[](p)
+    catch err
+        (err isa Base.IOError && err.code == Base.UV_ESRCH) || rethrow()
+        nothing
+    end
+end
+
+_close_quietly(io) = try
+    close(io)
+catch
+end
+
+# Wait for a task whose failure, if any, was already reported (errormonitor).
+_wait_quietly(t::Task) = try
+    wait(t)
+catch
+end
+
+# After the run has ended: stop reading its pipes and release our end of its stdin.
+function _finish_run!(c::Child, r::_Run)
+    foreach(wait, r.pumps)
+    c.stdin === nothing || _close_quietly(c.stdin)
+    return nothing
+end
+
+# Run the child once: spawn it, wait for it to exit, and log the exit. Returns its uptime in
+# seconds, or `nothing` if it could not be spawned.
+function _run_once!(sup::Supervisor, c::Child)
+    r = try
+        _start!(sup, c)
+    catch e
+        _slog(sup, "$(c.spec.name) failed to spawn: $(sprint(showerror, e))")
+        return nothing
+    end
+    pid = _child_pid(r.proc)
+    _slog(sup, "started $(c.spec.name) (pid $(pid === nothing ? "unknown: it has already exited" : pid))")
+    wait(r.proc)
+    _finish_run!(c, r)
+    uptime = time() - c.started_at
+    sup.shutting_down[] ||
+        _slog(sup, "$(c.spec.name) exited (code=$(r.proc.exitcode), signal=$(r.proc.termsignal), uptime=$(round(uptime; digits = 1))s)")
+    return uptime
+end
+
+# Bring a child whose supervision hit an unexpected error back to a known state before it is
+# restarted: kill it if it is still running (a second copy would fight it for its ports and its
+# GPU), then stop reading its pipes.
+function _put_down!(sup::Supervisor, c::Child)
+    r = c.run
+    r === nothing && return nothing
+    if process_running(r.proc)
+        _slog(sup, "sending SIGKILL to $(c.spec.name), so it can be restarted")
+        kill(r.proc, Base.SIGKILL)
+        timedwait(() -> !process_running(r.proc), _KILL_WAIT_SECONDS; pollint = 0.05) === :ok ||
+            _slog(sup, "$(c.spec.name) is still running $(_secs(_KILL_WAIT_SECONDS))s after SIGKILL; restarting it anyway")
+    end
+    _close_quietly(r.out)
+    _close_quietly(r.err)
+    c.stdin === nothing || _close_quietly(c.stdin)
+    return nothing
+end
+
+# An exception with the first lines of its backtrace, for the log; never throws itself.
+function _describe(err, bt; lines::Integer = 12)
+    text = try
+        sprint(showerror, err, bt)
+    catch
+        "$(typeof(err)) (its message could not be shown)"
+    end
+    ls = split(text, '\n')
+    length(ls) > lines && (ls = [ls[1:lines]; "  ..."])
+    return join(ls, '\n')
 end
 
 """
@@ -247,33 +337,42 @@ end
 
 # One child's supervision loop: run, drain, log the exit, back off, restart. Runs until
 # shutdown, or until the child exceeds max_restarts without a stable run (which takes the whole
-# node down so the container restart policy can take over).
+# node down so the container restart policy can take over). An unexpected error in one run is
+# logged, the child is put down if it still runs, and it is restarted like a child that exited.
 function _supervise!(sup::Supervisor, c::Child)
     while !sup.shutting_down[]
-        local proc, t1, t2
+        uptime = nothing
         try
-            proc, t1, t2 = _start!(sup, c)
-        catch e
-            _slog(sup, "$(c.spec.name) failed to spawn: $(sprint(showerror, e))")
-            c.restarts += 1
-            _check_restart_budget!(sup, c) || break
-            _sleep_interruptible(sup, min(2.0^(c.restarts - 1), sup.backoff_cap))
-            continue
+            uptime = _run_once!(sup, c)
+        catch err
+            sup.shutting_down[] && break
+            _slog(sup, "supervising $(c.spec.name) failed unexpectedly; restarting it:\n$(_describe(err, catch_backtrace()))")
+            _put_down!(sup, c)
         end
-        _slog(sup, "started $(c.spec.name) (pid $(getpid(proc)))")
-        wait(proc)
-        wait(t1)
-        wait(t2)
-        uptime = time() - c.started_at
         sup.shutting_down[] && break
-        _slog(sup, "$(c.spec.name) exited (code=$(proc.exitcode), signal=$(proc.termsignal), uptime=$(round(uptime; digits = 1))s)")
-        uptime >= sup.stable_seconds && (c.restarts = 0)
+        uptime !== nothing && uptime >= sup.stable_seconds && (c.restarts = 0)
         c.restarts += 1
         _check_restart_budget!(sup, c) || break
         delay = min(2.0^(c.restarts - 1), sup.backoff_cap)
         _slog(sup, "restarting $(c.spec.name) in $(round(delay; digits = 1))s")
         _sleep_interruptible(sup, delay)
     end
+    return nothing
+end
+
+# The task behind each child's supervision. Supervision must never end silently while the node
+# runs: an error the loop itself cannot absorb, or the loop ending for any reason but a shutdown it
+# asked for, is logged and takes the node down with status 1, so the container restart policy acts.
+function _supervise_task(sup::Supervisor, c::Child; supervise = _supervise!)
+    try
+        supervise(sup, c)
+    catch err
+        _slog(sup, "supervision of $(c.spec.name) cannot continue; shutting the node down:\n$(_describe(err, catch_backtrace()))")
+        request_shutdown!(sup, 1)
+        return nothing
+    end
+    # Returning while the node runs means the restart budget ran out, which already asked for exit 1.
+    sup.shutting_down[] || request_shutdown!(sup, 1)
     return nothing
 end
 
@@ -370,7 +469,8 @@ _secs(x::Real) = isinteger(x) ? Int(x) : x
     run_supervisor!(sup; install_signal_handlers=true) -> Int
 
 Run every child's supervision loop and block until shutdown is requested (SIGTERM/SIGINT, a
-crash-loop budget breach, or `request_shutdown!`). Children are stopped gracefully before it
+crash-loop budget breach, `request_shutdown!`, or exit code 1 when supervising a child cannot
+continue, which is logged; it never stops silently). Children are stopped gracefully before it
 returns the exit code: the gateway is asked to drain and waited for, then the workers, in
 parallel; a child that does not finish within its windows is sent SIGKILL. Refuses to run
 (`check_signal_threads`) with Julia's signal handling off and more than one thread.
@@ -391,10 +491,10 @@ function run_supervisor!(sup::Supervisor; install_signal_handlers::Bool = true)
             # cond closed below after a non-signal shutdown; nothing to do
         end
     end
-    tasks = [@async _supervise!(sup, c) for c in sup.children]
+    tasks = [errormonitor(@async _supervise_task(sup, c)) for c in sup.children]
     code = take!(sup.exit_signal)
     _shutdown_children!(sup)
-    foreach(wait, tasks)
+    foreach(_wait_quietly, tasks)
     close(cond)
     _slog(sup, "node stopped (exit $code)")
     _close_log!(sup)

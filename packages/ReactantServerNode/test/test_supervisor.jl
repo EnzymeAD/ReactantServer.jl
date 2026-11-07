@@ -236,6 +236,85 @@ _counted(lines, re) = [parse(Int, m[1]) for m in (match(re, l) for l in lines) i
     @test any(l -> startswith(l, "[supervisor] node stopped (exit 0)"), lines)
 end
 
+@testset "supervisor: getpid failing does not end supervision" begin
+    # A child that exits at once is already reaped when its pid is read, and getpid throws ESRCH.
+    # Before, that escaped the loop, the child's task ended, and it was never restarted.
+    RSN._GETPID[] = p -> throw(Base.IOError("getpid: no such process (ESRCH)", Base.UV_ESRCH))
+    try
+        sink = IOBuffer()
+        sup = RSN.Supervisor([_script_spec("quick", "sleep(0.5); exit(3)")]; sink = sink, max_restarts = 1)
+        @test RSN.run_supervisor!(sup; install_signal_handlers = false) == 1   # budget, not a silent stop
+        lines = _sink_lines(sink)
+        @test count(l -> startswith(l, "[supervisor] started quick (pid unknown"), lines) == 2
+        @test count(l -> occursin("quick exited (code=3", l), lines) == 2
+        @test any(l -> occursin("restarting quick in 1.0s", l), lines)
+    finally
+        RSN._GETPID[] = getpid
+    end
+end
+
+@testset "supervisor: an unexpected error in a run restarts the child" begin
+    # The first pid lookup fails with an error the loop has no handler of its own for. The running
+    # child is killed (a second copy would fight it for its ports) and restarted.
+    calls = Ref(0)
+    RSN._GETPID[] = p -> ((calls[] += 1) == 1 ? error("injected supervision fault") : getpid(p))
+    try
+        sink = IOBuffer()
+        sup = RSN.Supervisor([_script_spec("steady", "println(\"up\"); flush(stdout); sleep(120)")]; sink = sink)
+        t = @async RSN.run_supervisor!(sup; install_signal_handlers = false)
+        @test wait_for(() -> count(==("[steady] up"), _sink_lines(sink)) == 2)
+        lines = _sink_lines(sink)
+        @test any(l -> startswith(l, "[supervisor] supervising steady failed unexpectedly; restarting it:"), lines)
+        @test any(l -> occursin("injected supervision fault", l), lines)
+        @test any(l -> l == "[supervisor] sending SIGKILL to steady, so it can be restarted", lines)
+        # The first run failed before its "started" line; the second logs one.
+        @test count(l -> startswith(l, "[supervisor] started steady (pid "), lines) == 1
+        @test process_running(sup.children[1].proc)          # the second copy is supervised
+        RSN.request_shutdown!(sup)
+        @test fetch(t) == 0
+    finally
+        RSN._GETPID[] = getpid
+    end
+end
+
+@testset "supervisor: supervision that cannot continue takes the node down" begin
+    sink = IOBuffer()
+    sup = RSN.Supervisor([_script_spec("x", "exit(0)")]; sink = sink)
+    RSN._start_log_writer!(sup)
+    RSN._supervise_task(sup, sup.children[1]; supervise = (s, c) -> error("loop broken"))
+    @test take!(sup.exit_signal) == 1
+    # A loop that returns while the node runs (rather than throwing) also takes it down.
+    RSN._supervise_task(sup, sup.children[1]; supervise = (s, c) -> nothing)
+    @test take!(sup.exit_signal) == 1
+    RSN._close_log!(sup)
+    lines = _sink_lines(sink)
+    @test any(l -> l == "[supervisor] supervision of x cannot continue; shutting the node down:", lines)
+    @test any(l -> occursin("loop broken", l), lines)
+end
+
+# A sink whose writes fail while `broken` is set, as a stdout whose reader has gone away.
+mutable struct _BrokenSink <: IO
+    const buf::IOBuffer
+    broken::Bool
+end
+_check_sink(s::_BrokenSink) = s.broken && throw(Base.IOError("write: broken pipe (EPIPE)", Base.UV_EPIPE))
+Base.unsafe_write(s::_BrokenSink, p::Ptr{UInt8}, n::UInt) = (_check_sink(s); unsafe_write(s.buf, p, n))
+Base.write(s::_BrokenSink, b::UInt8) = (_check_sink(s); write(s.buf, b))
+Base.flush(::_BrokenSink) = nothing
+
+@testset "supervisor: a failing sink does not end supervision" begin
+    # Before, the write error escaped the "started" line and ended the child's supervision silently.
+    sink = _BrokenSink(IOBuffer(), true)
+    sup = RSN.Supervisor([_script_spec("crashy", "sleep(1); exit(3)")]; sink = sink, max_restarts = 2)
+    t = @async RSN.run_supervisor!(sup; install_signal_handlers = false)
+    sleep(0.5)
+    sink.broken = false
+    @test fetch(t) == 1                                  # restarted until the budget ran out
+    lines = _sink_lines(sink.buf)
+    @test any(l -> occursin(r"^\[supervisor\] \d+ log line\(s\) were lost: writing them failed \(.*EPIPE", l), lines)
+    @test count(l -> occursin("crashy exited (code=3", l), lines) == 3
+end
+
 @testset "supervisor: grace windows run in parallel" begin
     sink = IOBuffer()
     # TERM-ignoring children (exec keeps the ignored disposition, so SIGKILL leaves no orphan).
