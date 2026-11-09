@@ -241,8 +241,8 @@ end
 # client chooses the names it sends, so labelling with them would let any client add series (each a
 # counter and an 18-bucket histogram) without bound; with this, the series are bounded by the models
 # the gateway has actually routed, plus this one. The workers use the same label for the same
-# purpose. The name is reserved: a model named `_unknown` would share this series with every unrouted
-# name, so no model should be given it.
+# purpose. The name is reserved: workers refuse to load a bundle named `_unknown`, so no routed model
+# shares this series.
 const UNKNOWN_MODEL_LABEL = "_unknown"
 
 # The `model` label for a ModelInfer for `model`: its name if the routing table holds it right now,

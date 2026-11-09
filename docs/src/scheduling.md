@@ -101,7 +101,8 @@ the gateway can act on it (back off, try another replica, give up, re-register s
 The worker's `worker_requests_total{status}` counts each request under the same status the
 client receives. Its `model` label (and that of `worker_request_latency_seconds`) is the model's
 name only when the worker serves a model of that name; a request for any other name, unknown or
-empty, counts under `model="_unknown"`, so names a client makes up add no series.
+empty, counts under `model="_unknown"`, so names a client makes up add no series. The name is
+reserved: a worker refuses to load a bundle named `_unknown` (see [Bundles](bundles.md)).
 
 If the dispatch loop itself fails with an error no single request can be held to, the worker
 logs it with its backtrace, reports itself not live and not ready (`ServerLive`, `ServerReady`,

@@ -620,7 +620,8 @@ returning whether it reported ready.
   model's name only while the routing table holds it; every other name (one no worker serves, an
   empty or unreadable one) is counted under the reserved label `_unknown`, the same label the
   workers use. A model that leaves the routing table keeps its series, so the series stay bounded
-  by the models the gateway has served. Do not name a model `_unknown`: it would share that series.
+  by the models the gateway has served. Workers refuse to load a bundle named `_unknown`, so no
+  model shares that series.
   The shared-memory register and unregister RPCs name a region, chosen by each client process, so
   they carry an empty `model` label, as the metadata RPCs do. Under `lpt_packing`, arrivals are
   counted only for routed models.

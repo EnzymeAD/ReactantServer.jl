@@ -9,6 +9,18 @@ struct BundleError <: Exception
 end
 Base.showerror(io::IO, e::BundleError) = print(io, "BundleError: ", e.msg)
 
+"""
+    UNKNOWN_MODEL_LABEL
+
+The `model` label of `worker_requests_total` and `worker_request_latency_seconds` for a ModelInfer
+whose model name this worker does not serve at that moment (an unknown name, an empty one, a model
+since unloaded). Labelling those with the client's string gave every distinct name a counter and a
+histogram that lived as long as the process (WRK-7). The gateway counts such requests under the same
+value. The name is therefore reserved: [`load_bundle_entry`](@ref) refuses a bundle directory named
+`_unknown`, so no served model shares these series.
+"""
+const UNKNOWN_MODEL_LABEL = "_unknown"
+
 # Include a bundle's model.jl in an isolated module so it cannot clobber server globals. Only
 # register_model, register_meta_model, and the ReactantServer module are injected. When `meta` is
 # true the bundle must call register_meta_model; otherwise it must call register_model.
@@ -106,19 +118,27 @@ sizes are read (see [`BatchSizeMode`](@ref)). `weights_migration` converts a leg
 file first (see [`migrate_bundle_weights!`](@ref)); a failed migration is logged and the bundle
 loads as it was. `signature`, when a `Ref`, receives the bundle's `bundle_signature` taken
 after the migration (which rewrites files) and before any file is read: the version of the files
-this entry is built from.
+this entry is built from. A directory named `_unknown` ([`UNKNOWN_MODEL_LABEL`](@ref)) is refused
+with a `BundleError` before anything in it is read or migrated.
 """
 function load_bundle_entry(
         dir::AbstractString; validator::SignatureValidator = NullSignatureValidator(),
         batch_sizes::BatchSizeMode = BATCH_SIZES_ALL,
         weights_migration::WeightsMigration = MIGRATE_OFF, signature = nothing
     )
+    name = basename(normpath(String(dir)))
+    name == UNKNOWN_MODEL_LABEL && throw(
+        BundleError(
+            "bundle $dir: the model name '$name' is reserved (it labels the request metrics of " *
+                "names this server does not serve); rename the directory"
+        )
+    )
     migrate_bundle_weights!(dir, weights_migration)
     signature === nothing || (signature[] = bundle_signature(dir))
     manifest_path = joinpath(dir, "manifest.yaml")
     raw = YAML.load_file(manifest_path; dicttype = Dict{String, Any})
     raw isa AbstractDict || throw(BundleError("manifest in $dir is not a mapping"))
-    raw["name"] = basename(normpath(String(dir)))   # identity comes from the directory, not the YAML
+    raw["name"] = name   # identity comes from the directory, not the YAML
     m = parse_manifest(raw)
 
     model_jl = joinpath(dir, "model.jl")

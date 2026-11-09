@@ -509,21 +509,10 @@ function WorkerMetrics(
     return WorkerMetrics(reg, requests_total, request_latency)
 end
 
-"""
-    UNKNOWN_MODEL_LABEL
-
-The `model` label of `worker_requests_total` and `worker_request_latency_seconds` for a ModelInfer
-whose model name this worker does not serve at that moment (an unknown name, an empty one, a model
-since unloaded). Labelling those with the client's string gave every distinct name a counter and a
-histogram that lived as long as the process (WRK-7). The gateway counts such requests under the same
-value. Model names are bundle directory names and nothing reserves this one, so a bundle named
-`_unknown` would share its series.
-"""
-const UNKNOWN_MODEL_LABEL = "_unknown"
-
 # The `model` label to count a request for `name` under: the name itself only when the registry
-# holds a model (or meta model) of that name now, else UNKNOWN_MODEL_LABEL. So the series are
-# bounded by the models the worker has served, not by what clients send.
+# holds a model (or meta model) of that name now, else UNKNOWN_MODEL_LABEL (bundle.jl, which refuses
+# a bundle of that name). So the series are bounded by the models the worker has served, not by
+# what clients send.
 request_model_label(reg::ModelRegistry, name::AbstractString) =
     (haskey(reg.by_name, name) || haskey(reg.meta, name)) ? String(name) : UNKNOWN_MODEL_LABEL
 
