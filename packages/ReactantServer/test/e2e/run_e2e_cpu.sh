@@ -6,8 +6,9 @@
 # multiplexing, the graceful drain (with requests held in flight (slow4), the gateway and then the
 # workers refuse new requests with UNAVAILABLE, finish the admitted ones, and every process exits
 # 0), and what a client is told of an INTERNAL error in each `grpc.error_detail` mode (a second
-# node runs with `full`), and, on that node, shared-memory outputs under client give-ups and a
-# worker restart under one client: the worker is stopped (SIGSTOP), so the supervisor's liveness
+# node runs with `full`), and, on that node, a client that registers shared memory while a worker is
+# out (stopped and resumed, then killed and restarted), shared-memory outputs under client give-ups
+# and a worker restart under one client: the worker is stopped (SIGSTOP), so the supervisor's liveness
 # check has to find it and kill it. Needs no GPU.
 set -euo pipefail
 
@@ -18,10 +19,13 @@ E2E_DIR="packages/ReactantServer/test/e2e"
 WORK="$(mktemp -d)"
 SUP_PID=""
 SHM_CLIENT_PID=""
+OUTAGE_CLIENT_PID=""
 cleanup() {
-    if [[ -n "$SHM_CLIENT_PID" ]] && kill -0 "$SHM_CLIENT_PID" 2>/dev/null; then
-        kill -TERM "$SHM_CLIENT_PID" 2>/dev/null || true
-    fi
+    for pid in "$SHM_CLIENT_PID" "$OUTAGE_CLIENT_PID"; do
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null || true
+        fi
+    done
     # TERM, not KILL: the supervisor drains its children and waits for them; SIGKILL would orphan
     # every worker and the gateway.
     if [[ -n "$SUP_PID" ]] && kill -0 "$SUP_PID" 2>/dev/null; then
@@ -47,7 +51,7 @@ GW_METRICS_PORT="$(free_port)"
 # below (a different preferences hash forces a full Reactant recompile, CPU-only and slow).
 READY_TIMEOUT="${E2E_CPU_READY_TIMEOUT:-1800}"
 
-echo "== [1/9] generating scale4 bundle =="
+echo "== [1/10] generating scale4 bundle =="
 julia --project=packages/ReactantServer "$E2E_DIR/gen_scale4.jl"
 
 mkdir -p "$WORK/models"
@@ -71,7 +75,7 @@ register_model("slow4"; preprocess = function (inputs)
 end)
 EOF
 
-echo "== [2/9] writing node file, gateway config and Reactant preference override =="
+echo "== [2/10] writing node file, gateway config and Reactant preference override =="
 # No workers list: the supervisor synthesizes them (REACTANT_CPU_WORKERS below).
 cat > "$WORK/node.yaml" << EOF
 model_repo: $WORK/models
@@ -125,7 +129,7 @@ EOF
 }
 write_gateway_config "$WORK/gateway.yml" redacted
 
-echo "== [3/9] starting supervisor (2 CPU workers + embedded gateway) =="
+echo "== [3/10] starting supervisor (2 CPU workers + embedded gateway) =="
 REACTANT_GPUS=0 \
 REACTANT_CPU_WORKERS=2 \
 REACTANT_WORKSPACE_ROOT="$REPO_ROOT" \
@@ -155,7 +159,7 @@ until curl -fsS "http://127.0.0.1:${GW_METRICS_PORT}/readyz" >/dev/null 2>&1; do
 done
 echo "   gateway ready."
 
-echo "== [4/9] running CPU e2e client =="
+echo "== [4/10] running CPU e2e client =="
 set +e
 julia --project=packages/ReactantServerGateway "$E2E_DIR/client_cpu.jl" "$GW_PORT" "$BASE_PORT" redacted |
     tee "$WORK/client_redacted.out"
@@ -215,7 +219,7 @@ check_forced_log() {
 }
 check_forced_log redacted "$WORK/supervisor.log"
 
-echo "== [5/9] SIGTERM under load: the node drains =="
+echo "== [5/10] SIGTERM under load: the node drains =="
 # The drain client holds requests in flight, sends the supervisor SIGTERM itself, and checks both
 # drain stages (gateway, then workers) from the outside.
 set +e
@@ -231,7 +235,7 @@ fi
 sup_rc=0
 wait "$SUP_PID" || sup_rc=$?
 
-echo "== [6/9] exit codes =="
+echo "== [6/10] exit codes =="
 # The supervisor exited 0 (argument 1) and every child drained and exited 0 on its own: no SIGTERM
 # or SIGKILL fallback was needed. Argument 2 is the node's log.
 check_clean_exit() {
@@ -267,7 +271,7 @@ for tag in worker0 worker1 gateway supervisor; do
     fi
 done
 
-echo "== [7/9] full INTERNAL error detail (node global.grpc.error_detail: full) =="
+echo "== [7/10] full INTERNAL error detail (node global.grpc.error_detail: full) =="
 # A second node, identical but for `global.grpc.error_detail: full`, which reaches the workers through
 # their config and the embedded gateway through its pinned gateway config (the Node unit tests cover
 # the supervisor's mirror of global.grpc into an env-configured gateway).
@@ -279,10 +283,13 @@ sed -e "s/^base_port: .*/base_port: $BASE_PORT/" -e "s/^metrics_base_port: .*/me
     "$WORK/node.yaml" > "$WORK/node_full.yaml"
 printf '  grpc:\n    error_detail: full\n' >> "$WORK/node_full.yaml"
 write_gateway_config "$WORK/gateway_full.yml" full
-# Liveness thresholds short enough for step 8 to see a stopped worker killed within about 20 s.
+# Liveness thresholds short enough for step 9 to see a stopped worker killed within about 20 s, and
+# a gateway probe every second, so step 8 sees a stopped worker marked down within about 6 s (the
+# 5 s probe deadline), well before its liveness check would kill it.
 REACTANT_LIVENESS_INTERVAL_SECONDS=2 \
 REACTANT_LIVENESS_TIMEOUT_SECONDS=5 \
 REACTANT_LIVENESS_FAILURES=3 \
+REACTANT_GATEWAY_HEALTH_INTERVAL_SECONDS=1 \
 REACTANT_GPUS=0 \
 REACTANT_CPU_WORKERS=2 \
 REACTANT_WORKSPACE_ROOT="$REPO_ROOT" \
@@ -315,7 +322,92 @@ if ((client_rc != 0)); then
 fi
 check_forced_log full "$WORK/supervisor_full.log"
 
-echo "== [8/9] shared memory: short deadlines, then a worker restart under the same client =="
+echo "== [8/10] shared memory: a client registers while a worker is out, then the worker returns =="
+# The gateway registers a region on its healthy workers only. Phase 1 stops worker1 (SIGSTOP: alive,
+# answering nothing), waits for the gateway to mark it down, lets a fresh client pool register, and
+# resumes it (SIGCONT) well before its liveness check would kill it. Phase 2 kills worker1 instead
+# and waits for the supervisor to restart it, which loses every registration. Each time the client's
+# requests that reach worker1 meet FAILED_PRECONDITION there, and the client registers again and
+# retries, so it sees no error and stays on shared memory (client_shm_outage_cpu.jl).
+OUTAGE="$WORK/outage"
+mkdir -p "$OUTAGE"
+log="$WORK/supervisor_full.log"
+julia --project=packages/ReactantServerClient --threads=2 "$E2E_DIR/client_shm_outage_cpu.jl" \
+    "$GW_PORT" "$BASE_PORT" "$((BASE_PORT + 1))" "$OUTAGE" > "$WORK/shm_outage_client.log" 2>&1 &
+OUTAGE_CLIENT_PID=$!
+await_marker() { # await_marker <name>: the outage client's marker file, failing if the client exits
+    until [[ -f "$OUTAGE/$1" ]]; do
+        if ! kill -0 "$OUTAGE_CLIENT_PID" 2>/dev/null; then
+            echo "ERROR: the outage client exited while this step waited for '$1'; its log:"
+            tail -60 "$WORK/shm_outage_client.log"
+            exit 1
+        fi
+        sleep 0.2
+    done
+}
+worker1_ready() { # 1 or 0, as the gateway reports worker1
+    curl -fsS "http://127.0.0.1:${GW_METRICS_PORT}/metrics" 2>/dev/null |
+        awk '/^gateway_worker_ready\{worker="worker1"\} / { print ($2 + 0) }'
+}
+await_worker1() { # await_worker1 <1|0>
+    local deadline=$((SECONDS + READY_TIMEOUT))
+    until [[ "$(worker1_ready)" == "$1" ]]; do
+        if ((SECONDS >= deadline)); then
+            echo "ERROR: the gateway never reported worker1 ready=$1"
+            exit 1
+        fi
+        sleep 0.2
+    done
+}
+worker1_pid() { grep -oE 'started worker1 \(pid [0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$'; }
+await_marker warm
+w1_pid="$(worker1_pid)"
+liveness_kills="$(grep -c 'worker1 failed 3 liveness checks' "$log" || true)"
+echo "   phase 1: stopping worker1 (pid $w1_pid) with SIGSTOP while a client registers"
+kill -STOP "$w1_pid"
+t_stop=$SECONDS
+await_worker1 0
+touch "$OUTAGE/down1"
+await_marker registered1
+kill -CONT "$w1_pid"
+echo "   the client registered with worker1 out; worker1 resumed after $((SECONDS - t_stop)) s"
+await_worker1 1
+if [[ "$(worker1_pid)" != "$w1_pid" ]] ||
+    (($(grep -c 'worker1 failed 3 liveness checks' "$log" || true) != liveness_kills)); then
+    echo "ERROR: worker1 was restarted during phase 1, which needs it to stay alive"
+    exit 1
+fi
+touch "$OUTAGE/back1"
+await_marker done1
+echo "   phase 2: killing worker1 (pid $w1_pid) with SIGKILL while a client registers"
+kill -KILL "$w1_pid"
+await_worker1 0
+touch "$OUTAGE/down2"
+await_marker registered2
+deadline=$((SECONDS + READY_TIMEOUT))
+until new_pid="$(worker1_pid)" && [[ -n "$new_pid" && "$new_pid" != "$w1_pid" ]]; do
+    if ((SECONDS >= deadline)); then
+        echo "ERROR: worker1 was not restarted within ${READY_TIMEOUT}s"
+        exit 1
+    fi
+    sleep 1
+done
+await_worker1 1
+echo "   worker1 restarted (pid $new_pid) and is ready again"
+touch "$OUTAGE/back2"
+set +e
+wait "$OUTAGE_CLIENT_PID"
+outage_rc=$?
+set -e
+grep -E "^(PASS|FAIL|CPU e2e)" "$WORK/shm_outage_client.log" || true
+if ((outage_rc != 0)); then
+    echo "== the outage client failed (rc=${outage_rc}); its log and recent supervisor log: =="
+    tail -60 "$WORK/shm_outage_client.log"
+    tail -120 "$log"
+    exit "$outage_rc"
+fi
+
+echo "== [9/10] shared memory: short deadlines, then a worker restart under the same client =="
 # Phase A drives shared-memory outputs with deadlines short enough that clients give up while
 # requests run (CORE-3). Then worker1 is stopped (SIGSTOP: alive, but answering nothing, as a hung
 # worker); the supervisor's liveness check kills it and the supervisor restarts it. Once the
@@ -369,7 +461,7 @@ if ((shm_rc != 0)); then
     exit "$shm_rc"
 fi
 
-echo "== [9/9] a stopped gateway is killed by its liveness check and restarted =="
+echo "== [10/10] a stopped gateway is killed by its liveness check and restarted =="
 # A hung gateway takes the node's public endpoint down with it. Stopped (SIGSTOP), it answers
 # nothing; the supervisor's check (2 s interval, 5 s timeout, 3 failures on this node) must kill it,
 # and the restarted gateway must serve the node again.
@@ -399,4 +491,4 @@ sup_rc=0
 wait "$SUP_PID" || sup_rc=$?
 check_clean_exit "$sup_rc" "$WORK/supervisor_full.log"
 
-echo "CPU e2e: PASS (workers synthesized, gateway routed, graceful drain, clean exit, INTERNAL error detail, shared memory, liveness restarts)"
+echo "CPU e2e: PASS (workers synthesized, gateway routed, graceful drain, clean exit, INTERNAL error detail, shared memory, a register during a worker outage, liveness restarts)"
