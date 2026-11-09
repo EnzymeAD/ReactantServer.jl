@@ -171,15 +171,21 @@ validated deployment should use.
 `model_control_mode` sets how the loaded model set evolves:
 
 - `dynamic` (the default) watches the repository and loads, unloads, and reloads bundles online as
-  their files change, including the weights, the MLIR, the manifest, and `model.jl`. A bundle must
-  look the same on two consecutive polls before it loads, so a half-written bundle never does. A
-  load or reload compiles the bundle on the worker's dispatch loop, so every other model on that
-  worker pauses until the compile ends, and a reloaded model answers `NOT_FOUND` until its new
-  version is in. The loop shares a thread with request handling, so the worker's health probes
-  stall for that time as well. An executable-cache hit (`runtime.executable_cache`) keeps the pause
-  short; an uncached compile takes 5 to 30 seconds per compiled program. A renamed directory is an
-  unload of the old name and a load of the new one. A bundle whose files change while it loads is
-  not admitted: the next poll loads it again from the files as they are then.
+  their files change, including the weights, the MLIR, the manifest, and `model.jl`. The watcher
+  compares only each bundle file's name, modification time and size, and acts on a change once it
+  looks the same on two consecutive polls. A deploy must therefore change a file's mtime or size to
+  be seen: new weights of the same size written with a fixed or preserved mtime (an archive built
+  with a fixed `--mtime`, unpacked or copied with `cp -p` or `rsync -a`) are never picked up. The
+  two polls let a copy in progress settle, but they do not guarantee a consistent bundle: an update
+  of several files that takes longer than two polls can be loaded with some files new and some old.
+  Make a multi-file update atomic: stage the new files elsewhere on the same filesystem, then rename
+  them into place. A load or reload compiles the bundle on the worker's dispatch loop, so every
+  other model on that worker pauses until the compile ends, and a reloaded model answers `NOT_FOUND`
+  until its new version is in. The loop shares a thread with request handling, so the worker's
+  health probes stall for that time as well. An executable-cache hit (`runtime.executable_cache`)
+  keeps the pause short; an uncached compile takes 5 to 30 seconds per compiled program. A renamed
+  directory is an unload of the old name and a load of the new one. A bundle whose files change
+  while it loads is not admitted: the next poll loads it again from the files as they are then.
 - `static` loads the startup set once and never changes it.
 - `explicit` cedes the lifecycle to an external control plane: the worker takes no action of its
   own, and a model serves only while the control plane holds it resident through the worker

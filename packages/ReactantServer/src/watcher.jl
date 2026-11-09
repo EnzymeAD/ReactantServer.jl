@@ -14,8 +14,12 @@
 # per compiled program.
 #
 # A change is acted on only once its signature is observed identical across two consecutive polls
-# (debounce), so a bundle still being copied in is not loaded half-written; `load_bundle_entry`'s
-# validation is the backstop. A failed load/reload is logged and retried every second poll: the
+# (debounce), which lets a bundle still being copied in settle first; `load_bundle_entry`'s
+# validation is the backstop. The signature is each file's name, mtime and size and nothing more, so
+# this is not a guarantee: a file replaced with the same size and mtime is never seen to change, and
+# an update of several files slower than two polls can be loaded part new, part old. Deploys change
+# a file's mtime or size and stage multi-file updates elsewhere, then rename them into place
+# (docs/src/node_config.md). A failed load/reload is logged and retried every second poll: the
 # change is not recorded as applied, so the next poll sees it again as a new change and the one
 # after confirms and retries it.
 #
