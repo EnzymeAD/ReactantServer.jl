@@ -235,10 +235,14 @@ end
 # `label`, when given, is how a client-visible message names this worker: a failure of the call
 # itself (not a status the worker sent) is then described as "<label>: <what happened>" instead of
 # with gRPCClient's text, which can name the worker's host and port (a redacted gateway, GW-15).
+#
+# `refused`, when given, is set to whether the call failed because the connection to the worker was
+# refused (see `_connection_refused`): the request never left the gateway.
 function invoke_infer(
         wc::WorkerClients, body::Vector{UInt8};
         deadline::Union{Real, Nothing} = nothing, cancelled = nothing,
-        label::Union{AbstractString, Nothing} = nothing
+        label::Union{AbstractString, Nothing} = nothing,
+        refused::Union{Base.RefValue{Bool}, Nothing} = nothing
     )
     rpc = try
         deadline === nothing ? GRPCInferenceService.ModelInfer(wc.chan, body, gRPCClient.gRPCAsync()) :
@@ -257,6 +261,7 @@ function invoke_infer(
         e isa gRPCClient.gRPCServiceCallException || rethrow()
         _note_infer_outcome!(wc, req, e)
         if _transport_failure(req, e)
+            refused === nothing || (refused[] = _connection_refused(req))
             e = gRPCClient.gRPCServiceCallException(gRPCClient.GRPC_UNAVAILABLE, "transport error: $(e.message)")
         end
         (label === nothing || _worker_sent(req)) || (e = _relabel(e, label))
@@ -304,6 +309,30 @@ end
 # any other reason (its deadline, a cancellation, a shut-down handle) keeps the code it was given.
 _transport_failure(req::gRPCClient.gRPCRequest, e::gRPCClient.gRPCServiceCallException) =
     e.grpc_status == gRPCClient.GRPC_INTERNAL && req.ex === nothing && !_worker_sent(req)
+
+"""
+    _connection_refused(req) -> Bool
+
+Whether a failed call ended because the connection to the worker could not be opened, so that no
+byte of the request reached it. gRPCClient 1.2.1 keeps libcurl's result code on the request
+(`req.code`) and reports a transport failure as INTERNAL with libcurl's error text; this reads the
+code: `CURLE_COULDNT_CONNECT` (7), which libcurl returns only when connect() itself failed. A
+connect that runs out of time is `CURLE_OPERATION_TIMEDOUT` (28) or, past the call's deadline,
+DEADLINE_EXCEEDED; a name that does not resolve is `CURLE_COULDNT_RESOLVE_HOST` (6); a connection
+reset or broken off after it was made is a send or receive error (55, 56) or an HTTP/2 error (16,
+92). None of those match.
+
+What this cannot tell apart is why connect() failed. libcurl 8.15 (the production lock) writes
+"Failed to connect to <host> port <port> after <n> ms: Could not connect to server" for a refusal,
+with no errno in the text, and gRPCClient frees the easy handle before the call returns, so
+`CURLINFO_OS_ERRNO` cannot be read. The match therefore also covers the rarer connect() failures
+with no route to the host (EHOSTUNREACH, ENETUNREACH), and a refused connect to a proxy, should the
+environment configure one; in every case the request was not sent. The message text is not used: it
+varies across libcurl versions (older ones end with "Connection refused") and carries nothing this
+code does not.
+"""
+_connection_refused(req::gRPCClient.gRPCRequest) =
+    req.ex === nothing && req.code == gRPCClient.CURLE_COULDNT_CONNECT
 invoke_shm_register(wc::WorkerClients, body::Vector{UInt8}) =
     GRPCInferenceService.SystemSharedMemoryRegister(wc.chan, body, Vector{UInt8})
 invoke_shm_unregister(wc::WorkerClients, body::Vector{UInt8}) =

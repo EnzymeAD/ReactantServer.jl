@@ -90,8 +90,9 @@ was refused, or failed) changes nothing: one slow answer must not take a worker'
 the table, and with them, when every worker missed the same round, every model, which clients see
 as NOT_FOUND and do not retry (GW-11).
 
-A worker is down from the moment the prober finds it unreachable, hung or not ready until the
-prober next finds it ready (`note_worker_ready!`, the one place that changes it). A down worker is sent no request: its answers are not taken (a draining or
+A worker is down from the moment the prober finds it unreachable, hung or not ready, or a request
+finds its connection refused, until the prober next finds it ready (`note_worker_ready!`, the one
+place that changes it). A down worker is sent no request: its answers are not taken (a draining or
 failing worker can list nothing, which says nothing about what it serves), its models go to the
 healthy workers that serve them, and a model that only down workers serve is held, so its requests
 are answered UNAVAILABLE, which clients retry, without calling any worker. Once the outage has
@@ -114,19 +115,29 @@ current_table(d::DiscoveredRoutes) = @atomic d.current
 swap_table!(d::DiscoveredRoutes, t::RoutingTable) = (@atomic d.current = t; nothing)
 
 """
-    note_worker_ready!(d, url, ready, now = time()) -> Bool
+    note_worker_ready!(d, url, ready, now = time(); observed_at = now) -> Bool
 
-Record a verdict on the worker at `url`: ready, or not (not ready, unreachable, or hung). This is
-the one place a worker's health changes, so anything that learns a worker is down (today the
-prober) marks it here. An outage starts at the first verdict that it is not ready and ends at the
-next ready one. A change of health swaps in a rebuilt routing table at once, so the next request
+Record a verdict on the worker at `url`: ready, or not (not ready, unreachable, hung, or its
+connection refused). This is the one place a worker's health changes: the prober marks a worker
+here every round, and the request path marks one down here when its connection is refused. An
+outage starts at the first verdict that it is not ready and ends at the next ready verdict observed
+after the outage began (`observed_at`, when the probe was sent), so a probe answered ready just
+before a request found the connection refused does not clear the refusal. Only the prober gives a
+ready verdict. A change of health swaps in a rebuilt routing table at once, so the next request
 already sees it. Returns whether the worker's health changed.
 """
-function note_worker_ready!(d::DiscoveredRoutes, url::AbstractString, ready::Bool, now::Real = time())
+function note_worker_ready!(
+        d::DiscoveredRoutes, url::AbstractString, ready::Bool, now::Real = time();
+        observed_at::Real = now
+    )
     return lock(d.lock) do
         changed = false
         if ready
-            changed = pop!(d.down_since, url, nothing) !== nothing
+            since = get(d.down_since, url, nothing)
+            if since !== nothing && since <= observed_at
+                delete!(d.down_since, url)
+                changed = true
+            end
         elseif !haskey(d.down_since, url)
             d.down_since[String(url)] = Float64(now)
             changed = true

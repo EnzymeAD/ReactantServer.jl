@@ -137,9 +137,10 @@ function _check_once(p::HealthProber)
     results = Vector{Bool}(undef, length(workers))
     timeouts = Vector{Bool}(undef, length(workers))
     elapsed = Vector{Float64}(undef, length(workers))
+    sent = Vector{Float64}(undef, length(workers))
     @sync for (i, wc) in enumerate(workers)
         @async begin
-            t0 = time()
+            t0 = sent[i] = time()
             results[i], timeouts[i] =
                 _bounded(
                 () -> probe_ready(wc), PROBE_TIMEOUT_SECONDS, false,
@@ -164,7 +165,9 @@ function _check_once(p::HealthProber)
         # their deadline unanswered has a parked inference connection; reset that one.
         results[i] && reset_if_parked!(wc)
         _track_outage!(p, wc.url, results[i])
-        p.routes === nothing || note_worker_ready!(p.routes, wc.url, results[i])
+        # A ready answer clears only an outage that began before the probe was sent: a request that
+        # found the worker's connection refused while this probe was out keeps it down until the next.
+        p.routes === nothing || note_worker_ready!(p.routes, wc.url, results[i]; observed_at = sent[i])
     end
     set_ready!(p.admin, any_ready)
     p.ever_responsive |= any_responsive

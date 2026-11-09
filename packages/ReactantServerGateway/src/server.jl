@@ -130,16 +130,22 @@ _is_cancelled(cancelled) = cancelled !== nothing && (
 # any failover retries — and forward it as the worker's grpc-timeout, so the budget shrinks for time
 # burned at the gateway instead of resetting to a fresh full budget at the worker. If it is already
 # gone, shed here (DEADLINE_EXCEEDED) rather than forward doomed work into the worker's queue.
+#
+# Returns (response, status, exception, refused): `refused` is true when the connection to the
+# worker was refused, so the request never reached it. The worker is then marked down at once, in
+# the same place the prober marks it (`note_worker_ready!`), and stays down until a probe sent after
+# the refusal finds it ready: no later request or failover goes to it meanwhile, and under
+# lpt_packing the prober's next round sees a membership change.
 function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64, cancelled = nothing)
     wc = get_clients(st.pool, url)
     if wc === nothing
         return nothing, STATUS_INTERNAL,
-            _gw_internal(st, "infer for model \"$model\"", id, "routing table referenced unknown worker $url")
+            _gw_internal(st, "infer for model \"$model\"", id, "routing table referenced unknown worker $url"), false
     end
     gate_wait(st.gate, url)
     if _is_cancelled(cancelled)
         return nothing, STATUS_CANCELLED,
-            gRPCServer.GRPCError(gRPCServer.StatusCode.CANCELLED, "request for model \"$model\" was cancelled by the client")
+            gRPCServer.GRPCError(gRPCServer.StatusCode.CANCELLED, "request for model \"$model\" was cancelled by the client"), false
     end
     deadline_s = nothing
     if deadline_ns != 0
@@ -149,7 +155,7 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64,
                 gRPCServer.GRPCError(
                     gRPCServer.StatusCode.DEADLINE_EXCEEDED,
                     "deadline exceeded at gateway for model \"$model\""
-                )
+                ), false
         end
         # Forward as WHOLE SECONDS: grpc_timeout_header_val only encodes integer seconds without
         # falling back to a >8-digit nanosecond value the worker rejects; ceil so a sub-second budget
@@ -162,8 +168,12 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64,
     # already redacted it), and a failure of the call itself is described by `invoke_infer` under the
     # worker's label, never with the transport's text (which names hosts and ports).
     full = st.error_detail == ERROR_DETAIL_FULL
+    refused = Ref(false)
     try
-        resp = invoke_infer(wc, body; deadline = deadline_s, cancelled = cancelled, label = full ? nothing : _shown(st, url))
+        resp = invoke_infer(
+            wc, body; deadline = deadline_s, cancelled = cancelled, label = full ? nothing : _shown(st, url),
+            refused = refused
+        )
         observe_worker!(st.metrics, "ModelInfer", url, time() - t0)
         # A worker's reply always carries model_name, so an empty body is a call that ended without
         # a response: gRPCClient before 1.1.2 returned one when a handle reset aborted the call.
@@ -171,15 +181,17 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64,
         if isempty(resp)
             @warn "infer: worker returned an empty response" model worker = url request_id = id
             return nothing, STATUS_UNAVAILABLE,
-                _server_exc(STATUS_UNAVAILABLE, "$(full ? "worker $url" : _shown(st, url)): empty response (connection reset?)")
+                _server_exc(STATUS_UNAVAILABLE, "$(full ? "worker $url" : _shown(st, url)): empty response (connection reset?)"), false
         end
-        return resp, STATUS_OK, nothing
+        return resp, STATUS_OK, nothing, false
     catch e
         observe_worker!(st.metrics, "ModelInfer", url, time() - t0)
         e isa gRPCClient.gRPCServiceCallException || rethrow()
         status = client_status(e)
-        @warn "infer: worker error" model worker = url request_id = id status = status msg = e.message
-        return nothing, status, _server_exc(status, full ? "worker $url: $(e.message)" : e.message)
+        @warn "infer: worker error" model worker = url request_id = id status = status msg = e.message refused = refused[]
+        refused[] && note_worker_ready!(st.routes, url, false) &&
+            @warn "infer: the worker refused the connection; marked down until a probe finds it ready" worker = url
+        return nothing, status, _server_exc(status, full ? "worker $url: $(e.message)" : e.message), refused[]
     end
 end
 
@@ -193,19 +205,27 @@ end
 # failed it may still be running it (an abandoned or reset call is not a stopped one), and a second
 # worker writing the same output slot, or reading an input slot the client has since reused, would
 # corrupt the client's data. Its failure reaches the client as UNAVAILABLE, the client's cue to retry.
+# The one exception is a refused connection: the request never left the gateway, so no worker has
+# it, and it moves on like any other request. Every other ending (any other transport failure, an
+# abandoned or reset call, a deadline, a status the worker sent) keeps the rule.
 #
-# A replica marked down after the scheduler chose it (the prober's round landed in between) is
-# skipped: no request is sent to a worker marked down, as a first choice or as a failover.
+# A replica marked down after the scheduler chose it (the prober's round, or another request's
+# refused connection, landed in between) is skipped: no request is sent to a worker marked down, as
+# a first choice or as a failover.
 function _try_replicas(st::GatewayState, urls, model, id, body, deadline_ns::Int64, cancelled = nothing)
     last_status = STATUS_UNAVAILABLE
     last_exc = _no_ready_worker(model)
     shm = nothing           # read from the body only once a worker has failed the request
     for url in urls
         is_healthy(st.routes, url) || continue
-        resp, status, exc = _post_infer(st, url, model, id, body, deadline_ns, cancelled)
+        resp, status, exc, refused = _post_infer(st, url, model, id, body, deadline_ns, cancelled)
         exc === nothing && return resp, status, nothing
         status == STATUS_NOT_FOUND && request_refresh!(st.refresher)
         _fails_over(status) || return nothing, status, exc
+        if refused
+            last_status, last_exc = status, exc
+            continue
+        end
         shm === nothing && (shm = peek_uses_shared_memory(body))
         if shm
             msg = "$(exc.message) (the request uses shared memory, so it is not retried on another worker)"

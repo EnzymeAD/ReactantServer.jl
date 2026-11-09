@@ -13,6 +13,11 @@
 # (`trigger = :membership`), where before a repack waited for the compute budget and then for a
 # missing worker's 30 s grace.
 #
+# A request whose connection to a worker is refused marks that worker down at once, without waiting
+# for the prober, and moves on to a healthy replica even when it uses shared memory (it never left
+# the gateway). Before, the worker kept getting its share of requests until the next probe round, and
+# a shared-memory request that met the refusal came back UNAVAILABLE.
+#
 # Reuses `MockWorker`, `_start_mock`, `_infer` (test_gateway.jl), `_retention_gateway`, `_rstatus`,
 # `_rurl` (test_route_retention.jl), `_sched_cfg` (test_scheduler.jl), and `AffMockWorker`,
 # `_aff_server`, `_aff_infer`, `_pk_state` (test_lpt_packing.jl).
@@ -434,4 +439,194 @@ end
         close(sa)
         close(sb)
     end
+end
+
+# --- A refused connection marks the worker down at once ----------------------------------------
+
+@testset "a ready probe sent before a refusal does not clear it" begin
+    d = GW.DiscoveredRoutes()
+    GW.record_answers!(d, Dict("w" => ["m"]))
+    @test GW.note_worker_ready!(d, "w", false, 100.0)                       # refused at t = 100
+    @test !GW.is_healthy(d, "w") && GW.replicas(d, "m") == String[]
+    @test !GW.note_worker_ready!(d, "w", true, 101.0; observed_at = 99.5)   # that probe was sent before
+    @test !GW.is_healthy(d, "w")
+    @test GW.note_worker_ready!(d, "w", true, 111.0; observed_at = 110.0)   # the next one clears it
+    @test GW.is_healthy(d, "w") && GW.replicas(d, "m") == ["w"]
+end
+
+# The refusal tests kill a worker the gateway has sent no request to, so the gateway holds no
+# inference connection to it and the next request must connect, which is refused. A worker that dies
+# while the gateway holds a connection to it fails the next call on that connection as a broken
+# connection, not a refusal (the request may have been sent), and only the call after it, which
+# connects afresh, is refused; the last testset below shows that case.
+@testset "round_robin: a refused connection marks the worker down at once; its request moves on (shm = $shm)" for shm in (false, true)
+    w0 = MockWorker("worker0", ["m"], false, false, false)
+    w1 = MockWorker("worker1", ["m"], false, false, false)
+    s0, p0 = _start_mock(w0)
+    s1, p1 = _start_mock(w1)
+    u1 = _rurl(p1)
+    request() = shm ? _hr_shm_request("m") : GWInf.ModelInferRequest(; model_name = "m")
+    # One prober round at startup, then none unless the test runs one.
+    gw = _retention_gateway([p0, p1]; env = ["REACTANT_GATEWAY_HEALTH_INTERVAL_SECONDS" => "3600"])
+    try
+        port, _ = _RGW.bound_ports(gw)
+        @test timedwait(() -> length(something(_RGW.replicas(gw.routes, "m"), String[])) == 2, 30) === :ok
+
+        # worker1 dies. Round robin puts it first for one of the next two requests, which finds its
+        # connection refused and is served by worker0, a shared-memory request too, since it never
+        # left the gateway.
+        gRPCServer.stop!(s1; force = true)
+        for _ in 1:2
+            @test _hr_call(port, request()).model_name == "worker0"
+        end
+        @test _hr_down(gw, u1)
+
+        # From then on no attempt is made on it, not even once a worker answers on its port again: only
+        # a probe clears the mark.
+        s1, _ = _start_mock(w1; port = p1)
+        w1.infer_calls = 0
+        before = _hr_attempts(gw, u1)
+        for _ in 1:6
+            @test _infer(port, "m").model_name == "worker0"
+            @test _hr_call(port, _hr_shm_request("m")).model_name == "worker0"
+        end
+        @test w1.infer_calls == 0
+        @test _hr_attempts(gw, u1) == before
+
+        # The prober's next round finds it ready: routable again.
+        _RGW._check_once(gw.prober)
+        @test !_hr_down(gw, u1)
+        @test Set(_infer(port, "m").model_name for _ in 1:4) == Set(["worker0", "worker1"])
+    finally
+        _RGW.stop!(gw)
+        close(s0)
+        gRPCServer.stop!(s1; force = true)
+    end
+end
+
+@testset "a worker that dies under an open connection: a broken call first, then the refusal marks it down" begin
+    w0 = MockWorker("worker0", ["m"], false, false, false)
+    w1 = MockWorker("worker1", ["m"], false, false, false)
+    s0, p0 = _start_mock(w0)
+    s1, p1 = _start_mock(w1)
+    u1 = _rurl(p1)
+    gw = _retention_gateway([p0, p1]; env = ["REACTANT_GATEWAY_HEALTH_INTERVAL_SECONDS" => "3600"])
+    try
+        port, _ = _RGW.bound_ports(gw)
+        @test timedwait(() -> length(something(_RGW.replicas(gw.routes, "m"), String[])) == 2, 30) === :ok
+        @test Set(_infer(port, "m").model_name for _ in 1:4) == Set(["worker0", "worker1"])   # connections open
+        gRPCServer.stop!(s1; force = true)
+        # Every inline request is still served; within a few, one has met the refusal on a fresh
+        # connection and marked worker1 down.
+        for _ in 1:6
+            @test _infer(port, "m").model_name == "worker0"
+        end
+        @test _hr_down(gw, u1)
+    finally
+        _RGW.stop!(gw)
+        close(s0)
+    end
+end
+
+@testset "lpt_packing: a refused connection marks the worker down, and the next round repacks for it" begin
+    A = AffMockWorker("workerA", ["m", "n"])
+    B = AffMockWorker("workerB", ["m", "n"])
+    sa = _aff_server(0, A); pa = grpc_start_ephemeral!(sa)
+    sb = _aff_server(0, B); pb = grpc_start_ephemeral!(sb)
+    ua, ub = "127.0.0.1:$pa", "127.0.0.1:$pb"
+    gw, aff = _hr_lpt_gateway([pa, pb])
+    try
+        port = _HGW.bound_ports(gw)[1]
+        _hr_place!(aff, ua, ub)
+        rep0 = @atomic aff.report
+
+        # B dies (no request has been sent to it yet). A shared-memory request for n, placed on B
+        # alone, finds B's connection refused and is served by A; B is marked down before any
+        # prober round.
+        gRPCServer.stop!(sb; force = true)
+        @test _hr_call(port, _hr_shm_request("n")).model_name == "workerA"
+        @test _hr_down(gw, ub)
+        before = _hr_attempts(gw, ub)
+        for _ in 1:4
+            @test _aff_infer(port, "n").model_name == "workerA"
+            @test _aff_infer(port, "m").model_name == "workerA"
+            @test _hr_call(port, _hr_shm_request("m")).model_name == "workerA"
+        end
+        @test _hr_attempts(gw, ub) == before
+        @test (@atomic aff.report).count == rep0.count          # no repack until the prober's round
+
+        # The next round repacks for it.
+        _HGW._check_once(gw.prober)
+        rep = @atomic aff.report
+        @test rep.trigger === :membership && rep.count == rep0.count + 1
+        @test all(pl -> all(wv -> first(wv) != ub, pl), values(@atomic aff.assignment))
+
+        # B is back on its port: the round that finds it ready makes it routable and repacks it in.
+        sb = _aff_server(pb, B)
+        gRPCServer.start!(sb)
+        @test timedwait(15) do
+            try
+                AInf.GRPCInferenceService.ServerReady("127.0.0.1", pb, AInf.ServerReadyRequest()).ready
+            catch
+                false
+            end
+        end === :ok
+        _HGW._check_once(gw.prober)
+        @test !_hr_down(gw, ub)
+        @test (@atomic aff.report).trigger === :membership
+        @test timedwait(() -> aff.transition === nothing, 15) === :ok
+        @test sort(first.((@atomic aff.assignment)["m"])) == sort([ua, ub])
+    finally
+        _HGW.stop!(gw)
+        close(sa)
+        gRPCServer.stop!(sb; force = true)
+    end
+end
+
+@testset "invoke_infer reports a refused connection, and nothing else, as refused" begin
+    body = UInt8[0x0a, 0x01, 0x61]
+    function attempt(host, port; deadline = 5)
+        grpc = gRPCClient.gRPCCURL(; sticky = true)
+        chan = gRPCClient.gRPCChannel(host, port; grpc = grpc, deadline = 30)
+        wc = GW.WorkerClients("$host:$port", grpc, chan, 5.0, 5.0)
+        refused = Ref(false)
+        status = try
+            GW.invoke_infer(wc, body; deadline = deadline, refused = refused)
+            nothing
+        catch e
+            e.grpc_status
+        end
+        gRPCClient.grpc_shutdown(grpc)
+        return status, refused[]
+    end
+    # Nothing listens: refused.
+    @test attempt("127.0.0.1", grpc_free_port()) == (gRPCClient.GRPC_UNAVAILABLE, true)
+    # Accepted, then closed at once: a reset, after the request was sent. Not refused.
+    srv = Sockets.listen(Sockets.localhost, 0)
+    rport = Int(Sockets.getsockname(srv)[2])
+    closer = @async try
+        while isopen(srv)
+            c = Sockets.accept(srv)
+            readavailable(c)
+            close(c)
+        end
+    catch
+    end
+    @test attempt("127.0.0.1", rport) == (gRPCClient.GRPC_UNAVAILABLE, false)
+    close(srv)
+    # Accepted and never answered: the call's deadline. Not refused.
+    srv = Sockets.listen(Sockets.localhost, 0)
+    hport = Int(Sockets.getsockname(srv)[2])
+    held = Any[]
+    acceptor = @async try
+        while isopen(srv)
+            push!(held, Sockets.accept(srv))
+        end
+    catch
+    end
+    @test attempt("127.0.0.1", hport; deadline = 1) == (gRPCClient.GRPC_DEADLINE_EXCEEDED, false)
+    close(srv)
+    foreach(close, held)
+    # A name that does not resolve. Not refused.
+    @test attempt("no-such-host.invalid", 9) == (gRPCClient.GRPC_UNAVAILABLE, false)
 end
