@@ -630,3 +630,97 @@ end
     # A name that does not resolve. Not refused.
     @test attempt("no-such-host.invalid", 9) == (gRPCClient.GRPC_UNAVAILABLE, false)
 end
+
+# --- Only the health check takes a worker out --------------------------------------------------
+
+_hr_on(aff, url) = any(pl -> any(wv -> first(wv) == url, pl), values(@atomic aff.assignment))
+
+@testset "lpt_packing: a healthy worker whose control-status poll fails keeps its placement and its traffic" begin
+    A = AffMockWorker("workerA", ["m", "n"])
+    B = AffMockWorker("workerB", ["m", "n"])
+    sa = _aff_server(0, A); pa = grpc_start_ephemeral!(sa)
+    sb = _aff_server(0, B); pb = grpc_start_ephemeral!(sb)
+    ua, ub = "127.0.0.1:$pa", "127.0.0.1:$pb"
+    gw, aff = _hr_lpt_gateway([pa, pb])
+    try
+        port = _HGW.bound_ports(gw)[1]
+        _hr_place!(aff, ua, ub)
+        rep0 = @atomic aff.report
+
+        # B passes its health check every round, but its ModelControlStatus times out once and then
+        # fails outright. No round repacks, n stays placed on B alone, and B keeps serving it.
+        for st in (:slow, :down, :down)
+            B.status = st
+            _HGW._check_once(gw.prober)
+            @test !_hr_down(gw, ub)
+            @test (@atomic aff.report).count == rep0.count
+            @test (@atomic aff.assignment)["n"] == [(ub, 1.0)]
+            b0 = B.calls
+            @test _aff_infer(port, "n").model_name == "workerB"
+            @test _hr_call(port, _hr_shm_request("n")).model_name == "workerB"
+            @test B.calls == b0 + 2
+        end
+        @test _hr_repacks(gw, "membership") == 0
+
+        # A repack due for another reason meanwhile (here an operator's) plans B from its last answer:
+        # B is among the workers it places on, and keeps n.
+        @atomic aff.repack_requested += 1
+        _HGW._check_once(gw.prober)
+        rep = @atomic aff.report
+        @test rep.trigger === :operator && rep.count == rep0.count + 1
+        @test ub in rep.polled
+        @test (@atomic aff.assignment)["n"] == [(ub, 1.0)]
+        @test _aff_infer(port, "n").model_name == "workerB"
+
+        # Losing the health check still takes it out at once.
+        B.ready = false
+        _HGW._check_once(gw.prober)
+        rep = @atomic aff.report
+        @test rep.trigger === :membership && rep.count == rep0.count + 2
+        @test !_hr_on(aff, ub)
+        @test _aff_infer(port, "n").model_name == "workerA"
+    finally
+        _HGW.stop!(gw)
+        close(sa)
+        close(sb)
+    end
+end
+
+@testset "lpt_packing: a healthy worker that has not answered a control-status poll gets no placement until it does" begin
+    A = AffMockWorker("workerA", ["m", "n"])
+    B = AffMockWorker("workerB", ["m", "n"])
+    sa = _aff_server(0, A); pa = grpc_start_ephemeral!(sa)
+    sb = _aff_server(0, B); pb = grpc_start_ephemeral!(sb)
+    ua, ub = "127.0.0.1:$pa", "127.0.0.1:$pb"
+    gw, aff = _hr_lpt_gateway([pa, pb])
+    try
+        # B fails its health check, which takes it out and forgets its answers.
+        B.ready = false
+        _HGW._check_once(gw.prober)
+        @test !_hr_on(aff, ub)
+        n1 = (@atomic aff.report).count
+
+        # B is healthy again but has not answered a poll since: it is routable, but not placed, and
+        # its return is no membership change yet.
+        B.ready = true
+        B.status = :down
+        for _ in 1:2
+            _HGW._check_once(gw.prober)
+            @test !_hr_down(gw, ub)
+            @test (@atomic aff.report).count == n1
+            @test !_hr_on(aff, ub)
+        end
+
+        # Its first answer: it joins, and the repack places m's second replica on it.
+        B.status = :ok
+        _HGW._check_once(gw.prober)
+        rep = @atomic aff.report
+        @test rep.trigger === :membership && rep.count == n1 + 1
+        @test timedwait(() -> aff.transition === nothing, 15) === :ok
+        @test sort(first.((@atomic aff.assignment)["m"])) == sort([ua, ub])
+    finally
+        _HGW.stop!(gw)
+        close(sa)
+        close(sb)
+    end
+end

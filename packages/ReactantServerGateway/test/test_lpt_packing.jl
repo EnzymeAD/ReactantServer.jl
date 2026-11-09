@@ -1205,11 +1205,13 @@ mutable struct AffMockWorker
     ready::Bool                 # what ServerReady reports
     hang::Bool                  # while set, ServerReady and ModelInfer do not answer (a frozen worker)
     calls::Int                  # ModelInfer calls that reached the worker, counted on arrival
+    # ModelControlStatus: :ok, :down (UNAVAILABLE), :slow (answers after 6 s, past the poll's 5 s deadline)
+    status::Symbol
 end
 AffMockWorker(name, models; discipline = "fifo", rows_per_request = 1, batch_at = ("IN", 1)) =
     AffMockWorker(
     name, models, discipline, Dict{String, Int}(), Dict{String, Float64}(),
-    Dict{String, Int}(), rows_per_request, batch_at, Vector{String}[], "staged", 0.0, true, false, 0
+    Dict{String, Int}(), rows_per_request, batch_at, Vector{String}[], "staged", 0.0, true, false, 0, :ok
 )
 
 # Hold a call while the worker is frozen (at most a minute, so a test that forgets to clear it ends).
@@ -1244,6 +1246,8 @@ function _aff_server(port::Integer, w::AffMockWorker)
         server;
         ModelControlStatus = (ctx, req) -> begin
             w = ctx.payload
+            w.status === :down && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, "mock $(w.name) control plane down"))
+            w.status === :slow && sleep(6)
             ACtl.ModelControlStatusResponse(;
                 residency_mode = "self_managed", discipline = w.discipline,
                 models = [

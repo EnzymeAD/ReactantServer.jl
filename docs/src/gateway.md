@@ -278,13 +278,15 @@ accepted but does not affect a model's GPU count.)
 When the set of healthy workers changes, the gateway repacks on the probe round that sees it, without
 waiting for the compute budget: a worker the probe finds not ready, unreachable or hung, or one a
 request found refusing connections, has left, and one the probe finds ready again (or sees for the
-first time) has joined once it answers the control-status poll. The placement each repack makes is computed for the workers that answered that repack's poll,
-and any later round whose answering workers differ repacks again (`trigger="membership"`). The repack
-places every model whose workers left on the workers that remain, so a single-replica model on a lost
-worker moves to a survivor, and caps each model's replica count by the workers present: a model with
-`replicas: 2` on a fleet down to one GPU runs on that one, and gets its second replica back at the
-repack the other's return triggers. A worker that answers its probe but misses the control-status
-poll counts as having left for that round.
+first time) has joined once it has answered a control-status poll, since placement needs its weight
+budget and counters; until then it gets no placement. Only the health check takes a worker out: one
+that passes it but whose control-status poll fails or times out keeps its placement and its traffic,
+and a repack due for another reason meanwhile plans it from its last answer. Each repack's placement
+is computed for the healthy workers that have answered, and any later round where those differ
+repacks again (`trigger="membership"`). The repack places every model whose workers left on the
+workers that remain, so a single-replica model on a lost worker moves to a survivor, and caps each
+model's replica count by the workers present: a model with `replicas: 2` on a fleet down to one GPU
+runs on that one, and gets its second replica back at the repack the other's return triggers.
 
 Without `forbid_memory_oversubscription` a worker may be placed more weights than its budget, and the
 overflow is priced by the uploads it causes. With it (the default), the budget is a hard limit on

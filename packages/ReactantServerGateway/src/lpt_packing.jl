@@ -549,9 +549,14 @@ mutable struct LptPackingState <: GatewayScheduler
     compute_accum::Float64
     last_worker_compute::Dict{String, Float64}
     # The workers the live assignment was computed for (sorted; prober task only): the healthy
-    # workers that answered the poll of the repack that made it. A tick whose healthy, polled workers
-    # differ from these repacks at once (`:membership`); see `tick_packing!`.
+    # workers with a control-status answer at the repack that made it. A tick whose healthy, answered
+    # workers differ from these repacks at once (`:membership`); see `tick_packing!`.
     members::Vector{String}
+    # Each healthy worker's last ModelControlStatus answer (prober task only). A healthy worker that
+    # misses a poll is planned from its last answer, so only the health check takes a worker out;
+    # a worker the health check marks down is forgotten here, so it rejoins only once it answers a
+    # poll again. See `_effective_poll!`.
+    last_status::Dict{String, Any}
     # whether a tick-driven repack has fired yet. The startup cold placement does not count; the
     # first tick repack sets this, after which the steady-state `rebalance_compute_seconds` applies.
     did_first_tick_repack::Bool
@@ -623,7 +628,7 @@ LptPackingState(cfg::GatewayConfig, meta::RoutingMeta = RoutingMeta(cfg)) = LptP
     PackingKnobs(cfg), ReentrantLock(), meta,
     Dict{String, Threads.Atomic{Int}}(), ReentrantLock(),
     Dict{String, Float64}(), Dict{String, Float64}(), Dict{String, Tuple{Float64, UInt64}}(),
-    0.0, 0.0, Dict{String, Float64}(), String[], false,
+    0.0, 0.0, Dict{String, Float64}(), String[], Dict{String, Any}(), false,
     Dict{String, Int}(), Dict{String, Float64}(), Dict{String, Placement}(),
     Dict{Tuple{String, String}, Threads.Atomic{Int}}(),
     Dict{Tuple{String, String}, Threads.Atomic{Int}}(),
@@ -1188,7 +1193,8 @@ function rebalance!(
         s::LptPackingState, pool::ClientPool, ready_urls::Vector{String},
         metrics::Union{GatewayMetrics, Nothing} = nothing; trigger::Symbol = :startup
     )
-    _repack!(s, poll_workers(pool, ready_urls), metrics; trigger = trigger, pool = pool)
+    poll = _effective_poll!(s, poll_workers(pool, ready_urls), ready_urls)
+    _repack!(s, poll, metrics; trigger = trigger, pool = pool)
     return nothing
 end
 
@@ -1208,12 +1214,36 @@ function _compute_delta!(s::LptPackingState, poll)
 end
 
 """
+    _effective_poll!(s, poll, healthy) -> poll
+
+The poll a tick plans from: this round's answers (`poll`, from `poll_workers` over the `healthy`
+workers), plus the last answer of each healthy worker that missed this round's poll. Only the health
+check takes a worker out of the placement: a worker that passes it but whose ModelControlStatus fails
+or times out keeps its place, and a repack due meanwhile plans it from its last answer (its budget
+and its counters as they last were; its compute is counted from them once it answers again). A
+worker no longer healthy is forgotten, so it joins again only once it is healthy and has answered a
+poll, which a new worker needs too: placement needs its budget and counters. Prober task only.
+"""
+function _effective_poll!(s::LptPackingState, poll, healthy::AbstractVector{<:AbstractString})
+    hasproperty(poll, :responses) || return poll      # a poll built by hand (tests): use as is
+    keep = Set{String}(healthy)
+    for w in collect(keys(s.last_status))
+        w in keep || delete!(s.last_status, w)
+    end
+    merge!(s.last_status, poll.responses)
+    length(s.last_status) == length(poll.responses) && return poll
+    @debug "lpt_packing: planning from the last control-status answer of healthy workers that missed this poll" workers = sort!(setdiff(collect(keys(s.last_status)), keys(poll.responses)))
+    return aggregate_poll(s.last_status)
+end
+
+"""
     membership_change(s, poll) -> Union{Nothing, NamedTuple}
 
-How the workers this tick's poll reached differ from those the live assignment was computed for
-(`s.members`): `(; left, joined)`, or `nothing` when they are the same or no worker answered the
-poll. The poll covers the healthy workers only, so a worker the prober marked down has left, and one
-it found ready again, or sees for the first time, has joined once it answers.
+How the workers in this tick's poll differ from those the live assignment was computed for
+(`s.members`): `(; left, joined)`, or `nothing` when they are the same or the poll holds no worker.
+The tick's poll (`_effective_poll!`) holds every healthy worker that has answered a poll, this round
+or before, so a worker leaves only when the health check marks it down (or a refused connection
+does), and joins once it is healthy and has answered.
 """
 function membership_change(s::LptPackingState, poll)
     isempty(poll.polled) && return nothing
@@ -1244,7 +1274,9 @@ committed assignment.
 
 `poll` is the prober's [`poll_workers`](@ref) result for this round, shared with the gateway's
 routing-metadata cache so there is one control-status round per tick however many consumers there
-are. It defaults to polling here so a test (or a direct caller) need not thread one through.
+are. It defaults to polling here so a test (or a direct caller) need not thread one through. The
+tick plans from it plus the last answer of every healthy worker that missed it (`_effective_poll!`),
+so a missed poll is never a membership change.
 """
 function tick_packing!(
         s::LptPackingState, pool::ClientPool, ready_urls::Vector{String},
@@ -1258,6 +1290,8 @@ function tick_packing!(
     # One knob snapshot for the whole tick, so a policy change landing mid-tick cannot produce a
     # repack that mixes old and new settings.
     k = knobs(s)
+    # A healthy worker that missed this round's poll stays in, planned from its last answer.
+    poll = _effective_poll!(s, poll, ready_urls)
     @atomic s.max_batch = poll.max_batch         # keep routing metadata fresh between repacks
     _publish_fill_plan!(s, k, poll.max_batch, poll.batch_at)   # ...and re-resolve the fill rules
     _refresh_live_gauges!(s, metrics)            # in-flight and quantum, refreshed between repacks
@@ -1285,7 +1319,7 @@ function tick_packing!(
             forced && @atomic s.repack_completed = requested
         end
     elseif (forced || s.compute_accum >= threshold) && isempty(poll.polled)
-        @info "lpt_packing: repack deferred: no worker answered the poll"
+        @info "lpt_packing: repack deferred: no healthy worker has answered a control-status poll"
     elseif (forced || s.compute_accum >= threshold) && s.transition !== nothing
         # The previous repack is still staging its moves' weights; the next one plans from what it
         # commits, so it waits (the accumulated compute and any operator request carry over).
