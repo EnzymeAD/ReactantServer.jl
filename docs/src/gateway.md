@@ -48,17 +48,31 @@ that serves the model. On a multi-worker node it also serves the node's merged m
   every input's name, datatype, and shape. That is a property of these requests, not a protocol
   guarantee: a Triton client may still inline typed contents, and the gateway keeps handling
   that.
-- **SHM broadcast:** `SystemSharedMemoryRegister` / `Unregister` are fanned out to every worker.
-  POSIX SHM regions are host-local; every worker attaches via `shm_open` independently. Register
-  succeeds only if all workers succeed. On a partial failure it rolls back only the registrations
-  this call created: each worker is first asked (`SystemSharedMemoryStatus`) whether it already
-  holds the name, and one that did (a client re-registering after another worker restarted) keeps
-  it. A worker that holds the name for another client's live object answers `ALREADY_EXISTS`, and
-  the gateway returns `ALREADY_EXISTS`; other failures return `FAILED_PRECONDITION`. Unregister
-  succeeds if any worker does.
-- **SHM namespace probe:** `IsSameIPCNamespace` is fanned out to every worker and the gateway
-  returns `true` only if all of them can see the client's region (any worker may service a later
-  `ModelInfer`). A worker that errors or does not implement the RPC counts as `false`.
+- **SHM broadcast:** `SystemSharedMemoryRegister` / `Unregister` are fanned out to every healthy
+  worker; a worker marked down is skipped, takes no part in the call and cannot hold it up. POSIX
+  SHM regions are host-local; every worker attaches via `shm_open` independently. Register succeeds
+  when every healthy worker accepts it, so a client can register during one worker's outage. On a
+  partial failure it rolls back only the registrations this call created: each worker is first
+  asked (`SystemSharedMemoryStatus`) whether it already holds the name, and one that did (a client
+  re-registering after another worker restarted) keeps it. A worker that holds the name for another
+  client's live object answers `ALREADY_EXISTS`, and the gateway returns `ALREADY_EXISTS`; other
+  failures return `FAILED_PRECONDITION`. Unregister succeeds if any healthy worker does. With no
+  healthy worker, both answer `UNAVAILABLE`.
+- **A worker that missed a registration:** a worker that was down during a register does not know
+  the region when it returns, and one that restarted has lost every registration, so its first
+  request that uses the region fails with `FAILED_PRECONDITION`. `ReactantServerClient` answers that
+  by registering the same region again through the gateway (a no-op on the workers that hold it)
+  and retrying the request once, so its callers see no error and it stays on shared memory. Other
+  clients, such as stock Triton clients, must register again themselves when a request fails with
+  `FAILED_PRECONDITION`. A worker that stayed alive while it was marked down still holds what it
+  had registered, which may be an object the client has since unregistered and replaced under the
+  same name; before such a worker takes requests again, the gateway unregisters on it every region
+  name it missed while down, and it stays down until that succeeds. A region it then no longer holds
+  fails with `FAILED_PRECONDITION` as above, never with the old object's data.
+- **SHM namespace probe:** `IsSameIPCNamespace` is fanned out to every healthy worker and the
+  gateway returns `true` only if all of them can see the client's region (any healthy worker may
+  service a later `ModelInfer`). A worker that errors or does not implement the RPC counts as
+  `false`, and so does a gateway with no healthy worker.
 - **Model metadata:** `ControlService/DescribeModels` asks every worker and merges the answers,
   so a client learns what the node serves without reading its model repository: each model's
   tensors with the kind of every axis (fixed, batch, or variable), its compiled batch sizes and

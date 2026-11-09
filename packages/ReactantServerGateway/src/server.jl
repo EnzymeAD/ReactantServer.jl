@@ -344,11 +344,27 @@ function _encode_unregister(region::AbstractString)
     return take!(io)
 end
 
-# Invoke `op` (a function of WorkerClients) on every worker concurrently, holding the per-worker
-# register gate. Returns (first_response, succeeded_urls, failed_urls, errors), where `errors` maps
-# each failed worker's URL to what it threw.
-function _broadcast_shm(st::GatewayState, op, region, rpc_label)
-    workers = all_clients(st.pool)
+# The workers a shared-memory fan-out goes to, and those it skips: only workers the health record
+# considers healthy are asked, as only they can be sent a request. A skipped worker takes no gate
+# slot and no status pre-check, so a dead or hung one cannot hold the call up.
+function _shm_targets(st::GatewayState)
+    healthy = WorkerClients[]
+    skipped = String[]
+    for wc in all_clients(st.pool)
+        is_healthy(st.routes, wc.url) ? push!(healthy, wc) : push!(skipped, wc.url)
+    end
+    return healthy, skipped
+end
+
+# The answer for a shared-memory register or unregister when no worker is healthy.
+_no_healthy_worker(rpc) = gRPCServer.GRPCError(
+    gRPCServer.StatusCode.UNAVAILABLE, "$rpc: no worker is ready; try again once one is"
+)
+
+# Invoke `op` (a function of WorkerClients) concurrently on each of `workers`, holding the
+# per-worker register gate. Returns (first_response, succeeded_urls, failed_urls, errors), where
+# `errors` maps each failed worker's URL to what it threw.
+function _broadcast_shm(st::GatewayState, workers, op, region, rpc_label)
     succeeded = String[]
     failed = String[]
     errors = Dict{String, Any}()
@@ -441,6 +457,19 @@ function _gw_shm_register(body::Vector{UInt8}, st::GatewayState)
     # back. An unanswered pre-check counts as "held" (never roll back what may have existed). A
     # registration created concurrently by another call for the same object can still be rolled
     # back; that client then sees FAILED_PRECONDITION on its next request and re-registers.
+    #
+    # Only the healthy workers are asked, and the register succeeds when every one of them accepts
+    # it. A worker marked down is skipped and noted (`note_missed!`): before it takes requests again
+    # it is told to drop the name, so its first request under it fails with FAILED_PRECONDITION and
+    # the client registers again, which reaches it then (ReactantServerClient does this by itself).
+    workers, skipped = _shm_targets(st)
+    note_missed!(st.gate, skipped, region)
+    if isempty(workers)
+        observe_request!(st.metrics, "SystemSharedMemoryRegister", "", time() - t0)
+        inc_requests!(st.metrics, "SystemSharedMemoryRegister", "", STATUS_UNAVAILABLE)
+        @warn "shm.register: no worker is ready" region skipped_workers = skipped
+        throw(_no_healthy_worker("SystemSharedMemoryRegister"))
+    end
     created = Set{String}()
     created_lock = ReentrantLock()
     register_op = function (wc)
@@ -449,16 +478,22 @@ function _gw_shm_register(body::Vector{UInt8}, st::GatewayState)
         held === false && @lock created_lock push!(created, wc.url)
         return resp
     end
-    resp, succeeded, failed, errors = _broadcast_shm(st, register_op, region, "SystemSharedMemory")
+    resp, succeeded, failed, errors = _broadcast_shm(st, workers, register_op, region, "SystemSharedMemory")
     observe_request!(st.metrics, "SystemSharedMemoryRegister", "", time() - t0)
 
     if isempty(failed)
         inc_requests!(st.metrics, "SystemSharedMemoryRegister", "", STATUS_OK)
-        @info "shm.register: ok" region workers = succeeded
+        isempty(skipped) ? (@info "shm.register: ok" region workers = succeeded) :
+            (@info "shm.register: ok on every ready worker" region workers = succeeded skipped_workers = skipped)
         return resp === nothing ? UInt8[] : resp
     end
 
+    # The rollback goes to healthy workers too; one marked down since it registered is noted
+    # instead, so it drops the name before it takes requests again.
     rollback = filter(in(created), succeeded)
+    gone = filter(u -> !is_healthy(st.routes, u), rollback)
+    note_missed!(st.gate, gone, region)
+    filter!(u -> !(u in gone), rollback)
     if !isempty(succeeded)
         @warn "shm.register: partial failure, rolling back what this call created" region ok_workers = succeeded failed_workers = failed rolled_back = rollback
         isempty(rollback) || _fanout_unregister(st, rollback, _encode_unregister(region))
@@ -499,7 +534,17 @@ function _gw_shm_unregister(body::Vector{UInt8}, st::GatewayState)
         )
     end
 
-    resp, succeeded, failed, _ = _broadcast_shm(st, wc -> invoke_shm_unregister(wc, body), region, "SystemSharedMemory")
+    # Only the healthy workers are asked; a worker marked down is noted and told to drop the name
+    # before it takes requests again (see `_gw_shm_register`).
+    workers, skipped = _shm_targets(st)
+    note_missed!(st.gate, skipped, region)
+    if isempty(workers)
+        observe_request!(st.metrics, "SystemSharedMemoryUnregister", "", time() - t0)
+        inc_requests!(st.metrics, "SystemSharedMemoryUnregister", "", STATUS_UNAVAILABLE)
+        @warn "shm.unregister: no worker is ready" region skipped_workers = skipped
+        throw(_no_healthy_worker("SystemSharedMemoryUnregister"))
+    end
+    resp, succeeded, failed, _ = _broadcast_shm(st, workers, wc -> invoke_shm_unregister(wc, body), region, "SystemSharedMemory")
     observe_request!(st.metrics, "SystemSharedMemoryUnregister", "", time() - t0)
 
     if isempty(succeeded) && !isempty(failed)
@@ -513,9 +558,9 @@ function _gw_shm_unregister(body::Vector{UInt8}, st::GatewayState)
         )
     end
     if !isempty(failed)
-        @warn "shm.unregister: partial failures" region ok_workers = succeeded failed_workers = failed
+        @warn "shm.unregister: partial failures" region ok_workers = succeeded failed_workers = failed skipped_workers = skipped
     else
-        @info "shm.unregister: ok" region workers = succeeded
+        @info "shm.unregister: ok" region workers = succeeded skipped_workers = skipped
     end
     inc_requests!(st.metrics, "SystemSharedMemoryUnregister", "", STATUS_OK)
     return resp === nothing ? UInt8[] : resp
@@ -523,14 +568,16 @@ end
 
 # --- SHM namespace probe ----------------------------------------------------------------------
 
-# Answer the client's IsSameIPCNamespace probe. Any worker may service a later ModelInfer, so
-# system shared memory is only usable if EVERY worker can see the client's region: fan the probe
-# out and AND the results. A worker that errors or does not implement the RPC (UNIMPLEMENTED)
-# counts as "not same", and a pool with no workers is "not same". The probed name carries a
-# random per-client token, so it is never used as a metric label (cardinality).
+# Answer the client's IsSameIPCNamespace probe. Any healthy worker may service a later ModelInfer,
+# so system shared memory is only usable if every one of them can see the client's region: fan the
+# probe out to the healthy workers and AND the results. A worker marked down is not asked, as the
+# register skips it too: a client that starts during one worker's outage still gets shared memory.
+# A worker that errors or does not implement the RPC (UNIMPLEMENTED) counts as "not same", and no
+# healthy worker is "not same". The probed name carries a random per-client token, so it is never
+# used as a metric label (cardinality).
 function _gw_is_same_ipc_namespace(req::IsSameIPCNamespaceRequest, st::GatewayState)
     t0 = time()
-    workers = all_clients(st.pool)
+    workers, _ = _shm_targets(st)
     same = if isempty(workers)
         false
     else
