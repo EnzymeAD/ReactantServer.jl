@@ -269,10 +269,19 @@ triggers it), and when it lowers the objective by at least `hysteresis` of the t
 it, a floor against noise in the rate estimates. The change with the most net saving goes first, and
 a move beats a swap that saves the same, since it is one upload instead of two. There is no fixed
 number of changes per repack: it makes every change that pays and stops. `payback_seconds: 0` never
-moves a model for balance. With a settled fleet a repack changes nothing. A worker that misses the
-poll for less than 30 s (three probe rounds) keeps its models: the repack waits rather than moving
-them onto the rest of the fleet and back. (`max_worker_share` is accepted but does not affect a
-model's GPU count.)
+moves a model for balance. With a settled fleet a repack changes nothing. (`max_worker_share` is
+accepted but does not affect a model's GPU count.)
+
+When the set of healthy workers changes, the gateway repacks on the probe round that sees it, without
+waiting for the compute budget: a worker the probe finds not ready, unreachable or hung has left, and
+one it finds ready again (or sees for the first time) has joined once it answers the control-status
+poll. The placement each repack makes is computed for the workers that answered that repack's poll,
+and any later round whose answering workers differ repacks again (`trigger="membership"`). The repack
+places every model whose workers left on the workers that remain, so a single-replica model on a lost
+worker moves to a survivor, and caps each model's replica count by the workers present: a model with
+`replicas: 2` on a fleet down to one GPU runs on that one, and gets its second replica back at the
+repack the other's return triggers. A worker that answers its probe but misses the control-status
+poll counts as having left for that round.
 
 Without `forbid_memory_oversubscription` a worker may be placed more weights than its budget, and the
 overflow is priced by the uploads it causes. With it (the default), the budget is a hard limit on
@@ -289,11 +298,14 @@ RAM, never for a read from disk. A change whose read fails, is deferred (the wor
 holds this way at half its host weight budget) or takes longer than `stage_timeout_seconds` is
 dropped from that repack and planned again by the next one. A swap commits only when both of its
 models are staged, since half a swap could overfill a GPU. The prober keeps running while the reads
-do, and no other repack starts until they end.
+do, and no other repack starts until they end, except a membership repack: when the healthy workers
+change while moves are staging, the staged moves are abandoned uncommitted (a move may target the
+worker that left), and the repack plans again at once from the placement that was in force, which
+places any move still worth making again, primed as before.
 
-Repacks are driven by accumulated compute, not wall-clock: the gateway polls the workers every
-probe round and recomputes the placement once the fleet has consumed `rebalance_compute_seconds`
-GPU-seconds since the last repack. This compute is **cumulative across every GPU**: the gateway
+Apart from a change in the healthy workers, repacks are driven by accumulated compute, not
+wall-clock: the gateway polls the workers every probe round and recomputes the placement once the
+fleet has consumed `rebalance_compute_seconds` GPU-seconds since the last repack. This compute is **cumulative across every GPU**: the gateway
 sums each worker's consumed GPU-seconds, so a fleet of N busy GPUs accrues the budget about N
 times as fast as one (the accrual rate is the sum of the per-GPU utilizations). The budget is
 therefore in GPU-work, not real time, and the wall-clock gap between repacks shrinks as the fleet
@@ -305,7 +317,9 @@ placement quickly, then later repacks use the larger steady-state budget to limi
 (`0` means the first repack uses `rebalance_compute_seconds` like the rest). An idle fleet does
 not repack until traffic resumes. Gateway-driven compaction of worker memory follows placement
 changes; see [On-demand Weights](on_demand_weights.md) for `compaction_mode` and
-`compaction_interval`.
+`compaction_interval`. A membership repack resets the accumulated compute like any other repack (it
+folds that compute into the demand estimates) and, like an operator repack, does not use up the
+first-repack budget.
 
 #### The fill quantum
 
@@ -412,7 +426,8 @@ routed uniformly over its actual replicas with a warning until the fleet converg
 that the probe finds not ready, unreachable or hung gets none of its placed traffic: each request
 goes to the model's healthy placed replicas, chosen by the same fill rules over the healthy ones,
 or, when none of them is healthy, to any healthy worker that serves the model, and is answered
-`Unavailable` when there is none.
+`Unavailable` when there is none. The same probe round repacks the placement without that worker,
+and the round that finds it ready again repacks it back in (see [Moves and swaps](#Moves-and-swaps)).
 
 #### Observability
 
@@ -600,7 +615,8 @@ returning whether it reported ready.
 - Under `lpt_packing`, the gateway polls the workers on every 10s probe round to refresh routing
   metadata and accumulate consumed compute, but recomputes the placement only once the fleet has
   consumed `scheduling.rebalance_compute_seconds` GPU-seconds (the first repack uses
-  `scheduling.first_rebalance_compute_seconds` when set). Each repack logs a `lpt_packing: repack`
+  `scheduling.first_rebalance_compute_seconds` when set), or at once when the healthy workers
+  change. Each repack logs a `lpt_packing: repack`
   line with the number of models placed, how many `moved` workers and the weight bytes that
   move puts on their new workers (`moved_weights`), whether it was `incremental` (every repack
   after the startup placement), the `changes` it planned and how many are `staging`, the objective
@@ -609,9 +625,10 @@ returning whether it reported ready.
   `compute_seconds`/`wall_seconds` since the last repack, useful for watching placement churn and
   the trigger cadence. A repack that stages its moves then logs `staged placement changes
   committed` with how many it committed and dropped (also counted by
-  `gateway_repack_staged_changes_total{outcome}`). A repack that comes due while a placed worker is
-  missing from the poll logs `repack deferred` instead and runs once the worker answers or 30 s have
-  passed.
+  `gateway_repack_staged_changes_total{outcome}`). A change in the healthy workers logs `the healthy
+  workers changed; repacking now` with the workers that `left` and `joined` and whether staged moves
+  were abandoned, then repacks on that round (`gateway_repacks_total{trigger="membership"}`); staged
+  moves it abandons log `staged placement changes abandoned` when their reads end.
 - The gateway holds two connections to each worker: one for the health probes, discovery and the
   control-status poll, and one for everything else, inference, shared memory, the metadata RPCs,
   `CompactMemory` and `StageWeights` (`worker_client.max_concurrent_streams` calls at once on it).

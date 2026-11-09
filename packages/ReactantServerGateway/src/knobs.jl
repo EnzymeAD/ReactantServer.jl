@@ -235,7 +235,7 @@ struct RepackReport
     unix_seconds::Float64
     wall_elapsed::Float64
     compute_elapsed::Float64
-    trigger::Symbol               # :none | :startup | :compute | :operator
+    trigger::Symbol               # :none | :startup | :compute | :operator | :membership
     count::Int                    # repacks since start, including the startup placement
     models_placed::Int
     models_moved::Int

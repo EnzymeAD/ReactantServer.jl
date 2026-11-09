@@ -9,6 +9,10 @@
 # first, a shared-memory request that failed there was never moved, and a hung worker held requests
 # until their deadline.
 #
+# Under lpt_packing a change in the healthy workers also repacks on the round that sees it
+# (`trigger = :membership`), where before a repack waited for the compute budget and then for a
+# missing worker's 30 s grace.
+#
 # Reuses `MockWorker`, `_start_mock`, `_infer` (test_gateway.jl), `_retention_gateway`, `_rstatus`,
 # `_rurl` (test_route_retention.jl), `_sched_cfg` (test_scheduler.jl), and `AffMockWorker`,
 # `_aff_server`, `_aff_infer`, `_pk_state` (test_lpt_packing.jl).
@@ -301,6 +305,131 @@ end
         @test B.calls == b0
     finally
         B.hang = false
+        _HGW.stop!(gw)
+        close(sa)
+        close(sb)
+    end
+end
+
+# How many repacks `gateway_repacks_total` counts for `trigger`.
+function _hr_repacks(gw, trigger)
+    body = String(HTTP.get("http://127.0.0.1:$(_HGW.bound_ports(gw)[2])/metrics"; retry = false).body)
+    m = match(Regex("gateway_repacks_total\\{trigger=\"$trigger\"\\} (\\S+)"), body)
+    return m === nothing ? 0 : round(Int, parse(Float64, m.captures[1]))
+end
+
+@testset "lpt_packing: losing a worker repacks at once; its return repacks it back in" begin
+    A = AffMockWorker("workerA", ["m", "n"])
+    B = AffMockWorker("workerB", ["m", "n"])
+    sa = _aff_server(0, A); pa = grpc_start_ephemeral!(sa)
+    sb = _aff_server(0, B); pb = grpc_start_ephemeral!(sb)
+    ua, ub = "127.0.0.1:$pa", "127.0.0.1:$pb"
+    gw, aff = _hr_lpt_gateway([pa, pb])
+    try
+        port = _HGW.bound_ports(gw)[1]
+        _hr_place!(aff, ua, ub)
+        rep0 = @atomic aff.report
+        @test _aff_infer(port, "n").model_name == "workerB"
+
+        # B goes down. The next round repacks for it, with the compute budget nowhere near reached.
+        B.ready = false
+        _HGW._check_once(gw.prober)
+        rep = @atomic aff.report
+        @test rep.trigger === :membership
+        @test rep.count == rep0.count + 1
+        @test (@atomic aff.tick).active_threshold >= 1.0e9 && aff.compute_accum == 0.0
+        @test !aff.did_first_tick_repack                # the first-repack budget stays armed
+        @test _hr_repacks(gw, "membership") == 1
+        asn = @atomic aff.assignment
+        @test asn["n"] == [(ua, 1.0)]                   # the single replica moved to the survivor
+        @test asn["m"] == [(ua, 1.0)]                   # two replicas, capped by one worker present
+        @test all(pl -> all(wv -> first(wv) != ub, pl), values(asn))
+        b0 = B.calls
+        for _ in 1:6
+            @test _aff_infer(port, "n").model_name == "workerA"
+            @test _aff_infer(port, "m").model_name == "workerA"
+            @test _hr_call(port, _hr_shm_request("n")).model_name == "workerA"
+        end
+        @test B.calls == b0
+
+        # B is back. The round that sees it repacks again, and m gets its second replica (a move
+        # onto a worker that does not hold it is staged first, so wait for the commit).
+        B.ready = true
+        _HGW._check_once(gw.prober)
+        @test (@atomic aff.report).trigger === :membership
+        @test _hr_repacks(gw, "membership") == 2
+        @test timedwait(() -> aff.transition === nothing, 15) === :ok
+        @test sort(first.((@atomic aff.assignment)["m"])) == sort([ua, ub])
+        @test timedwait(() -> (_aff_infer(port, "m"); B.calls > b0), 15) === :ok
+        # Settled: a round with the same healthy workers repacks nothing.
+        n = (@atomic aff.report).count
+        _HGW._check_once(gw.prober)
+        @test (@atomic aff.report).count == n
+    finally
+        _HGW.stop!(gw)
+        close(sa)
+        close(sb)
+    end
+end
+
+@testset "lpt_packing: a worker lost while moves stage gets no request, and the placement converges" begin
+    models = ["hot", "warm", "cool"]
+    A = AffMockWorker("workerA", copy(models))
+    B = AffMockWorker("workerB", copy(models))
+    sa = _aff_server(0, A); pa = grpc_start_ephemeral!(sa)
+    sb = _aff_server(0, B); pb = grpc_start_ephemeral!(sb)
+    ua, ub = "127.0.0.1:$pa", "127.0.0.1:$pb"
+    gw, aff = _hr_lpt_gateway([pa, pb])
+    try
+        port = _HGW.bound_ports(gw)[1]
+        # hot and warm share A (0.9 busy) while B idles at 0.1, so a repack moves warm to B, staging
+        # its weights there first (as in test_lpt_packing.jl).
+        asn = Dict{String, GW.Placement}("hot" => [(ua, 1.0)], "warm" => [(ua, 1.0)], "cool" => [(ub, 1.0)])
+        @atomic aff.assignment = asn
+        GW._swap_outstanding!(aff, asn)
+        for (m, r) in ("hot" => 6.0, "warm" => 3.0, "cool" => 1.0)
+            aff.rate_ewma[m] = r
+            aff.cost_ewma[m] = 0.1
+        end
+        B.stage_delay = 3.0
+        GW._repack!(aff, GW.poll_workers(gw.pool, [ua, ub]), gw.metrics; trigger = :operator, pool = gw.pool)
+        staging = aff.transition
+        @test staging !== nothing
+        @test (@atomic aff.assignment)["warm"] == [(ua, 1.0)]   # not switched while it stages
+
+        # B goes down while warm stages there. The round repacks at once over A alone, abandoning the
+        # staged move rather than waiting for it.
+        B.ready = false
+        _HGW._check_once(gw.prober)
+        @test (@atomic aff.report).trigger === :membership
+        @test aff.transition === nothing
+        @test all(pl -> pl == [(ua, 1.0)], values(@atomic aff.assignment))
+        b0 = B.calls
+        for m in models
+            @test _aff_infer(port, m).model_name == "workerA"
+        end
+        # The abandoned staging ends (B answered its read) and commits nothing.
+        @test timedwait(() -> istaskdone(staging), 15) === :ok
+        @test all(pl -> pl == [(ua, 1.0)], values(@atomic aff.assignment))
+        @test aff.transition === nothing
+        for m in models, _ in 1:3
+            @test _aff_infer(port, m).model_name == "workerA"
+            @test _hr_call(port, _hr_shm_request(m)).model_name == "workerA"
+        end
+        @test B.calls == b0
+
+        # B is back: the placement converges over both workers, and stays put.
+        B.ready = true
+        B.stage_delay = 0.0
+        _HGW._check_once(gw.prober)
+        @test timedwait(() -> aff.transition === nothing, 15) === :ok
+        rep = @atomic aff.report
+        @test rep.trigger === :membership && rep.polled == sort([ua, ub]) && !rep.staging
+        @test any(pl -> any(wv -> first(wv) == ub, pl), values(@atomic aff.assignment))
+        n = rep.count
+        _HGW._check_once(gw.prober)
+        @test (@atomic aff.report).count == n
+    finally
         _HGW.stop!(gw)
         close(sa)
         close(sb)

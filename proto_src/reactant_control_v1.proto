@@ -320,7 +320,7 @@ message RepackStatus
   double last_repack_unix_seconds = 1;           // 0 = no repack yet
   double last_repack_wall_elapsed_seconds = 2;   // wall time the last repack covered
   double last_repack_compute_seconds = 3;        // fleet GPU-seconds the last repack consumed
-  string last_trigger = 4;                       // "startup" | "compute" | "operator"
+  string last_trigger = 4;                       // "startup" | "compute" | "operator" | "membership"
   int64 last_models_placed = 5;
   int64 last_models_moved = 6;
   uint64 repack_count = 7;                       // repacks since start, including the startup one

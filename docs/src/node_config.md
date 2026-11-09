@@ -184,7 +184,8 @@ validated deployment should use.
   until its new version is in. The loop shares a thread with request handling, so the worker's
   health probes stall for that time as well. Behind a gateway, a stall longer than the gateway's
   5 second probe deadline marks the worker down, and the gateway sends it no request until a later
-  probe finds it ready; `dynamic` is not a production mode, and this is not avoided. An
+  probe finds it ready; under `lpt_packing` its models are also repacked onto the other workers and
+  back again. `dynamic` is not a production mode, and this is not avoided. An
   executable-cache hit (`runtime.executable_cache`) keeps the pause short; an uncached compile
   takes 5 to 30 seconds per compiled program. A renamed
   directory is an unload of the old name and a load of the new one. A bundle whose files change
