@@ -24,13 +24,17 @@ that serves the model. On a multi-worker node it also serves the node's merged m
   workers, either uniformly (`round_robin`, the default) or by packing each model onto a fixed,
   operator-configured number of GPUs with coalescing-aware routing (`lpt_packing`); see
   [Scheduling modes](#Scheduling-modes) below. A third mode, `least_outstanding`, spreads by
-  live occupancy. Either way, a request fails over to the remaining replicas when a worker
-  returns `NotFound` or `Unavailable`, or the call to it fails in the transport; every other
-  status reaches the client as the worker sent it, and a request that uses shared memory is
+  live occupancy. Either way, a request fails over to the remaining healthy replicas when a
+  worker returns `NotFound` or `Unavailable`, or the call to it fails in the transport; every
+  other status reaches the client as the worker sent it, and a request that uses shared memory is
   never retried on another worker (see [Status codes and failover](#Status-codes-and-failover)).
 - **Readiness probe:** a background loop calls each worker's KServe `ServerReady` RPC; `/readyz`
   is ready when at least one worker reports ready. The probes have a connection to each worker of
   their own, so they never wait behind the inference queued at a busy worker.
+- **Healthy workers only:** a worker the probe finds not ready, unreachable, or hung (no answer
+  within the 5 s probe deadline) is marked down, and the gateway sends it no request, in any
+  scheduling mode, as a first choice or as a failover, until a later probe finds it ready. A model
+  that only down workers serve is answered `Unavailable` without calling any worker.
 - **Raw passthrough:** the `ModelInfer` hot path never decodes or re-marshals the protobuf body.
   The request and response types are `Vector{UInt8}` end to end (gRPCServer.jl and gRPCClient.jl
   support raw byte messages natively). To route, the gateway decodes a partial schema declaring
@@ -72,6 +76,14 @@ on few GPUs for deep coalescing batches and is the mode whose placement the gate
 Every setting in the block below except `mode` can also be changed while the gateway runs,
 through its own gRPC control plane; see
 [Runtime scheduling control](#Runtime-scheduling-control).
+
+Whatever the mode, a request is only ever sent to a worker the readiness probe currently finds
+healthy. Each mode chooses among a model's healthy replicas only, and its failover list holds only
+healthy replicas too; a worker marked down gets nothing until the probe round that finds it ready
+again, from which it is routable at once. A model whose workers are all down is answered
+`Unavailable` by the gateway itself. A worker can still receive requests in the window between
+failing and the next probe round (up to one probe interval, 10 s by default); those fail over as
+described in [Status codes and failover](#Status-codes-and-failover).
 
 ```yaml
 scheduling:
@@ -396,8 +408,11 @@ and you may see one such restart before it serves. Once all workers are up, a wr
 or differing model set is a hard error.
 
 Runtime drift after startup degrades gracefully: a model temporarily missing from some workers is
-routed uniformly over its actual replicas with a warning until the fleet converges, and a worker
-that drops out is excluded from placement, its traffic failing over to the remaining replicas.
+routed uniformly over its actual replicas with a warning until the fleet converges. A placed worker
+that the probe finds not ready, unreachable or hung gets none of its placed traffic: each request
+goes to the model's healthy placed replicas, chosen by the same fill rules over the healthy ones,
+or, when none of them is healthy, to any healthy worker that serves the model, and is answered
+`Unavailable` when there is none.
 
 #### Observability
 
@@ -479,8 +494,12 @@ installed.
 
 ## Status codes and failover
 
-The gateway forwards a worker's gRPC status to the client unchanged, and moves a request on to
-the next replica only when the worker it tried could not serve it:
+The gateway calls only workers the readiness probe currently finds healthy: the replica a request
+is sent to first and every replica it may fail over to. A model whose workers are all marked down
+is answered `UNAVAILABLE` (the workers that serve the model are not ready) without calling any
+worker, and a model no worker serves is `NOT_FOUND`. Otherwise the gateway forwards a worker's gRPC
+status to the client unchanged, and moves a request on to the next healthy replica only when the
+worker it tried could not serve it:
 
 | The worker call ended with | The gateway |
 | --- | --- |
@@ -569,12 +588,13 @@ returning whether it reported ready.
   once; a call that does not answer (it times out, is refused, or fails) changes nothing, and the
   worker keeps the routes it last reported. While the readiness probe (`ServerReady`, same 10s
   loop, which also drives `/readyz` and the `gateway_worker_ready` metric) finds a worker
-  unreachable or not ready, its own answers are not taken, and its models are routed to the ready
-  workers that serve them; a model that only workers in that state serve is still routed to them,
-  so its requests fail over or come back `Unavailable`, which clients retry, rather than
-  `NotFound`. A worker that stays out for `worker_client.route_retention_seconds` (default 600, the
-  time a restart takes to load and compile its models with room to spare; 0 drops its routes at its
-  first missed round) loses its routes, and a model nobody else serves becomes `NotFound`. A model
+  unreachable, hung or not ready, its own answers are not taken and no request is sent to it: its
+  models are routed to the ready workers that serve them, and a model that only workers in that
+  state serve is answered `Unavailable` by the gateway, without a worker call, which clients retry,
+  rather than `NotFound`. A worker that stays out for `worker_client.route_retention_seconds`
+  (default 600, the time a restart takes to load and compile its models with room to spare; 0 drops
+  its routes at its first missed round) loses its routes, and a model nobody else serves becomes
+  `NotFound`. A model
   no worker has ever reported is `NotFound` at once. Rebuilding the table keeps each model's
   round-robin position.
 - Under `lpt_packing`, the gateway polls the workers on every 10s probe round to refresh routing

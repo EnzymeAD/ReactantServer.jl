@@ -1201,18 +1201,28 @@ mutable struct AffMockWorker
     staged::Vector{Vector{String}}
     stage_state::String
     stage_delay::Float64
+    ready::Bool                 # what ServerReady reports
+    hang::Bool                  # while set, ServerReady and ModelInfer do not answer (a frozen worker)
+    calls::Int                  # ModelInfer calls that reached the worker, counted on arrival
 end
 AffMockWorker(name, models; discipline = "fifo", rows_per_request = 1, batch_at = ("IN", 1)) =
     AffMockWorker(
     name, models, discipline, Dict{String, Int}(), Dict{String, Float64}(),
-    Dict{String, Int}(), rows_per_request, batch_at, Vector{String}[], "staged", 0.0
+    Dict{String, Int}(), rows_per_request, batch_at, Vector{String}[], "staged", 0.0, true, false, 0
+)
+
+# Hold a call while the worker is frozen (at most a minute, so a test that forgets to clear it ends).
+_aff_hold(w) = (
+    t = time() + 60; while w.hang && time() < t
+        sleep(0.05)
+    end
 )
 
 function _aff_server(port::Integer, w::AffMockWorker)
     server = gRPCServer.GRPCServerHTTPJl("127.0.0.1", Int(port); context = w)
     GW.register_GRPCInferenceService!(
         server;
-        ServerReady = (ctx, req) -> AInf.ServerReadyResponse(; ready = true),
+        ServerReady = (ctx, req) -> (_aff_hold(ctx.payload); AInf.ServerReadyResponse(; ready = ctx.payload.ready)),
         RepositoryIndex = (ctx, req) -> AInf.RepositoryIndexResponse(;
             models = [
                 AInf.var"RepositoryIndexResponse.ModelIndex"(; name = m, version = "", state = "READY", reason = "")
@@ -1221,6 +1231,8 @@ function _aff_server(port::Integer, w::AffMockWorker)
         ),
         ModelInfer = (ctx, req) -> begin
             w = ctx.payload
+            w.calls += 1
+            _aff_hold(w)
             w.served[req.model_name] = get(w.served, req.model_name, 0) + 1
             w.rows[req.model_name] = get(w.rows, req.model_name, 0) + w.rows_per_request
             w.compute[req.model_name] = get(w.compute, req.model_name, 0.0) + 0.05

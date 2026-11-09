@@ -108,6 +108,13 @@ _server_exc(status::AbstractString, msg::AbstractString) =
 # another replica.
 _fails_over(status::AbstractString) = status == STATUS_NOT_FOUND || status == STATUS_UNAVAILABLE
 
+# The answer for a request whose model is served only by workers that are not ready: the gateway
+# sends nothing to a worker the prober has marked down, so the client hears UNAVAILABLE and retries.
+_no_ready_worker(model) = gRPCServer.GRPCError(
+    gRPCServer.StatusCode.UNAVAILABLE,
+    "model \"$model\" is unavailable: the workers that serve it are not ready"
+)
+
 _is_cancelled(cancelled) = cancelled !== nothing && (
     try
         cancelled() === true
@@ -186,11 +193,15 @@ end
 # failed it may still be running it (an abandoned or reset call is not a stopped one), and a second
 # worker writing the same output slot, or reading an input slot the client has since reused, would
 # corrupt the client's data. Its failure reaches the client as UNAVAILABLE, the client's cue to retry.
+#
+# A replica marked down after the scheduler chose it (the prober's round landed in between) is
+# skipped: no request is sent to a worker marked down, as a first choice or as a failover.
 function _try_replicas(st::GatewayState, urls, model, id, body, deadline_ns::Int64, cancelled = nothing)
     last_status = STATUS_UNAVAILABLE
-    last_exc = gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, "no replica available")
+    last_exc = _no_ready_worker(model)
     shm = nothing           # read from the body only once a worker has failed the request
     for url in urls
+        is_healthy(st.routes, url) || continue
         resp, status, exc = _post_infer(st, url, model, id, body, deadline_ns, cancelled)
         exc === nothing && return resp, status, nothing
         status == STATUS_NOT_FOUND && request_refresh!(st.refresher)
@@ -207,9 +218,11 @@ end
 
 function _dispatch_infer(st::GatewayState, model, id, body, deadline_ns::Int64, cancelled = nothing)
     # Ask the scheduler which replicas to try (urls[1] is its choice; the rest are failover order)
-    # and for an opaque reservation to release once the request completes. `nothing` means the
-    # scheduler has no route for the model: it may have just been loaded on a worker, so refresh the
-    # routing table on demand (single-flight, rate-limited) and re-select before giving up.
+    # and for an opaque reservation to release once the request completes. Every URL it returns is a
+    # worker that is not marked down. `nothing` means the scheduler has no route for the model: it
+    # may have just been loaded on a worker, so refresh the routing table on demand (single-flight,
+    # rate-limited) and re-select before giving up. An empty list means the model is known but no
+    # worker that serves it is ready.
     # How much work this request is, per the scheduler (a no-op for the modes that route by request
     # count). Resolved once here rather than per selection attempt.
     ctx = ScheduleContext(
@@ -227,6 +240,14 @@ function _dispatch_infer(st::GatewayState, model, id, body, deadline_ns::Int64, 
             gRPCServer.GRPCError(gRPCServer.StatusCode.NOT_FOUND, "model \"$model\" not found on any worker")
     end
     urls, reservation = sel
+    # A known model whose workers are all down: answered without calling any of them. UNAVAILABLE,
+    # because the model exists and the client should retry once a worker is back. A known model
+    # skips the refresh above: a discovery scan never changes which workers are down.
+    if isempty(urls)
+        release!(st.scheduler, reservation)
+        @info "infer: no ready worker serves the model" model request_id = id
+        return nothing, STATUS_UNAVAILABLE, _no_ready_worker(model)
+    end
     # Release the reservation exactly once, on every path (success, retryable error, hard error, or
     # timeout), so a scheduler's outstanding counters never leak.
     try

@@ -40,6 +40,11 @@ and return them with an opaque, scheduler-specific reservation to hand back to [
 when the request completes (or `nothing` if the scheduler tracks nothing). Return `nothing` when the
 scheduler has no route for the model; the caller refreshes the routing table once and re-selects
 before giving up. Required for every scheduler.
+
+Every URL returned must be a worker the routing table does not mark down (`is_healthy`), the first
+choice and every failover alike: the gateway never sends a request to a worker that is not ready.
+A model that is known but has no healthy worker returns an empty list, which the caller answers
+UNAVAILABLE without calling any worker.
 """
 function select_replicas end
 
@@ -196,7 +201,8 @@ end
 # --- round_robin ------------------------------------------------------------------------------
 
 # Stateless: the round-robin cursor lives in the discovered routing table (see routing.jl), so this
-# scheduler just delegates to `pick`, which rotates the replicas and returns them in failover order.
+# scheduler just delegates to `pick`, which rotates the healthy replicas and returns them in failover
+# order (empty when every worker that serves the model is down).
 struct RoundRobinScheduler <: GatewayScheduler end
 
 function select_replicas(::RoundRobinScheduler, ctx::ScheduleContext)
@@ -283,8 +289,9 @@ function _inflight_counter!(s::LeastOutstandingScheduler, url::AbstractString)
 end
 
 function select_replicas(s::LeastOutstandingScheduler, ctx::ScheduleContext)
-    urls = pick(ctx.routes, ctx.model)
+    urls = pick(ctx.routes, ctx.model)            # healthy replicas only
     urls === nothing && return nothing
+    isempty(urls) && return (urls, nothing)       # known, but no worker that serves it is ready
     counters = [_inflight_counter!(s, u) for u in urls]
     best = 1
     for i in 2:length(urls)

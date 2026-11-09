@@ -172,9 +172,18 @@ mutable struct MockWorker
     fail_code::Any              # reject ModelInfer with this gRPCServer.StatusCode, or nothing
     index::Symbol               # RepositoryIndex: :ok, :down (UNAVAILABLE), :slow (answers after 7 s)
     ready::Bool                 # what ServerReady reports
+    hang::Bool                  # while set, ServerReady and ModelInfer do not answer (a frozen worker)
 end
 MockWorker(name, models, fail_infer, fail_shm, fail_exhausted) =
-    MockWorker(name, models, fail_infer, fail_shm, fail_exhausted, false, String[], :ok, false, 0, nothing, :ok, true)
+    MockWorker(name, models, fail_infer, fail_shm, fail_exhausted, false, String[], :ok, false, 0, nothing, :ok, true, false)
+
+# A frozen worker: hold the call while `hang` is set (at most a minute, so a test that forgets to
+# clear it still ends).
+_mock_hold(w) = (
+    t = time() + 60; while w.hang && time() < t
+        sleep(0.05)
+    end
+)
 
 # The metadata RPCs' failure modes, and whether the mock serves `name` at all.
 function _mock_metadata_check(w::MockWorker)
@@ -195,7 +204,7 @@ function _mock_server(worker::MockWorker; port::Integer = 0)
     server.port = port   # 0: OS-assigned ephemeral port; HTTP.port(server) reports it after start!
     ReactantServerGateway.register_GRPCInferenceService!(
         server;
-        ServerReady = (ctx, req) -> GWInf.ServerReadyResponse(; ready = ctx.payload.ready),
+        ServerReady = (ctx, req) -> (_mock_hold(ctx.payload); GWInf.ServerReadyResponse(; ready = ctx.payload.ready)),
         RepositoryIndex = (ctx, req) -> begin
             w = ctx.payload
             w.index === :down && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, "mock $(w.name) index down"))
@@ -210,6 +219,7 @@ function _mock_server(worker::MockWorker; port::Integer = 0)
         ModelInfer = (ctx, req) -> begin
             w = ctx.payload
             w.infer_calls += 1
+            _mock_hold(w)
             w.fail_infer && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, "mock $(w.name) down"))
             w.fail_invalid && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.INVALID_ARGUMENT, "requested output 'x' is not produced by the model"))
             w.fail_exhausted && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.RESOURCE_EXHAUSTED, "mock $(w.name) at capacity"))

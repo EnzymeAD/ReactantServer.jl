@@ -179,10 +179,14 @@ function _check_once(p::HealthProber)
     # round_robin fleet at exactly one probe round-trip per worker as before.
     #
     # Scheduler tick: lpt_packing folds the poll to refresh routing metadata and accumulate consumed
-    # compute, repacking only once the fleet has consumed the configured compute budget (other
-    # schedulers are no-ops). Placement is computed over the workers that reported ready this round;
-    # a dead worker drops out until it recovers.
-    ready_urls = String[wc.url for (i, wc) in enumerate(workers) if results[i]]
+    # compute, repacking once the fleet has consumed the configured compute budget or the set of
+    # healthy workers changed (other schedulers are no-ops). Placement is computed over the healthy
+    # workers, read from the routing table's record of who is down, the one the request path reads,
+    # so the two never disagree; a dead worker drops out until it recovers.
+    ready_urls = String[
+        wc.url for (i, wc) in enumerate(workers)
+            if (p.routes === nothing ? results[i] : is_healthy(p.routes, wc.url))
+    ]
     if !isempty(ready_urls)
         try
             poll = nothing

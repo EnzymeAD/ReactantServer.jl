@@ -1336,12 +1336,19 @@ function _reserve_on!(out_snap, routed_snap, wload_snap, model, w, weight, units
 end
 
 """
-    route_replica(s, model) -> Union{Nothing, Tuple{Vector{String}, Counters}}
+    route_replica(s, model, units = 1; down = nothing) -> Union{Nothing, Tuple{Vector{String}, Counters}}
 
 Order a model's replicas for dispatch and reserve the chosen one. Returns `nothing` when the model
 has no placement yet (cold or unknown); the caller falls back to round robin. Otherwise returns the
 ordered replica URLs (the chosen worker first, the rest as failover) and `Counters`, the reserved
 counters to release when the request completes.
+
+`down` is the set of workers marked down (the routing table's, read once per request with the
+routes). A placed worker in it is never returned: the fill logic below chooses among the healthy
+replicas only, while every index, the run's `target` and `cursor` included, stays an index into the
+full placement, so the run and its counters remain valid as workers leave and return between
+repacks. With no healthy replica the result is an empty list (and no reservation), and the caller
+falls back to the healthy replicas the routing table knows.
 
 The model's `fill_mode` (see [`FillPlan`](@ref)) decides what the quantum `Q` counts, and
 `routing_policy` decides which replica a fresh run opens on:
@@ -1374,11 +1381,15 @@ sees load from all models. The reservation (atomic increments under the per-mode
 selection lock for multi-replica models) makes concurrent selections see the choice, so requests do
 not stampede onto the same replica.
 """
-function route_replica(s::LptPackingState, model::AbstractString, units::Integer = 1)
+function route_replica(
+        s::LptPackingState, model::AbstractString, units::Integer = 1;
+        down::Union{Nothing, AbstractSet{String}} = nothing
+    )
     placement = get(@atomic(s.assignment), model, nothing)
     placement === nothing && return nothing
     n = length(placement)
     n == 0 && return nothing
+    up(w) = down === nothing || !(w in down)
 
     out_snap = @atomic s.outstanding
     routed_snap = @atomic s.routed
@@ -1394,12 +1405,16 @@ function route_replica(s::LptPackingState, model::AbstractString, units::Integer
 
     if n == 1
         w = placement[1][1]
+        up(w) || return (String[], nothing)
         return (String[w], _reserve_on!(out_snap, routed_snap, wload_snap, model, w, weight, units))
     end
 
     workers = String[p[1] for p in placement]
+    # The healthy replicas, as indices into the placement. Every choice below is made among these.
+    live = Int[i for i in 1:n if up(workers[i])]
+    isempty(live) && return (String[], nothing)
     lk = get(@atomic(s.sel_locks), model, nothing)
-    lk === nothing && return (workers, nothing)   # mid-repack drift: route in order, untracked
+    lk === nothing && return (workers[live], nothing)   # mid-repack drift: route in order, untracked
     policy = k.routing_policy
     Q = plan.quantum
     all_runs = @atomic s.fill_runs
@@ -1407,13 +1422,13 @@ function route_replica(s::LptPackingState, model::AbstractString, units::Integer
     res = lock(lk) do
         cobjs = Vector{Threads.Atomic{Int}}(undef, n)
         outs = Vector{Int}(undef, n)
-        total = 0
+        total = 0                                 # in flight on the healthy replicas
         for i in 1:n
             a = get(out_snap, (model, workers[i]), nothing)
             a === nothing && return nothing       # snapshot drift: bail to untracked routing
             cobjs[i] = a
             outs[i] = a[]
-            total += outs[i]
+            i in live && (total += outs[i])
         end
         # Mid-repack drift: decide with a throwaway record rather than skipping the fill logic, so a
         # request between the swap and the next tick still routes sanely (it just does not persist).
@@ -1429,20 +1444,21 @@ function route_replica(s::LptPackingState, model::AbstractString, units::Integer
         if plan.mode === :spread
             # All replicas serve the model at once; ties go to the policy so an idle set still rotates.
             chosen = policy === :fill_least ?
-                argmin(i -> (outs[i], wload_of(i), rot(i)), 1:n) :
-                argmin(i -> (outs[i], rot(i)), 1:n)
+                argmin(i -> (outs[i], wload_of(i), rot(i)), live) :
+                argmin(i -> (outs[i], rot(i)), live)
             run.cursor = mod(chosen, n)
             run.target = chosen
             run.units = units
         elseif plan.mode === :run
             # `behind` is the backpressure guard: a replica a whole quantum deeper than the
-            # least-backed-up one can neither keep nor open a run.
-            floor_q = minimum(fld(outs[i], Q) for i in 1:n)
+            # least-backed-up one can neither keep nor open a run. A run whose replica is down ends.
+            floor_q = minimum(fld(outs[i], Q) for i in live)
             behind(i) = fld(outs[i], Q) > floor_q
-            if run.target < 1 || run.target > n || run.units >= Q || behind(run.target) || total == 0
+            if run.target < 1 || run.target > n || !up(workers[run.target]) || run.units >= Q ||
+                    behind(run.target) || total == 0
                 chosen = policy === :fill_least ?
-                    argmin(i -> (behind(i), wload_of(i), rot(i)), 1:n) :
-                    argmin(i -> (behind(i), rot(i)), 1:n)
+                    argmin(i -> (behind(i), wload_of(i), rot(i)), live) :
+                    argmin(i -> (behind(i), rot(i)), live)
                 run.cursor = mod(chosen, n)
                 run.target = chosen
                 run.units = units
@@ -1458,14 +1474,14 @@ function route_replica(s::LptPackingState, model::AbstractString, units::Integer
             # what keeps a mid-fill replica winning until it holds a full quantum.
             prog(i) = (fld(outs[i], Q), -outs[i])
             if policy === :fill_least
-                chosen = argmin(i -> (prog(i), wload_of(i), rot(i)), 1:n)
+                chosen = argmin(i -> (prog(i), wload_of(i), rot(i)), live)
             else
-                chosen = argmin(i -> (prog(i), rot(i)), 1:n)
+                chosen = argmin(i -> (prog(i), rot(i)), live)
             end
             # The cursor advances only on a genuine batch start (more than one replica tied at the
             # best progress), so a lone mid-fill winner keeps concentrating.
             best = prog(chosen)
-            count(i -> prog(i) == best, 1:n) > 1 && (run.cursor = mod(chosen, n))
+            count(i -> prog(i) == best, live) > 1 && (run.cursor = mod(chosen, n))
             run.target = chosen
             run.units = units
         end
@@ -1475,13 +1491,12 @@ function route_replica(s::LptPackingState, model::AbstractString, units::Integer
         wload === nothing || Threads.atomic_add!(wload, weight)
         rtd = get(routed_snap, (model, workers[chosen]), nothing)
         rtd === nothing || Threads.atomic_add!(rtd, 1)
-        # Chosen first, then least-backed-up, as the failover order.
-        order = collect(1:n)
-        sort!(order; by = i -> (i == chosen ? 0 : 1, fld(outs[i], Q), outs[i], workers[i]))
+        # Chosen first, then the other healthy replicas least-backed-up first, as the failover order.
+        order = sort(live; by = i -> (i == chosen ? 0 : 1, fld(outs[i], Q), outs[i], workers[i]))
         ordered = String[workers[i] for i in order]
         return (ordered, cobjs[chosen], wload)
     end
-    res === nothing && return (workers, nothing)
+    res === nothing && return (workers[live], nothing)
     ordered, mwc, wload = res
     return (ordered, (mwc, wload, weight, units))
 end
@@ -1556,19 +1571,22 @@ function _warn_inflight_fill(k::PackingKnobs)
     return nothing
 end
 
-# Route to the placement replica that fills its batch first (route_replica reserves it), the rest of
-# the placement following as failover, then any discovered replicas outside the placement as a
-# last resort so a concentrated model survives its worker dying between repacks. A model without a
-# placement yet (cold, or new since the last repack) falls back to round robin over discovered routes.
+# Route to the healthy placement replica that fills its batch first (route_replica reserves it), the
+# rest of the healthy placement following as failover, then any healthy discovered replicas outside
+# the placement as a last resort, so a concentrated model is still served when its placed workers
+# are down until the repack that their leaving triggers. A model without a placement yet (cold, or
+# new since the last repack) falls back to round robin over the healthy discovered routes. The
+# routes and the down set come from one read of the routing table, so the placement is filtered by
+# the same verdict the routes were built from.
 function select_replicas(s::LptPackingState, ctx::ScheduleContext)
-    routed = route_replica(s, ctx.model, ctx.units)
+    t = current_table(ctx.routes)
+    routed = route_replica(s, ctx.model, ctx.units; down = t.down)
+    rr = pick(t, ctx.model)
     if routed === nothing
-        urls = pick(ctx.routes, ctx.model)
-        urls === nothing && return nothing
-        return (urls, nothing)
+        rr === nothing && return nothing
+        return (rr, nothing)
     end
     urls, counters = routed
-    rr = pick(ctx.routes, ctx.model)
     if rr !== nothing
         extra = String[u for u in rr if !(u in urls)]
         isempty(extra) || (urls = vcat(urls, extra))

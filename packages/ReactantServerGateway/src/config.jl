@@ -174,11 +174,11 @@ struct GatewayConfig
     # reach and the inbound admission cap is what bounds a resetting client.
     rapid_reset_protection::Bool
     # How long a worker that stops answering, or reports not ready, keeps the routes it last reported
-    # (`worker_client.route_retention_seconds`, default 600). Meanwhile a model that only such
-    # workers serve is still routed to them, so its requests fail over or come back UNAVAILABLE,
-    # which clients retry, rather than NOT_FOUND, which they do not; a model a ready worker serves
-    # goes to the ready ones. After it, a model nobody else serves is NOT_FOUND. 0 forgets a worker's
-    # routes at the first round it is not ready. See `DiscoveredRoutes`.
+    # (`worker_client.route_retention_seconds`, default 600). No request is sent to such a worker;
+    # meanwhile a model that only such workers serve is answered UNAVAILABLE without calling any
+    # worker, which clients retry, rather than NOT_FOUND, which they do not; a model a ready worker
+    # serves goes to the ready ones. After it, a model nobody else serves is NOT_FOUND. 0 forgets a
+    # worker's routes at the first round it is not ready. See `DiscoveredRoutes`.
     route_retention_seconds::Float64
 end
 

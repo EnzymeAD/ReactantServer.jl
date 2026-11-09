@@ -182,8 +182,11 @@ validated deployment should use.
   them into place. A load or reload compiles the bundle on the worker's dispatch loop, so every
   other model on that worker pauses until the compile ends, and a reloaded model answers `NOT_FOUND`
   until its new version is in. The loop shares a thread with request handling, so the worker's
-  health probes stall for that time as well. An executable-cache hit (`runtime.executable_cache`)
-  keeps the pause short; an uncached compile takes 5 to 30 seconds per compiled program. A renamed
+  health probes stall for that time as well. Behind a gateway, a stall longer than the gateway's
+  5 second probe deadline marks the worker down, and the gateway sends it no request until a later
+  probe finds it ready; `dynamic` is not a production mode, and this is not avoided. An
+  executable-cache hit (`runtime.executable_cache`) keeps the pause short; an uncached compile
+  takes 5 to 30 seconds per compiled program. A renamed
   directory is an unload of the old name and a load of the new one. A bundle whose files change
   while it loads is not admitted: the next poll loads it again from the files as they are then.
 - `static` loads the startup set once and never changes it.
