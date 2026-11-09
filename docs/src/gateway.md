@@ -671,7 +671,10 @@ returning whether it reported ready.
   the worker. The gateway logs a warning each time.
 - Successful `ModelInfer` requests are not logged (to keep the hot path quiet); worker errors and
   a model with no live replica are logged, and per-request latency and gRPC status are exported
-  as Prometheus metrics. Logs contain no tensor data.
+  as Prometheus metrics. Logs contain no tensor data. A request for a model whose workers are all
+  marked down logs `no ready worker serves the model` at info once per model per outage, and at
+  debug for every later request until a worker that serves it is ready again; a new outage logs at
+  info again.
 - Clients choose the names they send, so they never become metric labels as sent. The `model`
   label of `gateway_requests_total` and `gateway_request_latency_seconds` for `ModelInfer` is the
   model's name only while the routing table holds it; every other name (one no worker serves, an

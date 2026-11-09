@@ -724,3 +724,36 @@ end
         close(sb)
     end
 end
+
+# --- The held-model log ------------------------------------------------------------------------
+
+@testset "a held model's UNAVAILABLE logs at info once per outage, then at debug" begin
+    a = "127.0.0.1:7001"
+    pool = GW.ClientPool(_sched_cfg("round_robin"))
+    routes = GW.DiscoveredRoutes()
+    metrics = GW.GatewayMetrics()
+    refresher = GW.RouteRefresher(pool, routes, metrics)
+    st = GW.GatewayState(pool, routes, GW.RegisterGate(), metrics, refresher, GW.RoundRobinScheduler())
+    dispatch() = GW._dispatch_infer(st, "m", "id", UInt8[], Int64(0))
+    # The levels of the held-model lines `f` logs.
+    function levels(f)
+        logger = Test.TestLogger(; min_level = Logging.Debug)
+        Logging.with_logger(f, logger)
+        return [l.level for l in logger.logs if occursin("no ready worker serves the model", string(l.message))]
+    end
+    try
+        GW.record_answers!(routes, Dict(a => ["m"]))
+        GW.note_worker_ready!(routes, a, false)              # an outage starts: m is held
+        @test levels(() -> foreach(_ -> @test(dispatch()[2] == GW.STATUS_UNAVAILABLE), 1:3)) ==
+            [Logging.Info, Logging.Debug, Logging.Debug]
+        # Table rebuilds during the outage keep it reported: still debug.
+        GW.record_answers!(routes, Dict(a => nothing))
+        @test levels(dispatch) == [Logging.Debug]
+        # The outage ends and a new one starts: info again, once.
+        GW.note_worker_ready!(routes, a, true)
+        GW.note_worker_ready!(routes, a, false)
+        @test levels(() -> (dispatch(); dispatch())) == [Logging.Info, Logging.Debug]
+    finally
+        GW.close_pool!(pool)
+    end
+end

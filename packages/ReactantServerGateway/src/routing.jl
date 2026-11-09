@@ -15,15 +15,23 @@ mutable struct RouteEntry
     next::Threads.Atomic{UInt64}
 end
 
+# A held model: the down workers that serve it, and whether a request has been answered for it
+# (and logged at info) during this outage. The flag lives as long as the model stays held, carried
+# across rebuilds like a route's cursor, so a new outage starts with a fresh one.
+struct HeldEntry
+    urls::Vector{String}
+    answered::Threads.Atomic{Bool}
+end
+
 struct RoutingTable
     routes::Dict{String, RouteEntry}      # model -> the healthy workers that serve it
-    held::Dict{String, Vector{String}}    # model -> its workers, for a model only down workers serve
+    held::Dict{String, HeldEntry}         # model -> its workers, for a model only down workers serve
     down::Set{String}                     # the workers marked down (see `note_worker_ready!`)
 end
 
 # `prev`, when given, is the table this one replaces: a model it also routes keeps its round-robin
 # cursor (the same atomic), so a rebuild every probe round does not send every model's next request
-# to its first replica again (GW-20).
+# to its first replica again (GW-20), and a model it also holds keeps its outage flag.
 function RoutingTable(
         routes::AbstractDict; prev::Union{RoutingTable, Nothing} = nothing,
         held::AbstractDict = Dict{String, Vector{String}}(), down = Set{String}()
@@ -34,8 +42,28 @@ function RoutingTable(
         old = prev === nothing ? nothing : get(prev.routes, model, nothing)
         d[String(model)] = RouteEntry(cp, old === nothing ? Threads.Atomic{UInt64}(0) : old.next)
     end
-    h = Dict{String, Vector{String}}(String(m) => sort(String[String(u) for u in urls]) for (m, urls) in held)
+    h = Dict{String, HeldEntry}()
+    for (model, urls) in held
+        old = prev === nothing ? nothing : get(prev.held, model, nothing)
+        h[String(model)] = HeldEntry(
+            sort(String[String(u) for u in urls]), old === nothing ? Threads.Atomic{Bool}(false) : old.answered
+        )
+    end
     return RoutingTable(d, h, Set{String}(String(u) for u in down))
+end
+
+"""
+    first_held_answer!(table, model) -> Bool
+
+Whether this is the first request answered for the held `model` during its current outage, marking
+it answered. False for every later request of the outage, and for a model that is not held. The
+gateway logs the first at info and the rest at debug, so an outage is reported once per model
+without a line per request.
+"""
+function first_held_answer!(t::RoutingTable, model::AbstractString)
+    e = get(t.held, model, nothing)
+    e === nothing && return false
+    return !Threads.atomic_xchg!(e.answered, true)
 end
 
 """
@@ -186,6 +214,7 @@ function rebuild_table!(d::DiscoveredRoutes, now::Real = time())
 end
 
 pick(d::DiscoveredRoutes, model::AbstractString) = pick(current_table(d), model)
+first_held_answer!(d::DiscoveredRoutes, model::AbstractString) = first_held_answer!(current_table(d), model)
 nmodels(d::DiscoveredRoutes) = nmodels(current_table(d))
 has_model(d::DiscoveredRoutes, model::AbstractString) = has_model(current_table(d), model)
 replicas(d::DiscoveredRoutes, model::AbstractString) = replicas(current_table(d), model)

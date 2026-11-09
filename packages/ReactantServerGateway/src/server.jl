@@ -262,10 +262,18 @@ function _dispatch_infer(st::GatewayState, model, id, body, deadline_ns::Int64, 
     urls, reservation = sel
     # A known model whose workers are all down: answered without calling any of them. UNAVAILABLE,
     # because the model exists and the client should retry once a worker is back. A known model
-    # skips the refresh above: a discovery scan never changes which workers are down.
+    # skips the refresh above: a discovery scan never changes which workers are down. Logged at info
+    # for the first request of each model's outage (the routing table holds a flag per held model,
+    # fresh for each outage) and at debug for every later one, so an outage under load is one line
+    # per model, not one per request. A model the table does not hold (an lpt_packing placement
+    # discovery never saw) logs at debug.
     if isempty(urls)
         release!(st.scheduler, reservation)
-        @info "infer: no ready worker serves the model" model request_id = id
+        if first_held_answer!(st.routes, model)
+            @info "infer: no ready worker serves the model; the workers that serve it are not ready (further requests for it during this outage log at debug)" model request_id = id
+        else
+            @debug "infer: no ready worker serves the model; the workers that serve it are not ready" model request_id = id
+        end
         return nothing, STATUS_UNAVAILABLE, _no_ready_worker(model)
     end
     # Release the reservation exactly once, on every path (success, retryable error, hard error, or
