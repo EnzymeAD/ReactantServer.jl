@@ -324,6 +324,121 @@ import InterProcessCommunication as IPC
     end
 end
 
+# Decode `msg` against `reg`, returning the error it throws instead of raising it.
+_c7_decode(msg, reg) = try
+    ReactantServer.decode_infer_request(msg, reg)
+catch e
+    e
+end
+# Bytes allocated by one decode of `msg`, measured after a first call has compiled it.
+_c7_alloc(msg, reg) = (_c7_decode(msg, reg); @allocated _c7_decode(msg, reg))
+
+@testset "a shared-memory tensor's byte size is checked before the region is touched (CORE-7)" begin
+    sp(s) = _Inf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:string_param, String(s)))
+    ip(i) = _Inf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:int64_param, Int64(i)))
+    shmp(bsize; off = 0) = Dict(
+        "shared_memory_region" => sp("r"), "shared_memory_offset" => ip(off), "shared_memory_byte_size" => ip(bsize)
+    )
+    inmsg(shape, params) = _Inf.ModelInferRequest(;
+        model_name = "m",
+        inputs = [_Inf.var"ModelInferRequest.InferInputTensor"(; name = "x", datatype = "FP32", shape = Int64.(shape), parameters = params)]
+    )
+
+    # A registered window of 1 MiB whose pages do not exist yet. Page allocation is recorded instead
+    # of done; a read still faults in the pages it reads, so the reads below are kept small.
+    n = 1 << 20
+    key = string("/rsc7-", string(getpid(); base = 36), "-", string(rand(UInt32); base = 36))
+    shm = IPC.SharedMemory(key, n)
+    reg = ReactantServer.SharedMemoryRegistry(; reap_interval = 0)
+    old = ReactantServer._SHM_FALLOCATE[]
+    asked = Tuple{Int, Int}[]
+    try
+        ReactantServer._SHM_FALLOCATE[] = (fd, off, len) -> (push!(asked, (Int(off), Int(len))); 0)
+        ReactantServer.shm_register!(reg, "r", key, 0, n)
+
+        # Four FP32 values are 16 bytes. A byte size naming the whole window used to be read in full
+        # (a buffer of the window's size, every page of it asked for, then faulted in by the read)
+        # before the request was refused. It is refused first, touching nothing.
+        bad = inmsg([4], shmp(n))
+        err = _c7_decode(bad, reg)
+        @test err isa ErrorException && occursin("is $n bytes, but shape [4] of FP32 needs 16", err.msg)
+        @test isempty(asked)
+        Sys.islinux() && @test stat("/dev/shm" * key).blocks == 0
+        @test _c7_alloc(bad, reg) < n ÷ 8
+        # The same for a byte size short of the shape, and for shapes no byte size can match.
+        for (shape, bsize) in (([4], 8), ([n], n ÷ 2), ([2^62, 2^62], n), ([-4], n))
+            @test _c7_decode(inmsg(shape, shmp(bsize)), reg) isa ErrorException
+        end
+        @test isempty(asked)
+
+        # A byte size that matches is read straight into the tensor: one copy out of the region, so
+        # a 256 KiB tensor costs about 256 KiB (it used to cost twice that: a byte buffer, then the
+        # tensor).
+        bytes = unsafe_wrap(Array, convert(Ptr{UInt8}, pointer(shm)), n; own = false)
+        copyto!(bytes, 17, reinterpret(UInt8, Float32[1, 2, 3, 4]), 1, 16)
+        x = _c7_decode(inmsg([4], shmp(16; off = 16)), reg).request.inputs[1].data
+        @test x == Float32[1, 2, 3, 4] && x isa Vector{Float32}
+        @test (16, 16) in asked                         # only the tensor's own bytes need pages
+        m = _c7_decode(inmsg([2, 3], shmp(24)), reg).request.inputs[1].data
+        @test size(m) == (3, 2) && m isa Matrix{Float32}   # Julia shape: the wire shape reversed
+        big = inmsg([1 << 16], shmp(1 << 18))
+        @test length(_c7_decode(big, reg).request.inputs[1].data) == 1 << 16
+        @test _c7_alloc(big, reg) < (3 << 18) ÷ 2
+
+        # A shared-memory output whose window lies outside the registered region is refused at
+        # decode, before the model runs, rather than when its result is written.
+        outmsg(off, bsize) = _Inf.ModelInferRequest(;
+            model_name = "m",
+            inputs = [_Inf.var"ModelInferRequest.InferInputTensor"(; name = "x", datatype = "FP32", shape = Int64[1])],
+            outputs = [_Inf.var"ModelInferRequest.InferRequestedOutputTensor"(; name = "y", parameters = shmp(bsize; off))],
+            raw_input_contents = [collect(reinterpret(UInt8, Float32[1]))]
+        )
+        @test _c7_decode(outmsg(n - 16, 16), reg) isa ReactantServer.DecodedRequest
+        for (off, bsize) in ((n - 8, 16), (0, n + 1), (n + 1, 0), (typemax(Int64), 16))
+            err = _c7_decode(outmsg(off, bsize), reg)
+            @test err isa ArgumentError && occursin("out of bounds", err.msg)
+        end
+    finally
+        ReactantServer._SHM_FALLOCATE[] = old
+        ReactantServer.shm_teardown!(reg)
+        finalize(shm)
+    end
+end
+
+@testset "a request naming an input or a requested output twice is refused (WRK-11)" begin
+    t(name; params = Dict{String, _Inf.InferParameter}()) =
+        _Inf.var"ModelInferRequest.InferInputTensor"(; name, datatype = "FP32", shape = Int64[1], parameters = params)
+    o(name) = _Inf.var"ModelInferRequest.InferRequestedOutputTensor"(; name)
+    raw(v) = collect(reinterpret(UInt8, Float32[v]))
+    msg(inputs, outputs = _Inf.var"ModelInferRequest.InferRequestedOutputTensor"[]; raws = [raw(i) for i in eachindex(inputs)]) =
+        _Inf.ModelInferRequest(; model_name = "m", inputs, outputs, raw_input_contents = raws)
+    refused(m, needle) = try
+        ReactantServer.decode_infer_request(m)
+        false
+    catch e
+        e isa ErrorException && occursin(needle, e.msg)
+    end
+
+    @test refused(msg([t("x"), t("x")]), "input 'x' appears more than once")
+    @test refused(msg([t("a"), t("x"), t("a")]), "input 'a' appears more than once")
+    @test refused(msg([t("x")], [o("y"), o("y")]), "requested output 'y' appears more than once")
+    ok = ReactantServer.decode_infer_request(msg([t("a"), t("b")], [o("y"), o("z")])).request
+    @test [i.name for i in ok.inputs] == ["a", "b"] && ok.requested_outputs == ["y", "z"]
+
+    # Refused before any tensor is read: two shared-memory inputs naming a region nobody registered
+    # fail as duplicates, not as an unregistered region.
+    sp(s) = _Inf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:string_param, String(s)))
+    ip(i) = _Inf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:int64_param, Int64(i)))
+    shmp = Dict("shared_memory_region" => sp("nope"), "shared_memory_byte_size" => ip(4))
+    reg = ReactantServer.SharedMemoryRegistry(; reap_interval = 0)
+    err = try
+        ReactantServer.decode_infer_request(msg([t("x"; params = shmp), t("x"; params = shmp)]; raws = Vector{UInt8}[]), reg)
+    catch e
+        e
+    end
+    @test err isa ErrorException && occursin("input 'x' appears more than once", err.msg)
+end
+
 @testset "raw_output_contents is positional with shared-memory outputs (CORE-1)" begin
     sp(s) = _Inf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:string_param, String(s)))
     ip(i) = _Inf.InferParameter(; parameter_choice = ReactantServer.ProtoBuf.OneOf(:int64_param, Int64(i)))

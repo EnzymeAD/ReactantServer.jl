@@ -5,15 +5,103 @@
 # file's concern (`endpoints.host`); in a container, which ports are reachable is decided by
 # what the operator publishes, and worker metrics ports must remain scrapable.
 
+# Liveness defaults for the workers and the embedded gateway (the node file's `liveness:` block, see
+# `_liveness_settings` in main.jl).
+# A worker that has been ready is asked `/healthz` every 10 s and given 10 s to answer, and is killed
+# after 6 failures in a row: about two minutes without an answer, or one minute of "not live"
+# answers. That is far beyond a garbage collection or a first-use compile on the thread that
+# answers (seconds), and the check never runs before the worker's first ready answer, so a startup
+# that compiles for hours is never touched.
+const LIVENESS_INTERVAL_SECONDS = 10.0
+const LIVENESS_TIMEOUT_SECONDS = 10.0
+const LIVENESS_FAILURES = 6
+# The worker's own stall limit (`ReactantServer.DISPATCH_STALL_SECONDS`), passed to every worker
+# in REACTANT_LIVENESS_DISPATCH_STALL_SECONDS. The worker reads that variable itself; its name is
+# repeated here because this package never loads ReactantServer.
+const DISPATCH_STALL_SECONDS = 600.0
+const DISPATCH_STALL_ENV = "REACTANT_LIVENESS_DISPATCH_STALL_SECONDS"
+
+"""
+    LivenessCheck(host, port; interval_seconds=10, timeout_seconds=10, failures=6)
+
+How the supervisor checks that a running worker still works, through the worker's HTTP listener
+(`endpoints.metrics_port`) at `host:port`. Until the worker's `/readyz` first answers 200 nothing is
+checked, so a worker that compiles its models for hours at startup is left alone. From then on
+`/healthz` is asked every `interval_seconds`; an answer other than 200, a refused connection, or no
+answer within `timeout_seconds` is a failure, and after `failures` in a row the worker is sent
+SIGKILL, so the ordinary restart, with its backoff and restart budget, takes over. The worker's
+`/healthz` says not live while its dispatch loop is stalled with work in hand, so a GPU call that
+never returns is caught too, not only a process that stops answering.
+"""
+struct LivenessCheck
+    ip::Sockets.IPAddr
+    port::Int
+    interval::Float64
+    timeout::Float64
+    failures::Int
+end
+function LivenessCheck(
+        host::Union{AbstractString, Sockets.IPAddr}, port::Integer;
+        interval_seconds::Real = LIVENESS_INTERVAL_SECONDS, timeout_seconds::Real = LIVENESS_TIMEOUT_SECONDS,
+        failures::Integer = LIVENESS_FAILURES
+    )
+    ip = host isa Sockets.IPAddr ? host : parse(Sockets.IPAddr, host)
+    (0 < port <= 65535) || throw(ArgumentError("liveness port must be in 1..65535, got $port"))
+    (interval_seconds > 0 && isfinite(interval_seconds)) ||
+        throw(ArgumentError("liveness interval must be a positive number of seconds, got $interval_seconds"))
+    (timeout_seconds > 0 && isfinite(timeout_seconds)) ||
+        throw(ArgumentError("liveness timeout must be a positive number of seconds, got $timeout_seconds"))
+    failures > 0 || throw(ArgumentError("liveness failures must be at least 1, got $failures"))
+    return LivenessCheck(ip, Int(port), Float64(interval_seconds), Float64(timeout_seconds), Int(failures))
+end
+
+# Defaults of the GPU-reclaim wait before a worker restart, the same variables (and defaults) as the
+# image's startup wait in deploy/runtime/entrypoint.node.sh: wait up to 30 s, until the GPU's used
+# memory is at most 15% of it.
+const GPU_RECLAIM_TIMEOUT_ENV = "REACTANT_GPU_RECLAIM_TIMEOUT_SECONDS"
+const GPU_RECLAIM_MAX_USED_ENV = "REACTANT_GPU_RECLAIM_MAX_USED_PERCENT"
+const GPU_RECLAIM_TIMEOUT_SECONDS = 30.0
+const GPU_RECLAIM_MAX_USED_PERCENT = 15.0
+
+"""
+    GpuReclaim(device, smi; timeout_seconds=30, max_used_percent=15, smi_timeout_seconds=30)
+
+How the supervisor waits, before it restarts a worker, for the driver to release the GPU memory
+the worker's previous run held, so the new run does not run out of memory while it preallocates.
+`device` is the worker's GPU as the supervisor assigned it (an `nvidia-smi` index or a GPU UUID) and
+`smi` the `nvidia-smi` to ask. The GPU counts as released once its used memory is at most
+`max_used_percent` of its total and the previous run's pid no longer holds memory on it (a pid
+`nvidia-smi` lists from another PID namespace never matches, so there the memory alone decides).
+The wait gives up after `timeout_seconds` and restarts the worker anyway; each `nvidia-smi` call is
+given up on after `smi_timeout_seconds`, and then the worker is restarted without waiting.
+"""
+struct GpuReclaim
+    device::String
+    smi::String
+    timeout::Float64
+    max_used_percent::Float64
+    smi_timeout::Float64
+end
+GpuReclaim(
+    device::AbstractString, smi::AbstractString; timeout_seconds::Real = GPU_RECLAIM_TIMEOUT_SECONDS,
+    max_used_percent::Real = GPU_RECLAIM_MAX_USED_PERCENT, smi_timeout_seconds::Real = NVIDIA_SMI_TIMEOUT_SECONDS
+) = GpuReclaim(
+    String(device), String(smi), Float64(timeout_seconds), Float64(max_used_percent), Float64(smi_timeout_seconds)
+)
+
 struct ChildSpec
     name::String
     cmd::Cmd
     grace_seconds::Float64   # SIGTERM-to-SIGKILL window at shutdown (after the drain, for a draining child)
     drain_seconds::Float64   # graceful drain budget, requested by closing the child's stdin; 0 = SIGTERM at once
     stage::Int               # shutdown order: every child of a lower stage stops before the next stage is asked
+    liveness::Union{LivenessCheck, Nothing}   # how a running child is checked; nothing = only its exit is watched
+    reclaim::Union{GpuReclaim, Nothing}       # what a restart waits for on the child's GPU; nothing = no wait
 end
-ChildSpec(name::AbstractString, cmd::Cmd, grace_seconds::Real) =
-    ChildSpec(String(name), cmd, Float64(grace_seconds), 0.0, 1)
+ChildSpec(
+    name::AbstractString, cmd::Cmd, grace_seconds::Real, drain_seconds::Real = 0.0, stage::Integer = 1;
+    liveness::Union{LivenessCheck, Nothing} = nothing, reclaim::Union{GpuReclaim, Nothing} = nothing
+) = ChildSpec(String(name), cmd, Float64(grace_seconds), Float64(drain_seconds), Int(stage), liveness, reclaim)
 
 # How long the node's public endpoint (the embedded gateway, or a sole worker bound to the public
 # ports itself) may take on shutdown to finish the requests it has already accepted.
@@ -151,7 +239,10 @@ function worker_spec(
         metrics_port::Union{Integer, Nothing} = nothing,
         node_workers::Integer = 1,
         grace_seconds::Real = 15.0,
-        drain_seconds::Real = WORKER_DRAIN_SECONDS
+        drain_seconds::Real = WORKER_DRAIN_SECONDS,
+        liveness::Union{LivenessCheck, Nothing} = nothing,
+        dispatch_stall_seconds::Union{Real, Nothing} = nothing,
+        reclaim::Union{GpuReclaim, Nothing} = nothing
     )
     ce = children isa ChildEnvironment ? children : workspace_environment(children)
     proj = ce.worker_project
@@ -178,7 +269,12 @@ function worker_spec(
     # Meta sub-calls run in-process now, so no loopback gRPC endpoint or shared-memory fan-out mesh is
     # injected; each worker builds its own local meta-scratch pool in serve().
     _push_drain!(pairs, drain_seconds)
-    return ChildSpec(String(name), addenv(cmd, pairs...), Float64(grace_seconds), Float64(drain_seconds), _WORKER_STAGE)
+    # The worker's dispatch-stall limit, which decides when its /healthz says not live.
+    dispatch_stall_seconds === nothing || push!(pairs, DISPATCH_STALL_ENV => string(Float64(dispatch_stall_seconds)))
+    return ChildSpec(
+        String(name), addenv(cmd, pairs...), grace_seconds, drain_seconds, _WORKER_STAGE;
+        liveness = liveness, reclaim = reclaim
+    )
 end
 
 # A child that drains on shutdown gets a pipe on stdin (see supervisor.jl), and the variable that
@@ -232,7 +328,8 @@ function gateway_spec(
         grpc_error_detail::Union{AbstractString, Nothing} = nothing,
         rapid_reset_protection::Union{Bool, Nothing} = nothing,
         grace_seconds::Real = 10.0,
-        drain_seconds::Real = PUBLIC_DRAIN_SECONDS
+        drain_seconds::Real = PUBLIC_DRAIN_SECONDS,
+        liveness::Union{LivenessCheck, Nothing} = nothing
     )
     ce = children isa ChildEnvironment ? children : workspace_environment(children)
     proj = ce.gateway_project
@@ -283,7 +380,7 @@ function gateway_spec(
         push!(pairs, "REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION" => string(rapid_reset_protection))
     _push_drain!(pairs, drain_seconds)
     isempty(pairs) || (cmd = addenv(cmd, pairs...))
-    return ChildSpec("gateway", cmd, Float64(grace_seconds), Float64(drain_seconds), _GATEWAY_STAGE)
+    return ChildSpec("gateway", cmd, grace_seconds, drain_seconds, _GATEWAY_STAGE; liveness = liveness)
 end
 
 """

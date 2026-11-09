@@ -17,7 +17,9 @@ that serves the model. On a multi-worker node it also serves the node's merged m
   `endpoints:` in its own `gateway.yml` and queries each worker's `RepositoryIndex` RPC (every
   10s) to learn which models it currently serves. The discovered model-to-workers routing table
   is rebuilt and swapped in atomically on each probe, so a control-plane pin/unpin or a worker
-  restart flips routing on the next probe.
+  restart flips routing on the next probe. A worker that does not answer keeps the routes it last
+  reported for a while (see [Operational notes](#Operational-notes)), so a slow answer or a
+  restart does not turn its models into `NotFound`.
 - **Replica scheduling:** a model served by more than one worker is load-balanced across those
   workers, either uniformly (`round_robin`, the default) or by packing each model onto a fixed,
   operator-configured number of GPUs with coalescing-aware routing (`lpt_packing`); see
@@ -27,7 +29,8 @@ that serves the model. On a multi-worker node it also serves the node's merged m
   status reaches the client as the worker sent it, and a request that uses shared memory is
   never retried on another worker (see [Status codes and failover](#Status-codes-and-failover)).
 - **Readiness probe:** a background loop calls each worker's KServe `ServerReady` RPC; `/readyz`
-  is ready when at least one worker reports ready.
+  is ready when at least one worker reports ready. The probes have a connection to each worker of
+  their own, so they never wait behind the inference queued at a busy worker.
 - **Raw passthrough:** the `ModelInfer` hot path never decodes or re-marshals the protobuf body.
   The request and response types are `Vector{UInt8}` end to end (gRPCServer.jl and gRPCClient.jl
   support raw byte messages natively). To route, the gateway decodes a partial schema declaring
@@ -155,6 +158,16 @@ on zeros:
   meta's whole measured cost. That cost is the GPU time of its sub-calls, which are hidden from
   the gateway, so it is counted once. Under `items` a meta charges one unit however expensive it
   is, so fleets that serve metas should use `compute`.
+
+The batch extent is the client's claim, and the gateway never rejects a request over it: the worker
+is the authority on what is valid. It believes the claim only as far as the request's own data
+goes, since every row takes at least one byte: a request counts as at most as many items as it
+carries bytes for the batch input, inline (its `raw_input_contents` entry, or the encoded length of
+its typed `contents`) or as the `shared_memory_byte_size` it declares, and as at least one item.
+A request that claims 2^62 rows in a few bytes of data therefore counts as a few items, and none
+counts as more than 2^40. The in-flight counters are integers (nanoseconds of GPU time, or items or
+requests), each request releases exactly what it was charged, and a charge is capped at about 78
+hours of GPU time, so no claim can make the arithmetic fail or leave a counter off after release.
 
 ### lpt_packing
 
@@ -473,7 +486,7 @@ the next replica only when the worker it tried could not serve it:
 | --- | --- |
 | `NOT_FOUND` (the model was unloaded there since the last discovery round) | tries the next replica and refreshes its routes |
 | `UNAVAILABLE` (the worker is shutting down or draining, its dispatch loop died, or the model is not resident there or cannot be placed on its device now) | tries the next replica |
-| a transport failure (connection refused or reset, a response that broke off, a client handle reset after a hung probe) | tries the next replica, as `UNAVAILABLE` |
+| a transport failure (connection refused or reset, a response that broke off, a call aborted when its parked connection was reset) | tries the next replica, as `UNAVAILABLE` |
 | any other status: `DEADLINE_EXCEEDED`, `INTERNAL`, `INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`, `FAILED_PRECONDITION`, `CANCELLED`, ... | returns it to the client as is |
 
 A deterministic failure (`INTERNAL`) or the request's own mistake (`INVALID_ARGUMENT`) would only
@@ -552,11 +565,18 @@ returning whether it reported ready.
   V2 gRPC endpoint during a gateway outage, so a client can fall back to addressing a worker
   directly.
 - The routing table is rebuilt every 10s from each worker's `RepositoryIndex` and swapped in
-  atomically. If a worker dies, its routes persist until the next successful probe (up to ~10s);
-  in the gap, requests to its models fail over to the remaining replicas (on `NotFound`,
-  `Unavailable`, or a transport failure; see [Status codes and failover](#Status-codes-and-failover)),
-  and a model with no live replica returns `NotFound`. The worker-side readiness
-  probe (`ServerReady`, same 10s loop) drives `/readyz` and the `gateway_worker_ready` metric.
+  atomically. A worker's answer replaces its routes, so a model it no longer lists is dropped at
+  once; a call that does not answer (it times out, is refused, or fails) changes nothing, and the
+  worker keeps the routes it last reported. While the readiness probe (`ServerReady`, same 10s
+  loop, which also drives `/readyz` and the `gateway_worker_ready` metric) finds a worker
+  unreachable or not ready, its own answers are not taken, and its models are routed to the ready
+  workers that serve them; a model that only workers in that state serve is still routed to them,
+  so its requests fail over or come back `Unavailable`, which clients retry, rather than
+  `NotFound`. A worker that stays out for `worker_client.route_retention_seconds` (default 600, the
+  time a restart takes to load and compile its models with room to spare; 0 drops its routes at its
+  first missed round) loses its routes, and a model nobody else serves becomes `NotFound`. A model
+  no worker has ever reported is `NotFound` at once. Rebuilding the table keeps each model's
+  round-robin position.
 - Under `lpt_packing`, the gateway polls the workers on every 10s probe round to refresh routing
   metadata and accumulate consumed compute, but recomputes the placement only once the fleet has
   consumed `scheduling.rebalance_compute_seconds` GPU-seconds (the first repack uses
@@ -572,11 +592,36 @@ returning whether it reported ready.
   `gateway_repack_staged_changes_total{outcome}`). A repack that comes due while a placed worker is
   missing from the poll logs `repack deferred` instead and runs once the worker answers or 30 s have
   passed.
-- If a probe to a worker hangs (times out, rather than failing fast), the gateway drops and
-  recreates that worker's gRPC connection before the next attempt. This recovers from a
-  half-open connection (for example one caught during a worker's brief silent-accept window at
-  startup) that would otherwise be reused and stall every later request to that worker, the
-  per-worker equivalent of a restart, without dropping HTTP/2 multiplexing for healthy workers.
+- The gateway holds two connections to each worker: one for the health probes, discovery and the
+  control-status poll, and one for everything else, inference, shared memory, the metadata RPCs,
+  `CompactMemory` and `StageWeights` (`worker_client.max_concurrent_streams` calls at once on it).
+  A probe therefore never waits for an inference slot, however busy the worker is: a probe that
+  hangs means the worker, or the gateway's own client stack, stopped answering. If a probe or a
+  control-status poll to a worker hangs (times out, rather than failing fast), the gateway drops
+  and recreates that worker's probe connection, which touches no inference. The gateway exits to be
+  restarted only when every probe has hung for three rounds in a row after it had reached a worker
+  (`REACTANT_GATEWAY_WEDGE_EXIT_ROUNDS`, 0 to disable), so a fleet saturated with inference cannot
+  trigger it.
+- The inference connection is dropped and recreated only when it is parked: the last 5 inference
+  calls to a worker all reached their deadline without any answer from it, and the worker answers
+  its health probe, ready, on the other connection. This covers a connection whose first calls were
+  all given up before the worker answered (a restarted worker whose first answers are slow, or a
+  frozen one): gRPCClient waits for a connection to answer before it uses it again, so without the
+  reset every later call to that worker waits behind it and fails at its deadline for up to two
+  minutes. Any answer from the worker, a success or a status it sent, clears the count, and a call
+  that expired waiting for a free slot does not count, so a busy worker that answers keeps its
+  calls; the reset fails over the calls in flight on the parked connection, which never reached
+  the worker. The gateway logs a warning each time.
 - Successful `ModelInfer` requests are not logged (to keep the hot path quiet); worker errors and
   a model with no live replica are logged, and per-request latency and gRPC status are exported
   as Prometheus metrics. Logs contain no tensor data.
+- Clients choose the names they send, so they never become metric labels as sent. The `model`
+  label of `gateway_requests_total` and `gateway_request_latency_seconds` for `ModelInfer` is the
+  model's name only while the routing table holds it; every other name (one no worker serves, an
+  empty or unreadable one) is counted under the reserved label `_unknown`, the same label the
+  workers use. A model that leaves the routing table keeps its series, so the series stay bounded
+  by the models the gateway has served. Workers refuse to load a bundle named `_unknown`, so no
+  model shares that series.
+  The shared-memory register and unregister RPCs name a region, chosen by each client process, so
+  they carry an empty `model` label, as the metadata RPCs do. Under `lpt_packing`, arrivals are
+  counted only for routed models.

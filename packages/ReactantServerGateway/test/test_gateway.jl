@@ -170,9 +170,11 @@ mutable struct MockWorker
     fail_invalid::Bool          # reject ModelInfer with INVALID_ARGUMENT (e.g. an unknown requested output)
     infer_calls::Int            # ModelInfer calls received, so a test can see whether the gateway failed over
     fail_code::Any              # reject ModelInfer with this gRPCServer.StatusCode, or nothing
+    index::Symbol               # RepositoryIndex: :ok, :down (UNAVAILABLE), :slow (answers after 7 s)
+    ready::Bool                 # what ServerReady reports
 end
 MockWorker(name, models, fail_infer, fail_shm, fail_exhausted) =
-    MockWorker(name, models, fail_infer, fail_shm, fail_exhausted, false, String[], :ok, false, 0, nothing)
+    MockWorker(name, models, fail_infer, fail_shm, fail_exhausted, false, String[], :ok, false, 0, nothing, :ok, true)
 
 # The metadata RPCs' failure modes, and whether the mock serves `name` at all.
 function _mock_metadata_check(w::MockWorker)
@@ -188,18 +190,23 @@ _mock_not_found(w::MockWorker, names) =
 _mock_description(w::MockWorker, name) =
     ReactantServerGateway.control.ModelDescription(; name = name, kind = "model", description = w.name)
 
-function _mock_server(worker::MockWorker)
+function _mock_server(worker::MockWorker; port::Integer = 0)
     server = gRPCServer.GRPCServerHTTPJl("127.0.0.1", 1; context = worker)
-    server.port = 0   # OS-assigned ephemeral port; HTTP.port(server) reports it after start!
+    server.port = port   # 0: OS-assigned ephemeral port; HTTP.port(server) reports it after start!
     ReactantServerGateway.register_GRPCInferenceService!(
         server;
-        ServerReady = (ctx, req) -> GWInf.ServerReadyResponse(; ready = true),
-        RepositoryIndex = (ctx, req) -> GWInf.RepositoryIndexResponse(;
-            models = [
-                GWInf.var"RepositoryIndexResponse.ModelIndex"(; name = m, version = "", state = "READY", reason = "")
-                    for m in ctx.payload.models
-            ]
-        ),
+        ServerReady = (ctx, req) -> GWInf.ServerReadyResponse(; ready = ctx.payload.ready),
+        RepositoryIndex = (ctx, req) -> begin
+            w = ctx.payload
+            w.index === :down && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, "mock $(w.name) index down"))
+            w.index === :slow && sleep(7)       # past the gateway's 5 s discovery deadline
+            GWInf.RepositoryIndexResponse(;
+                models = [
+                    GWInf.var"RepositoryIndexResponse.ModelIndex"(; name = m, version = "", state = "READY", reason = "")
+                        for m in w.models
+                ]
+            )
+        end,
         ModelInfer = (ctx, req) -> begin
             w = ctx.payload
             w.infer_calls += 1
@@ -244,8 +251,8 @@ end
 # (ServerReady), so the gateway's first synchronous discovery round always probes a live
 # worker. start! is async and the first request on a cold CI runner can be slow, so a
 # readiness poll beats a fixed sleep: the gateway must never discover a half-started mock.
-function _start_mock(worker::MockWorker; timeout::Real = 30.0)
-    server = _mock_server(worker)
+function _start_mock(worker::MockWorker; timeout::Real = 30.0, port::Integer = 0)
+    server = _mock_server(worker; port = port)
     gRPCServer.start!(server)
     # HTTP.port reads the listener's bound address; with an ephemeral port it is only
     # meaningful once start! has actually bound, so poll for it first.
@@ -365,7 +372,7 @@ end
         end
 
         @testset "an empty worker response fails over instead of passing as a success" begin
-            # gRPCClient before 1.1.2 completed a call aborted by reset_clients! with an empty body.
+            # gRPCClient before 1.1.2 completed a call aborted by a handle reset with an empty body.
             # A real worker always sets model_name, so the gateway treats empty as unavailable.
             w0.empty_infer = true
             for _ in 1:4

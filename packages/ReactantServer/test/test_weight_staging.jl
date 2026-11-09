@@ -162,7 +162,10 @@ end
     end
 end
 
-@testset "staging: unloading a model waits for its background read before closing its weights" begin
+@testset "staging: unloading a model does not wait for its background read, which drops what it read" begin
+    # The unload runs on the dispatch loop, and a read on storage that stopped answering never
+    # returns, so the unload does not wait for it. The read keeps the weights file open (see
+    # test_stalled_reads.jl) and drops what it read when it returns.
     gw = GatedWeights()
     sched, A, B = _st_running(gw)
     try
@@ -173,13 +176,18 @@ end
         end
         wait(gw.started)
         tE = Threads.@spawn ReactantServer.evict!(sched, "B")
-        sleep(0.3)
-        @test !istaskdone(tE)                           # the unload waits on the read in progress
-        notify(gw.gate)
+        @test timedwait(() -> istaskdone(tE), 10.0) === :ok      # with B's read still held
         @test fetch(tE) === B
         @test fetch(tB) isa ReactantServer.ModelNotFoundError   # the queued request was rejected as unloaded
-        @test B.sched.host_stage === :none && B.sched.staged === nothing
         @test _st_infer(sched, "A") == _ST_OUT          # the worker carries on
+        @test lock(() -> length(sched.reads), sched.cond) == 1
+        notify(gw.gate)
+        t_end = time() + 10
+        while lock(() -> !isempty(sched.reads), sched.cond) && time() < t_end
+            sleep(0.01)
+        end
+        @test lock(() -> isempty(sched.reads), sched.cond)
+        @test B.sched.host_stage === :none && B.sched.staged === nothing
     finally
         notify(gw.gate)
         ReactantServer.shutdown!(sched)

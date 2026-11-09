@@ -1,6 +1,7 @@
 # Repro for a gRPCClient behavior the stress suite hit through the gateway: an in-flight unary call
-# whose gRPCCURL handle is shut down and re-initialized (the gateway's reset_clients!, run when a
-# worker probe hits its deadline) returns normally with an empty response instead of raising. The
+# whose gRPCCURL handle is shut down and re-initialized (as the gateway resets a worker's handle; at
+# the time, whenever a worker probe hit its deadline) returns normally with an empty response
+# instead of raising. The
 # server is a TCP black hole that accepts and never answers, like a stalled worker.
 #
 #   julia -t 4 --project=packages/ReactantServerGateway tools/residency_stress/grpc_reset_repro.jl

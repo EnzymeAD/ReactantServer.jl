@@ -15,6 +15,16 @@ Base.length(io::_TestIO) = io.n
 ReactantServerClient.item_input_bytes(io::_TestIO) = io.ipb
 ReactantServerClient.output_specs(io::_TestIO) = io.specs
 
+# A model type of the caller's own that reports a max batch size below 1 (CLI-4).
+struct _ZeroBatchModel <: AbstractInferenceModel end
+ReactantServerClient.max_batch_size(::_ZeroBatchModel) = 0
+
+# An IO that reports a negative output size per item (CLI-4).
+struct _NegOutputIO <: AbstractInferenceIO end
+Base.length(::_NegOutputIO) = 10
+ReactantServerClient.item_input_bytes(::_NegOutputIO) = 16
+ReactantServerClient.item_output_bytes(::_NegOutputIO) = -32
+
 # Build an InferParameter the way the wire carries shared-memory pointers.
 _strp(s) = inference.InferParameter(parameter_choice = OneOf(:string_param, String(s)))
 _intp(i) = inference.InferParameter(parameter_choice = OneOf(:int64_param, Int64(i)))
@@ -251,6 +261,35 @@ end
         end
     end
 
+    @testset "an input larger than its subslot is refused on either transport (CLI-12)" begin
+        # The shared-memory branch sends only an offset and a byte size, so a shape larger than the
+        # subslot used to make the server read past it, into whatever followed, without an error.
+        m = KServeModel("grpc://h:1", "x"; max_batch_size = 8)
+        shm = InferenceBufferPool(4096; n_slots = 4, use_shm = true, name = "rsc_cli12_pool")
+        inl = InferenceBufferPool(4096; n_slots = 4, use_shm = false)
+        try
+            for p in (shm, inl)
+                s = acquire_slot!(p)
+                sub = subslot(s, 4 * sizeof(Float32))                  # room for 4 Float32
+                err = try
+                    ReactantServerClient.materialize_input(InferInput("A", sub, [8], Float32), m, p)
+                    nothing
+                catch e
+                    e
+                end
+                @test err isa ArgumentError
+                @test err isa ArgumentError && occursin("\"A\"", err.msg) && occursin("16 bytes", err.msg)
+                @test_throws ArgumentError ReactantServerClient.materialize_input(InferInput("N", sub, [-4], Float32), m, p)
+                # A shape that fits is sent as before.
+                tensor, _ = ReactantServerClient.materialize_input(InferInput("A", sub, [4], Float32), m, p)
+                @test tensor.shape == [4]
+                release_slot!(s)
+            end
+        finally
+            rm(shm.pool.backing)
+        end
+    end
+
     @testset "scratch returns a homogeneous descriptor vector (no element promotion)" begin
         p = InferenceBufferPool(4096; n_slots = 4, use_shm = false)
         s = acquire_slot!(p, 2)
@@ -338,6 +377,23 @@ end
         @test item_output_bytes(io) == 16 + 6
         # Scalar (no per-item dims) counts as one element.
         @test item_output_bytes(_TestIO(1, 1, [OutputSpec("S", Float64, Int[])])) == 8
+    end
+
+    @testset "OutputSpec refuses a negative dimension" begin
+        # -1 is how describe_model marks a variable axis. An even count of them used to multiply
+        # out to a positive size and pass, declaring an output the server cannot match.
+        for dims in ([-1], [-8], [-1, -4], [4, -1])
+            err = try
+                OutputSpec("y", Float32, dims)
+                nothing
+            catch e
+                e
+            end
+            @test err isa ArgumentError
+            @test err isa ArgumentError && occursin("\"y\"", err.msg) && occursin("inline", err.msg)
+        end
+        @test_throws ArgumentError OutputSpec("y", Float32, -1, -4)      # the varargs form too
+        @test OutputSpec("y", Float32, [0, 4]).per_item_dims == [0, 4]
     end
 
     @testset "inline pool: name-only outputs, output bytes not charged to slot" begin
@@ -565,6 +621,44 @@ end
         io = _TestIO(10, 5000, OutputSpec[])                           # input alone exceeds pool
         @test_throws ErrorException ReactantServerClient._chunk_geometry(io, m, p)
         @test_throws ErrorException ReactantServerClient._chunk_size(io, m, p)
+    end
+
+    @testset "max_batch_size must be at least 1 (CLI-4)" begin
+        # describe_model reports 0 for a meta model and when the limit is unknown. Passed through,
+        # it used to build a model whose drivers never finished: a chunk size below 1 never
+        # advances, and every step sent another empty request.
+        for bad in (0, -1)
+            err = try
+                KServeModel("grpc://h:1", "x"; max_batch_size = bad)
+                nothing
+            catch e
+                e
+            end
+            @test err isa ArgumentError
+            @test err isa ArgumentError && occursin("max_batch_size", err.msg) &&
+                occursin("describe_model", err.msg) && occursin("meta model", err.msg)
+            @test_throws ArgumentError KServeModel("h", 1, "x"; max_batch_size = bad)
+            @test_throws ArgumentError ReactantServerClient.BatchIterator(10, bad)
+        end
+        @test KServeModel("grpc://h:1", "x"; max_batch_size = 1).max_batch_size == 1
+        @test collect(ReactantServerClient.BatchIterator(5, 2)) == [1:2, 3:4, 5:5]
+        @test isempty(collect(ReactantServerClient.BatchIterator(0, 2)))
+
+        # A model type of the caller's own that reports a size below 1 is refused before any chunk
+        # is sized.
+        p = InferenceBufferPool(4096; n_slots = 4, use_shm = false)
+        @test_throws ArgumentError ReactantServerClient._chunk_geometry(_TestIO(10, 16, OutputSpec[]), _ZeroBatchModel(), p)
+
+        # Nor can a negative per-item output size make the chunk size 0 on a shared-memory pool, where
+        # outputs share the slot with the inputs. OutputSpec refuses a negative dimension, so this
+        # takes an IO that reports a negative item_output_bytes itself.
+        shm = InferenceBufferPool(4096; n_slots = 4, use_shm = true, name = "rsc_cli4_pool")
+        try
+            m = KServeModel("grpc://h:1", "x"; max_batch_size = 8)
+            @test_throws ErrorException ReactantServerClient._chunk_geometry(_NegOutputIO(), m, shm)
+        finally
+            rm(shm.pool.backing)
+        end
     end
 
     @testset "acquire_slot! forwards span through InferenceBufferPool" begin
@@ -831,6 +925,23 @@ end
     end
     @test d_attempts[] == 1
     @test d_budget[] == 5.0
+
+    # Once the call has failed elsewhere (another chunk of an infer_async call), no further attempt
+    # goes out: not after a shed, and not after a backoff that was already being slept.
+    slow = RSC.RetryPolicy(; initial_backoff = 5.0, jitter = false, min_budget = 0.01)
+    ms = KServeModel("grpc://h:1", "x"; deadline = 60.0, retry = slow)
+    for already in (true, false)
+        stop = Threads.Atomic{Bool}(already)
+        c_attempts = Ref(0)
+        t0 = time()
+        @test_throws RSC.gRPCClient.gRPCServiceCallException RSC._infer_with_retry(ms; cancelled = () -> stop[]) do _
+            c_attempts[] += 1
+            already || Threads.@spawn (sleep(0.2); stop[] = true)   # fails during the 5 s backoff
+            throw(shed())
+        end
+        @test c_attempts[] == 1
+        @test time() - t0 < 2.0
+    end
 end
 
 @testset "parse_grpc_url rejects malformed URLs with a clear error" begin
@@ -890,6 +1001,16 @@ end
         kserve_shutdown()
         ReactantServerClient._shm_unsupported[] = saved
     end
+end
+
+@testset "ShmUnrecoverableError shows the endpoint and the cause, not the model's internals" begin
+    RSC = ReactantServerClient
+    m = KServeModel("grpc://host.example:8001", "mymodel")
+    cause = RSC.gRPCClient.gRPCServiceCallException(RSC.gRPCClient.GRPC_INTERNAL, "register rejected")
+    msg = sprint(showerror, RSC.ShmUnrecoverableError(m, cause))
+    @test occursin("host.example:8001", msg) && occursin("mymodel", msg)
+    @test occursin("register rejected", msg)
+    @test !occursin("gRPCCURL", msg) && length(msg) < 400
 end
 
 # Shared-memory recovery against a mock KServe gRPC server (restart, coalescing, latch, unlatch).

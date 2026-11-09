@@ -352,6 +352,12 @@ gateway-fronted worker never self-compacts; and `models` holds the per-model
 profile) lets the scheduler merge several queued requests to one model into a single dispatch; when
 it is `false` every dispatch serves exactly one request, padded to its compiled batch size, so a
 request's rows always occupy the same batch slots whatever else is queued.
+`weight_read_stall_seconds` (default `20`, `0` disables it) is how long a background read of a
+model's weights into host memory may go without progress before the worker abandons it: the
+model's queued requests fail with `UNAVAILABLE`, and its read slot passes to the next model.
+Progress is bytes arriving from the weights file, so storage that is slow but moving is never cut
+off; a wait for another worker filling the same shared host-weight copy counts that worker's
+progress, and any other wait on a lock counts as none.
 """
 struct SchedulerConfig
     ema_halflife_seconds::Float64
@@ -364,9 +370,29 @@ struct SchedulerConfig
     compaction_interval::Int
     models::Dict{String, ModelSchedConfig}
     coalescing::Bool                       # merge queued same-model requests into one dispatch
+    weight_read_stall_seconds::Float64     # a weights read this long without progress is abandoned; 0 = never
 end
 
-# Nine-argument form: the previous full positional layout (through `models`), with coalescing on.
+# The default `weight_read_stall_seconds`.
+# Below the default `dispatch_timeout_seconds` (30), so a request waiting for a read that stalls fails
+# with the retryable UNAVAILABLE rather than at its dispatch timeout.
+const DEFAULT_WEIGHT_READ_STALL_SECONDS = 20.0
+
+# Ten-argument form: the previous full positional layout (through `coalescing`), with the default
+# stall limit for weight reads.
+SchedulerConfig(
+    ema_halflife_seconds::Real, recency_penalty_cap::Real, coalescing_discount::Real,
+    cost_ema_alpha::Real, max_queue_depth::Integer, dispatch_timeout_seconds::Real,
+    discipline::SchedulingDiscipline, compaction_interval::Integer,
+    models::Dict{String, ModelSchedConfig}, coalescing::Bool
+) =
+    SchedulerConfig(
+    Float64(ema_halflife_seconds), Float64(recency_penalty_cap), Float64(coalescing_discount),
+    Float64(cost_ema_alpha), Int(max_queue_depth), Float64(dispatch_timeout_seconds), discipline,
+    Int(compaction_interval), models, coalescing, DEFAULT_WEIGHT_READ_STALL_SECONDS
+)
+
+# Nine-argument form: the layout before that (through `models`), with coalescing on.
 SchedulerConfig(
     ema_halflife_seconds::Real, recency_penalty_cap::Real, coalescing_discount::Real,
     cost_ema_alpha::Real, max_queue_depth::Integer, dispatch_timeout_seconds::Real,
@@ -374,25 +400,25 @@ SchedulerConfig(
     models::Dict{String, ModelSchedConfig}
 ) =
     SchedulerConfig(
-    Float64(ema_halflife_seconds), Float64(recency_penalty_cap), Float64(coalescing_discount),
-    Float64(cost_ema_alpha), Int(max_queue_depth), Float64(dispatch_timeout_seconds), discipline,
-    Int(compaction_interval), models, true
+    ema_halflife_seconds, recency_penalty_cap, coalescing_discount, cost_ema_alpha,
+    max_queue_depth, dispatch_timeout_seconds, discipline, compaction_interval, models, true
 )
 
 # Convenience constructor preserving the original three-argument form. The cost-aware knobs,
-# discipline, compaction interval, per-model overrides, and coalescing take their defaults unless
-# passed as keywords.
+# discipline, compaction interval, per-model overrides, coalescing, and the weight-read stall limit
+# take their defaults unless passed as keywords.
 SchedulerConfig(
     ema_halflife_seconds::Real, max_queue_depth::Integer, dispatch_timeout_seconds::Real;
     recency_penalty_cap::Real = 0.25, coalescing_discount::Real = 0.1, cost_ema_alpha::Real = 0.2,
     discipline::SchedulingDiscipline = FAIR, compaction_interval::Integer = 0,
     models::Dict{String, ModelSchedConfig} = Dict{String, ModelSchedConfig}(),
-    coalescing::Bool = true
+    coalescing::Bool = true, weight_read_stall_seconds::Real = DEFAULT_WEIGHT_READ_STALL_SECONDS
 ) =
     SchedulerConfig(
     Float64(ema_halflife_seconds), Float64(recency_penalty_cap),
     Float64(coalescing_discount), Float64(cost_ema_alpha), Int(max_queue_depth),
-    Float64(dispatch_timeout_seconds), discipline, Int(compaction_interval), models, coalescing
+    Float64(dispatch_timeout_seconds), discipline, Int(compaction_interval), models, coalescing,
+    Float64(weight_read_stall_seconds)
 )
 
 """
@@ -568,6 +594,7 @@ const ENV_PATHS = Tuple{String, Vector{String}, DataType}[
     ("SCHEDULER_DISPATCH_TIMEOUT_SECONDS", ["scheduler", "dispatch_timeout_seconds"], Float64),
     ("SCHEDULER_COMPACTION_INTERVAL", ["scheduler", "compaction_interval"], Int),
     ("SCHEDULER_COALESCING", ["scheduler", "coalescing"], Bool),
+    ("SCHEDULER_WEIGHT_READ_STALL_SECONDS", ["scheduler", "weight_read_stall_seconds"], Float64),
     ("ENDPOINTS_HOST", ["endpoints", "host"], String),
     ("ENDPOINTS_PORT", ["endpoints", "port"], Int),
     ("ENDPOINTS_METRICS_PORT", ["endpoints", "metrics_port"], Int),
@@ -898,6 +925,7 @@ function build_config(raw::AbstractDict)
         _opt(sc, "compaction_interval", Int, 0),
         _parse_sched_models(sc),
         _opt(sc, "coalescing", Bool, _profile_coalescing(profile)),
+        _opt(sc, "weight_read_stall_seconds", Float64, DEFAULT_WEIGHT_READ_STALL_SECONDS),
     )
 
     haskey(raw, "batch_policy") && throw(ConfigError(_BATCH_POLICY_REMOVED_MSG))
@@ -953,6 +981,8 @@ function validate_config(cfg::ServerConfig)
         throw(ConfigError("scheduler.dispatch_timeout_seconds must be non-negative (0 = no timeout)"))
     cfg.scheduler.compaction_interval >= 0 ||
         throw(ConfigError("scheduler.compaction_interval must be non-negative (0 = disabled)"))
+    (isfinite(cfg.scheduler.weight_read_stall_seconds) && cfg.scheduler.weight_read_stall_seconds >= 0) ||
+        throw(ConfigError("scheduler.weight_read_stall_seconds must be a finite non-negative number of seconds (0 = never abandon a read)"))
     for (name, mc) in cfg.scheduler.models
         # The fair discipline charges a dispatch as its seconds over the weight, so only a positive,
         # finite weight orders models: Inf charges nothing, and NaN fails every comparison.
@@ -981,7 +1011,7 @@ end
 # `apply_env_overrides!` is applied on top by `node_server_config`.
 
 function log_effective_config(cfg::ServerConfig, applied)
-    @info "Effective configuration" model_dirs = cfg.model_dirs models_include = cfg.models_include model_control_mode = cfg.model_control_mode model_poll_seconds = cfg.model_poll_seconds cache_dir = cfg.cache_dir backend = cfg.runtime.backend device_ordinal = cfg.runtime.device_ordinal device_memory_fraction = cfg.runtime.device_memory_fraction preallocate = cfg.runtime.preallocate allow_cpu_fallback = cfg.runtime.allow_cpu_fallback device_weight_fraction = cfg.runtime.device_weight_fraction device_headroom_fraction = cfg.runtime.device_headroom_fraction autotune = cfg.runtime.autotune autotune_cache = cfg.runtime.autotune_cache autotune_cache_dir = cfg.runtime.autotune_cache_dir numerics = cfg.runtime.numerics executable_cache = cfg.runtime.executable_cache profile = cfg.runtime.profile batch_sizes = cfg.runtime.batch_sizes weights_migration = cfg.runtime.weights_migration host_weight_budget = cfg.runtime.host_weight_budget host_weight_budget_workers = cfg.runtime.host_weight_budget_workers xla_flags = sort!(["$k=$v" for (k, v) in cfg.runtime.xla_flags]) residency_mode = cfg.runtime.residency_mode shared_host_weights = cfg.runtime.shared_host_weights shared_host_weights_mode = string(cfg.runtime.shared_host_weights_mode; base = 8) host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests discipline = cfg.scheduler.discipline ema_halflife_seconds = cfg.scheduler.ema_halflife_seconds recency_penalty_cap = cfg.scheduler.recency_penalty_cap coalescing = cfg.scheduler.coalescing coalescing_discount = cfg.scheduler.coalescing_discount cost_ema_alpha = cfg.scheduler.cost_ema_alpha max_queue_depth = cfg.scheduler.max_queue_depth compaction_interval = cfg.scheduler.compaction_interval scheduler_models = collect(keys(cfg.scheduler.models))
+    @info "Effective configuration" model_dirs = cfg.model_dirs models_include = cfg.models_include model_control_mode = cfg.model_control_mode model_poll_seconds = cfg.model_poll_seconds cache_dir = cfg.cache_dir backend = cfg.runtime.backend device_ordinal = cfg.runtime.device_ordinal device_memory_fraction = cfg.runtime.device_memory_fraction preallocate = cfg.runtime.preallocate allow_cpu_fallback = cfg.runtime.allow_cpu_fallback device_weight_fraction = cfg.runtime.device_weight_fraction device_headroom_fraction = cfg.runtime.device_headroom_fraction autotune = cfg.runtime.autotune autotune_cache = cfg.runtime.autotune_cache autotune_cache_dir = cfg.runtime.autotune_cache_dir numerics = cfg.runtime.numerics executable_cache = cfg.runtime.executable_cache profile = cfg.runtime.profile batch_sizes = cfg.runtime.batch_sizes weights_migration = cfg.runtime.weights_migration host_weight_budget = cfg.runtime.host_weight_budget host_weight_budget_workers = cfg.runtime.host_weight_budget_workers xla_flags = sort!(["$k=$v" for (k, v) in cfg.runtime.xla_flags]) residency_mode = cfg.runtime.residency_mode shared_host_weights = cfg.runtime.shared_host_weights shared_host_weights_mode = string(cfg.runtime.shared_host_weights_mode; base = 8) host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests discipline = cfg.scheduler.discipline ema_halflife_seconds = cfg.scheduler.ema_halflife_seconds recency_penalty_cap = cfg.scheduler.recency_penalty_cap coalescing = cfg.scheduler.coalescing coalescing_discount = cfg.scheduler.coalescing_discount cost_ema_alpha = cfg.scheduler.cost_ema_alpha max_queue_depth = cfg.scheduler.max_queue_depth compaction_interval = cfg.scheduler.compaction_interval weight_read_stall_seconds = cfg.scheduler.weight_read_stall_seconds scheduler_models = collect(keys(cfg.scheduler.models))
     isempty(applied) || @info "Configuration overridden by environment" overrides = ["$k=$v" for (k, v) in applied]
     return nothing
 end

@@ -437,6 +437,54 @@ end
     end
 end
 
+@testset "a dispatch loop stuck with work in hand reports not live until it moves again" begin
+    # The program waits on `gate`, as a GPU call that never returns: the loop is stuck in its
+    # dispatch while the threads that answer health checks are free. Before, ServerLive, ServerReady
+    # and /healthz kept answering live and ready, so nothing would ever restart the worker.
+    gate = Base.Event()
+    sched, ctx = _sc_sched(_sc_entry("h"; fn = a -> (wait(gate); [a[1] .* a[2]])))
+    sched.progress.stall_seconds = 0.5
+    _SC.start!(sched)
+    t = nothing
+    try
+        # Idle for longer than the limit: waiting with nothing to do is never a stall.
+        sleep(1.0)
+        @test _SC.dispatch_alive(sched) && !_SC.dispatch_stalled(sched)
+        t = Threads.@spawn _SC.infer(sched, _sc_req("h"))
+        @test @test_logs (:error, r"dispatch loop has made no progress") match_mode = :any _sc_until(
+            () -> !_SC.dispatch_alive(sched); timeout = 10.0
+        )
+        @test _SC.dispatch_stalled(sched)
+        @test !_SC._handle_server_live(ctx).live
+        @test !_SC._handle_server_ready(ctx).ready
+        @test !_SC._model_ready(ctx, "h")
+        @test !_SC._DispatchLive(sched)()
+        @test !_SC._RegistryReady(sched.registry, sched)()
+        # A limit of 0 turns the check off.
+        sched.progress.stall_seconds = 0.0
+        @test _SC._handle_server_live(ctx).live
+        sched.progress.stall_seconds = 0.5
+        @test !_SC._handle_server_live(ctx).live
+        # The call returns: the loop has made progress, the request is answered, and the worker is
+        # live and ready again.
+        notify(gate)
+        @test !(fetch(t) isa Exception)
+        @test _sc_until(() -> _SC.dispatch_alive(sched))
+        @test _SC._handle_server_live(ctx).live && _SC._handle_server_ready(ctx).ready
+    finally
+        notify(gate)
+        _SC.shutdown!(sched)
+    end
+
+    # The limit a served worker uses: REACTANT_LIVENESS_DISPATCH_STALL_SECONDS, else the default.
+    env(v) = Dict(_SC.DISPATCH_STALL_ENV => v)
+    @test _SC._dispatch_stall_seconds(Dict{String, String}()) == _SC.DISPATCH_STALL_SECONDS == 600.0
+    @test _SC._dispatch_stall_seconds(env("90")) == 90.0
+    @test _SC._dispatch_stall_seconds(env("0")) == 0.0
+    @test (@test_logs (:warn, r"must be a non-negative number") _SC._dispatch_stall_seconds(env("-1"))) == 600.0
+    @test (@test_logs (:warn, r"must be a non-negative number") _SC._dispatch_stall_seconds(env("soon"))) == 600.0
+end
+
 @testset "a failure outside the execution fails only the requests still unanswered" begin
     answered = _SC.QueuedRequest(_sc_req("m"))
     put!(answered.reply, _SC.DeadlineExceeded("m"))

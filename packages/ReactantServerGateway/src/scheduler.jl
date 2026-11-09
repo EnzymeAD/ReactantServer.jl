@@ -61,6 +61,8 @@ scheduler_tick!(::GatewayScheduler, ::ClientPool, ready_urls, metrics, poll) = n
 needs_routing_meta(::GatewayScheduler) = false
 
 # Record a request arrival, for schedulers that estimate arrival rate. lpt_packing overrides this.
+# The gateway calls it only for a model the routing table holds (see `_gw_infer`), so a scheduler
+# that keeps state per name keeps it for models actually served, never for names clients make up.
 record_arrival!(::GatewayScheduler, model::AbstractString) = nothing
 
 # How many items a request carries, for a scheduler that routes by work rather than by request
@@ -77,50 +79,55 @@ scheduler_repack_seq(::GatewayScheduler) = 0
 # it (covers schedulers that reserve nothing, and the `nothing` reservation of any scheduler).
 release!(::GatewayScheduler, reservation) = nothing
 
-# --- comparing in-flight work -------------------------------------------------------------------
-
-# One nanosecond of GPU time, as the quantum for comparing two workers' loads. Far below the smallest
-# charge that can exist (a single item of the cheapest model is microseconds) and far above the
-# floating-point residue that accumulates in a load counter.
-const _LOAD_QUANTUM_INV = 1.0e9
+# --- counting in-flight work ----------------------------------------------------------------------
 
 """
-    _load_key(load) -> Int
+In-flight work is counted in whole QUANTA, in `Threads.Atomic{Int}` counters: one nanosecond of GPU
+time for a cost-weighted charge, and one item or one request for a count. Each request is charged a
+whole number of quanta at selection and releases exactly that number, so a counter returns to exactly
+0 when its worker drains, and two workers' loads compare exactly.
 
-`load` reduced to an integer number of nanoseconds, for ORDERING two workers' in-flight work.
+They used to be Float64 GPU-seconds, which went wrong two ways. Floating-point addition is not
+associative, so a drained worker kept a couple of ulp (netai02 sat at 4.44e-16 on two GPUs and exactly
+0.0 on the other two), and both `fill_least` and `least_outstanding` are specified to treat equal loads
+as a TIE that the rotation cursor (or the URL order) breaks; residue turned every tie into a strict
+inequality, which skewed a 4-replica model's work 1.9x between its GPUs. And a charge far larger than
+the rest absorbed them: with a client claiming 2^62 rows, adding and then releasing its charge lost
+the smaller charges in flight beside it, so the counter ended below zero and that worker was favored
+for the rest of the process's life, while turning such a load into nanoseconds to compare it threw
+`InexactError` for every concurrent request (GW-4).
 
-A load counter does not return to exactly 0.0 when a worker drains: its charges are added and
-subtracted in different orders, and floating-point addition is not associative, so an idle worker
-keeps a couple of ulp (netai02 sat at 4.44e-16 on two GPUs and exactly 0.0 on the other two). The
-values are numerically meaningless, but comparing them raw is not: both `fill_least` and
-`least_outstanding` are specified to treat equal loads as a TIE and let the rotation cursor (or the
-URL order) break it, so that an idle fleet warms every replica. Residue turns every tie into a strict
-inequality, the tie-break never runs, and the residue-free workers win every time. On netai02 that
-skewed a 4-replica model's work 1.9x between its GPUs.
-
-Quantizing to a nanosecond restores the tie without hiding any difference that could matter: two
-workers whose in-flight work differs by less than a nanosecond of GPU time are, for routing purposes,
-carrying the same load. Integer keys then compare exactly.
+A nanosecond is far below the smallest charge that can exist (a single item of the cheapest model is
+microseconds), so the quantization hides no difference that could matter for routing.
 """
-_load_key(load::Real) = round(Int, Float64(load) * _LOAD_QUANTUM_INV)
+const _NS_PER_SECOND = 1.0e9
 
-# Snap a drained counter to exactly zero. Called after a release: if the counter has come back within
-# one quantum of zero, store a true 0.0 so the residue cannot accumulate over the process's life and
-# the exported gauge reads 0 when the worker is idle (a gauge showing 4.44e-16 reads as "busy" to a
-# human and to a `> 0` alert). The compare-and-swap is what makes it safe: if a concurrent charge
-# landed in between, the swap fails and the value it wrote stands, so no charge is ever lost.
-function _settle_zero!(c::Threads.Atomic{Float64})
-    v = c[]
-    (v != 0.0 && abs(v) * _LOAD_QUANTUM_INV < 1.0) && Threads.atomic_cas!(c, v, 0.0)
-    return nothing
+# The most quanta one request is charged: about 78 hours of GPU time, or 2.8e14 items. Far above any
+# real request, and far enough below `typemax(Int)` that 32768 requests charged this much can be in
+# flight on one worker before its counter could overflow.
+const MAX_CHARGE = 1 << 48
+
+"""
+    _quanta(x) -> Int
+
+`x` quanta of work, as the whole number a counter is charged: rounded, at least 1 (a request is never
+free, and a NaN or negative cost counts as one quantum), and at most `MAX_CHARGE`. Never throws.
+"""
+function _quanta(x::Real)
+    v = Float64(x)
+    v >= MAX_CHARGE && return MAX_CHARGE         # Inf included
+    v >= 1.0 || return 1                         # NaN, negative, and less than one quantum
+    return round(Int, v)
 end
 
 # --- per-worker in-flight work ------------------------------------------------------------------
 
-# The live per-worker work counters a work-routing scheduler compares, as `(basis, url => counter)`,
-# or `nothing` for a scheduler that tracks none (round_robin). This is the number that decides which
-# replica a request goes to, so exporting it is the difference between being able to explain a routing
-# decision and guessing at it.
+# The live per-worker work counters a work-routing scheduler compares, as
+# `(basis, url => counter, unit)`, where `unit` is what one quantum is worth in the unit the gauge
+# reports (1e-9 for nanoseconds reported as GPU-seconds, 1.0 for a count), or `nothing` for a
+# scheduler that tracks none (round_robin). This is the number that decides which replica a request
+# goes to, so exporting it is the difference between being able to explain a routing decision and
+# guessing at it.
 inflight_work(::GatewayScheduler) = nothing
 
 # Exported at SCRAPE time from the scheduler's live counters, the same pattern as `RoutedCollector`:
@@ -146,7 +153,7 @@ const _WORK_GAUGE_HELP =
 function Prometheus.collect!(out::Vector, c::WorkerWorkCollector)
     got = inflight_work(c.scheduler)
     got === nothing && return out
-    basis, counters = got
+    basis, counters, unit = got
     isempty(counters) && return out
     ln = Prometheus.LabelNames((:worker, :basis))
     b = String(basis)
@@ -156,7 +163,7 @@ function Prometheus.collect!(out::Vector, c::WorkerWorkCollector)
             samples, Prometheus.Sample(
                 nothing, ln,
                 Prometheus.LabelValues((get(c.worker_names, w, w), b)),
-                Float64(a[])
+                a[] * unit
             )
         )
     end
@@ -227,14 +234,14 @@ const WORK_BASES = (:compute, :items, :requests)
 mutable struct LeastOutstandingScheduler <: GatewayScheduler
     basis::Symbol
     meta::RoutingMeta                                    # shared routing metadata (batch axis + cost)
-    @atomic inflight::Dict{String, Threads.Atomic{Float64}}
+    @atomic inflight::Dict{String, Threads.Atomic{Int}}        # in quanta (see `_quanta`)
     lock::ReentrantLock
 end
 
 function LeastOutstandingScheduler(meta::RoutingMeta = RoutingMeta(); basis::Symbol = :compute)
     basis in WORK_BASES ||
         throw(ArgumentError("work basis must be one of $(WORK_BASES), got :$basis"))
-    return LeastOutstandingScheduler(basis, meta, Dict{String, Threads.Atomic{Float64}}(), ReentrantLock())
+    return LeastOutstandingScheduler(basis, meta, Dict{String, Threads.Atomic{Int}}(), ReentrantLock())
 end
 
 # Only the work bases need the control plane; `:requests` counts what it can see in the request itself.
@@ -247,13 +254,15 @@ function request_units(s::LeastOutstandingScheduler, model::AbstractString, body
     return request_items(routing_meta(s.meta), model, body)
 end
 
-# The load one request charges: its items, weighted by the model's cost per item under `:compute`.
+# The load one request charges, in quanta: one per request under `:requests`, one per item under
+# `:items`, and under `:compute` its items times the model's cost per item, in nanoseconds of GPU time.
 # Captured at selection and the identical value released, so a cost that changes in between (the
 # prober refolds the EWMA every tick) cannot leave the counters drifting.
 function _charge(s::LeastOutstandingScheduler, ctx::ScheduleContext)
-    units = Float64(max(ctx.units, 1))
-    s.basis === :compute || return units
-    return units * item_cost(routing_meta(s.meta), ctx.model)
+    s.basis === :requests && return 1
+    units = max(ctx.units, 1)
+    s.basis === :items && return _quanta(units)
+    return _quanta(units * item_cost(routing_meta(s.meta), ctx.model) * _NS_PER_SECOND)
 end
 
 # The in-flight load counter for `url`, creating it on first sight (lock + copy-on-write swap).
@@ -266,7 +275,7 @@ function _inflight_counter!(s::LeastOutstandingScheduler, url::AbstractString)
         cc = get(cur2, url, nothing)
         if cc === nothing
             nxt = copy(cur2)
-            cc = nxt[String(url)] = Threads.Atomic{Float64}(0.0)
+            cc = nxt[String(url)] = Threads.Atomic{Int}(0)
             @atomic s.inflight = nxt
         end
         cc
@@ -279,10 +288,9 @@ function select_replicas(s::LeastOutstandingScheduler, ctx::ScheduleContext)
     counters = [_inflight_counter!(s, u) for u in urls]
     best = 1
     for i in 2:length(urls)
-        # Quantized, so that equally loaded replicas compare EQUAL and the URL order breaks the tie
-        # as documented; raw float loads carry residue that would make every tie a strict inequality
-        # and pin the model to whichever replica happens to hold the smaller crumb (see `_load_key`).
-        ci, cb = _load_key(counters[i][]), _load_key(counters[best][])
+        # Whole quanta, so that equally loaded replicas compare EQUAL and the URL order breaks the tie
+        # as documented (see `_quanta`).
+        ci, cb = counters[i][], counters[best][]
         (ci < cb || (ci == cb && urls[i] < urls[best])) && (best = i)
     end
     charge = _charge(s, ctx)
@@ -291,13 +299,14 @@ function select_replicas(s::LeastOutstandingScheduler, ctx::ScheduleContext)
     return (vcat(urls[best], rest), (counters[best], charge))
 end
 
-function release!(::LeastOutstandingScheduler, res::Tuple{Threads.Atomic{Float64}, Float64})
+function release!(::LeastOutstandingScheduler, res::Tuple{Threads.Atomic{Int}, Int})
     Threads.atomic_sub!(res[1], res[2])
-    _settle_zero!(res[1])       # a drained worker reads exactly 0, not a few ulp of cancellation
     return nothing
 end
 
-inflight_work(s::LeastOutstandingScheduler) = (s.basis, @atomic s.inflight)
+# Nanoseconds reported as GPU-seconds under `:compute`; items or requests as counted otherwise.
+inflight_work(s::LeastOutstandingScheduler) =
+    (s.basis, @atomic(s.inflight), s.basis === :compute ? 1 / _NS_PER_SECOND : 1.0)
 
 # No preconditions to verify and nothing to place; the hook exists only to export the load gauge.
 function scheduler_start!(s::LeastOutstandingScheduler, ::ClientPool, metrics)

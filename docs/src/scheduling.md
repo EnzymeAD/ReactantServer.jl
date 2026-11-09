@@ -72,9 +72,11 @@ A caller waits for its request's result for at most `scheduler.dispatch_timeout_
 by default; 0 disables it), counted from submission, so queueing and execution together. Past it
 the request is withdrawn and the call fails with `DEADLINE_EXCEEDED`: a request still queued is
 dropped when the dispatch loop reaches it, without running, and one already executing finishes
-but its result is discarded. This is the bound that holds when nothing else does, for example a
-model whose weights read hangs. A client deadline is enforced separately, before dispatch (see
-[edf](#edf)).
+but its result is discarded. This is the bound that holds when nothing else does. A request whose
+model's weights read stops making progress fails sooner, with `UNAVAILABLE`, once the read is
+abandoned after `scheduler.weight_read_stall_seconds` (20 s by default, below the dispatch timeout so
+that such a request can fail over; see [On-demand Weights](on_demand_weights.md)). A client deadline
+is enforced separately, before dispatch (see [edf](#edf)).
 
 A gRPC call whose client cancels it withdraws its request the same way and is answered
 `CANCELLED`, so cancelled work is not run. That depends on gRPCServer reporting the cancellation;
@@ -88,7 +90,7 @@ the gateway can act on it (back off, try another replica, give up, re-register s
 | Status | When |
 | --- | --- |
 | `RESOURCE_EXHAUSTED` | the model's queue holds `max_queue_depth` requests, or the worker is at its `max_concurrent_requests` cap, or `/dev/shm` has no room for the pages of a shared-memory region the request reads or writes (see [Deployment](deployment.md)) |
-| `UNAVAILABLE` | the worker is shutting down or draining (see [Stopping](deployment.md#Stopping)), its dispatch loop has died, (externally managed residency) the model is not resident on this worker, or the model cannot be placed on this worker's device now (see [On-demand Weights](on_demand_weights.md#Memory-fragmentation-and-compaction)) |
+| `UNAVAILABLE` | the worker is shutting down or draining (see [Stopping](deployment.md#Stopping)), its dispatch loop has died, (externally managed residency) the model is not resident on this worker, the model cannot be placed on this worker's device now (see [On-demand Weights](on_demand_weights.md#Memory-fragmentation-and-compaction)), or the model's weights cannot be read now because reading them, or reading weights on this worker at all, has stalled (see [On-demand Weights](on_demand_weights.md)) |
 | `NOT_FOUND` | the model is not served here: never loaded, or unloaded or replaced while the request waited |
 | `DEADLINE_EXCEEDED` | the deadline passed before dispatch (the `edf` laxity drop included), or the dispatch timeout did |
 | `CANCELLED` | the client cancelled the call |
@@ -97,7 +99,10 @@ the gateway can act on it (back off, try another replica, give up, re-register s
 | `INTERNAL` | anything else: a failure on the server's side, logged on the worker with its backtrace under a request id; the client is told that id (and the exception text only under `grpc.error_detail: full`, see [Node Configuration](node_config.md)) |
 
 The worker's `worker_requests_total{status}` counts each request under the same status the
-client receives.
+client receives. Its `model` label (and that of `worker_request_latency_seconds`) is the model's
+name only when the worker serves a model of that name; a request for any other name, unknown or
+empty, counts under `model="_unknown"`, so names a client makes up add no series. The name is
+reserved: a worker refuses to load a bundle named `_unknown` (see [Bundles](bundles.md)).
 
 If the dispatch loop itself fails with an error no single request can be held to, the worker
 logs it with its backtrace, reports itself not live and not ready (`ServerLive`, `ServerReady`,
@@ -444,6 +449,7 @@ global:
     dispatch_timeout_seconds: 30.0 # longest a caller waits for its result; 0 = no limit
     compaction_interval: 0         # worker-local memory compaction every N on-demand loads
     coalescing: true               # merge queued requests per dispatch (false under regulated)
+    weight_read_stall_seconds: 20.0  # abandon a weights read with no progress this long; 0 = never
     models: {}                     # per-model overrides (weight, residency, max_batch_size)
 ```
 

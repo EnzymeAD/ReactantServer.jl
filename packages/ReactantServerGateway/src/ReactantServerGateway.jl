@@ -160,7 +160,7 @@ function serve_gateway(gateway_path::Union{AbstractString, Nothing} = nothing; b
     blocking && ReactantServerCore.watch_stdin_drain()
     cfg = load_gateway(gateway_path)
     pool = ClientPool(cfg)
-    routes = DiscoveredRoutes()
+    routes = DiscoveredRoutes(; retention = cfg.route_retention_seconds)
     gate = RegisterGate()
     # Map every worker endpoint url (gRPC and metrics, index-aligned to worker_names) to its friendly
     # name so gateway series read worker0..N instead of host:port and join the workers' own labels.
@@ -201,8 +201,7 @@ function serve_gateway(gateway_path::Union{AbstractString, Nothing} = nothing; b
     # Discover routes once synchronously so the table is populated before we accept traffic;
     # reachable endpoints are routable immediately, and the prober refreshes the rest.
     try
-        table = discover_routes(pool)
-        swap_table!(routes, table)
+        table = discover_routes!(routes, pool)
         set_routing_size!(metrics, nmodels(table))
     catch e
         @warn "initial route discovery failed; the health prober will retry" exception = e

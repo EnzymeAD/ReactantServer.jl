@@ -15,8 +15,12 @@ client behaves.
 
 [`KServeModel`](@ref) takes either `(host, port, model_name)` or a `url` of the form
 `grpc://host:port` (or bare `host:port`); `grpcs`/`https` selects a secure channel.
-`max_batch_size` caps how many items the batched drivers coalesce per request, and `deadline`
-is the per-request timeout in seconds (10 by default). [`infer_sync`](@ref)`(model, inputs)` sends
+`max_batch_size` caps how many items the batched drivers coalesce per request and must be at least
+1; anything smaller is refused with an `ArgumentError` when the model is constructed.
+[`describe_model`](@ref) reports a `max_batch_size` of 0 for a meta model and when the server does
+not know the limit, so do not pass that value through: pass the largest of the description's
+`batch_sizes`, or 1 when it lists none. `deadline` is the per-request timeout in seconds (10 by
+default). [`infer_sync`](@ref)`(model, inputs)` sends
 one request built from [`InferInput`](@ref) tensors, and [`InferOutput`](@ref) reads a named output
 back. Tensors use Julia's column-major layout with the batch axis last on both ends; the wire codec
 converts to KServe's row-major shapes.
@@ -76,7 +80,8 @@ slots (8 by default), which bounds how many chunks can be in flight against one 
 `scratch` is the same buffer-request interface meta models use through `call.scratch`; see the
 [Meta Models](meta_models.md) page. The lower-level path is still supported: carve a
 `subslot`, `pool_view` it, and return an `InferInput(name, sub, shape, T)` descriptor; both
-forms may be mixed in the returned vector.
+forms may be mixed in the returned vector. A descriptor whose shape needs more bytes than its
+subslot holds is refused with an `ArgumentError` on either transport.
 
 Slot boundaries are aligned (to a page for slots of at least a page, otherwise to 64 bytes), and
 `scratch` places every buffer at an offset aligned for its element type: within one call it lays
@@ -92,7 +97,30 @@ bytes into the response before `infer_decode_chunk!` sees it, so [`InferOutput`]
 the same on either transport. The default (empty) keeps every output inline. A non-empty
 vector also opts the IO into explicit-output mode: the request asks for exactly those outputs,
 so declare every output the IO consumes. Outputs with data-dependent shapes cannot be sized
-ahead of time and must stay inline.
+ahead of time and must stay inline; an `OutputSpec` with a negative dimension (such as the `-1`
+that [`describe_model`](@ref) reports for a variable axis) is refused with an `ArgumentError`.
+
+### When a chunk fails
+
+[`infer_sync`](@ref)`(model, io)` stops at the first chunk that fails and throws its exception.
+[`infer_async`](@ref) may have other chunks in flight when one fails:
+
+- Once a chunk has failed, no further chunk starts. A chunk already in flight finishes the attempt
+  it has sent (a shared-memory attempt cannot be abandoned safely) and then makes no further
+  attempt: no retry or backoff after a shed, and no re-registration of a stale shared-memory
+  registration. A result that still arrives is delivered to `infer_decode_chunk!`.
+- The call waits for those chunks before it throws, so once it returns or throws, nothing writes
+  into the IO or holds a pool slot for it.
+- It throws the original exception, not a `TaskFailedException`, so a
+  `gRPCClient.gRPCServiceCallException`, or an exception from your own `infer_encode_chunk!` or
+  `infer_decode_chunk!`, is caught by type exactly as from `infer_sync`. The chunk's backtrace stays
+  on the exception stack (`current_exceptions()`), where Julia prints it as "caused by".
+
+An unrecoverable shared-memory failure is not thrown: on either driver the endpoint latches to
+inline transport as described above and the whole batch runs again inline, so a chunk decoded
+before the failure is decoded again. When several chunks of an `infer_async` call fail, the first
+failure is thrown, except that an unrecoverable shared-memory failure takes precedence over the
+others, so that fallback happens even when another chunk failed first.
 
 ### Slot ownership
 

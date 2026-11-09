@@ -570,10 +570,11 @@ mutable struct LptPackingState <: GatewayScheduler
     # Exported as `gateway_replica_routed_total`, which is the only series that shows a starved
     # replica: its in-flight gauge reads 0 whether it is idle or never chosen.
     @atomic routed::Dict{Tuple{String, String}, Threads.Atomic{Int}}
-    # Per-worker in-flight compute load: the sum over a worker's in-flight requests of each routed
-    # model's cost weight (GPU-seconds). Drives fill_least's least-loaded batch-start choice. Every
-    # routed request, single- or multi-replica, contributes, so the load reflects all models.
-    @atomic worker_load::Dict{String, Threads.Atomic{Float64}}
+    # Per-worker in-flight load: the sum over a worker's in-flight requests of each one's charge, in
+    # whole quanta (nanoseconds of GPU time, or items under the `items` basis; see `_route_weight`
+    # and `_quanta`). Drives fill_least's least-loaded batch-start choice. Every routed request,
+    # single- or multi-replica, contributes, so the load reflects all models.
+    @atomic worker_load::Dict{String, Threads.Atomic{Int}}
     # per-model selection lock (multi-replica models only), so a pick-and-reserve is atomic and
     # concurrent requests do not stampede onto the same replica.
     @atomic sel_locks::Dict{String, ReentrantLock}
@@ -618,7 +619,7 @@ LptPackingState(cfg::GatewayConfig, meta::RoutingMeta = RoutingMeta(cfg)) = LptP
     Dict{String, Int}(), Dict{String, Float64}(), Dict{String, Placement}(),
     Dict{Tuple{String, String}, Threads.Atomic{Int}}(),
     Dict{Tuple{String, String}, Threads.Atomic{Int}}(),
-    Dict{String, Threads.Atomic{Float64}}(),
+    Dict{String, Threads.Atomic{Int}}(),
     Dict{String, ReentrantLock}(), Dict{String, FillRun}(), Dict{String, FillPlan}(),
     Set{Tuple{String, String}}(), Set{String}(), 0,
     TickReport(), RepackReport(), 0, 0, false, nothing
@@ -653,7 +654,8 @@ function set_knobs!(s::LptPackingState; kwargs...)
 end
 
 # Hot path: one dict lookup on an immutable snapshot plus an atomic increment. Insertion of a
-# never-seen model takes the lock once to swap in an extended copy.
+# never-seen model takes the lock once to swap in an extended copy, so the gateway passes only routed
+# models (see the generic in scheduler.jl): a name a client made up would cost a copy and stay forever.
 function record_arrival!(s::LptPackingState, model::AbstractString)
     counters = @atomic s.arrivals
     c = get(counters, model, nothing)
@@ -685,7 +687,7 @@ function _swap_outstanding!(s::LptPackingState, next::Dict{String, Placement})
     prev_runs = @atomic s.fill_runs
     out = Dict{Tuple{String, String}, Threads.Atomic{Int}}()
     routed = Dict{Tuple{String, String}, Threads.Atomic{Int}}()
-    wload = Dict{String, Threads.Atomic{Float64}}()
+    wload = Dict{String, Threads.Atomic{Int}}()
     locks = Dict{String, ReentrantLock}()
     runs = Dict{String, FillRun}()
     for (m, placement) in next
@@ -700,7 +702,7 @@ function _swap_outstanding!(s::LptPackingState, next::Dict{String, Placement})
         for (w, _) in placement
             out[(m, w)] = get(prev_out, (m, w), Threads.Atomic{Int}(0))
             routed[(m, w)] = get(prev_routed, (m, w), Threads.Atomic{Int}(0))
-            haskey(wload, w) || (wload[w] = get(prev_wload, w, Threads.Atomic{Float64}(0.0)))
+            haskey(wload, w) || (wload[w] = get(prev_wload, w, Threads.Atomic{Int}(0)))
         end
     end
     @atomic s.outstanding = out
@@ -1111,7 +1113,10 @@ register_routed!(s::LptPackingState, m::GatewayMetrics) =
 # The per-worker load `fill_least` compares, in whatever unit `work_basis` selects (see
 # `_route_weight`). Exported through the shared scrape-time collector in scheduler.jl, so a fleet on
 # either work-routing mode reads the same series.
-inflight_work(s::LptPackingState) = (knobs(s).work_basis, @atomic s.worker_load)
+function inflight_work(s::LptPackingState)
+    basis = knobs(s).work_basis
+    return (basis, @atomic(s.worker_load), work_unit(basis))
+end
 
 # After a repack, fan a CompactMemory out to the workers whose assignment changed, on the gateway's
 # compaction cadence. Counts every repack; once `compaction_interval` repacks have elapsed, the first
@@ -1288,13 +1293,14 @@ end
 const _COST_DEFAULT_KEY = ""
 
 # The work charged to a worker's load for one in-flight request of `model` carrying `units` items,
-# under `basis` (see `GatewayConfig.work_basis`):
+# under `basis` (see `GatewayConfig.work_basis`), in whole quanta (see `_quanta`):
 #
-#   :compute   items x the model's measured cost per ITEM, i.e. GPU-seconds. Comparable across models
-#              and honest about batch size, which is what `fill_least` compares.
+#   :compute   items x the model's measured cost per ITEM, i.e. GPU time, in nanoseconds. Comparable
+#              across models and honest about batch size, which is what `fill_least` compares.
 #   :items     items, cost-blind.
-#   :requests  the model's measured cost per REQUEST, whatever the request's size. This is what
-#              `fill_least` charged before the basis existed, kept as the exact pre-knob behavior.
+#   :requests  the model's measured cost per REQUEST, whatever the request's size, in nanoseconds.
+#              This is what `fill_least` charged before the basis existed, kept as the exact pre-knob
+#              behavior.
 #
 # Do NOT "fix" :requests by multiplying it by `units`: the per-request cost is measured from the
 # traffic the clients actually sent, so for a client that always sends 32 items it already IS the cost
@@ -1303,13 +1309,17 @@ const _COST_DEFAULT_KEY = ""
 # The value is captured at reservation and the identical value released, so a cost that changes in
 # between (every repack refolds the EWMA) never leaves the per-worker load drifting.
 function _route_weight(s::LptPackingState, model::AbstractString, units::Int, basis::Symbol)
-    basis === :items && return Float64(units)
-    basis === :compute && return units * item_cost(routing_meta(s.meta), model)
+    basis === :items && return _quanta(units)
+    basis === :compute && return _quanta(units * item_cost(routing_meta(s.meta), model) * _NS_PER_SECOND)
     snap = @atomic s.cost_snapshot                       # :requests, the pre-basis behavior
     c = get(snap, model, 0.0)
-    c > 0 && return c
-    return get(snap, _COST_DEFAULT_KEY, 1.0)
+    c > 0 || (c = get(snap, _COST_DEFAULT_KEY, 1.0))
+    return _quanta(c * _NS_PER_SECOND)
 end
+
+# What one quantum of `worker_load` is worth in the unit the gauge and the status RPC report: an item
+# under `items`, a nanosecond reported as GPU-seconds otherwise.
+work_unit(basis::Symbol) = basis === :items ? 1.0 : 1 / _NS_PER_SECOND
 
 # Reserve `model` on a single worker `w` (the n==1 fast path and the shared per-worker bookkeeping):
 # bump the per-(model,worker) and per-worker compute-load counters, returning the reservation tuple
@@ -1379,7 +1389,7 @@ function route_replica(s::LptPackingState, model::AbstractString, units::Integer
     # One resolved plan per request: the mode and the quantum must come from the same generation.
     # `units` is how many items this request carries, already resolved by `request_units`.
     plan = get(@atomic(s.fill_plan), model, _DEFAULT_FILL_PLAN)
-    units = max(Int(units), 1)
+    units = clamp(Int(units), 1, MAX_REQUEST_ITEMS)   # what the gateway believes; see `request_item_count`
     weight = _route_weight(s, model, units, k.work_basis)
 
     if n == 1
@@ -1410,11 +1420,9 @@ function route_replica(s::LptPackingState, model::AbstractString, units::Integer
         run = get(all_runs, model, nothing)
         run === nothing && (run = FillRun())
         # Read lazily: only the fill_least paths need it, and reading per candidate avoids the
-        # Vector{Float64} this function used to allocate on every multi-replica request.
-        # QUANTIZED, because the exact-tie rotation below depends on equal loads comparing equal, and
-        # float loads do not return to exactly 0.0: a worker's charges are added and subtracted in
-        # different orders, so an idle worker retains a couple of ulp
-        wload_of(i) = (wa = get(wload_snap, workers[i], nothing); wa === nothing ? 0 : _load_key(wa[]))
+        # vector this function used to allocate on every multi-replica request. Whole quanta, so the
+        # exact-tie rotation below sees equal loads as equal (see `_quanta`).
+        wload_of(i) = (wa = get(wload_snap, workers[i], nothing); wa === nothing ? 0 : wa[])
         rot(i) = mod(i - 1 - run.cursor, n)       # 0-based distance from the rotation cursor
 
         chosen = 0
@@ -1488,10 +1496,7 @@ function _release_route!(counters)
     # The captured `units` and `weight` are subtracted, not recomputed: a repack between reservation
     # and release changes both, and recomputing would leave the counters drifting.
     mwc === nothing || Threads.atomic_sub!(mwc, units)
-    if wload !== nothing
-        Threads.atomic_sub!(wload, weight)
-        _settle_zero!(wload)    # a drained worker reads exactly 0, not a few ulp of cancellation
-    end
+    wload === nothing || Threads.atomic_sub!(wload, weight)
     return nothing
 end
 
@@ -1503,13 +1508,13 @@ release!(::LptPackingState, reservation) = _release_route!(reservation)
 
 # How many items a request carries, for the item-denominated quantum and in-flight counters. The
 # worker told us where to look (see `FillPlan`); a model that declares no batch axis, or a request
-# missing that input, counts as one item. Only this scheduler pays the peek: the generic default in
-# scheduler.jl returns 1 without touching the body.
+# missing that input, counts as one item, and no request counts as more items than it carries bytes
+# of data for that input (`request_item_count`). Only this scheduler pays the peek: the generic
+# default in scheduler.jl returns 1 without touching the body.
 function request_units(s::LptPackingState, model::AbstractString, body::AbstractVector{UInt8})
     plan = get(@atomic(s.fill_plan), model, nothing)
-    (plan === nothing || plan.batch_axis < 1) && return 1
-    n = peek_batch_size(body, plan.batch_input, plan.batch_axis)
-    return n > 0 ? n : 1
+    plan === nothing && return 1
+    return request_item_count(body, plan.batch_input, plan.batch_axis)
 end
 
 scheduler_repack_seq(s::LptPackingState) = @atomic s.repack_requested
@@ -1586,8 +1591,8 @@ fails fast. The supervisor sets this to wait for the workers it co-launches (see
 Once all workers are reachable, FIFO discipline and identical model sets are hard requirements and
 a violation raises with the offending worker named.
 
-Every poll is watchdog-bounded (`call_timeout`): the gateway's clients share one libcurl multi
-handle whose request semaphore caps in-flight requests at GRPC_MAX_STREAMS (16). After the burst of
+Every poll is watchdog-bounded (`call_timeout`): each worker's polls run on its probe handle, a
+libcurl multi handle whose request semaphore caps in-flight requests at GRPC_MAX_STREAMS (16). After the burst of
 failed connects during warmup the handle's socket/timer driving can stall, so in-flight requests
 never complete, never return their semaphore slot, and every new call blocks at acquire forever (the
 "wedge"). A worker that is merely down refuses fast and releases its slot; but if every worker's
@@ -1621,7 +1626,7 @@ function verify_lpt_packing_preconditions!(
                 push!(pending, wc.url)
                 # A hung call (not a fast refuse) means the worker was caught mid-stall and its
                 # connection is poisoned; drop it so the next poll reconnects fresh.
-                to && (timed_out += 1; reset_clients!(wc))
+                to && (timed_out += 1; reset_probe_connection!(wc))
             else
                 statuses[wc.url] = resp
             end

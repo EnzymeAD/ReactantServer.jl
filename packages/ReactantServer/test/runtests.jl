@@ -38,11 +38,13 @@ include("grpc_helpers.jl")
     include("test_mock_runtime.jl")
     include("test_status_cancel.jl")
     include("test_coalesce_isolation.jl")
+    include("test_intake.jl")           # after test_status_cancel.jl: reuses its helpers
     include("test_meta.jl")
     include("test_weight_cache.jl")
     include("test_host_cache.jl")
     include("test_weight_staging.jl")
     include("test_staging_release.jl")   # after test_weight_staging.jl: reuses its helpers
+    include("test_stalled_reads.jl")     # likewise
     include("test_admission.jl")
     include("test_weights_version.jl")
     include("test_weights_file.jl")

@@ -96,6 +96,62 @@ function release_meta_gate!(g::MetaGate)
     return nothing
 end
 
+# A background read of one model's weights into host memory, from its start until it returns,
+# stalled or not (see "Staging" below). `kind` is what it reads for: `:stage`, the model's queued
+# requests; `:prefetch`, a StageWeights hold; `:residency`, a residency change (`set_residency!`).
+# Guarded by the scheduler's `cond`, except `progress`, which the reading task advances as bytes
+# arrive.
+mutable struct WeightRead
+    entry::ModelEntry
+    kind::Symbol
+    prefetch::Any                     # the StageWeights hold (`Prefetched`) it fills, or nothing
+    progress::ReadProgress
+    task::Union{Task, Nothing}
+    timer::Union{Timer, Nothing}      # the stall check, while it is watched
+    started::Float64
+    ended::Bool                       # it returned
+    stalled::Bool                     # abandoned for want of progress: nothing waits for it any more
+    close_weights::Bool               # its model was unloaded meanwhile: close the weights file once it returns
+    outcome::Any                      # StageWeights: the model's row (state, read, seconds, error);
+    # a residency change: `Some(result)`, or the exception it failed or stalled with
+    done::Base.Event                  # StageWeights, a residency change: notified once `outcome` is set
+end
+
+# The most stalled reads a worker leaves outstanding before it starts no more: each holds a
+# default-pool thread in a system call nothing can interrupt, and the memory it reads into. Four, or
+# a quarter of the default pool when that is fewer, and at least one.
+const _MAX_STALLED_READS = 4
+_stalled_read_bound() = clamp(Threads.nthreads(:default) ÷ 4, 1, _MAX_STALLED_READS)
+
+"""
+    DISPATCH_STALL_SECONDS
+
+The default of how long the dispatch loop may go without progress, with work in hand, before the
+worker reports itself not live (and not ready): 600 s. A dispatch, a weight upload, a compaction
+or a control command is one unit of work, and a legitimate one can take seconds to minutes (a large
+model read from slow storage, a dynamic-mode compile), so the default is well beyond that and twenty
+times the default request timeout (`scheduler.dispatch_timeout_seconds`, 30 s): a loop that has
+finished nothing for that long while requests wait serves nobody.
+`REACTANT_LIVENESS_DISPATCH_STALL_SECONDS` sets it (`0` turns the check off); the node supervisor
+passes its `liveness.dispatch_stall_seconds`.
+"""
+const DISPATCH_STALL_SECONDS = 600.0
+
+# Whether the dispatch loop is making progress. The loop stamps `since` when it takes up work and
+# again after each unit of work it finishes, and clears it (0) while it waits with nothing to do, so
+# `since` is the last sign of progress while it holds work. Read without the scheduler lock (which a
+# stuck loop may hold) by the liveness and readiness checks, through `dispatch_stalled`.
+mutable struct DispatchProgress
+    const since::Threads.Atomic{Float64}
+    const reported::Threads.Atomic{Bool}   # the current stall has been logged
+    stall_seconds::Float64                 # no progress this long with work in hand is a stall; 0 = never
+end
+DispatchProgress(stall_seconds::Real = DISPATCH_STALL_SECONDS) =
+    DispatchProgress(Threads.Atomic{Float64}(0.0), Threads.Atomic{Bool}(false), Float64(stall_seconds))
+
+_mark_progress!(p::DispatchProgress) = (p.since[] = time(); p.reported[] = false; nothing)
+_mark_idle!(p::DispatchProgress) = (p.since[] = 0.0; p.reported[] = false; nothing)
+
 """
     Scheduler
 
@@ -137,6 +193,11 @@ mutable struct Scheduler
     on_failure::Any                            # `f(err)` run once if the dispatch loop dies, or nothing
     vfloor::Float64                            # virtual time of the most recent fair dispatch; never
     # decreases (see `_select_fair!`); guarded by `cond`
+    progress::DispatchProgress                 # the dispatch loop's last progress (see `dispatch_stalled`)
+    reads::Vector{WeightRead}                  # background weight reads that have not returned, the
+    # stalled ones included (see "Staging"); guarded by `cond`
+    stalled_reads::Int                         # weight reads abandoned so far; guarded by `cond`
+    stalled_read_bound::Int                    # with this many stalled reads outstanding, no read starts
 end
 
 function Scheduler(registry::ModelRegistry, backend::AbstractBackend, pool::MemoryPool, cfg::SchedulerConfig)
@@ -144,7 +205,7 @@ function Scheduler(registry::ModelRegistry, backend::AbstractBackend, pool::Memo
         registry, backend, pool, cfg,
         Threads.Condition(), false, nothing, nothing, nothing, ControlCommand[],
         MetaGate(1), QueuedRequest[], 0, nothing, ReentrantLock(), Dict{String, Any}(),
-        nothing, nothing, 0.0
+        nothing, nothing, 0.0, DispatchProgress(), WeightRead[], 0, _stalled_read_bound()
     )
 end
 
@@ -277,6 +338,30 @@ function _batch_extents_agree(entry::ModelEntry, inputs::AbstractVector{NamedTen
     return true
 end
 
+# Whether request `b`'s batched executable inputs can be concatenated with request `a`'s row for row:
+# each has the same element type and the same extent on every axis but its batch axis (STG-1), which
+# is what `cat` along the batch axis requires (a missing trailing axis counting as 1). Validation
+# checks the client's inputs, but a model's preprocess can emit a tensor whose other axes, or element
+# type, differ for some inputs. Merged with others, such a tensor failed the concatenation, or the
+# program, for every request in the dispatch; it ends the coalescing prefix instead, so it runs apart
+# from the well-formed requests and fails without them. Like `_batch_extents_agree`, this reads a few
+# sizes per request as the queue is planned.
+function _rows_alike(entry::ModelEntry, a::AbstractVector{NamedTensor}, b::AbstractVector{NamedTensor})
+    for sp in entry.manifest.executable_inputs
+        ax = sp.batch_axis
+        ax === nothing && continue
+        i = findfirst(t -> t.name == sp.name, a)
+        j = findfirst(t -> t.name == sp.name, b)
+        (i === nothing || j === nothing) && return false
+        x, y = a[i].data, b[j].data
+        eltype(x) == eltype(y) || return false
+        for d in 1:max(ndims(x), ndims(y))
+            d == ax || size(x, d) == size(y, d) || return false
+        end
+    end
+    return true
+end
+
 # A model can coalesce multiple requests only when EVERY executable input carries a batch axis and
 # every output does too (so inputs concatenate and outputs split per request). Otherwise it serves
 # one request per dispatch. Single unbatched modules (batch key 0) are never coalesced. The strict
@@ -311,7 +396,8 @@ _smallest_ge(sizes::Vector{Int}, n::Int) = (i = findfirst(>=(n), sizes); i === n
 # dispatches alone. For non-coalescable models exactly one request is taken at its own size, and so
 # is it for every model when `coalesce` is false (`scheduler.coalescing`), so a request's rows always
 # occupy the same slots of the same program whatever else is queued. A request whose batched inputs
-# disagree on their batch extent is never coalesced either: it dispatches alone.
+# disagree on their batch extent is never coalesced either: it dispatches alone. Nor are requests
+# whose inputs differ from each other off the batch axis or in element type (`_rows_alike`).
 function plan_batch(entry::ModelEntry, st::ModelSchedState; coalesce::Bool = true)
     isempty(st.queue) && return nothing
     front = st.queue[1]
@@ -345,11 +431,15 @@ function plan_batch(entry::ModelEntry, st::ModelSchedState; coalesce::Bool = tru
 
     # The leading run of same-variant requests is the only window we may coalesce within (keeps
     # `taken` a contiguous front prefix so _finalize can deleteat! it, and preserves FIFO order).
-    # A request whose batch extents disagree also ends it; it leads a later dispatch, alone.
+    # A request whose batch extents disagree also ends it; it leads a later dispatch, alone. So does
+    # one whose inputs differ from the front request's on any other axis or in element type
+    # (`_rows_alike`); it leads a later dispatch, shared only with requests whose inputs match its
+    # own. When the front request is the odd one, it dispatches without the others.
     nprefix = 0
     for qr in st.queue
         _request_variant(entry, qr.prepared) == variant || break
         _batch_extents_agree(entry, qr.prepared) || break
+        qr === front || _rows_alike(entry, front.prepared, qr.prepared) || break
         nprefix += 1
     end
     prefix = view(st.queue, 1:nprefix)
@@ -1076,13 +1166,35 @@ _unavailable(s::Scheduler) = WorkerUnavailableError(
     dispatch_alive(scheduler) -> Bool
 
 Whether the dispatch loop can still serve: `false` once it has died with an unexpected error
-(the worker then reports not live and not ready, and rejects every request with `UNAVAILABLE`).
+(the worker then reports not live and not ready, and rejects every request with `UNAVAILABLE`),
+and `false` while it is stalled (`dispatch_stalled`), which ServerLive, ServerReady,
+ModelReady, `/healthz` and `/readyz` all report until it makes progress again.
 """
 function dispatch_alive(s::Scheduler)
     s.failure === nothing || return false
     t = s.task
     # A loop task that ended while the scheduler still runs died some way the guard did not see.
-    return !(s.running && t !== nothing && istaskdone(t))
+    s.running && t !== nothing && istaskdone(t) && return false
+    return !dispatch_stalled(s)
+end
+
+"""
+    dispatch_stalled(scheduler; now=time()) -> Bool
+
+Whether the dispatch loop holds work (a dispatch, a control command, or more requests queued
+behind the one it finished) and has made no progress for longer than its stall limit
+(`DISPATCH_STALL_SECONDS` by default): stuck in a GPU call that never returns, say, while
+the threads that answer health checks are still free. An idle loop is never stalled, however long
+it waits. Lock-free, so a loop stuck while holding the scheduler lock cannot block it.
+"""
+function dispatch_stalled(s::Scheduler; now::Real = time())
+    p = s.progress
+    p.stall_seconds > 0 || return false
+    t = p.since[]
+    (t > 0 && now - t > p.stall_seconds) || return false
+    Threads.atomic_cas!(p.reported, false, true) ||
+        @error "the dispatch loop has made no progress for $(round(now - t; digits = 1))s with work in hand; reporting this worker not live and not ready until it does" stall_seconds = p.stall_seconds
+    return true
 end
 
 # Build zero-filled executable inputs at batch size `sz` (0 = unbatched) and input-shape `variant`
@@ -1162,11 +1274,64 @@ end
 # This runs after every pass of the dispatch loop and on every submission, so whatever left a queued
 # model off the device (an eviction, a compaction, a residency change) has marked it before the next
 # selection.
+#
+# A read that stops making progress is abandoned. Storage that stops answering (a hard NFS mount, a
+# shared-store lock held by a stuck worker) leaves a read in a system call that never returns and
+# cannot be interrupted, holding its slot: two of them would leave every other cold model `:pending`
+# for good while the worker still reports ready. So a read counts the bytes it reads as it goes
+# (`ReadProgress`), and one that goes `scheduler.weight_read_stall_seconds` without any is abandoned
+# (`_check_stall!`): its model's queued requests fail with `UNAVAILABLE` (`WeightsReadStalledError`,
+# which a gateway retries on another replica), its slot passes to the next model, and nothing waits
+# for it any more, the dispatch loop included. It stays in `s.reads` until it returns, if it ever does,
+# and then what it read is released and used by nothing. Until then its model is not read again (a
+# second read would hang the same way and hold another thread), so requests for it fail at once. Each
+# stalled read holds a thread, so with `stalled_read_bound` of them outstanding the worker starts no
+# read of storage at all and every request for a model off the device fails at once, except for a
+# model with a copy in this worker's host cache, whose read takes it from RAM. Models on the device
+# serve throughout.
 
 const _MAX_HOST_STAGES = 2
 
-# Start background reads for models that need one, up to the cap, and mark the rest `:pending`.
-# Caller holds `s.cond`.
+# Why no read of `e`'s weights may start now, or nothing: an earlier read of it stalled and has not
+# returned, or so many reads have that none starts. At that bound a model whose weights are in a
+# private host copy is still read, since its read touches no storage. Caller holds `s.cond`.
+function _stall_refusal(s::Scheduler, e::ModelEntry)
+    name = e.name
+    n = 0
+    own = false
+    for r in s.reads
+        r.stalled || continue
+        n += 1
+        r.entry.name == name && (own = true)
+    end
+    own && return "model '$name' is not loaded on this worker now: an earlier read of its weights " *
+        "stalled and has not returned, and it is not read again until it does (the weights storage " *
+        "may not be answering)"
+    (n < s.stalled_read_bound || _private_host_copy(s, e)) && return nothing
+    stalled = n == 1 ? "a read of model weights stalled and has" : "$n reads of model weights stalled and have"
+    return "model '$name' is not loaded on this worker now: $stalled not returned, so no new read of " *
+        "storage starts until one does (the weights storage may not be answering)"
+end
+
+# Whether `e`'s weights are in this worker's private host cache, so reading them takes them from
+# RAM. A region in the shared store does not count: taking it waits on a lock another worker may hold.
+function _private_host_copy(s::Scheduler, e::ModelEntry)
+    wc = s.weight_cache
+    return wc !== nothing && !(wc.store isa SharedWeightStore) && has_host_copy(wc, e)
+end
+
+# Answer every request queued for `e` with `err`. Caller holds `s.cond`.
+function _fail_queued!(e::ModelEntry, err)
+    for qr in e.sched.queue
+        put!(qr.reply, err)
+    end
+    empty!(e.sched.queue)
+    return nothing
+end
+
+# Start background reads for models that need one, up to the cap, and mark the rest `:pending`. A
+# model that may not be read now (`_stall_refusal`) has its requests failed instead. Caller holds
+# `s.cond`.
 function _kick_staging!(s::Scheduler)
     wc = s.weight_cache
     (wc === nothing || !s.running) && return nothing
@@ -1196,12 +1361,18 @@ function _kick_staging!(s::Scheduler)
             e.sched.host_stage = :staged
             continue
         elseif pf !== nothing && pf.staged === nothing
-            e.sched.host_stage = :pending         # its read is under way; `stage_weights!` kicks again after
+            e.sched.host_stage = :pending         # its read is under way and kicks again when it lands
+            continue
+        end
+        why = _stall_refusal(s, e)
+        if why !== nothing
+            _fail_queued!(e, WeightsReadStalledError(e.name, why))
+            e.sched.host_stage = :none
             continue
         end
         if busy < _MAX_HOST_STAGES
             e.sched.host_stage = :staging
-            e.sched.stage_task = Threads.@spawn :default _run_stage!(s, e)
+            e.sched.stage_task = _start_read!(r -> _run_stage!(s, r), s, e; kind = :stage).task
             busy += 1
         else
             e.sched.host_stage = :pending
@@ -1210,49 +1381,153 @@ function _kick_staging!(s::Scheduler)
     return nothing
 end
 
-# The background read for one model. On success the model waits, staged, for its dispatch; if it
-# was unloaded, loaded some other way, or the read failed, the read is dropped and the dispatch
-# loads the model itself. It is dropped too when nothing is queued for the model any more, as
-# happens when something else loaded the model while the read ran (a compaction told to reload it)
-# and the model then served its requests and was evicted again: held for a dispatch that never comes,
-# the read would keep its slot for good. Either way the loop is woken to reconsider it.
-function _run_stage!(s::Scheduler, entry::ModelEntry)
-    wc = s.weight_cache::WeightCache
-    staged = nothing
-    failure = nothing
-    try
-        staged = stage_host_weights(wc, entry)
-    catch err
-        failure = err
-        @warn "reading weights ahead of the dispatch failed; failing the model's queued requests" model = entry.name exception = (err, catch_backtrace())
+# Start a background read of `e`'s weights for `kind` (see `WeightRead`): `body(r)` on a
+# default-pool task, with a timer that checks it for progress when `weight_read_stall_seconds` is on.
+# `prefetch` is the StageWeights hold it fills. Caller holds `s.cond`, which `body` takes to record the
+# result, so `r.task` is set first.
+function _start_read!(body, s::Scheduler, e::ModelEntry; kind::Symbol, prefetch = nothing)
+    r = WeightRead(e, kind, prefetch, ReadProgress(), nothing, nothing, time(), false, false, false, nothing, Base.Event())
+    push!(s.reads, r)
+    limit = s.cfg.weight_read_stall_seconds
+    if limit > 0
+        tick = clamp(limit / 8, 0.01, 5.0)
+        r.timer = Timer(_ -> _check_stall!(s, r), tick; interval = tick, spawn = true)
     end
+    r.task = Threads.@spawn :default body(r)
+    return r
+end
+
+# Read `r`'s model into host memory, counting the bytes as progress: the StagedWeights, or nothing
+# and the failure with its backtrace.
+function _watched_read(wc::WeightCache, r::WeightRead)
+    try
+        return with_read_progress(() -> stage_host_weights(wc, r.entry), r.progress), nothing
+    catch err
+        return nothing, (err, catch_backtrace())
+    end
+end
+
+# A read's progress check, run by its timer: abandon it once it has gone the stall limit without
+# reading a byte.
+function _check_stall!(s::Scheduler, r::WeightRead)
+    limit = s.cfg.weight_read_stall_seconds
+    report = lock(s.cond) do
+        (r.ended || r.stalled) && return nothing
+        idle = max(Int64(time_ns()) - (@atomic r.progress.last_ns), 0) / 1.0e9
+        idle < limit && return nothing
+        _abandon_read!(s, r, idle)
+        return (idle = idle, outstanding = count(x -> x.stalled, s.reads))
+    end
+    report === nothing && return nothing
+    @warn "a weights read made no progress for the stall limit and was abandoned; the model is not read again on this worker until it returns" model = r.entry.name purpose = _READ_PURPOSE[r.kind] seconds_without_progress = round(report.idle; digits = 1) bytes_read = (@atomic r.progress.bytes) stalled_reads = report.outstanding no_reads_at = s.stalled_read_bound
+    return nothing
+end
+
+const _READ_PURPOSE = Dict(:stage => "queued requests", :prefetch => "StageWeights", :residency => "a residency change")
+
+# Abandon a read that stalled: fail the requests waiting for it, or answer the StageWeights call or
+# the residency change waiting for it, and give its slot to the next model. The read itself goes on
+# until it returns. Caller holds `s.cond`.
+function _abandon_read!(s::Scheduler, r::WeightRead, idle::Float64)
+    r.stalled = true
+    s.stalled_reads += 1
+    r.timer === nothing || close(r.timer)
+    e = r.entry
+    msg = "reading the weights of model '$(e.name)' stalled: no progress for $(round(idle; digits = 1)) s, " *
+        "so the read was abandoned (the weights storage may not be answering); this worker does not read " *
+        "the model again until that read returns"
+    if r.kind === :stage
+        st = e.sched
+        if st !== nothing && st.host_stage === :staging && st.stage_task === r.task
+            _fail_queued!(e, WeightsReadStalledError(e.name, msg))
+            st.host_stage = :none
+            st.stage_task = nothing
+        end
+    elseif r.kind === :prefetch
+        # The hold goes now: left with nothing in it, it would keep the model `:pending`.
+        pf = r.prefetch
+        get(s.prefetched, e.name, nothing) === pf && delete!(s.prefetched, e.name)
+        r.outcome = (state = "failed", read = false, seconds = time() - r.started, error = msg)
+        notify(r.done)
+    else
+        r.outcome = WeightsReadStalledError(e.name, msg)
+        notify(r.done)
+    end
+    _kick_staging!(s)
+    notify(s.cond)
+    return nothing
+end
+
+# The bookkeeping of a read that returned, stalled or not: it is no longer outstanding. Returns
+# whether its model was unloaded meanwhile, so the caller closes the weights file once it has
+# released what the read holds. Caller holds `s.cond`.
+function _read_ended!(s::Scheduler, r::WeightRead)
+    r.ended = true
+    r.timer === nothing || close(r.timer)
+    i = findfirst(x -> x === r, s.reads)
+    i === nothing || deleteat!(s.reads, i)
+    return r.close_weights
+end
+
+# How to let go of the StagedWeights `drop` a read returned with, or nothing to let go of.
+_releaser(wc::WeightCache, r::WeightRead, drop) =
+    drop === nothing ? nothing : () -> release_staged!(wc, r.entry, drop; uploaded = false)
+
+# Release what a read returned with (`release()`, when it is not nothing), then close its model's
+# weights file if the model was unloaded while it ran; log a stalled read's return.
+function _after_read!(r::WeightRead, release, close_file::Bool, stalled::Bool, failure)
+    try
+        release === nothing || release()
+    finally
+        close_file && close_weights!(r.entry.weights)
+    end
+    stalled && @info "a stalled weights read returned; what it read was released, unused" model = r.entry.name seconds_since_start = round(time() - r.started; digits = 1) bytes_read = (@atomic r.progress.bytes) outcome = (failure === nothing ? "read" : sprint(showerror, failure[1]))
+    return nothing
+end
+
+# The background read for one model's queued requests. On success the model waits, staged, for its
+# dispatch; if it was unloaded, loaded some other way, or the read failed, the read is dropped and
+# the dispatch loads the model itself. It is dropped too when nothing is queued for the model any
+# more, as happens when something else loaded the model while the read ran (a compaction told to
+# reload it) and the model then served its requests and was evicted again: held for a dispatch that
+# never comes, the read would keep its slot for good. A read abandoned as stalled is dropped
+# whenever it returns. Either way the loop is woken to reconsider the model.
+function _run_stage!(s::Scheduler, r::WeightRead)
+    entry = r.entry
+    wc = s.weight_cache::WeightCache
+    staged, failure = _watched_read(wc, r)
     drop = nothing
+    close_file = false
+    stalled = false
     lock(s.cond) do
+        close_file = _read_ended!(s, r)
+        stalled = r.stalled
         st = entry.sched
         live = s.running && get(s.registry.by_name, entry.name, nothing) === entry
-        if staged !== nothing && live && st.host_stage === :staging && entry.executable.weights === nothing &&
+        if stalled
+            drop = staged                         # its requests were answered when it was abandoned
+        elseif staged !== nothing && live && st.host_stage === :staging && entry.executable.weights === nothing &&
                 !isempty(st.queue)
             st.staged = staged
             st.host_stage = :staged
+            st.stage_task = nothing
         else
             drop = staged
             # A failed read is not repeated on the dispatch loop: the requests waiting for it get the
             # error, as they would have from a load that failed there, and the next request for the
             # model starts a fresh read.
             if failure !== nothing && st.host_stage === :staging
-                err = ErrorException("reading the weights of model '$(entry.name)' failed: $(sprint(showerror, failure))")
-                for qr in st.queue
-                    put!(qr.reply, err)
-                end
-                empty!(st.queue)
+                _fail_queued!(entry, ErrorException("reading the weights of model '$(entry.name)' failed: $(sprint(showerror, failure[1]))"))
             end
             st.host_stage === :staging && (st.host_stage = :none)
+            st.stage_task = nothing
         end
-        st.stage_task = nothing
         _kick_staging!(s)
         notify(s.cond)
     end
-    drop === nothing || release_staged!(wc, entry, drop; uploaded = false)
+    failure === nothing || stalled ||
+        @warn "reading weights ahead of the dispatch failed; failing the model's queued requests" model = entry.name exception = failure
+    _after_read!(r, _releaser(wc, r, drop), close_file, stalled, failure)
     return nothing
 end
 
@@ -1310,13 +1585,15 @@ end
 Read the weights of each model in `names` (each sub-model of a meta) into host memory ahead of a
 placement change, and hold them for `hold_seconds` (at most $(_PREFETCH_HOLD_MAX_SECONDS) s) or
 until the model's first dispatch uploads them. Runs the reads on default-pool tasks, never on the
-dispatch loop, and returns once they end. One row per requested name (a meta's combines its
+dispatch loop, and returns once they end, or once a read that stopped making progress is abandoned
+(`scheduler.weight_read_stall_seconds`). One row per requested name (a meta's combines its
 sub-models', taking the worst state):
 
 - `state`: `"resident"` (on the device, or with a host floor: nothing to read), `"staged"` (held
   in host memory now), `"deferred"` (the held bytes would pass the cap; ask again later),
   `"skipped"` (a CPU or externally-managed worker, where the gateway does not place weights), or
-  `"failed"` (the read failed, `error` says why)
+  `"failed"` (the read failed or stalled, reads of model weights on this worker have stalled, or
+  the model was unloaded or replaced before its weights could be held; `error` says why)
 - `read`: whether the weights came from the weights file rather than a host copy
 - `nbytes`, `seconds`: the model's weight bytes, and how long the read took
 """
@@ -1362,7 +1639,7 @@ function _stage_entries!(s::Scheduler, wc, entries::Vector{ModelEntry}, hold::Fl
         nbytes = e.executable === nothing ? 0 : Int(e.executable.nbytes), seconds = seconds, error = error,
     )
     rows = NamedTuple[]
-    pending = Tuple{ModelEntry, Prefetched}[]
+    pending = Tuple{ModelEntry, WeightRead}[]
     for e in entries
         if wc === nothing || wc.mode != SELF_MANAGED
             push!(rows, row(e, "skipped"))
@@ -1373,55 +1650,90 @@ function _stage_entries!(s::Scheduler, wc, entries::Vector{ModelEntry}, hold::Fl
             push!(rows, row(e, "resident"))
             continue
         end
-        state = lock(s.cond) do
+        state, msg = lock(s.cond) do
+            # `stage_weights!` took the entries under an earlier hold of the lock, and a reload or
+            # unload may have run since. Such an entry's weights file is closed (a read could get
+            # another file's bytes through a reused descriptor, or fill a shared region under the old
+            # version's digest), and a hold made for it would never be claimed: the version now
+            # registered would wait behind it, `:pending`, for good (`_kick_staging!`).
+            get(s.registry.by_name, e.name, nothing) === e ||
+                return ("failed", "model '$(e.name)' was unloaded or replaced before its weights were read; ask again")
             pf = get(s.prefetched, e.name, nothing)
             if pf !== nothing
                 pf.expires = max(pf.expires, time() + hold)      # an earlier request's read covers it
-                return "staged"
+                return ("staged", "")
             end
-            e.sched !== nothing && e.sched.host_stage in (:staging, :staged) && return "staged"
+            e.sched !== nothing && e.sched.host_stage in (:staging, :staged) && return ("staged", "")
+            why = _stall_refusal(s, e)
+            why === nothing || return ("failed", why)
             held = sum((p.nbytes for p in values(s.prefetched)); init = 0)
-            held + m.nbytes > _prefetch_cap(wc) && return "deferred"
+            held + m.nbytes > _prefetch_cap(wc) && return ("deferred", "")
             pf = Prefetched(nothing, nothing, Inf, Int(m.nbytes))
-            pf.task = Threads.@spawn :default stage_host_weights(wc, e)
             s.prefetched[e.name] = pf
-            push!(pending, (e, pf))
-            return ""
+            r = _start_read!(r -> _run_prefetch!(s, r, hold), s, e; kind = :prefetch, prefetch = pf)
+            pf.task = r.task
+            push!(pending, (e, r))
+            return ("", "")
         end
-        isempty(state) || push!(rows, row(e, state))
+        isempty(state) || push!(rows, row(e, state; error = msg))
     end
-    for (e, pf) in pending
-        t0 = time()
-        staged = nothing
-        err = ""
-        try
-            staged = fetch(pf.task::Task)
-        catch ex
-            err = sprint(showerror, ex isa TaskFailedException ? ex.task.result : ex)
-        end
-        dt = time() - t0
-        keep = lock(s.cond) do
+    # Each read sets its row when it returns, or when it is abandoned as stalled, so this wait ends
+    # within the stall limit even when a read never returns.
+    for (e, r) in pending
+        wait(r.done)
+        o = r.outcome
+        push!(rows, row(e, o.state; read = o.read, seconds = o.seconds, error = o.error))
+    end
+    return rows
+end
+
+# The read behind a StageWeights hold. What it read is held for the model's first dispatch, and the
+# call that asked for it is answered with the model's row (`r.outcome`, then `r.done`). A read
+# abandoned as stalled has had its call answered and its hold dropped already; whatever it returns
+# with is released.
+function _run_prefetch!(s::Scheduler, r::WeightRead, hold::Float64)
+    e = r.entry
+    pf = r.prefetch::Prefetched
+    wc = s.weight_cache::WeightCache
+    staged, failure = _watched_read(wc, r)
+    keep = false
+    close_file = false
+    stalled = false
+    lock(s.cond) do
+        close_file = _read_ended!(s, r)
+        stalled = r.stalled
+        if !stalled
             pf.task = nothing
-            live = get(s.prefetched, e.name, nothing) === pf && get(s.registry.by_name, e.name, nothing) === e
-            if staged !== nothing && live
+            mine = get(s.prefetched, e.name, nothing) === pf
+            if staged !== nothing && mine && get(s.registry.by_name, e.name, nothing) === e
                 pf.staged = staged
                 pf.expires = time() + hold
-                return true
+                keep = true
+            else
+                # Not kept, so the hold goes too, whatever became of the model: left behind with
+                # nothing in it, it would keep a version registered since `:pending` for good.
+                mine && delete!(s.prefetched, e.name)
             end
-            live && delete!(s.prefetched, e.name)
-            return false
+            r.outcome = if staged === nothing
+                (state = "failed", read = false, seconds = time() - r.started, error = sprint(showerror, failure[1]))
+            elseif keep
+                (state = "staged", read = !staged.hit, seconds = staged.host_seconds, error = "")
+            else
+                (
+                    state = "failed", read = !staged.hit, seconds = staged.host_seconds,
+                    error = "model '$(e.name)' was unloaded or replaced while its weights were read; ask again",
+                )
+            end
+            notify(r.done)
         end
-        keep || staged === nothing || release_staged!(wc, e, staged; uploaded = false)
-        if staged === nothing
-            @warn "reading weights ahead of a placement change failed" model = e.name exception = err
-            push!(rows, row(e, "failed"; seconds = dt, error = err))
-        else
-            push!(rows, row(e, keep ? "staged" : "resident"; read = !staged.hit, seconds = staged.host_seconds))
-        end
+        # The dispatch loop may already have requests waiting for this model.
+        _kick_staging!(s)
+        notify(s.cond)
     end
-    # The dispatch loop may already have requests waiting for one of these models.
-    isempty(pending) || lock(() -> (_kick_staging!(s); notify(s.cond)), s.cond)
-    return rows
+    failure === nothing || stalled ||
+        @warn "reading weights ahead of a placement change failed" model = e.name exception = failure
+    _after_read!(r, _releaser(wc, r, keep ? nothing : staged), close_file, stalled, failure)
+    return nothing
 end
 
 # Make the dispatched model's weights resident, uploading its staged weights when it has them.
@@ -1556,12 +1868,15 @@ function _dispatch_loop(s::Scheduler)
     while true
         cmds, chosen = lock(s.cond) do
             while s.running && isempty(s.control) && !_has_queued(s)
+                _mark_idle!(s.progress)   # nothing to do: waiting is not a stall
                 wait(s.cond)
             end
             if !s.running
+                _mark_idle!(s.progress)
                 _reject_pending_locked!(s)
                 return (ControlCommand[], nothing)
             end
+            _mark_progress!(s.progress)   # work in hand: progress is measured from here
             # Drain control commands first; defer selecting a dispatch to the next iteration so
             # residency transitions take effect before the dispatch that may depend on them.
             if !isempty(s.control)
@@ -1579,6 +1894,7 @@ function _dispatch_loop(s::Scheduler)
             catch e
                 put!(c.reply, e)
             end
+            _mark_progress!(s.progress)
         end
         (isempty(cmds) && chosen === nothing) && break
         if chosen !== nothing
@@ -1590,7 +1906,9 @@ function _dispatch_loop(s::Scheduler)
                 @error "a dispatch failed outside its execution; failing its requests" model = chosen.entry.name exception = (err, catch_backtrace())
                 _fail_unanswered!(chosen.taken, err)
             end
+            _mark_progress!(s.progress)
             _maybe_compact!(s)
+            _mark_progress!(s.progress)
         end
         # A residency change or a compaction can leave queued models off the device.
         lock(() -> _kick_staging!(s), s.cond)
@@ -1679,7 +1997,10 @@ end
 
 Move a model to the `target` residency floor. Only meaningful in externally-managed mode; the
 worker rejects it otherwise. Runs on the dispatch thread (the sole residency mutator) and blocks
-until applied. Raises on an unknown model or in self-managed mode.
+until applied. Raises on an unknown model or in self-managed mode, and with a
+[`WeightsReadStalledError`](@ref) (UNAVAILABLE) when reading the model's weights makes no progress
+for `scheduler.weight_read_stall_seconds`, or reads of model weights have stalled on this worker;
+the next residency change does not wait for such a read.
 """
 function set_residency!(s::Scheduler, name::AbstractString, target::ResidencyState)
     # One residency change at a time, so the weights read ahead below are still what the op needs.
@@ -1702,7 +2023,9 @@ end
 
 # Read, off the dispatch loop, what moving `name` (each sub-model, for a meta) to `target` would
 # otherwise read on it: a host floor for PINNED_SYSTEM, the weights to upload for PINNED_DEVICE.
-# A model with a host copy to take them from needs nothing read.
+# A model with a host copy to take them from needs nothing read. Each read is watched like a
+# staging read (`_watched_preread`): one that stalls fails the change with
+# `WeightsReadStalledError`, and what was read for earlier sub-models is let go.
 function _preread_for_residency(s::Scheduler, name::String, target::ResidencyState)
     pre = Dict{String, NamedTuple{(:entry, :floor, :staged), Tuple{ModelEntry, Any, Any}}}()
     wc = s.weight_cache
@@ -1712,17 +2035,76 @@ function _preread_for_residency(s::Scheduler, name::String, target::ResidencySta
         meta === nothing && return ModelEntry[e for e in (get(s.registry.by_name, name, nothing),) if e !== nothing]
         return ModelEntry[s.registry.by_name[c] for c in meta.calls if haskey(s.registry.by_name, c)]
     end
-    for e in entries
-        m = e.executable
-        (m === nothing || m.state == target || m.host_weights !== nothing) && continue
-        if target == PINNED_SYSTEM
-            has_host_copy(wc, e) && !(wc.store isa SharedWeightStore) && continue   # taken from the private cache
-            pre[e.name] = (entry = e, floor = host_materialize(wc.store, e, m.sig.weight_names), staged = nothing)
-        elseif target == PINNED_DEVICE && m.weights === nothing
-            pre[e.name] = (entry = e, floor = nothing, staged = stage_host_weights(wc, e))
+    try
+        for e in entries
+            m = e.executable
+            (m === nothing || m.state == target || m.host_weights !== nothing) && continue
+            if target == PINNED_SYSTEM
+                has_host_copy(wc, e) && !(wc.store isa SharedWeightStore) && continue   # taken from the private cache
+                floor = _watched_preread(
+                    s, e, () -> host_materialize(wc.store, e, m.sig.weight_names),
+                    _ -> host_release!(wc.store, e.name)
+                )
+                pre[e.name] = (entry = e, floor = floor, staged = nothing)
+            elseif target == PINNED_DEVICE && m.weights === nothing
+                staged = _watched_preread(
+                    s, e, () -> stage_host_weights(wc, e), st -> release_staged!(wc, e, st; uploaded = false)
+                )
+                pre[e.name] = (entry = e, floor = nothing, staged = staged)
+            end
         end
+    catch
+        for (nm, p) in pre
+            p.floor === nothing || host_release!(wc.store, nm)
+            p.staged === nothing || release_staged!(wc, p.entry, p.staged; uploaded = false)
+        end
+        rethrow()
     end
     return pre
+end
+
+# Run `read()` for a residency change as a watched background read of `e`'s weights, and wait for
+# it: its result, or the error it failed with. One that stops making progress is abandoned: this
+# throws `WeightsReadStalledError` at once, so the change fails (UNAVAILABLE) and the caller lets go
+# of `residency_lock`, and if the read ever returns, `release(result)` lets go of what it read. No
+# read starts for a model whose earlier read stalled, nor while reads are stalled at the bound
+# (`_stall_refusal`).
+function _watched_preread(s::Scheduler, e::ModelEntry, read::Function, release::Function)
+    r = lock(s.cond) do
+        why = _stall_refusal(s, e)
+        why === nothing || throw(WeightsReadStalledError(e.name, why))
+        return _start_read!(r -> _run_preread!(s, r, read, release), s, e; kind = :residency)
+    end
+    wait(r.done)
+    o = r.outcome
+    o isa Some || throw(o)
+    return something(o)
+end
+
+# The body of a residency change's watched read: run it, then hand the result to the waiting change,
+# or, when the read was abandoned meanwhile, release it.
+function _run_preread!(s::Scheduler, r::WeightRead, read::Function, release::Function)
+    result = nothing
+    failure = nothing
+    try
+        result = with_read_progress(read, r.progress)
+    catch err
+        failure = (err, catch_backtrace())
+    end
+    close_file = false
+    stalled = false
+    lock(s.cond) do
+        close_file = _read_ended!(s, r)
+        stalled = r.stalled
+        if !stalled
+            r.outcome = failure === nothing ? Some(result) : failure[1]
+            notify(r.done)
+        end
+        _kick_staging!(s)
+        notify(s.cond)
+    end
+    _after_read!(r, stalled && failure === nothing ? () -> release(result) : nothing, close_file, stalled, failure)
+    return nothing
 end
 
 function _set_residency_op!(s::Scheduler, name::AbstractString, target::ResidencyState, pre)
@@ -1883,9 +2265,8 @@ end
 # Remove a model from the live registry, rejecting any queued requests, and release its residency.
 # Runs on the dispatch thread. Returns the removed entry, or `nothing` if it was not registered.
 function _evict_entry!(sch::Scheduler, name::AbstractString)
-    entry, reading, staged, pf = lock(sch.cond) do
+    entry, staged, pf, reading = lock(sch.cond) do
         e = pop!(sch.registry.by_name, String(name), nothing)
-        t = nothing
         h = nothing
         p = e === nothing ? nothing : pop!(sch.prefetched, e.name, nothing)
         if e !== nothing && e.sched !== nothing
@@ -1893,30 +2274,37 @@ function _evict_entry!(sch::Scheduler, name::AbstractString)
                 put!(qr.reply, ModelNotFoundError(name, "model '$name' was unloaded"))
             end
             empty!(e.sched.queue)
-            t = e.sched.stage_task
             h = e.sched.staged
             e.sched.staged = nothing
             e.sched.host_stage = :none
         end
-        return (e, t, h, p)
+        # A background read of this model's weights that has not returned (stalled or not) keeps the
+        # weights file open: a descriptor closed under a running pread can be reused by another
+        # open, and the read would then copy the wrong file's bytes. The read closes it once it
+        # returns, and drops what it read, since the model is gone. Nothing here waits for it: this
+        # runs on the dispatch loop, and a read on storage that stopped answering never returns.
+        reading = false
+        if e !== nothing
+            for r in sch.reads
+                r.entry === e || continue
+                r.close_weights = true
+                reading = true
+            end
+        end
+        return (e, h, p, reading)
     end
     entry === nothing && return nothing
-    # A background read of this model's weights must end before its weights file is closed below:
-    # a descriptor closed under a running pread can be reused by another open, and the read would
-    # then copy the wrong file's bytes. The read sees the model gone and drops what it read.
-    reading === nothing || wait(reading)
-    if pf !== nothing
-        pf.task === nothing || wait(pf.task)       # a read ahead of a placement change, likewise
-        pf.staged === nothing || sch.weight_cache === nothing ||
-            release_staged!(sch.weight_cache, entry, pf.staged; uploaded = false)
-    end
+    # A hold for a placement change: what it read is released now, and a read still filling it finds
+    # the hold gone when it returns and releases what it read itself.
+    pf === nothing || pf.staged === nothing || sch.weight_cache === nothing ||
+        release_staged!(sch.weight_cache, entry, pf.staged; uploaded = false)
     staged === nothing || sch.weight_cache === nothing ||
         release_staged!(sch.weight_cache, entry, staged; uploaded = false)
     # Release residency outside the lock (device frees can be slow).
     sch.weight_cache === nothing || release_all!(sch.weight_cache, entry)
     # Close the weights file: it holds the loaded version's inode, which a replaced file keeps alive
-    # (and keeps on disk) until then.
-    close_weights!(entry.weights)
+    # (and keeps on disk) until then. A read still running closes it when it returns.
+    reading || close_weights!(entry.weights)
     # Eagerly free every compiled executable (all variants and batch sizes). Waiting for GC would
     # leave the executables' command buffers resident on the device indefinitely (they live outside
     # the BFC arena and only the finalizer reclaims them). Safe here: this runs on the dispatch
@@ -2592,9 +2980,14 @@ end
     weight_cache_metrics(scheduler) -> Union{NamedTuple,Nothing}
 
 Snapshot the on-demand weight cache (resident bytes/budget, currently resident models, and
-load/evict counters), or `nothing` when on-demand loading is disabled.
+load/evict counters) and the weight reads that stalled (`stalled_reads`, abandoned so far, and
+`stalled_reads_outstanding`, abandoned and not yet returned), or `nothing` when on-demand loading
+is disabled.
 """
 function weight_cache_metrics(s::Scheduler)
     s.weight_cache === nothing && return nothing
-    return weight_cache_stats(s.weight_cache)
+    reads = lock(s.cond) do
+        (stalled_reads = s.stalled_reads, stalled_reads_outstanding = count(r -> r.stalled, s.reads))
+    end
+    return merge(weight_cache_stats(s.weight_cache), reads)
 end

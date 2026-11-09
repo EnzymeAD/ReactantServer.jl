@@ -415,6 +415,22 @@ function _meta_concurrency()
     return max(1, n)
 end
 
+# How long the dispatch loop may go without progress, with work in hand, before the worker reports
+# itself not live and not ready (`dispatch_stalled`): REACTANT_LIVENESS_DISPATCH_STALL_SECONDS (the
+# node supervisor sets it from the node file's `liveness.dispatch_stall_seconds`), default
+# `DISPATCH_STALL_SECONDS`; 0 turns the check off. A value that is not a non-negative number is
+# reported and the default used.
+const DISPATCH_STALL_ENV = "REACTANT_LIVENESS_DISPATCH_STALL_SECONDS"
+
+function _dispatch_stall_seconds(env::AbstractDict = ENV)
+    v = strip(get(env, DISPATCH_STALL_ENV, ""))
+    isempty(v) && return DISPATCH_STALL_SECONDS
+    x = tryparse(Float64, v)
+    (x !== nothing && x >= 0) && return x
+    @warn "$DISPATCH_STALL_ENV must be a non-negative number of seconds; using the default" value = v default = DISPATCH_STALL_SECONDS
+    return DISPATCH_STALL_SECONDS
+end
+
 # /readyz for the metrics listener: ready once every loaded model is compiled, the ServerReady rule,
 # never once the dispatch loop has died, and not while the server drains. A named callable rather
 # than a closure so the precompile workload can start the listener with this exact type; HTTP.jl
@@ -433,7 +449,8 @@ function (r::_RegistryReady)()
         dispatch_alive(r.sched)
 end
 
-# /healthz for the metrics listener: live while the dispatch loop serves, as ServerLive.
+# /healthz for the metrics listener: live while the dispatch loop serves (it has not died and is
+# not stalled, see `dispatch_alive`), as ServerLive. The node supervisor's liveness check reads it.
 struct _DispatchLive
     sched::Scheduler
 end
@@ -467,6 +484,7 @@ function serve(
     enable_compile_timing!()
     shm = SharedMemoryRegistry()   # client-facing SystemSharedMemory feature (decode/encode shm path)
     pool, registry, sched, watcher = _bring_up(cfg, backend)
+    sched.progress.stall_seconds = _dispatch_stall_seconds()
     # A blocking serve is a worker process: should its dispatch loop die, exit nonzero for a restart.
     # `exiting` records that the hook fired, for the end of a blocking serve (see there).
     exiting = Threads.Atomic{Bool}(false)
@@ -523,7 +541,7 @@ function serve(
             worker_name = worker_name, gpu = _gpu_identity(cfg)
         )
     end
-    @info "Starting gRPC server" host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests rapid_reset_protection = cfg.grpc.rapid_reset_protection models = model_names(registry)
+    @info "Starting gRPC server" host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests rapid_reset_protection = cfg.grpc.rapid_reset_protection dispatch_stall_seconds = sched.progress.stall_seconds models = model_names(registry)
     blocking || return _start_server(cfg, registry, sched, pool, shm, server, watcher, metrics_server, monitor, drain)
     # Blocking: serve until a drain is requested (the supervisor closing stdin, or `request_drain!`),
     # then drain and tear everything down, so the process exits 0 with nothing left running.

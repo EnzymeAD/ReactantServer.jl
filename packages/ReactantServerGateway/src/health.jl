@@ -113,11 +113,12 @@ function _health_interval_seconds()
     return (v === nothing || v <= 0) ? HEALTH_INTERVAL_SECONDS : v
 end
 
-# Query every endpoint's ready models concurrently and build the model -> endpoints routing table.
-# An unreachable endpoint is skipped (it contributes no routes this round and is picked up later).
-function discover_routes(pool::ClientPool)
+# Query every endpoint's ready models concurrently, record the answers in `routes`, and swap in the
+# model -> endpoints routing table they make; returns it. An endpoint that does not answer keeps the
+# routes it last reported (see `DiscoveredRoutes` for how long).
+function discover_routes!(routes::DiscoveredRoutes, pool::ClientPool)
     workers = all_clients(pool)
-    found = Dict{String, Vector{String}}()
+    answers = Dict{String, Union{Nothing, Vector{String}}}()
     lk = ReentrantLock()
     @sync for wc in workers
         @async begin
@@ -125,15 +126,10 @@ function discover_routes(pool::ClientPool)
                 () -> discover_models(wc), PROBE_TIMEOUT_SECONDS, nothing,
                 "RepositoryIndex discovery", wc.url
             )
-            names === nothing && return
-            lock(lk) do
-                for n in names
-                    push!(get!(found, n, String[]), wc.url)
-                end
-            end
+            lock(() -> (answers[wc.url] = names), lk)
         end
     end
-    return RoutingTable(found)
+    return record_answers!(routes, answers)
 end
 
 function _check_once(p::HealthProber)
@@ -159,19 +155,22 @@ function _check_once(p::HealthProber)
         observe_probe!(p.metrics, wc.url, elapsed[i])
         any_ready |= results[i]
         any_responsive |= !timeouts[i]   # answered within the watchdog (ready or not)
-        # A hung probe (timed out, not a fast refuse) means the worker was caught mid-stall, and its
-        # connection may be one that never answered, which every later call would wait behind until
-        # its deadline (see `reset_clients!`); drop it so this round's discovery and the next probe
-        # reconnect fresh.
-        timeouts[i] && reset_clients!(wc)
+        # A hung probe (timed out, not a fast refuse) means the worker was caught mid-stall, and the
+        # probe connection may be one that never answered, which every later probe would wait behind
+        # until its deadline (see `reset_if_parked!`); drop it so this round's discovery and the next
+        # probe reconnect fresh. The probes have a handle of their own, so this touches no inference.
+        timeouts[i] && reset_probe_connection!(wc)
+        # A worker that answered ready on the probe handle while its inference calls keep reaching
+        # their deadline unanswered has a parked inference connection; reset that one.
+        results[i] && reset_if_parked!(wc)
         _track_outage!(p, wc.url, results[i])
+        p.routes === nothing || note_worker_ready!(p.routes, wc.url, results[i])
     end
     set_ready!(p.admin, any_ready)
     p.ever_responsive |= any_responsive
     _track_wedge!(p, !isempty(workers) && all(timeouts))
     if p.routes !== nothing
-        table = discover_routes(p.pool)
-        swap_table!(p.routes, table)
+        table = discover_routes!(p.routes, p.pool)
         set_routing_size!(p.metrics, nmodels(table))
     end
     # Control-plane round, for the schedulers that route by work: ONE ModelControlStatus poll shared
@@ -223,7 +222,9 @@ end
 # wedged client stack (and the gateway exits for a fresh restart) ONLY after a worker has
 # answered at least once (`ever_responsive`) — i.e. a genuine regression from working to wedged.
 # Before that, an all-timeout round is just warmup (workers slow/busy/compiling) or a loaded
-# host starving the prober; restarting then is useless churn, so it is ignored.
+# host starving the prober; restarting then is useless churn, so it is ignored. Only the probes
+# count, and they run on handles of their own (see `WorkerClients`), so inference queued at busy
+# workers, however much, cannot make a round look wedged.
 function _track_wedge!(p::HealthProber, all_timed_out::Bool)
     p.wedged_rounds = all_timed_out ? p.wedged_rounds + 1 : 0
     p.ever_responsive || return nothing

@@ -115,24 +115,45 @@ or recreated (CORE-11). Low frequency on purpose: a check is one `shm_open` and 
 const SHM_REAP_INTERVAL_SECONDS = 60.0
 
 """
-    SharedMemoryRegistry(; reap_interval = SHM_REAP_INTERVAL_SECONDS)
+    SharedMemoryRegistry(; reap_interval = SHM_REAP_INTERVAL_SECONDS,
+                           reserved_prefixes = [SHARED_WEIGHT_PREFIX])
 
 The registry of client shared-memory regions. Once something is registered, a timer re-checks
 every `reap_interval` seconds that each registration's object still exists under its key and drops
 those that do not (see [`shm_reap!`](@ref)); `shm_teardown!` stops it. A non-positive
 interval disables the timer (registrations still sweep).
+
+A key named `<prefix>-...` for any of `reserved_prefixes` is never registered (WRK-9): by default
+that covers the regions and lock files of the node's shared host-weight store
+([`SharedWeightStore`](@ref), `/dev/shm/rsw-...`), which a client could otherwise register and
+point an output at, writing into the weights every worker on the node serves.
 """
 struct SharedMemoryRegistry
     regions::Dict{String, ShmRegion}
     lock::ReentrantLock
     reap_interval::Float64
     reaper::Base.RefValue{Union{Nothing, Timer}}
+    reserved_prefixes::Vector{String}
 end
-SharedMemoryRegistry(; reap_interval::Real = SHM_REAP_INTERVAL_SECONDS) =
-    SharedMemoryRegistry(
-    Dict{String, ShmRegion}(), ReentrantLock(), Float64(reap_interval),
-    Ref{Union{Nothing, Timer}}(nothing)
-)
+function SharedMemoryRegistry(;
+        reap_interval::Real = SHM_REAP_INTERVAL_SECONDS,
+        reserved_prefixes = [SHARED_WEIGHT_PREFIX]
+    )
+    return SharedMemoryRegistry(
+        Dict{String, ShmRegion}(), ReentrantLock(), Float64(reap_interval),
+        Ref{Union{Nothing, Timer}}(nothing), String[String(p) for p in reserved_prefixes]
+    )
+end
+
+# The reserved prefix `key` falls under, or nothing. shm_open ignores leading slashes, so
+# "rsw-x", "/rsw-x" and "//rsw-x" all name /dev/shm/rsw-x.
+function _reserved_prefix(reg::SharedMemoryRegistry, key::AbstractString)
+    name = lstrip(key, '/')
+    for p in reg.reserved_prefixes
+        startswith(name, p * "-") && return p
+    end
+    return nothing
+end
 
 # Detach our mapping of a region. Takes `r.lock`, so it waits for a copy in progress, and flips
 # `attached` so any reader blocked on the same lock bails instead of touching the munmap'd page.
@@ -168,7 +189,9 @@ and keeps that descriptor. When `name` is already registered:
 - a different object that still exists: [`ShmRegionExistsError`](@ref) (ALREADY_EXISTS), and the
   existing registration is untouched.
 
-Every registration also sweeps the registry for stale entries ([`shm_reap!`](@ref)).
+A key under one of the registry's reserved prefixes (by default the shared host-weight store's) is
+refused with an `ArgumentError` (INVALID_ARGUMENT) before it is opened. Every registration also
+sweeps the registry for stale entries ([`shm_reap!`](@ref)).
 """
 function shm_register!(
         reg::SharedMemoryRegistry, name::AbstractString, key::AbstractString,
@@ -176,6 +199,13 @@ function shm_register!(
     )
     isempty(name) && throw(ArgumentError("shared memory region name must not be empty"))
     isempty(key) && throw(ArgumentError("shared memory key must not be empty"))
+    reserved = _reserved_prefix(reg, key)
+    reserved === nothing || throw(
+        ArgumentError(
+            "shared memory key '$key' names a region of the node's shared host-weight store " *
+                "('$reserved-...'), which clients may not register"
+        )
+    )
     # Validate and narrow the untrusted sizes before any mapping exists, so an out-of-range
     # value is a clean ArgumentError rather than an InexactError after the mmap was created.
     (0 <= offset <= typemax(Int)) ||
@@ -353,9 +383,10 @@ function _lookup_region(reg::SharedMemoryRegistry, name::AbstractString)
     return r
 end
 
-# Bounds-checked raw byte base within a region. Caller MUST hold `r.lock` and have verified
-# `r.attached`.
-function _region_base(r::ShmRegion, offset::Integer, byte_size::Integer)
+# The access `[offset, offset + byte_size)` of region `r`, checked against its registered window
+# and narrowed to Int. Reads only the registration's constant fields, so it needs no lock: the
+# decoder checks a shared-memory output's window with it before any compute.
+function _check_window(r::ShmRegion, offset::Integer, byte_size::Integer)
     # Range-check the untrusted values before narrowing, and use the subtraction form for the
     # bounds check: `off + bs` could wrap for hostile int64 parameters.
     (0 <= offset <= typemax(Int) && 0 <= byte_size <= typemax(Int)) ||
@@ -374,6 +405,13 @@ function _region_base(r::ShmRegion, offset::Integer, byte_size::Integer)
                 "'$(r.name)' of $(r.byte_size) bytes"
         )
     )
+    return off, bs
+end
+
+# Bounds-checked raw byte base within a region. Caller MUST hold `r.lock` and have verified
+# `r.attached`.
+function _region_base(r::ShmRegion, offset::Integer, byte_size::Integer)
+    off, bs = _check_window(r, offset, byte_size)
     return r.ptr + r.offset + off, bs
 end
 
@@ -404,20 +442,31 @@ end
 
 """
     shm_read(registry, name, offset, byte_size) -> Vector{UInt8}
+    shm_read(alloc, registry, name, offset, byte_size) -> Array
 
-Copy `[offset, offset+byte_size)` of the named region into a fresh byte vector. The copy is
+Copy a range of the named region into a fresh byte vector, or into an array the caller allocates.
+The range is `[offset, offset+byte_size)`; the array `alloc(byte_size)` returns must hold exactly
+`byte_size` bytes of a bits type (a decoded tensor is read straight into its final array this way,
+with no intermediate copy). The copy is
 done while the region's lock is held, so a concurrent `shm_unregister!` of the same region
 cannot detach the mapping underneath the read. The object must still cover the range
 ([`ShmRegionShrunkError`](@ref) otherwise), and its pages are allocated first
-([`ShmSpaceError`](@ref) when `/dev/shm` has no room), so the copy cannot raise SIGBUS.
+([`ShmSpaceError`](@ref) when `/dev/shm` has no room), so the copy cannot raise SIGBUS. The
+destination is allocated only after the range has passed both checks.
 """
 function shm_read(reg::SharedMemoryRegistry, name::AbstractString, offset::Integer, byte_size::Integer)
+    return shm_read(bs -> Vector{UInt8}(undef, bs), reg, name, offset, byte_size)
+end
+
+function shm_read(alloc, reg::SharedMemoryRegistry, name::AbstractString, offset::Integer, byte_size::Integer)
     r = _lookup_region(reg, name)
     @lock r.lock begin
         r.attached || throw(UnregisteredRegionError(String(name)))
         base, bs = _backed_region_base(r, offset, byte_size)
-        out = Vector{UInt8}(undef, bs)
-        GC.@preserve r out unsafe_copyto!(pointer(out), base, bs)
+        out = alloc(bs)
+        (out isa Array && isbitstype(eltype(out)) && sizeof(out) == bs) ||
+            throw(ArgumentError("shm_read: the destination for $bs bytes of region '$(r.name)' does not hold exactly $bs bytes of a bits type"))
+        GC.@preserve r out unsafe_copyto!(convert(Ptr{UInt8}, pointer(out)), base, bs)
         return out
     end
 end

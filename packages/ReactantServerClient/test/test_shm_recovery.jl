@@ -33,10 +33,15 @@ mutable struct MockState
     lock::ReentrantLock
     unregister_calls::Threads.Atomic{Int}
     registered_names::Vector{String}     # every name a register call carried, in order
+    fail_infer::Bool                     # when true, ModelInfer fails with INVALID_ARGUMENT
+    shed::Function                       # req -> true sheds that ModelInfer with RESOURCE_EXHAUSTED
+    stale::Function                      # req -> true answers that ModelInfer as a stale registration
+    register_sleep::Float64              # seconds the register handler stalls before answering
 end
 MockState() = MockState(
     Set{String}(), true, false, 0.0, Threads.Atomic{Int}(0),
-    Threads.Atomic{Int}(0), ReentrantLock(), Threads.Atomic{Int}(0), String[]
+    Threads.Atomic{Int}(0), ReentrantLock(), Threads.Atomic{Int}(0), String[], false, req -> false,
+    req -> false, 0.0
 )
 
 # Extract a tensor's shared_memory_region string parameter, or nothing when the tensor is inline.
@@ -68,6 +73,7 @@ function _mk_server(st::MockState, port::Integer)
         "SystemSharedMemoryRegister", inf.SystemSharedMemoryRegisterRequest, inf.SystemSharedMemoryRegisterResponse, (ctx, req) -> begin
             Threads.atomic_add!(st.register_calls, 1)
             @lock st.lock push!(st.registered_names, req.name)
+            st.register_sleep > 0 && sleep(st.register_sleep)
             st.reject_register &&
                 throw(gRPCServer.GRPCError(gRPCServer.StatusCode.INTERNAL, "register rejected"))
             @lock st.lock push!(st.regions, req.name)
@@ -84,6 +90,16 @@ function _mk_server(st::MockState, port::Integer)
     _reg(
         "ModelInfer", inf.ModelInferRequest, inf.ModelInferResponse, (ctx, req) -> begin
             Threads.atomic_add!(st.infer_calls, 1)
+            st.fail_infer &&
+                throw(gRPCServer.GRPCError(gRPCServer.StatusCode.INVALID_ARGUMENT, "rejected by the mock"))
+            # invokelatest: a test sets `shed` after the server's tasks started, in a newer world.
+            Base.invokelatest(st.shed, req) &&
+                throw(gRPCServer.GRPCError(gRPCServer.StatusCode.RESOURCE_EXHAUSTED, "shed by the mock"))
+            Base.invokelatest(st.stale, req) && throw(
+                gRPCServer.GRPCError(
+                    gRPCServer.StatusCode.FAILED_PRECONDITION, "unregistered shared memory region (mock)"
+                )
+            )
             for t in req.inputs
                 name = _region_of(t)
                 name === nothing && continue           # inline input: nothing to check
@@ -207,6 +223,262 @@ end
         @test st.unregister_calls[] == 0
         # Every registration carried the one pool's name.
         @test length(unique(st.registered_names)) == 1
+    finally
+        kserve_shutdown()
+        close(server)
+    end
+end
+
+# Whether every slot of `pool` can be taken at once right now (taken and given back).
+function _all_slots_free(pool)
+    s = ReactantServerCore.try_acquire_slot!(pool, pool.n_slots)
+    s === nothing && return false
+    ReactantServerCore.release_slot!(s)
+    return true
+end
+
+# A chunk failure timed to land while other chunks are still decoding (CLI-3). The chunk holding
+# item `fail_at` fails in its decode once two other chunks are inside theirs; every other chunk
+# spends `hold` seconds in its decode, then writes its items. Counts the items encoded, the decodes
+# running, and the items written.
+struct ChunkFailure <: Exception
+    item::Int
+end
+mutable struct SlowFailIO <: AbstractInferenceIO
+    n::Int
+    fail_at::Int
+    hold::Float64
+    out::Vector{Int}
+    encoded::Threads.Atomic{Int}
+    active::Threads.Atomic{Int}
+    writes::Threads.Atomic{Int}
+end
+SlowFailIO(n, fail_at, hold) = SlowFailIO(
+    n, fail_at, hold, zeros(Int, n), Threads.Atomic{Int}(0), Threads.Atomic{Int}(0), Threads.Atomic{Int}(0)
+)
+Base.length(io::SlowFailIO) = io.n
+ReactantServerClient.item_input_bytes(::SlowFailIO) = 4 * sizeof(Float32)
+function ReactantServerClient.infer_encode_chunk!(io::SlowFailIO, r, slot)
+    Threads.atomic_add!(io.encoded, length(r))
+    return scratch(slot, "x", (4, length(r)), Float32)
+end
+function ReactantServerClient.infer_decode_chunk!(io::SlowFailIO, r, response)
+    if io.fail_at in r
+        timedwait(() -> io.active[] >= 2, 30.0)
+        throw(ChunkFailure(io.fail_at))
+    end
+    Threads.atomic_add!(io.active, 1)
+    try
+        sleep(io.hold)
+        io.out[r] .= r
+        Threads.atomic_add!(io.writes, length(r))
+    finally
+        Threads.atomic_sub!(io.active, 1)
+    end
+    return nothing
+end
+
+@testset "infer_async finishes every chunk it started, then throws the chunk's own exception (CLI-3)" begin
+    st = MockState()
+    port = free_port()
+    server = _mk_server(st, port); gRPCServer.start!(server)
+    try
+        for mode in (:on, :off)
+            kserve_init(; pool_bytes = 1 << 20, n_slots = 4, shm_reprobe_interval = 0.0)
+            m = KServeModel("127.0.0.1", port, "m"; shared_memory = mode, max_batch_size = 1, deadline = 60.0, retry = _noretry())
+            infer_sync(m, RecoveryIO(1))                    # warm up: the first call compiles the request path
+            pool = RSC.get_or_create_pool!(m).pool
+            # Four slots and one item per chunk: four chunks in flight. The first fails while the
+            # other three are inside their decode.
+            io = SlowFailIO(12, 1, 0.5)
+            err, stack = try
+                infer_async(m, io)
+                nothing, nothing
+            catch e
+                e, current_exceptions()
+            end
+            # The state the moment the call has thrown.
+            active, writes, slots_free = io.active[], io.writes[], _all_slots_free(pool)
+            sleep(1.0)                                      # longer than a decode: a chunk still running writes meanwhile
+            @test err isa ChunkFailure && err.item == 1      # the chunk's exception itself, not a TaskFailedException
+            @test active == 0                                # no chunk was still decoding into the io
+            @test slots_free                                 # every chunk had given its slot back
+            @test io.writes[] == writes                      # nothing wrote into the io after the call
+            @test writes == 3 && io.out[2:4] == 2:4          # the chunks already in flight finished
+            @test io.encoded[] == 4                          # and none started after the failure
+            # The chunk's backtrace is kept, below the error on the exception stack.
+            @test stack !== nothing && length(stack) >= 2
+            @test occursin("infer_decode_chunk!", sprint(show, MIME"text/plain"(), stack))
+        end
+    finally
+        kserve_shutdown()
+        close(server)
+    end
+end
+
+@testset "infer_async throws the server's gRPC error unwrapped, as infer_sync does (CLI-3)" begin
+    st = MockState()
+    port = free_port()
+    server = _mk_server(st, port); gRPCServer.start!(server)
+    try
+        kserve_init(; pool_bytes = 1 << 20, n_slots = 4, shm_reprobe_interval = 0.0)
+        m = KServeModel("127.0.0.1", port, "m"; shared_memory = :off, max_batch_size = 1, deadline = 60.0, retry = _noretry())
+        infer_sync(m, RecoveryIO(1))                        # warm up
+        st.fail_infer = true
+        for f in (infer_sync, infer_async)
+            err = try
+                f(m, RecoveryIO(8))
+                nothing
+            catch e
+                e
+            end
+            @test err isa RSC.gRPCClient.gRPCServiceCallException
+            @test err isa RSC.gRPCClient.gRPCServiceCallException &&
+                err.grpc_status == RSC.gRPCClient.GRPC_INVALID_ARGUMENT
+        end
+    finally
+        kserve_shutdown()
+        close(server)
+    end
+end
+
+# Item i stages its own index, so the mock can tell the chunks apart. The chunk holding item
+# `fail_at` fails in its decode once `ready()` holds.
+struct ShedFailIO <: AbstractInferenceIO
+    n::Int
+    fail_at::Int
+    ready::Function
+end
+Base.length(io::ShedFailIO) = io.n
+ReactantServerClient.item_input_bytes(::ShedFailIO) = 4 * sizeof(Float32)
+function ReactantServerClient.infer_encode_chunk!(io::ShedFailIO, r, slot)
+    x = scratch(slot, "x", (4, length(r)), Float32)
+    v = pool_view(x)
+    for (j, i) in enumerate(r)
+        v[:, j] .= i
+    end
+    return x
+end
+function ReactantServerClient.infer_decode_chunk!(io::ShedFailIO, r, response)
+    io.fail_at in r || return nothing
+    timedwait(io.ready, 30.0)
+    throw(ChunkFailure(io.fail_at))
+end
+
+@testset "once a chunk of infer_async has failed, the others stop retrying (CLI-3)" begin
+    st = MockState()
+    port = free_port()
+    server = _mk_server(st, port); gRPCServer.start!(server)
+    try
+        kserve_init(; pool_bytes = 1 << 20, n_slots = 4, shm_reprobe_interval = 0.0)
+        warm = KServeModel("127.0.0.1", port, "m"; shared_memory = :off, max_batch_size = 1, deadline = 60.0, retry = _noretry())
+        infer_sync(warm, RecoveryIO(1))                     # warm up
+        # The server sheds every request for item 2, so its chunk would retry every 0.2 s for the
+        # model's whole 20 s budget. Item 1's chunk fails once item 2's has been shed twice.
+        sheds = Threads.Atomic{Int}(0)
+        st.shed = req -> begin
+            reinterpret(Float32, req.raw_input_contents[1])[1] == 2.0f0 || return false
+            Threads.atomic_add!(sheds, 1)
+            return true
+        end
+        policy = RSC.RetryPolicy(; initial_backoff = 0.2, factor = 1.0, jitter = false, min_budget = 0.01)
+        m = KServeModel("127.0.0.1", port, "m"; shared_memory = :off, max_batch_size = 1, deadline = 20.0, retry = policy)
+        t0 = time()
+        err = try
+            infer_async(m, ShedFailIO(2, 1, () -> sheds[] >= 2))
+            nothing
+        catch e
+            e
+        end
+        elapsed = time() - t0
+        @test err isa ChunkFailure && err.item == 1         # still the first failure
+        @test elapsed < 5.0                                  # without waiting out the 20 s retry budget
+        @test sheds[] < 10                                   # item 2's chunk stopped retrying
+    finally
+        kserve_shutdown()
+        close(server)
+    end
+end
+
+@testset "an unrecoverable shared-memory failure in infer_async latches to inline, as in infer_sync (CLI-3)" begin
+    st = MockState()
+    port = free_port()
+    server = _mk_server(st, port); gRPCServer.start!(server)
+    try
+        kserve_init(; pool_bytes = 1 << 20, n_slots = 8, shm_reprobe_interval = 0.0)
+        m = KServeModel("127.0.0.1", port, "m"; shared_memory = :on, max_batch_size = 1, deadline = 60.0, retry = _noretry())
+        key = (m.host, m.port, m.shared_memory)
+        io1 = RecoveryIO(4)
+        infer_async(m, io1)
+        @test io1.decoded[] == 4
+        @test RSC.is_shm_backed(RSC.get_or_create_pool!(m))
+
+        # The server forgets the region and refuses to register it again: every chunk fails with
+        # ShmUnrecoverableError, which latches the endpoint to inline, and the batch completes inline.
+        st.reject_register = true
+        @lock st.lock empty!(st.regions)
+        io2 = RecoveryIO(8)
+        infer_async(m, io2)
+        @test io2.decoded[] == 8
+        @test haskey(RSC._latched, key)
+        @test !RSC.is_shm_backed(RSC.get_or_create_pool!(m))
+    finally
+        kserve_shutdown()
+        close(server)
+    end
+end
+
+# Counts the items decoded. The first decode fails instead, once `ready()` holds.
+struct FailOnceIO <: AbstractInferenceIO
+    n::Int
+    ready::Function
+    armed::Threads.Atomic{Bool}
+    decoded::Threads.Atomic{Int}
+end
+FailOnceIO(n, ready) = FailOnceIO(n, ready, Threads.Atomic{Bool}(true), Threads.Atomic{Int}(0))
+Base.length(io::FailOnceIO) = io.n
+ReactantServerClient.item_input_bytes(::FailOnceIO) = 4 * sizeof(Float32)
+ReactantServerClient.infer_encode_chunk!(io::FailOnceIO, r, slot) = scratch(slot, "x", (4, length(r)), Float32)
+function ReactantServerClient.infer_decode_chunk!(io::FailOnceIO, r, response)
+    if Threads.atomic_xchg!(io.armed, false)
+        timedwait(io.ready, 30.0)
+        throw(ChunkFailure(first(r)))
+    end
+    Threads.atomic_add!(io.decoded, length(r))
+    return nothing
+end
+
+@testset "an unrecoverable shared-memory failure in infer_async wins over an earlier failure" begin
+    st = MockState()
+    port = free_port()
+    server = _mk_server(st, port); gRPCServer.start!(server)
+    try
+        kserve_init(; pool_bytes = 1 << 20, n_slots = 4, shm_reprobe_interval = 0.0)
+        m = KServeModel("127.0.0.1", port, "m"; shared_memory = :on, max_batch_size = 1, deadline = 60.0, retry = _noretry())
+        key = (m.host, m.port, m.shared_memory)
+        infer_async(m, RecoveryIO(2))                       # warm up, and register the pool
+        @test RSC.is_shm_backed(RSC.get_or_create_pool!(m))
+
+        # The first request of the next call is told its registration is stale, and the server
+        # refuses the re-registration its chunk then makes, after 1 s. Meanwhile the other chunk's
+        # response arrives and its decode fails, so the shared-memory failure comes second in time.
+        regs = st.register_calls[]
+        first_request = Threads.Atomic{Bool}(true)
+        st.stale = req -> Threads.atomic_xchg!(first_request, false)
+        st.reject_register = true
+        st.register_sleep = 1.0
+        io = FailOnceIO(2, () -> st.register_calls[] > regs)
+        err = try
+            infer_async(m, io)
+            nothing
+        catch e
+            e
+        end
+        # It still decides the outcome: the endpoint latches to inline, and the batch completes there.
+        @test err === nothing
+        @test haskey(RSC._latched, key)
+        @test !RSC.is_shm_backed(RSC.get_or_create_pool!(m))
+        @test io.decoded[] == 2
     finally
         kserve_shutdown()
         close(server)

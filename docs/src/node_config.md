@@ -26,6 +26,9 @@ metrics_base_port: 9100
 # (ordinals or GPU UUIDs). The supervisor synthesizes one worker per selected device.
 # gpus: auto
 
+# Supervisor-only: how a worker or the gateway that stops working is found and restarted.
+# liveness: { interval_seconds: 10, timeout_seconds: 10, failures: 6, dispatch_stall_seconds: 600 }
+
 global:    # defaults merged into every worker (any block may be overridden per worker)
 workers:   # optional under the supervisor; one entry per GPU
 models:    # optional; pins the named models to device memory on the listed workers
@@ -42,6 +45,9 @@ models:    # optional; pins the named models to device memory on the listed work
   no `workers:` list is present: `auto` (the default) enumerates the visible devices, an
   integer is a device count, and a list gives explicit device selectors (ordinals or GPU
   UUIDs). The `REACTANT_GPUS` environment variable overrides this key.
+- `liveness` (optional, supervisor-only) sets how the supervisor checks that each worker, and the
+  embedded gateway, still works once it has been ready, and kills and restarts one that does not
+  ([Liveness](#Liveness)).
 - `global` holds the defaults merged into every worker; any block may be overridden per worker.
 - `workers` lists the worker entries (optional under the supervisor).
 - `models` optionally pins the named models to device memory on the listed workers.
@@ -83,6 +89,7 @@ global:
     dispatch_timeout_seconds: 30.0
     compaction_interval: 0     # defragment device memory every N on-demand weight loads; 0 disables
     coalescing: true           # merge queued requests into one dispatch (profile default)
+    weight_read_stall_seconds: 20.0  # abandon a weights read with no progress this long; 0 disables
     models: {}                 # per-model overrides -> ModelSchedConfig (see below)
   endpoints:                   # -> EndpointsConfig
     host: 0.0.0.0              # bind all interfaces so the gateway and clients can reach the worker
@@ -164,15 +171,21 @@ validated deployment should use.
 `model_control_mode` sets how the loaded model set evolves:
 
 - `dynamic` (the default) watches the repository and loads, unloads, and reloads bundles online as
-  their files change, including the weights, the MLIR, the manifest, and `model.jl`. A bundle must
-  look the same on two consecutive polls before it loads, so a half-written bundle never does. A
-  load or reload compiles the bundle on the worker's dispatch loop, so every other model on that
-  worker pauses until the compile ends, and a reloaded model answers `NOT_FOUND` until its new
-  version is in. The loop shares a thread with request handling, so the worker's health probes
-  stall for that time as well. An executable-cache hit (`runtime.executable_cache`) keeps the pause
-  short; an uncached compile takes 5 to 30 seconds per compiled program. A renamed directory is an
-  unload of the old name and a load of the new one. A bundle whose files change while it loads is
-  not admitted: the next poll loads it again from the files as they are then.
+  their files change, including the weights, the MLIR, the manifest, and `model.jl`. The watcher
+  compares only each bundle file's name, modification time and size, and acts on a change once it
+  looks the same on two consecutive polls. A deploy must therefore change a file's mtime or size to
+  be seen: new weights of the same size written with a fixed or preserved mtime (an archive built
+  with a fixed `--mtime`, unpacked or copied with `cp -p` or `rsync -a`) are never picked up. The
+  two polls let a copy in progress settle, but they do not guarantee a consistent bundle: an update
+  of several files that takes longer than two polls can be loaded with some files new and some old.
+  Make a multi-file update atomic: stage the new files elsewhere on the same filesystem, then rename
+  them into place. A load or reload compiles the bundle on the worker's dispatch loop, so every
+  other model on that worker pauses until the compile ends, and a reloaded model answers `NOT_FOUND`
+  until its new version is in. The loop shares a thread with request handling, so the worker's
+  health probes stall for that time as well. An executable-cache hit (`runtime.executable_cache`)
+  keeps the pause short; an uncached compile takes 5 to 30 seconds per compiled program. A renamed
+  directory is an unload of the old name and a load of the new one. A bundle whose files change
+  while it loads is not admitted: the next poll loads it again from the files as they are then.
 - `static` loads the startup set once and never changes it.
 - `explicit` cedes the lifecycle to an external control plane: the worker takes no action of its
   own, and a model serves only while the control plane holds it resident through the worker
@@ -314,6 +327,9 @@ grpc:
 worker_client:
   request_timeout_seconds: 60
   max_concurrent_streams: 32      # outbound in-flight RPCs the gateway multiplexes to one worker
+                                  # (inference and the rest; the health probes have their own)
+  route_retention_seconds: 600    # how long a worker that is unreachable or not ready keeps its
+                                  # routes, so its models are UNAVAILABLE rather than NOT_FOUND
 logging:
   level: "info"
   format: "json"
@@ -388,6 +404,63 @@ A worker or gateway run without the supervisor has only its own settings: a work
 file's `global.grpc` and its own entry, with `INFERENCE_SERVER_GRPC_RAPID_RESET_PROTECTION` over
 both, and a gateway its `gateway.yml`, with `REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION` over it.
 
+## Liveness
+
+The supervisor restarts a worker or the embedded gateway that exits, and also one that is still
+running but no longer works: deadlocked, stopped, stuck in the kernel, or, for a worker, with its
+dispatch loop stuck in a GPU call that never returns. It checks each worker over the worker's HTTP
+listener (`metrics_base_port + i`, or the public `8002` for a sole worker), and the gateway over its
+admin listener (`listen.metrics`, default `8002`, whose `/readyz` answers 200 once at least one
+worker is ready). The same steps and settings apply to both:
+
+1. Until the worker's `/readyz` first answers 200, nothing is checked, so a startup that compiles
+   models for hours is never interrupted.
+2. From then on the supervisor asks `/healthz` every `interval_seconds`. An answer other than 200,
+   a refused connection, or no answer within `timeout_seconds` is a failure, and is logged.
+3. After `failures` failures in a row the supervisor logs that it is killing the worker, sends it
+   SIGKILL, and the usual restart takes over, with its backoff and its restart budget
+   (`REACTANT_SUPERVISOR_MAX_RESTARTS`). The restarted worker is checked again once it is ready.
+
+Nothing is checked while the node shuts down. A worker answers `/healthz` (and `ServerLive`) with
+"not live", and `/readyz` (and `ServerReady`, `ModelReady`) with "not ready", while its dispatch
+loop has had work in hand and finished none of it for `dispatch_stall_seconds`: a dispatch, a
+weight upload, a compaction and a control command each count as one piece of work. An idle worker
+is never stalled, and the worker says so in its log once per stall. That is how a GPU call that
+never returns is caught: the worker's other threads keep answering, but no longer "live".
+
+```yaml
+liveness:                       # supervisor-only; every key is optional
+  interval_seconds: 10          # REACTANT_LIVENESS_INTERVAL_SECONDS
+  timeout_seconds: 10           # REACTANT_LIVENESS_TIMEOUT_SECONDS
+  failures: 6                   # REACTANT_LIVENESS_FAILURES; 0 turns the check off
+  dispatch_stall_seconds: 600   # REACTANT_LIVENESS_DISPATCH_STALL_SECONDS; 0 turns it off
+```
+
+Each environment variable, set on the node container, wins over its key. With the defaults a
+worker that stops answering is killed after about two minutes, and one that answers "not live"
+after about one; a stalled dispatch loop is reported after ten minutes. These are far longer than
+anything a healthy worker does on the thread that answers (a garbage collection or a first-use
+compile takes seconds), and the stall limit is far longer than the slowest legitimate piece of work
+(minutes for a large model read from slow storage, or a compile in `dynamic` mode). The startup line
+`worker liveness checks: ...` shows what is in effect. The supervisor passes
+`dispatch_stall_seconds` to each worker in `REACTANT_LIVENESS_DISPATCH_STALL_SECONDS`; a worker run
+without the supervisor reads that variable itself, so an orchestrator's own liveness probe on
+`/healthz` gets the same answer.
+
+Some limits to know:
+
+- A worker with no HTTP listener (no `metrics_base_port` on a multi-worker node) is not checked; it
+  is restarted only when it exits, and the startup line names it.
+- In `dynamic` mode a hot load or reload compiles the new bundle on the thread that answers
+  `/healthz`, so a reload whose uncached compile stops that thread for longer than about two minutes
+  gets the worker killed and restarted, and it then loads the new version at startup. Raise
+  `timeout_seconds` or `failures` (or set `failures: 0`) if reloads of large uncached bundles must
+  not restart the worker.
+- A hung gateway takes the node's public endpoint down with it, so it is killed and restarted the
+  same way; its startup line is `gateway liveness check: ...`. Its `/healthz` answers whenever the
+  process can answer at all, so the check catches a gateway that is stopped or deadlocked, not one
+  that answers while routing badly.
+
 ## Environment overrides
 
 Any worker value can be overridden per process by an environment variable of the form
@@ -439,6 +512,7 @@ overrides were applied, is logged at startup.
 | `INFERENCE_SERVER_SCHEDULER_DISPATCH_TIMEOUT_SECONDS` | `scheduler.dispatch_timeout_seconds` | seconds |
 | `INFERENCE_SERVER_SCHEDULER_COMPACTION_INTERVAL` | `scheduler.compaction_interval` | integer |
 | `INFERENCE_SERVER_SCHEDULER_COALESCING` | `scheduler.coalescing` | bool |
+| `INFERENCE_SERVER_SCHEDULER_WEIGHT_READ_STALL_SECONDS` | `scheduler.weight_read_stall_seconds` | seconds |
 | `INFERENCE_SERVER_ENDPOINTS_HOST` | `endpoints.host` | address |
 | `INFERENCE_SERVER_ENDPOINTS_PORT` | `endpoints.port` | port |
 | `INFERENCE_SERVER_ENDPOINTS_METRICS_PORT` | `endpoints.metrics_port` | port |

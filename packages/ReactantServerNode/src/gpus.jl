@@ -26,14 +26,53 @@ end
 _parse_smi_indices(out::AbstractString) =
     String[strip(l) for l in split(out, '\n') if !isempty(strip(l))]
 
-function _smi_gpus()
-    smi = Sys.which("nvidia-smi")
-    smi === nothing && return nothing
-    out = try
-        readchomp(`$smi --query-gpu=index --format=csv,noheader`)
+# How long any `nvidia-smi` call the supervisor makes may take: REACTANT_NVIDIA_SMI_TIMEOUT_SECONDS,
+# default 30. It answers in well under a second normally and in a few seconds on a cold driver with
+# many GPUs; a wedged driver can keep it waiting indefinitely, and it must not hold up the node.
+const NVIDIA_SMI_TIMEOUT_ENV = "REACTANT_NVIDIA_SMI_TIMEOUT_SECONDS"
+const NVIDIA_SMI_TIMEOUT_SECONDS = 30.0
+
+function nvidia_smi_timeout(env::AbstractDict = ENV)
+    v = strip(get(env, NVIDIA_SMI_TIMEOUT_ENV, ""))
+    isempty(v) && return NVIDIA_SMI_TIMEOUT_SECONDS
+    x = tryparse(Float64, v)
+    (x !== nothing && x > 0 && isfinite(x)) ||
+        throw(ConfigError("$NVIDIA_SMI_TIMEOUT_ENV must be a positive number of seconds, got $(repr(env[NVIDIA_SMI_TIMEOUT_ENV]))"))
+    return x
+end
+
+# Run `cmd` with stdin and stderr on /dev/null (so nothing it leaves running can hold a pipe of
+# ours) and give up on it after `timeout` seconds, sending it SIGKILL. Returns `(stdout, :ok)`, or
+# `(nothing, :failed)` for a nonzero exit or a failure to start, or `(nothing, :timeout)`.
+function _read_bounded(cmd::Cmd, timeout::Real)
+    out = Pipe()
+    p = try
+        run(pipeline(cmd; stdin = devnull, stdout = out, stderr = devnull); wait = false)
     catch
+        return (nothing, :failed)
+    end
+    close(out.in)
+    reader = @async read(out, String)
+    if timedwait(() -> istaskdone(reader) && !process_running(p), Float64(timeout); pollint = 0.02) !== :ok
+        try
+            kill(p, Base.SIGKILL)
+        catch
+        end
+        close(out)
+        return (nothing, :timeout)
+    end
+    (istaskfailed(reader) || !success(p)) && return (nothing, :failed)
+    return (fetch(reader), :ok)
+end
+
+function _smi_gpus(; smi = Sys.which("nvidia-smi"), timeout::Real = NVIDIA_SMI_TIMEOUT_SECONDS)
+    smi === nothing && return nothing
+    out, status = _read_bounded(`$smi --query-gpu=index --format=csv,noheader`, timeout)
+    if status === :timeout
+        @warn "nvidia-smi did not answer within $(timeout)s; detecting GPUs from /dev instead" timeout_env = NVIDIA_SMI_TIMEOUT_ENV
         return nothing
     end
+    out === nothing && return nothing
     idx = _parse_smi_indices(out)
     return isempty(idx) ? nothing : idx
 end
@@ -67,9 +106,19 @@ function detect_gpus(
     g isa Int && return _expand_count(g)
     g isa Vector{String} && return g
     haskey(env, "CUDA_VISIBLE_DEVICES") && return _parse_selector_list(env["CUDA_VISIBLE_DEVICES"])
-    smi = _smi_gpus()
+    smi = _smi_gpus(; timeout = nvidia_smi_timeout(env))
     smi === nothing || return smi
     dev = _devfs_gpus(devdir)
     dev === nothing || return dev
     return String[]
+end
+
+# `name` on the PATH of `env` (the environment the supervisor was given, which may not be ENV), or
+# `nothing`.
+function _which(name::AbstractString, env::AbstractDict = ENV)
+    for dir in split(get(env, "PATH", ""), ':'; keepempty = false)
+        p = joinpath(dir, name)
+        isfile(p) && Sys.isexecutable(p) && return p
+    end
+    return nothing
 end

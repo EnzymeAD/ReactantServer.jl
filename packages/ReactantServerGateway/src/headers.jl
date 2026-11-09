@@ -38,70 +38,198 @@ function peek_model_name_and_id(body::AbstractVector{UInt8})
     return h.model_name, h.id
 end
 
-# Partial schema for one InferInputTensor: its `name` (field 1) and `shape` (field 3). The datatype,
-# parameters, and any inline `contents` are skipped, so entering this submessage never touches
-# tensor data. The repeated-scalar decode is the library's, which handles both the packed and
-# unpacked encodings of `repeated int64`; hand-rolling that works until a client encodes the other
-# way.
-struct InferInputShape
+const _LENGTH_DELIMITED = PB.Codecs.LENGTH_DELIMITED
+
+# The tensor parameters that place a tensor in a registered shared-memory region, and the bytes it
+# occupies there (KServe's system shared-memory extension).
+const _SHM_REGION_PARAM = "shared_memory_region"
+const _SHM_BYTE_SIZE_PARAM = "shared_memory_byte_size"
+
+# The value of an `InferParameter` when it is an `int64_param` (field 2), else `nothing`. The bool and
+# string choices are skipped.
+struct InferParameterInt
+    value::Union{Nothing, Int64}
+end
+PB.default_values(::Type{InferParameterInt}) = (; value = nothing)
+PB.field_numbers(::Type{InferParameterInt}) = (; value = 2)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:InferParameterInt}, _endpos::Int = 0, _group::Bool = false)
+    value = nothing
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 2 && wire_type == PB.Codecs.VARINT
+            value = PB.decode(d, Int64)
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return InferParameterInt(value)
+end
+
+# Partial schema for one entry of a tensor's `parameters` map (key field 1, value field 2): the key,
+# and the value when it is an int64 parameter.
+struct ParameterEntryInt
+    key::String
+    value::Union{Nothing, Int64}
+end
+PB.default_values(::Type{ParameterEntryInt}) = (; key = "", value = nothing)
+PB.field_numbers(::Type{ParameterEntryInt}) = (; key = 1, value = 2)
+
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:ParameterEntryInt}, _endpos::Int = 0, _group::Bool = false)
+    key = ""
+    value = nothing
+    while !PB.message_done(d, _endpos, _group)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 1
+            key = PB.decode(d, String)
+        elseif field_number == 2 && wire_type == _LENGTH_DELIMITED
+            v = Ref{Union{Nothing, InferParameterInt}}(nothing)
+            PB.decode!(d, v)
+            value = v[] === nothing ? nothing : v[].value
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    return ParameterEntryInt(key, value)
+end
+
+# Partial schema for one InferInputTensor: its `name` (field 1), its `shape` (field 3), whether a
+# parameter (field 4) places it in shared memory and the byte size declared there, and the encoded
+# length of any inline `contents` (field 5), which is skipped rather than read. The datatype and
+# every tensor payload are skipped, so entering this submessage never touches tensor data. The
+# repeated-scalar decode is the library's, which handles both the packed and unpacked encodings of
+# `repeated int64`; hand-rolling that works until a client encodes the other way.
+struct InferInputData
     name::String
     shape::Vector{Int64}
+    shm::Bool                  # a `shared_memory_region` parameter is present
+    shm_bytes::Int64           # its `shared_memory_byte_size` (0 when absent or not an int64)
+    contents_bytes::Int64      # encoded bytes of the inline typed `contents`
 end
-PB.default_values(::Type{InferInputShape}) = (; name = "", shape = Int64[])
-PB.field_numbers(::Type{InferInputShape}) = (; name = 1, shape = 3)
 
-function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:InferInputShape}, _endpos::Int = 0, _group::Bool = false)
+function PB.decode(d::PB.AbstractProtoDecoder, ::Type{<:InferInputData}, _endpos::Int = 0, _group::Bool = false)
     name = ""
     shape = PB.BufferedVector{Int64}()
+    shm = false
+    shm_bytes = Int64(0)
+    contents_bytes = Int64(0)
     while !PB.message_done(d, _endpos, _group)
         field_number, wire_type = PB.decode_tag(d)
         if field_number == 1
             name = PB.decode(d, String)
         elseif field_number == 3
             PB.decode!(d, wire_type, shape)
+        elseif field_number == 4 && wire_type == _LENGTH_DELIMITED
+            entry = Ref{Union{Nothing, ParameterEntryInt}}(nothing)   # a fresh Ref per entry
+            PB.decode!(d, entry)
+            e = entry[]
+            if e !== nothing
+                e.key == _SHM_REGION_PARAM && (shm = true)
+                (e.key == _SHM_BYTE_SIZE_PARAM && e.value !== nothing) && (shm_bytes = e.value)
+            end
+        elseif field_number == 5 && wire_type == _LENGTH_DELIMITED
+            n = PB.decode(d, UInt64)
+            skip(PB.Codecs.get_stream(d), n)
+            contents_bytes += Int64(min(n, UInt64(typemax(Int32))))
         else
             Base.skip(d, wire_type)
         end
     end
-    return InferInputShape(name, shape[])
+    return InferInputData(name, shape[], shm, shm_bytes, contents_bytes)
+end
+
+"""
+    peek_batch_input(body, input_name, axis) -> (extent, data_bytes)
+
+The extent of `input_name`'s `axis`-th dimension in a serialized `ModelInferRequest`, and how many
+bytes of data the request carries for that input: the `shared_memory_byte_size` it declares when it
+is in shared memory, else the length of its entry in `raw_input_contents`, else the encoded length of
+its inline typed `contents`. `(0, 0)` when the request has no such input; the extent is 0 when the
+shape is too short. `input_name` and `axis` come from the worker over the control plane
+(`ModelStatus.batch_input_name` / `batch_axis`), which is the only party that reads the manifest and
+therefore the only one that knows where a bundle puts its batch axis.
+
+Matching by NAME rather than position is deliberate: KServe inputs are name-addressed and nothing
+requires a client to send them in manifest order. `raw_input_contents` is positional, so the input's
+position among `inputs` picks its entry there.
+
+Reading this costs no payload decode: every `raw_input_contents` entry and every inline `contents` is
+skipped by its length prefix (`Base.skip` seeks rather than copying), and the shape is present even
+on the shared-memory path, where the body carries no contents at all.
+"""
+function peek_batch_input(body::AbstractVector{UInt8}, input_name::AbstractString, axis::Integer)
+    (isempty(input_name) || axis < 1) && return (0, 0)
+    io = IOBuffer(body)
+    d = PB.ProtoDecoder(io)
+    seen = 0                                     # inputs read so far
+    pos = 0                                      # the batch input's position among them
+    found = nothing
+    raw = Int64[]                                # raw_input_contents entry lengths, in order
+    while !PB.message_done(d, 0, false)
+        field_number, wire_type = PB.decode_tag(d)
+        if field_number == 5 && wire_type == _LENGTH_DELIMITED
+            # A FRESH Ref per input: `decode!` into a singular-message Ref MERGES successive
+            # occurrences (proto3 semantics for a repeated field decoded as singular), so reusing one
+            # concatenates the shapes of every input and silently reports the wrong extent.
+            tensor = Ref{Union{Nothing, InferInputData}}(nothing)
+            PB.decode!(d, tensor)
+            seen += 1
+            t = tensor[]
+            if found === nothing && t !== nothing && t.name == input_name
+                found = t
+                pos = seen
+            end
+        elseif field_number == 7 && wire_type == _LENGTH_DELIMITED
+            n = PB.decode(d, UInt64)
+            skip(io, n)
+            push!(raw, Int64(min(n, UInt64(typemax(Int32)))))
+        else
+            Base.skip(d, wire_type)
+        end
+    end
+    found === nothing && return (0, 0)
+    extent = axis <= length(found.shape) ? Int(found.shape[axis]) : 0
+    bytes = found.shm ? max(found.shm_bytes, 0) :
+        !isempty(raw) ? (pos <= length(raw) ? raw[pos] : 0) : found.contents_bytes
+    return extent, Int(bytes)
 end
 
 """
     peek_batch_size(body, input_name, axis) -> Int
 
-The extent of `input_name`'s `axis`-th dimension in a serialized `ModelInferRequest`, or 0 when the
-request has no such input or its shape is too short. `input_name` and `axis` come from the worker
-over the control plane (`ModelStatus.batch_input_name` / `batch_axis`), which is the only party that
-reads the manifest and therefore the only one that knows where a bundle puts its batch axis.
-
-Matching by NAME rather than position is deliberate: KServe inputs are name-addressed and nothing
-requires a client to send them in manifest order.
-
-Reading this costs no payload decode. `inputs` is field 5 while the bulk `raw_input_contents` is
-field 7, and within a tensor `shape` is field 3 while any inline `contents` is field 5, so the
-shapes always precede the data on the wire; `Base.skip` seeks over the rest rather than copying it.
-The shape is present even on the shared-memory path, where the body carries no contents at all.
+The extent of `input_name`'s `axis`-th dimension as the request states it, or 0 when the request has
+no such input or its shape is too short (see [`peek_batch_input`](@ref)). This is the client's claim;
+[`request_item_count`](@ref) is what the gateway believes.
 """
-function peek_batch_size(body::AbstractVector{UInt8}, input_name::AbstractString, axis::Integer)
-    (isempty(input_name) || axis < 1) && return 0
-    d = PB.ProtoDecoder(IOBuffer(body))
-    while !PB.message_done(d, 0, false)
-        field_number, wire_type = PB.decode_tag(d)
-        if field_number == 5
-            # A FRESH Ref per input: `decode!` into a singular-message Ref MERGES successive
-            # occurrences (proto3 semantics for a repeated field decoded as singular), so reusing one
-            # concatenates the shapes of every input and silently reports the wrong extent.
-            tensor = Ref{Union{Nothing, InferInputShape}}(nothing)
-            PB.decode!(d, tensor)
-            t = tensor[]
-            if t !== nothing && t.name == input_name
-                return axis <= length(t.shape) ? Int(t.shape[axis]) : 0
-            end
-        else
-            Base.skip(d, wire_type)
-        end
+peek_batch_size(body::AbstractVector{UInt8}, input_name::AbstractString, axis::Integer) =
+    first(peek_batch_input(body, input_name, axis))
+
+# The most items the gateway counts one request as, whatever it claims. Far above any real request (a
+# trillion rows), and low enough that a load counter can add tens of thousands of such requests
+# without overflowing (see `MAX_CHARGE` in scheduler.jl).
+const MAX_REQUEST_ITEMS = 1 << 40
+
+"""
+    request_item_count(body, input_name, axis) -> Int
+
+How many items the gateway counts a request as: the extent of its batch axis, but no more than the
+bytes of data it carries for that input (every row takes at least one byte), at least 1, and at most
+`MAX_REQUEST_ITEMS`. The extent and the byte count are both the client's, but the bytes are what the
+request actually carries inline, so a request that claims 2^62 rows in a few bytes of data counts as
+a few items. A shared-memory input's byte count is the size the client declares for it, which the
+worker checks against the registered region; the ceiling bounds that case.
+
+The gateway never rejects a request over its shape (the worker is the authority on what is valid);
+a request it cannot read this far, or one with no such input, counts as one item.
+"""
+function request_item_count(body::AbstractVector{UInt8}, input_name::AbstractString, axis::Integer)
+    (isempty(input_name) || axis < 1) && return 1
+    extent, bytes = try
+        peek_batch_input(body, input_name, axis)
+    catch
+        (0, 0)
     end
-    return 0
+    return clamp(min(extent, bytes), 1, MAX_REQUEST_ITEMS)
 end
 
 # Read the region `name` (field 1) from a serialized SystemSharedMemory{Register,Unregister}Request.
@@ -111,10 +239,6 @@ function peek_shm_name(body::AbstractVector{UInt8})
     msg = PB.decode(PB.ProtoDecoder(IOBuffer(body)), SystemSharedMemoryUnregisterRequest)
     return msg.name
 end
-
-# The tensor parameter that places a tensor in a registered shared-memory region (KServe's system
-# shared-memory extension).
-const _SHM_REGION_PARAM = "shared_memory_region"
 
 # Partial schema for one entry of a tensor's `parameters` map (`map<string, InferParameter>` is a
 # repeated entry message with the key as field 1 and the value as field 2): its key only.

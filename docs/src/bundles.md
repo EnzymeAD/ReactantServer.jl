@@ -28,6 +28,11 @@ immediate subdirectory of `model_repo` that contains a `manifest.yaml` is a bund
 mode the watcher sees a renamed bundle directory as the old name removed and a new name added: it
 unloads the old name and loads and compiles the bundle under the new one.
 
+The name `_unknown` is reserved: the request metrics count requests for names a server does not
+serve under `model="_unknown"`, so a model of that name would share their series. A bundle
+directory named `_unknown` is refused like any invalid bundle: at startup the worker reports the
+`BundleError` and does not start, and in `dynamic` mode the watcher logs it and loads nothing.
+
 ## Manifest shape encoding
 
 Each tensor's shape is an einsum-style string of single ASCII letters, one per axis, with a

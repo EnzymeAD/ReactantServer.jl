@@ -102,8 +102,9 @@ _status_label(e) = get(_GRPC_STATUS_NAME, Int(_grpc_status(e)), "UNKNOWN")
 #   has no room for the pages of a shared-memory range the request reads or writes (`ShmSpaceError`,
 #   CORE-4)
 # - UNAVAILABLE: the worker is shutting down or draining, its dispatch loop died, the model is
-#   not resident under externally-managed residency, or admission cannot place it on the device
-#   now (`AdmissionError`). Another replica may serve it; never FAILED_PRECONDITION, which a
+#   not resident under externally-managed residency, admission cannot place it on the device
+#   now (`AdmissionError`), or its weights cannot be read now because reads stalled
+#   (`WeightsReadStalledError`). Another replica may serve it; never FAILED_PRECONDITION, which a
 #   client reads as a stale shared-memory registration
 # - NOT_FOUND: the model is unknown here, or was unloaded or replaced while the request waited
 # - DEADLINE_EXCEEDED: the deadline passed before dispatch (EDF laxity drops included), or the
@@ -123,7 +124,8 @@ function _grpc_status(e)
     S = gRPCServer.StatusCode
     e isa gRPCServer.GRPCError && return e.code
     (e isa QueueFullError || e isa ShmSpaceError) && return S.RESOURCE_EXHAUSTED
-    (e isa WorkerUnavailableError || e isa NotResidentError || e isa AdmissionError) && return S.UNAVAILABLE
+    (e isa WorkerUnavailableError || e isa NotResidentError || e isa AdmissionError || e isa WeightsReadStalledError) &&
+        return S.UNAVAILABLE
     e isa ModelNotFoundError && return S.NOT_FOUND
     (e isa DeadlineExceeded || e isa DispatchTimeoutError) && return S.DEADLINE_EXCEEDED
     (e isa RequestCancelledError || e isa RequestCancelled) && return S.CANCELLED
@@ -316,6 +318,7 @@ end
 # (column-major) order on both sides. Inputs whose batch extents disagree are accepted too, since
 # preprocess may change an input's row count; the scheduler checks the preprocessed inputs and
 # dispatches such a request alone (`_batch_extents_agree`), so it fails without touching others.
+# An input given twice is refused (WRK-11; the codec refuses it first, before reading any data).
 function _validate_inputs(entry, request::InferRequest)
     specs = client_input_spec(entry.manifest)
     byname = Dict(sp.name => sp for sp in specs)
@@ -323,6 +326,7 @@ function _validate_inputs(entry, request::InferRequest)
     for t in request.inputs
         sp = get(byname, t.name, nothing)
         sp === nothing && _invalid("input '$(t.name)' is not declared by model '$(request.model_name)'")
+        t.name in seen && _invalid("input '$(t.name)' appears more than once in the request")
         push!(seen, t.name)
         t.dtype == sp.dtype ||
             _invalid("input '$(t.name)' has dtype $(dtype_token(t.dtype)), expected $(dtype_token(sp.dtype))")
@@ -351,7 +355,8 @@ _infer_or_not_found(ctx::InferContext, request; kw...) = infer(ctx.sched, reques
 # applied to the response inside the timed region (the raw path encodes there), and `t0` lets a
 # caller start the clock before its own work (the raw path starts it before decoding). Every
 # failure leaves as a GRPCError carrying the status contract's code (`_grpc_status`), and the
-# status label counted is that same code. `cancelled` is the call's cancellation probe (see `infer`).
+# status label counted is that same code. The model label is the name only for a model the worker
+# serves (`request_model_label`). `cancelled` is the call's cancellation probe (see `infer`).
 function _handle_infer(
         ctx::InferContext, req, grpc_deadline_ns::Integer = 0;
         finish = identity, t0::Float64 = time(), cancelled = nothing
@@ -360,8 +365,9 @@ function _handle_infer(
     try
         resp = finish(_handle_infer_impl(ctx, req, grpc_deadline_ns; cancelled = cancelled))
         if ctx.metrics !== nothing
-            observe_request!(ctx.metrics, name, time() - t0)
-            inc_request!(ctx.metrics, name, "OK")
+            label = request_model_label(ctx.registry, name)
+            observe_request!(ctx.metrics, label, time() - t0)
+            inc_request!(ctx.metrics, label, "OK")
         end
         return resp
     catch e
@@ -370,8 +376,9 @@ function _handle_infer(
             detail = ctx.error_detail, worker = ctx.name, id = req.id
         )
         if ctx.metrics !== nothing
-            observe_request!(ctx.metrics, name, time() - t0)
-            inc_request!(ctx.metrics, name, _status_label(err))
+            label = request_model_label(ctx.registry, name)
+            observe_request!(ctx.metrics, label, time() - t0)
+            inc_request!(ctx.metrics, label, _status_label(err))
         end
         throw(err)
     finally

@@ -279,3 +279,44 @@ end
         end
     end
 end
+
+@testset "a client cannot register the shared host-weight store's regions (WRK-9)" begin
+    # A stand-in for a weight region (`/rsw-<model>-<digest>`), unlinked before the test ends. A
+    # client used to be able to register it and point an output at it, so the worker would write a
+    # request's result into the weights every worker on the node serves.
+    tag = string(getpid(); base = 36) * "_" * string(rand(UInt32); base = 36)
+    weights_key = "/rsw-wrk9_" * tag * "-0123abcd"
+    w = IPC.SharedMemory(weights_key, 64)
+    own_key = _r2key()
+    own = IPC.SharedMemory(own_key, 64)
+    reg = _RSC2.SharedMemoryRegistry(; reap_interval = 0)
+    try
+        refused(r, key) = try
+            _RSC2.shm_register!(r, "w", key, 0, 64)
+            false
+        catch e
+            e isa ArgumentError && occursin("shared host-weight store", e.msg)
+        end
+        # Every spelling shm_open resolves to the same object is refused, before it is opened.
+        for key in (weights_key, lstrip(weights_key, '/'), "//" * lstrip(weights_key, '/'))
+            @test refused(reg, key)
+        end
+        @test refused(reg, "/rsw-budget.lock")                   # the store's lock files too
+        @test isempty(_RSC2.shm_regions(reg))
+        # A client's own object registers as before, including one whose name merely contains rsw.
+        _RSC2.shm_register!(reg, "own", own_key, 0, 64)
+        @test haskey(_RSC2.shm_regions(reg), "own")
+        @test _RSC2._reserved_prefix(reg, "/rswx-1") === nothing
+        @test _RSC2._reserved_prefix(reg, "/shm-rsw-1") === nothing
+        # The default is the store's own default prefix; a store with another prefix is reserved by
+        # passing it.
+        @test _RSC2.SharedWeightStore().prefix == _RSC2.SHARED_WEIGHT_PREFIX
+        custom = _RSC2.SharedMemoryRegistry(; reap_interval = 0, reserved_prefixes = ["rsw", "abc"])
+        @test _RSC2._reserved_prefix(custom, "/abc-m-1") == "abc"
+        @test refused(custom, weights_key)
+    finally
+        _RSC2.shm_teardown!(reg)
+        finalize(own)
+        finalize(w)
+    end
+end

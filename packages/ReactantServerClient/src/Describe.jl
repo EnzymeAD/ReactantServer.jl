@@ -28,7 +28,8 @@ What [`describe_models`](@ref) reports for one model:
 - `inputs`, `outputs`: [`TensorDescription`](@ref)s, in declaration order
 - `batch_sizes`: the batch sizes the bundle was compiled for, ascending (empty when it declares none)
 - `max_batch_size`: the most rows the worker coalesces into one execution, after any configured cap
-  (0 for a meta model, or when the server does not know it)
+  (0 for a meta model, or when the server does not know it). [`KServeModel`](@ref) refuses a
+  `max_batch_size` below 1, so in that case pass the largest of `batch_sizes`, or 1 when it is empty
 - `calls`: a meta model's sub-models, which are internal: request the meta model, not them
 - `variants`: the compiled input shapes of a model whose inputs have variable axes, one
   `Dict(input name => Julia column-major shape)` per variant with the batch axis left at `-1`.

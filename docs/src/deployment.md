@@ -32,7 +32,10 @@ child processes. It does so in three steps.
    `0` means a CPU node.
 2. the node file's `gpus:` key (`auto`, a count, or a list).
 3. a `CUDA_VISIBLE_DEVICES` already set on the host.
-4. `nvidia-smi` enumeration.
+4. `nvidia-smi` enumeration. Every `nvidia-smi` call the node makes, here, in the image's
+   startup GPU-reclaim wait, and before a worker restart, is given up on after
+   `REACTANT_NVIDIA_SMI_TIMEOUT_SECONDS` (default 30), so a wedged driver cannot hang the node; here
+   detection then falls through to the device nodes.
 5. `/dev/nvidiaN` device nodes.
 
 For a CUDA node that finds no devices, startup fails with guidance (run with `--gpus all`, set
@@ -79,6 +82,36 @@ for the gateway and every worker the supervisor launches, and overrides
 `global.grpc.rapid_reset_protection` in the node file. It is off by default. When it is on, a client
 is disconnected after about 200 calls it gave up on per connection; see
 [Rapid-Reset protection](node_config.md#Rapid-Reset-protection).
+
+### Restarts and logs
+
+A child that exits is restarted after a backoff that starts at 1 second and doubles up to 30. A
+worker that is still running but no longer works (deadlocked, stopped, stuck in the kernel, or with
+its dispatch loop stuck in a GPU call) is killed and restarted the same way: once it has first
+reported ready, the supervisor checks its `/healthz` every 10 seconds and sends it SIGKILL after 6
+failures in a row, and the worker reports itself not live once its dispatch loop has had work and
+finished none of it for 10 minutes. The embedded gateway is checked the same way on its admin
+listener. [Liveness](node_config.md#Liveness) has the settings (the node file's `liveness:` block, or
+`REACTANT_LIVENESS_*` on the container) and their limits. Before a GPU worker is restarted, the supervisor waits until the driver has released the
+memory its last run held on its GPU, as the image's entrypoint does once at container start: up to
+`REACTANT_GPU_RECLAIM_TIMEOUT_SECONDS` (default 30; 0 turns the wait off), until the GPU's used
+memory is at most `REACTANT_GPU_RECLAIM_MAX_USED_PERCENT` of it (default 15) and the dead process no
+longer holds any. Otherwise a restart a second after a crash or a liveness kill can find the memory
+still held and run out of it while it preallocates. After the timeout the worker is restarted
+anyway, and every step is logged; a CPU node, or a node without `nvidia-smi`, does not wait, and
+neither does a restart when `nvidia-smi` does not answer.
+
+With `REACTANT_SUPERVISOR_MAX_RESTARTS` set, a child that fails that many times in a row
+without a stable minute of uptime takes the node down with status 1, so the container restart
+policy acts. The supervisor never stops supervising a child silently: if it cannot go on (an
+internal error it cannot recover from), it says why and exits with status 1.
+
+The supervisor reads its children's output continuously and writes it to its own stdout from a
+bounded buffer (10,000 lines or 8 MiB). If whatever reads the container's log falls behind or stops,
+the children are unaffected: lines past the buffer are dropped, and once the log moves again one
+line says how many were dropped there and from which child. Once a child has exited, the
+supervisor reads what is left of its output for at most 5 seconds, so a process the child started
+that still holds its output open cannot delay the restart or the node's shutdown.
 
 ### Stopping
 
@@ -222,7 +255,9 @@ override, which can be passed with `-e`.
 
 **Health.** An OCI image cannot carry a healthcheck, so pass one at run time:
 `/usr/local/bin/healthcheck.node.sh` reports healthy once the node's `/readyz` answers. Set the
-start period longer than a cold start, which compiles every model before `/readyz` succeeds.
+start period longer than a cold start, which compiles every model before `/readyz` succeeds. On a
+multi-worker node `/readyz` stays healthy while any worker is ready; a worker or gateway that stops
+working is restarted by the supervisor itself ([Restarts and logs](#Restarts-and-logs)).
 
 ### Building the image
 

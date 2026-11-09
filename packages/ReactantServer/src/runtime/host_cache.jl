@@ -313,28 +313,27 @@ Do every host step of loading `entry` and no device step: take its region from t
 file. Runs on a background task, concurrently with the dispatch loop: it reads the weights file
 with `pread`, which keeps no file position, and takes `cache.lock` for the cache bookkeeping. Hit and
 miss counters are left to the upload (`_device_buffers`), so they count loads, as before, and the
-time taken is recorded on the result so the load's full cost still reaches the eviction policy.
+time taken is recorded on the result so the load's full cost still reaches the eviction policy. The
+read is counted in `stages` when it starts, so one that never returns (storage that stopped
+answering) is counted as well; its time, and its failure if it fails, are added when it ends.
 """
 function stage_host_weights(
         cache::WeightCache, entry::ModelEntry,
         names::Vector{String} = (entry.executable::LoadedModel).sig.weight_names
     )
     t0 = time()
+    lock(() -> cache.stages += 1, cache.lock)
     staged = try
         _stage_host_weights(cache, entry, names)
     catch
         lock(cache.lock) do
-            cache.stages += 1
             cache.stage_failures += 1
             cache.stage_seconds += time() - t0
         end
         rethrow()
     end
     staged.host_seconds = time() - t0
-    lock(cache.lock) do
-        cache.stages += 1
-        cache.stage_seconds += staged.host_seconds
-    end
+    lock(() -> cache.stage_seconds += staged.host_seconds, cache.lock)
     return staged
 end
 

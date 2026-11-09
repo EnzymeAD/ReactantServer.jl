@@ -178,17 +178,53 @@ queued keeps it for them.
 Workers on the same node read different models at once; two workers wanting the same model share
 one read.
 
+A read that stops making progress is abandoned. Weights on network storage can stop answering (a
+hard NFS mount whose server went away, or a shared host-weight lock held by a worker that is stuck),
+and a read waiting on them sits in the kernel for good, where nothing can interrupt it. Each read
+counts the bytes it reads as they arrive, 8 MiB at a time, and one that reads nothing for
+`scheduler.weight_read_stall_seconds` (20 s by default; 0 turns this off) is abandoned: the requests
+waiting for the model fail with `UNAVAILABLE`, which the gateway retries on another replica, and the
+read slot passes to the next model. Storage that is slow but still moving is never cut off (8 MiB per
+limit, 410 KiB/s at the default, is enough). A worker waiting for another worker that is reading the
+same model into the node's shared copy counts that worker's progress as its own, so the wait is cut
+off only when that read stalls too; any other wait on a shared host-weight lock counts as no
+progress. The abandoned read still holds a thread and the memory it was reading into. Until it
+returns, its model is not read again, and requests for it fail with `UNAVAILABLE` at once; if it
+returns, what it read is released. With four abandoned reads outstanding (a quarter of the worker's
+default threads when that is fewer, at least one), the worker starts no read of storage at all, and
+every request for a model that is not on its GPU fails with `UNAVAILABLE` at once, unless the
+model's weights are in the worker's own host cache (private host copies under
+`runtime.host_weight_budget`), which needs no read of storage. Models on the GPU keep serving
+throughout, and the worker keeps reporting ready. Each abandoned read is logged, and so is its
+return; `worker_weight_stalled_reads_total` counts them, and `worker_weight_stalled_reads` shows the
+ones that have not returned.
+
+The default limit is below the default dispatch timeout (`scheduler.dispatch_timeout_seconds`,
+30 s), so every request waiting for a read that stalls fails with the retryable `UNAVAILABLE`, which
+a gateway can move to another replica, rather than with `DEADLINE_EXCEEDED` at its dispatch timeout.
+A reason to raise it is NFS: a hard mount resends a request its server did not answer only after the
+mount's `timeo` (60 s by default over TCP), so a single lost request can hold up a healthy read for a
+minute. If the log shows reads abandoned that then return on their own, raise the limit above
+`timeo`. A limit above the dispatch timeout makes the requests waiting for a stalled read fail with
+`DEADLINE_EXCEEDED` instead, which a gateway does not retry elsewhere.
+
 The same holds for every other load. Compaction, and the fallback compaction admission runs, reload
 only models with a host copy to upload from; a model without one stays evicted until its next request
 reads it in the background. A hot reload from the directory watcher reads the new version's weights
 before it takes the GPU loop (and attaches a `residency: system` floor after), and a residency change
-on an externally managed worker reads before its control step.
+on an externally managed worker reads before its control step. That read is watched for progress like
+the reads above: one that stalls fails the `SetModelResidency` call with `UNAVAILABLE`, and the next
+residency change, for any other model, does not wait for it.
 
 A gateway moving a model onto a worker can read it there ahead of time: the worker's
 `StageWeights` RPC reads the named models into host memory on background tasks, holds what it read
 until each model's first dispatch uploads it (or the hold expires, at most 10 minutes), and returns
 once the reads end. Held bytes are capped at half the host weight budget (4 GiB without one); past
-the cap a model is reported `deferred`. See [primed moves](gateway.md#Primed-moves).
+the cap a model is reported `deferred`. A model the directory watcher unloads or reloads while the
+call runs is reported `failed` and nothing is held for it, so a new version is read for its own
+requests as usual. A read that stalls is abandoned as above and its model reported `failed`, so the
+call returns within the stall limit even when the read never does; so is a model the worker will not
+read because reads have stalled. See [primed moves](gateway.md#Primed-moves).
 
 How the budget is shared depends on `shared_host_weights`:
 

@@ -171,11 +171,26 @@ end
         @test cfgb.scheduler.cost_ema_alpha == 0.2
         @test cfgb.scheduler.discipline == ReactantServer.FAIR
         @test isempty(cfgb.scheduler.models)
+        @test cfgb.scheduler.weight_read_stall_seconds == 20.0
+
+        # The weight-read stall limit, from the file or the environment; 0 turns it off.
+        for (yaml, want) in (("2.5", 2.5), ("0", 0.0))
+            cs, _, _ = load_single_worker(dir, "scheduler:\n  weight_read_stall_seconds: $yaml"; model_repo = modeldir)
+            @test ReactantServer.validate_config(cs) === cs
+            @test cs.scheduler.weight_read_stall_seconds == want
+        end
+        withenv("INFERENCE_SERVER_SCHEDULER_WEIGHT_READ_STALL_SECONDS" => "15") do
+            ce, applied, _ = load_single_worker(dir, "scheduler:\n  weight_read_stall_seconds: 2.5"; model_repo = modeldir)
+            @test ce.scheduler.weight_read_stall_seconds == 15.0
+            @test length(applied) == 1
+        end
 
         # validation rejects out-of-range knobs and bad per-model values
         for (key, val) in (
                 ("recency_penalty_cap", "1.5"), ("coalescing_discount", "1.0"),
                 ("cost_ema_alpha", "0"), ("dispatch_timeout_seconds", "-1.0"),
+                ("weight_read_stall_seconds", "-1.0"), ("weight_read_stall_seconds", ".inf"),
+                ("weight_read_stall_seconds", ".nan"),
             )
             c, _, _ = load_single_worker(dir, "scheduler:\n  $key: $val"; model_repo = modeldir)
             @test_throws ReactantServer.ConfigError ReactantServer.validate_config(c)
@@ -818,5 +833,12 @@ end
             30.0, 0.25, 0.1, 0.2, 64, 30.0, ReactantServer.FAIR, 0, Dict{String, ReactantServer.ModelSchedConfig}()
         )
         @test c9.coalescing
+        # ... and the weight-read stall limit at its default.
+        @test c9.weight_read_stall_seconds == 20.0
+        c10 = ReactantServer.SchedulerConfig(
+            30.0, 0.25, 0.1, 0.2, 64, 30.0, ReactantServer.FAIR, 0, Dict{String, ReactantServer.ModelSchedConfig}(), false
+        )
+        @test !c10.coalescing && c10.weight_read_stall_seconds == 20.0
+        @test ReactantServer.SchedulerConfig(30.0, 64, 30.0; weight_read_stall_seconds = 5).weight_read_stall_seconds == 5.0
     end
 end

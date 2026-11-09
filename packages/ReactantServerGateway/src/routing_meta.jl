@@ -20,8 +20,8 @@
 # (Δcompute / Δrequests) already embeds whatever batch sizes the clients happened to send, so it
 # cannot be scaled by an item count without double-counting. Cost per item (Δcompute / Δrows) can.
 
-# Watchdog ceiling for one control-status poll. The gateway's clients share one libcurl multi
-# handle with a 16-slot request semaphore (GRPC_MAX_STREAMS); if its driving stalls, in-flight
+# Watchdog ceiling for one control-status poll. The poll runs on the worker's probe handle, a libcurl
+# multi handle with a 16-slot request semaphore (GRPC_MAX_STREAMS); if its driving stalls, in-flight
 # calls never release their slot and new calls block forever, so every poll is bounded and a worker
 # that exceeds this is treated as not-polled.
 const POLL_TIMEOUT_SECONDS = 8.0
@@ -112,15 +112,14 @@ model_meta(snap::RoutingMetaSnapshot, model::AbstractString) =
     request_items(snap::RoutingMetaSnapshot, model, body) -> Int
 
 How many items the request in `body` carries: the extent of `model`'s batch axis, read out of the
-request without decoding its payload. Falls back to 1 for a model that declares no batch axis, one
-the gateway has not polled yet, or a request missing that input, so the count degrades to a request
-count rather than to zero.
+request without decoding its payload and capped at the bytes of data the request carries for that
+input (see [`request_item_count`](@ref)). Falls back to 1 for a model that declares no batch axis,
+one the gateway has not polled yet, or a request missing that input, so the count degrades to a
+request count rather than to zero.
 """
 function request_items(snap::RoutingMetaSnapshot, model::AbstractString, body::AbstractVector{UInt8})
     m = model_meta(snap, model)
-    m.batch_axis < 1 && return 1
-    n = peek_batch_size(body, m.batch_input, m.batch_axis)
-    return n > 0 ? n : 1
+    return request_item_count(body, m.batch_input, m.batch_axis)
 end
 
 """
@@ -172,7 +171,7 @@ function poll_workers(pool::ClientPool, ready_urls::Vector{String})
                 "ModelControlStatus poll", url
             )
             if resp === nothing
-                to && reset_clients!(wc)
+                to && reset_probe_connection!(wc)
                 return
             end
             lock(lk) do

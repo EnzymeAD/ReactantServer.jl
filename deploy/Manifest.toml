@@ -2,7 +2,7 @@
 
 julia_version = "1.12.7"
 manifest_format = "2.0"
-project_hash = "e1e010f853ccaa6e1c8b9f256309cc89f230e7b5"
+project_hash = "3e69655b68879b6405357bb8c227458dc733d003"
 
 [[deps.Adapt]]
 deps = ["LinearAlgebra"]
@@ -664,7 +664,7 @@ uuid = "b92f1031-7cb7-4fde-89de-b6dd50303018"
 version = "0.2.0"
 
 [[deps.ReactantServerNode]]
-deps = ["ReactantServerCore", "TOML", "YAML"]
+deps = ["ReactantServerCore", "Sockets", "TOML", "YAML"]
 path = "packages/ReactantServerNode"
 uuid = "49f09047-4fb9-4260-828b-8494ed8e9881"
 version = "0.2.0"

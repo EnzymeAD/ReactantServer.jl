@@ -159,7 +159,7 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64,
         resp = invoke_infer(wc, body; deadline = deadline_s, cancelled = cancelled, label = full ? nothing : _shown(st, url))
         observe_worker!(st.metrics, "ModelInfer", url, time() - t0)
         # A worker's reply always carries model_name, so an empty body is a call that ended without
-        # a response: gRPCClient before 1.1.2 returned one when `reset_clients!` aborted the call.
+        # a response: gRPCClient before 1.1.2 returned one when a handle reset aborted the call.
         # Fail over rather than hand the client an empty response as a success.
         if isempty(resp)
             @warn "infer: worker returned an empty response" model worker = url request_id = id
@@ -236,6 +236,21 @@ function _dispatch_infer(st::GatewayState, model, id, body, deadline_ns::Int64, 
     end
 end
 
+# The `model` label of the ModelInfer series for every name the routing table does not hold when the
+# request is counted: names nobody serves, names a client made up, and an empty or unreadable one. A
+# client chooses the names it sends, so labelling with them would let any client add series (each a
+# counter and an 18-bucket histogram) without bound; with this, the series are bounded by the models
+# the gateway has actually routed, plus this one. The workers use the same label for the same
+# purpose. The name is reserved: workers refuse to load a bundle named `_unknown`, so no routed model
+# shares this series.
+const UNKNOWN_MODEL_LABEL = "_unknown"
+
+# The `model` label for a ModelInfer for `model`: its name if the routing table holds it right now,
+# else `UNKNOWN_MODEL_LABEL`. A model that leaves the table later keeps its series, which stays
+# bounded by the models the gateway has served.
+_model_label(st::GatewayState, model::AbstractString) =
+    has_model(st.routes, model) ? String(model) : UNKNOWN_MODEL_LABEL
+
 # `cancelled` is the inbound call's cancellation probe (see `_CallCancelled`): a cancelled call stops
 # trying replicas and cancels its in-flight worker call.
 function _gw_infer(body::Vector{UInt8}, st::GatewayState, deadline_ns::Integer = 0, cancelled = nothing)
@@ -244,7 +259,7 @@ function _gw_infer(body::Vector{UInt8}, st::GatewayState, deadline_ns::Integer =
     try
         model, id = peek_model_name_and_id(body)
     catch e
-        inc_requests!(st.metrics, "ModelInfer", "", STATUS_INVALID)
+        inc_requests!(st.metrics, "ModelInfer", UNKNOWN_MODEL_LABEL, STATUS_INVALID)
         throw(
             gRPCServer.GRPCError(
                 gRPCServer.StatusCode.INVALID_ARGUMENT,
@@ -253,7 +268,7 @@ function _gw_infer(body::Vector{UInt8}, st::GatewayState, deadline_ns::Integer =
         )
     end
     if isempty(model)
-        inc_requests!(st.metrics, "ModelInfer", "", STATUS_INVALID)
+        inc_requests!(st.metrics, "ModelInfer", UNKNOWN_MODEL_LABEL, STATUS_INVALID)
         throw(
             gRPCServer.GRPCError(
                 gRPCServer.StatusCode.INVALID_ARGUMENT,
@@ -261,10 +276,12 @@ function _gw_infer(body::Vector{UInt8}, st::GatewayState, deadline_ns::Integer =
             )
         )
     end
-    record_arrival!(st.scheduler, model)
+    # Only a routed model's arrivals are counted: a scheduler keeps a counter per name it is given.
+    has_model(st.routes, model) && record_arrival!(st.scheduler, model)
     resp, status, exc = _dispatch_infer(st, model, id, body, Int64(deadline_ns), cancelled)
-    observe_request!(st.metrics, "ModelInfer", model, time() - t0)
-    inc_requests!(st.metrics, "ModelInfer", model, status)
+    label = _model_label(st, model)
+    observe_request!(st.metrics, "ModelInfer", label, time() - t0)
+    inc_requests!(st.metrics, "ModelInfer", label, status)
     exc === nothing || throw(exc)
     return resp
 end
@@ -342,6 +359,8 @@ function _fanout_unregister(st::GatewayState, urls, body)
     return nothing
 end
 
+# The shared-memory RPCs are counted with an empty `model` label: they name a region, not a model, and
+# a region's name is chosen by each client process (usually at random), so it must not label a series.
 function _gw_shm_register(body::Vector{UInt8}, st::GatewayState)
     t0 = time()
     region = ""
@@ -382,10 +401,10 @@ function _gw_shm_register(body::Vector{UInt8}, st::GatewayState)
         return resp
     end
     resp, succeeded, failed, errors = _broadcast_shm(st, register_op, region, "SystemSharedMemory")
-    observe_request!(st.metrics, "SystemSharedMemoryRegister", region, time() - t0)
+    observe_request!(st.metrics, "SystemSharedMemoryRegister", "", time() - t0)
 
     if isempty(failed)
-        inc_requests!(st.metrics, "SystemSharedMemoryRegister", region, STATUS_OK)
+        inc_requests!(st.metrics, "SystemSharedMemoryRegister", "", STATUS_OK)
         @info "shm.register: ok" region workers = succeeded
         return resp === nothing ? UInt8[] : resp
     end
@@ -398,7 +417,7 @@ function _gw_shm_register(body::Vector{UInt8}, st::GatewayState)
     # The name belongs to another client's live object on some worker: say so, as Triton does, so
     # the client does not mistake it for a stale registration.
     if any(_already_exists, values(errors))
-        inc_requests!(st.metrics, "SystemSharedMemoryRegister", region, "AlreadyExists")
+        inc_requests!(st.metrics, "SystemSharedMemoryRegister", "", STATUS_ALREADY_EXISTS)
         throw(
             gRPCServer.GRPCError(
                 gRPCServer.StatusCode.ALREADY_EXISTS,
@@ -407,7 +426,7 @@ function _gw_shm_register(body::Vector{UInt8}, st::GatewayState)
             )
         )
     end
-    inc_requests!(st.metrics, "SystemSharedMemoryRegister", region, STATUS_FAILED_PRE)
+    inc_requests!(st.metrics, "SystemSharedMemoryRegister", "", STATUS_FAILED_PRE)
     throw(
         gRPCServer.GRPCError(
             gRPCServer.StatusCode.FAILED_PRECONDITION,
@@ -432,11 +451,11 @@ function _gw_shm_unregister(body::Vector{UInt8}, st::GatewayState)
     end
 
     resp, succeeded, failed, _ = _broadcast_shm(st, wc -> invoke_shm_unregister(wc, body), region, "SystemSharedMemory")
-    observe_request!(st.metrics, "SystemSharedMemoryUnregister", region, time() - t0)
+    observe_request!(st.metrics, "SystemSharedMemoryUnregister", "", time() - t0)
 
     if isempty(succeeded) && !isempty(failed)
         @warn "shm.unregister: every worker failed" region failed_workers = failed
-        inc_requests!(st.metrics, "SystemSharedMemoryUnregister", region, STATUS_UNAVAILABLE)
+        inc_requests!(st.metrics, "SystemSharedMemoryUnregister", "", STATUS_UNAVAILABLE)
         throw(
             gRPCServer.GRPCError(
                 gRPCServer.StatusCode.UNAVAILABLE,
@@ -449,7 +468,7 @@ function _gw_shm_unregister(body::Vector{UInt8}, st::GatewayState)
     else
         @info "shm.unregister: ok" region workers = succeeded
     end
-    inc_requests!(st.metrics, "SystemSharedMemoryUnregister", region, STATUS_OK)
+    inc_requests!(st.metrics, "SystemSharedMemoryUnregister", "", STATUS_OK)
     return resp === nothing ? UInt8[] : resp
 end
 

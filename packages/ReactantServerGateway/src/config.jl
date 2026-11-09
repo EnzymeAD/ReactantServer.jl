@@ -22,6 +22,12 @@ end
 
 GatewayModelConfig(replicas::Int) = GatewayModelConfig(replicas, :inherit, 0.0)
 
+# How long a worker that stops answering, or reports not ready, keeps the routes it last reported, by
+# default (`worker_client.route_retention_seconds`; see `DiscoveredRoutes`). Ten minutes covers a
+# worker's restart, including loading and compiling its models, so a gateway in front of one worker
+# answers UNAVAILABLE rather than NOT_FOUND while it comes back.
+const ROUTE_RETENTION_SECONDS = 600.0
+
 struct GatewayConfig
     listen_grpc::String
     listen_metrics::String
@@ -167,6 +173,13 @@ struct GatewayConfig
     # can then hang until their deadline (GW-18). When false the stream limit is out of any client's
     # reach and the inbound admission cap is what bounds a resetting client.
     rapid_reset_protection::Bool
+    # How long a worker that stops answering, or reports not ready, keeps the routes it last reported
+    # (`worker_client.route_retention_seconds`, default 600). Meanwhile a model that only such
+    # workers serve is still routed to them, so its requests fail over or come back UNAVAILABLE,
+    # which clients retry, rather than NOT_FOUND, which they do not; a model a ready worker serves
+    # goes to the ready ones. After it, a model nobody else serves is NOT_FOUND. 0 forgets a worker's
+    # routes at the first round it is not ready. See `DiscoveredRoutes`.
+    route_retention_seconds::Float64
 end
 
 """
@@ -178,8 +191,9 @@ RESOURCE_EXHAUSTED (see `build_gateway_server`).
 """
 inbound_cap(cfg::GatewayConfig) = cfg.max_concurrent_requests_per_worker * length(cfg.workers)
 
-# The positional form without `error_detail` and `rapid_reset_protection` (tests, older callers): the
-# defaults, production-safe redaction and no Rapid-Reset cut-off.
+# The positional form without `error_detail`, `rapid_reset_protection` and `route_retention_seconds`
+# (tests, older callers): the defaults, production-safe redaction, no Rapid-Reset cut-off, and the
+# default route retention.
 GatewayConfig(
     listen_grpc, listen_metrics, workers, worker_metrics, worker_names,
     request_timeout_seconds, max_recv_msg_bytes, max_send_msg_bytes, log_level, log_format,
@@ -197,7 +211,7 @@ GatewayConfig(
     routing_fill_factor, routing_policy, routing_fill_mode, models,
     max_concurrent_streams_per_worker, max_concurrent_requests_per_worker, compaction_mode,
     compaction_interval, forbid_memory_oversubscription, payback_seconds, prime_moves,
-    stage_timeout_seconds, ERROR_DETAIL_REDACTED, false
+    stage_timeout_seconds, ERROR_DETAIL_REDACTED, false, ROUTE_RETENTION_SECONDS
 )
 
 const GW_ENV_PREFIX = "REACTANT_GATEWAY_"
@@ -223,6 +237,7 @@ const GW_ENV_PATHS = Tuple{String, Vector{String}, DataType}[
     ("SCHEDULING_STAGE_TIMEOUT_SECONDS", ["scheduling", "stage_timeout_seconds"], Float64),
     ("WORKER_CLIENT_REQUEST_TIMEOUT_SECONDS", ["worker_client", "request_timeout_seconds"], Int),
     ("WORKER_CLIENT_MAX_CONCURRENT_STREAMS", ["worker_client", "max_concurrent_streams"], Int),
+    ("WORKER_CLIENT_ROUTE_RETENTION_SECONDS", ["worker_client", "route_retention_seconds"], Float64),
     ("GRPC_MAX_RECV_MSG_BYTES", ["grpc", "max_recv_msg_bytes"], Int),
     ("GRPC_MAX_SEND_MSG_BYTES", ["grpc", "max_send_msg_bytes"], Int),
     ("GRPC_MAX_CONCURRENT_REQUESTS_PER_WORKER", ["grpc", "max_concurrent_requests_per_worker"], Int),
@@ -375,6 +390,7 @@ function _build_gateway_config(raw::Dict{String, Any})
         _opt(sched, "stage_timeout_seconds", Float64, 120.0),
         _parse_error_detail(_opt(grpc, "error_detail", String, "redacted")),
         _opt(grpc, "rapid_reset_protection", Bool, false),
+        _opt(wc, "route_retention_seconds", Float64, ROUTE_RETENTION_SECONDS),
     )
     cfg.max_concurrent_streams_per_worker > 0 ||
         throw(ConfigError("worker_client.max_concurrent_streams must be positive"))
@@ -401,6 +417,8 @@ function _build_gateway_config(raw::Dict{String, Any})
     _ck_nonneg_int("scheduling.compaction_interval", cfg.compaction_interval; hint = "0 = disabled")
     _ck_nonneg("scheduling.payback_seconds", cfg.payback_seconds; hint = "0 = never move a model for balance")
     _ck_positive("scheduling.stage_timeout_seconds", cfg.stage_timeout_seconds)
+    isfinite(cfg.route_retention_seconds) || throw(ConfigError("worker_client.route_retention_seconds must be finite, got $(cfg.route_retention_seconds)"))
+    _ck_nonneg("worker_client.route_retention_seconds", cfg.route_retention_seconds; hint = "0 = forget a worker's routes at its first missed round")
 
     if !isempty(_opt(tls, "cert_file", String, "")) || !isempty(_opt(tls, "key_file", String, ""))
         @warn "gateway TLS is configured but not yet enforced; serving cleartext h2c"

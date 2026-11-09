@@ -20,7 +20,13 @@ following before exposing any endpoint:
   mapped (device and inode), not by its name: registering a name that is held by another client's
   object that still exists fails with `ALREADY_EXISTS` instead of redirecting that client's
   traffic, and registrations whose object was unlinked or recreated are dropped. An object a
-  crashed client left behind stays registered until it is removed from `/dev/shm`. Before every
+  crashed client left behind stays registered until it is removed from `/dev/shm`. A worker refuses
+  to register a key under the shared host-weight store's prefix (`rsw-`, the store's regions and lock
+  files) with `INVALID_ARGUMENT`, so a client cannot point an output at the weights that every
+  worker on the node serves. That stops a client that only reaches the worker over gRPC; a local
+  user who can write the regions (any user under the default mode `666`) can change them directly,
+  or link one into `/dev/shm` under another name and register that, so mode `660` matters
+  wherever local users are not trusted. Before every
   copy into or out of a registered region, and before touching a slot control word, a worker checks
   that the object still covers the range and that the range's pages exist (allocating them unless
   `fstat` shows every page of the object allocated), so a client that shrinks its object after

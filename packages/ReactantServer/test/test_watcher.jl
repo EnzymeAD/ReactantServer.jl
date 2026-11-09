@@ -387,6 +387,66 @@ end
     end
 end
 
+@testset "a bundle named _unknown, the request-metrics label, is refused (CPU)" begin
+    BundleError = ReactantServer.BundleError
+    _reserved(e) = e isa BundleError && occursin("'_unknown' is reserved", sprint(showerror, e))
+    mktempdir() do root
+        # Refused before anything is read: an empty directory gives the reserved-name error, not a
+        # missing manifest.
+        empty = mkpath(joinpath(root, "_unknown"))
+        err = try
+            ReactantServer.load_bundle_entry(empty)
+            nothing
+        catch e
+            e
+        end
+        @test _reserved(err)
+        rm(empty; recursive = true)
+
+        # A complete bundle under the name is refused too, at startup (load_bundles) as for any
+        # invalid bundle; an allowlist that leaves it out loads the rest.
+        _write_scale_bundle(root, "_unknown")
+        _write_scale_bundle(root, "m")
+        err = try
+            ReactantServer.load_bundles([root])
+            nothing
+        catch e
+            e
+        end
+        @test _reserved(err)
+        reg = ReactantServer.load_bundles([root]; include = ["m"])
+        @test haskey(reg.by_name, "m") && !haskey(reg.by_name, "_unknown")
+        @test ReactantServer.request_model_label(reg, "_unknown") == ReactantServer.UNKNOWN_MODEL_LABEL
+    end
+    mktempdir() do root
+        # In dynamic mode the watcher loads the other bundle and logs the refusal, registering
+        # nothing under the reserved name. Both bundles appear after the watcher starts, as the
+        # other watcher tests' do (one present at its creation counts as already loaded).
+        env = _cpu_watch_env(root)
+        ReactantServer.start!(env.sched)
+        try
+            w = BundleWatcher(env.sched, env.backend, env.pool, env.cfg; interval = 0.1, on_demand = false)
+            _write_scale_bundle(root, "_unknown")
+            _write_scale_bundle(root, "m")
+            @test _poll_action(w) === nothing
+            logger = TestLogger()
+            with_logger(logger) do
+                _watch_once!(w)
+            end
+            @test get_model(env.reg, "m") !== nothing
+            @test get_model(env.reg, "_unknown") === nothing
+            @test !haskey(env.reg.meta, "_unknown")
+            @test any(logger.logs) do r
+                r.message == "watcher: failed to apply model change; will retry next poll" &&
+                    r.kwargs[:name] == "_unknown" && _reserved(first(r.kwargs[:exception]))
+            end
+            @test _y(env.sched, "m") == Float32[2, 4, 6, 8]
+        finally
+            ReactantServer.shutdown!(env.sched)
+        end
+    end
+end
+
 @testset "renamed bundle directory: an unload of the old name and a load of the new one (CPU)" begin
     mktempdir() do root
         backend = ReactantServer.ReactantBackend()

@@ -88,12 +88,14 @@ end
     sink = IOBuffer()
     # A child that traps and ignores SIGTERM (a Julia child cannot: its runtime handles SIGTERM
     # on a dedicated signal thread); the supervisor must escalate to SIGKILL after the grace
-    # window.
+    # window. `exec` makes the sleep the child itself (it keeps the ignored disposition), so the
+    # SIGKILL ends it; a plain `sleep` would be a grandchild left running for two minutes, holding
+    # the child's output pipes.
     sup = RSN.Supervisor(
         [
             RSN.ChildSpec(
                 "stubborn",
-                `sh -c 'trap "" TERM; echo "ignoring TERM"; sleep 120'`, 1.0
+                `sh -c 'trap "" TERM; echo "ignoring TERM"; exec sleep 120'`, 1.0
             ),
         ]; sink = sink
     )
@@ -101,8 +103,11 @@ end
     @test wait_for(() -> any(l -> l == "[stubborn] ignoring TERM", _sink_lines(sink)))
     RSN.request_shutdown!(sup)
     @test fetch(t) == 0
-    @test any(l -> occursin("sending SIGKILL", l), _sink_lines(sink))
+    lines = _sink_lines(sink)
+    @test any(l -> occursin("sending SIGKILL", l), lines)
     @test !process_running(sup.children[1].proc)
+    # Nothing the child started outlives it: its pipes closed with it.
+    @test !any(l -> occursin("still holds its output open", l), lines)
 end
 
 @testset "supervisor: refuses --handle-signals=no with more than one thread" begin
@@ -192,6 +197,356 @@ end
     @test any(l -> occursin("deaf did not acknowledge the drain request within 10s; sending SIGTERM", l), lines)
     @test any(l -> startswith(l, "[supervisor] deaf stopped") && occursin("signal=15", l), lines)
     @test !any(l -> occursin("SIGKILL", l), lines)
+end
+
+# A sink whose writes wait until its gate opens, as a stdout whose reader has stopped reading does.
+struct _GatedSink <: IO
+    buf::IOBuffer
+    gate::Base.Event
+end
+_GatedSink() = _GatedSink(IOBuffer(), Base.Event())
+Base.unsafe_write(s::_GatedSink, p::Ptr{UInt8}, n::UInt) = (wait(s.gate); unsafe_write(s.buf, p, n))
+Base.write(s::_GatedSink, b::UInt8) = (wait(s.gate); write(s.buf, b))
+Base.flush(::_GatedSink) = nothing
+
+_counted(lines, re) = [parse(Int, m[1]) for m in (match(re, l) for l in lines) if m !== nothing]
+
+@testset "supervisor: a blocked log sink never blocks a child" begin
+    sink = _GatedSink()
+    done = joinpath(mktempdir(), "done")
+    # Far more output than a pipe holds (64 KiB) or the log queue keeps (50 lines), then a marker
+    # file. While the sink takes nothing, the child gets to the marker only if the supervisor keeps
+    # reading its pipe. Before, the pump waited on the sink, the pipe filled, and the child blocked.
+    script = """
+    for i in 1:20000
+        println("line \$i")
+    end
+    flush(stdout)
+    touch($(repr(done)))
+    sleep(120)
+    """
+    sup = RSN.Supervisor([_script_spec("chatty", script)]; sink = sink, log_lines = 50)
+    t = @async RSN.run_supervisor!(sup; install_signal_handlers = false)
+    @test wait_for(() -> isfile(done); timeout = 60)
+    @test position(sink.buf) == 0                        # the sink has still taken nothing
+    notify(sink.gate)
+    @test wait_for(() -> any(l -> occursin("were dropped here", l), _sink_lines(sink.buf)))
+    RSN.request_shutdown!(sup)
+    @test fetch(t) == 0
+    lines = _sink_lines(sink.buf)
+    got = _counted(lines, r"^\[chatty\] line (\d+)$")
+    dropped = _counted(lines, r"^\[supervisor\] the log sink fell behind and \d+ line\(s\) were dropped here \(.*chatty: (\d+)")
+    @test issorted(got) && allunique(got)                # one child's lines keep their order
+    @test !isempty(dropped) && length(got) + sum(dropped) == 20000   # every line written or counted
+    @test any(l -> startswith(l, "[supervisor] node stopped (exit 0)"), lines)
+end
+
+@testset "supervisor: getpid failing does not end supervision" begin
+    # A child that exits at once is already reaped when its pid is read, and getpid throws ESRCH.
+    # Before, that escaped the loop, the child's task ended, and it was never restarted.
+    RSN._GETPID[] = p -> throw(Base.IOError("getpid: no such process (ESRCH)", Base.UV_ESRCH))
+    try
+        sink = IOBuffer()
+        sup = RSN.Supervisor([_script_spec("quick", "sleep(0.5); exit(3)")]; sink = sink, max_restarts = 1)
+        @test RSN.run_supervisor!(sup; install_signal_handlers = false) == 1   # budget, not a silent stop
+        lines = _sink_lines(sink)
+        @test count(l -> startswith(l, "[supervisor] started quick (pid unknown"), lines) == 2
+        @test count(l -> occursin("quick exited (code=3", l), lines) == 2
+        @test any(l -> occursin("restarting quick in 1.0s", l), lines)
+    finally
+        RSN._GETPID[] = getpid
+    end
+end
+
+@testset "supervisor: an unexpected error in a run restarts the child" begin
+    # The first pid lookup fails with an error the loop has no handler of its own for. The running
+    # child is killed (a second copy would fight it for its ports) and restarted.
+    calls = Ref(0)
+    RSN._GETPID[] = p -> ((calls[] += 1) == 1 ? error("injected supervision fault") : getpid(p))
+    try
+        sink = IOBuffer()
+        sup = RSN.Supervisor([_script_spec("steady", "println(\"up\"); flush(stdout); sleep(120)")]; sink = sink)
+        t = @async RSN.run_supervisor!(sup; install_signal_handlers = false)
+        @test wait_for(() -> count(==("[steady] up"), _sink_lines(sink)) == 2)
+        lines = _sink_lines(sink)
+        @test any(l -> startswith(l, "[supervisor] supervising steady failed unexpectedly; restarting it:"), lines)
+        @test any(l -> occursin("injected supervision fault", l), lines)
+        @test any(l -> l == "[supervisor] sending SIGKILL to steady, so it can be restarted", lines)
+        # The first run failed before its "started" line; the second logs one.
+        @test count(l -> startswith(l, "[supervisor] started steady (pid "), lines) == 1
+        @test process_running(sup.children[1].proc)          # the second copy is supervised
+        RSN.request_shutdown!(sup)
+        @test fetch(t) == 0
+    finally
+        RSN._GETPID[] = getpid
+    end
+end
+
+@testset "supervisor: supervision that cannot continue takes the node down" begin
+    sink = IOBuffer()
+    sup = RSN.Supervisor([_script_spec("x", "exit(0)")]; sink = sink)
+    RSN._start_log_writer!(sup)
+    RSN._supervise_task(sup, sup.children[1]; supervise = (s, c) -> error("loop broken"))
+    @test take!(sup.exit_signal) == 1
+    # A loop that returns while the node runs (rather than throwing) also takes it down.
+    RSN._supervise_task(sup, sup.children[1]; supervise = (s, c) -> nothing)
+    @test take!(sup.exit_signal) == 1
+    RSN._close_log!(sup)
+    lines = _sink_lines(sink)
+    @test any(l -> l == "[supervisor] supervision of x cannot continue; shutting the node down:", lines)
+    @test any(l -> occursin("loop broken", l), lines)
+end
+
+# A sink whose writes fail while `broken` is set, as a stdout whose reader has gone away.
+mutable struct _BrokenSink <: IO
+    const buf::IOBuffer
+    broken::Bool
+end
+_check_sink(s::_BrokenSink) = s.broken && throw(Base.IOError("write: broken pipe (EPIPE)", Base.UV_EPIPE))
+Base.unsafe_write(s::_BrokenSink, p::Ptr{UInt8}, n::UInt) = (_check_sink(s); unsafe_write(s.buf, p, n))
+Base.write(s::_BrokenSink, b::UInt8) = (_check_sink(s); write(s.buf, b))
+Base.flush(::_BrokenSink) = nothing
+
+@testset "supervisor: a failing sink does not end supervision" begin
+    # Before, the write error escaped the "started" line and ended the child's supervision silently.
+    sink = _BrokenSink(IOBuffer(), true)
+    sup = RSN.Supervisor([_script_spec("crashy", "sleep(1); exit(3)")]; sink = sink, max_restarts = 2)
+    t = @async RSN.run_supervisor!(sup; install_signal_handlers = false)
+    sleep(0.5)
+    sink.broken = false
+    @test fetch(t) == 1                                  # restarted until the budget ran out
+    lines = _sink_lines(sink.buf)
+    @test any(l -> occursin(r"^\[supervisor\] \d+ log line\(s\) were lost: writing them failed \(.*EPIPE", l), lines)
+    @test count(l -> occursin("crashy exited (code=3", l), lines) == 3
+end
+
+# Kill the `sleep` grandchildren a test's children reported (`grandchild <pid>` lines).
+function _kill_grandchildren(lines)
+    for l in lines
+        m = match(r"\] grandchild (\d+)$", l)
+        m === nothing || run(ignorestatus(`kill $(m[1])`))
+    end
+    return nothing
+end
+
+@testset "supervisor: a grandchild holding a child's stderr delays neither restart nor shutdown" begin
+    # The child exits, but a process it started inherited its stderr and keeps it open, as an
+    # `nvidia-smi` a worker ran for a metrics scrape can. Before, the loop waited for end of file on
+    # that pipe, so the restart (and the node's shutdown) waited for the grandchild.
+    holder(name, rest) = RSN.ChildSpec(name, `sh -c "sleep 120 >/dev/null & echo \"grandchild \$!\"; $rest"`, 2.0)
+    sink = IOBuffer()
+    sup = RSN.Supervisor([holder("holder", "exit 3")]; sink = sink, max_restarts = 1)
+    t0 = time()
+    try
+        @test RSN.run_supervisor!(sup; install_signal_handlers = false) == 1
+        @test time() - t0 < 30                           # two runs and one restart, not 120 s
+        lines = _sink_lines(sink)
+        @test count(l -> startswith(l, "[supervisor] started holder"), lines) == 2
+        @test count(l -> occursin("holder has exited, but a process it started still holds its output open", l), lines) == 2
+    finally
+        _kill_grandchildren(_sink_lines(sink))
+    end
+
+    sink = IOBuffer()
+    sup = RSN.Supervisor([holder("runner", "echo up; exec sleep 120")]; sink = sink)
+    t = @async RSN.run_supervisor!(sup; install_signal_handlers = false)
+    try
+        @test wait_for(() -> any(==("[runner] up"), _sink_lines(sink)))
+        t0 = time()
+        RSN.request_shutdown!(sup)
+        @test fetch(t) == 0
+        @test time() - t0 < 15                           # the pipe's bound, not the grandchild's 120 s
+        @test any(l -> startswith(l, "[supervisor] runner stopped"), _sink_lines(sink))
+    finally
+        _kill_grandchildren(_sink_lines(sink))
+    end
+end
+
+# A stand-in worker with an HTTP listener on `port` answering /readyz and /healthz with 200. Its
+# first run (no `marker` file yet) misbehaves 3 s after it starts, by `mode`: "stop" stops the whole
+# process (SIGSTOP, as a deadlock or a wedged runtime would: nothing answers); "unlive" answers
+# /healthz with 503, as a worker whose dispatch loop is stalled does. "never_ready" answers /readyz
+# with 503 and never answers /healthz, as a worker still compiling its models does.
+const _FAKE_WORKER = raw"""
+using Sockets
+port, mode, marker = parse(Int, ARGS[1]), ARGS[2], ARGS[3]
+first_run = !isfile(marker)
+touch(marker)
+srv = listen(ip"127.0.0.1", port)
+t0 = time()
+println("up"); flush(stdout)
+misbehaving() = first_run && time() - t0 > 3.0
+while true
+    s = accept(srv)
+    @async try
+        path = split(readline(s))[2]
+        while !isempty(readline(s))
+        end
+        code = 200
+        if mode == "never_ready"
+            path == "/readyz" ? (code = 503) : sleep(3600)
+        elseif mode == "unlive" && misbehaving() && path == "/healthz"
+            code = 503
+        elseif mode == "stop" && misbehaving()
+            ccall(:kill, Cint, (Cint, Cint), getpid(), 19)
+        end
+        write(s, "HTTP/1.1 $code X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    catch
+    finally
+        close(s)
+    end
+end
+"""
+
+function _free_port()
+    s = RSN.Sockets.listen(RSN.Sockets.IPv4("127.0.0.1"), 0)
+    port = Int(RSN.Sockets.getsockname(s)[2])
+    close(s)
+    return port
+end
+
+function _fake_worker(name, mode, dir; interval = 0.5, timeout = 1.0, failures = 3)
+    port = _free_port()
+    cmd = `$(Base.julia_cmd()) --startup-file=no -e $_FAKE_WORKER $port $mode $(joinpath(dir, "marker"))`
+    chk = RSN.LivenessCheck("127.0.0.1", port; interval_seconds = interval, timeout_seconds = timeout, failures = failures)
+    return RSN.ChildSpec(name, addenv(cmd, "JULIA_LOAD_PATH" => "@stdlib"), 5.0; liveness = chk)
+end
+
+@testset "supervisor: a worker that stops answering once ready is killed and restarted ($mode)" for (mode, why) in (
+        ("stop", "no answer to /healthz within 1s"), ("unlive", "/healthz answered HTTP 503"),
+    )
+    # Before, the supervisor reacted only to an exit, so a worker that hung (or whose dispatch loop
+    # stalled) after it had become ready was never restarted.
+    sink = IOBuffer()
+    sup = RSN.Supervisor([_fake_worker("w", mode, mktempdir())]; sink = sink)
+    t = @async RSN.run_supervisor!(sup; install_signal_handlers = false)
+    try
+        @test wait_for(() -> count(==("[supervisor] w is ready; checking its liveness every 0.5s (SIGKILL after 3 failures in a row, 1s to answer each)"), _sink_lines(sink)) == 2; timeout = 90)
+        lines = _sink_lines(sink)
+        for k in 1:3
+            @test any(==("[supervisor] w failed a liveness check ($k of 3): $why"), lines)
+        end
+        @test any(==("[supervisor] w failed 3 liveness checks in a row; sending SIGKILL so it is restarted"), lines)
+        @test any(l -> startswith(l, "[supervisor] w exited (") && occursin("signal=9,", l), lines)
+        @test count(l -> startswith(l, "[supervisor] started w (pid "), lines) == 2
+        @test process_running(sup.children[1].proc)          # the restarted copy, checked again
+    finally
+        RSN.request_shutdown!(sup)
+        @test fetch(t) == 0
+    end
+end
+
+@testset "supervisor: a worker that has not been ready is never killed by its liveness check" begin
+    # Startup can compile for hours. Until /readyz first answers 200, /healthz is not even asked.
+    sink = IOBuffer()
+    sup = RSN.Supervisor([_fake_worker("slow", "never_ready", mktempdir())]; sink = sink)
+    t = @async RSN.run_supervisor!(sup; install_signal_handlers = false)
+    try
+        @test wait_for(() -> any(==("[slow] up"), _sink_lines(sink)))
+        sleep(6.0)                                           # a dozen check intervals
+        lines = _sink_lines(sink)
+        @test !any(l -> occursin("liveness", l) || occursin("SIGKILL", l), lines)
+        @test count(l -> startswith(l, "[supervisor] started slow"), lines) == 1
+        @test process_running(sup.children[1].proc)
+    finally
+        RSN.request_shutdown!(sup)
+        @test fetch(t) == 0
+    end
+end
+
+# A fake nvidia-smi for one GPU (index 0, UUID GPU-fake) that reads its answers from files in `dir`:
+# `gpu` holds "used, total" in MiB, `apps` the pids holding memory on it, and while `hang` exists it
+# hangs, as nvidia-smi does on a wedged driver.
+function _fake_gpu(dir; used = 14000, total = 15360)
+    write(joinpath(dir, "gpu"), "$used, $total")
+    write(joinpath(dir, "apps"), "")
+    smi = joinpath(dir, "nvidia-smi")
+    write(
+        smi, """
+        #!/bin/sh
+        [ -f $dir/hang ] && exec sleep 60
+        case "\$*" in
+          *query-gpu*) echo "0, GPU-fake, \$(cat $dir/gpu)" ;;
+          *query-compute-apps*) for p in \$(cat $dir/apps); do echo "\$p, GPU-fake"; done ;;
+        esac
+        """
+    )
+    chmod(smi, 0o755)
+    return smi
+end
+
+_gpu_child(name, reclaim) = RSN.ChildSpec(name, `sh -c 'echo up; sleep 1; exit 3'`, 2.0; reclaim = reclaim)
+
+@testset "supervisor: a restart waits for the GPU to release the last run's memory" begin
+    # The run exits while the (fake) GPU still shows its memory in use, as it does for a moment
+    # after a worker dies or is killed. Before, the restart came right after the 1 s backoff, and the
+    # new worker could run out of memory preallocating its arena.
+    dir = mktempdir()
+    reclaim = RSN.GpuReclaim("0", _fake_gpu(dir); timeout_seconds = 60, smi_timeout_seconds = 10)
+    sink = IOBuffer()
+    sup = RSN.Supervisor([_gpu_child("g", reclaim)]; sink = sink, max_restarts = 1)
+    t = @async RSN.run_supervisor!(sup; install_signal_handlers = false)
+    waiting = "[supervisor] waiting up to 60s for GPU 0 to release g's memory before restarting it: 14000/15360 MiB used (91%)"
+    @test wait_for(() -> any(==(waiting), _sink_lines(sink)))
+    sleep(2.0)
+    @test count(l -> startswith(l, "[supervisor] started g "), _sink_lines(sink)) == 1   # still waiting
+    write(joinpath(dir, "gpu"), "300, 15360")
+    @test fetch(t) == 1                                  # the second run used up the restart budget
+    lines = _sink_lines(sink)
+    released = findfirst(l -> startswith(l, "[supervisor] GPU 0 released g's memory after "), lines)
+    @test released !== nothing && endswith(lines[released], ": 300/15360 MiB used (2%)")
+    @test released < findlast(l -> startswith(l, "[supervisor] started g "), lines)
+    @test count(l -> startswith(l, "[supervisor] started g "), lines) == 2
+
+    # The memory is low, but the dead run's pid still holds some of it: that is waited for too.
+    dir = mktempdir()
+    reclaim = RSN.GpuReclaim("0", _fake_gpu(dir; used = 300); timeout_seconds = 60, smi_timeout_seconds = 10)
+    sink = IOBuffer()
+    sup = RSN.Supervisor([_gpu_child("p", reclaim)]; sink = sink, max_restarts = 1)
+    t = @async RSN.run_supervisor!(sup; install_signal_handlers = false)
+    @test wait_for(() -> any(==("[p] up"), _sink_lines(sink)))
+    pid = sup.children[1].pid
+    write(joinpath(dir, "apps"), string(pid))
+    @test wait_for(() -> any(l -> occursin("to release p's memory before restarting it: 300/15360 MiB used (2%), pid $pid still holds memory on it", l), _sink_lines(sink)))
+    sleep(1.5)
+    write(joinpath(dir, "apps"), "")
+    @test fetch(t) == 1
+    lines = _sink_lines(sink)
+    @test findfirst(l -> startswith(l, "[supervisor] GPU 0 released p's memory"), lines) <
+        findlast(l -> startswith(l, "[supervisor] started p "), lines)
+end
+
+@testset "supervisor: the GPU wait before a restart is bounded" begin
+    # The memory is never released: after the timeout the worker is restarted anyway.
+    dir = mktempdir()
+    reclaim = RSN.GpuReclaim("0", _fake_gpu(dir); timeout_seconds = 2, smi_timeout_seconds = 10)
+    sink = IOBuffer()
+    sup = RSN.Supervisor([_gpu_child("t", reclaim)]; sink = sink, max_restarts = 1)
+    @test RSN.run_supervisor!(sup; install_signal_handlers = false) == 1
+    lines = _sink_lines(sink)
+    @test any(==("[supervisor] GPU 0 still has 14000/15360 MiB used (91%) after 2s; restarting t anyway"), lines)
+    @test count(l -> startswith(l, "[supervisor] started t "), lines) == 2
+
+    # nvidia-smi hangs: it is given up on and the worker restarted without waiting.
+    dir = mktempdir()
+    reclaim = RSN.GpuReclaim("0", _fake_gpu(dir); timeout_seconds = 60, smi_timeout_seconds = 1)
+    touch(joinpath(dir, "hang"))
+    sink = IOBuffer()
+    sup = RSN.Supervisor([_gpu_child("h", reclaim)]; sink = sink, max_restarts = 1)
+    t0 = time()
+    @test RSN.run_supervisor!(sup; install_signal_handlers = false) == 1
+    @test time() - t0 < 20
+    lines = _sink_lines(sink)
+    @test any(==("[supervisor] nvidia-smi did not answer within 1s; restarting h without waiting for its GPU memory"), lines)
+    @test count(l -> startswith(l, "[supervisor] started h "), lines) == 2
+
+    # A GPU nvidia-smi does not list is not waited for.
+    dir = mktempdir()
+    reclaim = RSN.GpuReclaim("GPU-other", _fake_gpu(dir); timeout_seconds = 60, smi_timeout_seconds = 10)
+    sink = IOBuffer()
+    sup = RSN.Supervisor([_gpu_child("a", reclaim)]; sink = sink, max_restarts = 1)
+    @test RSN.run_supervisor!(sup; install_signal_handlers = false) == 1
+    @test any(==("[supervisor] nvidia-smi does not list GPU GPU-other; restarting a without waiting for its GPU memory"), _sink_lines(sink))
 end
 
 @testset "supervisor: grace windows run in parallel" begin
