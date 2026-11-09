@@ -34,7 +34,7 @@ Base.showerror(io::IO, e::WorkerUnavailableError) = print(io, e.msg)
 """
     WeightsReadStalledError(model, msg)
 
-Raised to a request for a model this worker cannot load now because reading weights stalled: the
+Raised to a request for a model this worker cannot load now because reading weights stalled. The
 background read of the model's weights made no progress for `scheduler.weight_read_stall_seconds`
 and was abandoned, an earlier read of them stalled and has not returned, or so many reads have
 stalled that the worker starts no new ones. Models already on the device keep serving. The gRPC

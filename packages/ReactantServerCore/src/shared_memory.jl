@@ -444,9 +444,10 @@ end
     shm_read(registry, name, offset, byte_size) -> Vector{UInt8}
     shm_read(alloc, registry, name, offset, byte_size) -> Array
 
-Copy `[offset, offset+byte_size)` of the named region into a fresh byte vector, or into the array
-`alloc(byte_size)` returns, which must hold exactly `byte_size` bytes of a bits type (a decoded
-tensor is read straight into its final array this way, with no intermediate copy). The copy is
+Copy a range of the named region into a fresh byte vector, or into an array the caller allocates.
+The range is `[offset, offset+byte_size)`; the array `alloc(byte_size)` returns must hold exactly
+`byte_size` bytes of a bits type (a decoded tensor is read straight into its final array this way,
+with no intermediate copy). The copy is
 done while the region's lock is held, so a concurrent `shm_unregister!` of the same region
 cannot detach the mapping underneath the read. The object must still cover the range
 ([`ShmRegionShrunkError`](@ref) otherwise), and its pages are allocated first
