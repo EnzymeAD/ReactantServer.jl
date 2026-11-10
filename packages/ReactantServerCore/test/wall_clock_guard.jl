@@ -47,17 +47,8 @@ const WALL_CLOCK_SITES = [
     ),
 ]
 
-# Files left out of the check: (package, file under the package, why).
-const WALL_CLOCK_UNCHECKED = [
-    (
-        "ReactantServer", "src/transport/responsiveness.jl",
-        "the worker's lag monitor: its clock is left to the change that reworks both monitors",
-    ),
-    (
-        "ReactantServerGateway", "src/responsiveness.jl",
-        "the gateway's lag monitor: its clock is left to the change that reworks both monitors",
-    ),
-]
+# Files left out of the check: (package, file under the package, why). None at present.
+const WALL_CLOCK_UNCHECKED = Tuple{String, String, String}[]
 
 # Every `time()` call in a package's `src/` and `ext/` as (file, line number, stripped line), leaving
 # out the generated protobuf bindings, comments, and mentions in backticks (prose that names it).

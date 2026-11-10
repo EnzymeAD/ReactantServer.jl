@@ -134,7 +134,30 @@ end
         count_ = parse(Float64, match(r"^worker_interactive_lag_seconds_count (\S+)$"m, body)[1])
         under = parse(Float64, match(r"^worker_interactive_lag_seconds_bucket\{le=\"0.256\"\} (\S+)$"m, body)[1])
         @test count_ >= 2 && under < count_          # some ticks on time, at least one 0.4 s late
+        # The gauge holds the longest delay of the last 30 s: the 0.4 s hold, not an average.
+        longest = parse(Float64, match(r"^worker_interactive_lag_max_seconds (\S+)$"m, body)[1])
+        @test 0.3 <= longest < 5.0
     end
+end
+
+@testset "worker metrics: the monitor's longest delay covers its window, then is forgotten" begin
+    reg = Prometheus.CollectorRegistry()
+    m = ReactantServer.InteractiveMonitor(reg; window = 30)
+    longest() = (io = IOBuffer(); Prometheus.expose(io, reg); parse(Float64, match(r"^worker_interactive_lag_max_seconds (\S+)$"m, String(take!(io)))[1]))
+    observe(late, second) = ReactantServer._observe_lag!(m, late, second)
+    observe(0.5, 1000)
+    observe(0.1, 1010)
+    @test longest() == 0.5
+    observe(0.05, 1029)
+    @test longest() == 0.5                           # second 1000 is still within the last 30 s
+    observe(0.05, 1030)
+    @test longest() == 0.1                           # 1000 has left the window (its slot is reused); 1010 has not
+    observe(0.02, 1040)
+    @test longest() == 0.05                          # 1010 has left too
+    observe(0.2, 1040)
+    @test longest() == 0.2                           # a second keeps its longest tick
+    observe(0.01, 1100)
+    @test longest() == 0.01                          # after a quiet stretch only the new tick counts
 end
 
 @testset "worker metrics: latency buckets reach past a minute" begin
