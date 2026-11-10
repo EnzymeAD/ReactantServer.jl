@@ -2423,9 +2423,8 @@ function load_model!(
                 # An uncached compile takes 5 to 30 s per program. On the interactive thread, which
                 # also reads requests and answers health checks, it would stop both for that long,
                 # so it runs on a default-pool task like the weight loads and long executions. The
-                # loop still waits for it, so nothing else mutates residency meanwhile. XLA's compile
-                # call is not GC-safe: a collection another thread requests during it still waits for
-                # the compile to return, and the whole worker stops for the rest of it.
+                # loop still waits for it, so nothing else mutates residency meanwhile. The XLA call
+                # is GC-safe (GcSafeXLA.compile), so a collection need not wait for it either.
                 entry.executable = off_interactive() do
                     build_loaded_model(
                         backend, pool, entry;

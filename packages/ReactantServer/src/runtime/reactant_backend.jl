@@ -334,6 +334,12 @@ function refuse_julia_callbacks(mod::_RMLIR.IR.Module)
     )
 end
 
+# The XLA compile. On a PJRT client (what `make_client` makes) it goes through GcSafeXLA, so a
+# garbage collection another thread requests during it need not wait for it to end; any other
+# client uses Reactant's own compile.
+_xla_compile(client::_RXLA.PJRT.Client, mod; program...) = GcSafeXLA.compile(client, mod; program...)
+_xla_compile(client, mod; program...) = _RXLA.compile(client, mod; program...)
+
 # Compile a StableHLO portable artifact, or, with a cache slot, load the compiled program that an
 # earlier start stored for this exact module, policy and device kind. Look-up, compile, serialize,
 # store: a hit skips XLA entirely; a miss compiles and stores; an entry that fails to load is dropped
@@ -363,7 +369,7 @@ function compile_artifact(
             is_sharded = false, num_replicas = Int64(1), num_partitions = Int64(1),
         )
         (cache === nothing || !supports_executable_cache(backend)) &&
-            return _RXLA.compile(pool.client, mod; program...)
+            return _xla_compile(pool.client, mod; program...)
 
         program_bytes = _portable_artifact_bytes(mod)
         key = sha256hex(vcat(program_bytes, Vector{UInt8}(codeunits(_cache_policy(pool, tf32)))))
@@ -387,7 +393,7 @@ function compile_artifact(
             end
         end
         t0 = time()
-        exec = _RXLA.compile(pool.client, compile_module(); program...)
+        exec = _xla_compile(pool.client, compile_module(); program...)
         elapsed = time() - t0
         record_exec_cache!(:miss, elapsed)
         try

@@ -181,15 +181,11 @@ validated deployment should use.
   Make a multi-file update atomic: stage the new files elsewhere on the same filesystem, then rename
   them into place. A load or reload compiles the bundle on the worker's dispatch loop, so every
   other model on that worker pauses until the compile ends, and a reloaded model answers `NOT_FOUND`
-  until its new version is in. The compile runs off the thread that handles requests, so meanwhile
-  the worker keeps accepting requests, which wait in its queues, and keeps answering health probes;
-  behind a gateway it stays ready, and the requests the gateway sends it wait for the compile too.
-  A garbage collection is the exception: XLA's compile call is not GC-safe, so a collection
-  requested while it runs waits for it to return, and the whole worker stops for the rest of the
-  compile, health probes included. Behind a gateway, a stop longer than the gateway's 5 second
-  probe deadline marks the worker down, and the gateway sends it no request until a later probe
-  finds it ready; under `lpt_packing` its models are also repacked onto the other workers and back
-  again. `dynamic` is not a production mode, and these pauses are not avoided. An
+  until its new version is in. The compile runs off the thread that handles requests, and garbage
+  collection can proceed while it runs, so meanwhile the worker keeps accepting requests, which
+  wait in its queues, and keeps answering health probes. Behind a gateway it stays ready, and the
+  requests the gateway sends it wait for the compile too. `dynamic` is not a production mode, and
+  this pause is not avoided. An
   executable-cache hit (`runtime.executable_cache`) keeps the pause short; an uncached compile
   takes 5 to 30 seconds per compiled program. A renamed
   directory is an unload of the old name and a load of the new one. A bundle whose files change
@@ -460,13 +456,9 @@ Some limits to know:
 - A worker with no HTTP listener (no `metrics_base_port` on a multi-worker node) is not checked; it
   is restarted only when it exits, and the startup line names it.
 - In `dynamic` mode a hot load or reload compiles the new bundle off the thread that answers
-  `/healthz`, and the compile counts as one piece of work for `dispatch_stall_seconds`, so a long
-  compile alone does not fail the check. A garbage collection requested during the compile stops
-  that thread as well until the compile returns (see `model_control_mode` above), so an uncached
-  compile that runs on for more than about two minutes after a collection starts gets the worker
-  killed and restarted, and it then loads the new version at startup. Raise `timeout_seconds` or
-  `failures` (or set `failures: 0`) if reloads of large uncached bundles must not restart the
-  worker.
+  `/healthz`, with garbage collection free to proceed, and the compile counts as one piece of work
+  for `dispatch_stall_seconds`. A compile therefore fails the check only if it outlasts that limit
+  while requests wait; raise `dispatch_stall_seconds` if a reload's uncached compile can take longer.
 - A hung gateway takes the node's public endpoint down with it, so it is killed and restarted the
   same way; its startup line is `gateway liveness check: ...`. Its `/healthz` answers whenever the
   process can answer at all, so the check catches a gateway that is stopped or deadlocked, not one

@@ -1,9 +1,25 @@
-# GcSafeXLA (runtime/gc_safe_calls.jl): the hot path's libReactantExtra calls declared gc_safe.
-# Checked on Reactant's CPU client: results match, frees are idempotent, a C++ error thrown from
-# inside a gc_safe call unwinds cleanly and leaves the runtime usable, and garbage collections
-# forced on another thread while the calls run cannot corrupt the data they read or write.
+# GcSafeXLA (runtime/gc_safe_calls.jl): the hot path's libReactantExtra calls and the XLA compile
+# declared gc_safe. Checked on Reactant's CPU client: results match, frees are idempotent, a C++
+# error thrown from inside a gc_safe call (an execution or a compile) unwinds cleanly and leaves the
+# runtime usable, garbage collections forced on another thread while the calls run cannot corrupt
+# the data they read or write, and a collection does not wait for a compile to end.
 
 const _GCX = ReactantServer.GcSafeXLA
+
+# A program XLA takes a while to compile on the CPU (about 2 s at n = 1500 on netai02): a chain of n
+# matrix products, each through a tanh so that nothing fuses away.
+function _gcx_slow_module(n::Int)
+    io = IOBuffer()
+    println(io, "module {\n  func.func @main(%x: tensor<64x64xf32>) -> tensor<64x64xf32> {")
+    prev = "%x"
+    for i in 1:n
+        println(io, "    %d$i = stablehlo.dot_general $prev, $prev, contracting_dims = [1] x [0] : (tensor<64x64xf32>, tensor<64x64xf32>) -> tensor<64x64xf32>")
+        println(io, "    %t$i = stablehlo.tanh %d$i : tensor<64x64xf32>")
+        prev = "%t$i"
+    end
+    println(io, "    return $prev : tensor<64x64xf32>\n  }\n}")
+    return String(take!(io))
+end
 
 @testset "gc_safe calls (CPU)" begin
     backend = ReactantServer.ReactantBackend()
@@ -171,5 +187,59 @@ const _GCX = ReactantServer.GcSafeXLA
         wait(churn)
         @test ok
         Threads.nthreads() > 1 && @test collections[] >= 10       # collections really did interleave
+    end
+
+    @testset "a compile error inside the gc_safe compile unwinds and leaves the runtime usable" begin
+        # XLA rejects a custom call with no registered handler while it compiles, and reports it
+        # through Reactant's error callback from inside the gc_safe call.
+        bad = """
+        module {
+          func.func @main(%x: tensor<4xf32>) -> tensor<4xf32> {
+            %0 = stablehlo.custom_call @no_such_target_xyz(%x) {api_version = 4 : i32} : (tensor<4xf32>) -> tensor<4xf32>
+            return %0 : tensor<4xf32>
+          }
+        }
+        """
+        err = try
+            ReactantServer.compile_artifact(backend, pool, stablehlo_artifact(bad), 1, 1)
+            nothing
+        catch e
+            e
+        end
+        @test err isa Reactant.XLA.ReactantInternalError
+        @test occursin("no_such_target_xyz", sprint(showerror, err))
+        GC.gc()                                                   # the collector still works afterwards
+        again = ReactantServer.compile_artifact(backend, pool, stablehlo_artifact(mlir), 2, 1)
+        @test again isa Reactant.XLA.PJRT.LoadedExecutable        # and so does compiling
+        x, w = rand(Float32, 1024), rand(Float32, 1024)
+        @test run(x, w) == x .* w
+    end
+
+    # The compile runs on a default-pool thread while this one collects every 10 ms. A collection
+    # stops every thread at a safepoint, and a thread inside a plain ccall reaches none until the call
+    # returns: with a plain compile the first collection requested during it waits for the whole
+    # compile. With the gc_safe one each collection takes milliseconds. Needs a second thread.
+    if Threads.nthreads(:default) + Threads.nthreads(:interactive) > 1
+        @testset "a collection on another thread does not wait for a compile" begin
+            artifact = stablehlo_artifact(_gcx_slow_module(1500))
+            took = Ref(0.0)
+            task = Threads.@spawn :default begin
+                took[] = @elapsed ReactantServer.compile_artifact(backend, pool, artifact, 1, 1)
+            end
+            longest = 0.0
+            collections = 0
+            while !istaskdone(task)
+                t0 = time()
+                GC.gc(false)
+                longest = max(longest, time() - t0)
+                collections += 1
+                sleep(0.01)
+            end
+            fetch(task)
+            @test took[] > 0.5                                    # long enough for the check to mean something
+            @test collections >= 10
+            # A plain compile makes one collection last about as long as the compile itself.
+            @test longest < took[] / 2
+        end
     end
 end

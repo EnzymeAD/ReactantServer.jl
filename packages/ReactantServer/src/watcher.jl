@@ -9,10 +9,10 @@
 # All filesystem work (scanning, signatures, parsing) happens on this task; the actual swap goes
 # through the scheduler's control queue (`load_model!`/`evict!`), which runs the compile and the
 # device frees on the dispatch loop. No model dispatches until the swap ends, not just the one being
-# swapped. The compile itself runs on a default-pool task the loop waits for, so request intake and
-# health probes carry on, unless a garbage collection is requested during it: XLA's compile call is
-# not GC-safe, so the collection, and with it the whole worker, waits for the compile to return. An
-# executable-cache hit shortens it to a load; an uncached compile takes seconds per compiled program.
+# swapped. The compile itself runs on a default-pool task the loop waits for, and is GC-safe
+# (GcSafeXLA.compile), so request intake, health probes and garbage collection carry on meanwhile.
+# An executable-cache hit shortens it to a load; an uncached compile takes seconds per compiled
+# program.
 #
 # A change is acted on only once its signature is observed identical across two consecutive polls
 # (debounce), which lets a bundle still being copied in settle first; `load_bundle_entry`'s

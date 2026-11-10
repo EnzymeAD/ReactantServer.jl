@@ -1,4 +1,4 @@
-# The serving hot path's calls into libReactantExtra, made GC-safe.
+# The serving hot path's calls into libReactantExtra, and the XLA compile, made GC-safe.
 #
 # Julia's garbage collector stops every thread at a safepoint before it runs. A thread inside a
 # plain `@ccall` is not at one, so while it runs, any other thread that asks for a collection makes
@@ -6,7 +6,8 @@
 # is a `Base.llvmcall`), and the serving hot path spends most of its time inside them: a weight
 # upload copies up to gigabytes, an execution's result wait lasts as long as the program runs. On a
 # soak with continuous weight churn (one A6000, 19 uploads a second) that froze the whole process
-# for 15 to 120 s at a time, stalling request threads and the GPU lease heartbeat alike.
+# for 15 to 120 s at a time, stalling request threads and the GPU lease heartbeat alike. A compile
+# is the same: 5 to 30 s per uncached program, at startup and on every dynamic-mode hot load.
 #
 # These are the same C functions Reactant's own wrappers call (same symbols, same arguments, as in
 # Reactant 0.2.287's src/mlir/libMLIR_h.jl and src/xla/PJRT), declared `gc_safe = true` so a
@@ -120,6 +121,43 @@ function execute(
         end
     end
     return bufs
+end
+
+"""
+    compile(client, mod; compile_options, num_parameters, num_outputs, is_sharded, num_replicas,
+            num_partitions) -> PJRT.LoadedExecutable
+
+Compile the MLIR module `mod` for `client` (`ClientCompileWithProto`), as Reactant's
+`XLA.compile` does for a PJRT client, with the call gc_safe. An uncached compile takes 5 to 30 s
+per program, and a collection requested meanwhile would otherwise stop every thread until it ends.
+
+The two conditions above hold here as well. The call reads one Julia object, the serialized compile
+options, which are rooted below; the module and its context are MLIR's own C++ memory, and
+Reactant's MLIR wrappers have no finalizers, so a collection cannot release them while XLA works on
+them. The only way back into Julia is the error callback: libReactantExtra reports a failed compile
+through `ReactantThrowError` and makes no other call into Julia. A collection that completes during
+the compile can run Reactant's finalizers for buffers and executables on the same client meanwhile;
+PJRT clients are made for concurrent use, and the gc_safe upload and execute already allow it.
+"""
+function compile(
+        client::PJRT.Client, mod::Reactant.MLIR.IR.Module;
+        compile_options, num_parameters::Integer, num_outputs::Integer, is_sharded::Bool,
+        num_replicas::Integer, num_partitions::Integer
+    )
+    opts = Reactant.ProtoUtils.proto_to_bytes(compile_options)
+    exec = GC.@preserve client mod opts begin
+        # Dumps the module when the compile throws, as Reactant's own compile does.
+        Reactant.MLIR.IR.try_compile_dump_mlir(mod) do
+            @ccall gc_safe = true Reactant_jll.libReactantExtra.ClientCompileWithProto(
+                client.client::Ptr{Cvoid}, mod::Reactant.MLIR.API.MlirModule,
+                pointer(opts)::Ptr{UInt8}, length(opts)::Csize_t
+            )::Ptr{Cvoid}
+        end
+    end
+    return PJRT.LoadedExecutable(
+        exec, Int64(num_outputs), Int64(num_parameters), is_sharded, Int64(num_replicas),
+        Int64(num_partitions)
+    )
 end
 
 end # module GcSafeXLA
