@@ -887,6 +887,28 @@ end
         @test 0.3 <= longest < 5.0
     end
 
+    @testset "a stall's log line says how much of it was collection, safepoint wait and compiling" begin
+        metrics = ReactantServerGateway.GatewayMetrics()
+        logger = Test.TestLogger()
+        Base.CoreLogging.with_logger(logger) do
+            m = ReactantServerGateway.LoopMonitor(metrics; interval = 0.02, warn_after = 0.2)
+            ReactantServerGateway.start_loop_monitor!(m)
+            sleep(0.2)
+            t = time()
+            while time() - t < 0.4                   # hold the thread without yielding
+            end
+            sleep(0.2)
+            ReactantServerGateway.stop_loop_monitor!(m)
+        end
+        stalls = filter(r -> occursin("event loop was blocked", string(r.message)), logger.logs)
+        @test !isempty(stalls)
+        kw = Dict(last(stalls).kwargs)
+        @test all(k -> haskey(kw, k), (:blocked_s, :gc_s, :safepoint_wait_s, :collections, :compile_s))
+        io = IOBuffer()
+        ReactantServerGateway.expose(io, metrics)
+        @test occursin(r"^julia_gc_time_to_safepoint_seconds_total \S+$"m, String(take!(io)))
+    end
+
     @testset "the event-loop monitor's longest delay covers its window, then is forgotten" begin
         metrics = ReactantServerGateway.GatewayMetrics()
         m = ReactantServerGateway.LoopMonitor(metrics; window = 30)

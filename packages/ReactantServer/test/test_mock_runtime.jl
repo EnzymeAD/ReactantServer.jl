@@ -112,12 +112,24 @@ end
 
     req = ReactantServer.InferRequest("scale", ["y"], [ReactantServer.NamedTensor("x", Float32[1, 2, 3, 4])])
     @test ReactantServer.infer(sched, req)[1].data == Float32[2, 4, 6, 8]
+    # A program with no learned cost yet could be long, so its first run is handed off the loop's thread.
+    @test timedwait(() -> (@atomic sched.progress.previous).kind === :dispatch, 5) === :ok
+    @test !(@atomic sched.progress.previous).in_place
 
     # several in a row are serialized through the single dispatch task
     for k in 1:5
         r = ReactantServer.InferRequest("scale", ["y"], [ReactantServer.NamedTensor("x", fill(Float32(k), 4))])
         @test ReactantServer.infer(sched, r)[1].data == fill(Float32(2k), 4)
     end
+
+    # The loop records the unit of work it finished last, for a stall report: by now the program's
+    # cost is learned and under the offload threshold, so its run is made in place on the loop's thread.
+    @test timedwait(() -> (@atomic sched.progress.previous).kind === :dispatch, 5) === :ok
+    prev = @atomic sched.progress.previous
+    @test prev.model == "scale" && prev.ended >= prev.started
+    @test prev.batch == 0                             # the trivial model has no batch axis
+    @test prev.in_place
+    @test occursin("before: dispatch of scale unbatched, run in place on this thread", ReactantServer.dispatch_activity(sched.progress))
 
     # unknown model surfaces as a thrown error
     bad = ReactantServer.InferRequest("nope", String[], [ReactantServer.NamedTensor("x", Float32[1])])

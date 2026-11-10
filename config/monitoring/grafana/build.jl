@@ -1180,7 +1180,10 @@ function resources()
             "GC time share", [
                 q("sum by (worker) (rate(julia_gc_seconds_total{%W}%ri))"; legend = "{{worker}}"),
                 q("sum(rate(julia_gc_seconds_total{$gw}%ri))"; legend = "gateway"),
-            ]; unit = "percentunit", w = 8, desc = "Share of wall time spent in garbage collection."
+                q("sum by (worker) (rate(julia_gc_time_to_safepoint_seconds_total{%W}%ri))"; legend = "{{worker}} safepoint wait"),
+                q("sum(rate(julia_gc_time_to_safepoint_seconds_total{$gw}%ri))"; legend = "gateway safepoint wait"),
+            ]; unit = "percentunit", w = 8,
+            desc = "Share of wall time spent in garbage collection, and (safepoint wait) spent waiting for every thread to reach a safepoint before a collection, which Julia does not count as collection time. Every thread of the process waits through both; a long safepoint wait means a thread was inside a long call that is not GC-safe."
         ),
         ts(
             "Collections per minute", [

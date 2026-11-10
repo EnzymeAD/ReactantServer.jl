@@ -882,7 +882,7 @@
         "type": "prometheus",
         "uid": "${ds}"
       },
-      "description": "Share of wall time spent in garbage collection.",
+      "description": "Share of wall time spent in garbage collection, and (safepoint wait) spent waiting for every thread to reach a safepoint before a collection, which Julia does not count as collection time. Every thread of the process waits through both; a long safepoint wait means a thread was inside a long call that is not GC-safe.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -969,6 +969,30 @@
           "legendFormat": "gateway",
           "range": true,
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "expr": "sum by (worker) (rate(julia_gc_time_to_safepoint_seconds_total{worker=~'$worker'}[$__rate_interval]))",
+          "format": "time_series",
+          "instant": false,
+          "legendFormat": "{{worker}} safepoint wait",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "expr": "sum(rate(julia_gc_time_to_safepoint_seconds_total{job=~'$job',worker=''}[$__rate_interval]))",
+          "format": "time_series",
+          "instant": false,
+          "legendFormat": "gateway safepoint wait",
+          "range": true,
+          "refId": "D"
         }
       ],
       "title": "GC time share",

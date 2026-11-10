@@ -141,16 +141,87 @@ const DISPATCH_STALL_SECONDS = 600.0
 # again after each unit of work it finishes, and clears it (0) while it waits with nothing to do, so
 # `since` is the last sign of progress while it holds work. Read without the scheduler lock (which a
 # stuck loop may hold) by the liveness and readiness checks, through `dispatch_stalled`.
+#
+# It also records the unit of work the loop is on and the one before it (`current`, `previous`), so
+# that when the worker's responsiveness monitor logs its interactive thread blocked, it can say what
+# the loop was running (`dispatch_activity`). Only the loop writes them, a small record per unit.
 mutable struct DispatchProgress
     const since::Threads.Atomic{Float64}
     const reported::Threads.Atomic{Bool}   # the current stall has been logged
     stall_seconds::Float64                 # no progress this long with work in hand is a stall; 0 = never
+    @atomic current::Any                   # the DispatchUnit the loop is on
+    @atomic previous::Any                  # the DispatchUnit it finished last
 end
-DispatchProgress(stall_seconds::Real = DISPATCH_STALL_SECONDS) =
-    DispatchProgress(Threads.Atomic{Float64}(0.0), Threads.Atomic{Bool}(false), Float64(stall_seconds))
+
+# One unit of the dispatch loop's work: a control command, or a dispatch of `model` at `batch` (0 for
+# a program with no batch axis), whose program runs `in_place` on the loop's own (interactive) thread
+# or on a default-pool task. `started` and `ended` are `monotonic_time()`; `ended` is NaN while the
+# unit runs.
+struct DispatchUnit
+    kind::Symbol                           # :idle, :control or :dispatch
+    model::String
+    batch::Int
+    in_place::Bool
+    started::Float64
+    ended::Float64
+end
+const _IDLE_UNIT = DispatchUnit(:idle, "", 0, false, 0.0, NaN)
+
+DispatchProgress(stall_seconds::Real = DISPATCH_STALL_SECONDS) = DispatchProgress(
+    Threads.Atomic{Float64}(0.0), Threads.Atomic{Bool}(false), Float64(stall_seconds), _IDLE_UNIT, _IDLE_UNIT
+)
 
 _mark_progress!(p::DispatchProgress) = (p.since[] = monotonic_time(); p.reported[] = false; nothing)
 _mark_idle!(p::DispatchProgress) = (p.since[] = 0.0; p.reported[] = false; nothing)
+
+# The loop begins a unit of work; the one it was on, if any, has ended.
+function _begin_unit!(p::DispatchProgress, kind::Symbol, model::String = "", batch::Int = 0)
+    now = monotonic_time()
+    cur = (@atomic p.current)::DispatchUnit
+    cur.kind === :idle || (@atomic p.previous = DispatchUnit(cur.kind, cur.model, cur.batch, cur.in_place, cur.started, now))
+    @atomic p.current = DispatchUnit(kind, model, batch, false, now, NaN)
+    return nothing
+end
+
+# The dispatch the loop is on runs its program on the loop's own thread.
+function _note_in_place!(p::DispatchProgress)
+    cur = (@atomic p.current)::DispatchUnit
+    cur.kind === :dispatch && !cur.in_place &&
+        (@atomic p.current = DispatchUnit(cur.kind, cur.model, cur.batch, true, cur.started, cur.ended))
+    return nothing
+end
+
+# The loop ends the unit it is on.
+function _end_unit!(p::DispatchProgress)
+    cur = (@atomic p.current)::DispatchUnit
+    cur.kind === :idle && return nothing
+    @atomic p.previous = DispatchUnit(cur.kind, cur.model, cur.batch, cur.in_place, cur.started, monotonic_time())
+    @atomic p.current = _IDLE_UNIT
+    return nothing
+end
+
+function _describe_unit(u::DispatchUnit, now::Float64)
+    u.kind === :idle && return "idle"
+    what = u.kind === :dispatch ?
+        "dispatch of $(u.model) $(u.batch == 0 ? "unbatched" : "at batch $(u.batch)"), " *
+        (u.in_place ? "run in place on this thread" : "run on a default-pool task") :
+        "control command"
+    isnan(u.ended) && return "$what, running for $(round(now - u.started; digits = 2)) s"
+    return "$what, took $(round(u.ended - u.started; digits = 2)) s, ended $(round(now - u.ended; digits = 2)) s ago"
+end
+
+"""
+    dispatch_activity(progress, now = monotonic_time()) -> String
+
+What the dispatch loop is on and what it finished last, with their times: for the worker's
+responsiveness monitor to log when its interactive thread, which the loop runs on, was blocked. A
+dispatch whose program runs in place holds that thread for the whole run.
+"""
+function dispatch_activity(p::DispatchProgress, now::Float64 = monotonic_time())
+    cur = (@atomic p.current)::DispatchUnit
+    prev = (@atomic p.previous)::DispatchUnit
+    return "now: " * _describe_unit(cur, now) * "; before: " * _describe_unit(prev, now)
+end
 
 """
     Scheduler
@@ -818,9 +889,9 @@ function _execute_dispatch!(s::Scheduler, d::Dispatch)
         t_load = monotonic_time()
         _acquire_for_dispatch!(s, entry)
         load_time = monotonic_time() - t_load
-        out, compute_time = _timed_run(
-            s, entry.executable, merged; offload = _offload_execution(st, variant, B)
-        )
+        offload = _offload_execution(st, variant, B)
+        offload || _note_in_place!(s.progress)       # for a stall report: this run holds the thread
+        out, compute_time = _timed_run(s, entry.executable, merged; offload = offload)
 
         # Slice every per-request result before delivering any. Slicing can throw; doing it up
         # front means the catch below has not yet filled any reply channel, so it can deliver the
@@ -1910,15 +1981,18 @@ function _dispatch_loop(s::Scheduler)
         # Control commands run on this (the dispatch) thread, the sole mutator of residency. The
         # slow host/device work inside `op` runs outside `s.cond`.
         for c in cmds
+            _begin_unit!(s.progress, :control)
             try
                 put!(c.reply, c.op(s))
             catch e
                 put!(c.reply, e)
             end
+            _end_unit!(s.progress)
             _mark_progress!(s.progress)
         end
         (isempty(cmds) && chosen === nothing) && break
         if chosen !== nothing
+            _begin_unit!(s.progress, :dispatch, chosen.entry.name, chosen.size)
             try
                 execute_and_record!(s, chosen)
             catch err
@@ -1927,6 +2001,7 @@ function _dispatch_loop(s::Scheduler)
                 @error "a dispatch failed outside its execution; failing its requests" model = chosen.entry.name exception = (err, catch_backtrace())
                 _fail_unanswered!(chosen.taken, err)
             end
+            _end_unit!(s.progress)
             _mark_progress!(s.progress)
             _maybe_compact!(s)
             _mark_progress!(s.progress)
