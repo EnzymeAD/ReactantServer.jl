@@ -101,7 +101,12 @@ reported shapes are Julia column-major (batch axis last), matching the order you
 the row-major KServe wire shape is reversed away by the client.
 """
 function model_io_spec(model::KServeModel)
-    resp = GRPCInferenceService.ModelMetadata(model.chan, ModelMetadataRequest(name = model_name(model)))
+    # The model's deadline, which is its channel's default.
+    resp = _call_unary(model.deadline) do b
+        GRPCInferenceService.ModelMetadata(
+            model.chan, ModelMetadataRequest(name = model_name(model)), gRPCClient.gRPCAsync(); deadline = b
+        )
+    end
     return _parse_io_spec(resp)
 end
 

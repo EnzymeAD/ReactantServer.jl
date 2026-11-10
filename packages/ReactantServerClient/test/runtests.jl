@@ -1015,5 +1015,6 @@ end
 
 # Shared-memory recovery against a mock KServe gRPC server (restart, coalescing, latch, unlatch).
 include("test_shm_recovery.jl")
+include("test_stale_connection.jl")    # after test_shm_recovery.jl: reuses its mock server
 include("test_shm_protocol.jl")
 include("test_describe.jl")

@@ -42,6 +42,7 @@ const DEFAULT_POOL_SLOTS = 8                   # fixed slots per pool (the alloc
 
 include("Defines.jl")
 include("Model.jl")
+include("Transport.jl")
 include("SharedMemory.jl")
 include("Inference.jl")
 include("Metadata.jl")

@@ -665,22 +665,26 @@ function _run_chunk(m, io, pool, fill_lock, r, slot; cancelled = _never)
         # released only in the `finally` after this send returns.
         materialized, raws = _materialize_inputs(inputs, m, pool)
         controlled = _slot_controlled(pool)
+        # Each send, a stale connection's second one included (`_call_unary`), is armed afresh.
         response = GC.@preserve pool begin
             _send_with_shm_recovery(m, pool; cancelled = cancelled) do
                 _infer_with_retry(m; cancelled = cancelled) do budget_s
-                    params = _request_deadline_params(budget_s)
-                    controlled && _add_slot_control!(params, pool, slot)
-                    GRPCInferenceService.ModelInfer(
-                        m.chan,
-                        ModelInferRequest(
-                            model_name = model_name(m),
-                            inputs = materialized,
-                            outputs = requested,
-                            parameters = params,
-                            raw_input_contents = raws,
-                        );
-                        deadline = budget_s,
-                    )
+                    _call_unary(budget_s; cancelled = cancelled) do b
+                        params = _request_deadline_params(b)
+                        controlled && _add_slot_control!(params, pool, slot)
+                        GRPCInferenceService.ModelInfer(
+                            m.chan,
+                            ModelInferRequest(
+                                model_name = model_name(m),
+                                inputs = materialized,
+                                outputs = requested,
+                                parameters = params,
+                                raw_input_contents = raws,
+                            ),
+                            gRPCClient.gRPCAsync();
+                            deadline = b,
+                        )
+                    end
                 end
             end
         end
@@ -853,15 +857,18 @@ function infer_sync(m::AbstractInferenceModel, network_inputs)
         "and use infer_async or infer_sync(model, io) to stage through the buffer pool and send " *
         "raw bytes" maxlog = 1
     return _infer_with_retry(m) do budget_s
-        GRPCInferenceService.ModelInfer(
-            m.chan,
-            ModelInferRequest(
-                model_name = model_name(m),
-                inputs = network_inputs,
-                parameters = _request_deadline_params(budget_s),
-            );
-            deadline = budget_s,
-        )
+        _call_unary(budget_s) do b
+            GRPCInferenceService.ModelInfer(
+                m.chan,
+                ModelInferRequest(
+                    model_name = model_name(m),
+                    inputs = network_inputs,
+                    parameters = _request_deadline_params(b),
+                ),
+                gRPCClient.gRPCAsync();
+                deadline = b,
+            )
+        end
     end
 end
 
