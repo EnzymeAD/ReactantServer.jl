@@ -66,15 +66,21 @@ end
     # lpt_packing keeps an arrival counter per name it is given, and it is given routed names only.
     @test isempty(@atomic s.arrivals)
 
-    # Shared-memory region names are chosen by each client process: no series carries one.
-    reg(n) = GW._gw_shm_register(_lenc(_LInf.SystemSharedMemoryRegisterRequest(; name = n, key = "/k", byte_size = UInt64(64))), st)
-    unreg(n) = GW._gw_shm_unregister(_lenc(_LInf.SystemSharedMemoryUnregisterRequest(; name = n)), st)
+    # Shared-memory region names are chosen by each client process: no series carries one. With no
+    # worker to ask, both RPCs answer UNAVAILABLE; they are counted all the same.
+    quiet(f) = try
+        f()
+    catch e
+        e isa gRPCServer.GRPCError || rethrow()
+    end
+    reg(n) = quiet(() -> GW._gw_shm_register(_lenc(_LInf.SystemSharedMemoryRegisterRequest(; name = n, key = "/k", byte_size = UInt64(64))), st))
+    unreg(n) = quiet(() -> GW._gw_shm_unregister(_lenc(_LInf.SystemSharedMemoryUnregisterRequest(; name = n)), st))
     reg("first-region")
     unreg("first-region")
     requests = _series_lines(metrics, "gateway_requests_total")
     latency = _series_lines(metrics, "gateway_request_latency_seconds_count")
-    @test "rpc=\"SystemSharedMemoryRegister\",model=\"\",status=\"OK\"" in requests
-    @test "rpc=\"SystemSharedMemoryUnregister\",model=\"\",status=\"OK\"" in requests
+    @test "rpc=\"SystemSharedMemoryRegister\",model=\"\",status=\"Unavailable\"" in requests
+    @test "rpc=\"SystemSharedMemoryUnregister\",model=\"\",status=\"Unavailable\"" in requests
     for n in unique([_lrandname() for _ in 1:10_000])
         reg(n)
         unreg(n)

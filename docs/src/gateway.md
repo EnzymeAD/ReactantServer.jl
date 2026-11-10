@@ -24,13 +24,18 @@ that serves the model. On a multi-worker node it also serves the node's merged m
   workers, either uniformly (`round_robin`, the default) or by packing each model onto a fixed,
   operator-configured number of GPUs with coalescing-aware routing (`lpt_packing`); see
   [Scheduling modes](#Scheduling-modes) below. A third mode, `least_outstanding`, spreads by
-  live occupancy. Either way, a request fails over to the remaining replicas when a worker
-  returns `NotFound` or `Unavailable`, or the call to it fails in the transport; every other
-  status reaches the client as the worker sent it, and a request that uses shared memory is
+  live occupancy. Either way, a request fails over to the remaining healthy replicas when a
+  worker returns `NotFound` or `Unavailable`, or the call to it fails in the transport; every
+  other status reaches the client as the worker sent it, and a request that uses shared memory is
   never retried on another worker (see [Status codes and failover](#Status-codes-and-failover)).
 - **Readiness probe:** a background loop calls each worker's KServe `ServerReady` RPC; `/readyz`
   is ready when at least one worker reports ready. The probes have a connection to each worker of
   their own, so they never wait behind the inference queued at a busy worker.
+- **Healthy workers only:** a worker the probe finds not ready, unreachable, or hung (no answer
+  within the 5 s probe deadline) is marked down, and the gateway sends it no request, in any
+  scheduling mode, as a first choice or as a failover, until a later probe finds it ready. A
+  request that finds a worker's connection refused marks it down the same way, at once. A model
+  that only down workers serve is answered `Unavailable` without calling any worker.
 - **Raw passthrough:** the `ModelInfer` hot path never decodes or re-marshals the protobuf body.
   The request and response types are `Vector{UInt8}` end to end (gRPCServer.jl and gRPCClient.jl
   support raw byte messages natively). To route, the gateway decodes a partial schema declaring
@@ -43,17 +48,31 @@ that serves the model. On a multi-worker node it also serves the node's merged m
   every input's name, datatype, and shape. That is a property of these requests, not a protocol
   guarantee: a Triton client may still inline typed contents, and the gateway keeps handling
   that.
-- **SHM broadcast:** `SystemSharedMemoryRegister` / `Unregister` are fanned out to every worker.
-  POSIX SHM regions are host-local; every worker attaches via `shm_open` independently. Register
-  succeeds only if all workers succeed. On a partial failure it rolls back only the registrations
-  this call created: each worker is first asked (`SystemSharedMemoryStatus`) whether it already
-  holds the name, and one that did (a client re-registering after another worker restarted) keeps
-  it. A worker that holds the name for another client's live object answers `ALREADY_EXISTS`, and
-  the gateway returns `ALREADY_EXISTS`; other failures return `FAILED_PRECONDITION`. Unregister
-  succeeds if any worker does.
-- **SHM namespace probe:** `IsSameIPCNamespace` is fanned out to every worker and the gateway
-  returns `true` only if all of them can see the client's region (any worker may service a later
-  `ModelInfer`). A worker that errors or does not implement the RPC counts as `false`.
+- **SHM broadcast:** `SystemSharedMemoryRegister` / `Unregister` are fanned out to every healthy
+  worker; a worker marked down is skipped, takes no part in the call and cannot hold it up. POSIX
+  SHM regions are host-local; every worker attaches via `shm_open` independently. Register succeeds
+  when every healthy worker accepts it, so a client can register during one worker's outage. On a
+  partial failure it rolls back only the registrations this call created: each worker is first
+  asked (`SystemSharedMemoryStatus`) whether it already holds the name, and one that did (a client
+  re-registering after another worker restarted) keeps it. A worker that holds the name for another
+  client's live object answers `ALREADY_EXISTS`, and the gateway returns `ALREADY_EXISTS`; other
+  failures return `FAILED_PRECONDITION`. Unregister succeeds if any healthy worker does. With no
+  healthy worker, both answer `UNAVAILABLE`.
+- **A worker that missed a registration:** a worker that was down during a register does not know
+  the region when it returns, and one that restarted has lost every registration, so its first
+  request that uses the region fails with `FAILED_PRECONDITION`. `ReactantServerClient` answers that
+  by registering the same region again through the gateway (a no-op on the workers that hold it)
+  and retrying the request once, so its callers see no error and it stays on shared memory. Other
+  clients, such as stock Triton clients, must register again themselves when a request fails with
+  `FAILED_PRECONDITION`. A worker that stayed alive while it was marked down still holds what it
+  had registered, which may be an object the client has since unregistered and replaced under the
+  same name; before such a worker takes requests again, the gateway unregisters on it every region
+  name it missed while down, and it stays down until that succeeds. A region it then no longer holds
+  fails with `FAILED_PRECONDITION` as above, never with the old object's data.
+- **SHM namespace probe:** `IsSameIPCNamespace` is fanned out to every healthy worker and the
+  gateway returns `true` only if all of them can see the client's region (any healthy worker may
+  service a later `ModelInfer`). A worker that errors or does not implement the RPC counts as
+  `false`, and so does a gateway with no healthy worker.
 - **Model metadata:** `ControlService/DescribeModels` asks every worker and merges the answers,
   so a client learns what the node serves without reading its model repository: each model's
   tensors with the kind of every axis (fixed, batch, or variable), its compiled batch sizes and
@@ -72,6 +91,16 @@ on few GPUs for deep coalescing batches and is the mode whose placement the gate
 Every setting in the block below except `mode` can also be changed while the gateway runs,
 through its own gRPC control plane; see
 [Runtime scheduling control](#Runtime-scheduling-control).
+
+Whatever the mode, a request is only ever sent to a worker the readiness probe currently finds
+healthy. Each mode chooses among a model's healthy replicas only, and its failover list holds only
+healthy replicas too; a worker marked down gets nothing until the probe round that finds it ready
+again, from which it is routable at once. A model whose workers are all down is answered
+`Unavailable` by the gateway itself. A worker whose connection is refused is marked down by the
+first request that finds it so, without waiting for the probe. A worker that fails in any other way
+can still receive requests in the window before the next probe round (up to one probe interval,
+10 s by default); those fail over as described in
+[Status codes and failover](#Status-codes-and-failover).
 
 ```yaml
 scheduling:
@@ -257,10 +286,21 @@ triggers it), and when it lowers the objective by at least `hysteresis` of the t
 it, a floor against noise in the rate estimates. The change with the most net saving goes first, and
 a move beats a swap that saves the same, since it is one upload instead of two. There is no fixed
 number of changes per repack: it makes every change that pays and stops. `payback_seconds: 0` never
-moves a model for balance. With a settled fleet a repack changes nothing. A worker that misses the
-poll for less than 30 s (three probe rounds) keeps its models: the repack waits rather than moving
-them onto the rest of the fleet and back. (`max_worker_share` is accepted but does not affect a
-model's GPU count.)
+moves a model for balance. With a settled fleet a repack changes nothing. (`max_worker_share` is
+accepted but does not affect a model's GPU count.)
+
+When the set of healthy workers changes, the gateway repacks on the probe round that sees it, without
+waiting for the compute budget: a worker the probe finds not ready, unreachable or hung, or one a
+request found refusing connections, has left, and one the probe finds ready again (or sees for the
+first time) has joined once it has answered a control-status poll, since placement needs its weight
+budget and counters; until then it gets no placement. Only the health check takes a worker out: one
+that passes it but whose control-status poll fails or times out keeps its placement and its traffic,
+and a repack due for another reason meanwhile plans it from its last answer. Each repack's placement
+is computed for the healthy workers that have answered, and any later round where those differ
+repacks again (`trigger="membership"`). The repack places every model whose workers left on the
+workers that remain, so a single-replica model on a lost worker moves to a survivor, and caps each
+model's replica count by the workers present: a model with `replicas: 2` on a fleet down to one GPU
+runs on that one, and gets its second replica back at the repack the other's return triggers.
 
 Without `forbid_memory_oversubscription` a worker may be placed more weights than its budget, and the
 overflow is priced by the uploads it causes. With it (the default), the budget is a hard limit on
@@ -277,11 +317,14 @@ RAM, never for a read from disk. A change whose read fails, is deferred (the wor
 holds this way at half its host weight budget) or takes longer than `stage_timeout_seconds` is
 dropped from that repack and planned again by the next one. A swap commits only when both of its
 models are staged, since half a swap could overfill a GPU. The prober keeps running while the reads
-do, and no other repack starts until they end.
+do, and no other repack starts until they end, except a membership repack: when the healthy workers
+change while moves are staging, the staged moves are abandoned uncommitted (a move may target the
+worker that left), and the repack plans again at once from the placement that was in force, which
+places any move still worth making again, primed as before.
 
-Repacks are driven by accumulated compute, not wall-clock: the gateway polls the workers every
-probe round and recomputes the placement once the fleet has consumed `rebalance_compute_seconds`
-GPU-seconds since the last repack. This compute is **cumulative across every GPU**: the gateway
+Apart from a change in the healthy workers, repacks are driven by accumulated compute, not
+wall-clock: the gateway polls the workers every probe round and recomputes the placement once the
+fleet has consumed `rebalance_compute_seconds` GPU-seconds since the last repack. This compute is **cumulative across every GPU**: the gateway
 sums each worker's consumed GPU-seconds, so a fleet of N busy GPUs accrues the budget about N
 times as fast as one (the accrual rate is the sum of the per-GPU utilizations). The budget is
 therefore in GPU-work, not real time, and the wall-clock gap between repacks shrinks as the fleet
@@ -293,7 +336,9 @@ placement quickly, then later repacks use the larger steady-state budget to limi
 (`0` means the first repack uses `rebalance_compute_seconds` like the rest). An idle fleet does
 not repack until traffic resumes. Gateway-driven compaction of worker memory follows placement
 changes; see [On-demand Weights](on_demand_weights.md) for `compaction_mode` and
-`compaction_interval`.
+`compaction_interval`. A membership repack resets the accumulated compute like any other repack (it
+folds that compute into the demand estimates) and, like an operator repack, does not use up the
+first-repack budget.
 
 #### The fill quantum
 
@@ -396,8 +441,12 @@ and you may see one such restart before it serves. Once all workers are up, a wr
 or differing model set is a hard error.
 
 Runtime drift after startup degrades gracefully: a model temporarily missing from some workers is
-routed uniformly over its actual replicas with a warning until the fleet converges, and a worker
-that drops out is excluded from placement, its traffic failing over to the remaining replicas.
+routed uniformly over its actual replicas with a warning until the fleet converges. A placed worker
+that the probe finds not ready, unreachable or hung gets none of its placed traffic: each request
+goes to the model's healthy placed replicas, chosen by the same fill rules over the healthy ones,
+or, when none of them is healthy, to any healthy worker that serves the model, and is answered
+`Unavailable` when there is none. The same probe round repacks the placement without that worker,
+and the round that finds it ready again repacks it back in (see [Moves and swaps](#Moves-and-swaps)).
 
 #### Observability
 
@@ -479,14 +528,19 @@ installed.
 
 ## Status codes and failover
 
-The gateway forwards a worker's gRPC status to the client unchanged, and moves a request on to
-the next replica only when the worker it tried could not serve it:
+The gateway calls only workers the readiness probe currently finds healthy: the replica a request
+is sent to first and every replica it may fail over to. A model whose workers are all marked down
+is answered `UNAVAILABLE` (the workers that serve the model are not ready) without calling any
+worker, and a model no worker serves is `NOT_FOUND`. Otherwise the gateway forwards a worker's gRPC
+status to the client unchanged, and moves a request on to the next healthy replica only when the
+worker it tried could not serve it:
 
 | The worker call ended with | The gateway |
 | --- | --- |
 | `NOT_FOUND` (the model was unloaded there since the last discovery round) | tries the next replica and refreshes its routes |
 | `UNAVAILABLE` (the worker is shutting down or draining, its dispatch loop died, or the model is not resident there or cannot be placed on its device now) | tries the next replica |
-| a transport failure (connection refused or reset, a response that broke off, a call aborted when its parked connection was reset) | tries the next replica, as `UNAVAILABLE` |
+| a refused connection (the request never reached the worker) | marks the worker down at once, as a failed probe would, and tries the next replica, as `UNAVAILABLE` |
+| any other transport failure (a connection reset, a response that broke off, a call aborted when its parked connection was reset) | tries the next replica, as `UNAVAILABLE` |
 | any other status: `DEADLINE_EXCEEDED`, `INTERNAL`, `INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`, `FAILED_PRECONDITION`, `CANCELLED`, ... | returns it to the client as is |
 
 A deterministic failure (`INTERNAL`) or the request's own mistake (`INVALID_ARGUMENT`) would only
@@ -504,9 +558,22 @@ A request that reads an input from, or writes an output to, a registered shared-
 replica: the worker that failed it may still be running it, and a second worker writing the same
 output slot, or reading an input slot the client has since reused, would corrupt the client's
 data. Whatever ends its attempt (`NOT_FOUND`, `UNAVAILABLE`, an abandoned or reset call, a
-transport failure) reaches the client as `UNAVAILABLE`, which `ReactantServerClient` retries. Its
-other statuses pass through like any request's. The gateway reads only the tensors' parameter
-keys to tell, never their payloads.
+transport failure, a deadline) reaches the client as `UNAVAILABLE`, which `ReactantServerClient`
+retries. The one exception is a refused connection: the request never left the gateway, so no
+worker has it, and it moves on to the next healthy replica like any other request. Its other
+statuses pass through like any request's. The gateway reads only the tensors' parameter keys to
+tell, never their payloads.
+
+The gateway knows a connection was refused from libcurl's result code for the call
+(`CURLE_COULDNT_CONNECT`), which libcurl returns only when it could not open the connection. It
+cannot tell a refusal from the rarer failure to reach the host at all (no route to it), since
+neither the code nor libcurl's message says which; both mean the request was not sent, and both mark
+the worker down. A timeout, a reset, a name that does not resolve, or a status from a live worker
+never marks a worker down from the request path; those are left to the probe. A worker that dies
+while the gateway holds a connection to it therefore shows first as a broken connection: the calls
+on that connection fail as any transport failure does (an inline request fails over, a
+shared-memory one comes back `UNAVAILABLE`), and the next call, which has to connect afresh, is
+refused and marks the worker down.
 
 When a client cancels its call, the gateway cancels its in-flight worker call (with gRPCClient's
 `grpc_cancel`) and the worker withdraws the queued request, so cancelled work is not run. Both
@@ -569,18 +636,21 @@ returning whether it reported ready.
   once; a call that does not answer (it times out, is refused, or fails) changes nothing, and the
   worker keeps the routes it last reported. While the readiness probe (`ServerReady`, same 10s
   loop, which also drives `/readyz` and the `gateway_worker_ready` metric) finds a worker
-  unreachable or not ready, its own answers are not taken, and its models are routed to the ready
-  workers that serve them; a model that only workers in that state serve is still routed to them,
-  so its requests fail over or come back `Unavailable`, which clients retry, rather than
-  `NotFound`. A worker that stays out for `worker_client.route_retention_seconds` (default 600, the
-  time a restart takes to load and compile its models with room to spare; 0 drops its routes at its
-  first missed round) loses its routes, and a model nobody else serves becomes `NotFound`. A model
+  unreachable, hung or not ready, or from the moment a request finds its connection refused until a
+  later probe finds it ready, its own answers are not taken and no request is sent to it: its
+  models are routed to the ready workers that serve them, and a model that only workers in that
+  state serve is answered `Unavailable` by the gateway, without a worker call, which clients retry,
+  rather than `NotFound`. A worker that stays out for `worker_client.route_retention_seconds`
+  (default 600, the time a restart takes to load and compile its models with room to spare; 0 drops
+  its routes at its first missed round) loses its routes, and a model nobody else serves becomes
+  `NotFound`. A model
   no worker has ever reported is `NotFound` at once. Rebuilding the table keeps each model's
   round-robin position.
 - Under `lpt_packing`, the gateway polls the workers on every 10s probe round to refresh routing
   metadata and accumulate consumed compute, but recomputes the placement only once the fleet has
   consumed `scheduling.rebalance_compute_seconds` GPU-seconds (the first repack uses
-  `scheduling.first_rebalance_compute_seconds` when set). Each repack logs a `lpt_packing: repack`
+  `scheduling.first_rebalance_compute_seconds` when set), or at once when the healthy workers
+  change. Each repack logs a `lpt_packing: repack`
   line with the number of models placed, how many `moved` workers and the weight bytes that
   move puts on their new workers (`moved_weights`), whether it was `incremental` (every repack
   after the startup placement), the `changes` it planned and how many are `staging`, the objective
@@ -589,9 +659,10 @@ returning whether it reported ready.
   `compute_seconds`/`wall_seconds` since the last repack, useful for watching placement churn and
   the trigger cadence. A repack that stages its moves then logs `staged placement changes
   committed` with how many it committed and dropped (also counted by
-  `gateway_repack_staged_changes_total{outcome}`). A repack that comes due while a placed worker is
-  missing from the poll logs `repack deferred` instead and runs once the worker answers or 30 s have
-  passed.
+  `gateway_repack_staged_changes_total{outcome}`). A change in the healthy workers logs `the healthy
+  workers changed; repacking now` with the workers that `left` and `joined` and whether staged moves
+  were abandoned, then repacks on that round (`gateway_repacks_total{trigger="membership"}`); staged
+  moves it abandons log `staged placement changes abandoned` when their reads end.
 - The gateway holds two connections to each worker: one for the health probes, discovery and the
   control-status poll, and one for everything else, inference, shared memory, the metadata RPCs,
   `CompactMemory` and `StageWeights` (`worker_client.max_concurrent_streams` calls at once on it).
@@ -614,7 +685,10 @@ returning whether it reported ready.
   the worker. The gateway logs a warning each time.
 - Successful `ModelInfer` requests are not logged (to keep the hot path quiet); worker errors and
   a model with no live replica are logged, and per-request latency and gRPC status are exported
-  as Prometheus metrics. Logs contain no tensor data.
+  as Prometheus metrics. Logs contain no tensor data. A request for a model whose workers are all
+  marked down logs `no ready worker serves the model` at info once per model per outage, and at
+  debug for every later request until a worker that serves it is ready again; a new outage logs at
+  info again.
 - Clients choose the names they send, so they never become metric labels as sent. The `model`
   label of `gateway_requests_total` and `gateway_request_latency_seconds` for `ModelInfer` is the
   model's name only while the routing table holds it; every other name (one no worker serves, an

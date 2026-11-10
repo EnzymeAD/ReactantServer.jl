@@ -206,7 +206,7 @@ function serve_gateway(gateway_path::Union{AbstractString, Nothing} = nothing; b
     catch e
         @warn "initial route discovery failed; the health prober will retry" exception = e
     end
-    prober = start_prober!(HealthProber(pool, metrics, admin, routes; scheduler = scheduler, meta = meta))
+    prober = start_prober!(HealthProber(pool, metrics, admin, routes; scheduler = scheduler, meta = meta, gate = gate))
     host, port = _split_hostport(cfg.listen_grpc)
     # Inbound admission cap: a per-worker multiple of the configured budget, scaled by the fleet
     # size so the gateway sheds (RESOURCE_EXHAUSTED) only past what the workers can plausibly absorb.

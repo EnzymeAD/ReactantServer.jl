@@ -54,7 +54,8 @@
 # `first_rebalance_compute_seconds` budget (a quick early rebalance), then steady-state uses the
 # larger `rebalance_compute_seconds`; the startup cold placement does not consume the first budget.
 # An operator can also force one out of band (Repack in control_service.jl), which the prober serves
-# on its next round without consuming the first-repack budget.
+# on its next round without consuming the first-repack budget. A change in the set of healthy workers
+# (one lost, one back, one new) repacks on the round that sees it, with neither budget involved.
 #
 # Every knob above is runtime-mutable through the gateway's own control plane
 # (GatewayControlService, see control_service.jl), including a model's replica count and fill mode.
@@ -63,8 +64,10 @@
 #
 # LPT-packing mode requires worker FIFO discipline and all models on all workers, verified as a hard
 # failure at gateway startup (see verify_lpt_packing_preconditions!). Runtime drift degrades
-# gracefully: a dead worker is excluded from placement until ready; a model temporarily missing
-# from some workers gets a uniform distribution over its actual replicas with a warning.
+# gracefully: a worker that is not healthy gets no request (routing skips it among a model's placed
+# replicas) and is repacked out of the placement at once, and back in once it is healthy again; a
+# model temporarily missing from some workers gets a uniform distribution over its actual replicas
+# with a warning.
 
 # One model's placement: worker URLs with weights (1/k across its k replicas), sorted by URL.
 # The weights are exported as metrics; request routing uses outstanding-batch counts, not weights.
@@ -545,9 +548,15 @@ mutable struct LptPackingState <: GatewayScheduler
     # worker (see `_compute_delta!`).
     compute_accum::Float64
     last_worker_compute::Dict{String, Float64}
-    # when each placed worker was first missing from a poll (prober task only); see
-    # `_hold_for_absent_workers!`.
-    absent_since::Dict{String, Float64}
+    # The workers the live assignment was computed for (sorted; prober task only): the healthy
+    # workers with a control-status answer at the repack that made it. A tick whose healthy, answered
+    # workers differ from these repacks at once (`:membership`); see `tick_packing!`.
+    members::Vector{String}
+    # Each healthy worker's last ModelControlStatus answer (prober task only). A healthy worker that
+    # misses a poll is planned from its last answer, so only the health check takes a worker out;
+    # a worker the health check marks down is forgotten here, so it rejoins only once it answers a
+    # poll again. See `_effective_poll!`.
+    last_status::Dict{String, Any}
     # whether a tick-driven repack has fired yet. The startup cold placement does not count; the
     # first tick repack sets this, after which the steady-state `rebalance_compute_seconds` applies.
     did_first_tick_repack::Bool
@@ -607,22 +616,26 @@ mutable struct LptPackingState <: GatewayScheduler
     # handler before it bumps `repack_requested`; consumed by the prober.
     @atomic full_requested::Bool
     # A repack's primed second half while its moves' weights are staged (`_prime_and_commit!`), or
-    # nothing. No repack starts while one runs. Prober task and that task only (one thread).
+    # nothing. No repack starts while one runs, except a membership repack, which abandons it.
+    # Prober task and that task only (one thread).
     transition::Union{Task, Nothing}
+    # Bumped when a membership change abandons the transition in progress. A transition commits
+    # only while this still holds the value it started with, so an abandoned one installs nothing.
+    transition_epoch::Int
 end
 
 LptPackingState(cfg::GatewayConfig, meta::RoutingMeta = RoutingMeta(cfg)) = LptPackingState(
     PackingKnobs(cfg), ReentrantLock(), meta,
     Dict{String, Threads.Atomic{Int}}(), ReentrantLock(),
     Dict{String, Float64}(), Dict{String, Float64}(), Dict{String, Tuple{Float64, UInt64}}(),
-    0.0, 0.0, Dict{String, Float64}(), Dict{String, Float64}(), false,
+    0.0, 0.0, Dict{String, Float64}(), String[], Dict{String, Any}(), false,
     Dict{String, Int}(), Dict{String, Float64}(), Dict{String, Placement}(),
     Dict{Tuple{String, String}, Threads.Atomic{Int}}(),
     Dict{Tuple{String, String}, Threads.Atomic{Int}}(),
     Dict{String, Threads.Atomic{Int}}(),
     Dict{String, ReentrantLock}(), Dict{String, FillRun}(), Dict{String, FillPlan}(),
     Set{Tuple{String, String}}(), Set{String}(), 0,
-    TickReport(), RepackReport(), 0, 0, false, nothing
+    TickReport(), RepackReport(), 0, 0, false, nothing, 0
 )
 
 """
@@ -821,6 +834,7 @@ function _repack!(
     for (w, c) in poll.worker_compute
         s.last_worker_compute[w] = c
     end
+    s.members = polled
 
     # Changes that move a model off a worker still serving it wait for their weights to be staged on
     # the new one (see `_prime_and_commit!`); everything else installs now. A full repack installs
@@ -843,7 +857,8 @@ function _repack!(
         new_repack = true
     )
     if !isempty(primed)
-        s.transition = @async _prime_and_commit!(s, pool, metrics, poll, prev, next, primed, k, complete_seq)
+        epoch = s.transition_epoch
+        s.transition = @async _prime_and_commit!(s, pool, metrics, poll, prev, next, primed, k, complete_seq, epoch)
     end
     return changed
 end
@@ -967,7 +982,7 @@ function _install_assignment!(
 end
 
 """
-    _prime_and_commit!(s, pool, metrics, poll, prev, plan, primed, k, complete_seq)
+    _prime_and_commit!(s, pool, metrics, poll, prev, plan, primed, k, complete_seq, epoch)
 
 The second half of a repack whose changes move models off workers still serving them: ask each
 destination to read the arriving models' weights into host memory (StageWeights), then switch
@@ -976,12 +991,15 @@ worker waits for an upload from RAM and never for a read from disk. A change wit
 deferred or timed-out read is dropped (the model stays where it was) and the next repack plans it
 again. A swap commits only when both of its models are staged, since half a swap can overfill a
 worker. Runs as its own task so the prober keeps ticking while the reads run; no repack starts
-until it ends.
+until it ends, except a membership repack: a change of the healthy workers abandons the transition
+(`s.transition_epoch` moves past `epoch`), and then this commits nothing, since its plan may place
+models on a worker that has left, and the membership repack plans again from the committed
+assignment.
 """
 function _prime_and_commit!(
         s::LptPackingState, pool::ClientPool, metrics::Union{GatewayMetrics, Nothing}, poll,
         prev::Dict{String, Placement}, plan::Dict{String, Placement}, primed::Vector{Vector{String}},
-        k::PackingKnobs, complete_seq::Int
+        k::PackingKnobs, complete_seq::Int, epoch::Int = s.transition_epoch
     )
     t0 = time()
     try
@@ -1017,6 +1035,12 @@ function _prime_and_commit!(
                 end
             end
         end
+        # Abandoned while staging: install nothing. From this check to the install below nothing
+        # yields, and the prober runs on this task's thread, so no membership repack can come between.
+        if s.transition_epoch != epoch
+            @info "lpt_packing: staged placement changes abandoned; the healthy workers changed while they staged" abandoned = length(primed) staging_seconds = round(time() - t0; digits = 1)
+            return nothing
+        end
         ready(w, m) = get(states, (w, m), "failed") in ("resident", "staged", "skipped")
         arrived(m) = [w for (w, _) in plan[m] if !(w in Set(first.(get(prev, m, Placement()))))]
         accepted = [c for c in primed if all(m -> all(w -> ready(w, m), arrived(m)), c)]
@@ -1045,9 +1069,21 @@ function _prime_and_commit!(
     catch err
         @error "lpt_packing: committing staged placement changes failed; the placement is unchanged" exception = (err, catch_backtrace())
     finally
-        complete_seq > 0 && @atomic s.repack_completed = max(@atomic(s.repack_completed), complete_seq)
-        s.transition = nothing
+        # An abandoned transition leaves both alone: the membership repack that abandoned it owns
+        # them now (it reports an operator request it served, and `transition` may be its own).
+        if s.transition_epoch == epoch
+            complete_seq > 0 && @atomic s.repack_completed = max(@atomic(s.repack_completed), complete_seq)
+            s.transition = nothing
+        end
     end
+    return nothing
+end
+
+# Abandon the transition in progress: its uncommitted changes will never be installed, and a repack
+# may start at once. The reads already sent keep running on the workers and are discarded.
+function _abandon_transition!(s::LptPackingState)
+    s.transition_epoch += 1
+    s.transition = nothing
     return nothing
 end
 
@@ -1157,7 +1193,8 @@ function rebalance!(
         s::LptPackingState, pool::ClientPool, ready_urls::Vector{String},
         metrics::Union{GatewayMetrics, Nothing} = nothing; trigger::Symbol = :startup
     )
-    _repack!(s, poll_workers(pool, ready_urls), metrics; trigger = trigger, pool = pool)
+    poll = _effective_poll!(s, poll_workers(pool, ready_urls), ready_urls)
+    _repack!(s, poll, metrics; trigger = trigger, pool = pool)
     return nothing
 end
 
@@ -1176,41 +1213,70 @@ function _compute_delta!(s::LptPackingState, poll)
     return total
 end
 
-# How long a placed worker may be missing from the polls before a repack moves its models elsewhere:
-# three probe rounds. A worker busy loading weights, or a dropped connection, misses a poll now and
-# then; packing without it would move every model it holds onto the rest of the fleet and back again
-# once it answers, each move a weight load. A worker gone for longer is treated as gone.
-const _ABSENT_GRACE_SECONDS = 30.0
+"""
+    _effective_poll!(s, poll, healthy) -> poll
 
-# Whether a due repack must wait: no worker answered the poll, or a worker that holds placements has
-# been missing for less than the grace period. Records when each placed worker went missing.
-function _hold_for_absent_workers!(s::LptPackingState, poll, now::Float64)
-    polled = Set(poll.polled)
-    placed = Set(w for pl in values(@atomic s.assignment) for (w, _) in pl)
-    for w in collect(keys(s.absent_since))
-        (w in polled || !(w in placed)) && delete!(s.absent_since, w)
+The poll a tick plans from: this round's answers (`poll`, from `poll_workers` over the `healthy`
+workers), plus the last answer of each healthy worker that missed this round's poll. Only the health
+check takes a worker out of the placement: a worker that passes it but whose ModelControlStatus fails
+or times out keeps its place, and a repack due meanwhile plans it from its last answer (its budget
+and its counters as they last were; its compute is counted from them once it answers again). A
+worker no longer healthy is forgotten, so it joins again only once it is healthy and has answered a
+poll, which a new worker needs too: placement needs its budget and counters. Prober task only.
+"""
+function _effective_poll!(s::LptPackingState, poll, healthy::AbstractVector{<:AbstractString})
+    hasproperty(poll, :responses) || return poll      # a poll built by hand (tests): use as is
+    keep = Set{String}(healthy)
+    for w in collect(keys(s.last_status))
+        w in keep || delete!(s.last_status, w)
     end
-    hold = isempty(polled)
-    for w in placed
-        w in polled && continue
-        t = get!(s.absent_since, w, now)
-        now - t < _ABSENT_GRACE_SECONDS && (hold = true)
-    end
-    return hold
+    merge!(s.last_status, poll.responses)
+    length(s.last_status) == length(poll.responses) && return poll
+    @debug "lpt_packing: planning from the last control-status answer of healthy workers that missed this poll" workers = sort!(setdiff(collect(keys(s.last_status)), keys(poll.responses)))
+    return aggregate_poll(s.last_status)
+end
+
+"""
+    membership_change(s, poll) -> Union{Nothing, NamedTuple}
+
+How the workers in this tick's poll differ from those the live assignment was computed for
+(`s.members`): `(; left, joined)`, or `nothing` when they are the same or the poll holds no worker.
+The tick's poll (`_effective_poll!`) holds every healthy worker that has answered a poll, this round
+or before, so a worker leaves only when the health check marks it down (or a refused connection
+does), and joins once it is healthy and has answered.
+"""
+function membership_change(s::LptPackingState, poll)
+    isempty(poll.polled) && return nothing
+    cur = sort(poll.polled)
+    cur == s.members && return nothing
+    return (; left = setdiff(s.members, cur), joined = setdiff(cur, s.members))
 end
 
 """
     tick_packing!(s, pool, ready_urls, metrics, poll=poll_workers(pool, ready_urls)) -> nothing
 
 One prober tick: refresh the routing metadata from `poll`, accumulate the fleet's consumed compute,
-and repack only when the accumulated compute crosses the active budget. The first tick-driven repack
-uses `first_rebalance_compute_seconds` (when set); every repack after uses
-`rebalance_compute_seconds`. The cheap per-tick work is the accumulator; the EWMA fold and
-`compute_assignment` run only on a triggered repack.
+and repack when the set of healthy workers changed, or when the accumulated compute crosses the
+active budget. The first compute-driven repack uses `first_rebalance_compute_seconds` (when set);
+every one after uses `rebalance_compute_seconds`. The cheap per-tick work is the accumulator; the
+EWMA fold and the assignment run only on a triggered repack.
+
+A membership change (a worker left, returned, or is new: see [`membership_change`](@ref)) repacks on
+the tick that sees it, whatever the compute accumulated, so a model whose replica left is placed on a
+worker that is up, and a returning worker gets its replicas back, at once. A replica count is still
+capped by the workers present at that repack. Such a repack folds the accumulated compute into the
+demand estimates and resets the accumulator, as every repack does (the accumulator is the compute
+since the last fold, which is what the estimates decay by, so it cannot be kept and counted again),
+and it leaves the first-repack budget armed, as an operator repack does: that budget is for the
+first repack driven by traffic. A primed transition still staging when the membership changes is
+abandoned (its plan may place models on a worker that has left), and the repack plans again from the
+committed assignment.
 
 `poll` is the prober's [`poll_workers`](@ref) result for this round, shared with the gateway's
 routing-metadata cache so there is one control-status round per tick however many consumers there
-are. It defaults to polling here so a test (or a direct caller) need not thread one through.
+are. It defaults to polling here so a test (or a direct caller) need not thread one through. The
+tick plans from it plus the last answer of every healthy worker that missed it (`_effective_poll!`),
+so a missed poll is never a membership change.
 """
 function tick_packing!(
         s::LptPackingState, pool::ClientPool, ready_urls::Vector{String},
@@ -1224,19 +1290,36 @@ function tick_packing!(
     # One knob snapshot for the whole tick, so a policy change landing mid-tick cannot produce a
     # repack that mixes old and new settings.
     k = knobs(s)
+    # A healthy worker that missed this round's poll stays in, planned from its last answer.
+    poll = _effective_poll!(s, poll, ready_urls)
     @atomic s.max_batch = poll.max_batch         # keep routing metadata fresh between repacks
     _publish_fill_plan!(s, k, poll.max_batch, poll.batch_at)   # ...and re-resolve the fill rules
     _refresh_live_gauges!(s, metrics)            # in-flight and quantum, refreshed between repacks
     s.compute_accum += _compute_delta!(s, poll)
-    hold = _hold_for_absent_workers!(s, poll, time())
     # The first tick-driven repack may use a smaller budget so an early rebalance corrects the cold
     # placement quickly; steady-state then uses the larger budget. The flag is flipped here, not in
     # `_repack!`, because the startup `rebalance!` also calls `_repack!` and must not consume it.
     threshold = (!s.did_first_tick_repack && k.first_rebalance_compute_seconds > 0) ?
         k.first_rebalance_compute_seconds : k.rebalance_compute_seconds
     forced = requested > (@atomic s.repack_completed)
-    if (forced || s.compute_accum >= threshold) && hold
-        @info "lpt_packing: repack deferred while a placed worker is missing from the poll" missing = sort!(collect(keys(s.absent_since))) grace_seconds = _ABSENT_GRACE_SECONDS
+    change = membership_change(s, poll)
+    if change !== nothing
+        # Repack now: neither the compute budget nor a staging transition holds it. An operator
+        # request pending at the same time is served by this repack.
+        abandoned = s.transition !== nothing
+        abandoned && _abandon_transition!(s)
+        @info "lpt_packing: the healthy workers changed; repacking now" left = change.left joined = change.joined abandoned_staging = abandoned
+        full = forced && (@atomicswap s.full_requested = false)
+        changed = _repack!(
+            s, poll, metrics; trigger = :membership, k = k, pool = pool, full = full,
+            complete_seq = forced ? requested : 0
+        )
+        if s.transition === nothing
+            _maybe_compact_fleet!(s, pool, metrics, changed; k = k)
+            forced && @atomic s.repack_completed = requested
+        end
+    elseif (forced || s.compute_accum >= threshold) && isempty(poll.polled)
+        @info "lpt_packing: repack deferred: no healthy worker has answered a control-status poll"
     elseif (forced || s.compute_accum >= threshold) && s.transition !== nothing
         # The previous repack is still staging its moves' weights; the next one plans from what it
         # commits, so it waits (the accumulated compute and any operator request carry over).
@@ -1336,12 +1419,19 @@ function _reserve_on!(out_snap, routed_snap, wload_snap, model, w, weight, units
 end
 
 """
-    route_replica(s, model) -> Union{Nothing, Tuple{Vector{String}, Counters}}
+    route_replica(s, model, units = 1; down = nothing) -> Union{Nothing, Tuple{Vector{String}, Counters}}
 
 Order a model's replicas for dispatch and reserve the chosen one. Returns `nothing` when the model
 has no placement yet (cold or unknown); the caller falls back to round robin. Otherwise returns the
 ordered replica URLs (the chosen worker first, the rest as failover) and `Counters`, the reserved
 counters to release when the request completes.
+
+`down` is the set of workers marked down (the routing table's, read once per request with the
+routes). A placed worker in it is never returned: the fill logic below chooses among the healthy
+replicas only, while every index, the run's `target` and `cursor` included, stays an index into the
+full placement, so the run and its counters remain valid as workers leave and return between
+repacks. With no healthy replica the result is an empty list (and no reservation), and the caller
+falls back to the healthy replicas the routing table knows.
 
 The model's `fill_mode` (see [`FillPlan`](@ref)) decides what the quantum `Q` counts, and
 `routing_policy` decides which replica a fresh run opens on:
@@ -1374,11 +1464,15 @@ sees load from all models. The reservation (atomic increments under the per-mode
 selection lock for multi-replica models) makes concurrent selections see the choice, so requests do
 not stampede onto the same replica.
 """
-function route_replica(s::LptPackingState, model::AbstractString, units::Integer = 1)
+function route_replica(
+        s::LptPackingState, model::AbstractString, units::Integer = 1;
+        down::Union{Nothing, AbstractSet{String}} = nothing
+    )
     placement = get(@atomic(s.assignment), model, nothing)
     placement === nothing && return nothing
     n = length(placement)
     n == 0 && return nothing
+    up(w) = down === nothing || !(w in down)
 
     out_snap = @atomic s.outstanding
     routed_snap = @atomic s.routed
@@ -1394,12 +1488,16 @@ function route_replica(s::LptPackingState, model::AbstractString, units::Integer
 
     if n == 1
         w = placement[1][1]
+        up(w) || return (String[], nothing)
         return (String[w], _reserve_on!(out_snap, routed_snap, wload_snap, model, w, weight, units))
     end
 
     workers = String[p[1] for p in placement]
+    # The healthy replicas, as indices into the placement. Every choice below is made among these.
+    live = Int[i for i in 1:n if up(workers[i])]
+    isempty(live) && return (String[], nothing)
     lk = get(@atomic(s.sel_locks), model, nothing)
-    lk === nothing && return (workers, nothing)   # mid-repack drift: route in order, untracked
+    lk === nothing && return (workers[live], nothing)   # mid-repack drift: route in order, untracked
     policy = k.routing_policy
     Q = plan.quantum
     all_runs = @atomic s.fill_runs
@@ -1407,13 +1505,13 @@ function route_replica(s::LptPackingState, model::AbstractString, units::Integer
     res = lock(lk) do
         cobjs = Vector{Threads.Atomic{Int}}(undef, n)
         outs = Vector{Int}(undef, n)
-        total = 0
+        total = 0                                 # in flight on the healthy replicas
         for i in 1:n
             a = get(out_snap, (model, workers[i]), nothing)
             a === nothing && return nothing       # snapshot drift: bail to untracked routing
             cobjs[i] = a
             outs[i] = a[]
-            total += outs[i]
+            i in live && (total += outs[i])
         end
         # Mid-repack drift: decide with a throwaway record rather than skipping the fill logic, so a
         # request between the swap and the next tick still routes sanely (it just does not persist).
@@ -1429,20 +1527,21 @@ function route_replica(s::LptPackingState, model::AbstractString, units::Integer
         if plan.mode === :spread
             # All replicas serve the model at once; ties go to the policy so an idle set still rotates.
             chosen = policy === :fill_least ?
-                argmin(i -> (outs[i], wload_of(i), rot(i)), 1:n) :
-                argmin(i -> (outs[i], rot(i)), 1:n)
+                argmin(i -> (outs[i], wload_of(i), rot(i)), live) :
+                argmin(i -> (outs[i], rot(i)), live)
             run.cursor = mod(chosen, n)
             run.target = chosen
             run.units = units
         elseif plan.mode === :run
             # `behind` is the backpressure guard: a replica a whole quantum deeper than the
-            # least-backed-up one can neither keep nor open a run.
-            floor_q = minimum(fld(outs[i], Q) for i in 1:n)
+            # least-backed-up one can neither keep nor open a run. A run whose replica is down ends.
+            floor_q = minimum(fld(outs[i], Q) for i in live)
             behind(i) = fld(outs[i], Q) > floor_q
-            if run.target < 1 || run.target > n || run.units >= Q || behind(run.target) || total == 0
+            if run.target < 1 || run.target > n || !up(workers[run.target]) || run.units >= Q ||
+                    behind(run.target) || total == 0
                 chosen = policy === :fill_least ?
-                    argmin(i -> (behind(i), wload_of(i), rot(i)), 1:n) :
-                    argmin(i -> (behind(i), rot(i)), 1:n)
+                    argmin(i -> (behind(i), wload_of(i), rot(i)), live) :
+                    argmin(i -> (behind(i), rot(i)), live)
                 run.cursor = mod(chosen, n)
                 run.target = chosen
                 run.units = units
@@ -1458,14 +1557,14 @@ function route_replica(s::LptPackingState, model::AbstractString, units::Integer
             # what keeps a mid-fill replica winning until it holds a full quantum.
             prog(i) = (fld(outs[i], Q), -outs[i])
             if policy === :fill_least
-                chosen = argmin(i -> (prog(i), wload_of(i), rot(i)), 1:n)
+                chosen = argmin(i -> (prog(i), wload_of(i), rot(i)), live)
             else
-                chosen = argmin(i -> (prog(i), rot(i)), 1:n)
+                chosen = argmin(i -> (prog(i), rot(i)), live)
             end
             # The cursor advances only on a genuine batch start (more than one replica tied at the
             # best progress), so a lone mid-fill winner keeps concentrating.
             best = prog(chosen)
-            count(i -> prog(i) == best, 1:n) > 1 && (run.cursor = mod(chosen, n))
+            count(i -> prog(i) == best, live) > 1 && (run.cursor = mod(chosen, n))
             run.target = chosen
             run.units = units
         end
@@ -1475,13 +1574,12 @@ function route_replica(s::LptPackingState, model::AbstractString, units::Integer
         wload === nothing || Threads.atomic_add!(wload, weight)
         rtd = get(routed_snap, (model, workers[chosen]), nothing)
         rtd === nothing || Threads.atomic_add!(rtd, 1)
-        # Chosen first, then least-backed-up, as the failover order.
-        order = collect(1:n)
-        sort!(order; by = i -> (i == chosen ? 0 : 1, fld(outs[i], Q), outs[i], workers[i]))
+        # Chosen first, then the other healthy replicas least-backed-up first, as the failover order.
+        order = sort(live; by = i -> (i == chosen ? 0 : 1, fld(outs[i], Q), outs[i], workers[i]))
         ordered = String[workers[i] for i in order]
         return (ordered, cobjs[chosen], wload)
     end
-    res === nothing && return (workers, nothing)
+    res === nothing && return (workers[live], nothing)
     ordered, mwc, wload = res
     return (ordered, (mwc, wload, weight, units))
 end
@@ -1556,19 +1654,22 @@ function _warn_inflight_fill(k::PackingKnobs)
     return nothing
 end
 
-# Route to the placement replica that fills its batch first (route_replica reserves it), the rest of
-# the placement following as failover, then any discovered replicas outside the placement as a
-# last resort so a concentrated model survives its worker dying between repacks. A model without a
-# placement yet (cold, or new since the last repack) falls back to round robin over discovered routes.
+# Route to the healthy placement replica that fills its batch first (route_replica reserves it), the
+# rest of the healthy placement following as failover, then any healthy discovered replicas outside
+# the placement as a last resort, so a concentrated model is still served when its placed workers
+# are down until the repack that their leaving triggers. A model without a placement yet (cold, or
+# new since the last repack) falls back to round robin over the healthy discovered routes. The
+# routes and the down set come from one read of the routing table, so the placement is filtered by
+# the same verdict the routes were built from.
 function select_replicas(s::LptPackingState, ctx::ScheduleContext)
-    routed = route_replica(s, ctx.model, ctx.units)
+    t = current_table(ctx.routes)
+    routed = route_replica(s, ctx.model, ctx.units; down = t.down)
+    rr = pick(t, ctx.model)
     if routed === nothing
-        urls = pick(ctx.routes, ctx.model)
-        urls === nothing && return nothing
-        return (urls, nothing)
+        rr === nothing && return nothing
+        return (rr, nothing)
     end
     urls, counters = routed
-    rr = pick(ctx.routes, ctx.model)
     if rr !== nothing
         extra = String[u for u in rr if !(u in urls)]
         isempty(extra) || (urls = vcat(urls, extra))

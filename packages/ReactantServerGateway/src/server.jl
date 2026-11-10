@@ -108,6 +108,13 @@ _server_exc(status::AbstractString, msg::AbstractString) =
 # another replica.
 _fails_over(status::AbstractString) = status == STATUS_NOT_FOUND || status == STATUS_UNAVAILABLE
 
+# The answer for a request whose model is served only by workers that are not ready: the gateway
+# sends nothing to a worker the prober has marked down, so the client hears UNAVAILABLE and retries.
+_no_ready_worker(model) = gRPCServer.GRPCError(
+    gRPCServer.StatusCode.UNAVAILABLE,
+    "model \"$model\" is unavailable: the workers that serve it are not ready"
+)
+
 _is_cancelled(cancelled) = cancelled !== nothing && (
     try
         cancelled() === true
@@ -123,16 +130,22 @@ _is_cancelled(cancelled) = cancelled !== nothing && (
 # any failover retries — and forward it as the worker's grpc-timeout, so the budget shrinks for time
 # burned at the gateway instead of resetting to a fresh full budget at the worker. If it is already
 # gone, shed here (DEADLINE_EXCEEDED) rather than forward doomed work into the worker's queue.
+#
+# Returns (response, status, exception, refused): `refused` is true when the connection to the
+# worker was refused, so the request never reached it. The worker is then marked down at once, in
+# the same place the prober marks it (`note_worker_ready!`), and stays down until a probe sent after
+# the refusal finds it ready: no later request or failover goes to it meanwhile, and under
+# lpt_packing the prober's next round sees a membership change.
 function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64, cancelled = nothing)
     wc = get_clients(st.pool, url)
     if wc === nothing
         return nothing, STATUS_INTERNAL,
-            _gw_internal(st, "infer for model \"$model\"", id, "routing table referenced unknown worker $url")
+            _gw_internal(st, "infer for model \"$model\"", id, "routing table referenced unknown worker $url"), false
     end
     gate_wait(st.gate, url)
     if _is_cancelled(cancelled)
         return nothing, STATUS_CANCELLED,
-            gRPCServer.GRPCError(gRPCServer.StatusCode.CANCELLED, "request for model \"$model\" was cancelled by the client")
+            gRPCServer.GRPCError(gRPCServer.StatusCode.CANCELLED, "request for model \"$model\" was cancelled by the client"), false
     end
     deadline_s = nothing
     if deadline_ns != 0
@@ -142,7 +155,7 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64,
                 gRPCServer.GRPCError(
                     gRPCServer.StatusCode.DEADLINE_EXCEEDED,
                     "deadline exceeded at gateway for model \"$model\""
-                )
+                ), false
         end
         # Forward as WHOLE SECONDS: grpc_timeout_header_val only encodes integer seconds without
         # falling back to a >8-digit nanosecond value the worker rejects; ceil so a sub-second budget
@@ -155,8 +168,12 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64,
     # already redacted it), and a failure of the call itself is described by `invoke_infer` under the
     # worker's label, never with the transport's text (which names hosts and ports).
     full = st.error_detail == ERROR_DETAIL_FULL
+    refused = Ref(false)
     try
-        resp = invoke_infer(wc, body; deadline = deadline_s, cancelled = cancelled, label = full ? nothing : _shown(st, url))
+        resp = invoke_infer(
+            wc, body; deadline = deadline_s, cancelled = cancelled, label = full ? nothing : _shown(st, url),
+            refused = refused
+        )
         observe_worker!(st.metrics, "ModelInfer", url, time() - t0)
         # A worker's reply always carries model_name, so an empty body is a call that ended without
         # a response: gRPCClient before 1.1.2 returned one when a handle reset aborted the call.
@@ -164,15 +181,17 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64,
         if isempty(resp)
             @warn "infer: worker returned an empty response" model worker = url request_id = id
             return nothing, STATUS_UNAVAILABLE,
-                _server_exc(STATUS_UNAVAILABLE, "$(full ? "worker $url" : _shown(st, url)): empty response (connection reset?)")
+                _server_exc(STATUS_UNAVAILABLE, "$(full ? "worker $url" : _shown(st, url)): empty response (connection reset?)"), false
         end
-        return resp, STATUS_OK, nothing
+        return resp, STATUS_OK, nothing, false
     catch e
         observe_worker!(st.metrics, "ModelInfer", url, time() - t0)
         e isa gRPCClient.gRPCServiceCallException || rethrow()
         status = client_status(e)
-        @warn "infer: worker error" model worker = url request_id = id status = status msg = e.message
-        return nothing, status, _server_exc(status, full ? "worker $url: $(e.message)" : e.message)
+        @warn "infer: worker error" model worker = url request_id = id status = status msg = e.message refused = refused[]
+        refused[] && note_worker_ready!(st.routes, url, false) &&
+            @warn "infer: the worker refused the connection; marked down until a probe finds it ready" worker = url
+        return nothing, status, _server_exc(status, full ? "worker $url: $(e.message)" : e.message), refused[]
     end
 end
 
@@ -186,15 +205,27 @@ end
 # failed it may still be running it (an abandoned or reset call is not a stopped one), and a second
 # worker writing the same output slot, or reading an input slot the client has since reused, would
 # corrupt the client's data. Its failure reaches the client as UNAVAILABLE, the client's cue to retry.
+# The one exception is a refused connection: the request never left the gateway, so no worker has
+# it, and it moves on like any other request. Every other ending (any other transport failure, an
+# abandoned or reset call, a deadline, a status the worker sent) keeps the rule.
+#
+# A replica marked down after the scheduler chose it (the prober's round, or another request's
+# refused connection, landed in between) is skipped: no request is sent to a worker marked down, as
+# a first choice or as a failover.
 function _try_replicas(st::GatewayState, urls, model, id, body, deadline_ns::Int64, cancelled = nothing)
     last_status = STATUS_UNAVAILABLE
-    last_exc = gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, "no replica available")
+    last_exc = _no_ready_worker(model)
     shm = nothing           # read from the body only once a worker has failed the request
     for url in urls
-        resp, status, exc = _post_infer(st, url, model, id, body, deadline_ns, cancelled)
+        is_healthy(st.routes, url) || continue
+        resp, status, exc, refused = _post_infer(st, url, model, id, body, deadline_ns, cancelled)
         exc === nothing && return resp, status, nothing
         status == STATUS_NOT_FOUND && request_refresh!(st.refresher)
         _fails_over(status) || return nothing, status, exc
+        if refused
+            last_status, last_exc = status, exc
+            continue
+        end
         shm === nothing && (shm = peek_uses_shared_memory(body))
         if shm
             msg = "$(exc.message) (the request uses shared memory, so it is not retried on another worker)"
@@ -207,9 +238,11 @@ end
 
 function _dispatch_infer(st::GatewayState, model, id, body, deadline_ns::Int64, cancelled = nothing)
     # Ask the scheduler which replicas to try (urls[1] is its choice; the rest are failover order)
-    # and for an opaque reservation to release once the request completes. `nothing` means the
-    # scheduler has no route for the model: it may have just been loaded on a worker, so refresh the
-    # routing table on demand (single-flight, rate-limited) and re-select before giving up.
+    # and for an opaque reservation to release once the request completes. Every URL it returns is a
+    # worker that is not marked down. `nothing` means the scheduler has no route for the model: it
+    # may have just been loaded on a worker, so refresh the routing table on demand (single-flight,
+    # rate-limited) and re-select before giving up. An empty list means the model is known but no
+    # worker that serves it is ready.
     # How much work this request is, per the scheduler (a no-op for the modes that route by request
     # count). Resolved once here rather than per selection attempt.
     ctx = ScheduleContext(
@@ -227,6 +260,22 @@ function _dispatch_infer(st::GatewayState, model, id, body, deadline_ns::Int64, 
             gRPCServer.GRPCError(gRPCServer.StatusCode.NOT_FOUND, "model \"$model\" not found on any worker")
     end
     urls, reservation = sel
+    # A known model whose workers are all down: answered without calling any of them. UNAVAILABLE,
+    # because the model exists and the client should retry once a worker is back. A known model
+    # skips the refresh above: a discovery scan never changes which workers are down. Logged at info
+    # for the first request of each model's outage (the routing table holds a flag per held model,
+    # fresh for each outage) and at debug for every later one, so an outage under load is one line
+    # per model, not one per request. A model the table does not hold (an lpt_packing placement
+    # discovery never saw) logs at debug.
+    if isempty(urls)
+        release!(st.scheduler, reservation)
+        if first_held_answer!(st.routes, model)
+            @info "infer: no ready worker serves the model; the workers that serve it are not ready (further requests for it during this outage log at debug)" model request_id = id
+        else
+            @debug "infer: no ready worker serves the model; the workers that serve it are not ready" model request_id = id
+        end
+        return nothing, STATUS_UNAVAILABLE, _no_ready_worker(model)
+    end
     # Release the reservation exactly once, on every path (success, retryable error, hard error, or
     # timeout), so a scheduler's outstanding counters never leak.
     try
@@ -295,11 +344,27 @@ function _encode_unregister(region::AbstractString)
     return take!(io)
 end
 
-# Invoke `op` (a function of WorkerClients) on every worker concurrently, holding the per-worker
-# register gate. Returns (first_response, succeeded_urls, failed_urls, errors), where `errors` maps
-# each failed worker's URL to what it threw.
-function _broadcast_shm(st::GatewayState, op, region, rpc_label)
-    workers = all_clients(st.pool)
+# The workers a shared-memory fan-out goes to, and those it skips: only workers the health record
+# considers healthy are asked, as only they can be sent a request. A skipped worker takes no gate
+# slot and no status pre-check, so a dead or hung one cannot hold the call up.
+function _shm_targets(st::GatewayState)
+    healthy = WorkerClients[]
+    skipped = String[]
+    for wc in all_clients(st.pool)
+        is_healthy(st.routes, wc.url) ? push!(healthy, wc) : push!(skipped, wc.url)
+    end
+    return healthy, skipped
+end
+
+# The answer for a shared-memory register or unregister when no worker is healthy.
+_no_healthy_worker(rpc) = gRPCServer.GRPCError(
+    gRPCServer.StatusCode.UNAVAILABLE, "$rpc: no worker is ready; try again once one is"
+)
+
+# Invoke `op` (a function of WorkerClients) concurrently on each of `workers`, holding the
+# per-worker register gate. Returns (first_response, succeeded_urls, failed_urls, errors), where
+# `errors` maps each failed worker's URL to what it threw.
+function _broadcast_shm(st::GatewayState, workers, op, region, rpc_label)
     succeeded = String[]
     failed = String[]
     errors = Dict{String, Any}()
@@ -392,6 +457,19 @@ function _gw_shm_register(body::Vector{UInt8}, st::GatewayState)
     # back. An unanswered pre-check counts as "held" (never roll back what may have existed). A
     # registration created concurrently by another call for the same object can still be rolled
     # back; that client then sees FAILED_PRECONDITION on its next request and re-registers.
+    #
+    # Only the healthy workers are asked, and the register succeeds when every one of them accepts
+    # it. A worker marked down is skipped and noted (`note_missed!`): before it takes requests again
+    # it is told to drop the name, so its first request under it fails with FAILED_PRECONDITION and
+    # the client registers again, which reaches it then (ReactantServerClient does this by itself).
+    workers, skipped = _shm_targets(st)
+    note_missed!(st.gate, skipped, region)
+    if isempty(workers)
+        observe_request!(st.metrics, "SystemSharedMemoryRegister", "", time() - t0)
+        inc_requests!(st.metrics, "SystemSharedMemoryRegister", "", STATUS_UNAVAILABLE)
+        @warn "shm.register: no worker is ready" region skipped_workers = skipped
+        throw(_no_healthy_worker("SystemSharedMemoryRegister"))
+    end
     created = Set{String}()
     created_lock = ReentrantLock()
     register_op = function (wc)
@@ -400,16 +478,22 @@ function _gw_shm_register(body::Vector{UInt8}, st::GatewayState)
         held === false && @lock created_lock push!(created, wc.url)
         return resp
     end
-    resp, succeeded, failed, errors = _broadcast_shm(st, register_op, region, "SystemSharedMemory")
+    resp, succeeded, failed, errors = _broadcast_shm(st, workers, register_op, region, "SystemSharedMemory")
     observe_request!(st.metrics, "SystemSharedMemoryRegister", "", time() - t0)
 
     if isempty(failed)
         inc_requests!(st.metrics, "SystemSharedMemoryRegister", "", STATUS_OK)
-        @info "shm.register: ok" region workers = succeeded
+        isempty(skipped) ? (@info "shm.register: ok" region workers = succeeded) :
+            (@info "shm.register: ok on every ready worker" region workers = succeeded skipped_workers = skipped)
         return resp === nothing ? UInt8[] : resp
     end
 
+    # The rollback goes to healthy workers too; one marked down since it registered is noted
+    # instead, so it drops the name before it takes requests again.
     rollback = filter(in(created), succeeded)
+    gone = filter(u -> !is_healthy(st.routes, u), rollback)
+    note_missed!(st.gate, gone, region)
+    filter!(u -> !(u in gone), rollback)
     if !isempty(succeeded)
         @warn "shm.register: partial failure, rolling back what this call created" region ok_workers = succeeded failed_workers = failed rolled_back = rollback
         isempty(rollback) || _fanout_unregister(st, rollback, _encode_unregister(region))
@@ -450,7 +534,17 @@ function _gw_shm_unregister(body::Vector{UInt8}, st::GatewayState)
         )
     end
 
-    resp, succeeded, failed, _ = _broadcast_shm(st, wc -> invoke_shm_unregister(wc, body), region, "SystemSharedMemory")
+    # Only the healthy workers are asked; a worker marked down is noted and told to drop the name
+    # before it takes requests again (see `_gw_shm_register`).
+    workers, skipped = _shm_targets(st)
+    note_missed!(st.gate, skipped, region)
+    if isempty(workers)
+        observe_request!(st.metrics, "SystemSharedMemoryUnregister", "", time() - t0)
+        inc_requests!(st.metrics, "SystemSharedMemoryUnregister", "", STATUS_UNAVAILABLE)
+        @warn "shm.unregister: no worker is ready" region skipped_workers = skipped
+        throw(_no_healthy_worker("SystemSharedMemoryUnregister"))
+    end
+    resp, succeeded, failed, _ = _broadcast_shm(st, workers, wc -> invoke_shm_unregister(wc, body), region, "SystemSharedMemory")
     observe_request!(st.metrics, "SystemSharedMemoryUnregister", "", time() - t0)
 
     if isempty(succeeded) && !isempty(failed)
@@ -464,9 +558,9 @@ function _gw_shm_unregister(body::Vector{UInt8}, st::GatewayState)
         )
     end
     if !isempty(failed)
-        @warn "shm.unregister: partial failures" region ok_workers = succeeded failed_workers = failed
+        @warn "shm.unregister: partial failures" region ok_workers = succeeded failed_workers = failed skipped_workers = skipped
     else
-        @info "shm.unregister: ok" region workers = succeeded
+        @info "shm.unregister: ok" region workers = succeeded skipped_workers = skipped
     end
     inc_requests!(st.metrics, "SystemSharedMemoryUnregister", "", STATUS_OK)
     return resp === nothing ? UInt8[] : resp
@@ -474,14 +568,16 @@ end
 
 # --- SHM namespace probe ----------------------------------------------------------------------
 
-# Answer the client's IsSameIPCNamespace probe. Any worker may service a later ModelInfer, so
-# system shared memory is only usable if EVERY worker can see the client's region: fan the probe
-# out and AND the results. A worker that errors or does not implement the RPC (UNIMPLEMENTED)
-# counts as "not same", and a pool with no workers is "not same". The probed name carries a
-# random per-client token, so it is never used as a metric label (cardinality).
+# Answer the client's IsSameIPCNamespace probe. Any healthy worker may service a later ModelInfer,
+# so system shared memory is only usable if every one of them can see the client's region: fan the
+# probe out to the healthy workers and AND the results. A worker marked down is not asked, as the
+# register skips it too: a client that starts during one worker's outage still gets shared memory.
+# A worker that errors or does not implement the RPC (UNIMPLEMENTED) counts as "not same", and no
+# healthy worker is "not same". The probed name carries a random per-client token, so it is never
+# used as a metric label (cardinality).
 function _gw_is_same_ipc_namespace(req::IsSameIPCNamespaceRequest, st::GatewayState)
     t0 = time()
-    workers = all_clients(st.pool)
+    workers, _ = _shm_targets(st)
     same = if isempty(workers)
         false
     else

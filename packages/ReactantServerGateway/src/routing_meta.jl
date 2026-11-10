@@ -135,13 +135,45 @@ function item_cost(snap::RoutingMetaSnapshot, model::AbstractString)
     return snap.mean_cost_per_item > 0 ? snap.mean_cost_per_item : 1.0
 end
 
-# Poll every ready worker's ModelControlStatus concurrently and aggregate: per-model cumulative
-# (compute, requests, rows) summed across workers, the per-model weight footprint, effective max
-# batch and batch axis, each worker's weight-memory budget, the workers that answered, the fleet's
-# total cumulative compute, and each worker's own (the compute-trigger signal, counted per worker so a
-# worker missing from one poll cannot skew it). I/O only; no state mutation, so
-# both this cache and lpt_packing's repack can be driven from one call.
+# Poll every ready worker's ModelControlStatus concurrently and aggregate the answers (see
+# `aggregate_poll`). I/O only; no state mutation, so both this cache and lpt_packing's repack can be
+# driven from one call.
 function poll_workers(pool::ClientPool, ready_urls::Vector{String})
+    responses = Dict{String, Any}()
+    lk = ReentrantLock()
+    @sync for url in ready_urls
+        wc = get_clients(pool, url)
+        wc === nothing && continue
+        @async begin
+            # Watchdog-bounded: a wedged client stack would otherwise hang the prober tick (and with
+            # it route discovery and /readyz). A worker that does not answer is simply missing from
+            # this round's answers. A hung call (timed out, not a fast refuse) means a poisoned
+            # connection; drop it so the next poll reconnects fresh.
+            resp, to = _bounded(
+                () -> fetch_control_status(wc), POLL_TIMEOUT_SECONDS, nothing,
+                "ModelControlStatus poll", url
+            )
+            if resp === nothing
+                to && reset_probe_connection!(wc)
+                return
+            end
+            lock(() -> (responses[url] = resp), lk)
+        end
+    end
+    return aggregate_poll(responses)
+end
+
+"""
+    aggregate_poll(responses) -> NamedTuple
+
+Aggregate workers' ModelControlStatus answers (worker url -> answer): per-model cumulative (compute,
+requests, rows) summed across workers, the per-model weight footprint, effective max batch and batch
+axis, each worker's weight-memory budget, the workers that answered (`polled`), the fleet's total
+cumulative compute, and each worker's own (the compute-trigger signal, counted per worker so a worker
+missing from one poll cannot skew it), plus the answers themselves (`responses`, a copy). Pure, so a
+caller can aggregate a set of answers it has kept (lpt_packing keeps each healthy worker's last one).
+"""
+function aggregate_poll(responses::AbstractDict)
     sums = Dict{String, Tuple{Float64, UInt64, UInt64}}()   # model -> (compute, requests, rows)
     permodel_workers = Dict{String, Vector{String}}()
     mem = Dict{String, Float64}()                 # model -> resident weight bytes
@@ -157,46 +189,28 @@ function poll_workers(pool::ClientPool, ready_urls::Vector{String})
     read = Dict{String, Float64}()
     host_copy = Set{Tuple{String, String}}()      # (worker, model)
     host_budget = Dict{String, Float64}()         # worker -> its host weight budget (0 = none)
-    lk = ReentrantLock()
-    @sync for url in ready_urls
-        wc = get_clients(pool, url)
-        wc === nothing && continue
-        @async begin
-            # Watchdog-bounded: a wedged client stack would otherwise hang the prober tick (and with
-            # it route discovery and /readyz). A worker that does not answer is simply skipped this
-            # round, as if not ready. A hung call (timed out, not a fast refuse) means a poisoned
-            # connection; drop it so the next poll reconnects fresh.
-            resp, to = _bounded(
-                () -> fetch_control_status(wc), POLL_TIMEOUT_SECONDS, nothing,
-                "ModelControlStatus poll", url
+    for url in sort!(collect(String, keys(responses)))
+        resp = responses[url]
+        push!(polled, url)
+        worker_compute[url] = sum((ms.total_compute_seconds for ms in resp.models); init = 0.0)
+        mem_cap[url] = Float64(resp.weight_cache_max_bytes)
+        host_budget[url] = Float64(resp.host_weight_budget_bytes)
+        for ms in resp.models
+            tc, rq, rw = get(sums, ms.name, (0.0, UInt64(0), UInt64(0)))
+            sums[ms.name] = (
+                tc + ms.total_compute_seconds, rq + ms.requests_served,
+                rw + ms.rows_served,
             )
-            if resp === nothing
-                to && reset_probe_connection!(wc)
-                return
-            end
-            lock(lk) do
-                push!(polled, url)
-                worker_compute[url] = sum((ms.total_compute_seconds for ms in resp.models); init = 0.0)
-                mem_cap[url] = Float64(resp.weight_cache_max_bytes)
-                host_budget[url] = Float64(resp.host_weight_budget_bytes)
-                for ms in resp.models
-                    tc, rq, rw = get(sums, ms.name, (0.0, UInt64(0), UInt64(0)))
-                    sums[ms.name] = (
-                        tc + ms.total_compute_seconds, rq + ms.requests_served,
-                        rw + ms.rows_served,
-                    )
-                    mem[ms.name] = max(get(mem, ms.name, 0.0), Float64(ms.weight_nbytes))
-                    max_batch[ms.name] = max(get(max_batch, ms.name, 0), Int(ms.max_batch_size))
-                    # Every worker serves the same bundle, so the first non-empty report wins; a
-                    # worker mid-reload can legitimately report nothing yet.
-                    isempty(ms.batch_input_name) || haskey(batch_at, ms.name) ||
-                        (batch_at[ms.name] = (ms.batch_input_name, Int(ms.batch_axis)))
-                    push!(get!(permodel_workers, ms.name, String[]), url)
-                    upload[ms.name] = max(get(upload, ms.name, 0.0), Float64(ms.upload_seconds))
-                    read[ms.name] = max(get(read, ms.name, 0.0), Float64(ms.read_seconds))
-                    ms.host_copy && push!(host_copy, (url, ms.name))
-                end
-            end
+            mem[ms.name] = max(get(mem, ms.name, 0.0), Float64(ms.weight_nbytes))
+            max_batch[ms.name] = max(get(max_batch, ms.name, 0), Int(ms.max_batch_size))
+            # Every worker serves the same bundle, so the first non-empty report wins; a
+            # worker mid-reload can legitimately report nothing yet.
+            isempty(ms.batch_input_name) || haskey(batch_at, ms.name) ||
+                (batch_at[ms.name] = (ms.batch_input_name, Int(ms.batch_axis)))
+            push!(get!(permodel_workers, ms.name, String[]), url)
+            upload[ms.name] = max(get(upload, ms.name, 0.0), Float64(ms.upload_seconds))
+            read[ms.name] = max(get(read, ms.name, 0.0), Float64(ms.read_seconds))
+            ms.host_copy && push!(host_copy, (url, ms.name))
         end
     end
     fleet_compute = 0.0
@@ -205,7 +219,7 @@ function poll_workers(pool::ClientPool, ready_urls::Vector{String})
     end
     return (;
         sums, permodel_workers, mem, mem_cap, max_batch, batch_at, polled, fleet_compute, worker_compute,
-        upload, read, host_copy, host_budget,
+        upload, read, host_copy, host_budget, responses = Dict{String, Any}(responses),
     )
 end
 

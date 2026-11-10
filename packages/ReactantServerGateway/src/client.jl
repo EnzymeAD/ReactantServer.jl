@@ -235,10 +235,14 @@ end
 # `label`, when given, is how a client-visible message names this worker: a failure of the call
 # itself (not a status the worker sent) is then described as "<label>: <what happened>" instead of
 # with gRPCClient's text, which can name the worker's host and port (a redacted gateway, GW-15).
+#
+# `refused`, when given, is set to whether the call failed because the connection to the worker was
+# refused (see `_connection_refused`): the request never left the gateway.
 function invoke_infer(
         wc::WorkerClients, body::Vector{UInt8};
         deadline::Union{Real, Nothing} = nothing, cancelled = nothing,
-        label::Union{AbstractString, Nothing} = nothing
+        label::Union{AbstractString, Nothing} = nothing,
+        refused::Union{Base.RefValue{Bool}, Nothing} = nothing
     )
     rpc = try
         deadline === nothing ? GRPCInferenceService.ModelInfer(wc.chan, body, gRPCClient.gRPCAsync()) :
@@ -257,6 +261,7 @@ function invoke_infer(
         e isa gRPCClient.gRPCServiceCallException || rethrow()
         _note_infer_outcome!(wc, req, e)
         if _transport_failure(req, e)
+            refused === nothing || (refused[] = _connection_refused(req))
             e = gRPCClient.gRPCServiceCallException(gRPCClient.GRPC_UNAVAILABLE, "transport error: $(e.message)")
         end
         (label === nothing || _worker_sent(req)) || (e = _relabel(e, label))
@@ -304,12 +309,42 @@ end
 # any other reason (its deadline, a cancellation, a shut-down handle) keeps the code it was given.
 _transport_failure(req::gRPCClient.gRPCRequest, e::gRPCClient.gRPCServiceCallException) =
     e.grpc_status == gRPCClient.GRPC_INTERNAL && req.ex === nothing && !_worker_sent(req)
+
+"""
+    _connection_refused(req) -> Bool
+
+Whether a failed call ended because the connection to the worker could not be opened, so that no
+byte of the request reached it. gRPCClient 1.2.1 keeps libcurl's result code on the request
+(`req.code`) and reports a transport failure as INTERNAL with libcurl's error text; this reads the
+code: `CURLE_COULDNT_CONNECT` (7), which libcurl returns only when connect() itself failed. A
+connect that runs out of time is `CURLE_OPERATION_TIMEDOUT` (28) or, past the call's deadline,
+DEADLINE_EXCEEDED; a name that does not resolve is `CURLE_COULDNT_RESOLVE_HOST` (6); a connection
+reset or broken off after it was made is a send or receive error (55, 56) or an HTTP/2 error (16,
+92). None of those match.
+
+What this cannot tell apart is why connect() failed. libcurl 8.15 (the production lock) writes
+"Failed to connect to <host> port <port> after <n> ms: Could not connect to server" for a refusal,
+with no errno in the text, and gRPCClient frees the easy handle before the call returns, so
+`CURLINFO_OS_ERRNO` cannot be read. The match therefore also covers the rarer connect() failures
+with no route to the host (EHOSTUNREACH, ENETUNREACH), and a refused connect to a proxy, should the
+environment configure one; in every case the request was not sent. The message text is not used: it
+varies across libcurl versions (older ones end with "Connection refused") and carries nothing this
+code does not.
+"""
+_connection_refused(req::gRPCClient.gRPCRequest) =
+    req.ex === nothing && req.code == gRPCClient.CURLE_COULDNT_CONNECT
 invoke_shm_register(wc::WorkerClients, body::Vector{UInt8}) =
     GRPCInferenceService.SystemSharedMemoryRegister(wc.chan, body, Vector{UInt8})
 invoke_shm_unregister(wc::WorkerClients, body::Vector{UInt8}) =
     GRPCInferenceService.SystemSharedMemoryUnregister(wc.chan, body, Vector{UInt8})
 # Ask the worker which regions named `name` it has registered; returns its
 # SystemSharedMemoryStatusResponse. Used by the register fan-out to learn what existed before it.
+# Unregister `name` on a worker for the prober's catch-up of a returning worker (`catch_up_shm!`).
+# It goes over the probe handle: this round's probe has just reached the worker on it, whereas the
+# inference handle may still hold a connection to the process that went away, whose first call
+# would fail. It is a short call, like the probes.
+invoke_shm_catch_up(wc::WorkerClients, body::Vector{UInt8}) =
+    GRPCInferenceService.SystemSharedMemoryUnregister(wc.probe_chan, body, Vector{UInt8}; deadline = wc.probe_deadline)
 invoke_shm_status(wc::WorkerClients, name::AbstractString) =
     GRPCInferenceService.SystemSharedMemoryStatus(
     wc.chan, SystemSharedMemoryStatusRequest(; name = String(name)); deadline = wc.probe_deadline
@@ -391,11 +426,64 @@ client_status(e::gRPCClient.gRPCServiceCallException) = get(_STATUS_BY_CODE, Int
 
 # --- RegisterGate -----------------------------------------------------------------------------
 
+# The gateway's per-worker shared-memory bookkeeping: which register or unregister is in flight
+# against each worker (requests to it wait for it, `gate_wait`), and which region names each worker
+# missed while it was marked down (`missed`, see `note_missed!`).
 struct RegisterGate
     lock::ReentrantLock
     inflight::Dict{String, Base.Event}
+    missed::Dict{String, Set{String}}
 end
-RegisterGate() = RegisterGate(ReentrantLock(), Dict{String, Base.Event}())
+RegisterGate() = RegisterGate(ReentrantLock(), Dict{String, Base.Event}(), Dict{String, Set{String}}())
+
+# How many distinct names a worker's missed record holds before it collapses to "every region" (""),
+# which keeps it bounded however many regions clients register during one outage.
+const MISSED_NAMES_MAX = 1024
+
+"""
+    note_missed!(gate, urls, name)
+
+Record that the workers at `urls`, marked down, were skipped by a register or unregister of the
+region `name` ("" for every region). A down worker that is still alive keeps whatever it had
+registered under that name, which may be an object the client has since unlinked and replaced, and a
+request under the name would then read and write the old object without an error. So before the
+prober lets such a worker take requests again, it unregisters every name the worker missed
+(`catch_up_shm!`); the worker then knows none of them, and its first request for one fails with
+FAILED_PRECONDITION, on which a client registers again (ReactantServerClient does so by itself).
+"""
+function note_missed!(g::RegisterGate, urls, name::AbstractString)
+    isempty(urls) && return nothing
+    lock(g.lock) do
+        for url in urls
+            s = get!(Set{String}, g.missed, String(url))
+            "" in s && continue                     # already "every region"
+            if isempty(name) || length(s) >= MISSED_NAMES_MAX
+                empty!(s)
+                push!(s, "")
+            else
+                push!(s, String(name))
+            end
+        end
+    end
+    return nothing
+end
+
+# The names the worker at `url` missed, as recorded so far (a copy).
+missed_names(g::RegisterGate, url::AbstractString) =
+    lock(() -> collect(String, get(g.missed, url, Set{String}())), g.lock)
+
+# Forget the names the worker at `url` has been told (those `missed_names` returned, all now
+# unregistered there). A name recorded again meanwhile is forgotten too: the worker was still down,
+# so it holds nothing under it.
+function clear_missed!(g::RegisterGate, url::AbstractString, names)
+    lock(g.lock) do
+        s = get(g.missed, url, nothing)
+        s === nothing && return
+        setdiff!(s, names)
+        isempty(s) && delete!(g.missed, url)
+    end
+    return nothing
+end
 
 # Mark a SHM operation in flight against `url`; returns a function that releases the gate.
 function gate_begin!(g::RegisterGate, url::AbstractString)

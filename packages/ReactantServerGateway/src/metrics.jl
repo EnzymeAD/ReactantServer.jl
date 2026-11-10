@@ -96,7 +96,7 @@ function GatewayMetrics(worker_names::Dict{String, String} = Dict{String, String
     )
     repacks_total = Prometheus.Family{Prometheus.Counter}(
         "gateway_repacks_total",
-        "LPT-packing repacks by what triggered them (startup, compute budget, or operator).",
+        "LPT-packing repacks by what triggered them (startup, compute budget, operator, or a change in the healthy workers: membership).",
         (:trigger,); registry = reg
     )
     worker_metrics_up = Prometheus.Family{Prometheus.Gauge}(

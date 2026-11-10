@@ -381,7 +381,7 @@ end
     @test GW.rebalance_assignment(u, W, prev; payback_seconds = 0.0) == prev
 end
 
-@testset "repack accounting: compute is counted per worker; a missing worker holds the repack" begin
+@testset "repack accounting: compute is counted per worker; a change of polled workers is a membership change" begin
     path = tempname() * ".yaml"
     write(path, "endpoints:\n  - \"127.0.0.1:7001\"\n")
     cfg = try
@@ -401,15 +401,16 @@ end
     @test GW._compute_delta!(s, poll(Dict("w0" => 5.0, "w1" => 65.0))) == 0.0
     @test GW._compute_delta!(s, poll(Dict("w0" => 7.0, "w1" => 65.0))) == 2.0
 
-    @atomic s.assignment = Dict{String, GW.Placement}("a" => [("w0", 1.0)], "b" => [("w1", 1.0)])
-    t0 = 1000.0
-    @test !GW._hold_for_absent_workers!(s, poll(Dict("w0" => 1.0, "w1" => 1.0)), t0)
-    @test GW._hold_for_absent_workers!(s, poll(Dict("w0" => 1.0)), t0 + 10)          # w1 just went missing
-    @test GW._hold_for_absent_workers!(s, poll(Dict("w0" => 1.0)), t0 + 10 + GW._ABSENT_GRACE_SECONDS - 1)
-    @test !GW._hold_for_absent_workers!(s, poll(Dict("w0" => 1.0)), t0 + 10 + GW._ABSENT_GRACE_SECONDS)   # gone: repack
-    @test !GW._hold_for_absent_workers!(s, poll(Dict("w0" => 1.0, "w1" => 1.0)), t0 + 100)   # back: clock reset
-    @test isempty(s.absent_since)
-    @test GW._hold_for_absent_workers!(s, poll(Dict{String, Float64}()), t0 + 200)   # no worker answered
+    # The workers the live assignment was computed for, against the healthy workers this tick's poll
+    # reached. There is no grace period: a worker missing from the poll has left (the poll covers the
+    # healthy workers only, so a worker the prober marked down is missing from it).
+    s.members = ["w0", "w1"]
+    @test GW.membership_change(s, poll(Dict("w0" => 1.0, "w1" => 1.0))) === nothing
+    @test GW.membership_change(s, poll(Dict("w0" => 1.0))) == (; left = ["w1"], joined = String[])
+    @test GW.membership_change(s, poll(Dict("w0" => 1.0, "w1" => 1.0, "w2" => 1.0))) ==
+        (; left = String[], joined = ["w2"])
+    # A poll no worker answered places nothing, so it is no change to repack for.
+    @test GW.membership_change(s, poll(Dict{String, Float64}())) === nothing
 end
 
 @testset "EMA decay: gamma tracks compute elapsed against the halflife" begin
@@ -1201,18 +1202,30 @@ mutable struct AffMockWorker
     staged::Vector{Vector{String}}
     stage_state::String
     stage_delay::Float64
+    ready::Bool                 # what ServerReady reports
+    hang::Bool                  # while set, ServerReady and ModelInfer do not answer (a frozen worker)
+    calls::Int                  # ModelInfer calls that reached the worker, counted on arrival
+    # ModelControlStatus: :ok, :down (UNAVAILABLE), :slow (answers after 6 s, past the poll's 5 s deadline)
+    status::Symbol
 end
 AffMockWorker(name, models; discipline = "fifo", rows_per_request = 1, batch_at = ("IN", 1)) =
     AffMockWorker(
     name, models, discipline, Dict{String, Int}(), Dict{String, Float64}(),
-    Dict{String, Int}(), rows_per_request, batch_at, Vector{String}[], "staged", 0.0
+    Dict{String, Int}(), rows_per_request, batch_at, Vector{String}[], "staged", 0.0, true, false, 0, :ok
+)
+
+# Hold a call while the worker is frozen (at most a minute, so a test that forgets to clear it ends).
+_aff_hold(w) = (
+    t = time() + 60; while w.hang && time() < t
+        sleep(0.05)
+    end
 )
 
 function _aff_server(port::Integer, w::AffMockWorker)
     server = gRPCServer.GRPCServerHTTPJl("127.0.0.1", Int(port); context = w)
     GW.register_GRPCInferenceService!(
         server;
-        ServerReady = (ctx, req) -> AInf.ServerReadyResponse(; ready = true),
+        ServerReady = (ctx, req) -> (_aff_hold(ctx.payload); AInf.ServerReadyResponse(; ready = ctx.payload.ready)),
         RepositoryIndex = (ctx, req) -> AInf.RepositoryIndexResponse(;
             models = [
                 AInf.var"RepositoryIndexResponse.ModelIndex"(; name = m, version = "", state = "READY", reason = "")
@@ -1221,6 +1234,8 @@ function _aff_server(port::Integer, w::AffMockWorker)
         ),
         ModelInfer = (ctx, req) -> begin
             w = ctx.payload
+            w.calls += 1
+            _aff_hold(w)
             w.served[req.model_name] = get(w.served, req.model_name, 0) + 1
             w.rows[req.model_name] = get(w.rows, req.model_name, 0) + w.rows_per_request
             w.compute[req.model_name] = get(w.compute, req.model_name, 0.0) + 0.05
@@ -1231,6 +1246,8 @@ function _aff_server(port::Integer, w::AffMockWorker)
         server;
         ModelControlStatus = (ctx, req) -> begin
             w = ctx.payload
+            w.status === :down && throw(gRPCServer.GRPCError(gRPCServer.StatusCode.UNAVAILABLE, "mock $(w.name) control plane down"))
+            w.status === :slow && sleep(6)
             ACtl.ModelControlStatusResponse(;
                 residency_mode = "self_managed", discipline = w.discipline,
                 models = [

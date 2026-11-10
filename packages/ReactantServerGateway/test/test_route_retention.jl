@@ -3,10 +3,10 @@
 # emptied the table, and clients got NOT_FOUND, which they do not retry; with one worker, every
 # restart did that for its whole duration. Now a worker keeps the routes it last reported until it
 # answers again, or until it has been unreachable or not ready for `route_retention_seconds`; while
-# it is out, its models go to ready replicas when there are any and to it otherwise, so a request
-# for a model whose only workers are down is UNAVAILABLE. Also the round-robin cursor, which every
-# rebuild reset (GW-20). Reuses `MockWorker`, `_start_mock`, `_infer` and `_http_get` from
-# test_gateway.jl.
+# it is out, no request is sent to it: its models go to ready replicas when there are any, and a
+# request for a model whose only workers are down is answered UNAVAILABLE without a worker call.
+# Also the round-robin cursor, which every rebuild reset (GW-20). Reuses `MockWorker`, `_start_mock`,
+# `_infer` and `_http_get` from test_gateway.jl.
 
 const _RGW = ReactantServerGateway
 
@@ -72,7 +72,7 @@ _rescan(gw) = (sleep(1.1); _RGW.refresh_now!(gw.server.context.refresher))
     end
 end
 
-@testset "requests go to ready replicas; a worker that is out keeps what nobody else serves (GW-11)" begin
+@testset "requests go to ready replicas; what only a worker that is out serves is UNAVAILABLE, uncalled (GW-11)" begin
     w0 = MockWorker("worker0", ["shared", "only0"], false, false, false)
     w1 = MockWorker("worker1", ["shared"], false, false, false)
     s0, p0 = _start_mock(w0)
@@ -89,9 +89,12 @@ end
         w0.infer_calls = w1.infer_calls = 0
         @test all(_ -> _infer(port, "shared").model_name == "worker1", 1:4)
         @test w0.infer_calls == 0
-        # ...and the one only it serves still goes to it, rather than becoming NOT_FOUND.
-        @test _RGW.replicas(gw.routes, "only0") == [_rurl(p0)]
-        @test _infer(port, "only0").model_name == "worker0"
+        # ...and the one only it serves is still known, so it is UNAVAILABLE rather than NOT_FOUND,
+        # but answered without sending worker0 anything.
+        @test _RGW.has_model(gw.routes, "only0")
+        @test _RGW.replicas(gw.routes, "only0") == String[]
+        @test _rstatus(() -> _infer(port, "only0")) == gRPCClient.GRPC_UNAVAILABLE
+        @test w0.infer_calls == 0
 
         # Ready again: both replicas share the model.
         w0.ready = true
@@ -117,9 +120,11 @@ end
         t_down = time()
         @test timedwait(() -> _http_get(aport, "/readyz").status == 503, 10) === :ok   # the prober saw it
         sleep(1.0)                                     # and discovery has failed to reach it since
-        # Its routes stay: the request goes to it, fails in the transport, and the client may retry.
+        # Its routes stay, so the model is still known, but no request is sent to a worker that is
+        # down: the gateway answers UNAVAILABLE itself, and the client may retry.
         @test _rstatus(() -> _infer(port, "m")) == gRPCClient.GRPC_UNAVAILABLE
-        @test _RGW.replicas(gw.routes, "m") == [_rurl(p)]
+        @test _RGW.has_model(gw.routes, "m")
+        @test _RGW.replicas(gw.routes, "m") == String[]
 
         # Once it has been out longer than the retention, its routes are dropped.
         @test timedwait(() -> _rstatus(() -> _infer(port, "m")) == gRPCClient.GRPC_NOT_FOUND, 15) === :ok

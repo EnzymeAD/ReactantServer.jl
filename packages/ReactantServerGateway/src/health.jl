@@ -83,6 +83,9 @@ mutable struct HealthProber
     # outage began and how many rounds it has missed.
     ever_ready::Set{String}
     outages::Dict{String, Tuple{Float64, Int}}
+    # The gateway's shared-memory bookkeeping, for the region names a worker missed while it was
+    # down (see `catch_up_shm!`), or nothing (tests that build a prober alone).
+    gate::Union{RegisterGate, Nothing}
 end
 
 function HealthProber(
@@ -90,6 +93,7 @@ function HealthProber(
         routes::Union{DiscoveredRoutes, Nothing} = nothing;
         scheduler::GatewayScheduler = RoundRobinScheduler(),
         meta::RoutingMeta = RoutingMeta(),
+        gate::Union{RegisterGate, Nothing} = nothing,
         interval::Real = _health_interval_seconds(),
         wedge_exit_rounds::Integer =
             parse(
@@ -102,7 +106,7 @@ function HealthProber(
     return HealthProber(
         pool, metrics, admin, routes, scheduler, meta, Float64(interval),
         Threads.Atomic{Bool}(true), nothing, 0, Int(wedge_exit_rounds), false, 0,
-        Set{String}(), Dict{String, Tuple{Float64, Int}}()
+        Set{String}(), Dict{String, Tuple{Float64, Int}}(), gate
     )
 end
 
@@ -137,9 +141,10 @@ function _check_once(p::HealthProber)
     results = Vector{Bool}(undef, length(workers))
     timeouts = Vector{Bool}(undef, length(workers))
     elapsed = Vector{Float64}(undef, length(workers))
+    sent = Vector{Float64}(undef, length(workers))
     @sync for (i, wc) in enumerate(workers)
         @async begin
-            t0 = time()
+            t0 = sent[i] = time()
             results[i], timeouts[i] =
                 _bounded(
                 () -> probe_ready(wc), PROBE_TIMEOUT_SECONDS, false,
@@ -148,6 +153,9 @@ function _check_once(p::HealthProber)
             elapsed[i] = time() - t0
         end
     end
+    # A worker coming back (marked down, now answering ready) first drops the shared-memory regions
+    # it missed while it was down; until that succeeds it stays down (see `catch_up_shm!`).
+    caught_up = catch_up_shm!(p, workers, results)
     any_ready = false
     any_responsive = false
     for (i, wc) in enumerate(workers)
@@ -164,7 +172,9 @@ function _check_once(p::HealthProber)
         # their deadline unanswered has a parked inference connection; reset that one.
         results[i] && reset_if_parked!(wc)
         _track_outage!(p, wc.url, results[i])
-        p.routes === nothing || note_worker_ready!(p.routes, wc.url, results[i])
+        # A ready answer clears only an outage that began before the probe was sent: a request that
+        # found the worker's connection refused while this probe was out keeps it down until the next.
+        p.routes === nothing || note_worker_ready!(p.routes, wc.url, results[i] && caught_up[i]; observed_at = sent[i])
     end
     set_ready!(p.admin, any_ready)
     p.ever_responsive |= any_responsive
@@ -179,10 +189,14 @@ function _check_once(p::HealthProber)
     # round_robin fleet at exactly one probe round-trip per worker as before.
     #
     # Scheduler tick: lpt_packing folds the poll to refresh routing metadata and accumulate consumed
-    # compute, repacking only once the fleet has consumed the configured compute budget (other
-    # schedulers are no-ops). Placement is computed over the workers that reported ready this round;
-    # a dead worker drops out until it recovers.
-    ready_urls = String[wc.url for (i, wc) in enumerate(workers) if results[i]]
+    # compute, repacking once the fleet has consumed the configured compute budget or the set of
+    # healthy workers changed (other schedulers are no-ops). Placement is computed over the healthy
+    # workers, read from the routing table's record of who is down, the one the request path reads,
+    # so the two never disagree; a dead worker drops out until it recovers.
+    ready_urls = String[
+        wc.url for (i, wc) in enumerate(workers)
+            if (p.routes === nothing ? results[i] : is_healthy(p.routes, wc.url))
+    ]
     if !isempty(ready_urls)
         try
             poll = nothing
@@ -196,6 +210,72 @@ function _check_once(p::HealthProber)
         end
     end
     return any_ready
+end
+
+"""
+    catch_up_shm!(prober, workers, ready) -> Vector{Bool}
+
+For each worker that is marked down but answered this round's probe ready, unregister every
+shared-memory region name it missed while it was down (`note_missed!`), all of them at once when it
+missed an unregister of every region. Returns, per worker, whether it may be marked ready: false only
+for a returning worker whose unregisters did not all succeed, which stays down and is tried again
+next round.
+
+Why: register and unregister fan out to the healthy workers only. A worker that was marked down but
+stayed alive (hung for a while, then recovered without a restart) still holds what it had
+registered. If the client meanwhile unregistered a name, unlinked its object and registered the name
+again for a new object, a request under that name on the returning worker would read the old
+object's inputs and write outputs the client never sees, and report success, until the worker's own
+sweep (`shm_reap!`, every 60 s and at its next registration) dropped the stale registration. Dropping
+the missed names before the worker takes requests closes that: it holds none of them, so a request
+under one fails with FAILED_PRECONDITION and the client registers again, which now reaches it. A
+restarted worker holds nothing, and the unregisters are no-ops. ReactantServerClient names each pool
+uniquely and never reuses a name, so for it this only costs a register; it matters to a client that
+reuses region names, as stock Triton clients may.
+"""
+function catch_up_shm!(p::HealthProber, workers, ready::AbstractVector{Bool})
+    ok = fill(true, length(workers))
+    (p.gate === nothing || p.routes === nothing) && return ok
+    @sync for (i, wc) in enumerate(workers)
+        (ready[i] && !is_healthy(p.routes, wc.url)) || continue
+        names = missed_names(p.gate, wc.url)
+        isempty(names) && continue
+        @async begin
+            todo = "" in names ? [""] : sort(names)
+            err = nothing
+            for name in todo
+                err = _catch_up_call(wc, name)
+                err === nothing || break
+            end
+            if err === nothing
+                clear_missed!(p.gate, wc.url, names)
+                @info "health: a returning worker dropped the shared-memory regions it missed while down" worker = wc.url regions = todo
+            else
+                ok[i] = false
+                @warn "health: a returning worker could not drop the shared-memory regions it missed while down; it stays out this round" worker = wc.url regions = todo error = err
+            end
+        end
+    end
+    return ok
+end
+
+# One catch-up unregister, watchdog-bounded like a probe: `nothing` on success, else what went wrong.
+# A call that hangs drops the probe connection, as a hung probe does.
+function _catch_up_call(wc::WorkerClients, name::AbstractString)
+    t = @async try
+        invoke_shm_catch_up(wc, _encode_unregister(name))
+        nothing
+    catch e
+        e
+    end
+    if timedwait(() -> istaskdone(t), PROBE_TIMEOUT_SECONDS) !== :ok
+        reset_probe_connection!(wc)
+        return "no answer within $(PROBE_TIMEOUT_SECONDS) s"
+    end
+    e = fetch(t)
+    e === nothing && return nothing
+    _deadline_exceeded(e) && reset_probe_connection!(wc)
+    return sprint(showerror, e)
 end
 
 # Outage accounting: a worker that was ready and then missed one or more rounds (a probe timeout,
