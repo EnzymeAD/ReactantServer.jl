@@ -190,6 +190,33 @@ function reset_if_parked!(wc::WorkerClients)
     return true
 end
 
+"""
+    reset_returning_connections!(wc)
+
+Reset the worker's data handle (`wc.grpc`: inference, shared memory, the metadata RPCs, StageWeights
+and CompactMemory) when the prober finds the worker back from an outage, before it is marked healthy.
+
+The worker may be a new process at the same address (killed and restarted), and the connections the
+handle pooled for the old one are then dead. libcurl takes an idle HTTP/2 connection for alive when
+its server went away without a GOAWAY, which an exit or a kill never sends, and the first call on it
+fails to send ("Send failure: Broken pipe"). Under lpt_packing that call was the StageWeights of the
+membership repack that gave the returning worker its replicas back: it failed at once, the changes
+were dropped, and on an idle fleet nothing planned them again, so the worker was healthy but placed
+nothing (CPU e2e step 11). The probe handle needs no reset: the probe that found the worker down
+failed on its dead connection, and libcurl dropped it then.
+
+A worker that was only hung keeps its process; it costs one connection setup. A call still in flight
+on the handle, sent before the worker was marked down, is aborted and fails over like a call to an
+unavailable worker. Not counted in `wc.resets`, which counts the resets for parked connections
+(`reset_if_parked!`).
+"""
+function reset_returning_connections!(wc::WorkerClients)
+    @debug "health: a worker back from an outage gets fresh data connections" worker = wc.url
+    _reset_handle!(wc.grpc, wc.url)
+    wc.unanswered[] = 0
+    return nothing
+end
+
 # Record how a ModelInfer call ended, for `reset_if_parked!`: any answer from the worker clears the
 # count of calls in a row that ended at their deadline unanswered, and such a call adds one. A call
 # that expired waiting for a slot on the handle (gRPCClient's "Deadline exceeded while queued ...")
