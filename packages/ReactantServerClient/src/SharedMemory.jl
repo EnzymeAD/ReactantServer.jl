@@ -85,17 +85,20 @@ function register_pool_with_model!(p::InferenceBufferPool, model::KServeModel)
     lock(p.register_lock) do
         key in p.registered_keys && return
 
-        GRPCInferenceService.SystemSharedMemoryRegister(
-            model.chan,
-            SystemSharedMemoryRegisterRequest(
-                name = pool_name(p),
-                key = shmid(p.pool.backing),
-                offset = 0,
-                # The whole object: the data slots and the slot control area after them.
-                byte_size = pool_region_bytes(p.pool),
-            );
-            deadline = SHM_CONTROL_DEADLINE,
-        )
+        _call_unary(SHM_CONTROL_DEADLINE) do b
+            GRPCInferenceService.SystemSharedMemoryRegister(
+                model.chan,
+                SystemSharedMemoryRegisterRequest(
+                    name = pool_name(p),
+                    key = shmid(p.pool.backing),
+                    offset = 0,
+                    # The whole object: the data slots and the slot control area after them.
+                    byte_size = pool_region_bytes(p.pool),
+                ),
+                gRPCClient.gRPCAsync();
+                deadline = b,
+            )
+        end
         push!(p.registered_keys, key)
         # One representative model per endpoint drives the teardown fan-out; re-registration reuses
         # the same key, so guard against pushing a duplicate on the recovery path.
@@ -132,11 +135,12 @@ function unregister_pool!(p::InferenceBufferPool)
     lock(p.register_lock) do
         for m in p.registered_models
             try
-                GRPCInferenceService.SystemSharedMemoryUnregister(
-                    m.chan,
-                    SystemSharedMemoryUnregisterRequest(name = pool_name(p));
-                    deadline = SHM_CONTROL_DEADLINE,
-                )
+                _call_unary(SHM_CONTROL_DEADLINE) do b
+                    GRPCInferenceService.SystemSharedMemoryUnregister(
+                        m.chan, SystemSharedMemoryUnregisterRequest(name = pool_name(p)),
+                        gRPCClient.gRPCAsync(); deadline = b,
+                    )
+                end
             catch ex
                 @info ex
             end
@@ -221,9 +225,11 @@ end
 # model makes; the background re-probe passes a shorter one.
 function query_same_ipc_namespace(model::KServeModel, name::AbstractString; deadline = model.deadline)
     try
-        resp = GRPCInferenceService.IsSameIPCNamespace(
-            model.chan, IsSameIPCNamespaceRequest(name = name); deadline = deadline
-        )
+        resp = _call_unary(deadline) do b
+            GRPCInferenceService.IsSameIPCNamespace(
+                model.chan, IsSameIPCNamespaceRequest(name = name), gRPCClient.gRPCAsync(); deadline = b
+            )
+        end
         return resp.same ? :yes : :no
     catch ex
         if ex isa gRPCClient.gRPCServiceCallException && ex.grpc_status == gRPCClient.GRPC_UNIMPLEMENTED

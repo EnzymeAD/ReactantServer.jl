@@ -190,6 +190,33 @@ function reset_if_parked!(wc::WorkerClients)
     return true
 end
 
+"""
+    reset_returning_connections!(wc)
+
+Reset the worker's data handle (`wc.grpc`: inference, shared memory, the metadata RPCs, StageWeights
+and CompactMemory) when the prober finds the worker back from an outage, before it is marked healthy.
+
+The worker may be a new process at the same address (killed and restarted), and the connections the
+handle pooled for the old one are then dead. libcurl takes an idle HTTP/2 connection for alive when
+its server went away without a GOAWAY, which an exit or a kill never sends, and the first call on it
+fails to send ("Send failure: Broken pipe"). Under lpt_packing that call was the StageWeights of the
+membership repack that gave the returning worker its replicas back: it failed at once, the changes
+were dropped, and on an idle fleet nothing planned them again, so the worker was healthy but placed
+nothing (CPU e2e step 11). The probe handle needs no reset: the probe that found the worker down
+failed on its dead connection, and libcurl dropped it then.
+
+A worker that was only hung keeps its process; it costs one connection setup. A call still in flight
+on the handle, sent before the worker was marked down, is aborted and fails over like a call to an
+unavailable worker. Not counted in `wc.resets`, which counts the resets for parked connections
+(`reset_if_parked!`).
+"""
+function reset_returning_connections!(wc::WorkerClients)
+    @debug "health: a worker back from an outage gets fresh data connections" worker = wc.url
+    _reset_handle!(wc.grpc, wc.url)
+    wc.unanswered[] = 0
+    return nothing
+end
+
 # Record how a ModelInfer call ended, for `reset_if_parked!`: any answer from the worker clears the
 # count of calls in a row that ended at their deadline unanswered, and such a call adds one. A call
 # that expired waiting for a slot on the handle (gRPCClient's "Deadline exceeded while queued ...")
@@ -355,12 +382,65 @@ invoke_compact(wc::WorkerClients, req::CompactMemoryRequest) =
     ControlService.CompactMemory(wc.chan, req; deadline = wc.compact_deadline)
 
 # Ask the worker to read models' weights into host memory ahead of a placement change and hold them
-# for `hold` seconds (StageWeights); returns its StageWeightsResponse. The reads take as long as the
-# disk does, so the caller passes a deadline sized for them rather than the probe deadline.
+# for `hold` seconds (StageWeights); returns the call, whose `fetch` gives its StageWeightsResponse
+# and whose request tells a transport failure apart (see `stage_weights`). The reads take as long as
+# the disk does, so the caller passes a deadline sized for them rather than the probe deadline.
 invoke_stage_weights(wc::WorkerClients, names::Vector{String}, hold::Real, deadline::Real) =
     ControlService.StageWeights(
-    wc.chan, StageWeightsRequest(; names = names, hold_seconds = Float64(hold)); deadline = Float64(deadline)
+    wc.chan, StageWeightsRequest(; names = names, hold_seconds = Float64(hold)), gRPCClient.gRPCAsync();
+    deadline = Float64(deadline)
 )
+
+# How long past its deadline a StageWeights call is waited for before it is given up on: the watchdog
+# `_bounded` applied to it, for a libcurl handle that stopped driving its calls.
+const STAGE_WATCHDOG_MARGIN_SECONDS = 5.0
+
+"""
+    stage_weights(wc, names, hold, timeout) -> (response, nothing) or (nothing, error)
+
+Ask the worker to read `names` into host memory and hold them for `hold` seconds (StageWeights),
+within `timeout` seconds. Returns the worker's StageWeightsResponse, or `nothing` and a description of
+what went wrong, for the caller's log.
+
+A call that fails in the transport (`_transport_failure`: a refused or broken connection) is sent
+once more, with what is left of `timeout`, and no more: a second failure is returned. This covers a
+worker replaced between two probe rounds, which the prober never sees down and so never gives fresh
+connections (`reset_returning_connections!`): the first call goes out on the connection pooled for
+the old process and fails ("Send failure: Broken pipe"). libcurl drops a connection that failed, so
+the second goes out on a fresh one, and the handle is not reset, which would abort the worker's other
+calls in flight.
+"""
+function stage_weights(wc::WorkerClients, names::Vector{String}, hold::Real, timeout::Real)
+    t0 = time()
+    resp, err, transport = _stage_once(wc, names, hold, timeout)
+    (resp === nothing && transport) || return resp, err
+    left = timeout - (time() - t0)
+    left > 0 || return resp, err
+    @info "lpt_packing: staging weights failed in the transport; sending it once more" worker = wc.url models = names error = err
+    resp, err, _ = _stage_once(wc, names, hold, left)
+    return resp, err
+end
+
+# One StageWeights call, given up on `STAGE_WATCHDOG_MARGIN_SECONDS` past its deadline:
+# (response, nothing, false), or (nothing, what went wrong, whether it failed in the transport).
+function _stage_once(wc::WorkerClients, names::Vector{String}, hold::Real, deadline::Real)
+    req = Ref{Any}(nothing)
+    t = @async begin
+        rpc = invoke_stage_weights(wc, names, hold, deadline)
+        req[] = rpc.req
+        fetch(rpc)
+    end
+    limit = deadline + STAGE_WATCHDOG_MARGIN_SECONDS
+    timedwait(() -> istaskdone(t), limit) === :ok ||
+        return nothing, "no answer within $(round(limit; digits = 1)) s", false
+    try
+        return fetch(t), nothing, false
+    catch e
+        e = e isa TaskFailedException ? e.task.exception : e
+        transport = e isa gRPCClient.gRPCServiceCallException && req[] !== nothing && _transport_failure(req[], e)
+        return nothing, sprint(showerror, e), transport
+    end
+end
 
 # Forward an IsSameIPCNamespace probe to the worker; returns its IsSameIPCNamespaceResponse.
 invoke_is_same_ipc_namespace(wc::WorkerClients, req::IsSameIPCNamespaceRequest) =

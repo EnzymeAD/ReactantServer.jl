@@ -76,7 +76,9 @@ end
 
 function _describe(chan::gRPCClient.gRPCChannel, names; deadline)
     req = control.DescribeModelsRequest(; names = collect(String, names))
-    resp = control.ControlService.DescribeModels(chan, req; deadline = deadline)
+    resp = _call_unary(deadline) do b
+        control.ControlService.DescribeModels(chan, req, gRPCClient.gRPCAsync(); deadline = b)
+    end
     return ModelDescription[_model_description(m) for m in resp.models]
 end
 

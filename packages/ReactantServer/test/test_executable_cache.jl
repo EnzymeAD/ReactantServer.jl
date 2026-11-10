@@ -255,7 +255,26 @@ end
     )
     # Simulate autotuning during compile: a huge transient that already set the session peak.
     b.peak = 900_000
-    got = _probe_max_scratch!(sched, ReactantServer.pinned_weight_bytes(sched.registry))
+    logs, got = Test.collect_test_logs() do
+        _probe_max_scratch!(sched, ReactantServer.pinned_weight_bytes(sched.registry))
+    end
+    lines(msg) = filter(l -> string(l.message) == msg, logs)
+    # One line marks the start of the measurement, counting the pinned model too.
+    started = lines("memory probe: measuring each model's execution scratch from the allocator high-water mark")
+    @test length(started) == 1
+    @test started[1].kwargs[:models] == 3
+    @test started[1].kwargs[:resettable] === true
+    # Then one line as each model starts, in probe order, and one with what it measured.
+    each = lines("memory probe: measuring model")
+    measured = lines("memory probe: model measured")
+    @test [l.kwargs[:progress] for l in each] == ["1/3", "2/3", "3/3"]
+    @test sort([l.kwargs[:model] for l in each]) == ["heavy", "light", "pinned"]
+    @test [l.kwargs[:model] for l in measured] == [l.kwargs[:model] for l in each]
+    @test all(l -> l.kwargs[:programs] == 1, each)
+    @test all(l -> l.kwargs[:scratch] == Base.format_bytes(scratch + 8), measured)
+    @test all(l -> l.kwargs[:scratch_from] == "measured run", measured)
+    @test all(l -> l.kwargs[:device_peak] != "unknown", measured)
+    @test all(l -> l.level == Base.CoreLogging.Info, vcat(started, each, measured))
     # Exactly the run transient: scratch plus the output buffer (8 bytes) that is live at the peak.
     @test got == scratch + 8
     # Each model's own S is kept for admission, not only the maximum.
@@ -285,6 +304,12 @@ end
     sched = _stats_scheduler(b, boom)
     ReactantServer.acquire!(sched.weight_cache, boom)
     @test _probe_entry_scratch!(sched, boom, true, 0) == ceil(Int, 1.5 * 40_000)
+    # The probe's line for the model says where its scratch came from.
+    logs, _ = Test.collect_test_logs(() -> _probe_max_scratch!(sched, 0))
+    m = only(filter(l -> string(l.message) == "memory probe: model measured", logs))
+    @test m.kwargs[:scratch] == Base.format_bytes(ceil(Int, 1.5 * 40_000))
+    @test m.kwargs[:scratch_from] == "compiler estimate"
+    @test m.kwargs[:device_peak] == "unknown"
 end
 
 @testset "memory probe: hot-loaded model re-resolves the weight budget without a restart" begin

@@ -948,28 +948,41 @@ function _probe_max_scratch!(s::Scheduler, pinned_bytes::Int)
             (resettable || !is_device_pinned(e.executable))
     ]          # need synthesizable inputs to measure
     sort!(probe; by = e -> e.executable.nbytes)                  # ascending weight
+    # The probe loads and runs every model in turn, which takes a while with many models, so the
+    # worker's log shows it start, each model as it is measured and what that model measured; the
+    # line after the probe ("weight budget resolved") gives the result for the worker.
+    n = length(probe)
+    @info "memory probe: measuring each model's execution scratch from the allocator high-water mark" models = n resettable = resettable
     max_scratch = 0
     max_weight = 0
-    for entry in probe
+    for (i, entry) in enumerate(probe)
         model = entry.executable
+        t0 = time()
+        @info "memory probe: measuring model" model = entry.name progress = "$i/$n" weights = Base.format_bytes(model.nbytes) programs = _program_count(model)
         if !is_device_pinned(model)
             _free_nonpinned!(s.weight_cache)                     # isolate: only pinned + M will be resident
             try
                 probe_acquire!(s.weight_cache, entry)
             catch err
-                err isa NotResidentError && continue             # externally-managed: cannot load to measure
-                rethrow()
+                err isa NotResidentError || rethrow()
+                @info "memory probe: model skipped: it is not resident, and externally-managed residency does not load it to measure" model = entry.name progress = "$i/$n"
+                continue
             end
         end
         max_weight = max(max_weight, model.nbytes)               # == model.nbytes given ascending order
-        scratch = _probe_entry_scratch!(s, entry, resettable, pinned_bytes + max_weight)
-        max_scratch = max(max_scratch, scratch)
+        m = _measure_entry!(s, entry, resettable, pinned_bytes + max_weight)
+        max_scratch = max(max_scratch, m.scratch)
         # Per-model S for admission (exact with a resettable peak, an upper bound otherwise, since
         # the monotone peak can carry an earlier model's transient).
-        model_footprint(s.weight_cache, entry).scratch_bytes = scratch
+        model_footprint(s.weight_cache, entry).scratch_bytes = m.scratch
+        # `device_peak` is the allocator's high-water mark over this model's runs: everything resident
+        # on the device plus the scratch. Without a resettable peak it is the session's so far.
+        @info "memory probe: model measured" model = entry.name progress = "$i/$n" scratch = Base.format_bytes(m.scratch) weights = Base.format_bytes(model.nbytes) device_peak = m.peak === nothing ? "unknown" : Base.format_bytes(m.peak) scratch_from = m.ran ? "measured run" : "compiler estimate" seconds = round(time() - t0; digits = 2)
     end
     return max(0, max_scratch)
 end
+
+_program_count(model) = sum(length, values(model.execs); init = 0)
 
 # Run every compiled (variant, size) of one resident model, seeding its cost estimates, and
 # return its scratch estimate in bytes. Resettable: the peak is reset first and the result is
@@ -978,7 +991,14 @@ end
 # cannot be run (no synthesizable inputs, or the run failed) the compiler's static `temp + outputs`
 # accounting, padded by half (it undershoots the allocator's view by 7 to 50 percent in
 # measurements), stands in so the model still reserves its declared scratch.
-function _probe_entry_scratch!(s::Scheduler, entry::ModelEntry, resettable::Bool, resident_floor::Int)
+_probe_entry_scratch!(s::Scheduler, entry::ModelEntry, resettable::Bool, resident_floor::Int) =
+    _measure_entry!(s, entry, resettable, resident_floor).scratch
+
+# The measurement behind `_probe_entry_scratch!`: `(; scratch, peak, ran)`, where `peak` is the
+# allocator's high-water mark after the runs (`nothing` when no program ran or the backend reports no
+# statistics) and `ran` whether any program ran, that is whether `scratch` was measured rather than
+# taken from the compiler's estimate.
+function _measure_entry!(s::Scheduler, entry::ModelEntry, resettable::Bool, resident_floor::Int)
     model = entry.executable
     baseline = 0
     if resettable
@@ -1002,11 +1022,12 @@ function _probe_entry_scratch!(s::Scheduler, entry::ModelEntry, resettable::Bool
             end
         end
     end
-    ran || return ceil(Int, 1.5 * static)
+    estimate = (; scratch = ceil(Int, 1.5 * static), peak = nothing, ran = false)
+    ran || return estimate
     dm = device_memory_stats(s.backend, s.pool)
-    dm === nothing && return ceil(Int, 1.5 * static)
+    dm === nothing && return estimate
     measured = resettable ? dm.peak_in_use - baseline : dm.peak_in_use - resident_floor
-    return max(0, measured)
+    return (; scratch = max(0, measured), peak = Int(dm.peak_in_use), ran = true)
 end
 
 # Size the on-demand cache from the unified memory model: pinned reserve their footprint, the
@@ -2360,10 +2381,13 @@ end
     load_model!(scheduler, backend, pool, entry; state, on_demand, store, unchanged) -> Union{String, Nothing}
 
 Compile and admit a freshly loaded (uncompiled) bundle `entry`, replacing any existing model of
-the same name. Runs entirely on the dispatch thread inside one control op (a stop-the-world swap):
-any existing model is evicted first so its device memory is freed before the new artifact is
-compiled, then the new entry is compiled (`build_loaded_model`) and admitted. This is the dynamic
-directory watcher's load/reload path. Returns the model name.
+the same name. Runs inside one control op on the dispatch loop (a stop-the-world swap): any
+existing model is evicted first so its device memory is freed before the new artifact is compiled,
+then the new entry is compiled (`build_loaded_model`) and admitted. The compile, and the upload of a
+resident model's weights that comes with it, run on a default-pool task the loop waits for
+([`off_interactive`](@ref)), so the worker keeps handling requests and health checks meanwhile; no
+model dispatches until the op ends. This is the dynamic directory watcher's load/reload path.
+Returns the model name.
 
 `unchanged()` says whether the bundle's files are still the ones `entry` was read from. It is asked
 before the control op, where `false` leaves any existing model serving, and again once the new
@@ -2396,12 +2420,19 @@ function load_model!(
         _run_control(
             s, function (sch)
                 _evict_entry!(sch, entry.name)          # no-op on a fresh load; frees device memory on reload
-                entry.executable = build_loaded_model(
-                    backend, pool, entry;
-                    state = state, on_demand = on_demand, store = store, source = :dynamic,
-                    executable_cache = executable_cache, host_arrays = host_arrays,
-                    defer_floor = defer_floor
-                )
+                # An uncached compile takes 5 to 30 s per program. On the interactive thread, which
+                # also reads requests and answers health checks, it would stop both for that long,
+                # so it runs on a default-pool task like the weight loads and long executions. The
+                # loop still waits for it, so nothing else mutates residency meanwhile. The XLA call
+                # is GC-safe (GcSafeXLA.compile), so a collection need not wait for it either.
+                entry.executable = off_interactive() do
+                    build_loaded_model(
+                        backend, pool, entry;
+                        state = state, on_demand = on_demand, store = store, source = :dynamic,
+                        executable_cache = executable_cache, host_arrays = host_arrays,
+                        defer_floor = defer_floor
+                    )
+                end
                 # Changed during the compile: this version may mix old and new files. Never admit it.
                 unchanged() || (_discard_unadmitted!(sch, entry); return nothing)
                 n = _admit_entry!(sch, entry; staged = staged)

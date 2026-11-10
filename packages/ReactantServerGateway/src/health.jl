@@ -168,9 +168,16 @@ function _check_once(p::HealthProber)
         # until its deadline (see `reset_if_parked!`); drop it so this round's discovery and the next
         # probe reconnect fresh. The probes have a handle of their own, so this touches no inference.
         timeouts[i] && reset_probe_connection!(wc)
-        # A worker that answered ready on the probe handle while its inference calls keep reaching
-        # their deadline unanswered has a parked inference connection; reset that one.
-        results[i] && reset_if_parked!(wc)
+        # A worker back from an outage may be a new process at the same address, whose predecessor's
+        # pooled connections are dead; it gets fresh ones before it is marked healthy, so nothing is
+        # routed or staged over them (see `reset_returning_connections!`). Otherwise, a worker that
+        # answered ready on the probe handle while its inference calls keep reaching their deadline
+        # unanswered has a parked inference connection; reset that one.
+        if results[i] && caught_up[i] && _returning(p, wc.url)
+            reset_returning_connections!(wc)
+        else
+            results[i] && reset_if_parked!(wc)
+        end
         _track_outage!(p, wc.url, results[i])
         # A ready answer clears only an outage that began before the probe was sent: a request that
         # found the worker's connection refused while this probe was out keeps it down until the next.
@@ -277,6 +284,12 @@ function _catch_up_call(wc::WorkerClients, name::AbstractString)
     _deadline_exceeded(e) && reset_probe_connection!(wc)
     return sprint(showerror, e)
 end
+
+# Whether the worker at `url` is coming back from an outage: the routing table has it marked down (by
+# the prober, or by a request that found its connection refused), or the prober has counted rounds it
+# missed. Read before `_track_outage!` clears the count and `note_worker_ready!` the mark.
+_returning(p::HealthProber, url::String) =
+    haskey(p.outages, url) || (p.routes !== nothing && !is_healthy(p.routes, url))
 
 # Outage accounting: a worker that was ready and then missed one or more rounds (a probe timeout,
 # which already logs a warning, or a fast refuse or not-ready answer, which does not) logs one line

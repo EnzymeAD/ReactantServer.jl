@@ -293,6 +293,49 @@ end
     end
 end
 
+# Records the thread pool each "model loaded" line is logged from. `build_loaded_model` logs it on
+# the thread it runs on, so the record says where a hot load compiled.
+struct _PoolLogger <: Base.CoreLogging.AbstractLogger
+    pools::Vector{Symbol}
+    lock::ReentrantLock
+end
+_PoolLogger() = _PoolLogger(Symbol[], ReentrantLock())
+Base.CoreLogging.min_enabled_level(::_PoolLogger) = Base.CoreLogging.Info
+Base.CoreLogging.shouldlog(::_PoolLogger, args...) = true
+Base.CoreLogging.catch_exceptions(::_PoolLogger) = false
+function Base.CoreLogging.handle_message(l::_PoolLogger, level, message, args...; kwargs...)
+    string(message) == "model loaded" && lock(() -> push!(l.pools, Threads.threadpool()), l.lock)
+    return nothing
+end
+
+@testset "load_model!: a hot load compiles off the interactive thread (CPU)" begin
+    if Threads.nthreads(:interactive) == 0
+        @info "skipped: the dispatch loop runs on the interactive thread only when there is one (--threads=auto,1)"
+    else
+        mktempdir() do root
+            env = _cpu_watch_env(root)
+            log = _PoolLogger()
+            # The dispatch loop takes the logger it is started under, and the compile task the loop's.
+            with_logger(log) do
+                ReactantServer.start!(env.sched)
+                try
+                    entry = ReactantServer.load_bundle_entry(_write_scale_bundle(root, "m"))
+                    name = ReactantServer.load_model!(
+                        env.sched, env.backend, env.pool, entry;
+                        state = ReactantServer.UNPINNED, on_demand = false
+                    )
+                    @test name == "m"
+                    @test _y(env.sched, "m") == Float32[2, 4, 6, 8]
+                finally
+                    ReactantServer.shutdown!(env.sched)
+                end
+            end
+            # Compiled on a default-pool thread, not on the interactive thread the loop runs on.
+            @test log.pools == [:default]
+        end
+    end
+end
+
 @testset "bundles changed or added while the worker starts are picked up by its first polls (CPU)" begin
     mktempdir() do root
         stage = mktempdir()
