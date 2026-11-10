@@ -433,18 +433,18 @@ function _infer_with_retry(attempt, m::AbstractInferenceModel; cancelled = _neve
     p = retry_policy(m)
     overall = overall_deadline(m)
     (!p.enabled || overall <= 0) && return attempt(overall)
-    start = time()
+    start = monotonic_time()
     backoff = p.initial_backoff
     while true
         try
-            return attempt(overall - (time() - start))
+            return attempt(overall - (monotonic_time() - start))
         catch e
             (_retryable_shed(e, p) && !cancelled()) || rethrow()
             wait_s = min(backoff, p.max_backoff)
             p.jitter && (wait_s *= rand())
             # Give up if a retry could not run after the sleep, so we never sleep away the budget
             # only to send a request the server would immediately deadline-shed.
-            (time() - start) + wait_s >= overall - p.min_budget && rethrow()
+            (monotonic_time() - start) + wait_s >= overall - p.min_budget && rethrow()
             _backoff_sleep(wait_s, cancelled) && rethrow()
             backoff *= p.factor
         end
@@ -458,10 +458,10 @@ const _CANCEL_POLL_SECONDS = 0.05
 # Sleep `s` seconds of retry backoff in slices of at most _CANCEL_POLL_SECONDS. Returns true, early,
 # once `cancelled()` holds, and false after the full `s`.
 function _backoff_sleep(s, cancelled)
-    until = time() + s
+    until = monotonic_time() + s
     while true
         cancelled() && return true
-        left = until - time()
+        left = until - monotonic_time()
         left <= 0 && return false
         sleep(min(left, _CANCEL_POLL_SECONDS))
     end
