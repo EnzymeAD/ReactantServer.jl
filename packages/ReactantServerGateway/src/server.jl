@@ -162,7 +162,7 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64,
         # never becomes 0 (which would disable curl's timeout entirely).
         deadline_s = max(1, cld(rem, 1_000_000_000))
     end
-    t0 = time()
+    t0 = monotonic_time()
     # In `full` mode a failure names the worker by host:port, prefixed to whatever the call ended
     # with. In `redacted` mode a worker's own status message passes through verbatim (the worker has
     # already redacted it), and a failure of the call itself is described by `invoke_infer` under the
@@ -174,7 +174,7 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64,
             wc, body; deadline = deadline_s, cancelled = cancelled, label = full ? nothing : _shown(st, url),
             refused = refused
         )
-        observe_worker!(st.metrics, "ModelInfer", url, time() - t0)
+        observe_worker!(st.metrics, "ModelInfer", url, monotonic_time() - t0)
         # A worker's reply always carries model_name, so an empty body is a call that ended without
         # a response: gRPCClient before 1.1.2 returned one when a handle reset aborted the call.
         # Fail over rather than hand the client an empty response as a success.
@@ -185,7 +185,7 @@ function _post_infer(st::GatewayState, url, model, id, body, deadline_ns::Int64,
         end
         return resp, STATUS_OK, nothing, false
     catch e
-        observe_worker!(st.metrics, "ModelInfer", url, time() - t0)
+        observe_worker!(st.metrics, "ModelInfer", url, monotonic_time() - t0)
         e isa gRPCClient.gRPCServiceCallException || rethrow()
         status = client_status(e)
         @warn "infer: worker error" model worker = url request_id = id status = status msg = e.message refused = refused[]
@@ -303,7 +303,7 @@ _model_label(st::GatewayState, model::AbstractString) =
 # `cancelled` is the inbound call's cancellation probe (see `_CallCancelled`): a cancelled call stops
 # trying replicas and cancels its in-flight worker call.
 function _gw_infer(body::Vector{UInt8}, st::GatewayState, deadline_ns::Integer = 0, cancelled = nothing)
-    t0 = time()
+    t0 = monotonic_time()
     local model, id
     try
         model, id = peek_model_name_and_id(body)
@@ -329,7 +329,7 @@ function _gw_infer(body::Vector{UInt8}, st::GatewayState, deadline_ns::Integer =
     has_model(st.routes, model) && record_arrival!(st.scheduler, model)
     resp, status, exc = _dispatch_infer(st, model, id, body, Int64(deadline_ns), cancelled)
     label = _model_label(st, model)
-    observe_request!(st.metrics, "ModelInfer", label, time() - t0)
+    observe_request!(st.metrics, "ModelInfer", label, monotonic_time() - t0)
     inc_requests!(st.metrics, "ModelInfer", label, status)
     exc === nothing || throw(exc)
     return resp
@@ -373,16 +373,16 @@ function _broadcast_shm(st::GatewayState, workers, op, region, rpc_label)
     @sync for wc in workers
         @async begin
             release = gate_begin!(st.gate, wc.url)
-            t0 = time()
+            t0 = monotonic_time()
             try
                 resp = op(wc)
-                observe_worker!(st.metrics, rpc_label, wc.url, time() - t0)
+                observe_worker!(st.metrics, rpc_label, wc.url, monotonic_time() - t0)
                 lock(lk) do
                     push!(succeeded, wc.url)
                     first_body[] === nothing && (first_body[] = resp)
                 end
             catch e
-                observe_worker!(st.metrics, rpc_label, wc.url, time() - t0)
+                observe_worker!(st.metrics, rpc_label, wc.url, monotonic_time() - t0)
                 lock(lk) do
                     push!(failed, wc.url)
                     errors[wc.url] = e
@@ -427,7 +427,7 @@ end
 # The shared-memory RPCs are counted with an empty `model` label: they name a region, not a model, and
 # a region's name is chosen by each client process (usually at random), so it must not label a series.
 function _gw_shm_register(body::Vector{UInt8}, st::GatewayState)
-    t0 = time()
+    t0 = monotonic_time()
     region = ""
     try
         region = peek_shm_name(body)
@@ -465,7 +465,7 @@ function _gw_shm_register(body::Vector{UInt8}, st::GatewayState)
     workers, skipped = _shm_targets(st)
     note_missed!(st.gate, skipped, region)
     if isempty(workers)
-        observe_request!(st.metrics, "SystemSharedMemoryRegister", "", time() - t0)
+        observe_request!(st.metrics, "SystemSharedMemoryRegister", "", monotonic_time() - t0)
         inc_requests!(st.metrics, "SystemSharedMemoryRegister", "", STATUS_UNAVAILABLE)
         @warn "shm.register: no worker is ready" region skipped_workers = skipped
         throw(_no_healthy_worker("SystemSharedMemoryRegister"))
@@ -479,7 +479,7 @@ function _gw_shm_register(body::Vector{UInt8}, st::GatewayState)
         return resp
     end
     resp, succeeded, failed, errors = _broadcast_shm(st, workers, register_op, region, "SystemSharedMemory")
-    observe_request!(st.metrics, "SystemSharedMemoryRegister", "", time() - t0)
+    observe_request!(st.metrics, "SystemSharedMemoryRegister", "", monotonic_time() - t0)
 
     if isempty(failed)
         inc_requests!(st.metrics, "SystemSharedMemoryRegister", "", STATUS_OK)
@@ -520,7 +520,7 @@ function _gw_shm_register(body::Vector{UInt8}, st::GatewayState)
 end
 
 function _gw_shm_unregister(body::Vector{UInt8}, st::GatewayState)
-    t0 = time()
+    t0 = monotonic_time()
     region = ""
     try
         region = peek_shm_name(body)
@@ -539,13 +539,13 @@ function _gw_shm_unregister(body::Vector{UInt8}, st::GatewayState)
     workers, skipped = _shm_targets(st)
     note_missed!(st.gate, skipped, region)
     if isempty(workers)
-        observe_request!(st.metrics, "SystemSharedMemoryUnregister", "", time() - t0)
+        observe_request!(st.metrics, "SystemSharedMemoryUnregister", "", monotonic_time() - t0)
         inc_requests!(st.metrics, "SystemSharedMemoryUnregister", "", STATUS_UNAVAILABLE)
         @warn "shm.unregister: no worker is ready" region skipped_workers = skipped
         throw(_no_healthy_worker("SystemSharedMemoryUnregister"))
     end
     resp, succeeded, failed, _ = _broadcast_shm(st, workers, wc -> invoke_shm_unregister(wc, body), region, "SystemSharedMemory")
-    observe_request!(st.metrics, "SystemSharedMemoryUnregister", "", time() - t0)
+    observe_request!(st.metrics, "SystemSharedMemoryUnregister", "", monotonic_time() - t0)
 
     if isempty(succeeded) && !isempty(failed)
         @warn "shm.unregister: every worker failed" region failed_workers = failed
@@ -576,7 +576,7 @@ end
 # healthy worker is "not same". The probed name carries a random per-client token, so it is never
 # used as a metric label (cardinality).
 function _gw_is_same_ipc_namespace(req::IsSameIPCNamespaceRequest, st::GatewayState)
-    t0 = time()
+    t0 = monotonic_time()
     workers, _ = _shm_targets(st)
     same = if isempty(workers)
         false
@@ -594,7 +594,7 @@ function _gw_is_same_ipc_namespace(req::IsSameIPCNamespaceRequest, st::GatewaySt
         end
         all(results)
     end
-    observe_request!(st.metrics, "IsSameIPCNamespace", "", time() - t0)
+    observe_request!(st.metrics, "IsSameIPCNamespace", "", monotonic_time() - t0)
     inc_requests!(st.metrics, "IsSameIPCNamespace", "", STATUS_OK)
     return IsSameIPCNamespaceResponse(; same = same)
 end
@@ -615,16 +615,16 @@ function _compact_workers(pool::ClientPool, metrics::Union{GatewayMetrics, Nothi
         wc = get_clients(pool, url)
         wc === nothing && continue
         @async begin
-            t0 = time()
+            t0 = monotonic_time()
             try
                 resp = invoke_compact(wc, CompactMemoryRequest(; reload_models = collect(String, reload)))
-                metrics === nothing || observe_worker!(metrics, "CompactMemory", url, time() - t0)
+                metrics === nothing || observe_worker!(metrics, "CompactMemory", url, monotonic_time() - t0)
                 lock(lk) do
                     push!(succeeded, url)
                     total[] += Int(resp.reloaded_models)
                 end
             catch e
-                metrics === nothing || observe_worker!(metrics, "CompactMemory", url, time() - t0)
+                metrics === nothing || observe_worker!(metrics, "CompactMemory", url, monotonic_time() - t0)
                 lock(lk) do
                     push!(failed, url)
                 end
@@ -636,11 +636,11 @@ function _compact_workers(pool::ClientPool, metrics::Union{GatewayMetrics, Nothi
 end
 
 function _gw_compact(req::CompactMemoryRequest, st::GatewayState)
-    t0 = time()
+    t0 = monotonic_time()
     reload = collect(String, req.reload_models)
     perworker = Dict(wc.url => reload for wc in all_clients(st.pool))
     total, succeeded, failed = _compact_workers(st.pool, st.metrics, perworker)
-    observe_request!(st.metrics, "CompactMemory", "", time() - t0)
+    observe_request!(st.metrics, "CompactMemory", "", monotonic_time() - t0)
 
     if isempty(succeeded) && !isempty(failed)
         inc_requests!(st.metrics, "CompactMemory", "", STATUS_UNAVAILABLE)
@@ -700,7 +700,7 @@ end
 # Record a metadata RPC's latency and outcome. The model label stays empty: these take arbitrary
 # names from clients, which must not become label values.
 function _record_metadata!(st::GatewayState, rpc, status, t0)
-    observe_request!(st.metrics, rpc, "", time() - t0)
+    observe_request!(st.metrics, rpc, "", monotonic_time() - t0)
     inc_requests!(st.metrics, rpc, "", status)
     return nothing
 end
@@ -721,7 +721,7 @@ function _merge_descriptions!(merged::Dict{String, ModelDescription}, st::Gatewa
 end
 
 function _gw_describe_models(req::DescribeModelsRequest, st::GatewayState)
-    t0 = time()
+    t0 = monotonic_time()
     merged = Dict{String, ModelDescription}()
     workers, answers, answered = _merge_descriptions!(merged, st, String[])
     if isempty(answered)
@@ -749,7 +749,7 @@ end
 # loaded since the last discovery round is not listed yet), then every other worker. NOT_FOUND only
 # when every worker that answered said so.
 function _gw_model_metadata(req::ModelMetadataRequest, st::GatewayState)
-    t0 = time()
+    t0 = monotonic_time()
     routed = something(replicas(st.routes, req.name), String[])
     order = vcat(routed, filter(u -> !(u in routed), st.pool.order))
     errors = Any[]
@@ -776,7 +776,7 @@ end
 # KServe RepositoryIndex: the union of every worker's index, a model READY when any worker has it
 # READY (otherwise the first worker's entry, with its reason).
 function _gw_repository_index(req::RepositoryIndexRequest, st::GatewayState)
-    t0 = time()
+    t0 = monotonic_time()
     workers, answers = _ask_workers(wc -> invoke_repository_index(wc, req), st)
     best = Dict{String, var"RepositoryIndexResponse.ModelIndex"}()
     nanswered = 0

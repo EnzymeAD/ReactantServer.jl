@@ -80,12 +80,12 @@ blocking, so it never starves the prober task it is waiting on.
 function await_repack(s::LptPackingState, seq::Integer, budget::Real)
     (@atomic s.repack_completed) >= seq && return (true, 0.0)
     budget <= 0 && return (false, 0.0)
-    t0 = time()
-    while time() - t0 < budget
+    t0 = monotonic_time()
+    while monotonic_time() - t0 < budget
         sleep(_REPACK_WAIT_POLL_SECONDS)
-        (@atomic s.repack_completed) >= seq && return (true, time() - t0)
+        (@atomic s.repack_completed) >= seq && return (true, monotonic_time() - t0)
     end
-    return ((@atomic s.repack_completed) >= seq, time() - t0)
+    return ((@atomic s.repack_completed) >= seq, monotonic_time() - t0)
 end
 
 # --- wire conversions -------------------------------------------------------------------------

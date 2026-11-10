@@ -22,7 +22,7 @@ mutable struct RouteRefresher
     metrics::GatewayMetrics
     lock::ReentrantLock
     inflight::Union{Task, Nothing}   # the in-progress scan, shared by concurrent callers
-    last_refresh::Float64           # time() of the last completed scan (0.0 = never), for rate limiting
+    last_refresh::Float64           # monotonic_time() of the last completed scan (0.0 = never), for rate limiting
     min_interval::Float64           # floor between forced scans; storm guard
     scans::Int                      # total scans performed (observability / tests)
 end
@@ -45,7 +45,7 @@ function _spawn_scan!(r::RouteRefresher)
             @warn "refresh: route discovery failed" exception = e
         finally
             lock(r.lock) do
-                r.last_refresh = time()
+                r.last_refresh = monotonic_time()
                 r.scans += 1
                 r.inflight = nothing
             end
@@ -67,7 +67,7 @@ function refresh_now!(r::RouteRefresher)
     task = lock(r.lock) do
         if r.inflight !== nothing
             return r.inflight
-        elseif time() - r.last_refresh < r.min_interval
+        elseif monotonic_time() - r.last_refresh < r.min_interval
             return nothing
         else
             return _spawn_scan!(r)
@@ -86,7 +86,7 @@ otherwise does nothing (an in-flight or recent scan already covers it).
 """
 function request_refresh!(r::RouteRefresher)
     lock(r.lock) do
-        (r.inflight === nothing && time() - r.last_refresh >= r.min_interval) && _spawn_scan!(r)
+        (r.inflight === nothing && monotonic_time() - r.last_refresh >= r.min_interval) && _spawn_scan!(r)
     end
     return nothing
 end

@@ -50,8 +50,8 @@ using PrecompileTools: @setup_workload, @compile_workload
     end
 
     function _pc_until(f; timeout = 15.0)
-        t_end = time() + timeout
-        while !f() && time() < t_end
+        t_end = monotonic_time() + timeout
+        while !f() && monotonic_time() < t_end
             sleep(0.05)
         end
         return nothing

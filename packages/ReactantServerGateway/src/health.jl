@@ -144,13 +144,13 @@ function _check_once(p::HealthProber)
     sent = Vector{Float64}(undef, length(workers))
     @sync for (i, wc) in enumerate(workers)
         @async begin
-            t0 = sent[i] = time()
+            t0 = sent[i] = monotonic_time()
             results[i], timeouts[i] =
                 _bounded(
                 () -> probe_ready(wc), PROBE_TIMEOUT_SECONDS, false,
                 "ServerReady probe", wc.url
             )
-            elapsed[i] = time() - t0
+            elapsed[i] = monotonic_time() - t0
         end
     end
     # A worker coming back (marked down, now answering ready) first drops the shared-memory regions
@@ -296,7 +296,7 @@ _returning(p::HealthProber, url::String) =
 # when it reports ready again, so a reader of the log can see that the outage ended and how long it
 # lasted. A worker that has never been ready is still warming up; its first ready is not a recovery.
 # `p` is the prober, or anything with its `ever_ready` and `outages` fields (the tests pass a stand-in).
-function _track_outage!(p, url::String, ready::Bool, now::Float64 = time())
+function _track_outage!(p, url::String, ready::Bool, now::Float64 = monotonic_time())
     if ready
         outage = pop!(p.outages, url, nothing)
         if outage !== nothing
