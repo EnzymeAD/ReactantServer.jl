@@ -225,7 +225,7 @@ function _start!(sup::Supervisor, c::Child)
     c.proc = proc
     c.stdin = inp
     c.drain_acked = false
-    c.started_at = time()
+    c.started_at = monotonic_time()
     r = _Run(proc, out, err, Task[@async(_pump(sup, c, out)), @async(_pump(sup, c, err))])
     c.run = r
     return r
@@ -284,7 +284,7 @@ function _run_once!(sup::Supervisor, c::Child)
     chk === nothing || errormonitor(@async _watch_liveness(sup, c, r.proc, chk))
     wait(r.proc)
     _finish_run!(sup, c, r)
-    uptime = time() - c.started_at
+    uptime = monotonic_time() - c.started_at
     sup.shutting_down[] ||
         _slog(sup, "$(c.spec.name) exited (code=$(r.proc.exitcode), signal=$(r.proc.termsignal), uptime=$(round(uptime; digits = 1))s)")
     return uptime
@@ -292,9 +292,9 @@ end
 
 # Sleep up to `secs` while `going()` holds. Returns whether it still holds.
 function _pause(going, secs::Real)
-    deadline = time() + secs
+    deadline = monotonic_time() + secs
     while going()
-        now = time()
+        now = monotonic_time()
         now >= deadline && return true
         sleep(min(0.2, deadline - now))
     end
@@ -404,7 +404,7 @@ end
 function _await_gpu_reclaim(sup::Supervisor, c::Child, r::GpuReclaim)
     r.timeout > 0 || return nothing
     name, gpu = c.spec.name, r.device
-    t0 = time()
+    t0 = monotonic_time()
     waiting = false
     while !sup.shutting_down[]
         st = _gpu_memory(r, c.pid)
@@ -418,7 +418,7 @@ function _await_gpu_reclaim(sup::Supervisor, c::Child, r::GpuReclaim)
         busy = pct > r.max_used_percent || st.held
         usage = "$(st.used)/$(st.total) MiB used ($(round(Int, pct))%)" *
             (st.held ? ", pid $(c.pid) still holds memory on it" : "")
-        elapsed = time() - t0
+        elapsed = monotonic_time() - t0
         if !busy
             waiting && _slog(sup, "GPU $gpu released $name's memory after $(round(elapsed; digits = 1))s: $usage")
             return nothing
@@ -484,9 +484,9 @@ end
 # Backoff sleep that returns early once shutdown begins, so a crash-looping child never delays
 # node shutdown.
 function _sleep_interruptible(sup::Supervisor, secs::Real)
-    deadline = time() + secs
-    while !sup.shutting_down[] && time() < deadline
-        sleep(min(0.2, max(deadline - time(), 0.01)))
+    deadline = monotonic_time() + secs
+    while !sup.shutting_down[] && monotonic_time() < deadline
+        sleep(min(0.2, max(deadline - monotonic_time(), 0.01)))
     end
     return nothing
 end
@@ -577,7 +577,7 @@ end
 # Ask every live child of one stage to stop, then wait for all of them at once: each child's
 # windows run concurrently, so the stage takes as long as its slowest child, not the sum.
 function _stop_stage!(sup::Supervisor, group::Vector{Child})
-    t0 = time()
+    t0 = monotonic_time()
     stopping = _Stopping[]
     for c in group
         p = c.proc
@@ -595,7 +595,7 @@ function _stop_stage!(sup::Supervisor, group::Vector{Child})
         end
     end
     while !isempty(stopping)
-        now = time()
+        now = monotonic_time()
         for s in stopping
             c, p = s.c, s.p
             if !process_running(p)
