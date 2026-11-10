@@ -380,11 +380,11 @@ function compile_artifact(
         )
         blob = lookup_entry(path)
         if blob !== nothing
-            t0 = time()
+            t0 = monotonic_time()
             try
                 exec = _XS.load_serialized_executable(pool.client, blob; program...)
-                record_exec_cache!(:hit, time() - t0)
-                @info "executable cache: hit" source = cache.source seconds = round(time() - t0; digits = 3) bytes = length(blob) path
+                record_exec_cache!(:hit, monotonic_time() - t0)
+                @info "executable cache: hit" source = cache.source seconds = round(monotonic_time() - t0; digits = 3) bytes = length(blob) path
                 return exec
             catch err
                 record_exec_cache!(:failure, 0.0)
@@ -392,9 +392,9 @@ function compile_artifact(
                 drop_entry(path)
             end
         end
-        t0 = time()
+        t0 = monotonic_time()
         exec = _xla_compile(pool.client, compile_module(); program...)
-        elapsed = time() - t0
+        elapsed = monotonic_time() - t0
         record_exec_cache!(:miss, elapsed)
         try
             bytes = _XS.serialize_executable(exec)

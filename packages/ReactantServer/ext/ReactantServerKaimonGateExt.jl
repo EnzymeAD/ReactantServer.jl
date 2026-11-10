@@ -226,13 +226,13 @@ function _launch!(state::ServerState)
             lock(SERVERS_LOCK) do
                 state.handle = handle
                 state.status = :running
-                state.ready_at = time()
+                state.ready_at = ReactantServer.monotonic_time()
             end
         catch e
             lock(SERVERS_LOCK) do
                 state.status = :failed
                 state.error = sprint(showerror, e, catch_backtrace())
-                state.stopped_at = time()
+                state.stopped_at = ReactantServer.monotonic_time()
                 _trim_registry_locked!()
             end
         end
@@ -243,7 +243,7 @@ end
 # ── Reporting ─────────────────────────────────────────────────────────────────────────
 
 _dur(from::Float64, to::Union{Float64, Nothing}) =
-    string(round(Int, something(to, time()) - from), "s")
+    string(round(Int, something(to, ReactantServer.monotonic_time()) - from), "s")
 
 function _model_summary(state::ServerState)
     state.handle === nothing && return (loaded = 0, ready = 0, metas = 0, names = String[])
@@ -420,7 +420,7 @@ function rserver_start(
         _check_client_commit_locked(cfg)
         s = ServerState(
             _next_id(), :starting, accel, device, only(cfg.model_dirs), cfg, nothing,
-            nothing, time(), nothing, nothing
+            nothing, ReactantServer.monotonic_time(), nothing, nothing
         )
         SERVERS[s.id] = s
         _trim_registry_locked!()
@@ -514,14 +514,14 @@ function rserver_stop(; id::Union{String, Nothing} = nothing)
         lock(SERVERS_LOCK) do
             state.status = :failed
             state.error = sprint(showerror, e, catch_backtrace())
-            state.stopped_at = time()
+            state.stopped_at = ReactantServer.monotonic_time()
         end
         return "stopping server $(state.id) failed: $(sprint(showerror, e))"
     end
     lock(SERVERS_LOCK) do
         state.status = :stopped
         state.handle = nothing
-        state.stopped_at = time()
+        state.stopped_at = ReactantServer.monotonic_time()
         _trim_registry_locked!()
     end
     return "stopped server $(state.id) (port $(state.cfg.endpoints.port)) after \

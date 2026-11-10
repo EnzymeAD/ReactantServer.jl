@@ -121,7 +121,7 @@ end
 
 function _ms_qr(name, w, h; deadline_ns = 0)
     req = InferRequest(name, ["y"], [NamedTensor("img", zeros(Float32, w, h, 1))], Int64(deadline_ns))
-    return QueuedRequest(req, req.inputs, time(), Channel{Any}(1))
+    return QueuedRequest(req, req.inputs, monotonic_time(), Channel{Any}(1))
 end
 
 @testset "cost estimates are kept per (shape variant, batch size)" begin
@@ -138,8 +138,8 @@ end
     @test !haskey(st.cost_estimate, (ReactantServer.VariantKey(), 1))
 
     # The choice to run a program off the interactive thread reads that program's own estimate.
-    st.cost_estimate[(small, 1)] = ReactantServer.CostEstimate(0.001, 2, time(), -Inf)
-    st.cost_estimate[(large, 1)] = ReactantServer.CostEstimate(1.0, 2, time(), -Inf)
+    st.cost_estimate[(small, 1)] = ReactantServer.CostEstimate(0.001, 2, monotonic_time(), -Inf)
+    st.cost_estimate[(large, 1)] = ReactantServer.CostEstimate(1.0, 2, monotonic_time(), -Inf)
     @test !ReactantServer._offload_execution(st, small, 1)
     @test ReactantServer._offload_execution(st, large, 1)
     @test ReactantServer._offload_execution(st, [9, 9], 1)        # never measured: could be long
@@ -194,7 +194,7 @@ end
     _install!(s, e, ModelSchedState("m", ModelSchedConfig(1.0), 0.0))
     st = e.sched
     key = (ReactantServer.VariantKey(), 4)
-    st.cost_estimate[key] = ReactantServer.CostEstimate(0.5, 2, time(), -Inf)
+    st.cost_estimate[key] = ReactantServer.CostEstimate(0.5, 2, monotonic_time(), -Inf)
     function dispatch3()
         qrs = [_qr("m"; deadline_ns = Int64(time_ns()) + 100_000_000) for _ in 1:3]
         append!(st.queue, qrs)
@@ -223,7 +223,7 @@ end
     @test !any(r -> r isa Exception, dispatch3())
 
     # At most one such run per interval, even when it fails and so refreshes nothing.
-    st.cost_estimate[key] = ReactantServer.CostEstimate(0.5, 5, time() - ReactantServer._COST_STALE_SECONDS - 1, -Inf)
+    st.cost_estimate[key] = ReactantServer.CostEstimate(0.5, 5, monotonic_time() - ReactantServer._COST_STALE_SECONDS - 1, -Inf)
     fail[] = true
     r = dispatch3()
     @test r[1] isa ErrorException
@@ -243,7 +243,7 @@ end
     _install!(s, e, ModelSchedState("w", ModelSchedConfig(1.0), 0.0))
     st = e.sched
     key = (ReactantServer.VariantKey(), 4)
-    st.cost_estimate[key] = ReactantServer.CostEstimate(0.5, 5, time() - ReactantServer._COST_STALE_SECONDS - 1, -Inf)
+    st.cost_estimate[key] = ReactantServer.CostEstimate(0.5, 5, monotonic_time() - ReactantServer._COST_STALE_SECONDS - 1, -Inf)
     qrs = [_qr("w"; deadline_ns = Int64(time_ns()) + 100_000_000) for _ in 1:3]
     ReactantServer._withdraw!(qrs[1])
     append!(st.queue, qrs)
@@ -254,7 +254,7 @@ end
     @test st.dispatch_count == 1
 
     # With every request withdrawn nothing runs, and the interval is not spent.
-    st.cost_estimate[key] = ReactantServer.CostEstimate(0.5, 5, time() - ReactantServer._COST_STALE_SECONDS - 1, -Inf)
+    st.cost_estimate[key] = ReactantServer.CostEstimate(0.5, 5, monotonic_time() - ReactantServer._COST_STALE_SECONDS - 1, -Inf)
     qrs = [_qr("w"; deadline_ns = Int64(time_ns()) + 100_000_000) for _ in 1:2]
     foreach(ReactantServer._withdraw!, qrs)
     append!(st.queue, qrs)

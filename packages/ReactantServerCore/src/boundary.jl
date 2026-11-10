@@ -87,7 +87,7 @@ struct QueuedRequest
     req::InferRequest
     prepared::Vector{NamedTensor}   # preprocess(req.inputs), the executable-ready inputs;
     # computed on the caller's task before the request is queued
-    enqueued_at::Float64
+    enqueued_at::Float64     # `monotonic_time()` when it was queued
     reply::Channel{Any}      # buffered; holds the raw sliced outputs or a captured exception
     committed::Bool          # a meta's in-flight continuation sub-call: jumps the queue for the next
     # GPU slot and is exempt from the EDF laxity drop (but not the base
@@ -103,7 +103,7 @@ end
 # reply channel holds two values: the scheduler puts exactly one reply, and a caller that stops
 # waiting puts its own wake-up beside it, so neither side can ever block on the other.
 QueuedRequest(req::InferRequest, prepared::Vector{NamedTensor} = req.inputs; committed::Bool = false) =
-    QueuedRequest(req, prepared, time(), Channel{Any}(2), committed)
+    QueuedRequest(req, prepared, monotonic_time(), Channel{Any}(2), committed)
 # Four-positional form (scheduler unit tests, fixtures) defaults to a non-committed request.
 QueuedRequest(
     req::InferRequest, prepared::Vector{NamedTensor}, enqueued_at::Float64,

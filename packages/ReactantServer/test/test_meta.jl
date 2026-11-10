@@ -384,7 +384,7 @@ end
         )
     end
     sched = _RS.Scheduler(reg, backend, pool, _RS.SchedulerConfig(30.0, 64, 30.0))
-    now = time()
+    now = monotonic_time()
     for e in values(reg.by_name)
         _RS.init_sched_state!(sched, e, now)
     end
@@ -395,12 +395,12 @@ end
     _RS.submit!(sched, qrA)
     _RS.submit!(sched, qrB)
     @test length(sched.committed) == 2          # both retained; no single-slot overwrite
-    d1 = _RS.select_dispatch!(sched, time())
-    d2 = _RS.select_dispatch!(sched, time())
+    d1 = _RS.select_dispatch!(sched, monotonic_time())
+    d2 = _RS.select_dispatch!(sched, monotonic_time())
     @test d1 isa _RS.Dispatch && d2 isa _RS.Dispatch
     @test Set([d1.entry.name, d2.entry.name]) == Set(["subA", "subB"])   # both jumped the line
     @test isempty(sched.committed)
-    @test _RS.select_dispatch!(sched, time()) === nothing                # nothing left to dispatch
+    @test _RS.select_dispatch!(sched, monotonic_time()) === nothing                # nothing left to dispatch
 end
 
 # A started scheduler whose scratch pool has ONE slot, so every meta's `call.scratch` lands on the same

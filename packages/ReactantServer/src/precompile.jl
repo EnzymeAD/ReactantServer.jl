@@ -71,8 +71,8 @@ using PrecompileTools: @setup_workload, @compile_workload
         gRPCServer.start!(server)
         try
             port = something(gRPCServer.bound_port(server), 0)
-            t_end = time() + 10
-            while port == 0 && time() < t_end   # the bound port appears once start! has bound
+            t_end = monotonic_time() + 10
+            while port == 0 && monotonic_time() < t_end   # the bound port appears once start! has bound
                 sleep(0.01)
                 port = something(gRPCServer.bound_port(server), 0)
             end

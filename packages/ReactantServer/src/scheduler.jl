@@ -149,7 +149,7 @@ end
 DispatchProgress(stall_seconds::Real = DISPATCH_STALL_SECONDS) =
     DispatchProgress(Threads.Atomic{Float64}(0.0), Threads.Atomic{Bool}(false), Float64(stall_seconds))
 
-_mark_progress!(p::DispatchProgress) = (p.since[] = time(); p.reported[] = false; nothing)
+_mark_progress!(p::DispatchProgress) = (p.since[] = monotonic_time(); p.reported[] = false; nothing)
 _mark_idle!(p::DispatchProgress) = (p.since[] = 0.0; p.reported[] = false; nothing)
 
 """
@@ -288,7 +288,7 @@ function _measure_program!(s::Scheduler, entry::ModelEntry, variant::VariantKey,
     runs = (st !== nothing && !haskey(st.cost_estimate, (variant, sz))) ? 2 : 1
     for _ in 1:runs
         _, dt = _timed_run(s, entry.executable, inputs; offload = true)
-        st === nothing || _update_cost!(st, variant, sz, dt, s.cfg.cost_ema_alpha, time())
+        st === nothing || _update_cost!(st, variant, sz, dt, s.cfg.cost_ema_alpha, monotonic_time())
     end
     return nothing
 end
@@ -698,9 +698,9 @@ _offload_execution(st::ModelSchedState, variant::VariantKey, B::Integer) =
 # Run one execution, timed where it runs, so the measured compute excludes any task hand-off.
 function _timed_run(s::Scheduler, model::LoadedModel, inputs; offload::Bool)
     run = function ()
-        t0 = time()
+        t0 = monotonic_time()
         out = run_model(s.backend, s.pool, model, inputs)
-        return (out, time() - t0)
+        return (out, monotonic_time() - t0)
     end
     return offload ? off_interactive(run) : run()
 end
@@ -786,8 +786,8 @@ function _execute_dispatch!(s::Scheduler, d::Dispatch)
         c = st.cost_estimate[(variant, B)]       # exists: only a measured estimate has a margin
         if request_cancelled(remeasure.req)
             put!(remeasure.reply, RequestCancelled(remeasure.req.model_name, "its client gave up the shared-memory slot"))
-        elseif isempty(live) && time() - max(c.refreshed, c.remeasured) >= _COST_STALE_SECONDS
-            c.remeasured = time()
+        elseif isempty(live) && monotonic_time() - max(c.refreshed, c.remeasured) >= _COST_STALE_SECONDS
+            c.remeasured = monotonic_time()
             push!(live, remeasure)
             @debug "EDF: running a request its stale cost estimate would shed, to measure the program again" model = entry.name variant = variant size = B estimate = est
         else
@@ -815,9 +815,9 @@ function _execute_dispatch!(s::Scheduler, d::Dispatch)
         # LRU under budget pressure). Load time is excluded from compute_time, which feeds the
         # cost estimate, so the estimate reflects steady-state (resident) execution. The load
         # still held the dispatch loop, so the fair discipline charges it to the model.
-        t_load = time()
+        t_load = monotonic_time()
         _acquire_for_dispatch!(s, entry)
-        load_time = time() - t_load
+        load_time = monotonic_time() - t_load
         out, compute_time = _timed_run(
             s, entry.executable, merged; offload = _offload_execution(st, variant, B)
         )
@@ -835,7 +835,7 @@ function _execute_dispatch!(s::Scheduler, d::Dispatch)
         end
 
         lock(s.cond) do
-            now = time()
+            now = monotonic_time()
             _decay_ema!(st, s.cfg.ema_halflife_seconds, now)
             st.recent_compute_ema += compute_time
             _charge_fair!(st, max(compute_time, 0.0) + max(load_time, 0.0))
@@ -891,7 +891,7 @@ function _run_meta_request(
         compute = call_ns[] / 1.0e9     # sub-call (model) time only; the Julia glue between stages is excluded
         st = meta.sched
         lock(s.cond) do
-            now = time()
+            now = monotonic_time()
             _decay_ema!(st, s.cfg.ema_halflife_seconds, now)
             st.recent_compute_ema += compute
             _update_cost!(st, VariantKey(), 0, compute, s.cfg.cost_ema_alpha, now)
@@ -957,7 +957,7 @@ function _probe_max_scratch!(s::Scheduler, pinned_bytes::Int)
     max_weight = 0
     for (i, entry) in enumerate(probe)
         model = entry.executable
-        t0 = time()
+        t0 = monotonic_time()
         @info "memory probe: measuring model" model = entry.name progress = "$i/$n" weights = Base.format_bytes(model.nbytes) programs = _program_count(model)
         if !is_device_pinned(model)
             _free_nonpinned!(s.weight_cache)                     # isolate: only pinned + M will be resident
@@ -977,7 +977,7 @@ function _probe_max_scratch!(s::Scheduler, pinned_bytes::Int)
         model_footprint(s.weight_cache, entry).scratch_bytes = m.scratch
         # `device_peak` is the allocator's high-water mark over this model's runs: everything resident
         # on the device plus the scratch. Without a resettable peak it is the session's so far.
-        @info "memory probe: model measured" model = entry.name progress = "$i/$n" scratch = Base.format_bytes(m.scratch) weights = Base.format_bytes(model.nbytes) device_peak = m.peak === nothing ? "unknown" : Base.format_bytes(m.peak) scratch_from = m.ran ? "measured run" : "compiler estimate" seconds = round(time() - t0; digits = 2)
+        @info "memory probe: model measured" model = entry.name progress = "$i/$n" scratch = Base.format_bytes(m.scratch) weights = Base.format_bytes(model.nbytes) device_peak = m.peak === nothing ? "unknown" : Base.format_bytes(m.peak) scratch_from = m.ran ? "measured run" : "compiler estimate" seconds = round(monotonic_time() - t0; digits = 2)
     end
     return max(0, max_scratch)
 end
@@ -1072,7 +1072,7 @@ function start!(
         s::Scheduler; autosize_arena::Integer = 0, autosize_fraction::Real = 0.0,
         autosize_wiggle::Real = 0.0
     )
-    now = time()
+    now = monotonic_time()
     for entry in values(s.registry.by_name)
         init_sched_state!(s, entry, now)
     end
@@ -1200,7 +1200,7 @@ function dispatch_alive(s::Scheduler)
 end
 
 """
-    dispatch_stalled(scheduler; now=time()) -> Bool
+    dispatch_stalled(scheduler; now=monotonic_time()) -> Bool
 
 Whether the dispatch loop holds work (a dispatch, a control command, or more requests queued
 behind the one it finished) and has made no progress for longer than its stall limit
@@ -1208,7 +1208,7 @@ behind the one it finished) and has made no progress for longer than its stall l
 the threads that answer health checks are still free. An idle loop is never stalled, however long
 it waits. Lock-free, so a loop stuck while holding the scheduler lock cannot block it.
 """
-function dispatch_stalled(s::Scheduler; now::Real = time())
+function dispatch_stalled(s::Scheduler; now::Real = monotonic_time())
     p = s.progress
     p.stall_seconds > 0 || return false
     t = p.since[]
@@ -1372,7 +1372,7 @@ function _kick_staging!(s::Scheduler)
         end
     end
     sort!(cands; by = e -> e.sched.queue[1].enqueued_at)
-    now = time()
+    now = monotonic_time()
     for e in cands
         # Weights read ahead of a placement change (`stage_weights!`) need no second read.
         pf = get(s.prefetched, e.name, nothing)
@@ -1407,7 +1407,7 @@ end
 # `prefetch` is the StageWeights hold it fills. Caller holds `s.cond`, which `body` takes to record the
 # result, so `r.task` is set first.
 function _start_read!(body, s::Scheduler, e::ModelEntry; kind::Symbol, prefetch = nothing)
-    r = WeightRead(e, kind, prefetch, ReadProgress(), nothing, nothing, time(), false, false, false, nothing, Base.Event())
+    r = WeightRead(e, kind, prefetch, ReadProgress(), nothing, nothing, monotonic_time(), false, false, false, nothing, Base.Event())
     push!(s.reads, r)
     limit = s.cfg.weight_read_stall_seconds
     if limit > 0
@@ -1468,7 +1468,7 @@ function _abandon_read!(s::Scheduler, r::WeightRead, idle::Float64)
         # The hold goes now: left with nothing in it, it would keep the model `:pending`.
         pf = r.prefetch
         get(s.prefetched, e.name, nothing) === pf && delete!(s.prefetched, e.name)
-        r.outcome = (state = "failed", read = false, seconds = time() - r.started, error = msg)
+        r.outcome = (state = "failed", read = false, seconds = monotonic_time() - r.started, error = msg)
         notify(r.done)
     else
         r.outcome = WeightsReadStalledError(e.name, msg)
@@ -1502,7 +1502,7 @@ function _after_read!(r::WeightRead, release, close_file::Bool, stalled::Bool, f
     finally
         close_file && close_weights!(r.entry.weights)
     end
-    stalled && @info "a stalled weights read returned; what it read was released, unused" model = r.entry.name seconds_since_start = round(time() - r.started; digits = 1) bytes_read = (@atomic r.progress.bytes) outcome = (failure === nothing ? "read" : sprint(showerror, failure[1]))
+    stalled && @info "a stalled weights read returned; what it read was released, unused" model = r.entry.name seconds_since_start = round(monotonic_time() - r.started; digits = 1) bytes_read = (@atomic r.progress.bytes) outcome = (failure === nothing ? "read" : sprint(showerror, failure[1]))
     return nothing
 end
 
@@ -1581,7 +1581,7 @@ function _prefetch_cap(wc::WeightCache)
 end
 
 # Release holds that expired. Takes `s.cond` briefly; the releases run outside it.
-function _sweep_prefetched!(s::Scheduler; now::Float64 = time())
+function _sweep_prefetched!(s::Scheduler; now::Float64 = monotonic_time())
     wc = s.weight_cache
     expired = lock(s.cond) do
         out = Tuple{String, Any}[]
@@ -1681,7 +1681,7 @@ function _stage_entries!(s::Scheduler, wc, entries::Vector{ModelEntry}, hold::Fl
                 return ("failed", "model '$(e.name)' was unloaded or replaced before its weights were read; ask again")
             pf = get(s.prefetched, e.name, nothing)
             if pf !== nothing
-                pf.expires = max(pf.expires, time() + hold)      # an earlier request's read covers it
+                pf.expires = max(pf.expires, monotonic_time() + hold)      # an earlier request's read covers it
                 return ("staged", "")
             end
             e.sched !== nothing && e.sched.host_stage in (:staging, :staged) && return ("staged", "")
@@ -1728,7 +1728,7 @@ function _run_prefetch!(s::Scheduler, r::WeightRead, hold::Float64)
             mine = get(s.prefetched, e.name, nothing) === pf
             if staged !== nothing && mine && get(s.registry.by_name, e.name, nothing) === e
                 pf.staged = staged
-                pf.expires = time() + hold
+                pf.expires = monotonic_time() + hold
                 keep = true
             else
                 # Not kept, so the hold goes too, whatever became of the model: left behind with
@@ -1736,7 +1736,7 @@ function _run_prefetch!(s::Scheduler, r::WeightRead, hold::Float64)
                 mine && delete!(s.prefetched, e.name)
             end
             r.outcome = if staged === nothing
-                (state = "failed", read = false, seconds = time() - r.started, error = sprint(showerror, failure[1]))
+                (state = "failed", read = false, seconds = monotonic_time() - r.started, error = sprint(showerror, failure[1]))
             elseif keep
                 (state = "staged", read = !staged.hit, seconds = staged.host_seconds, error = "")
             else
@@ -1905,7 +1905,7 @@ function _dispatch_loop(s::Scheduler)
                 s.control = ControlCommand[]
                 return (cs, nothing)
             end
-            return (ControlCommand[], select_dispatch!(s, time()))
+            return (ControlCommand[], select_dispatch!(s, monotonic_time()))
         end
         # Control commands run on this (the dispatch) thread, the sole mutator of residency. The
         # slow host/device work inside `op` runs outside `s.cond`.
@@ -2260,7 +2260,7 @@ function _admit_entry!(sch::Scheduler, entry::ModelEntry; staged = nothing)
         haskey(sch.registry.by_name, entry.name) &&
             throw(ErrorException("model '$(entry.name)' is already registered"))
         sch.registry.by_name[entry.name] = entry
-        init_sched_state!(sch, entry, time())
+        init_sched_state!(sch, entry, monotonic_time())
     end
     staged === nothing || acquire!(sch.weight_cache, entry; staged = staged)
     # Warmup runs the model on this (the dispatch) thread, outside the lock.
@@ -2530,7 +2530,7 @@ scheduler lock rather than through the control queue. Returns the model name.
 """
 function put_meta!(s::Scheduler, entry::MetaEntry)
     lock(s.cond) do
-        init_sched_state!(s, entry, time())   # give it a queue + sched so the dispatch loop can run it
+        init_sched_state!(s, entry, monotonic_time())   # give it a queue + sched so the dispatch loop can run it
         s.registry.meta[entry.name] = entry
     end
     return entry.name
@@ -2600,12 +2600,12 @@ function _await_replies(s::Scheduler, qrs::Vector{QueuedRequest}, cancelled)
     timed = timeout > 0 && isfinite(timeout)
     (timed || cancelled !== nothing) || return Any[take!(qr.reply) for qr in qrs]
     model = qrs[1].req.model_name
-    t0 = time()
+    t0 = monotonic_time()
     poll = timed ? min(_WAIT_POLL_SECONDS, timeout) : _WAIT_POLL_SECONDS
     # A Timer runs its callback on one task, one firing at a time, and this one closes itself when it
     # fires, so each channel gets at most one wake-up.
     timer = Timer(poll; interval = poll) do t
-        err = if timed && time() - t0 >= timeout
+        err = if timed && monotonic_time() - t0 >= timeout
             DispatchTimeoutError(model, timeout)
         elseif _is_cancelled(cancelled)
             RequestCancelledError(model)
@@ -2815,7 +2815,7 @@ EMA, queue-wait P50/P99, the histogram of dispatch batch sizes, and residency.
 """
 function scheduler_metrics(s::Scheduler)
     return lock(s.cond) do
-        now = time()
+        now = monotonic_time()
         return Dict(
             entry.name => (
                 dispatch_count = entry.sched.dispatch_count,

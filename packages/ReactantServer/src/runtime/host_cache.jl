@@ -71,12 +71,12 @@ function _load_via_host_cache(
     # one worker and unpinned on another shares one region.
     digest = weights_digest(entry.name, specs; content = weights_file_token(entry.weights_id))
     fill! = function (arrays)
-        t = time()
+        t = monotonic_time()
         for (i, n) in enumerate(names)
             read_weight!(arrays[i], st, n)
         end
         _check_unmodified(entry)
-        _timed_read!(timing, time() - t)
+        _timed_read!(timing, monotonic_time() - t)
         return
     end
     r = try
@@ -114,10 +114,10 @@ function _load_via_host_cache(
         return bufs
     end
     _note_disk_load!(cache, entry)
-    t = time()
+    t = monotonic_time()
     arrays = materialize_host_weights(entry.weights, model.sig.weight_names)
     _check_unmodified(entry)
-    _timed_read!(timing, time() - t)
+    _timed_read!(timing, monotonic_time() - t)
     bufs = _timed_transfer(cache, arrays, timing)
     lock(() -> cache.host_misses += 1, cache.lock)
     _cache_host!(cache, entry, arrays)
@@ -321,18 +321,18 @@ function stage_host_weights(
         cache::WeightCache, entry::ModelEntry,
         names::Vector{String} = (entry.executable::LoadedModel).sig.weight_names
     )
-    t0 = time()
+    t0 = monotonic_time()
     lock(() -> cache.stages += 1, cache.lock)
     staged = try
         _stage_host_weights(cache, entry, names)
     catch
         lock(cache.lock) do
             cache.stage_failures += 1
-            cache.stage_seconds += time() - t0
+            cache.stage_seconds += monotonic_time() - t0
         end
         rethrow()
     end
-    staged.host_seconds = time() - t0
+    staged.host_seconds = monotonic_time() - t0
     lock(() -> cache.stage_seconds += staged.host_seconds, cache.lock)
     return staged
 end

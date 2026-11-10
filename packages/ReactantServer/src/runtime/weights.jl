@@ -26,13 +26,13 @@ function load_pinned_weights(backend::AbstractBackend, pool::MemoryPool, st, nam
     try
         for (i, name) in enumerate(names)
             haskey(st, name) || throw(ErrorException("weight '$name' missing from safetensors"))
-            t = time()
+            t = monotonic_time()
             host = read_weight(st, name)             # a contiguous Array of the tensor's Julia shape
-            t1 = time()
+            t1 = monotonic_time()
             bufs[i] = to_device(backend, pool.client, host, pool.device)
             # Read and upload alternate tensor by tensor, so each half is timed per tensor.
             _timed_read!(timing, t1 - t)
-            _timed_upload!(timing, time() - t1)
+            _timed_upload!(timing, monotonic_time() - t1)
         end
     catch
         _free_partial!(backend, bufs)

@@ -107,8 +107,8 @@ const CostKey = Tuple{VariantKey, Int}
 # `runs` counts the executions measured. The first is the program's cold run in this process and is
 # not trusted: until a second run, `seconds` holds that cold time and the estimate counts as
 # unmeasured. `refreshed` is when a measurement last moved the estimate, and `remeasured` when the
-# EDF laxity check last ran a request it would have shed, to measure the program again (`time()`
-# values; -Inf for never).
+# EDF laxity check last ran a request it would have shed, to measure the program again
+# (`monotonic_time()` values; -Inf for never).
 mutable struct CostEstimate
     seconds::Float64
     runs::Int
