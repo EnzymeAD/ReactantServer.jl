@@ -1489,6 +1489,112 @@
         "type": "prometheus",
         "uid": "${ds}"
       },
+      "description": "The longest single time each responsiveness monitor's thread was held in each step of the graph: the worst block, not an average. About a millisecond when free; the monitors log a stall past 1 s. Timed with a monotonic clock, so a step of the system clock does not show here. Gateway: its single event loop. Workers: the interactive thread request handling shares with the dispatch loop.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.25
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 55
+      },
+      "id": 21,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "expr": "max(max_over_time(gateway_event_loop_lag_max_seconds{job=~'$job',worker=''}[$__rate_interval]))",
+          "format": "time_series",
+          "instant": false,
+          "legendFormat": "gateway",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "expr": "max by (worker) (max_over_time(worker_interactive_lag_max_seconds{worker=~'$worker'}[$__rate_interval]))",
+          "format": "time_series",
+          "instant": false,
+          "legendFormat": "{{worker}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Longest delay between ticks",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
       "description": "How often each responsiveness monitor woke. A free thread ticks 10 times a second; fewer means it was held by other work (a blocking call, code compiling on first use) and every request, probe and scrape on it waited. Gateway: its single event loop. Workers: the interactive thread request handling shares with the dispatch loop.",
       "fieldConfig": {
         "defaults": {
@@ -1534,11 +1640,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 0,
+        "w": 6,
+        "x": 6,
         "y": 55
       },
-      "id": 21,
+      "id": 22,
       "options": {
         "legend": {
           "calcs": [
@@ -1631,11 +1737,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 8,
+        "w": 6,
+        "x": 12,
         "y": 55
       },
-      "id": 22,
+      "id": 23,
       "options": {
         "legend": {
           "calcs": [
@@ -1727,11 +1833,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 16,
+        "w": 6,
+        "x": 18,
         "y": 55
       },
-      "id": 23,
+      "id": 24,
       "options": {
         "legend": {
           "calcs": [
@@ -1787,7 +1893,7 @@
         "x": 0,
         "y": 63
       },
-      "id": 24,
+      "id": 25,
       "panels": [],
       "title": "Monitoring",
       "type": "row"
@@ -1846,7 +1952,7 @@
         "x": 0,
         "y": 64
       },
-      "id": 25,
+      "id": 26,
       "options": {
         "alignValue": "left",
         "legend": {
@@ -1933,7 +2039,7 @@
         "x": 8,
         "y": 64
       },
-      "id": 26,
+      "id": 27,
       "options": {
         "alignValue": "left",
         "legend": {
@@ -2015,7 +2121,7 @@
         "x": 16,
         "y": 64
       },
-      "id": 27,
+      "id": 28,
       "options": {
         "legend": {
           "calcs": [],
