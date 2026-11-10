@@ -9,7 +9,9 @@
 # node runs with `full`), and, on that node, a client that registers shared memory while a worker is
 # out (stopped and resumed, then killed and restarted), shared-memory outputs under client give-ups
 # and a worker restart under one client: the worker is stopped (SIGSTOP), so the supervisor's liveness
-# check has to find it and kill it. Needs no GPU.
+# check has to find it and kill it; and, on a third node whose gateway runs lpt_packing, that the node
+# recovers when every worker goes out at once (stopped and resumed together, stopped and resumed one
+# at a time, killed and restarted). Needs no GPU.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
@@ -20,11 +22,17 @@ WORK="$(mktemp -d)"
 SUP_PID=""
 SHM_CLIENT_PID=""
 OUTAGE_CLIENT_PID=""
+ALL_OUT_CLIENT_PID=""
+STOPPED_PIDS="" # workers step 11 holds stopped (SIGSTOP) right now
 cleanup() {
-    for pid in "$SHM_CLIENT_PID" "$OUTAGE_CLIENT_PID"; do
+    for pid in "$SHM_CLIENT_PID" "$OUTAGE_CLIENT_PID" "$ALL_OUT_CLIENT_PID"; do
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             kill -TERM "$pid" 2>/dev/null || true
         fi
+    done
+    # A stopped worker cannot drain; resume it first, so the supervisor's drain below finishes.
+    for pid in $STOPPED_PIDS; do
+        kill -CONT "$pid" 2>/dev/null || true
     done
     # TERM, not KILL: the supervisor drains its children and waits for them; SIGKILL would orphan
     # every worker and the gateway.
@@ -51,7 +59,7 @@ GW_METRICS_PORT="$(free_port)"
 # below (a different preferences hash forces a full Reactant recompile, CPU-only and slow).
 READY_TIMEOUT="${E2E_CPU_READY_TIMEOUT:-1800}"
 
-echo "== [1/10] generating scale4 bundle =="
+echo "== [1/11] generating scale4 bundle =="
 julia --project=packages/ReactantServer "$E2E_DIR/gen_scale4.jl"
 
 mkdir -p "$WORK/models"
@@ -75,7 +83,7 @@ register_model("slow4"; preprocess = function (inputs)
 end)
 EOF
 
-echo "== [2/10] writing node file, gateway config and Reactant preference override =="
+echo "== [2/11] writing node file, gateway config and Reactant preference override =="
 # No workers list: the supervisor synthesizes them (REACTANT_CPU_WORKERS below).
 cat > "$WORK/node.yaml" << EOF
 model_repo: $WORK/models
@@ -129,7 +137,7 @@ EOF
 }
 write_gateway_config "$WORK/gateway.yml" redacted
 
-echo "== [3/10] starting supervisor (2 CPU workers + embedded gateway) =="
+echo "== [3/11] starting supervisor (2 CPU workers + embedded gateway) =="
 REACTANT_GPUS=0 \
 REACTANT_CPU_WORKERS=2 \
 REACTANT_WORKSPACE_ROOT="$REPO_ROOT" \
@@ -159,7 +167,7 @@ until curl -fsS "http://127.0.0.1:${GW_METRICS_PORT}/readyz" >/dev/null 2>&1; do
 done
 echo "   gateway ready."
 
-echo "== [4/10] running CPU e2e client =="
+echo "== [4/11] running CPU e2e client =="
 set +e
 julia --project=packages/ReactantServerGateway "$E2E_DIR/client_cpu.jl" "$GW_PORT" "$BASE_PORT" redacted |
     tee "$WORK/client_redacted.out"
@@ -219,7 +227,7 @@ check_forced_log() {
 }
 check_forced_log redacted "$WORK/supervisor.log"
 
-echo "== [5/10] SIGTERM under load: the node drains =="
+echo "== [5/11] SIGTERM under load: the node drains =="
 # The drain client holds requests in flight, sends the supervisor SIGTERM itself, and checks both
 # drain stages (gateway, then workers) from the outside.
 set +e
@@ -235,7 +243,7 @@ fi
 sup_rc=0
 wait "$SUP_PID" || sup_rc=$?
 
-echo "== [6/10] exit codes =="
+echo "== [6/11] exit codes =="
 # The supervisor exited 0 (argument 1) and every child drained and exited 0 on its own: no SIGTERM
 # or SIGKILL fallback was needed. Argument 2 is the node's log.
 check_clean_exit() {
@@ -271,7 +279,7 @@ for tag in worker0 worker1 gateway supervisor; do
     fi
 done
 
-echo "== [7/10] full INTERNAL error detail (node global.grpc.error_detail: full) =="
+echo "== [7/11] full INTERNAL error detail (node global.grpc.error_detail: full) =="
 # A second node, identical but for `global.grpc.error_detail: full`, which reaches the workers through
 # their config and the embedded gateway through its pinned gateway config (the Node unit tests cover
 # the supervisor's mirror of global.grpc into an env-configured gateway).
@@ -322,7 +330,7 @@ if ((client_rc != 0)); then
 fi
 check_forced_log full "$WORK/supervisor_full.log"
 
-echo "== [8/10] shared memory: a client registers while a worker is out, then the worker returns =="
+echo "== [8/11] shared memory: a client registers while a worker is out, then the worker returns =="
 # The gateway registers a region on its healthy workers only. Phase 1 stops worker1 (SIGSTOP: alive,
 # answering nothing), waits for the gateway to mark it down, lets a fresh client pool register, and
 # resumes it (SIGCONT) well before its liveness check would kill it. Phase 2 kills worker1 instead
@@ -407,7 +415,7 @@ if ((outage_rc != 0)); then
     exit "$outage_rc"
 fi
 
-echo "== [9/10] shared memory: short deadlines, then a worker restart under the same client =="
+echo "== [9/11] shared memory: short deadlines, then a worker restart under the same client =="
 # Phase A drives shared-memory outputs with deadlines short enough that clients give up while
 # requests run (CORE-3). Then worker1 is stopped (SIGSTOP: alive, but answering nothing, as a hung
 # worker); the supervisor's liveness check kills it and the supervisor restarts it. Once the
@@ -461,7 +469,7 @@ if ((shm_rc != 0)); then
     exit "$shm_rc"
 fi
 
-echo "== [10/10] a stopped gateway is killed by its liveness check and restarted =="
+echo "== [10/11] a stopped gateway is killed by its liveness check and restarted =="
 # A hung gateway takes the node's public endpoint down with it. Stopped (SIGSTOP), it answers
 # nothing; the supervisor's check (2 s interval, 5 s timeout, 3 failures on this node) must kill it,
 # and the restarted gateway must serve the node again.
@@ -491,4 +499,276 @@ sup_rc=0
 wait "$SUP_PID" || sup_rc=$?
 check_clean_exit "$sup_rc" "$WORK/supervisor_full.log"
 
-echo "CPU e2e: PASS (workers synthesized, gateway routed, graceful drain, clean exit, INTERNAL error detail, shared memory, a register during a worker outage, liveness restarts)"
+echo "== [11/11] every worker out at once: the node recovers =="
+# A third node, whose gateway runs lpt_packing (which needs the workers' fifo discipline) with every
+# model placed on both workers (default_replicas: all), probing every second as on the second node.
+# The supervisor's liveness checks are off on it (liveness.failures: 0), so a worker stopped for
+# longer than a check allows is never killed, and only the gateway reacts. Its gateway file lists no
+# metrics_endpoints, so a /metrics scrape never waits for a stopped worker's.
+#  - Phase A: every worker stopped (SIGSTOP). Once the gateway marks them all down, every model is
+#    held: the gateway answers a request UNAVAILABLE without calling a worker. Every probe round then
+#    times out, and after 3 such rounds (WEDGE_EXIT_ROUNDS) the gateway concludes its own gRPC client
+#    is wedged and exits, and the supervisor restarts it. The workers stay stopped until that restart
+#    (or a bound), and then resume together.
+#  - Phase B: every worker stopped, then worker0 alone resumed, well before the wedge exit. The
+#    membership repack places every model on worker0, which serves them alone; once worker1 resumes,
+#    the next one places every model on both workers again.
+#  - Phase C: every worker killed (SIGKILL). A refused connection does not count toward the wedge exit,
+#    so the gateway stays up; the supervisor restarts the workers, and the client registers its
+#    region on them again after their FAILED_PRECONDITION.
+# The client (client_all_out_cpu.jl) checks each phase's baseline and recovery from its side, and this
+# script stops, resumes and kills the workers and checks the gateway's side, through marker files.
+t11="$(date +%s%3N)"
+BASE_PORT="$(free_port)"
+METRICS_BASE_PORT="$(free_port)"
+GW_PORT="$(free_port)"
+GW_METRICS_PORT="$(free_port)"
+sed -e "s/^base_port: .*/base_port: $BASE_PORT/" -e "s/^metrics_base_port: .*/metrics_base_port: $METRICS_BASE_PORT/" \
+    "$WORK/node.yaml" > "$WORK/node_out.yaml"
+printf '  scheduler:\n    discipline: fifo\n  grpc:\n    error_detail: full\nliveness:\n  failures: 0\n' >> "$WORK/node_out.yaml"
+cat > "$WORK/gateway_out.yml" << EOF
+listen:
+  grpc: "127.0.0.1:$GW_PORT"
+  metrics: "127.0.0.1:$GW_METRICS_PORT"
+endpoints:
+  - "127.0.0.1:$BASE_PORT"
+  - "127.0.0.1:$((BASE_PORT + 1))"
+worker_names: [worker0, worker1]
+grpc:
+  error_detail: full
+scheduling:
+  mode: lpt_packing
+  default_replicas: all
+EOF
+log="$WORK/supervisor_out.log"
+REACTANT_GATEWAY_HEALTH_INTERVAL_SECONDS=1 \
+REACTANT_GPUS=0 \
+REACTANT_CPU_WORKERS=2 \
+REACTANT_WORKSPACE_ROOT="$REPO_ROOT" \
+REACTANT_GATEWAY_FILE="$WORK/gateway_out.yml" \
+REACTANT_GATEWAY_LISTEN_GRPC="127.0.0.1:$GW_PORT" \
+REACTANT_GATEWAY_LISTEN_METRICS="127.0.0.1:$GW_METRICS_PORT" \
+julia --handle-signals=no --threads=1,0 --project=packages/ReactantServerNode -e '
+    using ReactantServerNode
+    exit(ReactantServerNode.supervise(ARGS[1]; runtime_dir = ARGS[2]))
+' "$WORK/node_out.yaml" "$WORK/run_out" > "$log" 2>&1 &
+SUP_PID=$!
+deadline=$((SECONDS + READY_TIMEOUT))
+until curl -fsS "http://127.0.0.1:${GW_METRICS_PORT}/readyz" >/dev/null 2>&1; do
+    if ! kill -0 "$SUP_PID" 2>/dev/null || ((SECONDS >= deadline)); then
+        echo "ERROR: the lpt_packing node did not become ready; log:"
+        tail -80 "$log"
+        exit 1
+    fi
+    sleep 2
+done
+
+OUT="$WORK/all_out"
+mkdir -p "$OUT"
+CLIENT_LOG="$WORK/all_out_client.log"
+FULL_PLACEMENT="scale4:worker0 scale4:worker1 slow4:worker0 slow4:worker1"
+WORKER0_PLACEMENT="scale4:worker0 slow4:worker0"
+now_ms() { date +%s%3N; }
+since() { awk -v a="$1" -v b="$(now_ms)" 'BEGIN { printf "%.1f", (b - a) / 1000 }'; }
+gw_metrics() { curl -fsS --max-time 5 "http://127.0.0.1:${GW_METRICS_PORT}/metrics" 2>/dev/null || true; }
+readyz_code() { curl -s -o /dev/null --max-time 5 -w '%{http_code}' "http://127.0.0.1:${GW_METRICS_PORT}/readyz" 2>/dev/null || true; }
+workers_ready() { # "<worker0> <worker1>": 1 or 0 each, as the gateway last probed them
+    gw_metrics | awk '/^gateway_worker_ready\{worker="worker0"\} / { a = $2 + 0 }
+        /^gateway_worker_ready\{worker="worker1"\} / { b = $2 + 0 } END { print a " " b }'
+}
+placement() { # the model:worker pairs of the gateway's placement (weight above 0), sorted
+    gw_metrics | sed -nE 's/^gateway_placement_weight\{model="([^"]+)",worker="([^"]+)"\} (.+)$/\1:\2 \3/p' |
+        awk '$2 + 0 > 0 { print $1 }' | sort | paste -sd ' ' -
+}
+membership_repacks() { gw_metrics | awk '/^gateway_repacks_total\{trigger="membership"\} / { n = $2 + 0 } END { print n + 0 }'; }
+routed_to() { # routed_to <model> <worker>: requests the gateway routed to that replica since it was placed
+    gw_metrics | awk -v k="gateway_replica_routed_total{model=\"$1\",worker=\"$2\"}" '$1 == k { n = $2 + 0 } END { print n + 0 }'
+}
+pid_of() { grep -oE "started $1 \(pid [0-9]+" "$log" | tail -1 | grep -oE '[0-9]+$' || true; }
+gateway_starts() { grep -c "^\[supervisor\] started gateway (pid" "$log" || true; }
+log_lines() { wc -l < "$log"; }
+# Predicates for `await`.
+all_down() { [[ "$(readyz_code)" == 503 && "$(workers_ready)" == "0 0" ]]; }
+all_up() { [[ "$(readyz_code)" == 200 && "$(workers_ready)" == "1 1" ]]; }
+workers_are() { [[ "$(workers_ready)" == "$1" ]]; }
+placed() { [[ "$(placement)" == "$1" ]]; }
+restarted() { # restarted <worker> <old pid>
+    local p
+    p="$(pid_of "$1")"
+    [[ -n "$p" && "$p" != "$2" ]]
+}
+marker() { # the client's marker file; failing the step if the client exits first
+    [[ -f "$OUT/$1" ]] && return 0
+    kill -0 "$ALL_OUT_CLIENT_PID" 2>/dev/null || out_fail "the client exited while the step waited for '$1'"
+    return 1
+}
+out_fail() { # out_fail <why>: fail the step with the supervisor's, the gateway's and the client's view
+    echo "FAIL  step 11: $1"
+    echo "-- supervisor and gateway lines:"
+    grep -E "^\[(supervisor|gateway)\]" "$log" | tail -80
+    echo "-- client log:"
+    tail -40 "$CLIENT_LOG"
+    exit 1
+}
+await() { # await <seconds> <what> <command...>: until the command succeeds, failing after <seconds>
+    local limit="$1" what="$2"
+    shift 2
+    local deadline=$((SECONDS + limit))
+    until "$@"; do
+        ((SECONDS < deadline)) || out_fail "$what: not within ${limit}s"
+        sleep 0.2
+    done
+}
+client_lines() { grep -E "^(PASS|FAIL|INFO)  " "$CLIENT_LOG" | grep -F "  $1" || true; }
+# A check the client fails fails its phase but not at once: the gateway has recovered by then (this
+# script checked it), so the later phases still run, and the step fails once its node has stopped.
+FAILED_PHASES=""
+phase_end() { # phase_end <A|B|C> <title> <start, ms> <what passed>: the phase's PASS or FAIL line
+    if grep -qE "^FAIL  phase $1[ (]" "$CLIENT_LOG"; then
+        echo "FAIL  phase $1 ($2) in $(since "$3") s: the client failed the check(s) above"
+        FAILED_PHASES="$FAILED_PHASES $1"
+    else
+        echo "PASS  phase $1 ($2) in $(since "$3") s: $4"
+    fi
+}
+
+await 60 "both workers ready on the lpt_packing node" all_up
+await 60 "the startup placement of every model on both workers" placed "$FULL_PLACEMENT"
+julia --project=packages/ReactantServerClient --threads=2 "$E2E_DIR/client_all_out_cpu.jl" \
+    "$GW_PORT" "$BASE_PORT" "$((BASE_PORT + 1))" "$OUT" > "$CLIENT_LOG" 2>&1 &
+ALL_OUT_CLIENT_PID=$!
+w0="$(pid_of worker0)"
+w1="$(pid_of worker1)"
+
+# Phase A: every worker stopped until the gateway restarts, then resumed together.
+await "$READY_TIMEOUT" "the client's baseline before phase A" marker baseA
+client_lines "phase A baseline"
+tA=$(now_ms)
+gw="$(pid_of gateway)"
+starts="$(gateway_starts)"
+from=$(($(log_lines) + 1))
+echo "   phase A: stopping every worker (pids $w0 $w1) with SIGSTOP; the gateway is pid $gw"
+STOPPED_PIDS="$w0 $w1"
+kill -STOP "$w0" "$w1"
+await 60 "the gateway reporting every worker down" all_down
+echo "   the gateway reports every worker down after $(since "$tA") s"
+touch "$OUT/downA"
+await 60 "the client's requests while every worker is down" marker checkedA
+held_lines="$(tail -n +"$from" "$log" | grep -c "no ready worker serves the model" || true)"
+((held_lines >= 2)) || out_fail "the gateway logged no held-model answer for each model (found $held_lines)"
+client_lines "phase A (every worker stopped)"
+# Hold the stop past the wedge exit: about 3 rounds of a 5 s probe deadline, a 5 s discovery deadline
+# and the 1 s interval, so about 35 s. The bound is far past that.
+until (($(gateway_starts) > starts)) || (($(since "$tA" | cut -d. -f1) >= 90)); do
+    sleep 0.2
+done
+stall="$(since "$tA")"
+if (($(gateway_starts) > starts)); then
+    echo "   the gateway restarted $stall s after the workers stopped (pid $gw -> $(pid_of gateway)); its last lines:"
+    tail -n +"$from" "$log" | grep -E "^\[supervisor\] .*gateway|wedged" | head -5 | sed 's/^/     /'
+else
+    echo "   the gateway did not restart within $stall s of the workers stopping"
+fi
+kill -CONT "$w0" "$w1"
+STOPPED_PIDS=""
+echo "   every worker resumed"
+await 300 "the gateway ready with both workers ready after phase A" all_up
+await 60 "the placement of every model on both workers after phase A" placed "$FULL_PLACEMENT"
+[[ "$(pid_of worker0)" == "$w0" && "$(pid_of worker1)" == "$w1" ]] ||
+    out_fail "a worker was restarted in phase A (pids $w0 $w1 -> $(pid_of worker0) $(pid_of worker1))"
+touch "$OUT/backA"
+await 300 "the client's recovery after phase A" marker doneA
+client_lines "phase A (every worker resumed together)"
+gw_restarts=$(($(gateway_starts) - starts))
+((gw_restarts <= 1)) || out_fail "the gateway restarted $gw_restarts times in phase A"
+phase_end A "every worker stopped, then resumed together" "$tA" \
+    "the gateway restarted $gw_restarts time(s), the workers kept their pids, every model serves on both workers through shared memory"
+
+# Phase B: every worker stopped, then worker0 alone resumed, then worker1.
+await 60 "the client's baseline before phase B" marker baseB
+client_lines "phase B baseline"
+tB=$(now_ms)
+gw="$(pid_of gateway)"
+starts="$(gateway_starts)"
+membership="$(membership_repacks)"
+echo "   phase B: stopping every worker with SIGSTOP; the gateway is pid $gw"
+STOPPED_PIDS="$w0 $w1"
+kill -STOP "$w0" "$w1"
+await 60 "the gateway reporting every worker down" all_down
+kill -CONT "$w0"
+STOPPED_PIDS="$w1"
+echo "   worker0 resumed $(since "$tB") s after the workers stopped"
+await 60 "the gateway reporting worker0 ready and worker1 down" workers_are "1 0"
+await 60 "a membership repack placing every model on worker0 alone" placed "$WORKER0_PLACEMENT"
+(($(membership_repacks) > membership)) || out_fail "the placement changed without a membership repack"
+touch "$OUT/oneB"
+await 60 "the client's requests with worker0 alone" marker servedB
+client_lines "phase B (worker0 resumed, worker1 still stopped)"
+kill -CONT "$w1"
+STOPPED_PIDS=""
+echo "   worker1 resumed $(since "$tB") s after the workers stopped"
+await 60 "the gateway ready with both workers ready after phase B" all_up
+await 60 "a membership repack placing every model on both workers again" placed "$FULL_PLACEMENT"
+(($(membership_repacks) >= membership + 2)) ||
+    out_fail "expected two membership repacks in phase B, saw $(($(membership_repacks) - membership))"
+touch "$OUT/backB"
+await 300 "the client's recovery after phase B" marker doneB
+client_lines "phase B (worker1 resumed too)"
+for m in scale4 slow4; do
+    (($(routed_to "$m" worker1) > 0)) || out_fail "no $m request was routed to worker1 after it returned"
+done
+[[ "$(pid_of gateway)" == "$gw" && "$(gateway_starts)" == "$starts" ]] ||
+    out_fail "the gateway restarted in phase B (pid $gw -> $(pid_of gateway))"
+phase_end B "every worker stopped, then resumed one at a time" "$tB" \
+    "worker0 served every model alone, then both workers again, through $(($(membership_repacks) - membership)) membership repacks; the gateway kept pid $gw"
+
+# Phase C: every worker killed and restarted by the supervisor.
+await 60 "the client's baseline before phase C" marker baseC
+client_lines "phase C baseline"
+tC=$(now_ms)
+gw="$(pid_of gateway)"
+starts="$(gateway_starts)"
+from=$(($(log_lines) + 1))
+echo "   phase C: killing every worker (pids $w0 $w1) with SIGKILL; the gateway is pid $gw"
+kill -KILL "$w0" "$w1"
+await 60 "the gateway reporting every worker down" all_down
+echo "   the gateway reports every worker down after $(since "$tC") s"
+touch "$OUT/downC"
+await 60 "the client's requests while every worker is down" marker checkedC
+client_lines "phase C (every worker killed)"
+await "$READY_TIMEOUT" "worker0 restarted" restarted worker0 "$w0"
+await "$READY_TIMEOUT" "worker1 restarted" restarted worker1 "$w1"
+await "$READY_TIMEOUT" "the gateway ready with both restarted workers ready" all_up
+await 60 "the placement of every model on both workers after phase C" placed "$FULL_PLACEMENT"
+echo "   both workers restarted (pids $(pid_of worker0) $(pid_of worker1)) and are ready after $(since "$tC") s"
+if [[ "$(pid_of gateway)" != "$gw" || "$(gateway_starts)" != "$starts" ]]; then
+    echo "   the gateway's lines in phase C:"
+    tail -n +"$from" "$log" | grep -E "^\[(supervisor|gateway)\]" | tail -60
+    out_fail "the gateway restarted in phase C (pid $gw -> $(pid_of gateway))"
+fi
+touch "$OUT/backC"
+set +e
+wait "$ALL_OUT_CLIENT_PID"
+all_out_rc=$?
+set -e
+client_lines "phase C (every worker restarted)"
+grep -E "^CPU e2e" "$CLIENT_LOG" || true
+phase_end C "every worker killed and restarted" "$tC" \
+    "the gateway kept pid $gw, and the client registered again and stays on shared memory"
+
+kill -TERM "$SUP_PID"
+sup_rc=0
+wait "$SUP_PID" || sup_rc=$?
+check_clean_exit "$sup_rc" "$log"
+echo "   step 11 took $(since "$t11") s, starting its node included"
+if [[ -n "$FAILED_PHASES" ]]; then
+    echo "FAIL  step 11: phase(s)$FAILED_PHASES failed"
+    exit 1
+fi
+if ((all_out_rc != 0)); then
+    echo "ERROR: the client exited $all_out_rc with no failed check; its log:"
+    tail -40 "$CLIENT_LOG"
+    exit 1
+fi
+
+echo "CPU e2e: PASS (workers synthesized, gateway routed, graceful drain, clean exit, INTERNAL error detail, shared memory, a register during a worker outage, liveness restarts, every worker out at once)"
