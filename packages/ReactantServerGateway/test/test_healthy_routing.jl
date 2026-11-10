@@ -639,6 +639,67 @@ end
     end
 end
 
+# A worker restarted between two probe rounds is never seen down, so the prober never gives it fresh
+# connections (above), and the data handle may still hold one to the old process. A StageWeights call
+# that fails in the transport is therefore sent once more; libcurl dropped the dead connection with
+# the failure, so the second goes out on a fresh one. Before, the staging failed and the change was
+# dropped, and the underlying error was not logged.
+@testset "lpt_packing: a staging call that fails on a connection to a replaced worker is sent once more" begin
+    A = AffMockWorker("workerA", ["m", "n"])
+    B = AffMockWorker("workerB", ["m", "n"])
+    sa = _aff_server(0, A); pa = grpc_start_ephemeral!(sa)
+    sb = _aff_server(0, B); pb = grpc_start_ephemeral!(sb)
+    ua, ub = "127.0.0.1:$pa", "127.0.0.1:$pb"
+    gw, aff = _hr_lpt_gateway([pa, pb])
+    try
+        port = _HGW.bound_ports(gw)[1]
+        # m on A alone (it is configured for two GPUs) and n on B; a request for n opens the gateway's
+        # data connection to B.
+        asn = Dict{String, GW.Placement}("m" => [(ua, 1.0)], "n" => [(ub, 1.0)])
+        @atomic aff.assignment = asn
+        GW._swap_outstanding!(aff, asn)
+        @test _aff_infer(port, "n").model_name == "workerB"
+
+        # B is replaced between prober rounds: no round sees it down. The prober's own connection to it
+        # is a fresh one, as after a probe that hung (the prober resets it then); the data connection
+        # still goes to the old process.
+        gRPCServer.stop!(sb; force = true)
+        sb = _aff_server(pb, B)
+        gRPCServer.start!(sb)
+        @test timedwait(15) do
+            try
+                AInf.GRPCInferenceService.ServerReady("127.0.0.1", pb, AInf.ServerReadyRequest()).ready
+            catch
+                false
+            end
+        end === :ok
+        GW.reset_probe_connection!(GW.get_clients(gw.pool, ub))
+        @test !_hr_down(gw, ub)
+
+        # An operator repack gives m its second replica, on B, staging its weights there first. The
+        # first StageWeights fails on the dead connection and is sent once more, on a fresh one.
+        staged = length(B.staged)
+        logs = Test.TestLogger(; min_level = Logging.Info)
+        Logging.with_logger(logs) do
+            GW._repack!(aff, GW.poll_workers(gw.pool, [ua, ub]), gw.metrics; trigger = :operator, pool = gw.pool)
+            @test timedwait(() -> aff.transition === nothing, 15) === :ok
+        end
+        @test length(B.staged) == staged + 1
+        rep = @atomic aff.report
+        @test rep.changes_planned > 0 && rep.changes_committed == rep.changes_planned && rep.changes_dropped == 0
+        @test sort(first.((@atomic aff.assignment)["m"])) == sort([ua, ub])
+        # The first failure is logged with its cause, which used to be discarded.
+        retried = filter(r -> occursin("sending it once more", r.message), logs.logs)
+        @test length(retried) == 1
+        @test all(r -> !isempty(string(get(r.kwargs, :error, ""))), retried)
+        @test !any(r -> occursin("staging weights for a placement change failed", r.message), logs.logs)
+    finally
+        _HGW.stop!(gw)
+        close(sa)
+        gRPCServer.stop!(sb; force = true)
+    end
+end
+
 @testset "invoke_infer reports a refused connection, and nothing else, as refused" begin
     body = UInt8[0x0a, 0x01, 0x61]
     function attempt(host, port; deadline = 5)

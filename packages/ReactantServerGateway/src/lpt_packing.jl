@@ -1016,16 +1016,15 @@ function _prime_and_commit!(
             @async begin
                 wc = get_clients(pool, w)
                 resp = nothing
+                err = "the worker is not in the gateway's pool"
                 if wc !== nothing
                     t1 = time()
-                    resp, _ = _bounded(
-                        () -> invoke_stage_weights(wc, unique(names), hold, k.stage_timeout_seconds),
-                        k.stage_timeout_seconds + 5.0, nothing, "StageWeights", w
-                    )
+                    # Sent once more after a transport failure (see `stage_weights`).
+                    resp, err = stage_weights(wc, unique(names), hold, k.stage_timeout_seconds)
                     metrics === nothing || observe_worker!(metrics, "StageWeights", w, time() - t1)
                 end
                 if resp === nothing
-                    @warn "lpt_packing: staging weights for a placement change failed; its changes stay unmade" worker = w models = names
+                    @warn "lpt_packing: staging weights for a placement change failed; its changes stay unmade" worker = w models = names error = err
                 else
                     for r in resp.models
                         states[(w, r.name)] = r.state
