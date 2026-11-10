@@ -180,17 +180,17 @@ its readiness reported as down). Returns how many requests were still in flight 
 function drain_inflight!(g::DrainGate, seconds::Real; what::AbstractString = "server", poll = nothing)
     g.draining[] = true
     seconds > 0 || return max(g.inflight[], 0)
-    t0 = time()
+    t0 = monotonic_time()
     deadline = t0 + Float64(seconds)
     @info "drain: $what refuses new requests (UNAVAILABLE) and reports not ready; waiting for in-flight requests" in_flight = g.inflight[] budget_seconds = seconds
     while true
         poll === nothing || poll()
-        (g.inflight[] <= 0 || time() >= deadline) && break
+        (g.inflight[] <= 0 || monotonic_time() >= deadline) && break
         sleep(0.05)
     end
     left = max(g.inflight[], 0)
     if left == 0
-        @info "drain: $what drained" seconds = round(time() - t0; digits = 2)
+        @info "drain: $what drained" seconds = round(monotonic_time() - t0; digits = 2)
     else
         @warn "drain: $what still has requests in flight after the drain budget; stopping anyway" in_flight = left budget_seconds = seconds
     end
