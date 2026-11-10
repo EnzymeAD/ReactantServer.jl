@@ -2381,10 +2381,13 @@ end
     load_model!(scheduler, backend, pool, entry; state, on_demand, store, unchanged) -> Union{String, Nothing}
 
 Compile and admit a freshly loaded (uncompiled) bundle `entry`, replacing any existing model of
-the same name. Runs entirely on the dispatch thread inside one control op (a stop-the-world swap):
-any existing model is evicted first so its device memory is freed before the new artifact is
-compiled, then the new entry is compiled (`build_loaded_model`) and admitted. This is the dynamic
-directory watcher's load/reload path. Returns the model name.
+the same name. Runs inside one control op on the dispatch loop (a stop-the-world swap): any
+existing model is evicted first so its device memory is freed before the new artifact is compiled,
+then the new entry is compiled (`build_loaded_model`) and admitted. The compile, and the upload of a
+resident model's weights that comes with it, run on a default-pool task the loop waits for
+([`off_interactive`](@ref)), so the worker keeps handling requests and health checks meanwhile; no
+model dispatches until the op ends. This is the dynamic directory watcher's load/reload path.
+Returns the model name.
 
 `unchanged()` says whether the bundle's files are still the ones `entry` was read from. It is asked
 before the control op, where `false` leaves any existing model serving, and again once the new
@@ -2417,12 +2420,20 @@ function load_model!(
         _run_control(
             s, function (sch)
                 _evict_entry!(sch, entry.name)          # no-op on a fresh load; frees device memory on reload
-                entry.executable = build_loaded_model(
-                    backend, pool, entry;
-                    state = state, on_demand = on_demand, store = store, source = :dynamic,
-                    executable_cache = executable_cache, host_arrays = host_arrays,
-                    defer_floor = defer_floor
-                )
+                # An uncached compile takes 5 to 30 s per program. On the interactive thread, which
+                # also reads requests and answers health checks, it would stop both for that long,
+                # so it runs on a default-pool task like the weight loads and long executions. The
+                # loop still waits for it, so nothing else mutates residency meanwhile. XLA's compile
+                # call is not GC-safe: a collection another thread requests during it still waits for
+                # the compile to return, and the whole worker stops for the rest of it.
+                entry.executable = off_interactive() do
+                    build_loaded_model(
+                        backend, pool, entry;
+                        state = state, on_demand = on_demand, store = store, source = :dynamic,
+                        executable_cache = executable_cache, host_arrays = host_arrays,
+                        defer_floor = defer_floor
+                    )
+                end
                 # Changed during the compile: this version may mix old and new files. Never admit it.
                 unchanged() || (_discard_unadmitted!(sch, entry); return nothing)
                 n = _admit_entry!(sch, entry; staged = staged)
