@@ -30,6 +30,7 @@ include("stablehlo_fixtures.jl")
 include("grpc_helpers.jl")
 
 @testset "ReactantServer" begin
+    include("test_wall_clock.jl")
     include("test_scheduler.jl")
     include("test_bert_text.jl")
     include("test_multishape.jl")
