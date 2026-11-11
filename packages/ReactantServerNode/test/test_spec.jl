@@ -428,6 +428,47 @@ end
     end
 end
 
+@testset "gateway_spec: GC threads" begin
+    gcflags(cmd) = filter(startswith("--gcthreads"), cmd.exec)
+    marks = min(Sys.CPU_THREADS, 4)
+    flag = "--gcthreads=$marks,1"
+    withenv(RSN._GC_THREADS_ENV => nothing) do
+        for gw in (
+                RSN.gateway_spec("/opt/rs"; endpoints = ["127.0.0.1:8080"]),
+                RSN.gateway_spec("/opt/rs"; gateway_path = "/etc/x/gateway.yml"),
+            )
+            # Exactly one, so Base.julia_cmd() brings none to conflict with, and placed as a Julia
+            # option, before the program, not among the program's arguments.
+            @test gcflags(gw.cmd) == [flag]
+            @test findfirst(==(flag), gw.cmd.exec) < findfirst(==("-e"), gw.cmd.exec)
+        end
+        # An empty variable counts as unset.
+        withenv(RSN._GC_THREADS_ENV => "") do
+            @test gcflags(RSN.gateway_spec("/opt/rs"; endpoints = ["127.0.0.1:8080"]).cmd) == [flag]
+        end
+        # This Julia takes the flag as meant: the mark threads (the collecting thread counts as one)
+        # plus one sweep thread.
+        julia = `$(Base.julia_cmd()) --startup-file=no $flag -e 'print(Threads.ngcthreads())'`
+        @test parse(Int, readchomp(julia)) == marks + 1
+    end
+    # The mark threads are capped at the host's CPUs.
+    unset = Dict{String, String}()
+    @test RSN._gateway_gc_flags(unset; cpu_threads = 64) == ["--gcthreads=4,1"]
+    @test RSN._gateway_gc_flags(unset; cpu_threads = 4) == ["--gcthreads=4,1"]
+    @test RSN._gateway_gc_flags(unset; cpu_threads = 2) == ["--gcthreads=2,1"]
+    @test RSN._gateway_gc_flags(unset; cpu_threads = 1) == ["--gcthreads=1,1"]
+    # JULIA_NUM_GC_THREADS set for the supervisor applies instead: the child inherits it, and no flag
+    # is added, since Julia would let the flag win over it.
+    @test RSN._gateway_gc_flags(Dict(RSN._GC_THREADS_ENV => "2,1"); cpu_threads = 64) == String[]
+    withenv(RSN._GC_THREADS_ENV => "2,1") do
+        gw = RSN.gateway_spec("/opt/rs"; endpoints = ["127.0.0.1:8080"])
+        @test isempty(gcflags(gw.cmd))
+        @test _envval(gw.cmd, RSN._GC_THREADS_ENV) == "2,1"
+    end
+    # The workers keep Julia's default.
+    @test isempty(gcflags(RSN.worker_spec("worker0", "/run/node.yaml", nothing, "/opt/rs").cmd))
+end
+
 @testset "gateway_spec: grpc message-size env synthesis" begin
     withenv(
         "REACTANT_GATEWAY_GRPC_MAX_RECV_MSG_BYTES" => nothing,

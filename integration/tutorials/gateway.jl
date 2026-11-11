@@ -69,8 +69,8 @@ write(
 # To keep this page one runnable script, it starts the same commands from Julia, with their output
 # shown in this session (`run` without `wait` would otherwise discard it):
 
-function start(code; threads = "auto,1")
-    cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) --threads=$threads -e $code`
+function start(code; threads = "auto,1", options = ``)
+    cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) --threads=$threads $options -e $code`
     return run(pipeline(cmd; stdout, stderr); wait = false)
 end
 
@@ -130,10 +130,14 @@ write(
 # until stopped; from a shell:
 #
 # ```sh
-# julia --project --threads=auto -e 'using ReactantServerGateway; serve_gateway("gateway.yml")'
+# julia --project --threads=auto --gcthreads=4,1 -e 'using ReactantServerGateway; serve_gateway("gateway.yml")'
 # ```
+#
+# `--gcthreads=4,1` gives its garbage collector four mark threads and a concurrent sweep thread, as
+# the node supervisor does for its embedded gateway ([Deployment](../../deployment.md)): every
+# request the gateway is proxying waits through each of its collections.
 
-push!(processes, start("using ReactantServerGateway; serve_gateway(\"gateway.yml\")"; threads = "auto"))
+push!(processes, start("using ReactantServerGateway; serve_gateway(\"gateway.yml\")"; threads = "auto", options = `--gcthreads=4,1`))
 wait_ready("http://127.0.0.1:8002/readyz")
 
 # ## Query through it
