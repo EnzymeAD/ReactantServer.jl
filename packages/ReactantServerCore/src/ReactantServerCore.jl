@@ -13,6 +13,9 @@ using FixedSizeArrays
 using ProtoBuf
 using YAML
 
+# The monotonic clock intervals are measured with.
+include("clock.jl")
+
 # Canonical dtype vocabulary (no transport, no Reactant).
 include("dtypes.jl")
 
@@ -59,6 +62,9 @@ function __init__()
     _init_shm_naming!()
     return nothing
 end
+
+# ---- clock ----
+export monotonic_time
 
 # ---- dtypes ----
 export DType, F16, F32, F64, BF16, F8E5M2, F8E4M3, I8, I16, I32, I64, U8, U16, U32, U64, BOOL

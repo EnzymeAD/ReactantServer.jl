@@ -70,14 +70,14 @@ shared-memory recovery, which handles FAILED_PRECONDITION) is unchanged.
 second send, as a retry's is (CORE-3).
 """
 function _call_unary(start, budget::Real; cancelled = () -> false)
-    t0 = time()
+    t0 = monotonic_time()
     call = start(budget)
     try
         return fetch(call)
     catch e
         _stale_connection(call.req, e) || rethrow()
         delay = _stale_resend_delay()
-        left = isfinite(budget) ? budget - (time() - t0) - delay : budget
+        left = isfinite(budget) ? budget - (monotonic_time() - t0) - delay : budget
         (left > 0 && !cancelled()) || rethrow()
         @debug "a call met a stale pooled connection; sending it once more on a fresh one" url = call.req.url code = Int(call.req.code) error = e.message delay_s = delay
         sleep(delay)

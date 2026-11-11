@@ -125,9 +125,9 @@ _timed_read!(t::LoadTiming, seconds) = (t.read = something(t.read, 0.0) + second
 
 # Transfer host arrays to the device, timing the transfer as the upload half.
 function _timed_transfer(cache::WeightCache, arrays, timing)
-    t = time()
+    t = monotonic_time()
     bufs = transfer_to_device(cache.backend, cache.pool, arrays)
-    _timed_upload!(timing, time() - t)
+    _timed_upload!(timing, monotonic_time() - t)
     return bufs
 end
 
@@ -370,11 +370,11 @@ function _upload_commit!(cache::WeightCache, entry::ModelEntry; fresh::Bool = tr
     before = _memory_point(cache)
     # With weights pinned in host RAM this is a pure host->device copy, not a re-materialization.
     timing = LoadTiming()
-    t0 = time()
+    t0 = monotonic_time()
     bufs = _device_buffers(cache, entry, model; staged = staged, timing = timing)
     after = _memory_point(cache)
     # End to end: a staged load read its weights earlier, off the dispatch loop.
-    dt = time() - t0 + (staged === nothing ? 0.0 : staged.host_seconds)
+    dt = monotonic_time() - t0 + (staged === nothing ? 0.0 : staged.host_seconds)
     upload = timing.upload > 0 ? timing.upload : dt - something(timing.read, 0.0)
     lock(cache.lock) do
         # Only this loop allocates on the device, so the growth in use is this upload's.
@@ -394,7 +394,7 @@ function _upload_commit!(cache::WeightCache, entry::ModelEntry; fresh::Bool = tr
         end
         record_load!(fp, dt)
         record_load_halves!(fp, upload, timing.read)
-        fp.loaded_at = time()
+        fp.loaded_at = monotonic_time()
         if fresh
             fp.hits = 1
             fp.prio_base = cache.inflation
@@ -591,7 +591,7 @@ compact!(cache::WeightCache, registry::ModelRegistry; reload::Vector{String} = S
     off_interactive(() -> _compact!(cache, registry, reload))
 
 function _compact!(cache::WeightCache, registry::ModelRegistry, reload::Vector{String})
-    t0 = time()
+    t0 = monotonic_time()
     before = memory_report(cache.backend, cache.pool; registry = registry, weight_cache = cache)
     before_point = _memory_point(cache)
 
@@ -638,7 +638,7 @@ function _compact!(cache::WeightCache, registry::ModelRegistry, reload::Vector{S
     end
     cold > 0 && @info "compaction: left evicted the requested models with no host copy; their next request reads them in the background" models = cold
 
-    lock(() -> cache.compaction_seconds += time() - t0, cache.lock)
+    lock(() -> cache.compaction_seconds += monotonic_time() - t0, cache.lock)
     after = memory_report(cache.backend, cache.pool; registry = registry, weight_cache = cache)
     after_point = _memory_point(cache)
     @info "memory compacted" reloaded = reloaded requested = length(reload) before = before after = after largest_free_before = _point_field(before_point, :largest_free) largest_free_after = _point_field(after_point, :largest_free) fragmentation_before = _point_field(before_point, :fragmentation) fragmentation_after = _point_field(after_point, :fragmentation)

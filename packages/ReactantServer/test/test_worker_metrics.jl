@@ -134,7 +134,76 @@ end
         count_ = parse(Float64, match(r"^worker_interactive_lag_seconds_count (\S+)$"m, body)[1])
         under = parse(Float64, match(r"^worker_interactive_lag_seconds_bucket\{le=\"0.256\"\} (\S+)$"m, body)[1])
         @test count_ >= 2 && under < count_          # some ticks on time, at least one 0.4 s late
+        # The gauge holds the longest delay of the last 30 s: the 0.4 s hold, not an average.
+        longest = parse(Float64, match(r"^worker_interactive_lag_max_seconds (\S+)$"m, body)[1])
+        @test 0.3 <= longest < 5.0
     end
+end
+
+@testset "worker metrics: the dispatch loop's activity reads as a sentence for a stall report" begin
+    p = ReactantServer.DispatchProgress()
+    @test ReactantServer.dispatch_activity(p, 10.0) == "now: idle; before: idle"
+    ReactantServer._begin_unit!(p, :dispatch, "m", 4)
+    ReactantServer._note_in_place!(p)
+    t = (@atomic p.current).started
+    @test ReactantServer.dispatch_activity(p, t + 1.3) ==
+        "now: dispatch of m at batch 4, run in place on this thread, running for 1.3 s; before: idle"
+    ReactantServer._begin_unit!(p, :control)          # the dispatch ended as the command began
+    u = @atomic p.previous
+    txt = ReactantServer.dispatch_activity(p, u.ended + 0.5)
+    @test startswith(txt, "now: control command, running for 0.5 s; before: dispatch of m at batch 4, run in place on this thread, took ")
+    @test endswith(txt, ", ended 0.5 s ago")
+    ReactantServer._end_unit!(p)
+    @test (@atomic p.current).kind === :idle && (@atomic p.previous).kind === :control
+    ReactantServer._begin_unit!(p, :dispatch, "n", 1)  # not in place unless noted
+    @test occursin("dispatch of n at batch 1, run on a default-pool task", ReactantServer.dispatch_activity(p))
+    ReactantServer._begin_unit!(p, :dispatch, "u", 0)  # a program with no batch axis
+    @test occursin("now: dispatch of u unbatched, run on a default-pool task", ReactantServer.dispatch_activity(p))
+end
+
+@testset "worker metrics: a stall's log line says what held the thread" begin
+    if Threads.nthreads(:interactive) == 0
+        @test_skip "needs an interactive thread"
+    else
+        reg = Prometheus.CollectorRegistry()
+        logger = Test.TestLogger()
+        Base.CoreLogging.with_logger(logger) do
+            m = ReactantServer.InteractiveMonitor(reg; interval = 0.02, warn_after = 0.2, context = () -> "the loop's report")
+            ReactantServer.start_interactive_monitor!(m)
+            sleep(0.2)
+            wait(Threads.@spawn :interactive (t = time(); while time() - t < 0.4 end))
+            sleep(0.2)
+            ReactantServer.stop_interactive_monitor!(m)
+        end
+        stalls = filter(r -> occursin("interactive thread was blocked", string(r.message)), logger.logs)
+        @test !isempty(stalls)
+        kw = Dict(last(stalls).kwargs)
+        @test all(k -> haskey(kw, k), (:blocked_s, :gc_s, :safepoint_wait_s, :collections, :compile_s))
+        @test kw[:activity] == "the loop's report"
+        io = IOBuffer()
+        Prometheus.expose(io, reg)
+        @test occursin(r"^julia_gc_time_to_safepoint_seconds_total \S+$"m, String(take!(io)))
+    end
+end
+
+@testset "worker metrics: the monitor's longest delay covers its window, then is forgotten" begin
+    reg = Prometheus.CollectorRegistry()
+    m = ReactantServer.InteractiveMonitor(reg; window = 30)
+    longest() = (io = IOBuffer(); Prometheus.expose(io, reg); parse(Float64, match(r"^worker_interactive_lag_max_seconds (\S+)$"m, String(take!(io)))[1]))
+    observe(late, second) = ReactantServer._observe_lag!(m, late, second)
+    observe(0.5, 1000)
+    observe(0.1, 1010)
+    @test longest() == 0.5
+    observe(0.05, 1029)
+    @test longest() == 0.5                           # second 1000 is still within the last 30 s
+    observe(0.05, 1030)
+    @test longest() == 0.1                           # 1000 has left the window (its slot is reused); 1010 has not
+    observe(0.02, 1040)
+    @test longest() == 0.05                          # 1010 has left too
+    observe(0.2, 1040)
+    @test longest() == 0.2                           # a second keeps its longest tick
+    observe(0.01, 1100)
+    @test longest() == 0.01                          # after a quiet stretch only the new tick counts
 end
 
 @testset "worker metrics: latency buckets reach past a minute" begin

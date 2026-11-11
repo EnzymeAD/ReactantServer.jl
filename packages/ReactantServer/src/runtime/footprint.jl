@@ -27,7 +27,7 @@ mutable struct ModelFootprint
     # Eviction policy state (GreedyDual-Size-Frequency, see admission.jl), for the current residency.
     hits::Int                   # dispatches since the weights were last loaded
     priority::Float64           # H: inflation at last use + hits * reload seconds / weight bytes
-    loaded_at::Float64          # time() of the last load, for the minimum-residency guard
+    loaded_at::Float64          # monotonic_time() of the last load (-Inf: none), for the minimum-residency guard
     tensor_bytes::Vector{Int}   # each weight's rounded allocation, in upload order
     # The two halves of a load, averaged separately because only the upload recurs while a host copy
     # of the weights exists: the device transfer, and reading the weights file (seconds; 0.0 = not
@@ -79,7 +79,7 @@ function _new_footprint(entry::ModelEntry, model::LoadedModel)
     w = sizes === nothing ? (weight_bytes = model.nbytes, max_weight_bytes = model.nbytes) :
         weight_footprint(sizes)
     tensors = sizes === nothing ? Int[model.nbytes] : Int[_alloc_rounded(n) for n in sizes]
-    return ModelFootprint(model, w.weight_bytes, w.max_weight_bytes, 0, 0.0, 0, 0, 0, 0.0, 0.0, tensors, 0.0, 0.0, 0, 0.0, 0, 0)
+    return ModelFootprint(model, w.weight_bytes, w.max_weight_bytes, 0, 0.0, 0, 0, 0, 0.0, -Inf, tensors, 0.0, 0.0, 0, 0.0, 0, 0)
 end
 
 # The bytes evicting the model gives back to the allocator: measured at its last upload, else its

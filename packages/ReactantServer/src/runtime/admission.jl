@@ -311,10 +311,10 @@ end
 # next decision does not read stale statistics and over-evict.
 function _await_frees!(cache::WeightCache, in_use_before::Int, freed::Int)
     target = in_use_before - freed
-    deadline = time() + FREE_WAIT_SECONDS
+    deadline = monotonic_time() + FREE_WAIT_SECONDS
     while true
         st = device_memory_stats(cache.backend, cache.pool)
-        (st === nothing || st.in_use <= target || time() >= deadline) && return st
+        (st === nothing || st.in_use <= target || monotonic_time() >= deadline) && return st
         yield()
     end
     return
@@ -363,7 +363,7 @@ function admit_weights!(cache::WeightCache, entry::ModelEntry; staged = nothing)
     while true
         deficit, contiguous_short = _weights_shortfall(cache, model, fp, stats)
         (deficit <= 0 && !contiguous_short) && break
-        s = _fill_candidates!(cache, entry.name, time())
+        s = _fill_candidates!(cache, entry.name, monotonic_time())
         chosen = if deficit > 0
             (select_cover!(s, deficit) || select_cover!(s, deficit; allow_protected = true)) ?
                 _chosen_names(s) : String[]
@@ -400,7 +400,7 @@ function admit_weights!(cache::WeightCache, entry::ModelEntry; staged = nothing)
         stats = device_memory_stats(cache.backend, cache.pool)
         lf = largest_free_bytes(stats)
         (lf === nothing || lf >= _scratch_need(cache, fp)) && return nothing
-        s = _fill_candidates!(cache, entry.name, time())
+        s = _fill_candidates!(cache, entry.name, monotonic_time())
         i = select_cheapest!(s)
         i == 0 && (i = select_cheapest!(s; allow_protected = true))
         i == 0 && return _compact_and_retry!(cache, entry; staged = staged, victims = victims)

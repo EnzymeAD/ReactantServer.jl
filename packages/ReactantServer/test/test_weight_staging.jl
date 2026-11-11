@@ -352,7 +352,7 @@ end
         @test only(ReactantServer.stage_weights!(sched, ["B"]; hold_seconds = 0.5)).state == "staged"
         ReactantServer._sweep_prefetched!(sched)
         @test haskey(sched.prefetched, "B")
-        ReactantServer._sweep_prefetched!(sched; now = time() + 1.0)
+        ReactantServer._sweep_prefetched!(sched; now = monotonic_time() + 1.0)
         @test isempty(sched.prefetched)
         @test _st_infer(sched, "B") == _ST_OUT           # a request then reads it the usual way
         @test gw.reads[] == 2

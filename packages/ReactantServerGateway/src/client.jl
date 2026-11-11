@@ -411,10 +411,10 @@ the second goes out on a fresh one, and the handle is not reset, which would abo
 calls in flight.
 """
 function stage_weights(wc::WorkerClients, names::Vector{String}, hold::Real, timeout::Real)
-    t0 = time()
+    t0 = monotonic_time()
     resp, err, transport = _stage_once(wc, names, hold, timeout)
     (resp === nothing && transport) || return resp, err
-    left = timeout - (time() - t0)
+    left = timeout - (monotonic_time() - t0)
     left > 0 || return resp, err
     @info "lpt_packing: staging weights failed in the transport; sending it once more" worker = wc.url models = names error = err
     resp, err, _ = _stage_once(wc, names, hold, left)

@@ -332,11 +332,11 @@ also marked `format_version: "2.1"`, as after any replace, and the result is `:r
 function migrate_bundle_weights!(dir::AbstractString, mode::WeightsMigration)
     mode == MIGRATE_OFF && return :off
     isfile(joinpath(dir, LEGACY_WEIGHTS_FILE)) || isfile(joinpath(dir, XLA_COPY_FILE)) || return :skipped
-    t0 = time()
+    t0 = monotonic_time()
     try
         result = _with_migration_lock(() -> _migrate!(String(dir), mode), dir)
         result in (:copied, :replaced) &&
-            @info "migrated weights to the program's axis order" bundle = dir result seconds = round(time() - t0; digits = 2)
+            @info "migrated weights to the program's axis order" bundle = dir result seconds = round(monotonic_time() - t0; digits = 2)
         return result
     catch e
         @error "weights migration failed; loading the bundle as it is" bundle = dir exception = (e, catch_backtrace())

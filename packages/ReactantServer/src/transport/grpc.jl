@@ -359,14 +359,14 @@ _infer_or_not_found(ctx::InferContext, request; kw...) = infer(ctx.sched, reques
 # serves (`request_model_label`). `cancelled` is the call's cancellation probe (see `infer`).
 function _handle_infer(
         ctx::InferContext, req, grpc_deadline_ns::Integer = 0;
-        finish = identity, t0::Float64 = time(), cancelled = nothing
+        finish = identity, t0::Float64 = monotonic_time(), cancelled = nothing
     )
     name = req.model_name
     try
         resp = finish(_handle_infer_impl(ctx, req, grpc_deadline_ns; cancelled = cancelled))
         if ctx.metrics !== nothing
             label = request_model_label(ctx.registry, name)
-            observe_request!(ctx.metrics, label, time() - t0)
+            observe_request!(ctx.metrics, label, monotonic_time() - t0)
             inc_request!(ctx.metrics, label, "OK")
         end
         return resp
@@ -377,7 +377,7 @@ function _handle_infer(
         )
         if ctx.metrics !== nothing
             label = request_model_label(ctx.registry, name)
-            observe_request!(ctx.metrics, label, time() - t0)
+            observe_request!(ctx.metrics, label, monotonic_time() - t0)
             inc_request!(ctx.metrics, label, _status_label(err))
         end
         throw(err)
@@ -394,7 +394,7 @@ end
 function _handle_infer_raw(
         ctx::InferContext, body::Vector{UInt8}, grpc_deadline_ns::Integer = 0; cancelled = nothing
     )
-    t0 = time()
+    t0 = monotonic_time()
     req = try
         ProtoBuf.decode(ProtoBuf.ProtoDecoder(IOBuffer(body)), inference.ModelInferRequest)
     catch err

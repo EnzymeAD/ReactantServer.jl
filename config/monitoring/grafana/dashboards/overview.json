@@ -2250,7 +2250,7 @@
         "type": "prometheus",
         "uid": "${ds}"
       },
-      "description": "How often each responsiveness monitor woke. A free thread ticks 10 times a second; fewer means it was held by other work (a blocking call, code compiling on first use) and every request, probe and scrape on it waited. Gateway: its single event loop. Workers: the interactive thread request handling shares with the dispatch loop.",
+      "description": "The longest single time each responsiveness monitor's thread was held in each step of the graph: the worst block, not an average. About a millisecond when free; the monitors log a stall past 1 s. Timed with a monotonic clock, so a step of the system clock does not show here. Gateway: its single event loop. Workers: the interactive thread request handling shares with the dispatch loop.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2275,21 +2275,25 @@
             }
           },
           "mappings": [],
-          "max": 11,
           "min": 0,
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "red",
+                "color": "green",
                 "value": null
               },
               {
-                "color": "green",
-                "value": 9
+                "color": "orange",
+                "value": 0.25
+              },
+              {
+                "color": "red",
+                "value": 1
               }
             ]
-          }
+          },
+          "unit": "s"
         },
         "overrides": []
       },
@@ -2318,7 +2322,7 @@
             "type": "prometheus",
             "uid": "${ds}"
           },
-          "expr": "sum(rate(gateway_event_loop_lag_seconds_count{job=~'$job',worker=''}[$__rate_interval]))",
+          "expr": "max(max_over_time(gateway_event_loop_lag_max_seconds{job=~'$job',worker=''}[$__rate_interval]))",
           "format": "time_series",
           "instant": false,
           "legendFormat": "gateway",
@@ -2330,7 +2334,7 @@
             "type": "prometheus",
             "uid": "${ds}"
           },
-          "expr": "sum by (worker) (rate(worker_interactive_lag_seconds_count{worker=~'$worker'}[$__rate_interval]))",
+          "expr": "max by (worker) (max_over_time(worker_interactive_lag_max_seconds{worker=~'$worker'}[$__rate_interval]))",
           "format": "time_series",
           "instant": false,
           "legendFormat": "{{worker}}",
@@ -2338,7 +2342,7 @@
           "refId": "B"
         }
       ],
-      "title": "Responsiveness monitor tick rate",
+      "title": "Longest delay between ticks",
       "type": "timeseries"
     }
   ],

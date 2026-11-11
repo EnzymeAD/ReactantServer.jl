@@ -542,7 +542,7 @@ mutable struct LptPackingState <: GatewayScheduler
     rate_ewma::Dict{String, Float64}          # requests/sec
     cost_ewma::Dict{String, Float64}          # compute seconds/request
     last_cum::Dict{String, Tuple{Float64, UInt64}}
-    last_rebalance::Float64
+    last_rebalance::Float64                   # monotonic_time() of the last repack (0.0 = none yet)
     # compute-trigger accounting (prober task only): fleet GPU-seconds since the last repack, and each
     # worker's cumulative compute at its last poll, from which the per-tick delta is summed worker by
     # worker (see `_compute_delta!`).
@@ -738,12 +738,15 @@ function _repack!(
     )
     # Never replace a live placement with one packed over no workers.
     (isempty(poll.polled) && !isempty(@atomic s.assignment)) && return Set{String}()
+    # When this repack runs: the time of day it reports (`last_repack_unix_seconds`), and the
+    # monotonic time the interval to the next repack is measured from.
     now = time()
+    mono = monotonic_time()
     # Elapsed since the last repack, for the repack log: wall time and the fleet GPU-seconds that
     # accumulated (the compute that triggered this repack). Captured before they are reset below.
-    wall_elapsed = s.last_rebalance == 0.0 ? 0.0 : now - s.last_rebalance
+    wall_elapsed = s.last_rebalance == 0.0 ? 0.0 : mono - s.last_rebalance
     compute_elapsed = s.compute_accum
-    s.last_rebalance = now
+    s.last_rebalance = mono
 
     # Arrival rates. The sample is the wall-clock arrival rate over the interval (so u = rate * cost
     # stays in GPU-sec/wall-sec, comparable to a worker's capacity 1.0); the EWMA decays against the
@@ -1001,7 +1004,7 @@ function _prime_and_commit!(
         prev::Dict{String, Placement}, plan::Dict{String, Placement}, primed::Vector{Vector{String}},
         k::PackingKnobs, complete_seq::Int, epoch::Int = s.transition_epoch
     )
-    t0 = time()
+    t0 = monotonic_time()
     try
         arrivals = Dict{String, Vector{String}}()       # worker -> the models moving onto it
         for c in primed, m in c
@@ -1018,10 +1021,10 @@ function _prime_and_commit!(
                 resp = nothing
                 err = "the worker is not in the gateway's pool"
                 if wc !== nothing
-                    t1 = time()
+                    t1 = monotonic_time()
                     # Sent once more after a transport failure (see `stage_weights`).
                     resp, err = stage_weights(wc, unique(names), hold, k.stage_timeout_seconds)
-                    metrics === nothing || observe_worker!(metrics, "StageWeights", w, time() - t1)
+                    metrics === nothing || observe_worker!(metrics, "StageWeights", w, monotonic_time() - t1)
                 end
                 if resp === nothing
                     @warn "lpt_packing: staging weights for a placement change failed; its changes stay unmade" worker = w models = names error = err
@@ -1037,7 +1040,7 @@ function _prime_and_commit!(
         # Abandoned while staging: install nothing. From this check to the install below nothing
         # yields, and the prober runs on this task's thread, so no membership repack can come between.
         if s.transition_epoch != epoch
-            @info "lpt_packing: staged placement changes abandoned; the healthy workers changed while they staged" abandoned = length(primed) staging_seconds = round(time() - t0; digits = 1)
+            @info "lpt_packing: staged placement changes abandoned; the healthy workers changed while they staged" abandoned = length(primed) staging_seconds = round(monotonic_time() - t0; digits = 1)
             return nothing
         end
         ready(w, m) = get(states, (w, m), "failed") in ("resident", "staged", "skipped")
@@ -1063,7 +1066,7 @@ function _prime_and_commit!(
             new_repack = false
         )
         metrics === nothing || inc_staged_changes!(metrics, length(accepted), dropped)
-        @info "lpt_packing: staged placement changes committed" committed = length(accepted) dropped = dropped staging_seconds = round(time() - t0; digits = 1)
+        @info "lpt_packing: staged placement changes committed" committed = length(accepted) dropped = dropped staging_seconds = round(monotonic_time() - t0; digits = 1)
         _maybe_compact_fleet!(s, pool, metrics, changed; k = k)
     catch err
         @error "lpt_packing: committing staged placement changes failed; the placement is unchanged" exception = (err, catch_backtrace())
@@ -1706,7 +1709,7 @@ function verify_lpt_packing_preconditions!(
     )
     clients = all_clients(pool)
     forever = isinf(wait_seconds)
-    deadline = (forever || wait_seconds <= 0) ? nothing : time() + Float64(wait_seconds)
+    deadline = (forever || wait_seconds <= 0) ? nothing : monotonic_time() + Float64(wait_seconds)
     statuses = Dict{String, Any}()
     wedged_streak = 0
     while true
@@ -1740,7 +1743,7 @@ function verify_lpt_packing_preconditions!(
             @error "lpt_packing: control-plane calls timed out for $(wedged_streak) consecutive rounds; the gRPC client stack is wedged. Exiting so the supervisor restarts the gateway with a fresh stack." rounds = wedged_streak
             exit(1)
         end
-        if !forever && (wait_seconds <= 0 || time() >= deadline)
+        if !forever && (wait_seconds <= 0 || monotonic_time() >= deadline)
             suffix = wait_seconds <= 0 ? "" : " after $(round(Int, wait_seconds))s"
             error("lpt_packing scheduling: worker(s) $(sort(pending)) unreachable over the control plane$(suffix); all workers must be up (set REACTANT_GATEWAY_STARTUP_WAIT_SECONDS to wait for slow-starting workers, or 'inf' to wait indefinitely)")
         end

@@ -362,6 +362,17 @@ tick_rate(; kw...) = ts(
     min = 0, max = 11, thresholds = steps("red", (9, "green")), custom = D("thresholdsStyle" => D("mode" => "dashed")),
     desc = TICKS_HELP, kw...
 )
+# The longest single delay between ticks. Each monitor exports the longest lateness of its last 30 s,
+# twice the scrape interval, so the maximum of that gauge over a step is the worst block in the step:
+# what the tick rate and the p99 average away.
+const LONGEST_GW = "max(max_over_time(gateway_event_loop_lag_max_seconds{$GW_SELF}%ri))"
+const LONGEST_WORKER = "max by (worker) (max_over_time(worker_interactive_lag_max_seconds{%W}%ri))"
+const LONGEST_HELP = "The longest single time each responsiveness monitor's thread was held in each step of the graph: the worst block, not an average. About a millisecond when free; the monitors log a stall past 1 s. Timed with a monotonic clock, so a step of the system clock does not show here. Gateway: its single event loop. Workers: the interactive thread request handling shares with the dispatch loop."
+longest_delay(; kw...) = ts(
+    "Longest delay between ticks", [q(LONGEST_GW; legend = "gateway"), q(LONGEST_WORKER; legend = "{{worker}}")];
+    unit = "s", min = 0, thresholds = steps("green", (0.25, "orange"), (1, "red")),
+    custom = D("thresholdsStyle" => D("mode" => "dashed")), desc = LONGEST_HELP, kw...
+)
 # Rank models over the range by a counter, and keep the top N.
 top(inner, counter, filt = "%W,%M") = "($inner) and on (model) topk(%n, sum by (model) (increase($counter{$filt}%rg @ end())))"
 per_min(x) = "($x) * 60"
@@ -493,7 +504,7 @@ function overview()
         b,
         timeline("Worker ready", q("max by (worker) (gateway_worker_ready{%W})"; legend = "{{worker}}"); w = 8, h = 6),
         timeline("Worker metrics answering", q("max by (worker) (gateway_worker_metrics_up{%W})"; legend = "{{worker}}"); w = 8, h = 6),
-        tick_rate(; w = 8, h = 6, legend = :list),
+        longest_delay(; w = 8, h = 6, legend = :list),
     )
     return b
 end
@@ -1169,7 +1180,10 @@ function resources()
             "GC time share", [
                 q("sum by (worker) (rate(julia_gc_seconds_total{%W}%ri))"; legend = "{{worker}}"),
                 q("sum(rate(julia_gc_seconds_total{$gw}%ri))"; legend = "gateway"),
-            ]; unit = "percentunit", w = 8, desc = "Share of wall time spent in garbage collection."
+                q("sum by (worker) (rate(julia_gc_time_to_safepoint_seconds_total{%W}%ri))"; legend = "{{worker}} safepoint wait"),
+                q("sum(rate(julia_gc_time_to_safepoint_seconds_total{$gw}%ri))"; legend = "gateway safepoint wait"),
+            ]; unit = "percentunit", w = 8,
+            desc = "Share of wall time spent in garbage collection, and (safepoint wait) spent waiting for every thread to reach a safepoint before a collection, which Julia does not count as collection time. Every thread of the process waits through both; a long safepoint wait means a thread was inside a long call that is not GC-safe."
         ),
         ts(
             "Collections per minute", [
@@ -1212,19 +1226,20 @@ function resources()
     row!(b, "Responsiveness")
     line!(
         b,
-        tick_rate(; w = 8),
+        longest_delay(; w = 6),
+        tick_rate(; w = 6),
         ts(
             "Monitor lateness, p99", [
                 q("histogram_quantile(0.99, sum by (le) (rate(gateway_event_loop_lag_seconds_bucket{$GW_SELF}%ri)))"; legend = "gateway"),
                 q("histogram_quantile(0.99, sum by (worker, le) (rate(worker_interactive_lag_seconds_bucket{%W}%ri)))"; legend = "{{worker}}"),
-            ]; unit = "s", w = 8,
+            ]; unit = "s", w = 6,
             desc = "How late the monitor woke: the time its thread was held. About a millisecond when free."
         ),
         ts(
             "Stalls over 1 s per minute", [
                 q(per_min("sum(rate(gateway_event_loop_stalls_total{$GW_SELF}%ri))"); legend = "gateway"),
                 q(per_min("sum by (worker) (rate(worker_interactive_stalls_total{%W}%ri))"); legend = "{{worker}}"),
-            ]; bars = true, w = 8,
+            ]; bars = true, w = 6,
             desc = "Each is also logged with how long the thread was blocked."
         ),
     )

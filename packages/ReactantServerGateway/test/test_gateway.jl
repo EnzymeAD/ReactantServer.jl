@@ -882,6 +882,51 @@ end
         count_ = parse(Float64, match(r"^gateway_event_loop_lag_seconds_count (\S+)$"m, body)[1])
         under = parse(Float64, match(r"^gateway_event_loop_lag_seconds_bucket\{le=\"0.256\"\} (\S+)$"m, body)[1])
         @test count_ >= 2 && under < count_          # some ticks were on time, at least one 0.4 s late
+        # The gauge holds the longest delay of the last 30 s: the 0.4 s hold, not an average.
+        longest = parse(Float64, match(r"^gateway_event_loop_lag_max_seconds (\S+)$"m, body)[1])
+        @test 0.3 <= longest < 5.0
+    end
+
+    @testset "a stall's log line says how much of it was collection, safepoint wait and compiling" begin
+        metrics = ReactantServerGateway.GatewayMetrics()
+        logger = Test.TestLogger()
+        Base.CoreLogging.with_logger(logger) do
+            m = ReactantServerGateway.LoopMonitor(metrics; interval = 0.02, warn_after = 0.2)
+            ReactantServerGateway.start_loop_monitor!(m)
+            sleep(0.2)
+            t = time()
+            while time() - t < 0.4                   # hold the thread without yielding
+            end
+            sleep(0.2)
+            ReactantServerGateway.stop_loop_monitor!(m)
+        end
+        stalls = filter(r -> occursin("event loop was blocked", string(r.message)), logger.logs)
+        @test !isempty(stalls)
+        kw = Dict(last(stalls).kwargs)
+        @test all(k -> haskey(kw, k), (:blocked_s, :gc_s, :safepoint_wait_s, :collections, :compile_s))
+        io = IOBuffer()
+        ReactantServerGateway.expose(io, metrics)
+        @test occursin(r"^julia_gc_time_to_safepoint_seconds_total \S+$"m, String(take!(io)))
+    end
+
+    @testset "the event-loop monitor's longest delay covers its window, then is forgotten" begin
+        metrics = ReactantServerGateway.GatewayMetrics()
+        m = ReactantServerGateway.LoopMonitor(metrics; window = 30)
+        longest() = (io = IOBuffer(); ReactantServerGateway.expose(io, metrics); parse(Float64, match(r"^gateway_event_loop_lag_max_seconds (\S+)$"m, String(take!(io)))[1]))
+        observe(late, second) = ReactantServerGateway._observe_lag!(m, late, second)
+        observe(0.5, 1000)
+        observe(0.1, 1010)
+        @test longest() == 0.5
+        observe(0.05, 1029)
+        @test longest() == 0.5                       # second 1000 is still within the last 30 s
+        observe(0.05, 1030)
+        @test longest() == 0.1                       # 1000 has left the window (its slot is reused); 1010 has not
+        observe(0.02, 1040)
+        @test longest() == 0.05                      # 1010 has left too
+        observe(0.2, 1040)
+        @test longest() == 0.2                       # a second keeps its longest tick
+        observe(0.01, 1100)
+        @test longest() == 0.01                      # after a quiet stretch only the new tick counts
     end
 
     @testset "latency buckets reach past a minute" begin

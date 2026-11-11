@@ -143,7 +143,7 @@ current_table(d::DiscoveredRoutes) = @atomic d.current
 swap_table!(d::DiscoveredRoutes, t::RoutingTable) = (@atomic d.current = t; nothing)
 
 """
-    note_worker_ready!(d, url, ready, now = time(); observed_at = now) -> Bool
+    note_worker_ready!(d, url, ready, now = monotonic_time(); observed_at = now) -> Bool
 
 Record a verdict on the worker at `url`: ready, or not (not ready, unreachable, hung, or its
 connection refused). This is the one place a worker's health changes: the prober marks a worker
@@ -155,7 +155,7 @@ ready verdict. A change of health swaps in a rebuilt routing table at once, so t
 already sees it. Returns whether the worker's health changed.
 """
 function note_worker_ready!(
-        d::DiscoveredRoutes, url::AbstractString, ready::Bool, now::Real = time();
+        d::DiscoveredRoutes, url::AbstractString, ready::Bool, now::Real = monotonic_time();
         observed_at::Real = now
     )
     return lock(d.lock) do
@@ -180,7 +180,7 @@ is_healthy(d::DiscoveredRoutes, url::AbstractString) = is_healthy(current_table(
 
 # Record one round of discovery answers (`nothing` for a worker that did not answer) and swap in the
 # table they make. Returns the table.
-function record_answers!(d::DiscoveredRoutes, answers::AbstractDict, now::Real = time())
+function record_answers!(d::DiscoveredRoutes, answers::AbstractDict, now::Real = monotonic_time())
     return lock(d.lock) do
         for (url, names) in answers
             (names === nothing || haskey(d.down_since, url)) && continue
@@ -193,7 +193,7 @@ end
 # Build and swap in the table from the recorded answers: every model a healthy worker reported is
 # routed to the healthy workers that reported it; a model only down workers reported is held; and a
 # worker whose outage has lasted past `retention` is forgotten. The caller holds `d.lock`.
-function rebuild_table!(d::DiscoveredRoutes, now::Real = time())
+function rebuild_table!(d::DiscoveredRoutes, now::Real = monotonic_time())
     live = Dict{String, Vector{String}}()
     standby = Dict{String, Vector{String}}()
     for url in collect(keys(d.answers))

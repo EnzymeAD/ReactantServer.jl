@@ -16,6 +16,7 @@ function wait_for(pred; timeout::Real = 30.0, interval::Real = 0.05)
 end
 
 @testset "ReactantServerNode" begin
+    include("test_wall_clock.jl")
     include("test_gpus.jl")
     # build_supervisor falls back to the image's gateway.yml mount point whenever that file exists,
     # and a host running a deployment may have one. Point the fallback at a path that does not exist

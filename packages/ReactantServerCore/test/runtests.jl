@@ -18,4 +18,5 @@ const ReactantServer = ReactantServerCore
     include("test_shm_backing.jl")
     include("test_weight_store.jl")
     include("test_drain.jl")
+    include("test_clock.jl")
 end
