@@ -1,0 +1,162 @@
+# HELP julia_compile_seconds_total Time the Julia compiler has spent compiling code, since compile timing was enabled at startup.
+# TYPE julia_compile_seconds_total counter
+julia_compile_seconds_total{gpu="1",worker="worker1"} 16.378189599
+# HELP julia_gc_alloc_bytes_total Total number of allocated bytes
+# TYPE julia_gc_alloc_bytes_total counter
+julia_gc_alloc_bytes_total{gpu="1",worker="worker1"} 48493415072
+# HELP julia_gc_alloc_total Total number of allocations (calls to malloc, realloc, etc)
+# TYPE julia_gc_alloc_total counter
+julia_gc_alloc_total{gpu="1",type="bigalloc",worker="worker1"} 75203
+julia_gc_alloc_total{gpu="1",type="malloc",worker="worker1"} 147689
+julia_gc_alloc_total{gpu="1",type="poolalloc",worker="worker1"} 190751674
+julia_gc_alloc_total{gpu="1",type="realloc",worker="worker1"} 0
+# HELP julia_gc_collections_total Total number of calls to garbage collection
+# TYPE julia_gc_collections_total counter
+julia_gc_collections_total{gpu="1",type="full",worker="worker1"} 35
+julia_gc_collections_total{gpu="1",type="minor",worker="worker1"} 979
+# HELP julia_gc_free_total Total number of calls to free()
+# TYPE julia_gc_free_total counter
+julia_gc_free_total{gpu="1",worker="worker1"} 145809
+# HELP julia_gc_live_bytes Current number of live bytes
+# TYPE julia_gc_live_bytes gauge
+julia_gc_live_bytes{gpu="1",worker="worker1"} 1328636080
+# HELP julia_gc_seconds_total Total time spent in garbage collection
+# TYPE julia_gc_seconds_total counter
+julia_gc_seconds_total{gpu="1",worker="worker1"} 7.481322436
+# HELP julia_gc_time_to_safepoint_seconds_total Time garbage collections spent waiting for every thread to reach a safepoint before collecting, since the responsiveness monitor started; not part of julia_gc_seconds_total. Every thread waits meanwhile.
+# TYPE julia_gc_time_to_safepoint_seconds_total counter
+julia_gc_time_to_safepoint_seconds_total{gpu="1",worker="worker1"} 0.10730914000000005
+# HELP julia_recompile_seconds_total The part of julia_compile_seconds_total spent recompiling methods invalidated by later definitions.
+# TYPE julia_recompile_seconds_total counter
+julia_recompile_seconds_total{gpu="1",worker="worker1"} 0.812277727
+# HELP process_cpu_seconds_total Total user and system CPU time spent in seconds.
+# TYPE process_cpu_seconds_total counter
+process_cpu_seconds_total{gpu="1",mode="system",worker="worker1"} 36.83
+process_cpu_seconds_total{gpu="1",mode="user",worker="worker1"} 221.12
+# HELP process_io_rchar_bytes_total Total number of bytes read in bytes (rchar from /proc/[pid]/io).
+# TYPE process_io_rchar_bytes_total counter
+process_io_rchar_bytes_total{gpu="1",worker="worker1"} 23885696050
+# HELP process_io_read_bytes_total Total number of bytes read from the file system (read_bytes from /proc/[pid]/io).
+# TYPE process_io_read_bytes_total counter
+process_io_read_bytes_total{gpu="1",worker="worker1"} 6936453120
+# HELP process_io_syscr_total Total number of read I/O operations (syscalls) (syscr from /proc/[pid]/io).
+# TYPE process_io_syscr_total counter
+process_io_syscr_total{gpu="1",worker="worker1"} 212458
+# HELP process_io_syscw_total Total number of write I/O operations (syscalls) (syscw from /proc/[pid]/io).
+# TYPE process_io_syscw_total counter
+process_io_syscw_total{gpu="1",worker="worker1"} 226454
+# HELP process_io_wchar_bytes_total Total number of bytes written in bytes (wchar from /proc/[pid]/io).
+# TYPE process_io_wchar_bytes_total counter
+process_io_wchar_bytes_total{gpu="1",worker="worker1"} 1437383477
+# HELP process_io_write_bytes_total Total number of bytes written to the file system (write_bytes from /proc/[pid]/io).
+# TYPE process_io_write_bytes_total counter
+process_io_write_bytes_total{gpu="1",worker="worker1"} 827392
+# HELP process_open_fds Number of open file descriptors.
+# TYPE process_open_fds gauge
+process_open_fds{gpu="1",worker="worker1"} 163
+# HELP process_resident_memory_bytes Resident memory size in bytes.
+# TYPE process_resident_memory_bytes gauge
+process_resident_memory_bytes{gpu="1",worker="worker1"} 10679541760
+# HELP process_start_time_seconds Start time of the process since unix epoch in seconds.
+# TYPE process_start_time_seconds gauge
+process_start_time_seconds{gpu="1",worker="worker1"} 1794417478.53
+# HELP process_virtual_memory_bytes Virtual memory size in bytes.
+# TYPE process_virtual_memory_bytes gauge
+process_virtual_memory_bytes{gpu="1",worker="worker1"} 75073634304
+# HELP worker_dispatch_total Total dispatches per model.
+# TYPE worker_dispatch_total counter
+worker_dispatch_total{gpu="1",model="model_001",worker="worker1"} 87
+worker_dispatch_total{gpu="1",model="model_002",worker="worker1"} 0
+worker_dispatch_total{gpu="1",model="model_003",worker="worker1"} 3
+# HELP worker_info Worker identity and configuration (value is always 1).
+# TYPE worker_info gauge
+worker_info{control_mode="dynamic",device_ordinal="0",discipline="fifo",gpu="1",residency_mode="self_managed",worker="worker1"} 1
+# HELP worker_interactive_lag_max_seconds The longest lateness of the worker's interactive-thread monitor over the last 30 s: the longest single time the thread shared by request handling and the dispatch loop was held in that window.
+# TYPE worker_interactive_lag_max_seconds gauge
+worker_interactive_lag_max_seconds{gpu="1",worker="worker1"} 0.0022463943809270803
+# HELP worker_interactive_lag_seconds How late the worker's interactive-thread monitor woke, per 0.1 s tick: the time the thread shared by request handling and the dispatch loop was held by other work. About a millisecond when it is free.
+# TYPE worker_interactive_lag_seconds histogram
+worker_interactive_lag_seconds_bucket{gpu="1",le="+Inf",worker="worker1"} 19536
+worker_interactive_lag_seconds_bucket{gpu="1",le="0.001",worker="worker1"} 1620
+worker_interactive_lag_seconds_bucket{gpu="1",le="0.002",worker="worker1"} 19098
+worker_interactive_lag_seconds_bucket{gpu="1",le="0.004",worker="worker1"} 19256
+worker_interactive_lag_seconds_bucket{gpu="1",le="0.008",worker="worker1"} 19302
+worker_interactive_lag_seconds_bucket{gpu="1",le="0.016",worker="worker1"} 19396
+worker_interactive_lag_seconds_bucket{gpu="1",le="0.032",worker="worker1"} 19466
+worker_interactive_lag_seconds_bucket{gpu="1",le="0.064",worker="worker1"} 19505
+worker_interactive_lag_seconds_bucket{gpu="1",le="0.128",worker="worker1"} 19525
+worker_interactive_lag_seconds_bucket{gpu="1",le="0.256",worker="worker1"} 19534
+worker_interactive_lag_seconds_bucket{gpu="1",le="0.512",worker="worker1"} 19536
+worker_interactive_lag_seconds_bucket{gpu="1",le="1.024",worker="worker1"} 19536
+worker_interactive_lag_seconds_bucket{gpu="1",le="131.072",worker="worker1"} 19536
+worker_interactive_lag_seconds_bucket{gpu="1",le="16.384",worker="worker1"} 19536
+worker_interactive_lag_seconds_bucket{gpu="1",le="2.048",worker="worker1"} 19536
+worker_interactive_lag_seconds_bucket{gpu="1",le="32.768",worker="worker1"} 19536
+worker_interactive_lag_seconds_bucket{gpu="1",le="4.096",worker="worker1"} 19536
+worker_interactive_lag_seconds_bucket{gpu="1",le="65.536",worker="worker1"} 19536
+worker_interactive_lag_seconds_bucket{gpu="1",le="8.192",worker="worker1"} 19536
+worker_interactive_lag_seconds_count{gpu="1",worker="worker1"} 19536
+worker_interactive_lag_seconds_sum{gpu="1",worker="worker1"} 30.547938814008592
+# HELP worker_models_loaded Number of loaded models.
+# TYPE worker_models_loaded gauge
+worker_models_loaded{gpu="1",worker="worker1"} 96
+# HELP worker_queue_wait_seconds Queue-wait latency per model (seconds).
+# TYPE worker_queue_wait_seconds gauge
+worker_queue_wait_seconds{gpu="1",model="model_001",quantile="0.5",worker="worker1"} 0.14408598095178604
+worker_queue_wait_seconds{gpu="1",model="model_001",quantile="0.99",worker="worker1"} 0.28181229159235954
+worker_queue_wait_seconds{gpu="1",model="model_002",quantile="0.5",worker="worker1"} 0
+worker_queue_wait_seconds{gpu="1",model="model_002",quantile="0.99",worker="worker1"} 0
+worker_queue_wait_seconds{gpu="1",model="model_003",quantile="0.5",worker="worker1"} 0.14160524867475033
+worker_queue_wait_seconds{gpu="1",model="model_003",quantile="0.99",worker="worker1"} 0.42670957557857037
+# HELP worker_request_latency_seconds Worker ModelInfer handler latency (seconds).
+# TYPE worker_request_latency_seconds histogram
+worker_request_latency_seconds_bucket{gpu="1",le="+Inf",model="model_001",worker="worker1"} 87
+worker_request_latency_seconds_bucket{gpu="1",le="+Inf",model="model_003",worker="worker1"} 3
+worker_request_latency_seconds_bucket{gpu="1",le="0.001",model="model_001",worker="worker1"} 0
+worker_request_latency_seconds_bucket{gpu="1",le="0.001",model="model_003",worker="worker1"} 0
+worker_request_latency_seconds_bucket{gpu="1",le="0.002",model="model_001",worker="worker1"} 0
+worker_request_latency_seconds_bucket{gpu="1",le="0.002",model="model_003",worker="worker1"} 0
+worker_request_latency_seconds_bucket{gpu="1",le="0.004",model="model_001",worker="worker1"} 0
+worker_request_latency_seconds_bucket{gpu="1",le="0.004",model="model_003",worker="worker1"} 0
+worker_request_latency_seconds_bucket{gpu="1",le="0.008",model="model_001",worker="worker1"} 0
+worker_request_latency_seconds_bucket{gpu="1",le="0.008",model="model_003",worker="worker1"} 0
+worker_request_latency_seconds_bucket{gpu="1",le="0.016",model="model_001",worker="worker1"} 0
+worker_request_latency_seconds_bucket{gpu="1",le="0.016",model="model_003",worker="worker1"} 0
+worker_request_latency_seconds_bucket{gpu="1",le="0.032",model="model_001",worker="worker1"} 0
+worker_request_latency_seconds_bucket{gpu="1",le="0.032",model="model_003",worker="worker1"} 0
+worker_request_latency_seconds_bucket{gpu="1",le="0.064",model="model_001",worker="worker1"} 0
+worker_request_latency_seconds_bucket{gpu="1",le="0.064",model="model_003",worker="worker1"} 0
+worker_request_latency_seconds_bucket{gpu="1",le="0.128",model="model_001",worker="worker1"} 38
+worker_request_latency_seconds_bucket{gpu="1",le="0.128",model="model_003",worker="worker1"} 0
+worker_request_latency_seconds_bucket{gpu="1",le="0.256",model="model_001",worker="worker1"} 85
+worker_request_latency_seconds_bucket{gpu="1",le="0.256",model="model_003",worker="worker1"} 1
+worker_request_latency_seconds_bucket{gpu="1",le="0.512",model="model_001",worker="worker1"} 87
+worker_request_latency_seconds_bucket{gpu="1",le="0.512",model="model_003",worker="worker1"} 1
+worker_request_latency_seconds_bucket{gpu="1",le="1.024",model="model_001",worker="worker1"} 87
+worker_request_latency_seconds_bucket{gpu="1",le="1.024",model="model_003",worker="worker1"} 1
+worker_request_latency_seconds_bucket{gpu="1",le="131.072",model="model_001",worker="worker1"} 87
+worker_request_latency_seconds_bucket{gpu="1",le="131.072",model="model_003",worker="worker1"} 3
+worker_request_latency_seconds_bucket{gpu="1",le="16.384",model="model_001",worker="worker1"} 87
+worker_request_latency_seconds_bucket{gpu="1",le="16.384",model="model_003",worker="worker1"} 3
+worker_request_latency_seconds_bucket{gpu="1",le="2.048",model="model_001",worker="worker1"} 87
+worker_request_latency_seconds_bucket{gpu="1",le="2.048",model="model_003",worker="worker1"} 1
+worker_request_latency_seconds_bucket{gpu="1",le="32.768",model="model_001",worker="worker1"} 87
+worker_request_latency_seconds_bucket{gpu="1",le="32.768",model="model_003",worker="worker1"} 3
+worker_request_latency_seconds_bucket{gpu="1",le="4.096",model="model_001",worker="worker1"} 87
+worker_request_latency_seconds_bucket{gpu="1",le="4.096",model="model_003",worker="worker1"} 3
+worker_request_latency_seconds_bucket{gpu="1",le="65.536",model="model_001",worker="worker1"} 87
+worker_request_latency_seconds_bucket{gpu="1",le="65.536",model="model_003",worker="worker1"} 3
+worker_request_latency_seconds_bucket{gpu="1",le="8.192",model="model_001",worker="worker1"} 87
+worker_request_latency_seconds_bucket{gpu="1",le="8.192",model="model_003",worker="worker1"} 3
+worker_request_latency_seconds_count{gpu="1",model="model_001",worker="worker1"} 87
+worker_request_latency_seconds_count{gpu="1",model="model_003",worker="worker1"} 3
+worker_request_latency_seconds_sum{gpu="1",model="model_001",worker="worker1"} 13.150092009454966
+worker_request_latency_seconds_sum{gpu="1",model="model_003",worker="worker1"} 5.283775854855776
+# HELP worker_requests_total Worker ModelInfer requests by model and gRPC status.
+# TYPE worker_requests_total counter
+worker_requests_total{gpu="1",model="model_001",status="OK",worker="worker1"} 87
+worker_requests_total{gpu="1",model="model_003",status="OK",worker="worker1"} 3
+# HELP worker_weight_stalled_reads Abandoned weight reads that have not returned. Each holds a thread; at a bound of a few, the worker starts no read and requests for models off the device fail with UNAVAILABLE.
+# TYPE worker_weight_stalled_reads gauge
+worker_weight_stalled_reads{gpu="1",worker="worker1"} 0
+worker_weight_stalled_reads_total{gpu="1",worker="worker1"} 0
