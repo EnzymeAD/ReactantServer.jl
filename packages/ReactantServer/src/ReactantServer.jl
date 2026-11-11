@@ -101,6 +101,9 @@ include("meta.jl")
 include("transport/metrics.jl")
 include("transport/responsiveness.jl")   # the interactive-thread lag monitor
 include("transport/grpc.jl")
+# Each model's request path compiled before it serves. After grpc.jl, whose decode, validation and
+# encode it runs; `serve` and the scheduler's `load_model!` call it.
+include("warmup.jl")
 include("transport/drain.jl")   # the graceful-drain gate on the gRPC server
 include("transport/control_grpc.jl")
 include("server.jl")

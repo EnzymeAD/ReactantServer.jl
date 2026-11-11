@@ -340,6 +340,10 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     else
         start!(sched)
     end
+    # Compile the rest of each model's request path before serving (its model.jl hooks, and the
+    # codec, coalescing and slicing for its tensor types), so a model's first request does not; the
+    # probe and the cost warmup run only the programs. Nothing scheduling reads changes (warmup.jl).
+    warm_request_paths!(registry)
     # Model lifecycle is governed by model_control_mode. Only `dynamic` runs the filesystem
     # watcher (Triton-style POLL): it polls the model dirs on a background task and hot-swaps
     # bundles via the scheduler's control queue, reusing the residency/on-demand/store decisions
