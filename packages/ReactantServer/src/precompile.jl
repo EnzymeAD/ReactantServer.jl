@@ -6,10 +6,10 @@
 #
 # What it covers is package code specialized on concrete types: the raw ModelInfer handler with u8,
 # f32 and i64 tensors at ranks 2 and 4 (decode, scheduling, batching and padding, the mock execution,
-# encode), one typed-contents request, the control and metadata handlers with their gRPC
-# serialization, and a full metrics exposition. What it cannot cover is code that only exists at run
-# time: a bundle's model.jl, and the HTTP/gRPC server closures specialized on a live server. It opens
-# no sockets and leaves no task running.
+# encode), one typed-contents request, the request-path warm-up, the control and metadata handlers
+# with their gRPC serialization, and a full metrics exposition. What it cannot cover is code that only
+# exists at run time: a bundle's model.jl, and the HTTP/gRPC server closures specialized on a live
+# server. It opens no sockets and leaves no task running.
 
 using PrecompileTools: @setup_workload, @compile_workload
 
@@ -162,6 +162,10 @@ using PrecompileTools: @setup_workload, @compile_workload
                 ]
             )
             _handle_infer_raw(ctx, _encode_message(typed), 0)
+            # The request-path warm-up that runs for every model before it serves (warmup.jl).
+            for e in values(reg.by_name)
+                warm_request_path!(e)
+            end
             # The control and metadata answers, serialized the way gRPCServer does for typed handlers.
             for resp in (
                     _handle_describe_models(ctx, control.DescribeModelsRequest()),

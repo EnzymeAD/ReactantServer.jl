@@ -178,6 +178,19 @@ tensor that does not match its batch) should throw [`InvalidInputError`](@ref): 
 gets `INVALID_ARGUMENT`, and the gateway does not retry the request elsewhere. Any other exception
 a hook throws is treated as a failure on the server's side and answered `INTERNAL`.
 
+The hooks are Julia code that only exists once the bundle loads, so they are compiled when first
+called. So that this is not a model's first request, the worker warms each model before it serves,
+at startup and on every hot load: it runs the request path once on a request built from the
+manifest, every client input zero-filled with one row and each variable axis at the size of the
+first compiled shape variant, or 1. Preprocess runs on that request and postprocess on zero outputs
+of the program's declared shapes (no program runs), along with the worker's own decode, batching,
+slicing and encode for the model's tensor types. The warm-up is not a request: no metric counts it
+and scheduling does not see it. A hook that throws on the zero request is logged, and the model
+serves as usual. Code that only real data reaches through a call whose argument type is known only
+at run time (the body of a per-token loop over an untyped tensor, say) is still compiled by the
+first request; asserting the types a hook reads, as in `only(outputs).data::Array{Float32, 3}`,
+lets the warm-up compile all of it.
+
 For a bundle whose `model.jl` chains several models with data-dependent logic rather than wrapping
 one executable, see [Meta Models](meta_models.md). That feature is experimental and its design is
 subject to change; prefer a single program with the fixed-size result pattern below where possible.

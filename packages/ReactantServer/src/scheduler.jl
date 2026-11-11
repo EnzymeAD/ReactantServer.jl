@@ -1292,25 +1292,34 @@ end
 # Build zero-filled executable inputs at batch size `sz` (0 = unbatched) and input-shape `variant`
 # for warmup. The variant supplies the variable-axis sizes in the same (input, axis) order they were
 # collected in (see ModelSignature.variant_spec); returns nothing if it runs short.
-function _zero_inputs(entry::ModelEntry, variant::VariantKey, sz::Int)
-    inputs = NamedTensor[]
+_zero_inputs(entry::ModelEntry, variant::VariantKey, sz::Int) =
+    _synth_zeros(entry.manifest.executable_inputs, sz == 0 ? 1 : sz, variant)
+
+# Zero-filled tensors for `specs`: `rows` along a batch axis, the declared size along a fixed one, and
+# along a variable one the next size from `variant` (nothing when it runs short), or 1 for every
+# variable axis when no variant is given (a client tensor, whose variable axes the variants do not
+# describe).
+function _synth_zeros(specs::Vector{TensorSpec}, rows::Int, variant::Union{VariantKey, Nothing})
+    tensors = NamedTensor[]
     vi = 0
-    for sp in entry.manifest.executable_inputs
+    for sp in specs
         dims = Int[]
         for d in sp.shape
             if d.kind == BATCH
-                push!(dims, sz == 0 ? 1 : sz)
+                push!(dims, rows)
             elseif d.kind == FIXED
                 push!(dims, d.size)
+            elseif variant === nothing
+                push!(dims, 1)
             else                          # variable axis: take the next size from the variant
                 vi += 1
                 vi <= length(variant) || return nothing
                 push!(dims, variant[vi])
             end
         end
-        push!(inputs, NamedTensor(sp.name, zeros(julia_type(sp.dtype), dims...)))
+        push!(tensors, NamedTensor(sp.name, zeros(julia_type(sp.dtype), dims...)))
     end
-    return inputs
+    return tensors
 end
 
 # Seed one entry's cost_estimate by running each compiled (variant, size) twice, the first run being
@@ -2462,7 +2471,8 @@ then the new entry is compiled (`build_loaded_model`) and admitted. The compile,
 resident model's weights that comes with it, run on a default-pool task the loop waits for
 ([`off_interactive`](@ref)), so the worker keeps handling requests and health checks meanwhile; no
 model dispatches until the op ends. This is the dynamic directory watcher's load/reload path.
-Returns the model name.
+Before any of it, the new version's request path is warmed ([`warm_request_path!`](@ref)), off the
+interactive thread and outside the op. Returns the model name.
 
 `unchanged()` says whether the bundle's files are still the ones `entry` was read from. It is asked
 before the control op, where `false` leaves any existing model serving, and again once the new
@@ -2474,6 +2484,11 @@ function load_model!(
         state::ResidencyState, on_demand::Bool, store::WeightStore = PrivateWeightStore(),
         executable_cache::Bool = false, unchanged::Function = () -> true
     )
+    # Compile the request path (model.jl hooks, codec, coalescing and slicing) first, so the new
+    # version's first request does not: on a default-pool task, before the control op, so neither
+    # the interactive thread nor the dispatch loop waits for it (see warmup.jl). It needs only the
+    # bundle, not the compiled program, and changes nothing scheduling reads.
+    warm_request_path!(entry)
     # Read the weights before the control op, which runs on the dispatch loop: a device-resident
     # model's host arrays (and a CPU worker's, which keeps every model resident), or an on-demand
     # model's staged weights when admission will run it. A system-pinned model's host floor is
