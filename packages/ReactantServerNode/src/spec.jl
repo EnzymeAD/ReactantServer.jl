@@ -304,6 +304,25 @@ const _GATEWAY_BOOT = _PDEATHSIG_BOOT * """
     ReactantServerGateway.serve_gateway(isempty(ARGS) ? nothing : ARGS[1])
     """
 
+# The embedded gateway's garbage collector runs `--gcthreads=<mark>,1`. The gateway keeps Julia's
+# default pools (one compute thread plus the interactive one), and Julia gives a process one mark
+# thread per compute thread and no sweep thread, so the gateway would mark alone. Its collection
+# time is mostly the full collections, whose mark walks the system and package images whatever the
+# live heap (about 184 ms at the median on a four-worker node), and every request it is proxying
+# waits through each one. Four mark threads and a concurrent sweep thread bring that to about 80 ms.
+# The mark threads are capped at the CPUs Julia detects, so a small host is not oversubscribed while
+# a collection runs.
+const _GATEWAY_GC_MARK_THREADS = 4
+const _GC_THREADS_ENV = "JULIA_NUM_GC_THREADS"
+
+# The gateway's GC flag, or none when the supervisor's environment, which every child inherits, sets
+# JULIA_NUM_GC_THREADS: Julia gives a `--gcthreads` flag precedence over the variable, so the flag
+# would silently overrule an operator's explicit setting. An empty value counts as unset.
+function _gateway_gc_flags(env::AbstractDict = ENV; cpu_threads::Integer = Sys.CPU_THREADS)
+    isempty(strip(get(env, _GC_THREADS_ENV, ""))) || return String[]
+    return ["--gcthreads=$(clamp(cpu_threads, 1, _GATEWAY_GC_MARK_THREADS)),1"]
+end
+
 """
     gateway_spec(children; gateway_path=nothing, endpoints=nothing,
                  metrics_endpoints=nothing) -> ChildSpec
@@ -316,6 +335,10 @@ worker's export. A mounted gateway.yml wins: it is passed through and no endpoin
 The node-wide `rapid_reset_protection` is the exception: it is synthesized into
 `REACTANT_GATEWAY_GRPC_RAPID_RESET_PROTECTION` with or without a mounted file, unless that variable
 is already set or the file sets `grpc.rapid_reset_protection` itself.
+
+Either way the gateway runs with `--gcthreads=4,1` (four mark threads, or as many as the host has
+CPUs if fewer, and one concurrent sweep thread), unless `JULIA_NUM_GC_THREADS` is set, which then
+applies instead.
 """
 function gateway_spec(
         children::Union{AbstractString, ChildEnvironment};
@@ -333,9 +356,11 @@ function gateway_spec(
     )
     ce = children isa ChildEnvironment ? children : workspace_environment(children)
     proj = ce.gateway_project
+    # Base.julia_cmd() carries no --gcthreads (nor any thread setting), so this is the only one.
+    gc = _gateway_gc_flags()
     cmd = gateway_path === nothing ?
-        `$(Base.julia_cmd()) --project=$proj -e $_GATEWAY_BOOT` :
-        `$(Base.julia_cmd()) --project=$proj -e $_GATEWAY_BOOT $gateway_path`
+        `$(Base.julia_cmd()) $gc --project=$proj -e $_GATEWAY_BOOT` :
+        `$(Base.julia_cmd()) $gc --project=$proj -e $_GATEWAY_BOOT $gateway_path`
     pairs = Pair{String, String}[]
     ce.load_path === nothing || push!(pairs, "JULIA_LOAD_PATH" => ce.load_path)
     # The supervisor co-launches the workers, which compile every model before answering. Under

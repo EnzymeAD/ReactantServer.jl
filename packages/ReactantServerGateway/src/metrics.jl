@@ -308,6 +308,100 @@ expose(io::IO, m::GatewayMetrics) = Prometheus.expose(io, m.registry)
 
 # --- Worker metrics aggregation -----------------------------------------------------------------
 
+# The merge reads each exposition as bytes, in place. A scrape of a four-worker node merges about
+# 1 MiB in 11,000 lines; making a String of every line, name and prefix used to allocate ten times
+# that per scrape, and the half-built result, still live when a young collection ran, was promoted
+# and set off full collections at idle.
+
+# A line of input `src` (an index into the merged inputs), as its bytes `first:last` without the
+# line's '\n' or the '\r' before it. A `src` of 0 is no line.
+struct _ExpoLine
+    src::Int
+    first::Int
+    last::Int
+end
+const _NO_LINE = _ExpoLine(0, 1, 0)
+
+# A metric family's name, as bytes of one input. Hashed and compared by content, so finding a family
+# by name needs no String.
+struct _FamilyName
+    bytes::Vector{UInt8}
+    first::Int
+    last::Int
+end
+_name_bytes(n::_FamilyName) = view(n.bytes, n.first:n.last)
+Base.:(==)(a::_FamilyName, b::_FamilyName) = _name_bytes(a) == _name_bytes(b)
+Base.hash(n::_FamilyName, h::UInt) = hash(_name_bytes(n), h)
+
+# Whether an ASCII byte is whitespace to `isspace`.
+_isblank(b::UInt8) = b == UInt8(' ') || UInt8('\t') <= b <= UInt8('\r')
+
+_same_bytes(bytes::Vector{UInt8}, a::UnitRange{Int}, b::UnitRange{Int}) =
+    length(a) == length(b) && view(bytes, a) == view(bytes, b)
+
+function _startswith(bytes::Vector{UInt8}, r::UnitRange{Int}, prefix::String)
+    n = ncodeunits(prefix)
+    return length(r) >= n && view(bytes, first(r):(first(r) + n - 1)) == codeunits(prefix)
+end
+
+# Whether a sample's name is the family name `fam` or extends it with '_' (a histogram's _bucket,
+# _sum and _count), both as ranges of `bytes`.
+function _in_family(bytes::Vector{UInt8}, name::UnitRange{Int}, fam::UnitRange{Int})
+    _same_bytes(bytes, name, fam) && return true
+    (length(name) > length(fam) && bytes[first(name) + length(fam)] == UInt8('_')) || return false
+    return _same_bytes(bytes, first(name):(first(name) + length(fam) - 1), fam)
+end
+
+# What a line is, and the metric name it carries (a range of the same bytes) when it has one.
+const _SKIP, _HELP, _TYPE, _SAMPLE = 0, 1, 2, 3
+
+# Blank and comment lines are skipped; a `# HELP` or `# TYPE` line names its family in its third
+# whitespace-separated field; a sample's name runs up to its first '{' or ' '.
+function _classify(bytes::Vector{UInt8}, line::UnitRange{Int})
+    # Past ASCII, what is whitespace and where a character starts are Unicode's to say, so such a
+    # line (in practice a HELP text or a label value) is classified as a String, which also fails
+    # on a malformed one exactly as the merge always has.
+    if !all(<(0x80), view(bytes, line))
+        return _classify_string(String(view(bytes, line)), first(line))
+    end
+    all(_isblank, view(bytes, line)) && return _SKIP, 1:0
+    kind = _startswith(bytes, line, "# HELP ") ? _HELP :
+        _startswith(bytes, line, "# TYPE ") ? _TYPE : _SAMPLE
+    if kind != _SAMPLE
+        a = first(line) + ncodeunits("# HELP ")
+        while a <= last(line) && _isblank(bytes[a])
+            a += 1
+        end
+        # A header with no name: the String path fails on it as the merge always has.
+        a > last(line) && return _classify_string(String(view(bytes, line)), first(line))
+        z = a
+        while z < last(line) && !_isblank(bytes[z + 1])
+            z += 1
+        end
+        return kind, a:z
+    end
+    bytes[first(line)] == UInt8('#') && return _SKIP, 1:0
+    z = first(line) - 1
+    while z < last(line) && bytes[z + 1] != UInt8('{') && bytes[z + 1] != UInt8(' ')
+        z += 1
+    end
+    return _SAMPLE, first(line):z
+end
+
+# `_classify` of a line held as a String, by the String functions the merge was first written with.
+# `at` is where the line starts in its input, so the name comes back as a range of the input.
+function _classify_string(line::String, at::Int)
+    isempty(strip(line)) && return _SKIP, 1:0
+    if startswith(line, "# HELP ") || startswith(line, "# TYPE ")
+        name = split(line; limit = 4)[3]
+        a = at + first(only(parentindices(name))) - 1
+        return (startswith(line, "# HELP ") ? _HELP : _TYPE), a:(a + ncodeunits(name) - 1)
+    end
+    startswith(line, '#') && return _SKIP, 1:0
+    stop = something(findfirst(c -> c == '{' || c == ' ', line), lastindex(line) + 1)
+    return _SAMPLE, at:(at + ncodeunits(line[1:(stop - 1)]) - 1)
+end
+
 """
     merge_expositions(texts) -> String
 
@@ -315,48 +409,85 @@ Merge several Prometheus text expositions into one valid exposition: each metric
 single `# HELP` / `# TYPE` header (the first seen) and the sample lines from every source are
 grouped under it. The sources are the gateway's own export plus each worker's; workers tag all
 their series with `worker`/`gpu` labels, so samples never collide.
+
+`texts` holds each exposition as bytes (`Vector{UInt8}`, as an HTTP response body comes), which are
+read in place; `String`s are copied to bytes first.
 """
-function merge_expositions(texts::Vector{String})
-    order = String[]                                  # family emission order
-    help = Dict{String, String}()                      # family -> "# HELP ..." line
-    type = Dict{String, String}()                      # family -> "# TYPE ..." line
-    samples = Dict{String, Vector{String}}()           # family -> sample lines
-    current = ""
-    family_of(line) = begin
-        # Sample lines belong to the family of the preceding header when their name extends it
-        # (histogram _bucket/_sum/_count); otherwise the bare metric name is its own family.
-        stop = something(findfirst(c -> c == '{' || c == ' ', line), lastindex(line) + 1)
-        name = line[1:(stop - 1)]
-        (!isempty(current) && (name == current || startswith(name, current * "_"))) ? current : name
+merge_expositions(texts::AbstractVector{String}) =
+    merge_expositions(Vector{UInt8}[Vector{UInt8}(t) for t in texts])
+
+function merge_expositions(texts::AbstractVector{Vector{UInt8}})
+    # Families are numbered by first appearance, the order they are written in. Each keeps its first
+    # HELP and TYPE line, and its sample lines as a list linked through `next` from `head` to
+    # `tail`, so they come out in input order with no vector per family.
+    ids = Dict{_FamilyName, Int}()
+    help = _ExpoLine[]
+    type = _ExpoLine[]
+    head = Int[]
+    tail = Int[]
+    lines = _ExpoLine[]
+    next = Int[]
+    family!(bytes, name) = get!(ids, _FamilyName(bytes, first(name), last(name))) do
+        push!(help, _NO_LINE)
+        push!(type, _NO_LINE)
+        push!(head, 0)
+        push!(tail, 0)
+        length(help)
     end
-    ensure!(fam) = fam in order || push!(order, fam)
-    for text in texts
-        current = ""
-        for line in eachline(IOBuffer(text))
-            isempty(strip(line)) && continue
-            if startswith(line, "# HELP ")
-                current = split(line; limit = 4)[3]
-                ensure!(current)
-                get!(help, current, line)
-            elseif startswith(line, "# TYPE ")
-                current = split(line; limit = 4)[3]
-                ensure!(current)
-                get!(type, current, line)
-            elseif startswith(line, '#')
-                continue
-            else
-                fam = family_of(line)
-                ensure!(fam)
-                push!(get!(samples, fam, String[]), line)
+    for (src, bytes) in enumerate(texts)
+        cur = 0             # the family of this input's latest HELP or TYPE line; 0 before any
+        curname = 1:0       # its name, in `bytes`
+        i = 1
+        n = length(bytes)
+        while i <= n
+            # A line ends at '\n' or at the end of the input; a '\r' before the '\n' is dropped.
+            j = something(findnext(==(UInt8('\n')), bytes, i), n + 1)
+            z = j - 1
+            j <= n && z >= i && bytes[z] == UInt8('\r') && (z -= 1)
+            line = i:z
+            i = j + 1
+            kind, name = _classify(bytes, line)
+            if kind == _SAMPLE
+                # A sample belongs to the family of the header before it when its name is that
+                # family's or extends it; otherwise its bare name is its own family.
+                fam = cur != 0 && _in_family(bytes, name, curname) ? cur : family!(bytes, name)
+                # A sample that directly follows the family's previous one in the same input extends
+                # its record, so a block of samples is written with one copy.
+                t = tail[fam]
+                if t != 0 && lines[t].src == src && lines[t].last + 2 == first(line)
+                    lines[t] = _ExpoLine(src, lines[t].first, last(line))
+                else
+                    push!(lines, _ExpoLine(src, first(line), last(line)))
+                    push!(next, 0)
+                    t == 0 ? (head[fam] = length(lines)) : (next[t] = length(lines))
+                    tail[fam] = length(lines)
+                end
+            elseif kind != _SKIP
+                fam = cur != 0 && _same_bytes(bytes, name, curname) ? cur : family!(bytes, name)
+                cur, curname = fam, name
+                headers = kind == _HELP ? help : type
+                headers[fam].src == 0 && (headers[fam] = _ExpoLine(src, first(line), last(line)))
             end
         end
     end
-    io = IOBuffer()
-    for fam in order
-        haskey(help, fam) && println(io, help[fam])
-        haskey(type, fam) && println(io, type[fam])
-        for s in get(samples, fam, String[])
-            println(io, s)
+    # Each line is written with its '\n'. The buffer is sized to the output exactly, so it is filled
+    # without growing and the String takes it over without a copy.
+    width(l::_ExpoLine) = l.src == 0 ? 0 : l.last - l.first + 2
+    nbytes = sum(width, help; init = 0) + sum(width, type; init = 0) + sum(width, lines; init = 0)
+    io = IOBuffer(; sizehint = nbytes)
+    function put(l::_ExpoLine)
+        l.src == 0 && return
+        write(io, view(texts[l.src], l.first:l.last))
+        write(io, UInt8('\n'))
+        return
+    end
+    for fam in eachindex(help)
+        put(help[fam])
+        put(type[fam])
+        r = head[fam]
+        while r != 0
+            put(lines[r])
+            r = next[r]
         end
     end
     return String(take!(io))
@@ -365,7 +496,7 @@ end
 # Fetch every worker's /metrics concurrently (best effort, bounded by readtimeout) and record
 # per-endpoint reachability in gateway_worker_metrics_up.
 function _fetch_worker_metrics(m::GatewayMetrics, endpoints::Vector{String}; readtimeout::Int = 5)
-    bodies = Vector{Union{Nothing, String}}(nothing, length(endpoints))
+    bodies = Vector{Union{Nothing, Vector{UInt8}}}(nothing, length(endpoints))
     @sync for (i, ep) in enumerate(endpoints)
         @async begin
             ok = false
@@ -374,7 +505,10 @@ function _fetch_worker_metrics(m::GatewayMetrics, endpoints::Vector{String}; rea
                     "http://$ep/metrics"; retry = false, status_exception = true,
                     connect_timeout = readtimeout, request_timeout = readtimeout
                 )
-                bodies[i] = String(resp.body)
+                # HTTP.jl reads each body into a Vector{UInt8} of its own that only `resp` holds, so
+                # the merge reads it in place. String(resp.body) copied it: only a vector whose
+                # memory was made for a String can hand it over.
+                bodies[i] = resp.body
                 ok = true
             catch e
                 @debug "worker metrics scrape failed" endpoint = ep exception = e
@@ -382,7 +516,7 @@ function _fetch_worker_metrics(m::GatewayMetrics, endpoints::Vector{String}; rea
             Prometheus.set(Prometheus.labels(m.worker_metrics_up, (_wname(m, ep),)), ok ? 1.0 : 0.0)
         end
     end
-    return String[b for b in bodies if b !== nothing]
+    return Vector{UInt8}[b for b in bodies if b !== nothing]
 end
 
 # --- Admin HTTP server ------------------------------------------------------------------------
@@ -416,7 +550,7 @@ function start_admin(
                 workers = _fetch_worker_metrics(metrics, worker_metrics)
                 io = IOBuffer()
                 expose(io, metrics)   # after the fetch, so worker_metrics_up is current
-                merge_expositions(pushfirst!(workers, String(take!(io))))
+                merge_expositions(pushfirst!(workers, take!(io)))
             end
             return HTTP.Response(
                 200, ["Content-Type" => PROMETHEUS_EXPOSITION_CONTENT_TYPE];

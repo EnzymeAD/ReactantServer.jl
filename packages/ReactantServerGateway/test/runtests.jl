@@ -6,6 +6,7 @@ include("grpc_helpers.jl")
 
 @testset "ReactantServerGateway" begin
     include("test_wall_clock.jl")
+    include("test_merge_expositions.jl")
     include("test_gateway.jl")
     include("test_route_retention.jl")   # after test_gateway.jl: reuses its mock workers
     include("test_gateway_shm.jl")

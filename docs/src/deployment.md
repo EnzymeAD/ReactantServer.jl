@@ -56,6 +56,14 @@ would fight for every core under load. The cap keeps a very large box from handi
 an unhelpfully huge pool. Set `REACTANT_WORKER_THREADS` to override the computed value; it is used
 verbatim, bypassing the split and the cap.
 
+The embedded gateway keeps Julia's default pools, one compute thread and one interactive, and runs
+with `--gcthreads=4,1`: four threads mark the heap in a garbage collection (as many as the host has
+CPUs, if fewer) and one sweeps concurrently. By default Julia gives a process one mark thread per
+compute thread, so the gateway would mark alone, and its full collections, which pause every request
+it is proxying, would take more than twice as long. Set `JULIA_NUM_GC_THREADS` on the container (for
+example `2,1`) to choose differently: the supervisor then leaves the flag out, and the variable
+applies to the gateway and, through the same inherited environment, to the workers.
+
 **3. Decide on the gateway** by worker count, in the default `all` role:
 
 - **One worker, no gateway.** A lone worker already serves the full KServe V2 API, so the
@@ -230,7 +238,8 @@ configured with one.
 If you limit the container's CPUs (for example with `--cpus`), the worker thread pools are still
 sized from the CPUs Julia detects ([The node supervisor](@ref)). Check the
 `worker compute threads: ...` startup line, and set `REACTANT_WORKER_THREADS` to the number each
-worker should run.
+worker should run. The gateway's GC mark threads are capped by the same count; with fewer than four
+CPUs to spare, set `JULIA_NUM_GC_THREADS` (for example `2,1`).
 
 **Model repository.** Mount it at `/var/lib/reactantserver/models`, writable: the compiled
 executable cache lives inside each bundle, so a read-only mount recompiles every program on every
