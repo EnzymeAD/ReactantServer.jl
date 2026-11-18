@@ -271,9 +271,20 @@ function invoke_infer(
         label::Union{AbstractString, Nothing} = nothing,
         refused::Union{Base.RefValue{Bool}, Nothing} = nothing
     )
+    # `borrow_request`: gRPCClient uploads `body` from this vector, after the gRPC frame prefix,
+    # instead of copying it into a frame buffer first, which saves a copy of every request forwarded
+    # to a worker. The vector is borrowed until the call has completed and must not be written
+    # meanwhile. Nothing writes it: it is the request gRPCServer handed the handler, a vector no one
+    # else holds (the buffer it read the request into, which it gives up, or a copy when the request
+    # fills less than half of that buffer). The gateway only reads it, as do the failover and
+    # shared-memory checks, and a failover sends it again only in a new call, after this one has
+    # completed. This function does not return before the call has completed: `grpc_async_await`
+    # waits for it, and a cancellation (`_cancel_when`) completes it under the handle's lock before
+    # the await can return.
     rpc = try
-        deadline === nothing ? GRPCInferenceService.ModelInfer(wc.chan, body, gRPCClient.gRPCAsync()) :
-            GRPCInferenceService.ModelInfer(wc.chan, body, gRPCClient.gRPCAsync(); deadline = deadline)
+        deadline === nothing ?
+            GRPCInferenceService.ModelInfer(wc.chan, body, gRPCClient.gRPCAsync(); borrow_request = true) :
+            GRPCInferenceService.ModelInfer(wc.chan, body, gRPCClient.gRPCAsync(); deadline = deadline, borrow_request = true)
     catch e
         (label !== nothing && e isa gRPCClient.gRPCServiceCallException) && throw(_relabel(e, label))
         rethrow()

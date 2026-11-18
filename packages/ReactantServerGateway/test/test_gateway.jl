@@ -545,6 +545,31 @@ end
             @test !isempty(ReactantServerGateway._model_infer_rpc(sctx, body))
         end
 
+        @testset "the inbound deadline is gRPCServer's monotonic deadline_ns; an expired one tries no worker" begin
+            # gRPCServer 0.1.2 parses grpc-timeout into `ServerContext.deadline_ns`, a time_ns()
+            # reading, the clock the gateway compares against, so the handler passes it on unchanged
+            # and no wall-clock reading is involved. No deadline (nothing) is the gateway's 0.
+            GW = ReactantServerGateway
+            SC = gRPCServer.ServerContext
+            @test GW._call_deadline_ns(SC()) === Int64(0)
+            d = Int64(time_ns()) + 5_000_000_000
+            @test GW._call_deadline_ns(SC(; deadline_ns = d)) === d
+            state = gw.server.context
+            body = (io = IOBuffer(); TPB.encode(TPB.ProtoEncoder(io), GWInf.ModelInferRequest(; model_name = "replicated")); take!(io))
+            w0.infer_calls = w1.infer_calls = 0
+            err = try
+                GW._model_infer_rpc(SC(; payload = state, deadline_ns = Int64(time_ns()) - 1), body)
+                nothing
+            catch e
+                e
+            end
+            @test err isa gRPCServer.GRPCError && err.code == gRPCServer.StatusCode.DEADLINE_EXCEEDED
+            @test w0.infer_calls + w1.infer_calls == 0
+            ok = SC(; payload = state, deadline_ns = Int64(time_ns()) + 30_000_000_000)
+            @test !isempty(GW._model_infer_rpc(ok, body))
+            @test w0.infer_calls + w1.infer_calls == 1
+        end
+
         @testset "error detail: workers by name, messages sanitized, the gateway's own INTERNAL by request id" begin
             GW = ReactantServerGateway
             S = gRPCServer.StatusCode
