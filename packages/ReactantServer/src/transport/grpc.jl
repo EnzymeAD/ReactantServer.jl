@@ -489,11 +489,13 @@ end
 _handle_is_same_ipc_namespace(name) =
     _as_invalid(() -> encode_is_same_ipc_namespace_response(inference, same_ipc_namespace(name)))
 
-# Old gRPCServer handed handlers an absolute deadline on Julia's machine-relative time_ns()
-# clock (time_ns() + grpc-timeout). The merged package parses grpc-timeout into a wall-clock
-# DateTime; the shared ReactantServerCore.deadline_to_time_ns converts ctx.deadline back onto
-# the local clock the scheduler compares against (time_ns() >= dl in scheduler.jl; the codec's
-# _decode_deadline_ns uses time_ns() + budget).
+# A call's deadline as the scheduler takes it: an absolute time_ns() reading, or 0 for none.
+# gRPCServer (0.1.2 and later) anchors the grpc-timeout to time_ns() in `ctx.deadline_ns`, the
+# monotonic clock the scheduler compares against (`time_ns() >= dl` in scheduler.jl; the codec's
+# `_decode_deadline_ns` uses `time_ns() + budget`), so it is used as is, and a step of the wall clock
+# cannot move it. `ctx.deadline` is the same deadline as a wall-clock DateTime, recomputed on every
+# read; nothing here uses it.
+_call_deadline_ns(ctx) = something(ctx.deadline_ns, Int64(0))
 
 """
     build_grpc_server(sched, registry, platform, shm, host, port, ctx;
@@ -523,7 +525,7 @@ _offloaded(handler) = (ctx, req) -> off_interactive(() -> _with_status(() -> han
 # handed down to the wait for its result. A failure before the request is decoded (a malformed body)
 # leaves through the status contract too.
 function _model_infer_rpc(ctx, body)
-    deadline_ns = deadline_to_time_ns(ctx.deadline, gRPCServer.remaining_time(ctx))
+    deadline_ns = _call_deadline_ns(ctx)
     cancelled = _CallCancelled(ctx)
     return off_interactive() do
         _with_status("ModelInfer", ctx.payload) do

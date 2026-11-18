@@ -2,7 +2,7 @@
 
 julia_version = "1.12.7"
 manifest_format = "2.0"
-project_hash = "e8dee807420ac511437ce0b6345788ac095c0ef0"
+project_hash = "c9bbb9ea7289f28fceca5f32ad975bd13ccc3f99"
 
 [[deps.Adapt]]
 deps = ["LinearAlgebra"]
@@ -652,7 +652,7 @@ uuid = "df172679-9d9b-4a02-a92c-27cb5f9e1c5c"
 version = "1.1.0"
 
 [[deps.ReactantServerCore]]
-deps = ["BFloat16s", "DLFP8Types", "Dates", "FixedSizeArrays", "InterProcessCommunication", "PrecompileTools", "ProtoBuf", "YAML"]
+deps = ["BFloat16s", "DLFP8Types", "FixedSizeArrays", "InterProcessCommunication", "PrecompileTools", "ProtoBuf", "YAML"]
 path = "packages/ReactantServerCore"
 uuid = "387a5f05-f7b4-4d57-bca9-cd3358e52bdc"
 version = "2.0.0"

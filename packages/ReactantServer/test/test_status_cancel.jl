@@ -380,6 +380,37 @@ end
     end
 end
 
+@testset "a call's deadline is gRPCServer's monotonic deadline_ns, taken as is" begin
+    # gRPCServer 0.1.2 parses grpc-timeout into `ServerContext.deadline_ns`, a time_ns() reading,
+    # the clock the scheduler compares against, so the handler passes it on unchanged and no
+    # wall-clock reading is involved. No deadline (nothing) is the scheduler's 0.
+    SC = _SC.gRPCServer.ServerContext
+    @test _SC._call_deadline_ns(SC()) === Int64(0)
+    d = Int64(time_ns()) + 5_000_000_000
+    @test _SC._call_deadline_ns(SC(; deadline_ns = d)) === d
+    gate = Base.Event()
+    notify(gate)
+    ran = Threads.Atomic{Int}(0)
+    sched, ctx = _sc_sched(_sc_gated(gate, ran))
+    _SC.start!(sched)
+    try
+        # Through the registered ModelInfer RPC: a deadline already past is answered
+        # DEADLINE_EXCEEDED and the model never runs; one in the future is served.
+        r = try
+            _SC._model_infer_rpc(SC(; payload = ctx, deadline_ns = Int64(time_ns()) - 1), _sc_body("g"))
+        catch e
+            e
+        end
+        @test _sc_code(r) == _SCStatus.DEADLINE_EXCEEDED
+        @test ran[] == 0
+        ok = SC(; payload = ctx, deadline_ns = Int64(time_ns()) + 30_000_000_000)
+        @test _SC._model_infer_rpc(ok, _sc_body("g")) isa Vector{UInt8}
+        @test ran[] == 1
+    finally
+        _SC.shutdown!(sched)
+    end
+end
+
 @testset "a dispatch loop that dies is fatal: logged, not live or ready, everything UNAVAILABLE" begin
     # A shape-variant model whose variant is read from input "v". A request without it fails the
     # variant lookup, which `infer` now catches for its own request...

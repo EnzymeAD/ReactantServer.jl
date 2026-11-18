@@ -799,10 +799,12 @@ end
 
 # --- Server ---------------------------------------------------------------------------------
 
-# Old gRPCServer handed handlers an absolute deadline on Julia's machine-relative time_ns()
-# clock (time_ns() + grpc-timeout). The merged package parses grpc-timeout into a wall-clock
-# DateTime; the shared ReactantServerCore.deadline_to_time_ns converts ctx.deadline back onto
-# the local clock the gateway compares against (deadline_ns - time_ns() in _post_infer).
+# A call's deadline as the gateway takes it: an absolute time_ns() reading, or 0 for none.
+# gRPCServer (0.1.2 and later) anchors the grpc-timeout to time_ns() in `ctx.deadline_ns`, the
+# monotonic clock the gateway compares against (`deadline_ns - time_ns()` in `_post_infer`), so it
+# is used as is, and a step of the wall clock cannot move it. `ctx.deadline` is the same deadline as
+# a wall-clock DateTime, recomputed on every read; nothing here uses it.
+_call_deadline_ns(ctx) = something(ctx.deadline_ns, Int64(0))
 
 # A registered handler `f(req, state)` run through `_gw_status`, as gRPCServer calls it.
 _gw_handler(f, what::AbstractString) = (ctx, req) -> _gw_status(() -> f(req, ctx.payload), ctx.payload, what)
@@ -816,7 +818,7 @@ end
 (c::_CallCancelled)() = gRPCServer.is_cancelled(c.ctx)
 
 _model_infer_rpc(ctx, body) = _gw_status(ctx.payload, "ModelInfer") do
-    _gw_infer(body, ctx.payload, deadline_to_time_ns(ctx.deadline, gRPCServer.remaining_time(ctx)), _CallCancelled(ctx))
+    _gw_infer(body, ctx.payload, _call_deadline_ns(ctx), _CallCancelled(ctx))
 end
 
 # What the gateway passes gRPCServer as `max_concurrent_requests` for an inbound cap of `cap`
