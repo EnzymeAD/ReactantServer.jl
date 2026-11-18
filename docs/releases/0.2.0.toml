@@ -1,6 +1,8 @@
-# Container release 0.2.0, drafted by `julia docs/releases.jl draft 0.2.0`; the commit,
-# image digest and publication date are added once the image is published.
+# Container release 0.2.0, written by `julia docs/releases.jl record 0.2.0`.
 version = "0.2.0"
+published = 2026-11-18
+commit = "44d2130e8ac045c0d5783f0fa05b86cf4ef7eef9"
+image_digest = "sha256:901f6a245585c4de93c272390de43ea380ae344f788b61213f9926de2abcb19f"
 labels = true
 platform = "linux/amd64"
 julia = "1.12.7"
