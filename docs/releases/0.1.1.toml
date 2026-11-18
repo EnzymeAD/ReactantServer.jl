@@ -28,3 +28,7 @@ ReactantServer = "0.1.1"
 ReactantServerCore = "1.3.0"
 ReactantServerGateway = "0.1.0"
 ReactantServerNode = "0.1.0"
+
+[grpc_packages]
+gRPCServer = "0.1.1"
+gRPCClient = "1.1.1"

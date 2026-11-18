@@ -181,7 +181,9 @@ workflow, which publishes `:X.Y.Z`, plus `:X.Y` and `:latest` when no higher rel
 those lines (a patch to an older line moves neither). Run by hand (Actions, Image, Run workflow) on
 a branch, it publishes `:sha-<commit>` only, so `:latest` always means the newest release; run by
 hand on a `ReactantServer-vX.Y.Z` tag, it publishes that release. The run summary records the
-tags, the pushed digest, the commit, and the image's labels.
+tags, the pushed digest, the commit, and the image's labels. A release run then builds the
+release's versioned docs and commits its completed container release record
+(`docs/releases/X.Y.Z.toml`, see [CONTRIBUTING.md](../CONTRIBUTING.md)) to main.
 
 The image reports what it is through the standard OCI labels, which `podman inspect` (or
 `docker inspect`) shows for an image or a running container:
