@@ -6,7 +6,9 @@
 #                     the registry. It names the components it was built from (the Julia version,
 #                     the base image digest, and each accelerator the image supports with the
 #                     package that provides it) and records the package versions from that tag's
-#                     deploy/Manifest.toml.
+#                     deploy/Manifest.toml: the compiler and runtime stack, ReactantServer's own
+#                     packages, and the gRPC packages it serves with. Every one must come from the
+#                     registry; `record` refuses a package the lock takes from git.
 #   components.toml   what those components are: Julia's LLVM, the base image, and for each
 #                     accelerator what its provider bundles and what it requires of the host.
 #                     Written by hand, once per new component, since none of it is in this
@@ -55,12 +57,16 @@ module ContainerReleases
         "LLVMExtra_jll", "GPUCompiler",
     ]
 
-    # ReactantServer's own packages. A release that changes only these keeps the numerics stack.
+    # ReactantServer's own packages, and the gRPC packages its worker and gateway serve with. A
+    # release that changes only these keeps the numerics stack.
     const SERVER_PACKAGES = [
         "ReactantServer", "ReactantServerCore", "ReactantServerGateway", "ReactantServerNode",
     ]
+    const GRPC_PACKAGES = ["gRPCServer", "gRPCClient"]
 
     const SERVER_SECTION = "ReactantServer packages"
+    const GRPC_SECTION = "gRPC packages"
+    const SERVING_SECTIONS = (SERVER_SECTION, GRPC_SECTION)
 
     code(s) = "`$s`"
 
@@ -149,6 +155,9 @@ module ContainerReleases
         for p in SERVER_PACKAGES
             push!(out, (SERVER_SECTION, p, r["server_packages"][p]))
         end
+        for p in GRPC_PACKAGES
+            push!(out, (GRPC_SECTION, p, r["grpc_packages"][p]))
+        end
         return out
     end
 
@@ -162,11 +171,18 @@ module ContainerReleases
         return out
     end
 
+    # Which of the serving sections a change that keeps the numerics stack touched.
+    function serving_changed(changed)
+        any(s == GRPC_SECTION for (s, _, _, _) in changed) || return "ReactantServer packages"
+        any(s == SERVER_SECTION for (s, _, _, _) in changed) || return "gRPC packages"
+        return "ReactantServer and gRPC packages"
+    end
+
     function change_summary(r, prev, c)
         prev === nothing && return "First release"
         changed = changes(r, prev, c)
-        stack = unique(l for (s, l, _, _) in changed if s != SERVER_SECTION)
-        isempty(stack) && return "ReactantServer packages only"
+        stack = unique(l for (s, l, _, _) in changed if s ∉ SERVING_SECTIONS)
+        isempty(stack) && return serving_changed(changed) * " only"
         return join(stack, ", ")
     end
 
@@ -197,8 +213,8 @@ module ContainerReleases
         else
             changed = changes(r, prev, c)
             pv = prev["version"]
-            if all(s == SERVER_SECTION for (s, _, _, _) in changed)
-                println(io, "Compared with [$pv]($pv.md), only ReactantServer's own packages changed; the numerics stack is the same.\n")
+            if all(s in SERVING_SECTIONS for (s, _, _, _) in changed)
+                println(io, "Compared with [$pv]($pv.md), only the ", serving_changed(changed), " changed; the numerics stack is the same.\n")
             else
                 println(io, "Compared with [$pv]($pv.md), this release changes the numerics stack; revalidate before moving to it (see [Reproducibility & Regulated Use](../reproducibility.md)).\n")
             end
@@ -324,7 +340,14 @@ module ContainerReleases
         julia == manifest["julia_version"] || error("MODULE.bazel pins Julia $julia but deploy/Manifest.toml is for $(manifest["julia_version"])")
         base = capture(match(r"name = \"reactantserver_cuda_base\",.*?digest = \"(sha256:[0-9a-f]{64})\""s, mod), "the base image digest in MODULE.bazel")
         platform = capture(match(r"name = \"reactantserver_cuda_base\",.*?platforms = \[\"([^\"]+)\"\]"s, mod), "the base image platform in MODULE.bazel")
-        pkgversion(p) = manifest["deps"][p][1]["version"]
+        # A release ships registered versions only: a package taken from git has no version anyone
+        # can resolve, so the record would name something a user cannot install.
+        function pkgversion(p)
+            entry = manifest["deps"][p][1]
+            haskey(entry, "repo-url") &&
+                error("$ref locks $p from git ($(entry["repo-url"]) at $(entry["repo-rev"])); release it from the registry")
+            return entry["version"]
+        end
         pkgversion("ReactantServer") == version ||
             error("$ref locks ReactantServer $(pkgversion("ReactantServer")) in deploy/Manifest.toml, not $version")
         file = joinpath(DATA, "$version.toml")
@@ -333,7 +356,8 @@ module ContainerReleases
             previous = isfile(file) ? TOML.parsefile(file) : Dict()
             published = something(published, get(previous, "image_digest", nothing) == digest ? previous["published"] : today())
         end
-        open(file, "w") do io
+        # Written to the file only once every value has resolved, so a refusal leaves no partial record.
+        text = sprint() do io
             if draft
                 println(io, "# Container release $version, drafted by `julia docs/releases.jl draft $version`; the commit,")
                 println(io, "# image digest and publication date are added once the image is published.")
@@ -358,7 +382,10 @@ module ContainerReleases
             foreach(p -> println(io, p, " = \"", pkgversion(p), "\""), STACK_PACKAGES)
             println(io, "\n[server_packages]")
             foreach(p -> println(io, p, " = \"", pkgversion(p), "\""), SERVER_PACKAGES)
+            println(io, "\n[grpc_packages]")
+            foreach(p -> println(io, p, " = \"", pkgversion(p), "\""), GRPC_PACKAGES)
         end
+        write(file, text)
         r = TOML.parsefile(file)
         try
             rows(r, load_components())

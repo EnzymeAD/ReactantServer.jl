@@ -10,8 +10,8 @@ requires of the host, its digests, and what changed from the release before it.
 Julia, the base image, and the compiler and runtime packages move only through
 `bazel run //deploy:relock` or a new base image digest, never as a side effect of a release, so
 consecutive releases often share them. **Changes from previous** names what moved. A release that
-changes only ReactantServer's own packages keeps the numerics stack; any other change is a change to
-revalidate (see [Reproducibility & Regulated Use](../reproducibility.md)).
+changes only ReactantServer's own packages and the gRPC packages it serves with (gRPCServer and
+gRPCClient) keeps the numerics stack; any other change is a change to revalidate (see [Reproducibility & Regulated Use](../reproducibility.md)).
 
 ## Accelerators
 
