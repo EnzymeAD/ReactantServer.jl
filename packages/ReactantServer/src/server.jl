@@ -188,7 +188,7 @@ function _report_regulated_precision(rt::RuntimeConfig, backend::AbstractBackend
         $banner
         REGULATED PROFILE: runtime.numerics = f32
         f32 matmul/convolution precision is pinned to full f32 and was attested bit-exact at startup.
-        $banner""" platform = pool.platform batch_sizes = rt.batch_sizes coalescing xla_flags = flags
+        $banner""" platform = pool.platform batch_sizes = rt.batch_sizes coalescing autotune_cache = rt.autotune_cache xla_flags = flags
         return nothing
     elseif rt.numerics == NUMERICS_TF32
         @info """
@@ -197,7 +197,7 @@ function _report_regulated_precision(rt::RuntimeConfig, backend::AbstractBackend
         TF32 is required and the startup probe confirmed it is active on this worker. XLA and cuBLAS
         still choose the kernel per op (StableHLO cannot force TF32 for convolutions), so results
         match the validation only on the same GPU class and software stack.
-        $banner""" platform = pool.platform batch_sizes = rt.batch_sizes coalescing xla_flags = flags
+        $banner""" platform = pool.platform batch_sizes = rt.batch_sizes coalescing autotune_cache = rt.autotune_cache xla_flags = flags
         return nothing
     end
     tf32 = probe === nothing ? backend_tf32_capable(backend, pool) : something(probe.tf32_active, backend_tf32_capable(backend, pool))
@@ -210,7 +210,17 @@ function _report_regulated_precision(rt::RuntimeConfig, backend::AbstractBackend
     f32 matmul/convolution precision in effect on this worker: $effective
     Results depend on the GPU generation. Set runtime.numerics to f32 or tf32 to make the precision
     a startup requirement.
-    $banner""" platform = pool.platform batch_sizes = rt.batch_sizes coalescing xla_flags = flags
+    $banner""" platform = pool.platform batch_sizes = rt.batch_sizes coalescing autotune_cache = rt.autotune_cache xla_flags = flags
+    return nothing
+end
+
+# The regulated profile's defaults can each be overridden, and that is allowed, but an override
+# gives up part of what the profile is for, so each one is a warning in the startup log, where the
+# deployment record picks it up.
+function _warn_regulated_overrides(cfg::ServerConfig)
+    for o in regulated_overrides(cfg)
+        @warn "Regulated profile default overridden: $(o.setting)" value = o.value profile_default = o.profile_value consequence = o.consequence
+    end
     return nothing
 end
 
@@ -230,6 +240,7 @@ function _assert_tf32_not_overridden(env = ENV)
 end
 
 function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
+    _warn_regulated_overrides(cfg)
     # numerics=f32 defense in depth: NVIDIA_TF32_OVERRIDE must be in the environment before the
     # CUDA client (and its cuBLAS/cuDNN handles) exists. It covers library-internal matmul paths
     # the op-level precision pin cannot see; it does NOT govern XLA's Triton GEMMs, which the pin

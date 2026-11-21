@@ -125,6 +125,7 @@ export RuntimeProfile, PROFILE_DEFAULT, PROFILE_REGULATED
 export RuntimeConfig, ModelSchedConfig, SchedulerConfig, EndpointsConfig, GrpcConfig, ServerConfig
 export ErrorDetail, ERROR_DETAIL_REDACTED, ERROR_DETAIL_FULL, sanitize_status_message, error_request_id
 export build_config, validate_config, apply_env_overrides!, log_effective_config, parse_byte_size
+export regulated_overrides
 
 # ---- node ----
 export load_node, load_node_raw, validate_node, worker_names, worker_raw_config, node_server_config
