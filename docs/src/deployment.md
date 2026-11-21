@@ -253,7 +253,8 @@ does not watch it.
 
 **Persistent caches.** Mount a volume at `/var/cache/reactant-compile` to keep XLA's autotune
 results across container recreation; without it every start re-times every GEMM and convolution.
-Never mount anything over `/opt/julia-depot/compiled`, which holds the image's precompiled
+The regulated profile does not use this cache; see
+[Autotuning under the regulated profile](@ref). Never mount anything over `/opt/julia-depot/compiled`, which holds the image's precompiled
 packages.
 
 **Node file.** The image runs `/etc/reactantserver/node.yaml`, a copy of

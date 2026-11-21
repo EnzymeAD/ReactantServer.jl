@@ -25,9 +25,10 @@ Settable in the compose `environment:` (or `docker run -e`), via the `INFERENCE_
 overrides:
 
 - `INFERENCE_SERVER_RUNTIME_AUTOTUNE` (default `true`): `false` compiles with
-  `xla_gpu_autotune_level=0` (deterministic gemm/conv selection, no timing trials, cleaner startup
-  memory probe).
-- `INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE` (default inherits `LocalPreferences.toml`, i.e. enabled):
-  toggle the persistent per-fusion autotune cache.
+  `xla_gpu_autotune_level=0` (no timing trials, cleaner startup memory probe). Choices already in
+  the autotune cache are still used; set `INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE=false` as well for
+  a selection that does not depend on earlier runs.
+- `INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE` (default inherits `LocalPreferences.toml`, i.e. enabled;
+  `false` under the regulated profile): toggle the persistent per-fusion autotune cache.
 - `INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE_DIR` (default `/var/cache/reactant-compile`): where the
   autotune cache lives; the compose file mounts a named volume there so it persists.
