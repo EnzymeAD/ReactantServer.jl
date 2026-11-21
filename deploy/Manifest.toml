@@ -2,7 +2,7 @@
 
 julia_version = "1.12.7"
 manifest_format = "2.0"
-project_hash = "70323fb01648a02554c7288a2857028c1015a9ad"
+project_hash = "fcb414c97fd9a87b25cb03deb6fd7edcbd155030"
 
 [[deps.Adapt]]
 deps = ["LinearAlgebra"]
@@ -637,7 +637,7 @@ version = "0.1.23"
 deps = ["BFloat16s", "DLFP8Types", "HTTP", "InterProcessCommunication", "JSON3", "NNlib", "PrecompileTools", "Prometheus", "ProtoBuf", "Reactant", "ReactantServerCore", "Reactant_jll", "SHA", "SafeTensors", "YAML", "gRPCServer"]
 path = "packages/ReactantServer"
 uuid = "faa8a0e4-1926-4c6b-a0e2-e70699715ecf"
-version = "0.2.0"
+version = "0.2.1"
 
     [deps.ReactantServer.extensions]
     ReactantServerKaimonGateExt = "KaimonGate"
@@ -655,7 +655,7 @@ version = "2.0.0"
 deps = ["BFloat16s", "DLFP8Types", "FixedSizeArrays", "InterProcessCommunication", "PrecompileTools", "ProtoBuf", "YAML"]
 path = "packages/ReactantServerCore"
 uuid = "387a5f05-f7b4-4d57-bca9-cd3358e52bdc"
-version = "2.0.0"
+version = "2.1.0"
 
 [[deps.ReactantServerGateway]]
 deps = ["HTTP", "PrecompileTools", "Prometheus", "ProtoBuf", "ReactantServerCore", "YAML", "gRPCClient", "gRPCServer"]
