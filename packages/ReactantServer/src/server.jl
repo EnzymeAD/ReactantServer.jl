@@ -346,10 +346,11 @@ function _bring_up(cfg::ServerConfig, backend::AbstractBackend)
     if on_demand
         start!(
             sched; autosize_arena = arena, autosize_fraction = frac,
-            autosize_wiggle = cfg.runtime.device_headroom_fraction
+            autosize_wiggle = cfg.runtime.device_headroom_fraction,
+            determinism_check = cfg.runtime.determinism_check
         )
     else
-        start!(sched)
+        start!(sched; determinism_check = cfg.runtime.determinism_check)
     end
     # Compile the rest of each model's request path before serving (its model.jl hooks, and the
     # codec, coalescing and slicing for its tensor types), so a model's first request does not; the
@@ -447,7 +448,8 @@ function _dispatch_stall_seconds(env::AbstractDict = ENV)
 end
 
 # /readyz for the metrics listener: ready once every loaded model is compiled, the ServerReady rule,
-# never once the dispatch loop has died, and not while the server drains. A named callable rather
+# never once the dispatch loop has died or the startup determinism check has failed (then the reason,
+# as a string, for the response body), and not while the server drains. A named callable rather
 # than a closure so the precompile workload can start the listener with this exact type; HTTP.jl
 # specializes the listener's code on the handler, and through it on this.
 struct _RegistryReady
@@ -459,6 +461,8 @@ _RegistryReady(registry::ModelRegistry, sched::Scheduler) =
     _RegistryReady(registry, sched, Threads.Atomic{Bool}(false))
 function (r::_RegistryReady)()
     r.draining[] && return false
+    reason = determinism_not_ready_reason(r.sched)
+    reason === nothing || return reason
     es = values(r.registry.by_name)
     return (!isempty(es) || !isempty(r.registry.meta)) && all(e -> e.executable !== nothing, es) &&
         dispatch_alive(r.sched)

@@ -223,6 +223,27 @@ function dispatch_activity(p::DispatchProgress, now::Float64 = monotonic_time())
     return "now: " * _describe_unit(cur, now) * "; before: " * _describe_unit(prev, now)
 end
 
+# One model's outcome in the startup determinism check (see determinism_canary.jl): `status` is
+# `:passed`, `:failed` or `:unchecked`, `detail` says why it failed or was not checked, and `digests`
+# holds each checked program's SHA-256 over its canary outputs.
+struct CanaryOutcome
+    status::Symbol
+    detail::String
+    digests::Vector{Pair{String, String}}
+end
+
+# The startup determinism check's state: whether it runs, whether any program failed it (read by
+# readiness and admission on every call, hence an atomic), and each model's outcome (under `lock`,
+# written at startup and read by the metrics).
+mutable struct DeterminismCanary
+    enabled::Bool
+    failed::Threads.Atomic{Bool}
+    lock::ReentrantLock
+    outcomes::Dict{String, CanaryOutcome}
+end
+DeterminismCanary() =
+    DeterminismCanary(false, Threads.Atomic{Bool}(false), ReentrantLock(), Dict{String, CanaryOutcome}())
+
 """
     Scheduler
 
@@ -269,6 +290,7 @@ mutable struct Scheduler
     # stalled ones included (see "Staging"); guarded by `cond`
     stalled_reads::Int                         # weight reads abandoned so far; guarded by `cond`
     stalled_read_bound::Int                    # with this many stalled reads outstanding, no read starts
+    canary::DeterminismCanary                  # the startup determinism check (determinism_canary.jl)
 end
 
 function Scheduler(registry::ModelRegistry, backend::AbstractBackend, pool::MemoryPool, cfg::SchedulerConfig)
@@ -276,7 +298,8 @@ function Scheduler(registry::ModelRegistry, backend::AbstractBackend, pool::Memo
         registry, backend, pool, cfg,
         Threads.Condition(), false, nothing, nothing, nothing, ControlCommand[],
         MetaGate(1), QueuedRequest[], 0, nothing, ReentrantLock(), Dict{String, Any}(),
-        nothing, nothing, 0.0, DispatchProgress(), WeightRead[], 0, _stalled_read_bound()
+        nothing, nothing, 0.0, DispatchProgress(), WeightRead[], 0, _stalled_read_bound(),
+        DeterminismCanary()
     )
 end
 
@@ -1042,6 +1065,9 @@ function _probe_max_scratch!(s::Scheduler, pinned_bytes::Int)
         end
         max_weight = max(max_weight, model.nbytes)               # == model.nbytes given ascending order
         m = _measure_entry!(s, entry, resettable, pinned_bytes + max_weight)
+        # The model is on the device now, so the determinism check runs here rather than loading it
+        # again later; after the measurement, so its runs cannot move this model's peak.
+        s.canary.enabled && _check_determinism!(s, entry)
         max_scratch = max(max_scratch, m.scratch)
         # Per-model S for admission (exact with a resettable peak, an upper bound otherwise, since
         # the monotone peak can carry an earlier model's transient).
@@ -1141,8 +1167,9 @@ end
 # before serving begins.
 function start!(
         s::Scheduler; autosize_arena::Integer = 0, autosize_fraction::Real = 0.0,
-        autosize_wiggle::Real = 0.0
+        autosize_wiggle::Real = 0.0, determinism_check::Bool = false
     )
+    s.canary.enabled = determinism_check
     now = monotonic_time()
     for entry in values(s.registry.by_name)
         init_sched_state!(s, entry, now)
@@ -1151,16 +1178,23 @@ function start!(
         init_sched_state!(s, entry, now)
     end
     s.weight_cache === nothing || preload_pinned!(s.weight_cache, s.registry)
-    if autosize_arena > 0 && s.weight_cache !== nothing
+    autosized = autosize_arena > 0 && s.weight_cache !== nothing
+    if autosized
         # The probe runs every model (seeding the cost estimates too) and sizes the cache.
         _autosize_weight_cache!(s, Int(autosize_arena), Float64(autosize_fraction), Float64(autosize_wiggle))
-        _fill_device!(s)
     elseif s.cfg.discipline == FAIR
         # No auto-size (cache off, or no device stats): just seed the cost estimates.
         for entry in values(s.registry.by_name)
             _warmup_entry!(s, entry)
         end
     end
+    # The determinism check covers every model: the probe checked those it measured, and the rest
+    # are checked here, before the device is filled, so the fill still starts from one model resident.
+    if s.canary.enabled
+        _check_determinism_remaining!(s)
+        _report_determinism(s)
+    end
+    autosized && _fill_device!(s)
     s.weight_cache === nothing || (s.weight_cache.serving = true)
     s.running = true
     # Run the dispatch loop on the interactive threadpool when one exists (the worker is started
@@ -1299,7 +1333,11 @@ _zero_inputs(entry::ModelEntry, variant::VariantKey, sz::Int) =
 # along a variable one the next size from `variant` (nothing when it runs short), or 1 for every
 # variable axis when no variant is given (a client tensor, whose variable axes the variants do not
 # describe).
-function _synth_zeros(specs::Vector{TensorSpec}, rows::Int, variant::Union{VariantKey, Nothing})
+_synth_zeros(specs::Vector{TensorSpec}, rows::Int, variant::Union{VariantKey, Nothing}) =
+    _synth_inputs((T, dims) -> zeros(T, dims...), specs, rows, variant)
+
+# The shapes of `_synth_zeros`, filled by `make(T, dims)`.
+function _synth_inputs(make, specs::Vector{TensorSpec}, rows::Int, variant::Union{VariantKey, Nothing})
     tensors = NamedTensor[]
     vi = 0
     for sp in specs
@@ -1317,7 +1355,7 @@ function _synth_zeros(specs::Vector{TensorSpec}, rows::Int, variant::Union{Varia
                 push!(dims, variant[vi])
             end
         end
-        push!(tensors, NamedTensor(sp.name, zeros(julia_type(sp.dtype), dims...)))
+        push!(tensors, NamedTensor(sp.name, make(julia_type(sp.dtype), dims)))
     end
     return tensors
 end
@@ -1909,6 +1947,11 @@ function submit!(s::Scheduler, qr::QueuedRequest; expected::Union{ModelEntry, No
     lock(s.cond) do
         if !s.running
             put!(qr.reply, _unavailable(s))
+            return
+        end
+        # A worker that failed its startup determinism check serves nothing (determinism_canary.jl).
+        if determinism_failed(s)
+            put!(qr.reply, WorkerUnavailableError("the worker failed its startup determinism check, so it serves no requests; see its log"))
             return
         end
         # Targets are regular models only: a meta runs on the request task (see `infer`), and its

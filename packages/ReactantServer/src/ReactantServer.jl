@@ -81,6 +81,7 @@ include("runtime/observe.jl")
 include("errors.jl")
 
 include("scheduler.jl")
+include("determinism_canary.jl")   # the startup determinism check; extends the Scheduler
 
 # Dynamic model-directory watching (opt-in via model_poll_seconds). Defined after the scheduler
 # (it drives load_model!/evict!) and before server.jl (RunningServer holds a BundleWatcher).

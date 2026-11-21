@@ -110,7 +110,8 @@ unaffected.
 A named set of runtime defaults (the `runtime.profile` knob). `PROFILE_DEFAULT` changes nothing.
 `PROFILE_REGULATED` is for validated deployments that need reproducible results: it defaults
 `batch_sizes` to `largest`, adds `xla_gpu_exclude_nondeterministic_ops: true` to `xla_flags`,
-turns `scheduler.coalescing` off, and turns the persistent autotune cache (`autotune_cache`) off.
+turns `scheduler.coalescing` off, turns the persistent autotune cache (`autotune_cache`) off, and
+turns the startup determinism check (`determinism_check`) on.
 Anything set explicitly in the config wins over the profile, so each piece can be turned back off;
 the worker logs a warning at startup for each one that is (see [`regulated_overrides`](@ref)).
 The profile does not change `numerics`; instead the worker logs a prominent warning at startup
@@ -146,6 +147,7 @@ _profile_batch_sizes(p::RuntimeProfile) = p == PROFILE_REGULATED ? BATCH_SIZES_L
 _profile_coalescing(p::RuntimeProfile) = p != PROFILE_REGULATED
 # `nothing` inherits Reactant's LocalPreferences; the regulated profile turns the cache off.
 _profile_autotune_cache(p::RuntimeProfile) = p == PROFILE_REGULATED ? false : nothing
+_profile_determinism_check(p::RuntimeProfile) = p == PROFILE_REGULATED
 
 """
     RuntimeConfig
@@ -192,7 +194,10 @@ checked against the linked XLA at startup, and the flags are part of the executa
 between GPU loads, in bytes (see [`parse_byte_size`](@ref) for the accepted spellings). The default
 `0` keeps no copies; `nothing` (`unlimited` in YAML) keeps every model's copy with no cap. With `shared_host_weights` the budget is one node-wide
 pool shared by every worker; without it each worker gets `budget ÷ host_weight_budget_workers`
-(default 1, which the node supervisor sets to its worker count).
+(default 1, which the node supervisor sets to its worker count). `determinism_check` (default
+`false`, `true` under the regulated profile) runs every compiled program of every model twice on
+the same synthesized input before the worker serves, and requires the outputs to agree bit for bit;
+a worker that fails it stays live but never reports ready and refuses inference requests.
 """
 struct RuntimeConfig
     backend::BackendKind
@@ -216,7 +221,30 @@ struct RuntimeConfig
     weights_migration::WeightsMigration   # convert legacy-order weights files at load
     host_weight_budget::Union{Int, Nothing}  # bytes of host weight copies kept between loads (default 0); nothing = unlimited
     host_weight_budget_workers::Int       # workers splitting the budget when host copies are private
+    determinism_check::Bool               # run each program twice at startup and require equal outputs
 end
+
+# Twenty-one-argument form: the previous full positional layout (through
+# `host_weight_budget_workers`), with the startup determinism check off.
+RuntimeConfig(
+    backend::BackendKind, device_ordinal::Integer, device_memory_fraction::Real,
+    preallocate::Bool, allow_cpu_fallback::Bool, residency_mode::ResidencyMode,
+    shared_host_weights::Bool, shared_host_weights_mode::Integer,
+    device_weight_fraction::Real, device_headroom_fraction::Real, autotune::Bool,
+    autotune_cache::Union{Bool, Nothing}, autotune_cache_dir::AbstractString, numerics::NumericsMode,
+    executable_cache::Bool, profile::RuntimeProfile, batch_sizes::BatchSizeMode,
+    xla_flags::AbstractDict, weights_migration::WeightsMigration,
+    host_weight_budget::Union{Integer, Nothing}, host_weight_budget_workers::Integer
+) =
+    RuntimeConfig(
+    backend, Int(device_ordinal), Float64(device_memory_fraction), preallocate, allow_cpu_fallback,
+    residency_mode, shared_host_weights, UInt16(shared_host_weights_mode),
+    Float64(device_weight_fraction), Float64(device_headroom_fraction), autotune,
+    autotune_cache, String(autotune_cache_dir), numerics, executable_cache,
+    profile, batch_sizes, Dict{String, Any}(xla_flags), weights_migration,
+    host_weight_budget === nothing ? nothing : Int(host_weight_budget), Int(host_weight_budget_workers),
+    false
+)
 
 # Nineteen-argument form: the previous full positional layout (through `weights_migration`), with
 # the default host weight budget (0: no host copies between loads).
@@ -591,6 +619,7 @@ const ENV_PATHS = Tuple{String, Vector{String}, DataType}[
     ("RUNTIME_NUMERICS", ["runtime", "numerics"], String),
     ("RUNTIME_EXECUTABLE_CACHE", ["runtime", "executable_cache"], Bool),
     ("RUNTIME_PROFILE", ["runtime", "profile"], String),
+    ("RUNTIME_DETERMINISM_CHECK", ["runtime", "determinism_check"], Bool),
     ("RUNTIME_BATCH_SIZES", ["runtime", "batch_sizes"], String),
     ("RUNTIME_SHARED_HOST_WEIGHTS", ["runtime", "shared_host_weights"], Bool),
     ("RUNTIME_SHARED_HOST_WEIGHTS_MODE", ["runtime", "shared_host_weights_mode"], String),
@@ -922,6 +951,7 @@ function build_config(raw::AbstractDict)
         _parse_weights_migration(_opt(rt, "weights_migration", String, "off")),
         _parse_host_weight_budget(rt),
         _parse_budget_workers(_opt(rt, "host_weight_budget_workers", Int, 1)),
+        _opt(rt, "determinism_check", Bool, _profile_determinism_check(profile)),
     )
 
     sc = _subdict(raw, "scheduler")
@@ -1023,7 +1053,7 @@ end
 # `apply_env_overrides!` is applied on top by `node_server_config`.
 
 function log_effective_config(cfg::ServerConfig, applied)
-    @info "Effective configuration" model_dirs = cfg.model_dirs models_include = cfg.models_include model_control_mode = cfg.model_control_mode model_poll_seconds = cfg.model_poll_seconds cache_dir = cfg.cache_dir backend = cfg.runtime.backend device_ordinal = cfg.runtime.device_ordinal device_memory_fraction = cfg.runtime.device_memory_fraction preallocate = cfg.runtime.preallocate allow_cpu_fallback = cfg.runtime.allow_cpu_fallback device_weight_fraction = cfg.runtime.device_weight_fraction device_headroom_fraction = cfg.runtime.device_headroom_fraction autotune = cfg.runtime.autotune autotune_cache = cfg.runtime.autotune_cache autotune_cache_dir = cfg.runtime.autotune_cache_dir numerics = cfg.runtime.numerics executable_cache = cfg.runtime.executable_cache profile = cfg.runtime.profile batch_sizes = cfg.runtime.batch_sizes weights_migration = cfg.runtime.weights_migration host_weight_budget = cfg.runtime.host_weight_budget host_weight_budget_workers = cfg.runtime.host_weight_budget_workers xla_flags = sort!(["$k=$v" for (k, v) in cfg.runtime.xla_flags]) residency_mode = cfg.runtime.residency_mode shared_host_weights = cfg.runtime.shared_host_weights shared_host_weights_mode = string(cfg.runtime.shared_host_weights_mode; base = 8) host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests discipline = cfg.scheduler.discipline ema_halflife_seconds = cfg.scheduler.ema_halflife_seconds recency_penalty_cap = cfg.scheduler.recency_penalty_cap coalescing = cfg.scheduler.coalescing coalescing_discount = cfg.scheduler.coalescing_discount cost_ema_alpha = cfg.scheduler.cost_ema_alpha max_queue_depth = cfg.scheduler.max_queue_depth compaction_interval = cfg.scheduler.compaction_interval weight_read_stall_seconds = cfg.scheduler.weight_read_stall_seconds scheduler_models = collect(keys(cfg.scheduler.models))
+    @info "Effective configuration" model_dirs = cfg.model_dirs models_include = cfg.models_include model_control_mode = cfg.model_control_mode model_poll_seconds = cfg.model_poll_seconds cache_dir = cfg.cache_dir backend = cfg.runtime.backend device_ordinal = cfg.runtime.device_ordinal device_memory_fraction = cfg.runtime.device_memory_fraction preallocate = cfg.runtime.preallocate allow_cpu_fallback = cfg.runtime.allow_cpu_fallback device_weight_fraction = cfg.runtime.device_weight_fraction device_headroom_fraction = cfg.runtime.device_headroom_fraction autotune = cfg.runtime.autotune autotune_cache = cfg.runtime.autotune_cache autotune_cache_dir = cfg.runtime.autotune_cache_dir numerics = cfg.runtime.numerics executable_cache = cfg.runtime.executable_cache profile = cfg.runtime.profile batch_sizes = cfg.runtime.batch_sizes weights_migration = cfg.runtime.weights_migration host_weight_budget = cfg.runtime.host_weight_budget host_weight_budget_workers = cfg.runtime.host_weight_budget_workers determinism_check = cfg.runtime.determinism_check xla_flags = sort!(["$k=$v" for (k, v) in cfg.runtime.xla_flags]) residency_mode = cfg.runtime.residency_mode shared_host_weights = cfg.runtime.shared_host_weights shared_host_weights_mode = string(cfg.runtime.shared_host_weights_mode; base = 8) host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port max_concurrent_requests = cfg.endpoints.max_concurrent_requests discipline = cfg.scheduler.discipline ema_halflife_seconds = cfg.scheduler.ema_halflife_seconds recency_penalty_cap = cfg.scheduler.recency_penalty_cap coalescing = cfg.scheduler.coalescing coalescing_discount = cfg.scheduler.coalescing_discount cost_ema_alpha = cfg.scheduler.cost_ema_alpha max_queue_depth = cfg.scheduler.max_queue_depth compaction_interval = cfg.scheduler.compaction_interval weight_read_stall_seconds = cfg.scheduler.weight_read_stall_seconds scheduler_models = collect(keys(cfg.scheduler.models))
     isempty(applied) || @info "Configuration overridden by environment" overrides = ["$k=$v" for (k, v) in applied]
     return nothing
 end
@@ -1065,6 +1095,14 @@ function regulated_overrides(cfg::ServerConfig)
             out, (;
                 setting = "scheduler.coalescing", value = "true", profile_value = "false",
                 consequence = "a request's rows can land in different batch slots depending on other traffic",
+            )
+        )
+    end
+    if !rt.determinism_check
+        push!(
+            out, (;
+                setting = "runtime.determinism_check", value = "false", profile_value = "true",
+                consequence = "the worker serves without first confirming that each compiled program gives the same outputs on repeated runs",
             )
         )
     end

@@ -763,6 +763,14 @@ end
         @test r.autotune_cache === false
         @test d.autotune_cache === nothing
         @test rt("runtime:\n  backend: cuda\n  profile: regulated\n  autotune_cache: true").autotune_cache === true
+        # It turns the startup determinism check on; it is off otherwise.
+        @test r.determinism_check === true
+        @test d.determinism_check === false
+        @test rt("runtime:\n  backend: cuda\n  determinism_check: true").determinism_check === true
+        @test rt("runtime:\n  backend: cuda\n  profile: regulated\n  determinism_check: false").determinism_check === false
+        withenv("INFERENCE_SERVER_RUNTIME_DETERMINISM_CHECK" => "false") do
+            @test rt("runtime:\n  backend: cuda\n  profile: regulated").determinism_check === false
+        end
 
         # Explicit settings win over the profile, piece by piece, and add to its flags.
         o = rt(
@@ -881,6 +889,7 @@ end
             "runtime.batch_sizes", "runtime.xla_flags.xla_gpu_exclude_nondeterministic_ops",
             "scheduler.coalescing", "runtime.autotune_cache",
         ]
+        @test settings("runtime:\n  profile: regulated\n  determinism_check: false") == ["runtime.determinism_check"]
         cache = only(o for o in all4 if o.setting == "runtime.autotune_cache")
         @test cache.value == "true" && cache.profile_value == "false"
         @test occursin("issues/182", cache.consequence)
