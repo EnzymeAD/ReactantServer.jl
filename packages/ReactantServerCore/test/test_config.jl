@@ -759,6 +759,18 @@ end
         @test r.batch_sizes == ReactantServer.BATCH_SIZES_LARGEST
         @test r.xla_flags == Dict{String, Any}("xla_gpu_exclude_nondeterministic_ops" => true)
         @test r.numerics == ReactantServer.NUMERICS_AUTO
+        # It turns the persistent autotune cache off; the default profile inherits LocalPreferences.
+        @test r.autotune_cache === false
+        @test d.autotune_cache === nothing
+        @test rt("runtime:\n  backend: cuda\n  profile: regulated\n  autotune_cache: true").autotune_cache === true
+        # It turns the startup determinism check on; it is off otherwise.
+        @test r.determinism_check === true
+        @test d.determinism_check === false
+        @test rt("runtime:\n  backend: cuda\n  determinism_check: true").determinism_check === true
+        @test rt("runtime:\n  backend: cuda\n  profile: regulated\n  determinism_check: false").determinism_check === false
+        withenv("INFERENCE_SERVER_RUNTIME_DETERMINISM_CHECK" => "false") do
+            @test rt("runtime:\n  backend: cuda\n  profile: regulated").determinism_check === false
+        end
 
         # Explicit settings win over the profile, piece by piece, and add to its flags.
         o = rt(
@@ -795,6 +807,13 @@ end
             @test e.profile == ReactantServer.PROFILE_REGULATED
             @test e.batch_sizes == ReactantServer.BATCH_SIZES_ALL
             @test haskey(e.xla_flags, "xla_gpu_exclude_nondeterministic_ops")
+            @test e.autotune_cache === false
+        end
+        withenv(
+            "INFERENCE_SERVER_RUNTIME_PROFILE" => "regulated",
+            "INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE" => "true",
+        ) do
+            @test rt("runtime:\n  backend: cuda").autotune_cache === true
         end
 
         # Positional constructors keep the defaults.
@@ -840,5 +859,59 @@ end
         )
         @test !c10.coalescing && c10.weight_read_stall_seconds == 20.0
         @test ReactantServer.SchedulerConfig(30.0, 64, 30.0; weight_read_stall_seconds = 5).weight_read_stall_seconds == 5.0
+    end
+end
+
+@testset "regulated_overrides: each overridden profile default, by name" begin
+    mktempdir() do dir
+        modeldir = joinpath(dir, "models"); mkpath(modeldir)
+        overrides(body) = ReactantServer.regulated_overrides(load_single_worker(dir, body; model_repo = modeldir)[1])
+        settings(body) = [o.setting for o in overrides(body)]
+
+        # Nothing to report outside the profile, or with every profile default in effect.
+        @test isempty(overrides("runtime:\n  batch_sizes: all\n  autotune_cache: true"))
+        @test isempty(overrides("runtime:\n  profile: regulated"))
+
+        # Every override is named, with its value and the profile's.
+        all4 = overrides(
+            """
+            runtime:
+              profile: regulated
+              batch_sizes: all
+              autotune_cache: true
+              xla_flags:
+                xla_gpu_exclude_nondeterministic_ops: false
+            scheduler:
+              coalescing: true
+            """
+        )
+        @test [o.setting for o in all4] == [
+            "runtime.batch_sizes", "runtime.xla_flags.xla_gpu_exclude_nondeterministic_ops",
+            "scheduler.coalescing", "runtime.autotune_cache",
+        ]
+        @test settings("runtime:\n  profile: regulated\n  determinism_check: false") == ["runtime.determinism_check"]
+        cache = only(o for o in all4 if o.setting == "runtime.autotune_cache")
+        @test cache.value == "true" && cache.profile_value == "false"
+        @test occursin("issues/182", cache.consequence)
+
+        # xla_gpu_deterministic_ops keeps the determinism the dropped flag provided.
+        @test isempty(
+            settings(
+                """
+                runtime:
+                  profile: regulated
+                  xla_flags:
+                    xla_gpu_exclude_nondeterministic_ops: false
+                    xla_gpu_deterministic_ops: true
+                """
+            )
+        )
+        # An environment override counts the same as one in the file.
+        withenv(
+            "INFERENCE_SERVER_RUNTIME_PROFILE" => "regulated",
+            "INFERENCE_SERVER_RUNTIME_AUTOTUNE_CACHE" => "true",
+        ) do
+            @test settings("") == ["runtime.autotune_cache"]
+        end
     end
 end

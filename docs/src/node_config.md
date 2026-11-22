@@ -69,13 +69,14 @@ global:
     allow_cpu_fallback: false
     numerics: auto             # f32 | auto | tf32; see below
     executable_cache: true     # cache compiled programs under each bundle's .cache/; see below
+    determinism_check: false   # run each program twice at startup, require equal outputs (profile default)
     profile: default           # default | regulated; see below
     batch_sizes: all           # all | largest compiled batch size per model (profile default)
     xla_flags: {}              # XLA DebugOptions overrides, e.g. xla_gpu_exclude_nondeterministic_ops: true
     device_weight_fraction: 1.0    # GPU arena share for resident weights (pinned + on-demand), (0, 1]
     device_headroom_fraction: 0.1  # GPU arena share kept free; drives startup auto-sizing
-    autotune: true             # XLA GPU compile autotuner; false = default kernels, no trials
-    # autotune_cache: false    # persistent per-fusion autotune cache; omit to inherit Reactant's
+    autotune: true             # XLA GPU compile autotuner; false = no trials (cached choices still used)
+    # autotune_cache: false    # persistent per-fusion autotune cache (profile default); omit to inherit Reactant's
     # autotune_cache_dir: /cache/autotune  # cache directory; omit to inherit Reactant's defaults
     shared_host_weights: false # one shm-backed host copy of each model on this node's workers
     shared_host_weights_mode: "666"  # octal permissions for the shared regions; "660" preferred
@@ -157,16 +158,24 @@ enumerator name), so a typo fails startup instead of being ignored. An explicit
 `xla_gpu_autotune_level` here wins over `autotune: false`.
 
 `runtime.profile` applies a named set of defaults. `regulated` defaults `batch_sizes` to
-`largest`, adds `xla_gpu_exclude_nondeterministic_ops: true` to `xla_flags`, and defaults
-`scheduler.coalescing` to `false`; anything set explicitly wins. It does not change `numerics`.
+`largest`, adds `xla_gpu_exclude_nondeterministic_ops: true` to `xla_flags`, defaults
+`scheduler.coalescing` to `false`, defaults `autotune_cache` to `false`, and defaults
+`determinism_check` to `true`. Anything set explicitly wins, and the worker logs a warning at
+startup for each profile default it overrides. It does not change `numerics`. XLA does not autotune
+under the profile, which costs latency; see [Autotuning under the regulated profile](@ref) and
+[issue #182](https://github.com/EnzymeAD/ReactantServer.jl/issues/182).
+
+`runtime.determinism_check` runs every compiled program of every model twice on one synthesized
+input before the worker serves, and requires identical outputs. A worker that fails it stays live
+but never reports ready and refuses requests; see [The determinism check](@ref).
 
 `scheduler.coalescing` (default `true`) lets the scheduler merge queued requests to the same model
 into one dispatch. With `false`, each dispatch serves exactly one request; see
 [Scheduling & Coalescing](scheduling.md).
 
 [Reproducibility & Regulated Use](reproducibility.md) explains how `numerics`, `batch_sizes`,
-`coalescing`, `executable_cache`, `xla_flags`, and `profile` affect a model's outputs, and which values a
-validated deployment should use.
+`coalescing`, `executable_cache`, `autotune`, `autotune_cache`, `xla_flags`, `determinism_check`,
+and `profile` affect a model's outputs, and which values a validated deployment should use.
 
 `model_control_mode` sets how the loaded model set evolves:
 
@@ -500,6 +509,7 @@ overrides were applied, is logged at startup.
 | `INFERENCE_SERVER_RUNTIME_NUMERICS` | `runtime.numerics` | `f32` \| `auto` \| `tf32` |
 | `INFERENCE_SERVER_RUNTIME_EXECUTABLE_CACHE` | `runtime.executable_cache` | bool |
 | `INFERENCE_SERVER_RUNTIME_PROFILE` | `runtime.profile` | `default` \| `regulated` |
+| `INFERENCE_SERVER_RUNTIME_DETERMINISM_CHECK` | `runtime.determinism_check` | bool |
 | `INFERENCE_SERVER_RUNTIME_BATCH_SIZES` | `runtime.batch_sizes` | `all` \| `largest` |
 | `INFERENCE_SERVER_RUNTIME_SHARED_HOST_WEIGHTS` | `runtime.shared_host_weights` | bool |
 | `INFERENCE_SERVER_RUNTIME_SHARED_HOST_WEIGHTS_MODE` | `runtime.shared_host_weights_mode` | octal string |

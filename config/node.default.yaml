@@ -17,10 +17,11 @@ global:
   runtime:
     backend: cuda
     # autotune (default true) enables XLA's GPU compile autotuner. Set false to compile with
-    # xla_gpu_autotune_level=0 (default gemm/conv algorithm selection, no timing trials), which makes
-    # kernel choice deterministic run-to-run and keeps the autotuner's compile-time scratch from
-    # inflating the startup weight-cache memory probe on the first, un-cached start. The trade-off is
-    # losing timing-tuned kernels.
+    # xla_gpu_autotune_level=0 (no timing trials), which keeps the autotuner's compile-time scratch
+    # from inflating the startup weight-cache memory probe on the first, un-cached start. Choices
+    # already in the persistent autotune cache are still used; set autotune_cache: false as well for
+    # a kernel choice that does not depend on earlier runs. The trade-off is losing timing-tuned
+    # kernels.
     # autotune: true
     # numerics (default auto) sets the f32 matmul/convolution precision policy. 'auto' follows the
     # hardware: TF32 on GPUs that support it (compute capability >= 8.0), plain f32 elsewhere, so

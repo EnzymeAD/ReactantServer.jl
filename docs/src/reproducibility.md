@@ -77,7 +77,8 @@ Some GPU kernels are not deterministic from run to run: a reduction or scatter t
 with atomic additions sums in whatever order the threads finish, so the same program on the same
 input can return different low bits. The XLA option `xla_gpu_exclude_nondeterministic_ops` asks
 XLA to leave such implementations out of the compiled program. Set it through `runtime.xla_flags`;
-the `regulated` profile sets it for you.
+the `regulated` profile sets it for you. It also turns XLA's autotuner off entirely; see
+[Autotuning under the regulated profile](@ref).
 
 ## Compilation and autotuning
 
@@ -98,7 +99,9 @@ A choice, once made, is held by two caches:
   compile settings.
 - **The autotune cache** (`runtime.autotune_cache`, `runtime.autotune_cache_dir`;
   `/var/cache/reactant-compile` in the image) stores the timing decisions themselves, so a fresh
-  compile reuses earlier choices instead of measuring again.
+  compile reuses earlier choices instead of measuring again. Its entries are keyed by GPU and
+  operation, not by compile settings, and a compile uses any entry it finds, whether or not that
+  compile autotunes.
 
 With autotuning on, make both caches persistent and back them up. Neither failure is visible: a
 lost cache does not stop a worker, it only autotunes again and may choose differently, which is a
@@ -111,8 +114,34 @@ change to revalidate. In practice:
 - After a restart, check that every program loaded from the executable cache: the worker logs
   `executable cache: hit` for each, and `worker_executable_cache_misses_total` stays at zero.
 
-**`runtime.autotune: false`** removes the dependence on timing altogether: XLA uses its default
-kernels, the same on every compile, at some cost in speed.
+**`runtime.autotune: false`** runs no timing trials: XLA uses its default kernel for every operation
+the autotune cache has no entry for, at some cost in speed. Choices already in the cache are still
+used, so a worker that once ran with autotuning on keeps them. To remove the dependence on timing
+altogether, set `runtime.autotune_cache: false` as well, or point `runtime.autotune_cache_dir` at a
+directory no tuned run has written to.
+
+### Autotuning under the regulated profile
+
+Under `xla_gpu_exclude_nondeterministic_ops`, which the regulated profile sets, XLA does not
+autotune at all: it measures no candidate kernels and creates no autotune cache entries, and
+`runtime.autotune` has no effect. XLA cannot yet tune among deterministic kernels only, so a
+regulated deployment gives up autotuning entirely, and it is slower than the same model tuned. On
+the convolutional model measured in
+[issue #182](https://github.com/EnzymeAD/ReactantServer.jl/issues/182) the cost was about 6% of
+latency. Models dominated by matrix multiplications, such as transformers, have not been measured
+and may lose more, since their tuned kernel choices matter more; measure your own model with and
+without the profile.
+
+The profile also turns the persistent autotune cache off (`runtime.autotune_cache: false`, from
+ReactantServer 0.2.1). Older Reactant builds, including the one in the 0.2.0 release image, still
+read that cache under the flag, so a worker switched to the profile could otherwise compile with
+choices that an earlier tuned run recorded, and its program would depend on the cache's history.
+Turning the cache back on is allowed but logged as a warning at startup.
+
+Restoring autotuning to regulated deployments needs a change in XLA, so that it can tune among
+deterministic kernels, and support in ReactantServer for one pinned set of autotune results
+shared by every worker. Follow [issue #182](https://github.com/EnzymeAD/ReactantServer.jl/issues/182)
+for progress.
 
 ## The software stack
 
@@ -138,8 +167,12 @@ CUDA libraries, and the driver. The release image pins all of them except the ho
 - `runtime.batch_sizes: largest`
 - `runtime.xla_flags: {xla_gpu_exclude_nondeterministic_ops: true}`
 - `scheduler.coalescing: false`
+- `runtime.autotune_cache: false`
+- `runtime.determinism_check: true` (see [The determinism check](@ref))
 
-Anything set explicitly wins, so either piece can be turned back off. The profile does not set
+Anything set explicitly wins, so each piece can be turned back off. Each one that is turned back
+off is logged as a warning at startup, `Regulated profile default overridden: <setting>`, with
+what the override gives up, so it is part of the deployment record. The profile does not set
 `runtime.numerics`, because the right mode is the one the deployment was validated with. Set it as
 well:
 
@@ -157,6 +190,42 @@ INFERENCE_SERVER_RUNTIME_PROFILE=regulated
 INFERENCE_SERVER_RUNTIME_NUMERICS=tf32
 ```
 
+## The determinism check
+
+With `runtime.determinism_check: true`, which the regulated profile sets, a worker runs every
+compiled program of every model twice on the same input before it serves, and requires the outputs
+to agree bit for bit. The input is synthesized from the bundle's manifest: a fixed sequence of
+values in [-1, 1) for floating-point inputs, and zeros for integer and boolean inputs, which are
+often indices. Under the regulated profile each model normally has one program, its largest batch
+size, so this costs two inferences per model. Models measured by the startup memory probe are
+checked while the probe has them on the device, so none is loaded twice.
+
+A worker whose check fails does not serve:
+
+- It never reports ready: `/readyz` answers 503 with the failing models named in the body, and
+  `ServerReady` and `ModelReady` say no, so the gateway routes nothing to it.
+- It refuses inference requests sent to it directly with UNAVAILABLE.
+- It stays live (`/healthz`), so the node supervisor, which checks liveness only once a worker has
+  been ready, leaves it running instead of restarting it in a loop.
+- It logs a bannered error, `DETERMINISM CHECK FAILED`, and exports
+  `worker_determinism_check_failed 1` and `worker_determinism_check{model, outcome}`.
+
+One model failing fails the whole worker, because every model on it shares the device and the
+software stack. Find the cause, typically an XLA flag that lets nondeterministic kernels back in or
+a kernel choice carried over from a tuned run, then restart the worker.
+
+A model the check cannot run is reported as unchecked, with a warning, and does not stop the worker:
+one with no inputs to synthesize, one whose program raises on the synthesized input, or, under
+externally managed residency, one that is not on the device at startup. Models loaded later by the
+directory watcher are not checked.
+
+The check catches a program that is not deterministic. It cannot catch one that is deterministic
+but differs from the program that was validated, for example after a driver change, because that
+program gives the same different output every time. For that, each passing model's log line records
+a SHA-256 of its canary outputs per program; compare these against the validation record. Making
+that comparison automatic is part of
+[issue #182](https://github.com/EnzymeAD/ReactantServer.jl/issues/182).
+
 ## Startup evidence
 
 Each worker records its effective settings at startup. Keep these log lines with the validation
@@ -168,7 +237,12 @@ record:
   is bit-exact.
 - **The `REGULATED PROFILE` banner:** the precision in effect under the regulated profile, as an
   info line under `f32` or `tf32` and as a warning under `auto`, together with `batch_sizes`,
-  `coalescing`, and the XLA flags.
+  `coalescing`, `autotune_cache`, and the XLA flags.
+- **`Regulated profile default overridden`:** one warning per profile default the configuration
+  overrides, naming the setting, its value, and what the override gives up. A deployment that
+  intends none should log none.
+- **`determinism check: model passed`:** per model, the SHA-256 of its canary outputs for each
+  compiled program, to compare across workers and against the validation record.
 - **`model loaded`:** per model, the compiled batch sizes actually loaded and the numerics outcome
   (operations pinned, algorithms rewritten or stripped).
 
@@ -177,9 +251,14 @@ record:
 - Serve from a release image pinned by digest or release tag, with its build attestation verified.
 - Set `runtime.profile: regulated` and pin `runtime.numerics` to the validated mode.
 - Run every worker on the validated GPU class and driver version.
-- With autotuning on, keep the executable cache and the autotune cache on persistent storage,
-  back both up with the validation record, and confirm a restart loads every program from the cache.
-  Otherwise set `runtime.autotune: false`.
+- Leave the persistent autotune cache off, as the profile sets it. XLA does not autotune under the
+  profile, so the cache can only hold choices from other, tuned runs.
+- Keep the executable cache on persistent storage, back it up with the validation record, and
+  confirm a restart loads every program from the cache.
+- Check the startup log for `Regulated profile default overridden` warnings, and record why each
+  one is there.
+- Leave the determinism check on, as the profile sets it, and record each model's canary output
+  digests with the validation. A model reported as unchecked is not covered by it.
 - Leave coalescing off, as the profile sets it. If it is turned back on, confirm for each model
   that a request's output is bit-identical alone and inside a full batch.
 - Archive each worker's startup evidence lines.

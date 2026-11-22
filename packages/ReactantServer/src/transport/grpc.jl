@@ -261,6 +261,7 @@ end
 function _model_ready(ctx::InferContext, name::AbstractString)
     sched = ctx.sched
     dispatch_alive(sched) || return false
+    determinism_failed(sched) && return false
     externally_managed = sched.weight_cache !== nothing && sched.weight_cache.mode == EXTERNALLY_MANAGED
     # A meta runs its sub-models in-process, so it is ready only where they can run. In
     # externally-managed mode that means every sub's weights must be resident on this worker (the
@@ -285,11 +286,13 @@ _handle_model_ready(ctx::InferContext, req) =
 # The server is ready only once at least one model is registered and every registered model
 # has been compiled. Compilation finishes before the gRPC plane accepts traffic, so this
 # guards mainly against a misconfigured model_dirs that left the registry empty. A worker whose
-# dispatch loop has died is never ready (nor live, see `_handle_server_live`).
+# dispatch loop has died is never ready (nor live, see `_handle_server_live`), and neither is one
+# that failed its startup determinism check (which stays live, see determinism_canary.jl).
 function _handle_server_ready(ctx::InferContext)
     entries = values(ctx.registry.by_name)
     has_any = !isempty(entries) || !isempty(ctx.registry.meta)
-    ready = has_any && all(e -> e.executable !== nothing, entries) && dispatch_alive(ctx.sched)
+    ready = has_any && all(e -> e.executable !== nothing, entries) && dispatch_alive(ctx.sched) &&
+        !determinism_failed(ctx.sched)
     return inference.ServerReadyResponse(; ready = ready)
 end
 

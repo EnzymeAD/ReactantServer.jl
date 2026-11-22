@@ -209,3 +209,24 @@ end
         rt(RS.NUMERICS_AUTO), backend, pool, nothing
     )
 end
+
+@testset "regulated profile override warnings" begin
+    mktempdir() do dir
+        cfg(runtime, scheduler = Dict{String, Any}()) = RS.build_config(
+            Dict{String, Any}("model_dirs" => [dir], "runtime" => runtime, "scheduler" => scheduler)
+        )
+        # The profile's own defaults, and any setting outside the profile, are not warned about.
+        @test_logs RS._warn_regulated_overrides(cfg(Dict{String, Any}("profile" => "regulated")))
+        @test_logs RS._warn_regulated_overrides(cfg(Dict{String, Any}("autotune_cache" => true)))
+        # Each override is its own warning, naming the setting.
+        @test_logs (:warn, r"overridden: runtime\.autotune_cache") RS._warn_regulated_overrides(
+            cfg(Dict{String, Any}("profile" => "regulated", "autotune_cache" => true))
+        )
+        @test_logs (:warn, r"overridden: runtime\.batch_sizes") (:warn, r"overridden: scheduler\.coalescing") RS._warn_regulated_overrides(
+            cfg(
+                Dict{String, Any}("profile" => "regulated", "batch_sizes" => "all"),
+                Dict{String, Any}("coalescing" => true)
+            )
+        )
+    end
+end

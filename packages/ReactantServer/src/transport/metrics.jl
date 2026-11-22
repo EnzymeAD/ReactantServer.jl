@@ -56,6 +56,7 @@ Prometheus.metric_names(::WorkerSnapshotCollector) = (
     "worker_device_memory_largest_free_block_bytes", "worker_device_memory_fragmentation",
     "worker_device_memory_process_used_bytes", "worker_device_memory_out_of_pool_bytes",
     "worker_models_loaded", "worker_models_resident", "worker_resident_weight_bytes",
+    "worker_determinism_check_failed", "worker_determinism_check",
     "worker_executable_cache_hits_total", "worker_executable_cache_misses_total",
     "worker_executable_cache_stores_total", "worker_executable_cache_failures_total",
     "worker_executable_cache_load_seconds_total", "worker_executable_cache_compile_seconds_total",
@@ -205,7 +206,27 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
             "worker_resident_weight_bytes", "gauge",
             "Total device-resident weight footprint (bytes).", rw.bytes
         ),
+        _scalar(
+            "worker_determinism_check_failed", "gauge",
+            "1 if the startup determinism check failed (the worker then serves nothing), else 0.",
+            determinism_failed(c.sched) ? 1 : 0
+        ),
     )
+    # The startup determinism check's outcome per model, when it ran: 1 on the model's outcome.
+    outcomes = determinism_outcomes(c.sched)
+    if !isempty(outcomes)
+        oln = Prometheus.LabelNames(("model", "outcome"))
+        push!(
+            metrics, Prometheus.Metric(
+                "gauge", "worker_determinism_check",
+                "Startup determinism check outcome per model (passed, failed, unchecked).",
+                Prometheus.Sample[
+                    Prometheus.Sample(nothing, oln, Prometheus.LabelValues((name, String(o.status))), 1.0)
+                        for (name, o) in outcomes
+                ]
+            )
+        )
+    end
 
     # On-demand weight cache (only when enabled).
     wc = weight_cache_metrics(c.sched)
@@ -586,7 +607,7 @@ end
     start_worker_metrics(metrics, host, port; ready_fn, live_fn, worker_name="", gpu="") -> HTTP server
 
 Serve `/metrics` (Prometheus text exposition), `/healthz` (`live_fn()`, always live by default), and
-`/readyz` (`ready_fn()`) on an HTTP/1.1 listener. Mirrors the gateway's admin server. Non-empty `worker_name` / `gpu` are
+`/readyz` (`ready_fn()`: `true` for ready, `false` or a string saying why not) on an HTTP/1.1 listener. Mirrors the gateway's admin server. Non-empty `worker_name` / `gpu` are
 injected as constant `worker` / `gpu` labels on every exported series. Close the returned
 server to stop it.
 """
@@ -611,7 +632,9 @@ function start_worker_metrics(
         elseif target == "/healthz"
             return live_fn() ? HTTP.Response(200; body = "ok") : HTTP.Response(503; body = "not live")
         elseif target == "/readyz"
-            return ready_fn() ? HTTP.Response(200; body = "ok") : HTTP.Response(503; body = "not ready")
+            ready = ready_fn()
+            return ready === true ? HTTP.Response(200; body = "ok") :
+                HTTP.Response(503; body = ready isa AbstractString ? ready : "not ready")
         else
             return HTTP.Response(404; body = "not found")
         end
